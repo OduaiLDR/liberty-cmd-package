@@ -1,9 +1,9 @@
 <?php
 
-namespace Packages\Cmd\Reports\ScheduledReports;
+namespace Cmd\Reports\ScheduledReports;
 
 use Illuminate\Console\Command;
-use Packages\Cmd\Reports\Services\SnowflakeConnector;
+use Cmd\Reports\Services\SnowflakeConnector;
 use Exception;
 
 /**
