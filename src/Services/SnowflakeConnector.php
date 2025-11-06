@@ -1,6 +1,6 @@
 <?php
 
-namespace Packages\Cmd\Reports\Services;
+namespace Cmd\Reports\Services;
 
 use GuzzleHttp\Client;
 use Firebase\JWT\JWT;

@@ -3,6 +3,7 @@
 namespace Cmd\Reports;
 
 use Illuminate\Support\ServiceProvider;
+use Cmd\Reports\Console\Commands\TestSnowflakeJWT;
 
 class ReportsServiceProvider extends ServiceProvider
 {
