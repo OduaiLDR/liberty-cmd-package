@@ -12,9 +12,9 @@ class ReportsServiceProvider extends ServiceProvider
         $this->loadRoutesFrom(__DIR__ . '/../routes/web.php');
         $this->loadViewsFrom(__DIR__ . '/../resources/views', 'reports');
 
-        $this->mergeConfigFrom(__DIR__ . '/../config/snowflake.php', 'reports');
+        $this->mergeConfigFrom(__DIR__ . '/../../config/snowflake.php', 'reports');
         $this->publishes([
-            __DIR__ . '/../config/reports.php' => config_path('snowflake.php'),
+            __DIR__ . '/../../config/snowflake.php' => config_path('snowflake.php'),
         ], 'reports-config');
 
         // Register console commands
@@ -30,3 +30,4 @@ class ReportsServiceProvider extends ServiceProvider
         //
     }
 }
+
