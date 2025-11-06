@@ -47,7 +47,11 @@ class SnowflakeConnector
      */
     public static function fromEnvironment(string $env): self
     {
-        $config = require __DIR__ . '/../config/snowflake.php';
+        $configPath = __DIR__ . '/../../config/snowflake.php';
+        if (!is_file($configPath)) {
+            throw new Exception('Snowflake configuration file not found: ' . $configPath);
+        }
+        $config = require $configPath;
         
         if (!isset($config['environments'][$env])) {
             throw new Exception("Unknown environment: {$env}");
