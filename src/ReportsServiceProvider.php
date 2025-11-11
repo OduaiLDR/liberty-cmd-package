@@ -27,6 +27,17 @@ class ReportsServiceProvider extends ServiceProvider
                 TestSnowflakeJWT::class,
             ]);
         }
+
+        // seed permissions for central and tenants
+        if ($this->app->runningInConsole()) {
+            $this->commands([
+                \Cmd\Reports\Console\Commands\SeedCmdReportPermissions::class,
+            ]);
+
+            $this->callAfterResolving('artisan', function (): void {
+                $this->app->call(\Cmd\Reports\Console\Commands\SeedCmdReportPermissions::class);
+            });
+        }
     }
 
     public function register()

@@ -47,13 +47,48 @@ class SnowflakeConnector
      */
     public static function fromEnvironment(string $env): self
     {
-        $config = require __DIR__ . '/../config/snowflake.php';
+        $config = self::loadConfiguration();
         
         if (!isset($config['environments'][$env])) {
             throw new Exception("Unknown environment: {$env}");
         }
 
         return new self($config['environments'][$env]);
+    }
+
+    /**
+     * Locate configuration from Laravel config or package stub
+     */
+    private static function loadConfiguration(): array
+    {
+        if (function_exists('config')) {
+            $snowflakeConfig = config('snowflake');
+            if (is_array($snowflakeConfig) && !empty($snowflakeConfig)) {
+                return $snowflakeConfig;
+            }
+
+            // legacy key support
+            $legacyConfig = config('reports');
+            if (is_array($legacyConfig) && !empty($legacyConfig)) {
+                return $legacyConfig;
+            }
+        }
+
+        if (function_exists('base_path')) {
+            $publishedConfig = base_path('config/snowflake.php');
+            if (is_file($publishedConfig)) {
+                return require $publishedConfig;
+            }
+        }
+
+        // Fallback to package stub next to this src/ tree
+        $packageConfig = __DIR__ . '/../../config/snowflake.php';
+        if (is_file($packageConfig)) {
+            return require $packageConfig;
+        }
+
+        throw new Exception('Snowflake configuration file could not be located. '
+            . 'Publish the config via php artisan vendor:publish --tag=reports-config or ensure config/snowflake.php exists.');
     }
 
     /**
