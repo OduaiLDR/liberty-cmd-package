@@ -2,142 +2,73 @@
 
 return [
     /*
-     * Default environment and mode
+     * Default connections to use
      */
-    'default' => env('SNOWFLAKE_ENV', 'plaw'),
-    'mode' => env('SNOWFLAKE_MODE', 'production'), // 'production' or 'sandbox'
+    'default' => ['plaw', 'ldr', 'lt'],
 
     /*
-     * Production Environment Configurations
+     * Snowflake Database Connections
+     * Add any Snowflake connection credentials here
      */
-    'production' => [
+    'snowflake' => [
         /*
-         * PLAW Production Environment
+         * PLAW Connection
          * Production-like AWS environment
          */
         'plaw' => [
-            'account' => 'ACCOUNT_IDENTIFIER',
-            'user' => 'USERNAME',
-            'database' => 'DATABASE_NAME',
-            'schema' => 'SCHEMA_NAME',
-            'warehouse' => 'WAREHOUSE_NAME',
-            'role' => 'ROLE_NAME',
-            'private_key' => '-----BEGIN PRIVATE KEY-----
-YOUR_PRIVATE_KEY
------END PRIVATE KEY-----',
-            'private_key_passphrase' => 'PRIVATE_KEY_PASSPHRASE',
+            'account' => '',
+            'user' => '',
+            'database' => '',
+            'schema' => '',
+            'warehouse' => '',
+            'role' => '',
+            'private_key' => '',
+            'private_key_passphrase' => '',
         ],
 
         /*
-         * LDR Environment Configuration
+         * LDR Connection
          * Leader environment
          */
         'ldr' => [
-            'account' => 'ACCOUNT_IDENTIFIER',
-            'user' => 'USERNAME',
-            'database' => 'DATABASE_NAME',
-            'schema' => 'SCHEMA_NAME',
-            'warehouse' => 'WAREHOUSE_NAME',
-            'role' => 'ROLE_NAME',
-            'private_key' => '-----BEGIN PRIVATE KEY-----
-YOUR_PRIVATE_KEY
------END PRIVATE KEY-----',
-            'private_key_passphrase' => 'PRIVATE_KEY_PASSPHRASE',
+            'account' => '',
+            'user' => '',
+            'database' => '',
+            'schema' => '',
+            'warehouse' => '',
+            'role' => '',
+            'private_key' => '',
+            'private_key_passphrase' => '',
         ],
 
         /*
-         * LT Environment Configuration
+         * LT Connection
          * Local testing environment
          */
         'lt' => [
-            'account' => 'ACCOUNT_IDENTIFIER',
-            'user' => 'USERNAME',
-            'database' => 'DATABASE_NAME',
-            'schema' => 'SCHEMA_NAME',
-            'warehouse' => 'WAREHOUSE_NAME',
-            'role' => 'ROLE_NAME',
-            'private_key' => '-----BEGIN PRIVATE KEY-----
-YOUR_PRIVATE_KEY
------END PRIVATE KEY-----',
-            'private_key_passphrase' => 'PRIVATE_KEY_PASSPHRASE',
+            'account' => '',
+            'user' => '',
+            'database' => '',
+            'schema' => '',
+            'warehouse' => '',
+            'role' => '',
+            'private_key' => "",
+            'private_key_passphrase' => '',
         ],
     ],
 
     /*
-     * Sandbox Environment Configurations
-     */
-    'sandbox' => [
-        /*
-         * PLAW Sandbox Environment
-         * Production-like testing environment
-         */
-        'plaw' => [
-            'account' => 'ACCOUNT_IDENTIFIER',
-            'user' => 'USERNAME',
-            'database' => 'DATABASE_NAME',
-            'schema' => 'SCHEMA_NAME',
-            'warehouse' => 'WAREHOUSE_NAME',
-            'role' => 'ROLE_NAME',
-            'password' => 'PASSWORD',
-            'private_key' => '-----BEGIN PRIVATE KEY-----
-YOUR_PRIVATE_KEY
------END PRIVATE KEY-----',
-            'private_key_passphrase' => 'PRIVATE_KEY_PASSPHRASE',
-        ],
-
-        /*
-         * LDR Sandbox Environment
-         * Development testing environment
-         */
-        'ldr' => [
-            'account' => 'ACCOUNT_IDENTIFIER',
-            'user' => 'USERNAME',
-            'database' => 'DATABASE_NAME',
-            'schema' => 'SCHEMA_NAME',
-            'warehouse' => 'WAREHOUSE_NAME',
-            'role' => 'ROLE_NAME',
-            'password' => 'PASSWORD',
-            'private_key' => '-----BEGIN PRIVATE KEY-----
-YOUR_PRIVATE_KEY
------END PRIVATE KEY-----',
-            'private_key_passphrase' => 'PRIVATE_KEY_PASSPHRASE',
-        ],
-
-        /*
-         * LT Sandbox Environment
-         * Local testing environment
-         */
-        'lt' => [
-            'account' => 'ACCOUNT_IDENTIFIER',
-            'user' => 'USERNAME',
-            'database' => 'DATABASE_NAME',
-            'schema' => 'SCHEMA_NAME',
-            'warehouse' => 'WAREHOUSE_NAME',
-            'role' => 'ROLE_NAME',
-            'password' => 'PASSWORD',
-            'private_key' => '-----BEGIN PRIVATE KEY-----
-YOUR_PRIVATE_KEY
------END PRIVATE KEY-----',
-            'private_key_passphrase' => 'PRIVATE_KEY_PASSPHRASE',
-        ],
-    ],
-
-    /*
-     * SQL Server CMD Database Configuration
-     * Used for data synchronization with Snowflake
+     * SQL Server Database Connections
      */
     'sql_server' => [
-
         /*
-         * Sandbox SQL Server Configuration
-         * Same server but different database/table for testing
+         * Sandbox SQL Server Connection
          */
-        'sandbox' => [
-            'dsn' => 'DSN_PLACEHOLDER',
-            'username' => 'USERNAME',
-            'password' => 'PASSWORD',
-            'database' => 'DATABASE_NAME',
-            'table' => 'TABLE_NAME',
+        'sql_server_connection' => [
+            'dsn' => '',
+            'username' => '',
+            'password' => '',
+            'database' => '',
             'timeout' => 30,
         ],
     ],

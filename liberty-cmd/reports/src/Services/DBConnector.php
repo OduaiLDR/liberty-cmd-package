@@ -34,6 +34,9 @@ class DBConnector
 
     public function __construct(array $config)
     {
+        // Validate required Snowflake configuration
+        $this->validateSnowflakeConfig($config);
+        
         $this->account = $config['account'];
         $this->user = strtoupper($config['user']);
         $this->database = $config['database'] ?? 'DPP_DATA';
@@ -41,12 +44,34 @@ class DBConnector
         $this->warehouse = $config['warehouse'] ?? 'DEFAULT_WH';
         $this->role = $config['role'] ?? 'ACCOUNTADMIN';
         $this->privateKey = $config['private_key'];
-        $this->privateKeyPassphrase = $config['private_key_passphrase'];
+        $this->privateKeyPassphrase = $config['private_key_passphrase'] ?? '';
 
         $this->client = new Client([
             'timeout' => 300,
             'verify' => true,
         ]);
+    }
+
+    /**
+     * Validate Snowflake configuration
+     */
+    private function validateSnowflakeConfig(array $config): void
+    {
+        $required = ['account', 'user', 'private_key'];
+        $missing = [];
+
+        foreach ($required as $field) {
+            if (empty($config[$field])) {
+                $missing[] = $field;
+            }
+        }
+
+        if (!empty($missing)) {
+            throw new Exception(
+                'Missing required Snowflake configuration: ' . implode(', ', $missing) . '. ' .
+                'Please set the appropriate environment variables or update the configuration file.'
+            );
+        }
     }
 
     /**
@@ -56,9 +81,41 @@ class DBConnector
     {
         $config = self::loadConfiguration();
         
-        // Determine mode (production or sandbox)
-        $mode = $mode ?: ($config['mode'] ?? 'production');
+        // Auto-detect mode based on credentials if not specified
+        if (!$mode) {
+            // Check if we have snowflake config
+            if (isset($config['snowflake'][$env])) {
+                $envConfig = $config['snowflake'][$env];
+                // Auto-detect: if database name contains SANDBOX, use sandbox mode
+                if (isset($envConfig['database']) && stripos($envConfig['database'], 'SANDBOX') !== false) {
+                    $mode = 'sandbox';
+                } else {
+                    $mode = 'production';
+                }
+            } else {
+                $mode = 'production'; // Default
+            }
+        }
         
+        // Check if we have the new configuration structure with mode support
+        if (isset($config['snowflake']) && isset($config[$mode])) {
+            // New structure with both production and sandbox: config[mode][env]
+            if (!isset($config[$mode][$env])) {
+                throw new Exception("Unknown environment: {$env} in mode: {$mode}");
+            }
+            return new self($config[$mode][$env]);
+        }
+        
+        // Check if we have only production snowflake configuration
+        if (isset($config['snowflake'])) {
+            // New structure: config['snowflake'][env] (production only)
+            if (!isset($config['snowflake'][$env])) {
+                throw new Exception("Unknown environment: {$env} in snowflake configuration");
+            }
+            return new self($config['snowflake'][$env]);
+        }
+        
+        // Legacy structure: config[mode][env]
         if (!isset($config[$mode][$env])) {
             throw new Exception("Unknown environment: {$env} in mode: {$mode}");
         }
@@ -430,10 +487,59 @@ class DBConnector
     /**
      * Initialize SQL Server connection
      */
-    public function initializeSqlServer(string $mode = 'production'): void
+    public function initializeSqlServer(?string $mode = null): void
     {
         $config = self::loadConfiguration();
-        $this->sqlServerConfig = $config['sql_server'][$mode];
+        
+        // Check if we have the new configuration structure
+        if (isset($config['sql_server'])) {
+            // Try to find SQL Server config - check multiple possible keys
+            if (isset($config['sql_server']['sql_server_connection'])) {
+                // Generic key - use this regardless of mode
+                $this->sqlServerConfig = $config['sql_server']['sql_server_connection'];
+            } elseif ($mode && isset($config['sql_server'][$mode])) {
+                // Mode-specific key (if mode is provided)
+                $this->sqlServerConfig = $config['sql_server'][$mode];
+            } elseif (isset($config['sql_server']['sandbox'])) {
+                // Default to sandbox if mode not found
+                $this->sqlServerConfig = $config['sql_server']['sandbox'];
+            } elseif (isset($config['sql_server']['production'])) {
+                // Try production as fallback
+                $this->sqlServerConfig = $config['sql_server']['production'];
+            } else {
+                throw new Exception("SQL Server configuration not found. Looking for key: sql_server_connection, sandbox, or production");
+            }
+        } else {
+            // Legacy structure
+            if (!isset($config['sql_server'][$mode])) {
+                throw new Exception("SQL Server configuration not found for mode: {$mode}");
+            }
+            $this->sqlServerConfig = $config['sql_server'][$mode];
+        }
+        
+        $this->validateSqlServerConfig($this->sqlServerConfig);
+    }
+
+    /**
+     * Validate SQL Server configuration
+     */
+    private function validateSqlServerConfig(array $config): void
+    {
+        $required = ['dsn', 'username', 'password'];
+        $missing = [];
+
+        foreach ($required as $field) {
+            if (empty($config[$field])) {
+                $missing[] = $field;
+            }
+        }
+
+        if (!empty($missing)) {
+            throw new Exception(
+                'Missing required SQL Server configuration: ' . implode(', ', $missing) . '. ' .
+                'Please set the appropriate environment variables or update the configuration file.'
+            );
+        }
     }
 
     /**
@@ -446,8 +552,17 @@ class DBConnector
                 throw new Exception('SQL Server not initialized. Call initializeSqlServer() first.');
             }
 
+            // Build DSN with database included for Azure SQL compatibility
+            $dsn = $this->sqlServerConfig['dsn'];
+            if (isset($this->sqlServerConfig['database']) && !empty($this->sqlServerConfig['database'])) {
+                // Add database to DSN if not already present
+                if (strpos($dsn, 'Database=') === false) {
+                    $dsn .= ';Database=' . $this->sqlServerConfig['database'];
+                }
+            }
+
             $this->sqlServerConnection = new PDO(
-                $this->sqlServerConfig['dsn'],
+                $dsn,
                 $this->sqlServerConfig['username'],
                 $this->sqlServerConfig['password'],
                 [
@@ -455,9 +570,6 @@ class DBConnector
                     PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
                 ]
             );
-
-            // Switch to the configured database
-            $this->sqlServerConnection->exec("USE {$this->sqlServerConfig['database']}");
         }
 
         return $this->sqlServerConnection;
