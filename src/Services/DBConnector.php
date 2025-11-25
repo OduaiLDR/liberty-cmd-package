@@ -76,6 +76,7 @@ class DBConnector
 
     /**
      * Create connector from environment configuration
+     * Picks the right Snowflake env/mode (production vs sandbox) based on config/ENV.
      */
     public static function fromEnvironment(string $env, string $mode = null): self
     {
@@ -115,7 +116,7 @@ class DBConnector
             return new self($config['snowflake'][$env]);
         }
         
-        // Legacy structure: config[mode][env]
+     
         if (!isset($config[$mode][$env])) {
             throw new Exception("Unknown environment: {$env} in mode: {$mode}");
         }
@@ -125,6 +126,7 @@ class DBConnector
 
     /**
      * Locate configuration from Laravel config or package stub
+     * Priority: published config -> app config -> package stub -> legacy files.
      */
     private static function loadConfiguration(): array
     {
@@ -572,56 +574,139 @@ class DBConnector
     public function initializeSqlServer(?string $mode = null): void
     {
         $config = self::loadConfiguration();
-        
-        // Check if we have the new configuration structure
+
+        $candidateConfig = null;
+
         if (isset($config['sql_server'])) {
-            // Try to find SQL Server config - check multiple possible keys
-            if (isset($config['sql_server']['sql_server_connection'])) {
-                // Generic key - use this regardless of mode
-                $this->sqlServerConfig = $config['sql_server']['sql_server_connection'];
-            } elseif ($mode && isset($config['sql_server'][$mode])) {
-                // Mode-specific key (if mode is provided)
-                $this->sqlServerConfig = $config['sql_server'][$mode];
-            } elseif (isset($config['sql_server']['sandbox'])) {
-                // Default to sandbox if mode not found
-                $this->sqlServerConfig = $config['sql_server']['sandbox'];
-            } elseif (isset($config['sql_server']['production'])) {
-                // Try production as fallback
-                $this->sqlServerConfig = $config['sql_server']['production'];
-            } else {
-                throw new Exception("SQL Server configuration not found. Looking for key: sql_server_connection, sandbox, or production");
+            $sqlServerConfig = $config['sql_server'];
+            if (isset($sqlServerConfig['sql_server_connection'])) {
+                $candidateConfig = $sqlServerConfig['sql_server_connection'];
+            } elseif ($mode && isset($sqlServerConfig[$mode])) {
+                $candidateConfig = $sqlServerConfig[$mode];
+            } elseif (isset($sqlServerConfig['sandbox'])) {
+                $candidateConfig = $sqlServerConfig['sandbox'];
+            } elseif (isset($sqlServerConfig['production'])) {
+                $candidateConfig = $sqlServerConfig['production'];
             }
-        } else {
-            // Legacy structure
-            if (!isset($config['sql_server'][$mode])) {
-                throw new Exception("SQL Server configuration not found for mode: {$mode}");
-            }
-            $this->sqlServerConfig = $config['sql_server'][$mode];
         }
-        
-        $this->validateSqlServerConfig($this->sqlServerConfig);
+
+        $resolvedConfig = $this->normalizeSqlServerConfig($candidateConfig);
+
+        // Fallback to Laravel database connection definitions
+        if ($resolvedConfig === null) {
+            $resolvedConfig = $this->resolveSqlServerConfigFromLaravel();
+        }
+
+        if ($resolvedConfig === null) {
+            throw new Exception('SQL Server configuration not found. Provide sql_server_connection in the package config or ensure database.connections.cmd/sqlsrv exists.');
+        }
+
+        $this->sqlServerConfig = $resolvedConfig;
     }
 
     /**
-     * Validate SQL Server configuration
+     * Attempt to normalize SQL Server configuration into DSN/credentials.
      */
-    private function validateSqlServerConfig(array $config): void
+    private function normalizeSqlServerConfig(?array $config): ?array
     {
-        $required = ['dsn', 'username', 'password'];
-        $missing = [];
+        if (!$config) {
+            return null;
+        }
 
-        foreach ($required as $field) {
-            if (empty($config[$field])) {
-                $missing[] = $field;
+        $normalized = $config;
+
+        $dsn = $normalized['dsn'] ?? null;
+        if (!$dsn) {
+            $dsn = $this->buildSqlServerDsn($normalized);
+        }
+
+        if (!$dsn) {
+            return null;
+        }
+
+        $normalized['dsn'] = $dsn;
+
+        if (empty($normalized['username']) || empty($normalized['password'])) {
+            return null;
+        }
+
+        if (!isset($normalized['timeout'])) {
+            $normalized['timeout'] = 30;
+        }
+
+        return $normalized;
+    }
+
+    /**
+     */
+    private function resolveSqlServerConfigFromLaravel(): ?array
+    {
+        if (!function_exists('config')) {
+            return null;
+        }
+
+        $connections = config('database.connections', []);
+        foreach (['cmd', 'sqlsrv'] as $connectionName) {
+            if (!isset($connections[$connectionName])) {
+                continue;
+            }
+
+            $connection = $connections[$connectionName];
+            $candidate = [
+                'dsn' => $connection['dsn'] ?? null,
+                'host' => $connection['host'] ?? null,
+                'port' => $connection['port'] ?? null,
+                'database' => $connection['database'] ?? null,
+                'username' => $connection['username'] ?? null,
+                'password' => $connection['password'] ?? null,
+                'encrypt' => $connection['encrypt'] ?? null,
+                'trust_server_certificate' => $connection['trust_server_certificate'] ?? null,
+                'timeout' => $connection['timeout'] ?? 30,
+            ];
+
+            $normalized = $this->normalizeSqlServerConfig($candidate);
+            if ($normalized !== null) {
+                return $normalized;
             }
         }
 
-        if (!empty($missing)) {
-            throw new Exception(
-                'Missing required SQL Server configuration: ' . implode(', ', $missing) . '. ' .
-                'Please set the appropriate environment variables or update the configuration file.'
-            );
+        return null;
+    }
+
+    /**
+     * Build a SQL Server DSN string from host/port/database settings.
+     */
+    private function buildSqlServerDsn(array $config): ?string
+    {
+        $host = $config['host'] ?? null;
+        if (!$host) {
+            return null;
         }
+
+        $dsn = 'sqlsrv:Server=' . $host;
+
+        if (!empty($config['port'])) {
+            $dsn .= ',' . $config['port'];
+        }
+
+        if (!empty($config['database'])) {
+            $dsn .= ';Database=' . $config['database'];
+        }
+
+        if (array_key_exists('trust_server_certificate', $config)) {
+            $value = $config['trust_server_certificate'];
+            $dsn .= ';TrustServerCertificate=' . ($value ? 'true' : 'false');
+        }
+
+        if (array_key_exists('encrypt', $config) && $config['encrypt'] !== null && $config['encrypt'] !== '') {
+            $value = $config['encrypt'];
+            if (is_bool($value)) {
+                $value = $value ? 'yes' : 'no';
+            }
+            $dsn .= ';Encrypt=' . $value;
+        }
+
+        return $dsn;
     }
 
     /**

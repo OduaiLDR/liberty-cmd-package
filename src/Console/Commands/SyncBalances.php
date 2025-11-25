@@ -8,7 +8,7 @@ use Illuminate\Support\Facades\Log;
 
 class SyncBalances extends Command
 {
-    /**
+    /**  
      * The name and signature of the console command.
      *
      * @var string
@@ -27,12 +27,12 @@ class SyncBalances extends Command
      */
     public function handle(): int
     {
-        $this->info('Balance sync: starting.');
-        Log::info('SyncBalances command started.');
+        $this->info('Balance sync: starting.'); // for user to see in terminal
+        Log::info('SyncBalances command started.'); // for logging 
 
         $batchSize = (int) $this->option('batch-size');
         if ($batchSize <= 0) {
-            $batchSize = 1000;
+            $batchSize = 1000; //batch size decided by jacob
         }
 
         $connections = ['plaw', 'ldr'];
@@ -409,7 +409,8 @@ BEGIN
         [Status] VARCHAR(20) NOT NULL,
         [RecordsProcessed] INT DEFAULT 0,
         [RecordsDeleted] INT DEFAULT 0,
-        [Details] VARCHAR(1000)
+        [Details] VARCHAR(1000),
+        [Import_Time] DATETIME NULL
     );
 END
 SQL;
@@ -441,6 +442,7 @@ SQL;
         );
 
         $timestamp = now()->format('Y-m-d H:i:s');
+        $importTime = now()->format('Y-m-d H:i:s');
 
         $tableNameEsc = $this->escapeSqlString($tableName);
         $macroEsc = $this->escapeSqlString($macro);
@@ -448,14 +450,15 @@ SQL;
         $actionEsc = $this->escapeSqlString($action);
         $resultEsc = $this->escapeSqlString($resultSummary);
         $timestampEsc = $this->escapeSqlString($timestamp);
+        $importTimeEsc = $this->escapeSqlString($importTime);
         $operationEsc = $this->escapeSqlString('BALANCE_SYNC');
         $sourceEsc = $this->escapeSqlString($source);
         $statusEsc = $this->escapeSqlString($status);
         $detailsEsc = $this->escapeSqlString($details);
 
         $sql = sprintf(
-            "INSERT INTO TblLog (Table_Name, Macro, Description, Action, Result, Timestamp, Operation, Source, Status, RecordsProcessed, RecordsDeleted, Details)
-            VALUES ('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', %d, %d, '%s');",
+            "INSERT INTO TblLog (Table_Name, Macro, Description, Action, Result, Timestamp, Operation, Source, Status, RecordsProcessed, RecordsDeleted, Details, Import_Time)
+            VALUES ('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', %d, %d, '%s', '%s');",
             $tableNameEsc,
             $macroEsc,
             $descriptionEsc,
@@ -467,7 +470,8 @@ SQL;
             $statusEsc,
             $recordsProcessed,
             $recordsDeleted,
-            $detailsEsc
+            $detailsEsc,
+            $importTimeEsc
         );
 
         $connector->querySqlServer($sql);
