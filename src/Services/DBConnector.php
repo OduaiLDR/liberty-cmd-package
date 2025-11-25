@@ -76,6 +76,7 @@ class DBConnector
 
     /**
      * Create connector from environment configuration
+     * Picks the right Snowflake env/mode (production vs sandbox) based on config/ENV.
      */
     public static function fromEnvironment(string $env, string $mode = null): self
     {
@@ -115,7 +116,7 @@ class DBConnector
             return new self($config['snowflake'][$env]);
         }
         
-        // Legacy structure: config[mode][env]
+     
         if (!isset($config[$mode][$env])) {
             throw new Exception("Unknown environment: {$env} in mode: {$mode}");
         }
@@ -125,6 +126,7 @@ class DBConnector
 
     /**
      * Locate configuration from Laravel config or package stub
+     * Priority: published config -> app config -> package stub -> legacy files.
      */
     private static function loadConfiguration(): array
     {
@@ -224,8 +226,8 @@ class DBConnector
         $privateKey = openssl_pkey_get_private($this->privateKey, $this->privateKeyPassphrase ?: null);
         if (!$privateKey) {
             $error = openssl_error_string();
-            error_log("Private key loading failed: {$error}");
-            error_log("Key starts with: " . substr($this->privateKey, 0, 50));
+            $this->debugLog("Private key loading failed: {$error}");
+            $this->debugLog("Key starts with: " . substr($this->privateKey, 0, 50));
             throw new Exception('Failed to load private key: ' . $error);
         }
         
@@ -235,7 +237,7 @@ class DBConnector
             throw new Exception('Private key must be RSA type, got: ' . $keyDetails['type']);
         }
         
-        error_log("Private key loaded successfully. Key size: " . $keyDetails['bits'] . " bits");
+        $this->debugLog("Private key loaded successfully. Key size: " . $keyDetails['bits'] . " bits");
 
         // Get public key details for fingerprint
         $publicKeyDetails = openssl_pkey_get_details($privateKey);
@@ -273,13 +275,13 @@ class DBConnector
         $jwt = JWT::encode($payload, $privateKey, 'RS256', null, $header);
         
         // Debug output
-        error_log("Generated JWT for {$this->account}: " . substr($jwt, 0, 100) . "...");
-        error_log("Issuer (iss): {$payload['iss']}");
-        error_log("Subject (sub): {$qualifiedUser}");
-        error_log("Audience (aud): {$audienceUrl}");
-        error_log("Public Key Fingerprint: {$fingerprintB64}");
-        error_log("JWT Header: " . json_encode($header));
-        error_log("JWT Payload: " . json_encode($payload));
+        $this->debugLog("Generated JWT for {$this->account}: " . substr($jwt, 0, 100) . "...");
+        $this->debugLog("Issuer (iss): {$payload['iss']}");
+        $this->debugLog("Subject (sub): {$qualifiedUser}");
+        $this->debugLog("Audience (aud): {$audienceUrl}");
+        $this->debugLog("Public Key Fingerprint: {$fingerprintB64}");
+        $this->debugLog("JWT Header: " . json_encode($header));
+        $this->debugLog("JWT Payload: " . json_encode($payload));
         
         return $jwt;
     }
@@ -295,8 +297,8 @@ class DBConnector
         );
 
         try {
-            error_log("Requesting token from: {$url}");
-            error_log("JWT assertion: " . substr($jwt, 0, 100) . "...");
+            $this->debugLog("Requesting token from: {$url}");
+            $this->debugLog("JWT assertion: " . substr($jwt, 0, 100) . "...");
             
             $response = $this->client->post($url, [
                 'form_params' => [
@@ -306,7 +308,7 @@ class DBConnector
             ]);
 
             $responseBody = $response->getBody()->getContents();
-            error_log("Token response: " . substr($responseBody, 0, 100) . "...");
+            $this->debugLog("Token response: " . substr($responseBody, 0, 100) . "...");
             
             // Snowflake returns the JWT token directly, not in JSON format
             if (empty($responseBody)) {
@@ -328,7 +330,7 @@ class DBConnector
             
         } catch (\GuzzleHttp\Exception\ClientException $e) {
             $errorResponse = $e->getResponse()->getBody()->getContents();
-            error_log("Token exchange error: " . $errorResponse);
+            $this->debugLog("Token exchange error: " . $errorResponse);
             throw new Exception('JWT token exchange failed: ' . $errorResponse);
         }
     }
@@ -357,7 +359,7 @@ class DBConnector
             $requestBody['bindings'] = $bindings;
         }
 
-        error_log("Making API request with token: " . substr($token, 0, 50) . "...");
+        $this->debugLog("Making API request with token: " . substr($token, 0, 50) . "...");
         
         $response = $this->client->post($url, [
             'headers' => [
@@ -371,9 +373,78 @@ class DBConnector
 
         $result = json_decode($response->getBody()->getContents(), true);
 
+        // Some long‑running statements may return a status URL first; poll until results are ready.
+        if (!isset($result['resultSetMetaData']) && isset($result['statementStatusUrl'])) {
+            $statusUrl = $result['statementStatusUrl'];
+
+            for ($i = 0; $i < 60; $i++) {
+                // Small delay between polls
+                sleep(1);
+
+                $statusResponse = $this->client->get($statusUrl, [
+                    'headers' => [
+                        'Authorization' => 'Bearer ' . $token,
+                        'Accept' => 'application/json',
+                        'X-Snowflake-Authorization-Token-Type' => 'OAUTH',
+                    ],
+                ]);
+
+                $statusBody = $statusResponse->getBody()->getContents();
+                $status = json_decode($statusBody, true);
+
+                if (isset($status['resultSetMetaData'])) {
+                    $result = $status;
+                    break;
+                }
+
+                if (isset($status['status']) && in_array($status['status'], ['FAILED', 'ABORTED'], true)) {
+                    $message = $status['errorMessage'] ?? 'Snowflake query failed with status ' . $status['status'];
+                    throw new Exception($message);
+                }
+            }
+        }
+
         if (!isset($result['resultSetMetaData'])) {
             throw new Exception('Invalid query response from Snowflake');
         }
+
+        // Handle pagination fully
+        $allData = $result['data'] ?? [];
+        $rowCount = count($allData);
+
+        $this->debugLog('Initial Snowflake rowCount: ' . ($result['rowCount'] ?? 'n/a'));
+        $this->debugLog('Initial nextRowUrl: ' . ($result['nextRowUrl'] ?? 'null'));
+
+        $nextRowUrl = $result['nextRowUrl'] ?? null;
+        while ($nextRowUrl) {
+            // nextRowUrl can be relative; prepend account host if needed
+            if (!str_starts_with($nextRowUrl, 'http')) {
+                $nextRowUrl = 'https://' . strtolower($this->account) . '.snowflakecomputing.com' . $nextRowUrl;
+            }
+
+            $this->debugLog('Fetching nextRowUrl: ' . $nextRowUrl);
+
+            $pageResponse = $this->client->get($nextRowUrl, [
+                'headers' => [
+                    'Authorization' => 'Bearer ' . $token,
+                    'Accept' => 'application/json',
+                    'X-Snowflake-Authorization-Token-Type' => 'OAUTH',
+                ],
+            ]);
+
+            $pageBody = $pageResponse->getBody()->getContents();
+            $page = json_decode($pageBody, true);
+
+            if (isset($page['data']) && is_array($page['data'])) {
+                $allData = array_merge($allData, $page['data']);
+                $rowCount += count($page['data']);
+            }
+
+            $nextRowUrl = $page['nextRowUrl'] ?? null;
+        }
+
+        $result['data'] = $allData;
+        $result['rowCount'] = $rowCount;
 
         return $this->formatResult($result);
     }
@@ -397,6 +468,19 @@ class DBConnector
             'rowCount' => $result['rowCount'] ?? count($rows),
             'columns' => $columns,
         ];
+    }
+
+    private function debugLog(string $message): void
+    {
+        if (function_exists('env')) {
+            $enabled = env('SNOWFLAKE_DEBUG', false);
+        } else {
+            $enabled = false;
+        }
+
+        if ($enabled) {
+            error_log($message);
+        }
     }
 
     /**
@@ -490,56 +574,139 @@ class DBConnector
     public function initializeSqlServer(?string $mode = null): void
     {
         $config = self::loadConfiguration();
-        
-        // Check if we have the new configuration structure
+
+        $candidateConfig = null;
+
         if (isset($config['sql_server'])) {
-            // Try to find SQL Server config - check multiple possible keys
-            if (isset($config['sql_server']['sql_server_connection'])) {
-                // Generic key - use this regardless of mode
-                $this->sqlServerConfig = $config['sql_server']['sql_server_connection'];
-            } elseif ($mode && isset($config['sql_server'][$mode])) {
-                // Mode-specific key (if mode is provided)
-                $this->sqlServerConfig = $config['sql_server'][$mode];
-            } elseif (isset($config['sql_server']['sandbox'])) {
-                // Default to sandbox if mode not found
-                $this->sqlServerConfig = $config['sql_server']['sandbox'];
-            } elseif (isset($config['sql_server']['production'])) {
-                // Try production as fallback
-                $this->sqlServerConfig = $config['sql_server']['production'];
-            } else {
-                throw new Exception("SQL Server configuration not found. Looking for key: sql_server_connection, sandbox, or production");
+            $sqlServerConfig = $config['sql_server'];
+            if (isset($sqlServerConfig['sql_server_connection'])) {
+                $candidateConfig = $sqlServerConfig['sql_server_connection'];
+            } elseif ($mode && isset($sqlServerConfig[$mode])) {
+                $candidateConfig = $sqlServerConfig[$mode];
+            } elseif (isset($sqlServerConfig['sandbox'])) {
+                $candidateConfig = $sqlServerConfig['sandbox'];
+            } elseif (isset($sqlServerConfig['production'])) {
+                $candidateConfig = $sqlServerConfig['production'];
             }
-        } else {
-            // Legacy structure
-            if (!isset($config['sql_server'][$mode])) {
-                throw new Exception("SQL Server configuration not found for mode: {$mode}");
-            }
-            $this->sqlServerConfig = $config['sql_server'][$mode];
         }
-        
-        $this->validateSqlServerConfig($this->sqlServerConfig);
+
+        $resolvedConfig = $this->normalizeSqlServerConfig($candidateConfig);
+
+        // Fallback to Laravel database connection definitions
+        if ($resolvedConfig === null) {
+            $resolvedConfig = $this->resolveSqlServerConfigFromLaravel();
+        }
+
+        if ($resolvedConfig === null) {
+            throw new Exception('SQL Server configuration not found. Provide sql_server_connection in the package config or ensure database.connections.cmd/sqlsrv exists.');
+        }
+
+        $this->sqlServerConfig = $resolvedConfig;
     }
 
     /**
-     * Validate SQL Server configuration
+     * Attempt to normalize SQL Server configuration into DSN/credentials.
      */
-    private function validateSqlServerConfig(array $config): void
+    private function normalizeSqlServerConfig(?array $config): ?array
     {
-        $required = ['dsn', 'username', 'password'];
-        $missing = [];
+        if (!$config) {
+            return null;
+        }
 
-        foreach ($required as $field) {
-            if (empty($config[$field])) {
-                $missing[] = $field;
+        $normalized = $config;
+
+        $dsn = $normalized['dsn'] ?? null;
+        if (!$dsn) {
+            $dsn = $this->buildSqlServerDsn($normalized);
+        }
+
+        if (!$dsn) {
+            return null;
+        }
+
+        $normalized['dsn'] = $dsn;
+
+        if (empty($normalized['username']) || empty($normalized['password'])) {
+            return null;
+        }
+
+        if (!isset($normalized['timeout'])) {
+            $normalized['timeout'] = 30;
+        }
+
+        return $normalized;
+    }
+
+    /**
+     */
+    private function resolveSqlServerConfigFromLaravel(): ?array
+    {
+        if (!function_exists('config')) {
+            return null;
+        }
+
+        $connections = config('database.connections', []);
+        foreach (['cmd', 'sqlsrv'] as $connectionName) {
+            if (!isset($connections[$connectionName])) {
+                continue;
+            }
+
+            $connection = $connections[$connectionName];
+            $candidate = [
+                'dsn' => $connection['dsn'] ?? null,
+                'host' => $connection['host'] ?? null,
+                'port' => $connection['port'] ?? null,
+                'database' => $connection['database'] ?? null,
+                'username' => $connection['username'] ?? null,
+                'password' => $connection['password'] ?? null,
+                'encrypt' => $connection['encrypt'] ?? null,
+                'trust_server_certificate' => $connection['trust_server_certificate'] ?? null,
+                'timeout' => $connection['timeout'] ?? 30,
+            ];
+
+            $normalized = $this->normalizeSqlServerConfig($candidate);
+            if ($normalized !== null) {
+                return $normalized;
             }
         }
 
-        if (!empty($missing)) {
-            throw new Exception(
-                'Missing required SQL Server configuration: ' . implode(', ', $missing) . '. ' .
-                'Please set the appropriate environment variables or update the configuration file.'
-            );
+        return null;
+    }
+
+    /**
+     * Build a SQL Server DSN string from host/port/database settings.
+     */
+    private function buildSqlServerDsn(array $config): ?string
+    {
+        $host = $config['host'] ?? null;
+        if (!$host) {
+            return null;
         }
+
+        $dsn = 'sqlsrv:Server=' . $host;
+
+        if (!empty($config['port'])) {
+            $dsn .= ',' . $config['port'];
+        }
+
+        if (!empty($config['database'])) {
+            $dsn .= ';Database=' . $config['database'];
+        }
+
+        if (array_key_exists('trust_server_certificate', $config)) {
+            $value = $config['trust_server_certificate'];
+            $dsn .= ';TrustServerCertificate=' . ($value ? 'true' : 'false');
+        }
+
+        if (array_key_exists('encrypt', $config) && $config['encrypt'] !== null && $config['encrypt'] !== '') {
+            $value = $config['encrypt'];
+            if (is_bool($value)) {
+                $value = $value ? 'yes' : 'no';
+            }
+            $dsn .= ';Encrypt=' . $value;
+        }
+
+        return $dsn;
     }
 
     /**
@@ -609,20 +776,39 @@ class DBConnector
     {
         try {
             $pdo = $this->getSqlServerConnection();
-            
-            if (empty($params)) {
-                $stmt = $pdo->query($sql);
+
+            $trimmedSql = ltrim($sql);
+            $isSelect = stripos($trimmedSql, 'SELECT') === 0;
+
+            if ($isSelect) {
+                if (empty($params)) {
+                    $stmt = $pdo->query($sql);
+                } else {
+                    $stmt = $pdo->prepare($sql);
+                    $stmt->execute($params);
+                }
+
                 $data = $stmt->fetchAll();
+
+                return [
+                    'success' => true,
+                    'data' => $data,
+                    'row_count' => count($data),
+                ];
+            }
+
+            if (empty($params)) {
+                $affected = $pdo->exec($sql);
             } else {
                 $stmt = $pdo->prepare($sql);
                 $stmt->execute($params);
-                $data = $stmt->fetchAll();
+                $affected = $stmt->rowCount();
             }
 
             return [
                 'success' => true,
-                'data' => $data,
-                'row_count' => count($data)
+                'data' => [],
+                'row_count' => $affected === false ? 0 : $affected,
             ];
         } catch (Exception $e) {
             return [
