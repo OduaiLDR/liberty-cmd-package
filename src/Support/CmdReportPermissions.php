@@ -13,8 +13,13 @@ final class CmdReportPermissions
         'cmd.reports.program_completion',
         'cmd.reports.lead_report',
         'cmd.reports.marketing_report',
+        'cmd.reports.marketing_admin_report',
+        'cmd.reports.drop_summary_report',
+        'cmd.reports.charts_report',
         'cmd.reports.tranche_summary',
         'cmd.reports.team_ranks',
+        'cmd.reports.team_cohesion_report',
+        'cmd.reports.debt_portfolio_summary_report',
     ];
 
     /** @return array<int, string> */
