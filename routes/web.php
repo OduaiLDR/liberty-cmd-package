@@ -8,11 +8,15 @@ use Cmd\Reports\Http\Controllers\ContactReportController;
 use Cmd\Reports\Http\Controllers\EnrollmentReportController;
 use Cmd\Reports\Http\Controllers\LeadReportController;
 use Cmd\Reports\Http\Controllers\MarketingReportController;
+use Cmd\Reports\Http\Controllers\MarketingAdminController;
+use Cmd\Reports\Http\Controllers\DropSummaryController;
 use Cmd\Reports\Http\Controllers\NegotiatorReportController;
 use Cmd\Reports\Http\Controllers\NsfReportController;
 use Cmd\Reports\Http\Controllers\ProgramCompletionController;
 use Cmd\Reports\Http\Controllers\TeamRanksController;
 use Cmd\Reports\Http\Controllers\TrancheSummaryController;
+use Cmd\Reports\Http\Controllers\TeamCohesionController;
+use Cmd\Reports\Http\Controllers\DebtPortfolioSummaryController;
 use Illuminate\Support\Facades\Route;
 use Stancl\Tenancy\Middleware\InitializeTenancyByDomainOrSubdomain;
 use Stancl\Tenancy\Middleware\PreventAccessFromCentralDomains;
@@ -63,6 +67,22 @@ $registerCmdReportRoutes = function (bool $withNames = true): void {
     Route::get('/tranche-summary', [TrancheSummaryController::class, 'index'])
         ->middleware('can:cmd.reports.tranche_summary')
         ->name($name('cmd.reports.tranche_summary'));
+
+    // New custom reports moved into package
+    Route::get('/marketing-admin', [MarketingAdminController::class, 'index'])
+        ->middleware('can:cmd.reports.marketing_admin_report')
+        ->name($name('cmd.reports.marketing_admin'));
+
+    Route::get('/drop-summary', [DropSummaryController::class, 'index'])
+        ->middleware('can:cmd.reports.drop_summary_report')
+        ->name($name('cmd.reports.drop_summary'));
+    Route::get('/team-cohesion', [TeamCohesionController::class, 'index'])
+        ->middleware('can:cmd.reports.team_cohesion_report')
+        ->name($name('cmd.reports.team_cohesion'));
+
+    Route::get('/debt-portfolio-summary', [DebtPortfolioSummaryController::class, 'index'])
+        ->middleware('can:cmd.reports.debt_portfolio_summary_report')
+        ->name($name('cmd.reports.debt_portfolio_summary'));
 };
 
 // Central-domain access (no tenancy), with distinct names to avoid overriding tenant routes.
