@@ -2,14 +2,14 @@
 
 namespace Cmd\Reports\Http\Controllers;
 
-use Cmd\Reports\Repositories\MarketingAdminRepository;
+use Cmd\Reports\Repositories\DropSummaryRepository;
 use Illuminate\Contracts\View\View;
 use Illuminate\Http\Request;
 use Illuminate\Routing\Controller;
 
 class DropSummaryController extends Controller
 {
-    public function __construct(protected MarketingAdminRepository $repo)
+    public function __construct(protected DropSummaryRepository $repo)
     {
     }
 
