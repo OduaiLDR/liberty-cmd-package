@@ -141,29 +141,53 @@ class SyncBalances extends Command
                     'recordsInserted' => $insertedCount,
                 ]);
 
-                $this->ensureLogTable($connector);
+                try {
+                    $this->ensureLogTable($connector);
 
-                $resultSummary = sprintf(
-                    'Processed: %d, Deleted: %d',
-                    $insertedCount,
-                    $deletedCount
-                );
+                    $resultSummary = sprintf(
+                        'Processed: %d, Deleted: %d',
+                        $insertedCount,
+                        $deletedCount
+                    );
 
-                $details = sprintf(
-                    'Sync completed successfully for source %s at %s.',
-                    $source,
-                    now()->toDateTimeString()
-                );
+                    $details = sprintf(
+                        'Sync completed successfully for source %s at %s. Expected %d rows from Snowflake.',
+                        $source,
+                        now()->toDateTimeString(),
+                        $totalToInsert
+                    );
 
-                $this->insertLogRow(
-                    $connector,
-                    $source,
-                    'DELETE_AND_INSERT',
-                    'SUCCESS',
-                    $insertedCount,
-                    $deletedCount,
-                    $resultSummary . ' ' . $details
-                );
+                    $this->insertLogRow(
+                        $connector,
+                        $source,
+                        'DELETE_AND_INSERT',
+                        'SUCCESS',
+                        $insertedCount,
+                        $deletedCount,
+                        $resultSummary . ' ' . $details
+                    );
+                } catch (\Throwable $logException) {
+                    Log::warning('SyncBalances: failed to insert success log row.', [
+                        'connection' => $connection,
+                        'source' => $source,
+                        'exception' => $logException,
+                    ]);
+                }
+
+                if ($insertedCount !== $totalToInsert) {
+                    $this->warn(sprintf(
+                        '[%s] Inserted count (%d) differs from fetched count (%d).',
+                        $source,
+                        $insertedCount,
+                        $totalToInsert
+                    ));
+                    Log::warning('SyncBalances: inserted count mismatch.', [
+                        'connection' => $connection,
+                        'source' => $source,
+                        'fetched' => $totalToInsert,
+                        'inserted' => $insertedCount,
+                    ]);
+                }
 
                 $this->info("[$source] Done.");
                 Log::info('SyncBalances: connection finished.', [
@@ -409,8 +433,7 @@ BEGIN
         [Status] VARCHAR(20) NOT NULL,
         [RecordsProcessed] INT DEFAULT 0,
         [RecordsDeleted] INT DEFAULT 0,
-        [Details] VARCHAR(1000),
-        [Import_Time] DATETIME NULL
+        [Details] VARCHAR(1000)
     );
 END
 SQL;
@@ -442,7 +465,6 @@ SQL;
         );
 
         $timestamp = now()->format('Y-m-d H:i:s');
-        $importTime = now()->format('Y-m-d H:i:s');
 
         $tableNameEsc = $this->escapeSqlString($tableName);
         $macroEsc = $this->escapeSqlString($macro);
@@ -450,15 +472,14 @@ SQL;
         $actionEsc = $this->escapeSqlString($action);
         $resultEsc = $this->escapeSqlString($resultSummary);
         $timestampEsc = $this->escapeSqlString($timestamp);
-        $importTimeEsc = $this->escapeSqlString($importTime);
         $operationEsc = $this->escapeSqlString('BALANCE_SYNC');
         $sourceEsc = $this->escapeSqlString($source);
         $statusEsc = $this->escapeSqlString($status);
         $detailsEsc = $this->escapeSqlString($details);
 
         $sql = sprintf(
-            "INSERT INTO TblLog (Table_Name, Macro, Description, Action, Result, Timestamp, Operation, Source, Status, RecordsProcessed, RecordsDeleted, Details, Import_Time)
-            VALUES ('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', %d, %d, '%s', '%s');",
+            "INSERT INTO TblLog (Table_Name, Macro, Description, Action, Result, Timestamp, Operation, Source, Status, RecordsProcessed, RecordsDeleted, Details)
+            VALUES ('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', %d, %d, '%s');",
             $tableNameEsc,
             $macroEsc,
             $descriptionEsc,
@@ -470,8 +491,7 @@ SQL;
             $statusEsc,
             $recordsProcessed,
             $recordsDeleted,
-            $detailsEsc,
-            $importTimeEsc
+            $detailsEsc
         );
 
         $connector->querySqlServer($sql);
