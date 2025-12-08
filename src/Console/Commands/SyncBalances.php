@@ -50,6 +50,7 @@ class SyncBalances extends Command
             try {
                 $connector = DBConnector::fromEnvironment($connection);
                 $connector->initializeSqlServer();
+                $this->ensureBalancesImportTime($connector);
 
                 $fetchResult = $this->fetchLatestBalancesFromSnowflake($connector);
 
@@ -141,29 +142,53 @@ class SyncBalances extends Command
                     'recordsInserted' => $insertedCount,
                 ]);
 
-                $this->ensureLogTable($connector);
+                try {
+                    $this->ensureLogTable($connector);
 
-                $resultSummary = sprintf(
-                    'Processed: %d, Deleted: %d',
-                    $insertedCount,
-                    $deletedCount
-                );
+                    $resultSummary = sprintf(
+                        'Processed: %d, Deleted: %d',
+                        $insertedCount,
+                        $deletedCount
+                    );
 
-                $details = sprintf(
-                    'Sync completed successfully for source %s at %s.',
-                    $source,
-                    now()->toDateTimeString()
-                );
+                    $details = sprintf(
+                        'Sync completed successfully for source %s at %s. Expected %d rows from Snowflake.',
+                        $source,
+                        now()->toDateTimeString(),
+                        $totalToInsert
+                    );
 
-                $this->insertLogRow(
-                    $connector,
-                    $source,
-                    'DELETE_AND_INSERT',
-                    'SUCCESS',
-                    $insertedCount,
-                    $deletedCount,
-                    $resultSummary . ' ' . $details
-                );
+                    $this->insertLogRow(
+                        $connector,
+                        $source,
+                        'DELETE_AND_INSERT',
+                        'SUCCESS',
+                        $insertedCount,
+                        $deletedCount,
+                        $resultSummary . ' ' . $details
+                    );
+                } catch (\Throwable $logException) {
+                    Log::warning('SyncBalances: failed to insert success log row.', [
+                        'connection' => $connection,
+                        'source' => $source,
+                        'exception' => $logException,
+                    ]);
+                }
+
+                if ($insertedCount !== $totalToInsert) {
+                    $this->warn(sprintf(
+                        '[%s] Inserted count (%d) differs from fetched count (%d).',
+                        $source,
+                        $insertedCount,
+                        $totalToInsert
+                    ));
+                    Log::warning('SyncBalances: inserted count mismatch.', [
+                        'connection' => $connection,
+                        'source' => $source,
+                        'fetched' => $totalToInsert,
+                        'inserted' => $insertedCount,
+                    ]);
+                }
 
                 $this->info("[$source] Done.");
                 Log::info('SyncBalances: connection finished.', [
@@ -352,7 +377,7 @@ LIMIT {$pageSize} OFFSET {$offset}";
                 continue;
             }
 
-            $sql = 'INSERT INTO TblBalances (CID, Balance, Source, UpdatedAt) VALUES ' .
+            $sql = 'INSERT INTO TblBalances (CID, Balance, Source, Import_Time) VALUES ' .
                 implode(', ', $values) .
                 ';';
 
@@ -386,6 +411,38 @@ LIMIT {$pageSize} OFFSET {$offset}";
         return $totalInserted;
     }
 
+    /**
+     * Ensure TblBalances has Import_Time column and populate any missing values.
+     */
+    protected function ensureBalancesImportTime(DBConnector $connector): void
+    {
+        $sql = <<<SQL
+IF COL_LENGTH('dbo.TblBalances', 'Import_Time') IS NULL
+BEGIN
+    ALTER TABLE [dbo].[TblBalances] ADD [Import_Time] DATETIME NULL;
+END
+
+IF NOT EXISTS (
+    SELECT 1
+    FROM sys.default_constraints dc
+    JOIN sys.columns c ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id
+    WHERE dc.parent_object_id = OBJECT_ID('dbo.TblBalances')
+      AND c.name = 'Import_Time'
+)
+BEGIN
+    ALTER TABLE [dbo].[TblBalances]
+        ADD CONSTRAINT DF_TblBalances_Import_Time
+        DEFAULT (GETDATE()) FOR [Import_Time];
+END
+
+UPDATE [dbo].[TblBalances]
+SET Import_Time = ISNULL(Import_Time, COALESCE(UpdatedAt, CreatedAt, GETDATE()))
+WHERE Import_Time IS NULL;
+SQL;
+
+        $connector->querySqlServer($sql);
+    }
+
     protected function ensureLogTable(DBConnector $connector): void
     {
         $sql = <<<SQL
@@ -398,21 +455,14 @@ IF NOT EXISTS (
 BEGIN
     CREATE TABLE [dbo].[TblLog] (
         [ID] INT IDENTITY(1,1) PRIMARY KEY,
-        [Table_Name] VARCHAR(100),
-        [Macro] VARCHAR(100),
-        [Description] VARCHAR(500),
-        [Action] VARCHAR(100),
-        [Result] VARCHAR(100),
-        [Timestamp] DATETIME NOT NULL,
-        [Operation] VARCHAR(100) NOT NULL,
-        [Source] VARCHAR(50) NOT NULL,
-        [Status] VARCHAR(20) NOT NULL,
-        [RecordsProcessed] INT DEFAULT 0,
-        [RecordsDeleted] INT DEFAULT 0,
-        [Details] VARCHAR(1000),
-        [Import_Time] DATETIME NULL
+        [Table_Name] NVARCHAR(100),
+        [Macro] NVARCHAR(100),
+        [Description] NVARCHAR(500),
+        [Action] NVARCHAR(100),
+        [Result] NVARCHAR(500),
+        [Timestamp] DATETIME NOT NULL DEFAULT(GETDATE())
     );
-END
+END;
 SQL;
 
         $connector->querySqlServer($sql);
@@ -431,18 +481,20 @@ SQL;
         $macro = 'SyncBalances';
 
         $description = sprintf(
-            'Sync contact balances from Snowflake %s to SQL Server TblBalances',
+            'Sync contact balances for %s to SQL Server TblBalances',
             $source
         );
 
         $resultSummary = sprintf(
-            'Processed: %d, Deleted: %d',
+            'Status: %s | Action: %s | Processed: %d | Deleted: %d | Details: %s',
+            $status,
+            $action,
             $recordsProcessed,
-            $recordsDeleted
+            $recordsDeleted,
+            $details
         );
 
         $timestamp = now()->format('Y-m-d H:i:s');
-        $importTime = now()->format('Y-m-d H:i:s');
 
         $tableNameEsc = $this->escapeSqlString($tableName);
         $macroEsc = $this->escapeSqlString($macro);
@@ -450,28 +502,16 @@ SQL;
         $actionEsc = $this->escapeSqlString($action);
         $resultEsc = $this->escapeSqlString($resultSummary);
         $timestampEsc = $this->escapeSqlString($timestamp);
-        $importTimeEsc = $this->escapeSqlString($importTime);
-        $operationEsc = $this->escapeSqlString('BALANCE_SYNC');
-        $sourceEsc = $this->escapeSqlString($source);
-        $statusEsc = $this->escapeSqlString($status);
-        $detailsEsc = $this->escapeSqlString($details);
 
         $sql = sprintf(
-            "INSERT INTO TblLog (Table_Name, Macro, Description, Action, Result, Timestamp, Operation, Source, Status, RecordsProcessed, RecordsDeleted, Details, Import_Time)
-            VALUES ('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', %d, %d, '%s', '%s');",
+            "INSERT INTO TblLog (Table_Name, Macro, Description, Action, Result, Timestamp)
+            VALUES ('%s', '%s', '%s', '%s', '%s', '%s');",
             $tableNameEsc,
             $macroEsc,
             $descriptionEsc,
             $actionEsc,
             $resultEsc,
-            $timestampEsc,
-            $operationEsc,
-            $sourceEsc,
-            $statusEsc,
-            $recordsProcessed,
-            $recordsDeleted,
-            $detailsEsc,
-            $importTimeEsc
+            $timestampEsc
         );
 
         $connector->querySqlServer($sql);
