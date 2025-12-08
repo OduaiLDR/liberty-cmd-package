@@ -364,10 +364,11 @@ LIMIT {$pageSize} OFFSET {$offset}";
                 }
 
                 $values[] = sprintf(
-                    "('%s', %s, '%s', '%s')",
+                    "('%s', %s, '%s', '%s', '%s')",
                     $cidEscaped,
                     $balanceValue,
                     $sourceEscaped,
+                    $nowEscaped,
                     $nowEscaped
                 );
             }
@@ -376,7 +377,7 @@ LIMIT {$pageSize} OFFSET {$offset}";
                 continue;
             }
 
-            $sql = 'INSERT INTO TblBalances (CID, Balance, Source, UpdatedAt) VALUES ' .
+            $sql = 'INSERT INTO TblBalances (CID, Balance, Source, UpdatedAt, Import_Time) VALUES ' .
                 implode(', ', $values) .
                 ';';
 
@@ -433,9 +434,30 @@ BEGIN
         [Status] VARCHAR(20) NOT NULL,
         [RecordsProcessed] INT DEFAULT 0,
         [RecordsDeleted] INT DEFAULT 0,
-        [Details] VARCHAR(1000)
+        [Details] VARCHAR(1000),
+        [Import_Time] DATETIME NULL
     );
 END
+ELSE IF COL_LENGTH('dbo.TblLog', 'Import_Time') IS NULL
+BEGIN
+    ALTER TABLE [dbo].[TblLog] ADD [Import_Time] DATETIME NULL;
+END
+
+IF NOT EXISTS (
+    SELECT 1
+    FROM sys.default_constraints dc
+    WHERE dc.parent_object_id = OBJECT_ID('dbo.TblLog')
+      AND dc.name = 'DF_TblLog_Import_Time'
+)
+BEGIN
+    ALTER TABLE [dbo].[TblLog]
+        ADD CONSTRAINT DF_TblLog_Import_Time
+        DEFAULT (GETDATE()) FOR [Import_Time];
+END
+
+UPDATE [dbo].[TblLog]
+SET Import_Time = ISNULL(Import_Time, GETDATE())
+WHERE Import_Time IS NULL;
 SQL;
 
         $connector->querySqlServer($sql);
@@ -465,6 +487,7 @@ SQL;
         );
 
         $timestamp = now()->format('Y-m-d H:i:s');
+        $importTime = now()->format('Y-m-d H:i:s');
 
         $tableNameEsc = $this->escapeSqlString($tableName);
         $macroEsc = $this->escapeSqlString($macro);
@@ -472,14 +495,15 @@ SQL;
         $actionEsc = $this->escapeSqlString($action);
         $resultEsc = $this->escapeSqlString($resultSummary);
         $timestampEsc = $this->escapeSqlString($timestamp);
+        $importTimeEsc = $this->escapeSqlString($importTime);
         $operationEsc = $this->escapeSqlString('BALANCE_SYNC');
         $sourceEsc = $this->escapeSqlString($source);
         $statusEsc = $this->escapeSqlString($status);
         $detailsEsc = $this->escapeSqlString($details);
 
         $sql = sprintf(
-            "INSERT INTO TblLog (Table_Name, Macro, Description, Action, Result, Timestamp, Operation, Source, Status, RecordsProcessed, RecordsDeleted, Details)
-            VALUES ('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', %d, %d, '%s');",
+            "INSERT INTO TblLog (Table_Name, Macro, Description, Action, Result, Timestamp, Operation, Source, Status, RecordsProcessed, RecordsDeleted, Details, Import_Time)
+            VALUES ('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', %d, %d, '%s', '%s');",
             $tableNameEsc,
             $macroEsc,
             $descriptionEsc,
@@ -491,7 +515,8 @@ SQL;
             $statusEsc,
             $recordsProcessed,
             $recordsDeleted,
-            $detailsEsc
+            $detailsEsc,
+            $importTimeEsc
         );
 
         $connector->querySqlServer($sql);
