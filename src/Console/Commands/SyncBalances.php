@@ -445,27 +445,7 @@ SQL;
 
     protected function ensureLogTable(DBConnector $connector): void
     {
-        $sql = <<<SQL
-IF NOT EXISTS (
-    SELECT *
-    FROM sys.objects
-    WHERE object_id = OBJECT_ID(N'[dbo].[TblLog]')
-      AND type IN (N'U')
-)
-BEGIN
-    CREATE TABLE [dbo].[TblLog] (
-        [ID] INT IDENTITY(1,1) PRIMARY KEY,
-        [Table_Name] NVARCHAR(100),
-        [Macro] NVARCHAR(100),
-        [Description] NVARCHAR(500),
-        [Action] NVARCHAR(100),
-        [Result] NVARCHAR(500),
-        [Timestamp] DATETIME NOT NULL DEFAULT(GETDATE())
-    );
-END;
-SQL;
-
-        $connector->querySqlServer($sql);
+        // No table creation here; assume TblLog already exists.
     }
 
     protected function insertLogRow(
@@ -480,19 +460,24 @@ SQL;
         $tableName = 'TblBalances';
         $macro = 'SyncBalances';
 
-        $description = sprintf(
-            'Sync contact balances for %s to SQL Server TblBalances',
-            $source
+        $description = $this->truncateString(
+            sprintf('Sync contact balances for %s to SQL Server TblBalances', $source),
+            510
         );
 
-        $resultSummary = sprintf(
-            'Status: %s | Action: %s | Processed: %d | Deleted: %d | Details: %s',
-            $status,
-            $action,
-            $recordsProcessed,
-            $recordsDeleted,
-            $details
+        $resultSummary = $this->truncateString(
+            sprintf(
+                'Status: %s | Action: %s | Processed: %d | Deleted: %d | Details: %s',
+                $status,
+                $action,
+                $recordsProcessed,
+                $recordsDeleted,
+                $details
+            ),
+            100
         );
+
+        $action = $this->truncateString($action, 510);
 
         $timestamp = now()->format('Y-m-d H:i:s');
 
@@ -503,22 +488,60 @@ SQL;
         $resultEsc = $this->escapeSqlString($resultSummary);
         $timestampEsc = $this->escapeSqlString($timestamp);
 
-        $sql = sprintf(
-            "INSERT INTO TblLog (Table_Name, Macro, Description, Action, Result, Timestamp)
-            VALUES ('%s', '%s', '%s', '%s', '%s', '%s');",
-            $tableNameEsc,
-            $macroEsc,
-            $descriptionEsc,
-            $actionEsc,
-            $resultEsc,
-            $timestampEsc
-        );
+        $sql = <<<SQL
+DECLARE @hasPK BIT = CASE WHEN COL_LENGTH('dbo.TblLog', 'PK') IS NULL THEN 0 ELSE 1 END;
+DECLARE @isIdentity BIT = CASE WHEN COLUMNPROPERTY(OBJECT_ID('dbo.TblLog'), 'PK', 'IsIdentity') = 1 THEN 1 ELSE 0 END;
 
-        $connector->querySqlServer($sql);
+IF @hasPK = 1 AND @isIdentity = 0
+BEGIN
+    DECLARE @nextPK INT = ISNULL((SELECT MAX(PK) FROM dbo.TblLog), 0) + 1;
+    INSERT INTO TblLog (PK, Table_Name, Macro, Description, Action, Result, Timestamp)
+    VALUES (@nextPK, '{$tableNameEsc}', '{$macroEsc}', '{$descriptionEsc}', '{$actionEsc}', '{$resultEsc}', '{$timestampEsc}');
+END
+ELSE
+BEGIN
+    INSERT INTO TblLog (Table_Name, Macro, Description, Action, Result, Timestamp)
+    VALUES ('{$tableNameEsc}', '{$macroEsc}', '{$descriptionEsc}', '{$actionEsc}', '{$resultEsc}', '{$timestampEsc}');
+END;
+SQL;
+
+        try {
+            $result = $connector->querySqlServer($sql);
+
+            // Handle non-exception failures returned by querySqlServer
+            if (is_array($result) && isset($result['success']) && $result['success'] === false) {
+                $errorMsg = $result['error'] ?? 'Unknown SQL Server error';
+                $this->error(sprintf('[%s] Log insert failed: %s', $source, $errorMsg));
+                Log::error('SyncBalances: log insert failed.', [
+                    'source' => $source,
+                    'sql' => $sql,
+                    'result' => $result,
+                ]);
+                return;
+            }
+
+            $this->info(sprintf('[%s] Log entry inserted into TblLog.', $source));
+        } catch (\Throwable $e) {
+            $this->error(sprintf('[%s] Log insert failed: %s', $source, $e->getMessage()));
+            Log::error('SyncBalances: log insert failed.', [
+                'source' => $source,
+                'sql' => $sql,
+                'exception' => $e->getMessage(),
+            ]);
+        }
     }
 
     protected function escapeSqlString(string $value): string
     {
         return str_replace("'", "''", $value);
+    }
+
+    protected function truncateString(string $value, int $maxLength): string
+    {
+        if (mb_strlen($value) <= $maxLength) {
+            return $value;
+        }
+
+        return mb_substr($value, 0, $maxLength);
     }
 }
