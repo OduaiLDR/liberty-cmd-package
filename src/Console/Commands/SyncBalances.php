@@ -338,7 +338,8 @@ LIMIT {$pageSize} OFFSET {$offset}";
         int $batchSize
     ): int {
         $totalInserted = 0;
-        $sourceEscaped = $this->escapeSqlString($source);
+        $sourceTrimmed = $this->truncateString($source, 100);
+        $sourceEscaped = $this->escapeSqlString($sourceTrimmed);
         $now = now()->format('Y-m-d H:i:s');
         $nowEscaped = $this->escapeSqlString($now);
 
@@ -354,15 +355,15 @@ LIMIT {$pageSize} OFFSET {$offset}";
 
                 $contactId = (string) $row['CONTACT_ID'];
                 $cid = 'LLG-' . $contactId;
+                $cid = $this->truncateString($cid, 100);
                 $cidEscaped = $this->escapeSqlString($cid);
 
                 $balance = $row['BALANCE'];
-
-                if (!is_numeric($balance)) {
-                    $balanceValue = '0';
-                } else {
-                    $balanceValue = (string) $balance;
-                }
+                $balanceNumeric = is_numeric($balance) ? (float) $balance : 0.0;
+                $balanceNumeric = round($balanceNumeric, 2);
+                // Clamp to decimal(9,2) range
+                $balanceNumeric = max(min($balanceNumeric, 9999999.99), -9999999.99);
+                $balanceValue = number_format($balanceNumeric, 2, '.', '');
 
                 $values[] = sprintf(
                     "('%s', %s, '%s', '%s')",
