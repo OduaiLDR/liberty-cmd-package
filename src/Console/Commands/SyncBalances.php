@@ -464,7 +464,7 @@ SQL;
 
         $description = $this->truncateString(
             sprintf('Sync contact balances for %s to SQL Server TblBalances', $source),
-            510
+            255
         );
 
         $resultSummary = $this->truncateString(
@@ -476,10 +476,12 @@ SQL;
                 $recordsDeleted,
                 $details
             ),
-            100
+            50
         );
 
-        $action = $this->truncateString($action, 510);
+        $action = $this->truncateString($action, 255);
+        $tableName = $this->truncateString($tableName, 50);
+        $macro = $this->truncateString($macro, 50);
 
         $timestamp = now()->format('Y-m-d H:i:s');
 
