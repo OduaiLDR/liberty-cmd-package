@@ -436,7 +436,7 @@ BEGIN
 END
 
 UPDATE [dbo].[TblBalances]
-SET Import_Time = ISNULL(Import_Time, COALESCE(UpdatedAt, CreatedAt, GETDATE()))
+SET Import_Time = ISNULL(Import_Time, GETDATE())
 WHERE Import_Time IS NULL;
 SQL;
 
