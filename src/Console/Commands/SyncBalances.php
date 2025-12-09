@@ -492,19 +492,21 @@ SQL;
         $resultEsc = $this->escapeSqlString($resultSummary);
         $timestampEsc = $this->escapeSqlString($timestamp);
 
+        $this->info(sprintf('[%s] Writing log entry to TblLog...', $source));
+
         $sql = <<<SQL
 DECLARE @hasPK BIT = CASE WHEN COL_LENGTH('dbo.TblLog', 'PK') IS NULL THEN 0 ELSE 1 END;
 DECLARE @isIdentity BIT = CASE WHEN COLUMNPROPERTY(OBJECT_ID('dbo.TblLog'), 'PK', 'IsIdentity') = 1 THEN 1 ELSE 0 END;
 
 IF @hasPK = 1 AND @isIdentity = 0
 BEGIN
-    DECLARE @nextPK INT = ISNULL((SELECT MAX(PK) FROM dbo.TblLog), 0) + 1;
-    INSERT INTO TblLog (PK, Table_Name, Macro, Description, Action, Result, Timestamp)
+    DECLARE @nextPK INT = ISNULL((SELECT MAX([PK]) FROM [dbo].[TblLog]), 0) + 1;
+    INSERT INTO [dbo].[TblLog] ([PK], [Table_Name], [Macro], [Description], [Action], [Result], [Timestamp])
     VALUES (@nextPK, '{$tableNameEsc}', '{$macroEsc}', '{$descriptionEsc}', '{$actionEsc}', '{$resultEsc}', '{$timestampEsc}');
 END
 ELSE
 BEGIN
-    INSERT INTO TblLog (Table_Name, Macro, Description, Action, Result, Timestamp)
+    INSERT INTO [dbo].[TblLog] ([Table_Name], [Macro], [Description], [Action], [Result], [Timestamp])
     VALUES ('{$tableNameEsc}', '{$macroEsc}', '{$descriptionEsc}', '{$actionEsc}', '{$resultEsc}', '{$timestampEsc}');
 END;
 SQL;
@@ -520,11 +522,11 @@ SQL;
                     'source' => $source,
                     'sql' => $sql,
                     'result' => $result,
-                ]);
-                return;
-            }
+            ]);
+            return;
+        }
 
-            $this->info(sprintf('[%s] Log entry inserted into TblLog.', $source));
+        $this->info(sprintf('[%s] Log entry inserted into TblLog.', $source));
         } catch (\Throwable $e) {
             $this->error(sprintf('[%s] Log insert failed: %s', $source, $e->getMessage()));
             Log::error('SyncBalances: log insert failed.', [
