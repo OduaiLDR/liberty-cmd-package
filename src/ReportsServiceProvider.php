@@ -5,6 +5,7 @@ namespace Cmd\Reports;
 use Illuminate\Support\ServiceProvider;
 use Cmd\Reports\Console\Commands\TestDatabaseConnections;
 use Cmd\Reports\Console\Commands\SyncBalances;
+use Cmd\Reports\Console\Commands\SyncBalancesHistory;
 
 class ReportsServiceProvider extends ServiceProvider
 {
@@ -42,6 +43,7 @@ class ReportsServiceProvider extends ServiceProvider
             $this->commands([
                 TestDatabaseConnections::class,
                 SyncBalances::class,
+                SyncBalancesHistory::class,
             ]);
         }
 
