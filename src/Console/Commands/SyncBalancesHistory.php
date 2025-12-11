@@ -284,6 +284,7 @@ LIMIT {$pageSize} OFFSET {$offset}";
     ): array {
         $chunks = array_chunk($rows, $batchSize);
         $sourceEscaped = $this->escapeSqlString($source);
+        $importTimeEscaped = $this->escapeSqlString(now()->format('Y-m-d H:i:s'));
         $totalInserted = 0;
         $skipped = 0;
 
@@ -309,11 +310,12 @@ LIMIT {$pageSize} OFFSET {$offset}";
                 $stampEscaped = $this->escapeSqlString((string) $stampValue);
 
                 $values[] = sprintf(
-                    "('%s', %s, '%s', '%s')",
+                    "('%s', %s, '%s', '%s', '%s')",
                     $cidEscaped,
                     $balanceValue,
                     $stampEscaped,
-                    $sourceEscaped
+                    $sourceEscaped,
+                    $importTimeEscaped
                 );
             }
 
@@ -321,7 +323,7 @@ LIMIT {$pageSize} OFFSET {$offset}";
                 continue;
             }
 
-            $sql = 'INSERT INTO TblBalancesHistory (LLG_ID, Balance, Balance_Date, Source) VALUES ' .
+            $sql = 'INSERT INTO TblBalancesHistory (LLG_ID, Balance, Balance_Date, Source, Import_Time) VALUES ' .
                 implode(', ', $values) .
                 ';';
 
@@ -380,10 +382,11 @@ LIMIT {$pageSize} OFFSET {$offset}";
     ): void {
         $tableName = 'TblBalancesHistory';
         $macro = 'SyncBalancesHistory';
+        $details = $this->truncateString($details, 60);
 
         $description = $this->truncateString(
-            sprintf('Sync contact balance history for %s to SQL Server TblBalancesHistory', $source),
-            510
+            sprintf('Sync balance history for %s -> TblBalancesHistory', $source),
+            200
         );
 
         $resultSummary = $this->truncateString(
@@ -398,7 +401,7 @@ LIMIT {$pageSize} OFFSET {$offset}";
             100
         );
 
-        $action = $this->truncateString($action, 510);
+        $action = $this->truncateString($action, 100);
         $tableName = $this->truncateString($tableName, 100);
         $macro = $this->truncateString($macro, 100);
 

@@ -461,10 +461,11 @@ SQL;
     ): void {
         $tableName = 'TblBalances';
         $macro = 'SyncBalances';
+        $details = $this->truncateString($details, 60);
 
         $description = $this->truncateString(
             sprintf('Sync contact balances for %s to SQL Server TblBalances', $source),
-            255
+            200
         );
 
         $resultSummary = $this->truncateString(
@@ -476,12 +477,12 @@ SQL;
                 $recordsDeleted,
                 $details
             ),
-            50
+            100
         );
 
-        $action = $this->truncateString($action, 255);
-        $tableName = $this->truncateString($tableName, 50);
-        $macro = $this->truncateString($macro, 50);
+        $action = $this->truncateString($action, 100);
+        $tableName = $this->truncateString($tableName, 100);
+        $macro = $this->truncateString($macro, 100);
 
         $timestamp = now()->format('Y-m-d H:i:s');
 
