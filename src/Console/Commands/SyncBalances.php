@@ -459,38 +459,39 @@ SQL;
         int $recordsDeleted,
         string $details
     ): void {
+        // TblLog schema: Table_Name/Macro NVARCHAR(50), Description/Action NVARCHAR(255), Result NVARCHAR(50)
         $tableName = 'TblBalances';
         $macro = 'SyncBalances';
-        $details = $this->truncateString($details, 120);
+        $actionLabel = $action !== '' ? strtoupper($action) : 'SYNC_BALANCES';
 
         $description = $this->truncateString(
-            sprintf('Sync contact balances for %s to SQL Server TblBalances', $source),
-            1020
+            sprintf('Sync balances for %s', $source),
+            255
         );
+        $descriptionEsc = $this->escapeSqlString($description);
 
+        $details = $this->truncateString($details, 200);
         $resultSummary = $this->truncateString(
             sprintf(
-                'Status: %s | Action: %s | Processed: %d | Deleted: %d | Details: %s',
+                'S=%s A=%s P=%d D=%d',
                 $status,
-                $action,
+                $actionLabel,
                 $recordsProcessed,
-                $recordsDeleted,
-                $details
+                $recordsDeleted
             ),
-            200
+            50
         );
+        $resultSummaryEsc = $this->escapeSqlString($resultSummary);
 
-        $action = $this->truncateString($action, 1020);
-        $tableName = $this->truncateString($tableName, 200);
-        $macro = $this->truncateString($macro, 200);
+        $actionSanitized = $this->truncateString($actionLabel, 255);
+        $actionEsc = $this->escapeSqlString($actionSanitized);
+
+        $tableName = $this->truncateString($tableName, 50);
+        $tableNameEsc = $this->escapeSqlString($tableName);
+        $macro = $this->truncateString($macro, 50);
+        $macroEsc = $this->escapeSqlString($macro);
 
         $timestamp = now()->format('Y-m-d H:i:s');
-
-        $tableNameEsc = $this->escapeSqlString($tableName);
-        $macroEsc = $this->escapeSqlString($macro);
-        $descriptionEsc = $this->escapeSqlString($description);
-        $actionEsc = $this->escapeSqlString($action);
-        $resultEsc = $this->escapeSqlString($resultSummary);
         $timestampEsc = $this->escapeSqlString($timestamp);
 
         $this->info(sprintf('[%s] Writing log entry to TblLog...', $source));
@@ -503,12 +504,12 @@ IF @hasPK = 1 AND @isIdentity = 0
 BEGIN
     DECLARE @nextPK INT = ISNULL((SELECT MAX([PK]) FROM [dbo].[TblLog]), 0) + 1;
     INSERT INTO [dbo].[TblLog] ([PK], [Table_Name], [Macro], [Description], [Action], [Result], [Timestamp])
-    VALUES (@nextPK, '{$tableNameEsc}', '{$macroEsc}', '{$descriptionEsc}', '{$actionEsc}', '{$resultEsc}', '{$timestampEsc}');
+    VALUES (@nextPK, '{$tableNameEsc}', '{$macroEsc}', '{$descriptionEsc}', '{$actionEsc}', '{$resultSummaryEsc}', '{$timestampEsc}');
 END
 ELSE
 BEGIN
     INSERT INTO [dbo].[TblLog] ([Table_Name], [Macro], [Description], [Action], [Result], [Timestamp])
-    VALUES ('{$tableNameEsc}', '{$macroEsc}', '{$descriptionEsc}', '{$actionEsc}', '{$resultEsc}', '{$timestampEsc}');
+    VALUES ('{$tableNameEsc}', '{$macroEsc}', '{$descriptionEsc}', '{$actionEsc}', '{$resultSummaryEsc}', '{$timestampEsc}');
 END;
 SQL;
 
