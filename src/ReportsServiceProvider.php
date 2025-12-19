@@ -8,6 +8,10 @@ use Cmd\Reports\Console\Commands\SyncBalances;
 use Cmd\Reports\Console\Commands\SyncBalancesHistory;
 use Cmd\Reports\Console\Commands\SyncEnrollmentPlans;
 use Cmd\Reports\Console\Commands\SyncDebtAccounts;
+use Cmd\Reports\Console\Commands\SyncSubmittedDate;
+use Cmd\Reports\Console\Commands\SyncFirstPaymentDate;
+use Cmd\Reports\Console\Commands\SyncFirstPaymentClearedDate;
+use Cmd\Reports\Console\Commands\SyncTimeInProgram;
 
 class ReportsServiceProvider extends ServiceProvider
 {
@@ -48,6 +52,10 @@ class ReportsServiceProvider extends ServiceProvider
                 SyncBalancesHistory::class,
                 SyncEnrollmentPlans::class,
                 SyncDebtAccounts::class,
+                SyncSubmittedDate::class,
+                SyncFirstPaymentDate::class,
+                SyncFirstPaymentClearedDate::class,
+                SyncTimeInProgram::class,
             ]);
         }
 
