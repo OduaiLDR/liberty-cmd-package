@@ -9,7 +9,9 @@ use Cmd\Reports\Http\Controllers\EnrollmentReportController;
 use Cmd\Reports\Http\Controllers\LeadReportController;
 use Cmd\Reports\Http\Controllers\MailerDataReportController;
 use Cmd\Reports\Http\Controllers\CreditorContactsReportController;
+use Cmd\Reports\Http\Controllers\EnrollmentFrequencyReportController;
 use Cmd\Reports\Http\Controllers\MarketingReportController;
+use Cmd\Reports\Http\Controllers\LdrPastDueReportController;
 use Cmd\Reports\Http\Controllers\MarketingAdminController;
 use Cmd\Reports\Http\Controllers\DropSummaryController;
 use Cmd\Reports\Http\Controllers\NegotiatorReportController;
@@ -52,9 +54,13 @@ $registerCmdReportRoutes = function (bool $withNames = true): void {
     Route::get('/enrollment-report', [EnrollmentReportController::class, 'index'])
         ->middleware('can:cmd.reports.enrollment_report')
         ->name($name('cmd.reports.enrollment_report'));
+     Route::get('/enrollment-frequency-report', [EnrollmentFrequencyReportController::class, 'index'])
+        ->name($name('cmd.reports.enrollment_frequency_report'));
     Route::get('/lead-report', [LeadReportController::class, 'index'])
         ->middleware('can:cmd.reports.lead_report')
         ->name($name('cmd.reports.lead_report'));
+      Route::get('/ldr-past-due-report', [LdrPastDueReportController::class, 'index'])
+        ->name($name('cmd.reports.ldr_past_due_report'));
     Route::get('/negotiator-report', [NegotiatorReportController::class, 'index'])
         ->middleware('can:cmd.reports.team_ranks')
         ->name($name('cmd.reports.negotiator_report'));
