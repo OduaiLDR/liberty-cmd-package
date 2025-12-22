@@ -4,14 +4,10 @@ use App\Http\Middleware\PulseRequestRecorderMiddleware;
 use App\Http\Middleware\SetSanctumDomain;
 use App\Http\Middleware\XSS;
 use Cmd\Reports\Http\Controllers\CancelReportController;
-use Cmd\Reports\Http\Controllers\CapitalReportController;
 use Cmd\Reports\Http\Controllers\ContactReportController;
 use Cmd\Reports\Http\Controllers\EnrollmentReportController;
 use Cmd\Reports\Http\Controllers\LeadReportController;
 use Cmd\Reports\Http\Controllers\CreditorContactsReportController;
-use Cmd\Reports\Http\Controllers\EpfPaidReportController;
-use Cmd\Reports\Http\Controllers\EpfDueReportController;
-use Cmd\Reports\Http\Controllers\MailerDataReportController;
 use Cmd\Reports\Http\Controllers\MarketingReportController;
 use Cmd\Reports\Http\Controllers\MarketingAdminController;
 use Cmd\Reports\Http\Controllers\DropSummaryController;
@@ -20,8 +16,6 @@ use Cmd\Reports\Http\Controllers\NsfReportController;
 use Cmd\Reports\Http\Controllers\ProgramCompletionController;
 use Cmd\Reports\Http\Controllers\TeamRanksController;
 use Cmd\Reports\Http\Controllers\TrancheSummaryController;
-use Cmd\Reports\Http\Controllers\JordanExpensesReportController;
-use Cmd\Reports\Http\Controllers\LlgExecAdminReportController;
 use Illuminate\Support\Facades\Route;
 use Stancl\Tenancy\Middleware\InitializeTenancyByDomainOrSubdomain;
 use Stancl\Tenancy\Middleware\PreventAccessFromCentralDomains;
@@ -38,20 +32,8 @@ $registerCmdReportRoutes = function (bool $withNames = true): void {
         ->name($name('cmd.reports.cancel_report'));
     Route::get('/nsf-report', [NsfReportController::class, 'index'])
         ->name($name('cmd.reports.nsf_report'));
-    Route::get('/mailer-data-report', [MailerDataReportController::class, 'index'])
-        ->name($name('cmd.reports.mailer_data_report'));
     Route::get('/creditor-contacts-report', [CreditorContactsReportController::class, 'index'])
         ->name($name('cmd.reports.creditor_contacts_report'));
-    Route::get('/epf-paid-report', [EpfPaidReportController::class, 'index'])
-        ->name($name('cmd.reports.epf_paid_report'));
-    Route::get('/epf-due-report', [EpfDueReportController::class, 'index'])
-        ->name($name('cmd.reports.epf_due_report'));
-    Route::get('/capital-report', [CapitalReportController::class, 'index'])
-        ->name($name('cmd.reports.capital_report'));
-    Route::get('/jordan-expenses-report', [JordanExpensesReportController::class, 'index'])
-        ->name($name('cmd.reports.jordan_expenses_report'));
-    Route::get('/llg-exec-admin-report', [LlgExecAdminReportController::class, 'index'])
-        ->name($name('cmd.reports.llg_exec_admin_report'));
     Route::get('/marketing-report', [MarketingReportController::class, 'index'])
         ->middleware('can:cmd.reports.marketing_report')
         ->name($name('cmd.reports.marketing_report'));
