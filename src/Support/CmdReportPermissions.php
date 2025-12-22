@@ -20,6 +20,8 @@ final class CmdReportPermissions
         'cmd.reports.settlement_analysis_report',
         'cmd.reports.enrollment_model_report',
         'cmd.reports.growth_model_report',
+        'cmd.reports.enrollment_frequency_report',
+        'cmd.reports.ldr_past_due_report',
         'cmd.reports.contact_report',
         'cmd.reports.enrollment_report',
         'cmd.reports.program_completion',
