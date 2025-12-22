@@ -7,6 +7,7 @@ use Cmd\Reports\Http\Controllers\CancelReportController;
 use Cmd\Reports\Http\Controllers\ContactReportController;
 use Cmd\Reports\Http\Controllers\EnrollmentReportController;
 use Cmd\Reports\Http\Controllers\LeadReportController;
+use Cmd\Reports\Http\Controllers\MailerDataReportController;
 use Cmd\Reports\Http\Controllers\CreditorContactsReportController;
 use Cmd\Reports\Http\Controllers\MarketingReportController;
 use Cmd\Reports\Http\Controllers\MarketingAdminController;
@@ -34,6 +35,8 @@ $registerCmdReportRoutes = function (bool $withNames = true): void {
         ->name($name('cmd.reports.nsf_report'));
     Route::get('/creditor-contacts-report', [CreditorContactsReportController::class, 'index'])
         ->name($name('cmd.reports.creditor_contacts_report'));
+        Route::get('/mailer-data-report', [MailerDataReportController::class, 'index'])
+        ->name($name('cmd.reports.mailer_data_report'));
     Route::get('/marketing-report', [MarketingReportController::class, 'index'])
         ->middleware('can:cmd.reports.marketing_report')
         ->name($name('cmd.reports.marketing_report'));
