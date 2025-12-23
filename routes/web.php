@@ -11,6 +11,7 @@ use Cmd\Reports\Http\Controllers\MailerDataReportController;
 use Cmd\Reports\Http\Controllers\CreditorContactsReportController;
 use Cmd\Reports\Http\Controllers\EnrollmentFrequencyReportController;
 use Cmd\Reports\Http\Controllers\MarketingReportController;
+use Cmd\Reports\Http\Controllers\CancellationReportController;
 use Cmd\Reports\Http\Controllers\LdrPastDueReportController;
 use Cmd\Reports\Http\Controllers\MarketingAdminController;
 use Cmd\Reports\Http\Controllers\DropSummaryController;
@@ -60,6 +61,8 @@ $registerCmdReportRoutes = function (bool $withNames = true): void {
     Route::get('/enrollment-report', [EnrollmentReportController::class, 'index'])
         ->middleware('can:cmd.reports.enrollment_report')
         ->name($name('cmd.reports.enrollment_report'));
+        Route::get('/cancellation-report', [CancellationReportController::class, 'index'])
+        ->name($name('cmd.reports.cancellation_report'));
      Route::get('/enrollment-frequency-report', [EnrollmentFrequencyReportController::class, 'index'])
         ->name($name('cmd.reports.enrollment_frequency_report'));
     Route::get('/lead-report', [LeadReportController::class, 'index'])
