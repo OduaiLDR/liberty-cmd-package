@@ -6,12 +6,19 @@ use Illuminate\Support\ServiceProvider;
 use Cmd\Reports\Console\Commands\TestDatabaseConnections;
 use Cmd\Reports\Console\Commands\SyncBalances;
 use Cmd\Reports\Console\Commands\SyncBalancesHistory;
+use Cmd\Reports\Console\Commands\SyncContactsData;
+use Cmd\Reports\Console\Commands\SyncEPFData;
+use Cmd\Reports\Console\Commands\UpdateEPFRates;
 use Cmd\Reports\Console\Commands\SyncEnrollmentPlans;
 use Cmd\Reports\Console\Commands\SyncDebtAccounts;
 use Cmd\Reports\Console\Commands\SyncSubmittedDate;
 use Cmd\Reports\Console\Commands\SyncFirstPaymentDate;
 use Cmd\Reports\Console\Commands\SyncFirstPaymentClearedDate;
 use Cmd\Reports\Console\Commands\SyncTimeInProgram;
+use Cmd\Reports\Console\Commands\SyncSettlementData;
+use Cmd\Reports\Console\Commands\SyncSettledDebtsData;
+use Cmd\Reports\Console\Commands\SyncEnrollmentStatus;
+use Cmd\Reports\Console\Commands\SyncVerifiedDebts;
 
 class ReportsServiceProvider extends ServiceProvider
 {
@@ -56,6 +63,13 @@ class ReportsServiceProvider extends ServiceProvider
                 SyncFirstPaymentDate::class,
                 SyncFirstPaymentClearedDate::class,
                 SyncTimeInProgram::class,
+                SyncEPFData::class,
+                UpdateEPFRates::class,
+                SyncSettlementData::class,
+                SyncSettledDebtsData::class,
+                SyncEnrollmentStatus::class,
+                SyncVerifiedDebts::class,
+                
             ]);
         }
 
