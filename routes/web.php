@@ -16,7 +16,9 @@ use Cmd\Reports\Http\Controllers\MarketingAdminController;
 use Cmd\Reports\Http\Controllers\DropSummaryController;
 use Cmd\Reports\Http\Controllers\NegotiatorReportController;
 use Cmd\Reports\Http\Controllers\NsfReportController;
+use Cmd\Reports\Http\Controllers\DroppedReportController;
 use Cmd\Reports\Http\Controllers\ProgramCompletionController;
+use Cmd\Reports\Http\Controllers\ReconsiderationReportController;
 use Cmd\Reports\Http\Controllers\TeamRanksController;
 use Cmd\Reports\Http\Controllers\TrancheSummaryController;
 use Illuminate\Support\Facades\Route;
@@ -48,9 +50,13 @@ $registerCmdReportRoutes = function (bool $withNames = true): void {
     Route::patch('/marketing-report/{pk}/data', [MarketingReportController::class, 'updateDataDropCost'])
         ->middleware('can:cmd.reports.marketing_report')
         ->name($name('cmd.reports.marketing_report.data.update'));
+        Route::get('/reconsideration-report', [ReconsiderationReportController::class, 'index'])
+        ->name($name('cmd.reports.reconsideration_report'));
     Route::get('/contact-report', [ContactReportController::class, 'index'])
         ->middleware('can:cmd.reports.contact_report')
         ->name($name('cmd.reports.contact_report'));
+        Route::get('/dropped-report', [DroppedReportController::class, 'index'])
+        ->name($name('cmd.reports.dropped_report'));
     Route::get('/enrollment-report', [EnrollmentReportController::class, 'index'])
         ->middleware('can:cmd.reports.enrollment_report')
         ->name($name('cmd.reports.enrollment_report'));
