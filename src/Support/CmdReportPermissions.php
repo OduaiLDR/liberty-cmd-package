@@ -26,6 +26,7 @@ final class CmdReportPermissions
         'cmd.reports.reconsideration_report',
         'cmd.reports.dropped_report',
         'cmd.reports.cancellation_report',
+        'cmd.reports.welcome_letter_report',
         'cmd.reports.contact_report',
         'cmd.reports.enrollment_report',
         'cmd.reports.program_completion',
