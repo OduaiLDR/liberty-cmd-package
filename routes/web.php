@@ -11,6 +11,7 @@ use Cmd\Reports\Http\Controllers\MailerDataReportController;
 use Cmd\Reports\Http\Controllers\CreditorContactsReportController;
 use Cmd\Reports\Http\Controllers\EnrollmentFrequencyReportController;
 use Cmd\Reports\Http\Controllers\MarketingReportController;
+use Cmd\Reports\Http\Controllers\WelcomeLetterReportController;
 use Cmd\Reports\Http\Controllers\CancellationReportController;
 use Cmd\Reports\Http\Controllers\LdrPastDueReportController;
 use Cmd\Reports\Http\Controllers\MarketingAdminController;
@@ -51,6 +52,8 @@ $registerCmdReportRoutes = function (bool $withNames = true): void {
     Route::patch('/marketing-report/{pk}/data', [MarketingReportController::class, 'updateDataDropCost'])
         ->middleware('can:cmd.reports.marketing_report')
         ->name($name('cmd.reports.marketing_report.data.update'));
+        Route::get('/welcome-letter-report', [WelcomeLetterReportController::class, 'index'])
+        ->name($name('cmd.reports.welcome_letter_report'));
         Route::get('/reconsideration-report', [ReconsiderationReportController::class, 'index'])
         ->name($name('cmd.reports.reconsideration_report'));
     Route::get('/contact-report', [ContactReportController::class, 'index'])
