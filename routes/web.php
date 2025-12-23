@@ -9,6 +9,7 @@ use Cmd\Reports\Http\Controllers\EnrollmentReportController;
 use Cmd\Reports\Http\Controllers\LeadReportController;
 use Cmd\Reports\Http\Controllers\MailerDataReportController;
 use Cmd\Reports\Http\Controllers\CreditorContactsReportController;
+use Cmd\Reports\Http\Controllers\OfferAuthorizationReportController;
 use Cmd\Reports\Http\Controllers\EnrollmentFrequencyReportController;
 use Cmd\Reports\Http\Controllers\MarketingReportController;
 use Cmd\Reports\Http\Controllers\WelcomeLetterReportController;
@@ -56,6 +57,8 @@ $registerCmdReportRoutes = function (bool $withNames = true): void {
         ->name($name('cmd.reports.welcome_letter_report'));
         Route::get('/reconsideration-report', [ReconsiderationReportController::class, 'index'])
         ->name($name('cmd.reports.reconsideration_report'));
+        Route::get('/offer-authorization-report', [OfferAuthorizationReportController::class, 'index'])
+        ->name($name('cmd.reports.offer_authorization_report'));
     Route::get('/contact-report', [ContactReportController::class, 'index'])
         ->middleware('can:cmd.reports.contact_report')
         ->name($name('cmd.reports.contact_report'));
