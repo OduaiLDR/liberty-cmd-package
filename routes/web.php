@@ -12,6 +12,7 @@ use Cmd\Reports\Http\Controllers\CreditorContactsReportController;
 use Cmd\Reports\Http\Controllers\OfferAuthorizationReportController;
 use Cmd\Reports\Http\Controllers\UnclearedSettlementPaymentsReportController;
 use Cmd\Reports\Http\Controllers\RetentionCommissionReportController;
+use Cmd\Reports\Http\Controllers\WelcomePacketReportController;
 use Cmd\Reports\Http\Controllers\EnrollmentFrequencyReportController;
 use Cmd\Reports\Http\Controllers\MarketingReportController;
 use Cmd\Reports\Http\Controllers\WelcomeLetterReportController;
@@ -80,6 +81,8 @@ $registerCmdReportRoutes = function (bool $withNames = true): void {
         ->name($name('cmd.reports.lead_report'));
       Route::get('/ldr-past-due-report', [LdrPastDueReportController::class, 'index'])
         ->name($name('cmd.reports.ldr_past_due_report'));
+        Route::get('/welcome-packet-report', [WelcomePacketReportController::class, 'index'])
+        ->name($name('cmd.reports.welcome_packet_report'));
     Route::get('/negotiator-report', [NegotiatorReportController::class, 'index'])
         ->middleware('can:cmd.reports.team_ranks')
         ->name($name('cmd.reports.negotiator_report'));
