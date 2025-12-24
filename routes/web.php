@@ -10,6 +10,7 @@ use Cmd\Reports\Http\Controllers\LeadReportController;
 use Cmd\Reports\Http\Controllers\MailerDataReportController;
 use Cmd\Reports\Http\Controllers\CreditorContactsReportController;
 use Cmd\Reports\Http\Controllers\OfferAuthorizationReportController;
+use Cmd\Reports\Http\Controllers\UnclearedSettlementPaymentsReportController;
 use Cmd\Reports\Http\Controllers\RetentionCommissionReportController;
 use Cmd\Reports\Http\Controllers\EnrollmentFrequencyReportController;
 use Cmd\Reports\Http\Controllers\MarketingReportController;
@@ -88,6 +89,8 @@ $registerCmdReportRoutes = function (bool $withNames = true): void {
     Route::get('/program-completion', [ProgramCompletionController::class, 'index'])
         ->middleware('can:cmd.reports.program_completion')
         ->name($name('cmd.reports.program_completion'));
+     Route::get('/uncleared-settlement-payments-report', [UnclearedSettlementPaymentsReportController::class, 'index'])
+        ->name($name('cmd.reports.uncleared_settlement_payments_report'));
     Route::get('/program-completion/data', [ProgramCompletionController::class, 'data'])
         ->middleware('can:cmd.reports.program_completion')
         ->name($name('cmd.reports.program_completion.data'));
