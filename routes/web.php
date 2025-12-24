@@ -9,20 +9,15 @@ use Cmd\Reports\Http\Controllers\EnrollmentReportController;
 use Cmd\Reports\Http\Controllers\LeadReportController;
 use Cmd\Reports\Http\Controllers\MailerDataReportController;
 use Cmd\Reports\Http\Controllers\CreditorContactsReportController;
-//use Cmd\Reports\Http\Controllers\OfferAuthorizationReportController;
 use Cmd\Reports\Http\Controllers\UnclearedSettlementPaymentsReportController;
-//use Cmd\Reports\Http\Controllers\RetentionCommissionReportController;
-//use Cmd\Reports\Http\Controllers\WelcomePacketReportController;
 use Cmd\Reports\Http\Controllers\EnrollmentFrequencyReportController;
 use Cmd\Reports\Http\Controllers\MarketingReportController;
-//use Cmd\Reports\Http\Controllers\WelcomeLetterReportController;
 use Cmd\Reports\Http\Controllers\CancellationReportController;
 use Cmd\Reports\Http\Controllers\LdrPastDueReportController;
 use Cmd\Reports\Http\Controllers\MarketingAdminController;
 use Cmd\Reports\Http\Controllers\DropSummaryController;
 use Cmd\Reports\Http\Controllers\NegotiatorReportController;
 use Cmd\Reports\Http\Controllers\NsfReportController;
-//use Cmd\Reports\Http\Controllers\DroppedReportController;
 use Cmd\Reports\Http\Controllers\ProgramCompletionController;
 use Cmd\Reports\Http\Controllers\ReconsiderationReportController;
 use Cmd\Reports\Http\Controllers\TeamRanksController;
@@ -56,19 +51,11 @@ $registerCmdReportRoutes = function (bool $withNames = true): void {
     Route::patch('/marketing-report/{pk}/data', [MarketingReportController::class, 'updateDataDropCost'])
         ->middleware('can:cmd.reports.marketing_report')
         ->name($name('cmd.reports.marketing_report.data.update'));
-       // Route::get('/welcome-letter-report', [WelcomeLetterReportController::class, 'index'])
-       // ->name($name('cmd.reports.welcome_letter_report'));
         Route::get('/reconsideration-report', [ReconsiderationReportController::class, 'index'])
         ->name($name('cmd.reports.reconsideration_report'));
-      //  Route::get('/offer-authorization-report', [OfferAuthorizationReportController::class, 'index'])
-       // ->name($name('cmd.reports.offer_authorization_report'));
     Route::get('/contact-report', [ContactReportController::class, 'index'])
         ->middleware('can:cmd.reports.contact_report')
         ->name($name('cmd.reports.contact_report'));
-       // Route::get('/retention-commission-report', [RetentionCommissionReportController::class, 'index'])
-        //->name($name('cmd.reports.retention_commission_report'));
-      //  Route::get('/dropped-report', [DroppedReportController::class, 'index'])
-       // ->name($name('cmd.reports.dropped_report'));
     Route::get('/enrollment-report', [EnrollmentReportController::class, 'index'])
         ->middleware('can:cmd.reports.enrollment_report')
         ->name($name('cmd.reports.enrollment_report'));
@@ -81,8 +68,6 @@ $registerCmdReportRoutes = function (bool $withNames = true): void {
         ->name($name('cmd.reports.lead_report'));
       Route::get('/ldr-past-due-report', [LdrPastDueReportController::class, 'index'])
         ->name($name('cmd.reports.ldr_past_due_report'));
-      //  Route::get('/welcome-packet-report', [WelcomePacketReportController::class, 'index'])
-       // ->name($name('cmd.reports.welcome_packet_report'));
     Route::get('/negotiator-report', [NegotiatorReportController::class, 'index'])
         ->middleware('can:cmd.reports.team_ranks')
         ->name($name('cmd.reports.negotiator_report'));
