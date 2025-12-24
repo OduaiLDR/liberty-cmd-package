@@ -8,6 +8,7 @@ final class CmdReportPermissions
         'cmd.reports',
         'cmd.reports.cancel_report',
         'cmd.reports.nsf_report',
+	'cmd.reports.uncleared_settlement_payments_report',
         'cmd.reports.mailer_data_report',
         'cmd.reports.creditor_contacts_report',
         'cmd.reports.epf_paid_report',
