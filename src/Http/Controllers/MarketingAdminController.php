@@ -38,9 +38,14 @@ class MarketingAdminController extends Controller
             'unique' => (int) $request->query('unique', 0) === 1,
             'sort' => strtolower((string) $request->query('sort', 'send_date')),
             'dir' => strtolower((string) $request->query('dir', 'asc')),
+            'intent' => (function () use ($request) {
+                $intent = strtolower((string) $request->query('intent', 'all'));
+                return in_array($intent, ['all', 'yes', 'no'], true) ? $intent : 'all';
+            })(),
         ];
 
         $data = $this->repo->summary($filters, $page, $perPage);
+        $audit = $this->repo->auditIntentCounts();
 
         return view('reports::reports.marketing_admin', array_merge($data, [
             'perPage' => $perPage,
@@ -49,6 +54,7 @@ class MarketingAdminController extends Controller
             'allDrops' => $this->repo->listDrops(),
             'allStates' => $this->repo->listStates(),
             'allVendors' => $this->repo->listVendors(),
+            'intentAudit' => $audit,
             'allDataProviders' => $this->repo->listDataProviders(),
         ]));
     }

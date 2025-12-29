@@ -36,7 +36,7 @@ trait CsvFormatting
             return '';
         }
 
-        return number_format((float) $value, $precision, '.', '');
+        return number_format((float) $value, $precision, '.', ',');
     }
 
     /**
@@ -48,7 +48,7 @@ trait CsvFormatting
             return '';
         }
 
-        return number_format((float) $value, $precision, '.', '');
+        return number_format((float) $value, $precision, '.', ',');
     }
 
     /**
@@ -64,6 +64,6 @@ trait CsvFormatting
             ? format_currency_string($value)
             : $value;
 
-        return '$' . number_format((float) $normalized, $precision, '.', '');
+        return '$' . number_format((float) $normalized, $precision, '.', ',');
     }
 }

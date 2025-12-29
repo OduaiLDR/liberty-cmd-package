@@ -92,12 +92,18 @@ class MarketingAdminRepository extends SqlSrvRepository
         $vendor = (string) ($filters['vendor'] ?? '');
         $dataProvider = (string) ($filters['data_provider'] ?? '');
         $marketingType = (string) ($filters['marketing_type'] ?? '');
+        $intent = (string) ($filters['intent'] ?? 'all');
         if ($month >= 1 && $month <= 12) { $whereParts[] = 'MONTH(m.Send_Date) = ?'; $whereParams[] = $month; }
         if ($year >= 2020 && $year <= 2100) { $whereParts[] = 'YEAR(m.Send_Date) = ?'; $whereParams[] = $year; }
         if ($tier !== '') { $whereParts[] = 'm.Debt_Tier = ?'; $whereParams[] = $tier; }
         if ($vendor !== '') { $whereParts[] = 'm.Vendor = ?'; $whereParams[] = $vendor; }
         if ($dataProvider !== '') { $whereParts[] = 'm.Data_Type = ?'; $whereParams[] = $dataProvider; }
         if ($marketingType !== '') { $whereParts[] = 'm.Drop_Type = ?'; $whereParams[] = $marketingType; }
+        if ($intent === 'yes') {
+            $whereParts[] = 'tmi.Drop_Name IS NOT NULL';
+        } elseif ($intent === 'no') {
+            $whereParts[] = 'tmi.Drop_Name IS NULL';
+        }
         $whereSql = count($whereParts) ? (' WHERE '.implode(' AND ', $whereParts)) : '';
 
         $cteHeader = <<<SQL
@@ -123,7 +129,8 @@ SQL;
         $joins = ' FROM TblMarketing m '
             .'LEFT JOIN csum ON csum.Campaign = m.Drop_Name '
             .'LEFT JOIN qsum ON qsum.Campaign = m.Drop_Name '
-            .'LEFT JOIN esum ON esum.Drop_Name = m.Drop_Name';
+            .'LEFT JOIN esum ON esum.Drop_Name = m.Drop_Name '
+            .'LEFT JOIN (SELECT DISTINCT [Drop_Name] FROM TblmailersIntent) tmi ON tmi.Drop_Name = m.Drop_Name';
 
         $selectCols = 'SELECT '
             .'m.Drop_Name AS [Drop Name], '
@@ -177,7 +184,47 @@ SQL;
             'columns' => $finalColumns,
             'rows' => $rows,
             'total' => $total,
-            'report' => 'summary',
+            'report' => 'marketing_admin',
+        ];
+    }
+
+    /**
+     * Temporary audit helper for intent counts.
+     * @return array{total:int,with:int,without:int}
+     */
+    public function auditIntentCounts(): array
+    {
+        $base = $this->connection();
+
+        $totalRow = $base->selectOne("SELECT COUNT(DISTINCT Drop_Name) AS cnt FROM TblMarketing");
+        $total = (int) ($totalRow->cnt ?? 0);
+
+        $withRow = $base->selectOne("
+            SELECT COUNT(DISTINCT m.Drop_Name) AS cnt
+            FROM TblMarketing m
+            LEFT JOIN (
+                SELECT DISTINCT [Drop_Name]
+                FROM TblmailersIntent
+            ) tmi ON tmi.Drop_Name = m.Drop_Name
+            WHERE tmi.Drop_Name IS NOT NULL
+        ");
+        $with = (int) ($withRow->cnt ?? 0);
+
+        $withoutRow = $base->selectOne("
+            SELECT COUNT(DISTINCT m.Drop_Name) AS cnt
+            FROM TblMarketing m
+            LEFT JOIN (
+                SELECT DISTINCT [Drop_Name]
+                FROM TblmailersIntent
+            ) tmi ON tmi.Drop_Name = m.Drop_Name
+            WHERE tmi.Drop_Name IS NULL
+        ");
+        $without = (int) ($withoutRow->cnt ?? 0);
+
+        return [
+            'total' => $total,
+            'with' => $with,
+            'without' => $without,
         ];
     }
 }
