@@ -183,7 +183,7 @@ SQL;
             $llgId = $this->truncateString('LLG-' . $cid, 100);
             $records[$llgId] = [
                 'program_length' => $timeInProgram,
-                'payment_frequency' => $this->mapFrequency($frequency),
+                'payment_frequency' => $this->mapFrequencyOrNull($frequency),
             ];
         }
 
@@ -214,10 +214,13 @@ SQL;
                 if ($programLength !== null && $programLength !== '' && is_numeric($programLength)) {
                     $programLengthSql = (string) $programLength;
                 }
-                $frequencyEsc = $this->truncateString($this->escapeSqlString($data['payment_frequency']), 50);
+                $freqVal = $data['payment_frequency'];
 
                 $casesLength[] = "WHEN '{$llgEsc}' THEN {$programLengthSql}";
-                $casesFrequency[] = "WHEN '{$llgEsc}' THEN '{$frequencyEsc}'";
+                if ($freqVal !== null && $freqVal !== '') {
+                    $frequencyEsc = $this->truncateString($this->escapeSqlString($freqVal), 50);
+                    $casesFrequency[] = "WHEN '{$llgEsc}' THEN '{$frequencyEsc}'";
+                }
                 $ids[] = "'{$llgEsc}'";
             }
 
@@ -226,32 +229,59 @@ SQL;
             }
 
             $caseLengthSql = implode(' ', $casesLength);
-            $caseFrequencySql = implode(' ', $casesFrequency);
             $idList = implode(', ', $ids);
+
+            $setClauses = ["Program_Length = CASE LLG_ID {$caseLengthSql} END"];
+            if (!empty($casesFrequency)) {
+                $caseFrequencySql = implode(' ', $casesFrequency);
+                $setClauses[] = "Payment_Frequency = CASE LLG_ID {$caseFrequencySql} ELSE Payment_Frequency END";
+            }
+
+            $setSql = implode(",\n    ", $setClauses);
 
             $sql = <<<SQL
 UPDATE TblEnrollment
 SET
-    Program_Length = CASE LLG_ID {$caseLengthSql} END,
-    Payment_Frequency = CASE LLG_ID {$caseFrequencySql} END
+    {$setSql}
 WHERE LLG_ID IN ({$idList});
 SQL;
 
             $result = $connector->querySqlServer($sql);
 
+            if (is_array($result) && isset($result['success']) && $result['success'] === false) {
+                $errorMsg = $result['error'] ?? 'Unknown SQL Server error';
+                throw new \RuntimeException("SQL Server update failed: {$errorMsg}");
+            }
+
+            $updated = null;
             if (is_array($result)) {
                 foreach (['rowCount', 'affected_rows', 'row_count'] as $key) {
                     if (isset($result[$key]) && is_numeric($result[$key])) {
-                        $totalUpdated += (int) $result[$key];
-                        continue 2;
+                        $updated = (int) $result[$key];
+                        break;
                     }
                 }
             }
 
-            $totalUpdated += count($chunk);
+            if ($updated !== null) {
+                $totalUpdated += $updated;
+            } else {
+                $this->warn('No row count returned from SQL Server update; treating as 0 updated for this batch.');
+            }
         }
 
         return $totalUpdated;
+    }
+
+    protected function mapFrequencyOrNull(?string $frequency): ?string
+    {
+        return match ($frequency) {
+            'BW' => 'Bi-Weekly',
+            'M' => 'Monthly',
+            'SM' => 'Semi-Monthly',
+            'W' => 'Weekly',
+            default => null,
+        };
     }
 
     protected function mapFrequency(?string $frequency): string

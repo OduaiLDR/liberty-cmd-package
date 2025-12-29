@@ -778,7 +778,7 @@ class DBConnector
             $pdo = $this->getSqlServerConnection();
 
             $trimmedSql = ltrim($sql);
-            $isSelect = stripos($trimmedSql, 'SELECT') === 0;
+            $isSelect = preg_match('/^(SELECT|WITH)\\b/i', $trimmedSql) === 1;
 
             if ($isSelect) {
                 if (empty($params)) {

@@ -6,24 +6,25 @@ use Cmd\Reports\Services\DBConnector;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
 
-class SyncFirstPaymentDate extends Command
+class SyncSubmittedDate extends Command
 {
-    protected $signature = 'sync:first-payment-date';
+    protected $signature = 'sync:submitted-date';
 
-    protected $description = 'Sync First_Payment_Date and First_Payment_Status in TblEnrollment from Snowflake TRANSACTIONS (first D per contact, last 60 days)';
+    protected $description = 'Sync Submitted_Date in TblEnrollment from Snowflake CONTACTS_STATUS (status 377680, last 60 days)';
 
     public function handle(): int
     {
-        $this->info('First payment sync: starting.');
-        Log::info('SyncFirstPaymentDate command started.');
+        $this->info('Submitted date sync: starting.');
+        Log::info('SyncSubmittedDate command started.');
 
         $connections = ['plaw', 'ldr'];
         $hadException = false;
 
         foreach ($connections as $connection) {
             $source = strtoupper($connection);
-            $this->info("[$source] Starting first payment sync.");
-            Log::info('SyncFirstPaymentDate: starting connection.', [
+
+            $this->info("[$source] Starting submitted date sync.");
+            Log::info('SyncSubmittedDate: starting connection.', [
                 'connection' => $connection,
                 'source' => $source,
             ]);
@@ -33,55 +34,55 @@ class SyncFirstPaymentDate extends Command
                 $connector->initializeSqlServer();
                 $this->ensureLogTable($connector);
 
-                $this->info("[$source] Fetching IDs missing First_Payment_Date from SQL Server...");
+                $this->info("[$source] Fetching IDs missing Submitted_Date from SQL Server...");
                 $missingIds = $this->fetchMissingIdsFromSqlServer($connector);
 
                 if (empty($missingIds)) {
-                    $this->warn("[$source] No rows missing First_Payment_Date in SQL Server.");
+                    $this->warn("[$source] No rows missing Submitted_Date in SQL Server.");
                     $this->insertLogRow(
                         $connector,
                         $source,
-                        'SYNC_FIRST_PAYMENT_DATE',
+                        'SYNC_SUBMITTED_DATE',
                         'SUCCESS',
                         0,
                         0,
-                        'No rows missing First_Payment_Date in SQL Server.'
+                        'No rows missing Submitted_Date in SQL Server.'
                     );
                     continue;
                 }
 
-                $this->info("[$source] Fetching first payments from Snowflake for missing IDs...");
-                $payments = $this->fetchFirstPaymentsFromSnowflake($connector, $missingIds);
+                $this->info("[$source] Fetching submitted dates from Snowflake for missing IDs...");
+                $submitted = $this->fetchSubmittedFromSnowflake($connector, $missingIds);
 
-                if (empty($payments)) {
-                    $this->warn("[$source] No first payments found in Snowflake for missing IDs.");
+                if (empty($submitted)) {
+                    $this->warn("[$source] No submitted dates found in Snowflake.");
                     $this->insertLogRow(
                         $connector,
                         $source,
-                        'SYNC_FIRST_PAYMENT_DATE',
+                        'SYNC_SUBMITTED_DATE',
                         'SUCCESS',
                         0,
                         0,
-                        'No first payments found to sync.'
+                        'No submitted dates found to sync.'
                     );
                     continue;
                 }
 
-                $this->info("[$source] Applying first payments to SQL Server...");
-                $updated = $this->updateFirstPayments($connector, $payments);
+                $this->info("[$source] Applying submitted dates to SQL Server...");
+                $updated = $this->updateSubmittedDates($connector, $submitted);
 
-                $this->info("[$source] Updated {$updated} first payment rows.");
+                $this->info("[$source] Updated {$updated} submitted dates.");
                 $this->insertLogRow(
                     $connector,
                     $source,
-                    'SYNC_FIRST_PAYMENT_DATE',
+                    'SYNC_SUBMITTED_DATE',
                     'SUCCESS',
                     $updated,
                     0,
-                    sprintf('Payments fetched: %d. Updated: %d.', count($payments), $updated)
+                    sprintf('Submitted rows fetched: %d. Updated: %d.', count($submitted), $updated)
                 );
 
-                Log::info('SyncFirstPaymentDate: connection finished.', [
+                Log::info('SyncSubmittedDate: connection finished.', [
                     'connection' => $connection,
                     'source' => $source,
                     'updated' => $updated,
@@ -89,10 +90,10 @@ class SyncFirstPaymentDate extends Command
             } catch (\Throwable $e) {
                 $hadException = true;
 
-                $this->error("First payment sync failed for connection [{$connection}] ({$source}).");
+                $this->error("Submitted date sync failed for connection [{$connection}] ({$source}).");
                 $this->error($e->getMessage());
 
-                Log::error('SyncFirstPaymentDate: exception during sync.', [
+                Log::error('SyncSubmittedDate: exception during sync.', [
                     'connection' => $connection,
                     'source' => $source,
                     'exception' => $e,
@@ -110,14 +111,14 @@ class SyncFirstPaymentDate extends Command
                     $this->insertLogRow(
                         $connector,
                         $source,
-                        'SYNC_FIRST_PAYMENT_DATE',
+                        'SYNC_SUBMITTED_DATE',
                         'FAILED',
                         0,
                         0,
                         $errorMessage
                     );
                 } catch (\Throwable $logException) {
-                    Log::error('SyncFirstPaymentDate: failed to log to TblLog after exception.', [
+                    Log::error('SyncSubmittedDate: failed to log to TblLog after exception.', [
                         'connection' => $connection,
                         'source' => $source,
                         'exception' => $logException,
@@ -126,8 +127,8 @@ class SyncFirstPaymentDate extends Command
             }
         }
 
-        $this->info('First payment sync: finished.');
-        Log::info('SyncFirstPaymentDate command finished.', [
+        $this->info('Submitted date sync: finished.');
+        Log::info('SyncSubmittedDate command finished.', [
             'status' => $hadException ? 'FAILURE' : 'SUCCESS',
         ]);
 
@@ -139,9 +140,7 @@ class SyncFirstPaymentDate extends Command
         $sql = <<<SQL
 SELECT LLG_ID
 FROM TblEnrollment
-WHERE First_Payment_Date IS NULL
-  AND LLG_ID LIKE 'LLG-%'
-  AND TRY_CONVERT(BIGINT, REPLACE(LLG_ID, 'LLG-', '')) IS NOT NULL
+WHERE Submitted_Date IS NULL
 SQL;
 
         $result = $connector->querySqlServer($sql);
@@ -171,75 +170,69 @@ SQL;
             }
         }
 
-        $this->info('Found ' . count($ids) . ' IDs missing First_Payment_Date.');
+        $this->info('Found ' . count($ids) . ' IDs missing Submitted_Date.');
 
         return $ids;
     }
 
-    protected function fetchFirstPaymentsFromSnowflake(DBConnector $connector, array $missingLlgs): array
+    protected function fetchSubmittedFromSnowflake(DBConnector $connector, array $missingLlgs): array
     {
         if (empty($missingLlgs)) {
             return [];
         }
 
-        $contactIds = array_values(array_filter(array_map(function ($llg) {
-            $id = preg_replace('/^LLG-?/i', '', (string) $llg);
-            $id = trim($id);
-            return ctype_digit($id) ? $id : null;
-        }, $missingLlgs)));
+        // Strip LLG- prefix for Snowflake CONTACT_ID lookup
+        $contactIds = array_map(function ($llg) {
+            return preg_replace('/^LLG-?/i', '', $llg);
+        }, $missingLlgs);
 
-        if (empty($contactIds)) {
-            $this->warn('No numeric CONTACT_IDs extracted from missing LLG IDs.');
-            return [];
-        }
-
-        $payments = [];
-        $chunkSize = 1000;
-
-        foreach (array_chunk($contactIds, $chunkSize) as $chunk) {
-            $values = implode(', ', array_map(function ($id) {
-                return "('" . $this->escapeSqlString($id) . "')";
-            }, $chunk));
-
-            $sql = <<<SQL
-WITH missing AS (
-    SELECT column1 AS CONTACT_ID_STR
-    FROM VALUES {$values}
-),
-tx AS (
-    SELECT
-        CONTACT_ID,
-        PROCESS_DATE,
-        CLEARED_DATE,
-        RETURNED_DATE,
-        ROW_NUMBER() OVER (PARTITION BY CONTACT_ID ORDER BY PROCESS_DATE) AS rn
-    FROM TRANSACTIONS
-    WHERE TRANS_TYPE = 'D'
-)
+        $chunks = array_chunk($contactIds, 500);
+        $baseSql = <<<SQL
 SELECT
-    TO_VARCHAR(tx.CONTACT_ID) AS CONTACT_ID,
-    tx.PROCESS_DATE,
-    tx.CLEARED_DATE,
-    tx.RETURNED_DATE
-FROM tx
-JOIN missing
-  ON TO_VARCHAR(tx.CONTACT_ID) = missing.CONTACT_ID_STR
-WHERE tx.rn = 1
-  AND tx.PROCESS_DATE >= DATEADD(day, -60, CURRENT_DATE)
-ORDER BY tx.PROCESS_DATE ASC
+    CONTACT_ID,
+    TO_CHAR(STAMP, 'YYYY-MM-DD') AS SUBMITTED_DATE
+FROM CONTACTS_STATUS
+WHERE STATUS_ID IN (377643, 377680)
+  AND STAMP >= DATEADD(day, -60, CURRENT_DATE)
 SQL;
 
-            $result = $connector->query($sql);
+        $submitted = [];
 
-            $rows = [];
+        foreach ($chunks as $chunk) {
+            $escapedIds = array_map(function ($id) {
+                return "'" . $this->escapeSqlString($id) . "'";
+            }, $chunk);
+            $inList = implode(', ', $escapedIds);
+
+            $pagedSql = $baseSql . " AND CONTACT_ID IN ({$inList}) ORDER BY STAMP ASC";
+
+            try {
+                $result = $connector->query($pagedSql);
+            } catch (\Throwable $e) {
+                $this->warn("[$connector->getConnectionName()] Snowflake query failed: {$e->getMessage()}");
+                Log::warning('SyncSubmittedDate: Snowflake query failed.', [
+                    'error' => $e->getMessage(),
+                    'chunk_size' => count($chunk),
+                ]);
+                $result = [];
+            }
+
             if (is_array($result)) {
                 if (isset($result['success']) && $result['success'] === false) {
+                    Log::warning('SyncSubmittedDate: Snowflake returned success=false.', [
+                        'result' => $result,
+                        'chunk_size' => count($chunk),
+                    ]);
                     $rows = [];
                 } elseif (isset($result['data']) && is_array($result['data'])) {
                     $rows = $result['data'];
                 } elseif (array_is_list($result)) {
                     $rows = $result;
+                } else {
+                    $rows = [];
                 }
+            } else {
+                $rows = [];
             }
 
             foreach ($rows as $row) {
@@ -248,79 +241,64 @@ SQL;
                 }
 
                 $cid = null;
-                $processDate = null;
-                $clearedDate = null;
+                $submittedDate = null;
 
                 foreach ($row as $key => $value) {
                     if (strcasecmp($key, 'CONTACT_ID') === 0) {
                         $cid = (string) $value;
-                    }
-                    if (strcasecmp($key, 'PROCESS_DATE') === 0) {
-                        $processDate = (string) $value;
-                    }
-                    if (strcasecmp($key, 'CLEARED_DATE') === 0) {
-                        $clearedDate = (string) $value;
+                    } elseif (strcasecmp($key, 'SUBMITTED_DATE') === 0) {
+                        $submittedDate = (string) $value;
                     }
                 }
 
-                if (!$cid || !$processDate) {
+                if ($cid === null || $cid === '' || $submittedDate === null || $submittedDate === '') {
                     continue;
                 }
 
-                $status = ($clearedDate === null || $clearedDate === '') ? 'Pending' : 'Cleared';
-                $llgId = 'LLG-' . $cid;
-
-                $payments[$llgId] = [
-                    'date' => $processDate,
-                    'status' => $status,
-                ];
+                $llgId = $this->truncateString('LLG-' . $cid, 100);
+                $submitted[$llgId] = $submittedDate;
             }
         }
 
-        $this->info('Fetched ' . count($payments) . ' first payments from Snowflake.');
+        $this->info('Fetched ' . count($submitted) . ' submitted dates from Snowflake.');
 
-        return $payments;
+        return $submitted;
     }
 
-    protected function updateFirstPayments(DBConnector $connector, array $payments): int
+    protected function updateSubmittedDates(DBConnector $connector, array $submitted): int
     {
-        if (empty($payments)) {
+        if (empty($submitted)) {
             return 0;
         }
 
         $totalUpdated = 0;
         $batchSize = 500;
-        $batches = array_chunk($payments, $batchSize, true);
+        $batches = array_chunk($submitted, $batchSize, true);
+        $batchIndex = 0;
 
         foreach ($batches as $chunk) {
-            $casesDate = [];
-            $casesStatus = [];
+            $batchIndex++;
+            $cases = [];
             $ids = [];
 
-            foreach ($chunk as $llgId => $data) {
+            foreach ($chunk as $llgId => $submittedDate) {
                 $llgEsc = $this->truncateString($this->escapeSqlString($llgId), 100);
-                $dateEsc = $this->truncateString($this->escapeSqlString($data['date']), 50);
-                $statusEsc = $this->truncateString($this->escapeSqlString($data['status']), 50);
-                $casesDate[] = "WHEN '{$llgEsc}' THEN '{$dateEsc}'";
-                $casesStatus[] = "WHEN '{$llgEsc}' THEN '{$statusEsc}'";
+                $dateEsc = $this->truncateString($this->escapeSqlString($submittedDate), 50);
+                $cases[] = "WHEN '{$llgEsc}' THEN '{$dateEsc}'";
                 $ids[] = "'{$llgEsc}'";
             }
 
-            if (empty($casesDate) || empty($ids)) {
+            if (empty($cases) || empty($ids)) {
                 continue;
             }
 
-            $caseDateSql = implode(' ', $casesDate);
-            $caseStatusSql = implode(' ', $casesStatus);
+            $caseSql = implode(' ', $cases);
             $idList = implode(', ', $ids);
 
             $sql = <<<SQL
 UPDATE TblEnrollment
-SET
-    First_Payment_Date = CASE LLG_ID {$caseDateSql} END,
-    First_Payment_Status = CASE LLG_ID {$caseStatusSql} END
-WHERE LLG_ID IN ({$idList})
-  AND First_Payment_Date IS NULL;
+SET Submitted_Date = CASE LLG_ID {$caseSql} END
+WHERE LLG_ID IN ({$idList});
 SQL;
 
             $result = $connector->querySqlServer($sql);
@@ -334,6 +312,7 @@ SQL;
                 }
             }
 
+            // Fallback to chunk size if no count returned
             $totalUpdated += count($chunk);
         }
 
@@ -356,18 +335,24 @@ SQL;
     ): void {
         // TblLog schema: Table_Name/Macro NVARCHAR(50), Description/Action NVARCHAR(255), Result NVARCHAR(50)
         $tableName = 'TblEnrollment';
-        $macro = 'SyncFirstPaymentDate';
-        $actionLabel = $action !== '' ? strtoupper($action) : 'SYNC_FIRST_PAYMENT_DATE';
+        $macro = 'SyncSubmittedDate';
+        $actionLabel = $action !== '' ? strtoupper($action) : 'SYNC_SUBMITTED_DATE';
 
         $description = $this->truncateString(
-            sprintf('Sync first payment date for %s', $source),
+            sprintf('Sync submitted date for %s', $source),
             255
         );
         $descriptionEsc = $this->escapeSqlString($description);
 
         $details = $this->truncateString($details, 200);
         $resultSummary = $this->truncateString(
-            sprintf('S=%s A=%s P=%d D=%d', $status, $actionLabel, $recordsProcessed, $recordsDeleted),
+            sprintf(
+                'S=%s A=%s P=%d D=%d',
+                $status,
+                $actionLabel,
+                $recordsProcessed,
+                $recordsDeleted
+            ),
             50
         );
         $resultSummaryEsc = $this->escapeSqlString($resultSummary);
@@ -407,7 +392,7 @@ SQL;
             if (is_array($result) && isset($result['success']) && $result['success'] === false) {
                 $errorMsg = $result['error'] ?? 'Unknown SQL Server error';
                 $this->error(sprintf('[%s] Log insert failed: %s', $source, $errorMsg));
-                Log::error('SyncFirstPaymentDate: log insert failed.', [
+                Log::error('SyncSubmittedDate: log insert failed.', [
                     'source' => $source,
                     'sql' => $sql,
                     'result' => $result,
@@ -418,7 +403,7 @@ SQL;
             $this->info(sprintf('[%s] Log entry inserted into TblLog.', $source));
         } catch (\Throwable $e) {
             $this->error(sprintf('[%s] Log insert failed: %s', $source, $e->getMessage()));
-            Log::error('SyncFirstPaymentDate: log insert failed.', [
+            Log::error('SyncSubmittedDate: log insert failed.', [
                 'source' => $source,
                 'sql' => $sql,
                 'exception' => $e->getMessage(),
