@@ -9,18 +9,12 @@ use Cmd\Reports\Http\Controllers\ContactReportController;
 use Cmd\Reports\Http\Controllers\EnrollmentReportController;
 use Cmd\Reports\Http\Controllers\LeadReportController;
 use Cmd\Reports\Http\Controllers\CreditorContactsReportController;
-<<<<<<< HEAD
-use Cmd\Reports\Http\Controllers\UnclearedSettlementPaymentsReportController;
-use Cmd\Reports\Http\Controllers\EnrollmentFrequencyReportController;
-use Cmd\Reports\Http\Controllers\MarketingReportController;
-use Cmd\Reports\Http\Controllers\CancellationReportController;
-use Cmd\Reports\Http\Controllers\LdrPastDueReportController;
-=======
+
 use Cmd\Reports\Http\Controllers\EpfPaidReportController;
 use Cmd\Reports\Http\Controllers\EpfDueReportController;
 use Cmd\Reports\Http\Controllers\MailerDataReportController;
 use Cmd\Reports\Http\Controllers\MarketingReportController;
->>>>>>> 62a3fe5 ( more reports)
+
 use Cmd\Reports\Http\Controllers\MarketingAdminController;
 use Cmd\Reports\Http\Controllers\DropSummaryController;
 use Cmd\Reports\Http\Controllers\NegotiatorReportController;
@@ -146,11 +140,6 @@ $registerCmdReportRoutes = function (bool $withNames = true): void {
     Route::patch('/marketing-report/{pk}/data', [MarketingReportController::class, 'updateDataDropCost'])
         ->middleware('can:cmd.reports.marketing_report')
         ->name($name('cmd.reports.marketing_report.data.update'));
-<<<<<<< HEAD
-        Route::get('/reconsideration-report', [ReconsiderationReportController::class, 'index'])
-        ->name($name('cmd.reports.reconsideration_report'));
-=======
->>>>>>> 62a3fe5 ( more reports)
     Route::get('/contact-report', [ContactReportController::class, 'index'])
         ->middleware('can:cmd.reports.contact_report')
         ->name($name('cmd.reports.contact_report'));
@@ -160,11 +149,7 @@ $registerCmdReportRoutes = function (bool $withNames = true): void {
     Route::get('/lead-report', [LeadReportController::class, 'index'])
         ->middleware('can:cmd.reports.lead_report')
         ->name($name('cmd.reports.lead_report'));
-<<<<<<< HEAD
-      Route::get('/ldr-past-due-report', [LdrPastDueReportController::class, 'index'])
-        ->name($name('cmd.reports.ldr_past_due_report'));
-=======
->>>>>>> 62a3fe5 ( more reports)
+
     Route::get('/negotiator-report', [NegotiatorReportController::class, 'index'])
         ->middleware('can:cmd.reports.team_ranks')
         ->name($name('cmd.reports.negotiator_report'));
