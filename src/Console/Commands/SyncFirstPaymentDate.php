@@ -10,7 +10,7 @@ class SyncFirstPaymentDate extends Command
 {
     protected $signature = 'sync:first-payment-date';
 
-    protected $description = 'Sync First_Payment_Date and First_Payment_Status in TblEnrollment from Snowflake TRANSACTIONS (first D per contact, last 60 days)';
+    protected $description = 'Sync First_Payment_Date, First_Payment_Cleared_Date, First_Payment_Status, and Program_Payment in TblEnrollment from Snowflake TRANSACTIONS (first D per contact, fill missing only)';
 
     public function handle(): int
     {
@@ -138,8 +138,9 @@ class SyncFirstPaymentDate extends Command
     {
         $sql = <<<SQL
 SELECT LLG_ID
-FROM TblEnrollment
+FROM dbo.TblEnrollment
 WHERE First_Payment_Date IS NULL
+  AND Cancel_Date IS NULL
   AND LLG_ID LIKE 'LLG-%'
   AND TRY_CONVERT(BIGINT, REPLACE(LLG_ID, 'LLG-', '')) IS NOT NULL
 SQL;
@@ -171,7 +172,7 @@ SQL;
             }
         }
 
-        $this->info('Found ' . count($ids) . ' IDs missing First_Payment_Date.');
+        $this->info('Found ' . count($ids) . ' IDs eligible for first payment sync.');
 
         return $ids;
     }
@@ -182,19 +183,27 @@ SQL;
             return [];
         }
 
-        $contactIds = array_values(array_filter(array_map(function ($llg) {
-            $id = preg_replace('/^LLG-?/i', '', (string) $llg);
-            $id = trim($id);
-            return ctype_digit($id) ? $id : null;
-        }, $missingLlgs)));
+        // Preserve exact LLG_ID mapping for updates
+        $contactToLlg = [];
+        foreach ($missingLlgs as $llg) {
+            $numeric = preg_replace('/\\D+/', '', (string) $llg);
+            if ($numeric === '') {
+                continue;
+            }
+            if (!isset($contactToLlg[$numeric])) {
+                $contactToLlg[$numeric] = (string) $llg;
+            }
+        }
+
+        $contactIds = array_keys($contactToLlg);
 
         if (empty($contactIds)) {
-            $this->warn('No numeric CONTACT_IDs extracted from missing LLG IDs.');
+            $this->warn('No numeric CONTACT_IDs extracted from provided LLG IDs.');
             return [];
         }
 
         $payments = [];
-        $chunkSize = 1000;
+        $chunkSize = 500;
 
         foreach (array_chunk($contactIds, $chunkSize) as $chunk) {
             $values = implode(', ', array_map(function ($id) {
@@ -203,29 +212,25 @@ SQL;
 
             $sql = <<<SQL
 WITH missing AS (
-    SELECT column1 AS CONTACT_ID_STR
+    SELECT TO_NUMBER(column1) AS CONTACT_ID
     FROM VALUES {$values}
 ),
 tx AS (
     SELECT
-        CONTACT_ID,
-        PROCESS_DATE,
-        CLEARED_DATE,
-        RETURNED_DATE,
-        ROW_NUMBER() OVER (PARTITION BY CONTACT_ID ORDER BY PROCESS_DATE) AS rn
-    FROM TRANSACTIONS
-    WHERE TRANS_TYPE = 'D'
+        t.CONTACT_ID,
+        t.PROCESS_DATE,
+        t.CLEARED_DATE,
+        ROW_NUMBER() OVER (PARTITION BY t.CONTACT_ID ORDER BY t.PROCESS_DATE) AS rn
+    FROM TRANSACTIONS t
+    JOIN missing m ON m.CONTACT_ID = t.CONTACT_ID
+    WHERE t.TRANS_TYPE = 'D'
 )
 SELECT
     TO_VARCHAR(tx.CONTACT_ID) AS CONTACT_ID,
-    tx.PROCESS_DATE,
-    tx.CLEARED_DATE,
-    tx.RETURNED_DATE
+    TO_VARCHAR(tx.PROCESS_DATE, 'YYYY-MM-DD') AS PROCESS_DATE,
+    TO_VARCHAR(tx.CLEARED_DATE, 'YYYY-MM-DD') AS CLEARED_DATE
 FROM tx
-JOIN missing
-  ON TO_VARCHAR(tx.CONTACT_ID) = missing.CONTACT_ID_STR
 WHERE tx.rn = 1
-  AND tx.PROCESS_DATE >= DATEADD(day, -60, CURRENT_DATE)
 ORDER BY tx.PROCESS_DATE ASC
 SQL;
 
@@ -254,11 +259,9 @@ SQL;
                 foreach ($row as $key => $value) {
                     if (strcasecmp($key, 'CONTACT_ID') === 0) {
                         $cid = (string) $value;
-                    }
-                    if (strcasecmp($key, 'PROCESS_DATE') === 0) {
+                    } elseif (strcasecmp($key, 'PROCESS_DATE') === 0) {
                         $processDate = (string) $value;
-                    }
-                    if (strcasecmp($key, 'CLEARED_DATE') === 0) {
+                    } elseif (strcasecmp($key, 'CLEARED_DATE') === 0) {
                         $clearedDate = (string) $value;
                     }
                 }
@@ -268,10 +271,11 @@ SQL;
                 }
 
                 $status = ($clearedDate === null || $clearedDate === '') ? 'Pending' : 'Cleared';
-                $llgId = 'LLG-' . $cid;
+                $llgOriginal = $contactToLlg[$cid] ?? ('LLG-' . $cid);
+                $llgId = $this->truncateString($llgOriginal, 100);
 
                 $payments[$llgId] = [
-                    'date' => $processDate,
+                    'process_date' => $processDate,
                     'status' => $status,
                 ];
             }
@@ -299,8 +303,9 @@ SQL;
 
             foreach ($chunk as $llgId => $data) {
                 $llgEsc = $this->truncateString($this->escapeSqlString($llgId), 100);
-                $dateEsc = $this->truncateString($this->escapeSqlString($data['date']), 50);
+                $dateEsc = $this->truncateString($this->escapeSqlString($data['process_date']), 50);
                 $statusEsc = $this->truncateString($this->escapeSqlString($data['status']), 50);
+
                 $casesDate[] = "WHEN '{$llgEsc}' THEN '{$dateEsc}'";
                 $casesStatus[] = "WHEN '{$llgEsc}' THEN '{$statusEsc}'";
                 $ids[] = "'{$llgEsc}'";
@@ -315,26 +320,45 @@ SQL;
             $idList = implode(', ', $ids);
 
             $sql = <<<SQL
-UPDATE TblEnrollment
+UPDATE dbo.TblEnrollment
 SET
-    First_Payment_Date = CASE LLG_ID {$caseDateSql} END,
-    First_Payment_Status = CASE LLG_ID {$caseStatusSql} END
+    First_Payment_Date = CASE LLG_ID {$caseDateSql} ELSE First_Payment_Date END,
+    First_Payment_Status = CASE LLG_ID {$caseStatusSql} ELSE First_Payment_Status END
 WHERE LLG_ID IN ({$idList})
   AND First_Payment_Date IS NULL;
 SQL;
 
             $result = $connector->querySqlServer($sql);
 
-            if (is_array($result)) {
-                foreach (['rowCount', 'affected_rows', 'row_count'] as $key) {
-                    if (isset($result[$key]) && is_numeric($result[$key])) {
-                        $totalUpdated += (int) $result[$key];
-                        continue 2;
-                    }
+            if (!is_array($result)) {
+                $this->error('SQL Server update returned non-array result; treating as 0 updated for this batch.');
+                continue;
+            }
+
+            if (isset($result['success']) && $result['success'] === false) {
+                $errorMsg = $result['error'] ?? 'Unknown SQL Server error';
+                $this->error('SQL Server update failed: ' . $errorMsg);
+                Log::error('SyncFirstPaymentDate: SQL Server update failed.', [
+                    'result' => $result,
+                    'sql' => mb_substr($sql, 0, 500),
+                ]);
+                continue;
+            }
+
+            $updated = null;
+            foreach (['row_count', 'rowCount', 'affected_rows'] as $key) {
+                if (isset($result[$key]) && is_numeric($result[$key])) {
+                    $updated = (int) $result[$key];
+                    break;
                 }
             }
 
-            $totalUpdated += count($chunk);
+            if ($updated !== null) {
+                $totalUpdated += $updated;
+                continue;
+            }
+
+            $this->warn('SQL Server update did not return a row count; assuming 0 updated for this batch.');
         }
 
         return $totalUpdated;

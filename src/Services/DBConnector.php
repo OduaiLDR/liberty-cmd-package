@@ -376,6 +376,9 @@ class DBConnector
         // Some long‑running statements may return a status URL first; poll until results are ready.
         if (!isset($result['resultSetMetaData']) && isset($result['statementStatusUrl'])) {
             $statusUrl = $result['statementStatusUrl'];
+            if (!str_starts_with($statusUrl, 'http')) {
+                $statusUrl = 'https://' . strtolower($this->account) . '.snowflakecomputing.com' . $statusUrl;
+            }
 
             for ($i = 0; $i < 60; $i++) {
                 // Small delay between polls
@@ -778,7 +781,7 @@ class DBConnector
             $pdo = $this->getSqlServerConnection();
 
             $trimmedSql = ltrim($sql);
-            $isSelect = stripos($trimmedSql, 'SELECT') === 0;
+            $isSelect = preg_match('/^(SELECT|WITH)\\b/i', $trimmedSql) === 1;
 
             if ($isSelect) {
                 if (empty($params)) {
