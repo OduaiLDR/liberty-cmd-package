@@ -185,7 +185,7 @@ SQL;
     protected function fetchFirstClearedFromSnowflake(DBConnector $connector, array $missingLlgs): array
     {
         if (empty($missingLlgs)) {
-            $this->warn('Empty $missingLlgs array passed to fetchFirstClearedFromSnowflake');
+            $this->warn('Empty LLG ID array passed to fetchFirstClearedFromSnowflake');
             return [];
         }
 
@@ -208,16 +208,12 @@ SQL;
         $contactIds = array_keys($contactToLlg);
 
         if (empty($contactIds)) {
-            $this->error('No numeric CONTACT_IDs extracted from missing LLG IDs.');
+            $this->error('No numeric CONTACT_IDs extracted from provided LLG IDs.');
             return [];
         }
 
         $this->info('Extracted ' . count($contactIds) . ' numeric contact IDs');
         $this->info('Sample contact IDs: ' . implode(', ', array_slice($contactIds, 0, 5)));
-
-        // 7-day filter to match VBA
-        $sevenDaysAgo = now()->subDays(7)->format('Y-m-d');
-        $this->info("Filtering for first payments that occurred on or after: {$sevenDaysAgo}");
 
         $chunkSize = 500;
         $payments = [];
@@ -230,25 +226,25 @@ SQL;
             }, $chunk));
 
             // Match VBA logic EXACTLY:
-            // 1) Find first payment ever per contact using PROCESS_DATE (since CLEARED_DATE may be NULL)
-            // 2) Only keep those whose first payment happened in the last 7 days
+            // 1) Find first CLEARED_DATE per contact.
             $sql = <<<SQL
 SELECT
     CONTACT_ID,
     TO_VARCHAR(CLEARED_DATE, 'YYYY-MM-DD') AS CLEARED_DATE,
+    TO_VARCHAR(PROCESS_DATE, 'YYYY-MM-DD') AS PROCESS_DATE,
     AMOUNT
 FROM (
     SELECT
         t.CONTACT_ID,
-        TO_DATE(t.PROCESS_DATE) AS CLEARED_DATE,
+        TO_DATE(t.CLEARED_DATE) AS CLEARED_DATE,
+        TO_DATE(t.PROCESS_DATE) AS PROCESS_DATE,
         t.AMOUNT,
-        ROW_NUMBER() OVER (PARTITION BY t.CONTACT_ID ORDER BY t.PROCESS_DATE) AS N
+        ROW_NUMBER() OVER (PARTITION BY t.CONTACT_ID ORDER BY TO_DATE(t.CLEARED_DATE)) AS N
     FROM TRANSACTIONS t
     WHERE t.CONTACT_ID IN (SELECT TO_NUMBER(column1) FROM VALUES {$values})
       AND t.TRANS_TYPE = 'D'
-      AND TO_DATE(t.PROCESS_DATE) IS NOT NULL
+      AND t.CLEARED_DATE IS NOT NULL
       AND t.RETURNED_DATE IS NULL
-      AND TO_DATE(t.PROCESS_DATE) >= TO_DATE('{$sevenDaysAgo}')
 )
 WHERE N = 1
 SQL;
@@ -260,7 +256,7 @@ SQL;
             if ($chunkIndex === 0) {
                 $debugIds = array_slice($chunk, 0, 5);
                 $debugIdList = implode(',', $debugIds);
-                $debugSql = "SELECT CONTACT_ID, TRANS_TYPE, PROCESS_DATE, CLEARED_DATE FROM TRANSACTIONS WHERE CONTACT_ID IN ({$debugIdList}) AND TRANS_TYPE = 'D' LIMIT 10";
+                $debugSql = "SELECT CONTACT_ID, TRANS_TYPE, CLEARED_DATE, RETURNED_DATE FROM TRANSACTIONS WHERE CONTACT_ID IN ({$debugIdList}) AND TRANS_TYPE = 'D' LIMIT 10";
                 try {
                     $this->info('DEBUG: Checking if any data exists for first 5 contact IDs...');
                     $debugResult = $connector->query($debugSql);
@@ -330,13 +326,16 @@ SQL;
 
                 $cid = null;
                 $clearedDate = null;
+                $processDate = null;
                 $amount = null;
 
                 foreach ($row as $key => $value) {
                     if (strcasecmp($key, 'CONTACT_ID') === 0) {
                         $cid = (string) $value;
                     } elseif (strcasecmp($key, 'CLEARED_DATE') === 0) {
-                        $clearedDate = (string) $value;
+                        $clearedDate = $this->normalizeSnowflakeDate((string) $value);
+                    } elseif (strcasecmp($key, 'PROCESS_DATE') === 0) {
+                        $processDate = $this->normalizeSnowflakeDate((string) $value);
                     } elseif (strcasecmp($key, 'AMOUNT') === 0) {
                         $amount = $value;
                     }
@@ -355,10 +354,17 @@ SQL;
                 $llgOriginal = $contactToLlg[$cid] ?? ('LLG-' . $cid);
                 $llgId = $this->truncateString($llgOriginal, 100);
 
+                $today = now()->format('Y-m-d');
+                if ($clearedDate > $today) {
+                    $this->warn("Skipping FUTURE cleared date for {$llgId}: {$clearedDate}");
+                    continue;
+                }
+
                 $this->info("✓ Found payment for {$llgId}: {$clearedDate}, Amount: " . ($amount ?? 'NULL'));
 
                 $payments[$llgId] = [
                     'cleared_date' => $clearedDate,
+                    'process_date' => $processDate,
                     'amount' => $amount,
                 ];
             }
@@ -394,12 +400,21 @@ SQL;
 
         foreach ($batches as $chunk) {
             $casesDate = [];
+            $casesProcessDate = [];
             $casesAmount = [];
             $ids = [];
 
             foreach ($chunk as $llgId => $data) {
                 $llgEsc = $this->truncateString($this->escapeSqlString($llgId), 100);
                 $dateEsc = $this->truncateString($this->escapeSqlString($data['cleared_date']), 50);
+                $processDateVal = $data['process_date'] ?? null;
+                $processDateEsc = null;
+                if ($processDateVal !== null && $processDateVal !== '') {
+                    $processDateEsc = $this->truncateString(
+                        $this->escapeSqlString((string) $processDateVal),
+                        50
+                    );
+                }
                 $amountVal = $data['amount'];
                 $amountSql = 'NULL';
                 if ($amountVal !== null && $amountVal !== '' && is_numeric($amountVal)) {
@@ -407,6 +422,9 @@ SQL;
                 }
 
                 $casesDate[] = "WHEN '{$llgEsc}' THEN '{$dateEsc}'";
+                if ($processDateEsc !== null) {
+                    $casesProcessDate[] = "WHEN '{$llgEsc}' THEN '{$processDateEsc}'";
+                }
                 $casesAmount[] = "WHEN '{$llgEsc}' THEN {$amountSql}";
                 $ids[] = "'{$llgEsc}'";
             }
@@ -416,15 +434,24 @@ SQL;
             }
 
             $caseDateSql = implode(' ', $casesDate);
+            $caseProcessDateSql = implode(' ', $casesProcessDate);
             $caseAmountSql = implode(' ', $casesAmount);
             $idList = implode(', ', $ids);
+
+            $setClauses = [
+                "First_Payment_Cleared_Date = CASE LLG_ID {$caseDateSql} END",
+                "First_Payment_Status = 'Cleared'",
+                "Program_Payment = CASE LLG_ID {$caseAmountSql} END",
+            ];
+            if ($caseProcessDateSql !== '') {
+                $setClauses[] = "First_Payment_Date = CASE LLG_ID {$caseProcessDateSql} ELSE First_Payment_Date END";
+            }
+            $setSql = implode(",\n    ", $setClauses);
 
             $sql = <<<SQL
 UPDATE TblEnrollment
 SET
-    First_Payment_Cleared_Date = CASE LLG_ID {$caseDateSql} END,
-    First_Payment_Status = 'Cleared',
-    Program_Payment = CASE LLG_ID {$caseAmountSql} END
+    {$setSql}
 WHERE LLG_ID IN ({$idList});
 SQL;
 
@@ -557,6 +584,41 @@ SQL;
     protected function escapeSqlString(string $value): string
     {
         return str_replace("'", "''", $value);
+    }
+
+    protected function normalizeSnowflakeDate(string $value): ?string
+    {
+        $trimmed = trim($value);
+        if ($trimmed === '') {
+            return null;
+        }
+
+        if (preg_match('/^\\d{4}-\\d{2}-\\d{2}/', $trimmed) === 1) {
+            return substr($trimmed, 0, 10);
+        }
+
+        if (preg_match('/^\\d{8}$/', $trimmed) === 1) {
+            $parsed = \DateTimeImmutable::createFromFormat('Ymd', $trimmed);
+            return $parsed ? $parsed->format('Y-m-d') : null;
+        }
+
+        if (preg_match('/^\\d+(?:\\.\\d+)?$/', $trimmed) === 1) {
+            // Snowflake can return DATE as days since 1970-01-01.
+            $days = (int) floor((float) $trimmed);
+            if ($days <= 0) {
+                return null;
+            }
+            $epoch = new \DateTimeImmutable('1970-01-01', new \DateTimeZone('UTC'));
+            $parsed = $epoch->modify('+' . $days . ' days');
+            return $parsed ? $parsed->format('Y-m-d') : null;
+        }
+
+        try {
+            $parsed = new \DateTimeImmutable($trimmed);
+            return $parsed->format('Y-m-d');
+        } catch (\Throwable $e) {
+            return null;
+        }
     }
 
     protected function truncateString(string $value, int $maxLength): string

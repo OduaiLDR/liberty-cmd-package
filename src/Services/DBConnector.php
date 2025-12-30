@@ -376,6 +376,9 @@ class DBConnector
         // Some long‑running statements may return a status URL first; poll until results are ready.
         if (!isset($result['resultSetMetaData']) && isset($result['statementStatusUrl'])) {
             $statusUrl = $result['statementStatusUrl'];
+            if (!str_starts_with($statusUrl, 'http')) {
+                $statusUrl = 'https://' . strtolower($this->account) . '.snowflakecomputing.com' . $statusUrl;
+            }
 
             for ($i = 0; $i < 60; $i++) {
                 // Small delay between polls
