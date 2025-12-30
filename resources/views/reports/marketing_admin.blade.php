@@ -55,6 +55,15 @@
 
                 <div class="collapse mt-3" id="advFilters">
                     <div class="row g-3">
+                        <div class="col-12 col-md-3">
+                            <label class="form-label">Intent</label>
+                            <select name="intent" class="form-select">
+                                @php $intentVal = $filters['intent'] ?? 'all'; @endphp
+                                <option value="all" @if($intentVal === 'all') selected @endif>All</option>
+                                <option value="yes" @if($intentVal === 'yes') selected @endif>Yes (Has intent)</option>
+                                <option value="no" @if($intentVal === 'no') selected @endif>No (No intent)</option>
+                            </select>
+                        </div>
                         <div class="col-12 col-md-4">
                             <label class="form-label">State</label>
                             <select name="state" class="form-select">
@@ -164,6 +173,17 @@
         <div class="card-body">
             @isset($error)
                 <div class="alert alert-danger">{{ $error }}</div>
+            @endisset
+
+            @isset($intentAudit)
+                <div class="alert alert-info mb-3">
+                    <div class="fw-bold mb-1">Audit:</div>
+                    <div class="d-flex flex-wrap gap-3">
+                        <span>Total: {{ $intentAudit['total'] ?? 0 }}</span>
+                        <span>With intent: {{ $intentAudit['with'] ?? 0 }}</span>
+                        <span>Without intent: {{ $intentAudit['without'] ?? 0 }}</span>
+                    </div>
+                </div>
             @endisset
 
             @if (empty($columns))
