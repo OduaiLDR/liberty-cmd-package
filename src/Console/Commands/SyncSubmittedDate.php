@@ -10,7 +10,7 @@ class SyncSubmittedDate extends Command
 {
     protected $signature = 'sync:submitted-date';
 
-    protected $description = 'Sync Submitted_Date in TblEnrollment from Snowflake CONTACTS_STATUS (status 377680, last 60 days)';
+    protected $description = 'Sync Submitted_Date in TblEnrollment from Snowflake CONTACTS_STATUS (statuses 123480, 377643, 377680, 37768; last 7 days)';
 
     public function handle(): int
     {
@@ -34,25 +34,8 @@ class SyncSubmittedDate extends Command
                 $connector->initializeSqlServer();
                 $this->ensureLogTable($connector);
 
-                $this->info("[$source] Fetching IDs missing Submitted_Date from SQL Server...");
-                $missingIds = $this->fetchMissingIdsFromSqlServer($connector);
-
-                if (empty($missingIds)) {
-                    $this->warn("[$source] No rows missing Submitted_Date in SQL Server.");
-                    $this->insertLogRow(
-                        $connector,
-                        $source,
-                        'SYNC_SUBMITTED_DATE',
-                        'SUCCESS',
-                        0,
-                        0,
-                        'No rows missing Submitted_Date in SQL Server.'
-                    );
-                    continue;
-                }
-
-                $this->info("[$source] Fetching submitted dates from Snowflake for missing IDs...");
-                $submitted = $this->fetchSubmittedFromSnowflake($connector, $missingIds);
+                $this->info("[$source] Fetching submitted dates from Snowflake...");
+                $submitted = $this->fetchSubmittedFromSnowflake($connector);
 
                 if (empty($submitted)) {
                     $this->warn("[$source] No submitted dates found in Snowflake.");
@@ -137,10 +120,30 @@ class SyncSubmittedDate extends Command
 
     protected function fetchMissingIdsFromSqlServer(DBConnector $connector): array
     {
+        $hasLookbackDate = false;
+        $columnCheckSql = <<<SQL
+SELECT CASE WHEN COL_LENGTH('dbo.TblEnrollment', 'Lookback_Date') IS NULL THEN 0 ELSE 1 END AS has_col
+SQL;
+
+        $columnCheck = $connector->querySqlServer($columnCheckSql);
+        if (is_array($columnCheck)) {
+            if (isset($columnCheck['data'][0]['has_col'])) {
+                $hasLookbackDate = (int) $columnCheck['data'][0]['has_col'] === 1;
+            } elseif (isset($columnCheck['has_col'])) {
+                $hasLookbackDate = (int) $columnCheck['has_col'] === 1;
+            }
+        }
+
+        $lookbackFilter = '';
+        if ($hasLookbackDate) {
+            $lookbackFilter = "  AND (Lookback_Date IS NULL OR Lookback_Date >= DATEADD(day, -90, CAST(GETDATE() AS date)))\n";
+        }
+
         $sql = <<<SQL
 SELECT LLG_ID
 FROM TblEnrollment
 WHERE Submitted_Date IS NULL
+{$lookbackFilter}
 SQL;
 
         $result = $connector->querySqlServer($sql);
@@ -175,89 +178,68 @@ SQL;
         return $ids;
     }
 
-    protected function fetchSubmittedFromSnowflake(DBConnector $connector, array $missingLlgs): array
+    protected function fetchSubmittedFromSnowflake(DBConnector $connector): array
     {
-        if (empty($missingLlgs)) {
-            return [];
-        }
-
-        // Strip LLG- prefix for Snowflake CONTACT_ID lookup
-        $contactIds = array_map(function ($llg) {
-            return preg_replace('/^LLG-?/i', '', $llg);
-        }, $missingLlgs);
-
-        $chunks = array_chunk($contactIds, 500);
         $baseSql = <<<SQL
 SELECT
     CONTACT_ID,
     TO_CHAR(STAMP, 'YYYY-MM-DD') AS SUBMITTED_DATE
 FROM CONTACTS_STATUS
-WHERE STATUS_ID = 377680
-  AND STAMP >= DATEADD(day, -60, CURRENT_DATE)
+WHERE STATUS_ID IN (123480, 377643, 377680, 37768)
+  AND STAMP >= DATEADD(day, -7, CURRENT_DATE)
+ORDER BY STAMP ASC
 SQL;
 
         $submitted = [];
+        try {
+            $result = $connector->query($baseSql);
+        } catch (\Throwable $e) {
+            $this->warn("[$connector->getConnectionName()] Snowflake query failed: {$e->getMessage()}");
+            Log::warning('SyncSubmittedDate: Snowflake query failed.', [
+                'error' => $e->getMessage(),
+            ]);
+            $result = [];
+        }
 
-        foreach ($chunks as $chunk) {
-            $escapedIds = array_map(function ($id) {
-                return "'" . $this->escapeSqlString($id) . "'";
-            }, $chunk);
-            $inList = implode(', ', $escapedIds);
-
-            $pagedSql = $baseSql . " AND CONTACT_ID IN ({$inList}) ORDER BY STAMP ASC";
-
-            try {
-                $result = $connector->query($pagedSql);
-            } catch (\Throwable $e) {
-                $this->warn("[$connector->getConnectionName()] Snowflake query failed: {$e->getMessage()}");
-                Log::warning('SyncSubmittedDate: Snowflake query failed.', [
-                    'error' => $e->getMessage(),
-                    'chunk_size' => count($chunk),
+        if (is_array($result)) {
+            if (isset($result['success']) && $result['success'] === false) {
+                Log::warning('SyncSubmittedDate: Snowflake returned success=false.', [
+                    'result' => $result,
                 ]);
-                $result = [];
-            }
-
-            if (is_array($result)) {
-                if (isset($result['success']) && $result['success'] === false) {
-                    Log::warning('SyncSubmittedDate: Snowflake returned success=false.', [
-                        'result' => $result,
-                        'chunk_size' => count($chunk),
-                    ]);
-                    $rows = [];
-                } elseif (isset($result['data']) && is_array($result['data'])) {
-                    $rows = $result['data'];
-                } elseif (array_is_list($result)) {
-                    $rows = $result;
-                } else {
-                    $rows = [];
-                }
+                $rows = [];
+            } elseif (isset($result['data']) && is_array($result['data'])) {
+                $rows = $result['data'];
+            } elseif (array_is_list($result)) {
+                $rows = $result;
             } else {
                 $rows = [];
             }
+        } else {
+            $rows = [];
+        }
 
-            foreach ($rows as $row) {
-                if (!is_array($row)) {
-                    continue;
-                }
-
-                $cid = null;
-                $submittedDate = null;
-
-                foreach ($row as $key => $value) {
-                    if (strcasecmp($key, 'CONTACT_ID') === 0) {
-                        $cid = (string) $value;
-                    } elseif (strcasecmp($key, 'SUBMITTED_DATE') === 0) {
-                        $submittedDate = (string) $value;
-                    }
-                }
-
-                if ($cid === null || $cid === '' || $submittedDate === null || $submittedDate === '') {
-                    continue;
-                }
-
-                $llgId = $this->truncateString('LLG-' . $cid, 100);
-                $submitted[$llgId] = $submittedDate;
+        foreach ($rows as $row) {
+            if (!is_array($row)) {
+                continue;
             }
+
+            $cid = null;
+            $submittedDate = null;
+
+            foreach ($row as $key => $value) {
+                if (strcasecmp($key, 'CONTACT_ID') === 0) {
+                    $cid = (string) $value;
+                } elseif (strcasecmp($key, 'SUBMITTED_DATE') === 0) {
+                    $submittedDate = (string) $value;
+                }
+            }
+
+            if ($cid === null || $cid === '' || $submittedDate === null || $submittedDate === '') {
+                continue;
+            }
+
+            $llgId = $this->truncateString('LLG-' . $cid, 100);
+            $submitted[$llgId] = $submittedDate;
         }
 
         $this->info('Fetched ' . count($submitted) . ' submitted dates from Snowflake.');

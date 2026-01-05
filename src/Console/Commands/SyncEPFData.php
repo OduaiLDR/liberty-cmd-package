@@ -128,10 +128,10 @@ SELECT
     CONCAT('LLG-', t.CONTACT_ID) AS LLG_ID,
     t.PAID_TO,
     t.AMOUNT,
-    t.DRAFT_DATE,
-    t.PROCESS_DATE,
-    t.RETURNED_DATE,
-    t.CLEARED_DATE,
+    TO_CHAR(t.DRAFT_DATE, 'YYYY-MM-DD HH24:MI:SS') AS DRAFT_DATE,
+    TO_CHAR(t.PROCESS_DATE, 'YYYY-MM-DD HH24:MI:SS') AS PROCESS_DATE,
+    TO_CHAR(t.RETURNED_DATE, 'YYYY-MM-DD HH24:MI:SS') AS RETURNED_DATE,
+    TO_CHAR(t.CLEARED_DATE, 'YYYY-MM-DD HH24:MI:SS') AS CLEARED_DATE,
     s.ID AS SETTLEMENT_ID,
     s.ORIGINAL_AMOUNT,
     s.SETTLEMENT_AMOUNT,
@@ -171,6 +171,17 @@ SQL;
             $rows = [];
         }
 
+        if (!empty($rows) && env('EPF_DEBUG', false)) {
+            $sample = $rows[0];
+            Log::info('SyncEPFData: Snowflake sample dates.', [
+                'draft_date' => $this->valueForKey($sample, 'DRAFT_DATE'),
+                'process_date' => $this->valueForKey($sample, 'PROCESS_DATE'),
+                'cleared_date' => $this->valueForKey($sample, 'CLEARED_DATE'),
+                'returned_date' => $this->valueForKey($sample, 'RETURNED_DATE'),
+                'keys' => array_keys($sample),
+            ]);
+        }
+
         $records = [];
         foreach ($rows as $row) {
             if (!is_array($row)) {
@@ -198,6 +209,12 @@ SQL;
                 'offer_id' => $this->valueForKey($row, 'OFFER_ID') ?? '',
                 'payment_number' => $paymentNumber ?? '',
             ];
+        }
+
+        if (!empty($records) && env('EPF_DEBUG', false)) {
+            Log::info('SyncEPFData: sample EPF record.', [
+                'sample' => $records[0],
+            ]);
         }
 
         $this->info('Fetched ' . count($records) . ' EPF rows from Snowflake.');
@@ -246,10 +263,10 @@ SQL;
                 $values .= "'" . $this->escapeSqlString((string) $row['llg_id']) . "'";
                 $values .= ", '" . $this->escapeSqlString((string) $row['paid_to']) . "'";
                 $values .= ', ' . $this->vbaVal($row['amount']);
-                $values .= ', ' . $this->sqlNullableString($row['draft_date']);
-                $values .= ', ' . $this->sqlNullableString($row['process_date']);
-                $values .= ', ' . $this->sqlNullableString($row['returned_date']);
-                $values .= ', ' . $this->sqlNullableString($row['cleared_date']);
+                $values .= ', ' . $this->sqlNullableDateTime($row['draft_date']);
+                $values .= ', ' . $this->sqlNullableDateTime($row['process_date']);
+                $values .= ', ' . $this->sqlNullableDateTime($row['returned_date']);
+                $values .= ', ' . $this->sqlNullableDateTime($row['cleared_date']);
                 $values .= ', ' . $this->sqlNullableString($row['settlement_id']);
                 $values .= ', ' . $this->sqlNullableString($row['original_amount']);
                 $values .= ', ' . $this->sqlNullableString($row['settlement_amount']);
@@ -286,6 +303,44 @@ SQL;
         }
 
         return "'" . $this->escapeSqlString($string) . "'";
+    }
+
+    protected function sqlNullableDateTime($value): string
+    {
+        if ($value instanceof \DateTimeInterface) {
+            $formatted = $value->format('Y-m-d H:i:s');
+            return "CONVERT(datetime, '" . $this->escapeSqlString($formatted) . "', 120)";
+        }
+
+        $string = trim((string) ($value ?? ''));
+        if ($string === '' || strcasecmp($string, 'null') === 0) {
+            return 'NULL';
+        }
+
+        // Fast-path ISO-ish values without re-parsing.
+        if (preg_match('/^\d{4}-\d{2}-\d{2}/', $string)) {
+            $normalized = substr($string, 0, 19);
+            if (strlen($normalized) === 10) {
+                $normalized .= ' 00:00:00';
+            }
+            $normalized = str_replace('T', ' ', $normalized);
+            return "CONVERT(datetime, '" . $this->escapeSqlString($normalized) . "', 120)";
+        }
+
+        try {
+            $dt = new \DateTimeImmutable($string);
+            $formatted = $dt->format('Y-m-d H:i:s');
+            return "CONVERT(datetime, '" . $this->escapeSqlString($formatted) . "', 120)";
+        } catch (\Throwable $e) {
+            // Fall back to common Snowflake patterns.
+        }
+
+        if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $string)) {
+            $formatted = $string . ' 00:00:00';
+            return "CONVERT(datetime, '" . $this->escapeSqlString($formatted) . "', 120)";
+        }
+
+        return 'NULL';
     }
 
     protected function vbaVal($value): string
