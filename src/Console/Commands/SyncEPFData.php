@@ -246,10 +246,10 @@ SQL;
                 $values .= "'" . $this->escapeSqlString((string) $row['llg_id']) . "'";
                 $values .= ", '" . $this->escapeSqlString((string) $row['paid_to']) . "'";
                 $values .= ', ' . $this->vbaVal($row['amount']);
-                $values .= ', ' . $this->sqlNullableString($row['draft_date']);
-                $values .= ', ' . $this->sqlNullableString($row['process_date']);
-                $values .= ', ' . $this->sqlNullableString($row['returned_date']);
-                $values .= ', ' . $this->sqlNullableString($row['cleared_date']);
+                $values .= ', ' . $this->sqlNullableDateTime($row['draft_date']);
+                $values .= ', ' . $this->sqlNullableDateTime($row['process_date']);
+                $values .= ', ' . $this->sqlNullableDateTime($row['returned_date']);
+                $values .= ', ' . $this->sqlNullableDateTime($row['cleared_date']);
                 $values .= ', ' . $this->sqlNullableString($row['settlement_id']);
                 $values .= ', ' . $this->sqlNullableString($row['original_amount']);
                 $values .= ', ' . $this->sqlNullableString($row['settlement_amount']);
@@ -286,6 +286,35 @@ SQL;
         }
 
         return "'" . $this->escapeSqlString($string) . "'";
+    }
+
+    protected function sqlNullableDateTime($value): string
+    {
+        if ($value instanceof \DateTimeInterface) {
+            return "'" . $this->escapeSqlString($value->format('Y-m-d H:i:s')) . "'";
+        }
+
+        $string = trim((string) ($value ?? ''));
+        if ($string === '') {
+            return 'NULL';
+        }
+
+        try {
+            $dt = new \DateTimeImmutable($string);
+            return "'" . $this->escapeSqlString($dt->format('Y-m-d H:i:s')) . "'";
+        } catch (\Throwable $e) {
+            // Fall back to common Snowflake patterns.
+        }
+
+        if (preg_match('/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}/', $string)) {
+            return "'" . $this->escapeSqlString(substr($string, 0, 19)) . "'";
+        }
+
+        if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $string)) {
+            return "'" . $this->escapeSqlString($string . ' 00:00:00') . "'";
+        }
+
+        return 'NULL';
     }
 
     protected function vbaVal($value): string
