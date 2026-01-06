@@ -8,7 +8,7 @@ use Illuminate\Support\Facades\Log;
 
 class SyncEPFData extends Command
 {
-    protected $signature = 'sync:epf-data';
+    protected $signature = 'sync:epf-data {--full-refresh : Delete existing EPF rows before inserting}';
 
     protected $description = 'Sync EPF payment data into TblEPFs from Snowflake transactions and settlements';
 
@@ -21,7 +21,7 @@ class SyncEPFData extends Command
         $hadException = false;
 
         foreach ($connections as $connection) {
-            $source = strtoupper($connection);
+            $source = $this->sourceLabelForConnection($connection);
             $this->info("[$source] Starting EPF sync.");
             Log::info('SyncEPFData: starting connection.', [
                 'connection' => $connection,
@@ -32,6 +32,9 @@ class SyncEPFData extends Command
                 $connector = DBConnector::fromEnvironment($connection);
                 $connector->initializeSqlServer();
                 $this->ensureLogTable($connector);
+                if (env('EPF_DEBUG', false)) {
+                    $this->logSqlServerCounts($connector, $source, 'before');
+                }
 
                 $this->info("[$source] Fetching EPF rows from Snowflake...");
                 $rows = $this->fetchEpfRowsFromSnowflake($connector);
@@ -57,6 +60,9 @@ class SyncEPFData extends Command
                 $inserted = $this->insertEpfRows($connector, $rows, $source);
 
                 $this->info("[$source] Inserted {$inserted} EPF rows.");
+                if (env('EPF_DEBUG', false)) {
+                    $this->logSqlServerCounts($connector, $source, 'after');
+                }
                 $this->insertLogRow(
                     $connector,
                     $source,
@@ -123,15 +129,19 @@ class SyncEPFData extends Command
 
     protected function fetchEpfRowsFromSnowflake(DBConnector $connector): array
     {
+        Log::info('SyncEPFData: fetch mode single query (VBA-style).');
+        $this->logSnowflakeCounts($connector);
+
+        // Exact VBA query - single query, no pagination
         $sql = <<<SQL
 SELECT
     CONCAT('LLG-', t.CONTACT_ID) AS LLG_ID,
     t.PAID_TO,
     t.AMOUNT,
-    TO_CHAR(t.DRAFT_DATE, 'YYYY-MM-DD HH24:MI:SS') AS DRAFT_DATE,
-    TO_CHAR(t.PROCESS_DATE, 'YYYY-MM-DD HH24:MI:SS') AS PROCESS_DATE,
-    TO_CHAR(t.RETURNED_DATE, 'YYYY-MM-DD HH24:MI:SS') AS RETURNED_DATE,
-    TO_CHAR(t.CLEARED_DATE, 'YYYY-MM-DD HH24:MI:SS') AS CLEARED_DATE,
+    t.DRAFT_DATE,
+    t.PROCESS_DATE,
+    t.RETURNED_DATE,
+    t.CLEARED_DATE,
     s.ID AS SETTLEMENT_ID,
     s.ORIGINAL_AMOUNT,
     s.SETTLEMENT_AMOUNT,
@@ -151,25 +161,11 @@ SQL;
         try {
             $result = $connector->query($sql);
         } catch (\Throwable $e) {
-            $this->warn('Snowflake query failed: ' . $e->getMessage());
-            Log::warning('SyncEPFData: Snowflake query failed.', ['error' => $e->getMessage()]);
+            Log::error('SyncEPFData: Snowflake query failed.', ['error' => $e->getMessage()]);
             throw $e;
         }
 
-        if (is_array($result)) {
-            if (isset($result['success']) && $result['success'] === false) {
-                Log::warning('SyncEPFData: Snowflake query success=false.', ['result' => $result]);
-                $rows = [];
-            } elseif (isset($result['data']) && is_array($result['data'])) {
-                $rows = $result['data'];
-            } elseif (array_is_list($result)) {
-                $rows = $result;
-            } else {
-                $rows = [];
-            }
-        } else {
-            $rows = [];
-        }
+        $rows = $this->extractSnowflakeRows($result);
 
         if (!empty($rows) && env('EPF_DEBUG', false)) {
             $sample = $rows[0];
@@ -222,6 +218,293 @@ SQL;
         return $records;
     }
 
+    protected function extractSnowflakeRows($result): array
+    {
+        if (is_array($result)) {
+            if (isset($result['success']) && $result['success'] === false) {
+                Log::warning('SyncEPFData: Snowflake query success=false.', ['result' => $result]);
+                return [];
+            }
+            if (isset($result['data']) && is_array($result['data'])) {
+                return $result['data'];
+            }
+            if (array_is_list($result)) {
+                return $result;
+            }
+        }
+
+        return [];
+    }
+
+    protected function fetchEpfRowsFromSnowflakePaged(
+        DBConnector $connector,
+        string $baseSql,
+        string $orderBy,
+        ?int $expectedRowCount = null
+    ): array {
+        $pageSize = (int) env('EPF_PAGE_SIZE', 10000);
+        if ($pageSize <= 0) {
+            $pageSize = 10000;
+        }
+
+        $offset = 0;
+        $allRows = [];
+
+        while (true) {
+            $pagedSql = $baseSql . "\n" . $orderBy . "\nLIMIT {$pageSize} OFFSET {$offset}";
+
+            try {
+                $result = $connector->query($pagedSql);
+            } catch (\Throwable $e) {
+                $this->warn('Snowflake paged query failed: ' . $e->getMessage());
+                Log::warning('SyncEPFData: Snowflake paged query failed.', [
+                    'error' => $e->getMessage(),
+                    'offset' => $offset,
+                    'limit' => $pageSize,
+                ]);
+                break;
+            }
+
+            $rows = $this->extractSnowflakeRows($result);
+            $count = count($rows);
+            if ($count === 0) {
+                break;
+            }
+
+            $allRows = array_merge($allRows, $rows);
+
+            if (env('EPF_DEBUG', false)) {
+                Log::info('SyncEPFData: Snowflake paged fetch batch.', [
+                    'offset' => $offset,
+                    'limit' => $pageSize,
+                    'count' => $count,
+                    'total' => count($allRows),
+                ]);
+            }
+
+            if ($count < $pageSize) {
+                if ($expectedRowCount !== null && count($allRows) < $expectedRowCount) {
+                    // Keep paginating until we reach the expected total, even if Snowflake returns short pages.
+                } else {
+                    break;
+                }
+            }
+
+            $offset += $pageSize;
+
+            if ($expectedRowCount !== null && count($allRows) >= $expectedRowCount) {
+                break;
+            }
+        }
+
+        return $allRows;
+    }
+
+    protected function fetchEpfRowsFromSnowflakeChunked(
+        DBConnector $connector,
+        string $baseSql,
+        string $orderBy,
+        int $pageSize,
+        ?int $expectedRowCount = null
+    ): array {
+        $start = 0;
+        $allRows = [];
+
+        while (true) {
+            $chunkSql = <<<SQL
+WITH base AS (
+{$baseSql}
+),
+numbered AS (
+    SELECT base.*, ROW_NUMBER() OVER (ORDER BY {$orderBy}) AS RN_GLOBAL
+    FROM base
+)
+SELECT *
+FROM numbered
+WHERE RN_GLOBAL > {$start}
+  AND RN_GLOBAL <= {$start} + {$pageSize}
+ORDER BY RN_GLOBAL
+SQL;
+
+            try {
+                $result = $connector->query($chunkSql);
+            } catch (\Throwable $e) {
+                $this->warn('Snowflake chunked query failed: ' . $e->getMessage());
+                Log::warning('SyncEPFData: Snowflake chunked query failed.', [
+                    'error' => $e->getMessage(),
+                    'start' => $start,
+                    'page_size' => $pageSize,
+                ]);
+                break;
+            }
+
+            $rows = $this->extractSnowflakeRows($result);
+            $count = count($rows);
+            if ($count === 0) {
+                break;
+            }
+
+            $allRows = array_merge($allRows, $rows);
+
+            if (env('EPF_DEBUG', false)) {
+                Log::info('SyncEPFData: Snowflake chunked fetch batch.', [
+                    'start' => $start,
+                    'page_size' => $pageSize,
+                    'count' => $count,
+                    'total' => count($allRows),
+                ]);
+            }
+
+            if ($count < $pageSize) {
+                if ($expectedRowCount !== null && count($allRows) < $expectedRowCount) {
+                    // keep looping
+                } else {
+                    break;
+                }
+            }
+
+            $start += $pageSize;
+
+            if ($expectedRowCount !== null && count($allRows) >= $expectedRowCount) {
+                break;
+            }
+        }
+
+        return $allRows;
+    }
+
+    protected function logSnowflakeCounts(DBConnector $connector): array
+    {
+        try {
+            $info = $connector->getConnectionInfo();
+            Log::info('SyncEPFData: Snowflake connection info.', $info);
+        } catch (\Throwable $e) {
+            Log::warning('SyncEPFData: unable to read Snowflake connection info.', ['error' => $e->getMessage()]);
+        }
+
+        $counts = [
+            'pf_total' => <<<SQL
+SELECT COUNT(*) AS CNT
+FROM TRANSACTIONS t
+WHERE t.TRANS_TYPE = 'PF'
+  AND t._FIVETRAN_DELETED = 'FALSE'
+SQL,
+            'pf_linked' => <<<SQL
+SELECT COUNT(*) AS CNT
+FROM TRANSACTIONS t
+WHERE t.TRANS_TYPE = 'PF'
+  AND t.RETURNED_DATE IS NULL
+  AND t.LINKED_TO <> 0
+  AND t._FIVETRAN_DELETED = 'FALSE'
+SQL,
+            'pf_joined' => <<<SQL
+SELECT COUNT(*) AS CNT
+FROM TRANSACTIONS AS t, SETTLEMENTS AS s
+WHERE t.LINKED_TO = s.TRANS_ID
+  AND t.TRANS_TYPE = 'PF'
+  AND t.RETURNED_DATE IS NULL
+  AND t.LINKED_TO <> 0
+  AND t._FIVETRAN_DELETED = 'FALSE'
+  AND s._FIVETRAN_DELETED = 'FALSE'
+SQL,
+        ];
+
+        $results = [];
+        foreach ($counts as $label => $sql) {
+            $count = $this->snowflakeCount($connector, $sql);
+            if ($count === null) {
+                Log::warning('SyncEPFData: Snowflake count unavailable.', ['label' => $label]);
+                $results[$label] = null;
+                continue;
+            }
+
+            Log::info('SyncEPFData: Snowflake count.', [
+                'label' => $label,
+                'count' => $count,
+            ]);
+            $results[$label] = $count;
+        }
+
+        return $results;
+    }
+
+    protected function snowflakeCount(DBConnector $connector, string $sql): ?int
+    {
+        try {
+            $result = $connector->query($sql);
+        } catch (\Throwable $e) {
+            Log::warning('SyncEPFData: Snowflake count query failed.', [
+                'error' => $e->getMessage(),
+                'sql' => mb_substr($sql, 0, 200),
+            ]);
+            return null;
+        }
+
+        if (is_array($result) && isset($result['data'][0]) && is_array($result['data'][0])) {
+            $value = $this->valueForKey($result['data'][0], 'CNT');
+            if ($value !== null && is_numeric($value)) {
+                return (int) $value;
+            }
+        }
+
+        return null;
+    }
+
+    protected function logSqlServerCounts(DBConnector $connector, string $source, string $stage): void
+    {
+        $info = $connector->querySqlServer('SELECT @@SERVERNAME AS SERVER_NAME, DB_NAME() AS DATABASE_NAME');
+        if (is_array($info) && isset($info['data'][0]) && is_array($info['data'][0])) {
+            $row = $info['data'][0];
+            Log::info('SyncEPFData: SQL Server connection info.', [
+                'stage' => $stage,
+                'server' => $row['SERVER_NAME'] ?? null,
+                'database' => $row['DATABASE_NAME'] ?? null,
+            ]);
+        }
+
+        $sourceCount = $this->sqlServerCount(
+            $connector,
+            'SELECT COUNT(*) AS CNT FROM TblEPFs WHERE Source = ?',
+            [$source]
+        );
+        $totalCount = $this->sqlServerCount(
+            $connector,
+            'SELECT COUNT(*) AS CNT FROM TblEPFs',
+            []
+        );
+
+        Log::info('SyncEPFData: SQL Server counts.', [
+            'stage' => $stage,
+            'source' => $source,
+            'source_count' => $sourceCount,
+            'total_count' => $totalCount,
+        ]);
+    }
+
+    protected function sqlServerCount(DBConnector $connector, string $sql, array $params = []): ?int
+    {
+        $result = $connector->querySqlServer($sql, $params);
+        if (!is_array($result) || !isset($result['data'][0]) || !is_array($result['data'][0])) {
+            return null;
+        }
+
+        $value = $this->valueForKey($result['data'][0], 'CNT');
+        if ($value !== null && is_numeric($value)) {
+            return (int) $value;
+        }
+
+        return null;
+    }
+
+    protected function sourceLabelForConnection(string $connection): string
+    {
+        if (strcasecmp($connection, 'plaw') === 0) {
+            return 'ProLaw';
+        }
+
+        return strtoupper($connection);
+    }
+
     protected function deleteEpfBySource(DBConnector $connector, string $source): int
     {
         $sourceEsc = $this->escapeSqlString($source);
@@ -249,7 +532,23 @@ SQL;
             return 0;
         }
 
-        $fields = 'LLG_ID, Paid_To, Amount, Draft_Date, Process_Date, Returned_Date, Cleared_Date, Settlement_ID, Original_Amount, Settlement_Amount, Creditor_Name, Offer_ID, Payment_Number, Source';
+        $fieldList = [
+            'LLG_ID',
+            'Paid_To',
+            'Amount',
+            'Draft_Date',
+            'Process_Date',
+            'Returned_Date',
+            'Cleared_Date',
+            'Settlement_ID',
+            'Original_Amount',
+            'Settlement_Amount',
+            'Creditor_Name',
+            'Offer_ID',
+            'Payment_Number',
+            'Source',
+        ];
+        $fields = implode(', ', $fieldList);
         $inserted = 0;
         $batchSize = 1000;
         $sourceEsc = $this->escapeSqlString($source);
@@ -277,7 +576,8 @@ SQL;
                 $values .= ')';
             }
 
-            $sql = "INSERT INTO TblEPFs ({$fields}) VALUES " . ltrim($values, ',');
+            $valuesSql = ltrim($values, ',');
+            $sql = "INSERT INTO TblEPFs ({$fields}) VALUES {$valuesSql}";
             $result = $connector->querySqlServer($sql);
             if (is_array($result) && isset($result['success']) && $result['success'] === false) {
                 $errorMsg = $result['error'] ?? 'Unknown SQL Server error';
@@ -289,7 +589,11 @@ SQL;
                 throw new \RuntimeException('Insert failed: ' . $errorMsg);
             }
 
-            $inserted += count($batch);
+            if (is_array($result) && isset($result['row_count']) && is_numeric($result['row_count'])) {
+                $inserted += (int) $result['row_count'];
+            } else {
+                $inserted += count($batch);
+            }
         }
 
         return $inserted;
