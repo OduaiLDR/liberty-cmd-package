@@ -621,6 +621,15 @@ SQL,
             return 'NULL';
         }
 
+        // Handle Snowflake epoch days (integer representing days since 1970-01-01)
+        // Values like 20028, 20024, etc. are days since Unix epoch
+        if (preg_match('/^\d{4,5}$/', $string) && (int) $string > 10000 && (int) $string < 50000) {
+            $epochDays = (int) $string;
+            $dt = (new \DateTimeImmutable('1970-01-01'))->modify("+{$epochDays} days");
+            $formatted = $dt->format('Y-m-d H:i:s');
+            return "CONVERT(datetime, '" . $this->escapeSqlString($formatted) . "', 120)";
+        }
+
         // Fast-path ISO-ish values without re-parsing.
         if (preg_match('/^\d{4}-\d{2}-\d{2}/', $string)) {
             $normalized = substr($string, 0, 19);
