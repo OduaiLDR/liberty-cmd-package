@@ -418,9 +418,48 @@ class DBConnector
         $this->debugLog('Initial Snowflake rowCount: ' . ($result['rowCount'] ?? 'n/a'));
         $this->debugLog('Initial nextRowUrl: ' . ($result['nextRowUrl'] ?? 'null'));
 
+        // Check for partition-based pagination (used for large result sets)
+        $partitionInfo = $result['resultSetMetaData']['partitionInfo'] ?? [];
+        $statementHandle = $result['statementHandle'] ?? null;
+        $totalPartitions = count($partitionInfo);
+        
+        $this->debugLog('Partitions found: ' . $totalPartitions);
+        $this->debugLog('Statement handle: ' . ($statementHandle ?? 'null'));
+
+        // Fetch additional partitions (partition 0 is already in $result['data'])
+        if ($totalPartitions > 1 && $statementHandle) {
+            for ($partitionId = 1; $partitionId < $totalPartitions; $partitionId++) {
+                $partitionUrl = sprintf(
+                    'https://%s.snowflakecomputing.com/api/v2/statements/%s?partition=%d',
+                    strtolower($this->account),
+                    $statementHandle,
+                    $partitionId
+                );
+
+                $this->debugLog('Fetching partition ' . $partitionId . ': ' . $partitionUrl);
+
+                $partitionResponse = $this->client->get($partitionUrl, [
+                    'headers' => [
+                        'Authorization' => 'Bearer ' . $token,
+                        'Accept' => 'application/json',
+                        'X-Snowflake-Authorization-Token-Type' => 'OAUTH',
+                    ],
+                ]);
+
+                $partitionBody = $partitionResponse->getBody()->getContents();
+                $partition = json_decode($partitionBody, true);
+
+                if (isset($partition['data']) && is_array($partition['data'])) {
+                    $allData = array_merge($allData, $partition['data']);
+                    $rowCount += count($partition['data']);
+                    $this->debugLog('Partition ' . $partitionId . ' fetched: ' . count($partition['data']) . ' rows, total: ' . $rowCount);
+                }
+            }
+        }
+
+        // Also handle nextRowUrl pagination (fallback for older API)
         $nextRowUrl = $result['nextRowUrl'] ?? null;
         while ($nextRowUrl) {
-            // nextRowUrl can be relative; prepend account host if needed
             if (!str_starts_with($nextRowUrl, 'http')) {
                 $nextRowUrl = 'https://' . strtolower($this->account) . '.snowflakecomputing.com' . $nextRowUrl;
             }
@@ -448,6 +487,8 @@ class DBConnector
 
         $result['data'] = $allData;
         $result['rowCount'] = $rowCount;
+
+        $this->debugLog('Final total rows: ' . $rowCount);
 
         return $this->formatResult($result);
     }
