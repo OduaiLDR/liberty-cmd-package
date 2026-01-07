@@ -30,6 +30,8 @@ final class CmdReportPermissions
         'cmd.reports.offer_authorization_report',
         'cmd.reports.uncleared_settlement_payments_report',
         'cmd.reports.retention_commission_report',
+        'cmd.reports.lead_summary_report',
+        'cmd.reports.contact_analysis_report',
         'cmd.reports.welcome_packet_report',
         'cmd.reports.lending_usa_prospects_report',
         'cmd.reports.client_submission_report',

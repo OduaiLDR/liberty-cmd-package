@@ -9,12 +9,10 @@ use Cmd\Reports\Http\Controllers\ContactReportController;
 use Cmd\Reports\Http\Controllers\EnrollmentReportController;
 use Cmd\Reports\Http\Controllers\LeadReportController;
 use Cmd\Reports\Http\Controllers\CreditorContactsReportController;
-
 use Cmd\Reports\Http\Controllers\EpfPaidReportController;
 use Cmd\Reports\Http\Controllers\EpfDueReportController;
 use Cmd\Reports\Http\Controllers\MailerDataReportController;
 use Cmd\Reports\Http\Controllers\MarketingReportController;
-
 use Cmd\Reports\Http\Controllers\MarketingAdminController;
 use Cmd\Reports\Http\Controllers\DropSummaryController;
 use Cmd\Reports\Http\Controllers\NegotiatorReportController;
@@ -30,6 +28,8 @@ use Cmd\Reports\Http\Controllers\SettlementAnalysisReportController;
 use Cmd\Reports\Http\Controllers\EnrollmentModelReportController;
 use Cmd\Reports\Http\Controllers\GrowthModelReportController;
 use Cmd\Reports\Http\Controllers\EnrollmentFrequencyReportController;
+use Cmd\Reports\Http\Controllers\LeadSummaryReportController;
+use Cmd\Reports\Http\Controllers\ContactAnalysisReportController;
 use Cmd\Reports\Http\Controllers\LdrPastDueReportController;
 use Cmd\Reports\Http\Controllers\LegalReportController;
 use Cmd\Reports\Http\Controllers\ReconsiderationReportController;
@@ -83,6 +83,12 @@ $registerCmdReportRoutes = function (bool $withNames = true): void {
         ->name($name('cmd.reports.veritas_report'));
     Route::get('/agent-roi-report', [AgentRoiReportController::class, 'index'])
         ->name($name('cmd.reports.agent_roi_report'));
+    Route::get('/lead-summary-report', [LeadSummaryReportController::class, 'index'])
+        ->middleware('can:cmd.reports.lead_summary_report')
+        ->name($name('cmd.reports.lead_summary_report'));
+    Route::get('/contact-analysis-report', [ContactAnalysisReportController::class, 'index'])
+        ->middleware('can:cmd.reports.contact_analysis_report')
+        ->name($name('cmd.reports.contact_analysis_report'));
     Route::get('/settlement-analysis-report', [SettlementAnalysisReportController::class, 'index'])
         ->name($name('cmd.reports.settlement_analysis_report'));
     Route::get('/enrollment-model-report', [EnrollmentModelReportController::class, 'index'])
@@ -149,7 +155,6 @@ $registerCmdReportRoutes = function (bool $withNames = true): void {
     Route::get('/lead-report', [LeadReportController::class, 'index'])
         ->middleware('can:cmd.reports.lead_report')
         ->name($name('cmd.reports.lead_report'));
-
     Route::get('/negotiator-report', [NegotiatorReportController::class, 'index'])
         ->middleware('can:cmd.reports.team_ranks')
         ->name($name('cmd.reports.negotiator_report'));
