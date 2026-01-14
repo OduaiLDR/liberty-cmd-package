@@ -9,15 +9,6 @@ use Illuminate\Support\Facades\Log;
 
 class Formatter
 {
-    private const FALLBACK_TO = [
-        'sam@libertydebtrelief.com',
-        'omar@libertydebtrelief.com',
-        'rama@libertydebtrelief.com',
-    ];
-
-    private const FALLBACK_CC = [
-        'jacob@libertydebtrelief.com',
-    ];
 
     /**
      * Build an HTML email body that mirrors the VBA macro layout.
@@ -61,23 +52,28 @@ class Formatter
     }
 
     /**
-     * Send the email (temporarily sending only to oduai@libertydebtrelief.com).
+     * Send the email using TblReports with LDR company.
      */
     public function sendEmail(DBConnector $connector, string $subject, string $body, ?Command $console = null): bool
     {
         $email = new EmailSenderService();
 
-        // Temporarily send only to oduai@libertydebtrelief.com (not using TblReports)
-        $sent = $email->sendMailHtml($subject, $body, ['oduai@libertydebtrelief.com'], []);
+        $sent = $email->sendMailUsingTblReportsHtml(
+            $connector,
+            ['Lookback Summary'],
+            ['LDR'],
+            $subject,
+            $body
+        );
         
         if ($sent) {
             if ($console) {
-                $console->info('[INFO] Lookback Summary email sent to oduai@libertydebtrelief.com (temporary).');
+                $console->info('[INFO] Lookback Summary email sent.');
             }
             return true;
         }
 
-        Log::warning('GenerateLookbackSummaryReport: failed to send email to oduai@libertydebtrelief.com.');
+        Log::warning('GenerateLookbackSummaryReport: failed to send email.');
         return false;
     }
 
