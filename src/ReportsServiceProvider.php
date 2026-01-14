@@ -18,6 +18,7 @@ use Cmd\Reports\Console\Commands\SyncSettlementData;
 use Cmd\Reports\Console\Commands\SyncSettledDebtsData;
 use Cmd\Reports\Console\Commands\SyncEnrollmentStatus;
 use Cmd\Reports\Console\Commands\SyncVerifiedDebts;
+use Cmd\Reports\Console\Commands\GenerateCompanyStatsReport\GenerateCompanyStatsReport;
 use Cmd\Reports\Console\Commands\GenerateWelcomeLetterReport\GenerateWelcomeLetterReport;
 use Cmd\Reports\Console\Commands\GenerateWelcomePacketReport\GenerateWelcomePacketReport;
 use Cmd\Reports\Console\Commands\GenerateLookbackSummaryReport\GenerateLookbackSummaryReport;
@@ -75,6 +76,7 @@ class ReportsServiceProvider extends ServiceProvider
                 GenerateWelcomeLetterReport::class,
                 GenerateWelcomePacketReport::class,
                 GenerateLookbackSummaryReport::class,
+                GenerateCompanyStatsReport::class,
 
             ]);
         }
