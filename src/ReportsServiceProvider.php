@@ -18,6 +18,8 @@ use Cmd\Reports\Console\Commands\SyncSettlementData;
 use Cmd\Reports\Console\Commands\SyncSettledDebtsData;
 use Cmd\Reports\Console\Commands\SyncEnrollmentStatus;
 use Cmd\Reports\Console\Commands\SyncVerifiedDebts;
+use Cmd\Reports\Console\Commands\GenerateWelcomeLetterReport\GenerateWelcomeLetterReport;
+
 
 class ReportsServiceProvider extends ServiceProvider
 {
@@ -68,7 +70,7 @@ class ReportsServiceProvider extends ServiceProvider
                 SyncSettledDebtsData::class,
                 SyncEnrollmentStatus::class,
                 SyncVerifiedDebts::class,
-                
+                GenerateWelcomeLetterReport::class,
             ]);
         }
 
