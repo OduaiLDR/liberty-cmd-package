@@ -22,7 +22,7 @@ use Cmd\Reports\Console\Commands\GenerateCompanyStatsReport\GenerateCompanyStats
 use Cmd\Reports\Console\Commands\GenerateWelcomeLetterReport\GenerateWelcomeLetterReport;
 use Cmd\Reports\Console\Commands\GenerateWelcomePacketReport\GenerateWelcomePacketReport;
 use Cmd\Reports\Console\Commands\GenerateLookbackSummaryReport\GenerateLookbackSummaryReport;
-
+use Cmd\Reports\Console\Commands\GenerateLegalReport\GenerateLegalReport;
 
 class ReportsServiceProvider extends ServiceProvider
 {
@@ -77,6 +77,7 @@ class ReportsServiceProvider extends ServiceProvider
                 GenerateWelcomePacketReport::class,
                 GenerateLookbackSummaryReport::class,
                 GenerateCompanyStatsReport::class,
+                GenerateLegalReport::class,
 
             ]);
         }
