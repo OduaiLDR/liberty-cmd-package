@@ -87,6 +87,12 @@ class EmailSenderService
             return false;
         }
 
+        Log::info('EmailSenderService: Sending HTML email', [
+            'subject' => $subject,
+            'to' => $to,
+            'from' => $this->fromAddress,
+        ]);
+
         $recipients = $this->formatRecipients($to);
         $ccRecipients = $this->formatRecipients($cc);
         $bccRecipients = $this->formatRecipients($bcc);
