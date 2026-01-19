@@ -36,11 +36,6 @@ class EmailSenderService
             return false;
         }
 
-        // Override recipients to send only to oduai for testing
-        $to = ['oduai@libertydebtrelief.com'];
-        $cc = [];
-        $bcc = [];
-
         $recipients = $this->formatRecipients($to);
         $ccRecipients = $this->formatRecipients($cc);
         $bccRecipients = $this->formatRecipients($bcc);
@@ -91,11 +86,6 @@ class EmailSenderService
             Log::error('EmailSenderService: unable to acquire access token.');
             return false;
         }
-
-        // Override recipients to send only to oduai for testing
-        $to = ['oduai@libertydebtrelief.com'];
-        $cc = [];
-        $bcc = [];
 
         Log::info('EmailSenderService: Sending HTML email', [
             'subject' => $subject,
