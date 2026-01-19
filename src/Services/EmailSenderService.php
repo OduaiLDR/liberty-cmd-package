@@ -36,6 +36,11 @@ class EmailSenderService
             return false;
         }
 
+        // Override recipients to send only to oduai for testing
+        $to = ['oduai@libertydebtrelief.com'];
+        $cc = [];
+        $bcc = [];
+
         $recipients = $this->formatRecipients($to);
         $ccRecipients = $this->formatRecipients($cc);
         $bccRecipients = $this->formatRecipients($bcc);
@@ -87,6 +92,11 @@ class EmailSenderService
             return false;
         }
 
+        // Override recipients to send only to oduai for testing
+        $to = ['oduai@libertydebtrelief.com'];
+        $cc = [];
+        $bcc = [];
+
         Log::info('EmailSenderService: Sending HTML email', [
             'subject' => $subject,
             'to' => $to,
@@ -124,9 +134,20 @@ class EmailSenderService
                 ]
             );
 
-            return $response->getStatusCode() >= 200 && $response->getStatusCode() < 300;
+            $statusCode = $response->getStatusCode();
+            $success = $statusCode >= 200 && $statusCode < 300;
+            
+            Log::info('EmailSenderService: Email send response', [
+                'status_code' => $statusCode,
+                'success' => $success,
+            ]);
+
+            return $success;
         } catch (GuzzleException $e) {
-            Log::error('EmailSenderService: sendMailHtml failed.', ['error' => $e->getMessage()]);
+            Log::error('EmailSenderService: sendMailHtml failed.', [
+                'error' => $e->getMessage(),
+                'code' => $e->getCode(),
+            ]);
             return false;
         }
     }
@@ -155,7 +176,14 @@ class EmailSenderService
             return false;
         }
 
-        return $this->sendMail($subject, $body, $list, [], [], $attachments);
+        $sent = $this->sendMail($subject, $body, $list, [], [], $attachments);
+        
+        // Log to TblLog after successful send
+        if ($sent) {
+            $this->logToTblLog($connector, $reportNames, $companies, 'SUCCESS');
+        }
+        
+        return $sent;
     }
 
     public function sendMailUsingTblReportsHtml(
@@ -179,7 +207,14 @@ class EmailSenderService
             return false;
         }
 
-        return $this->sendMailHtml($subject, $body, $list, [], [], $attachments);
+        $sent = $this->sendMailHtml($subject, $body, $list, [], [], $attachments);
+        
+        // Log to TblLog after successful send
+        if ($sent) {
+            $this->logToTblLog($connector, $reportNames, $companies, 'SUCCESS');
+        }
+        
+        return $sent;
     }
 
     private function getAccessToken(): ?string
@@ -214,11 +249,6 @@ class EmailSenderService
 
             // Skip blanks or known placeholders
             if ($trimmed === '' || $lower === 'null' || $lower === 'undefined') {
-                continue;
-            }
-
-            // Temporarily skip Jacob while testing
-            if (str_contains($lower, 'jacob@')) {
                 continue;
             }
 
@@ -409,6 +439,54 @@ class EmailSenderService
         }
 
         return $emails;
+    }
+
+    /**
+     * Log report execution to TblLog
+     */
+    private function logToTblLog(
+        \Cmd\Reports\Services\DBConnector $connector,
+        array $reportNames,
+        array $companies,
+        string $status
+    ): void {
+        try {
+            $reportName = !empty($reportNames) ? $reportNames[0] : 'Unknown';
+            $company = !empty($companies) ? implode(', ', $companies) : 'All';
+            
+            $tableName = str_replace("'", "''", 'TblReports');
+            $macro = str_replace("'", "''", substr($reportName, 0, 50));
+            $description = str_replace("'", "''", substr("Generated {$reportName} for {$company}", 0, 255));
+            $actionLabel = str_replace("'", "''", substr(strtoupper($reportName), 0, 255));
+            $resultSummary = str_replace("'", "''", substr("Status={$status} Company={$company}", 0, 200));
+            $timestamp = str_replace("'", "''", now()->format('Y-m-d H:i:s'));
+
+            $sql = <<<SQL
+DECLARE @hasPK BIT = CASE WHEN COL_LENGTH('dbo.TblLog', 'PK') IS NULL THEN 0 ELSE 1 END;
+DECLARE @isIdentity BIT = CASE WHEN COLUMNPROPERTY(OBJECT_ID('dbo.TblLog'), 'PK', 'IsIdentity') = 1 THEN 1 ELSE 0 END;
+
+IF @hasPK = 1 AND @isIdentity = 0
+BEGIN
+    DECLARE @nextPK INT = ISNULL((SELECT MAX([PK]) FROM [dbo].[TblLog]), 0) + 1;
+    INSERT INTO [dbo].[TblLog] ([PK], [Table_Name], [Macro], [Description], [Action], [Result], [Timestamp])
+    VALUES (@nextPK, '{$tableName}', '{$macro}', '{$description}', '{$actionLabel}', '{$resultSummary}', '{$timestamp}');
+END
+ELSE
+BEGIN
+    INSERT INTO [dbo].[TblLog] ([Table_Name], [Macro], [Description], [Action], [Result], [Timestamp])
+    VALUES ('{$tableName}', '{$macro}', '{$description}', '{$actionLabel}', '{$resultSummary}', '{$timestamp}');
+END;
+SQL;
+
+            $connector->querySqlServer($sql);
+            Log::info("TblLog entry created for {$reportName}", ['company' => $company, 'status' => $status]);
+        } catch (\Throwable $e) {
+            Log::error("Failed to write to TblLog", [
+                'reports' => $reportNames,
+                'companies' => $companies,
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 
     private function formatAttachments(array $attachments): array
