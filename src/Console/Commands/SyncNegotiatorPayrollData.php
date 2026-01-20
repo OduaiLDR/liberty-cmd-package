@@ -60,6 +60,8 @@ class SyncNegotiatorPayrollData extends Command
     private function syncForSource(string $source, DBConnector $sqlConnector, string $startDate, string $endDate): void
     {
         $snowflake = DBConnector::fromEnvironment(strtolower($source));
+        $deleteSources = $this->buildDeleteSources($source);
+        $deleteSourceList = $this->implodeSourceList($deleteSources);
 
         // First query: EPF Summary data
         $sql1 = "
@@ -96,7 +98,7 @@ class SyncNegotiatorPayrollData extends Command
         $deleteSql1 = "
             DELETE FROM TblNegotiatorEPFSummary
             WHERE Settlement_Date BETWEEN '{$this->esc($startDate)}' AND '{$this->esc($endDate)}'
-              AND Source = '{$this->esc($source)}'
+              AND Source IN ({$deleteSourceList})
         ";
         $sqlConnector->querySqlServer($deleteSql1);
 
@@ -136,7 +138,7 @@ class SyncNegotiatorPayrollData extends Command
         $deleteSql2 = "
             DELETE FROM TblNegotiatorSettlementSummary
             WHERE Created_Date BETWEEN '{$this->esc($startDate)}' AND '{$this->esc($endDate)}'
-              AND Source = '{$this->esc($source)}'
+              AND Source IN ({$deleteSourceList})
         ";
         $sqlConnector->querySqlServer($deleteSql2);
 
@@ -217,5 +219,27 @@ class SyncNegotiatorPayrollData extends Command
     private function esc(string $value): string
     {
         return str_replace("'", "''", $value);
+    }
+
+    private function buildDeleteSources(string $source): array
+    {
+        if ($source === 'PLAW') {
+            return ['PLAW', 'ProLaw', 'DP_PLAW'];
+        }
+
+        if ($source === 'LDR') {
+            return ['LDR', 'DP_LDR'];
+        }
+
+        return [$source];
+    }
+
+    private function implodeSourceList(array $sources): string
+    {
+        $escaped = array_map(function ($value) {
+            return "'" . $this->esc((string) $value) . "'";
+        }, $sources);
+
+        return implode(', ', $escaped);
     }
 }

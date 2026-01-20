@@ -40,6 +40,7 @@ class SyncBalances extends Command
 
         foreach ($connections as $connection) {
             $source = strtoupper($connection);
+            $logSource = $this->buildLogSource($source);
 
             $this->info("[$source] Starting.");
             Log::info('SyncBalances: starting connection.', [
@@ -70,7 +71,7 @@ class SyncBalances extends Command
                     $this->ensureLogTable($connector);
                     $this->insertLogRow(
                         $connector,
-                        $source,
+                        $logSource,
                         'FAILED',
                         'FAILED',
                         0,
@@ -101,7 +102,7 @@ class SyncBalances extends Command
                     $this->ensureLogTable($connector);
                     $this->insertLogRow(
                         $connector,
-                        $source,
+                        $logSource,
                         'DELETE_AND_INSERT',
                         'SUCCESS',
                         0,
@@ -160,7 +161,7 @@ class SyncBalances extends Command
 
                     $this->insertLogRow(
                         $connector,
-                        $source,
+                        $logSource,
                         'DELETE_AND_INSERT',
                         'SUCCESS',
                         $insertedCount,
@@ -231,7 +232,7 @@ class SyncBalances extends Command
 
                     $this->insertLogRow(
                         $connector,
-                        $source,
+                        $logSource,
                         'FAILED',
                         'FAILED',
                         0,
@@ -309,9 +310,9 @@ LIMIT {$pageSize} OFFSET {$offset}";
 
     protected function deleteExistingBalances(DBConnector $connector, string $source): int
     {
-        $sourceEscaped = $this->escapeSqlString($source);
-
-        $sql = "DELETE FROM TblBalances WHERE Source = '{$sourceEscaped}';";
+        $sources = $this->buildDeleteSources($source);
+        $sourceList = $this->implodeSourceList($sources);
+        $sql = "DELETE FROM TblBalances WHERE Source IN ({$sourceList});";
 
         $result = $connector->querySqlServer($sql);
 
@@ -551,5 +552,37 @@ SQL;
         }
 
         return mb_substr($value, 0, $maxLength);
+    }
+
+    protected function buildLogSource(string $source): string
+    {
+        return 'DP_' . $source;
+    }
+
+    protected function buildDeleteSources(string $source): array
+    {
+        $baseSource = $source;
+        if (str_starts_with($source, 'DP_')) {
+            $baseSource = substr($source, 3);
+        }
+
+        if ($baseSource === 'PLAW') {
+            return ['PLAW', 'ProLaw', 'DP_PLAW'];
+        }
+
+        if ($baseSource === 'LDR') {
+            return ['LDR', 'DP_LDR'];
+        }
+
+        return [$baseSource, $source];
+    }
+
+    protected function implodeSourceList(array $sources): string
+    {
+        $escaped = array_map(function ($value) {
+            return "'" . $this->escapeSqlString((string) $value) . "'";
+        }, $sources);
+
+        return implode(', ', $escaped);
     }
 }

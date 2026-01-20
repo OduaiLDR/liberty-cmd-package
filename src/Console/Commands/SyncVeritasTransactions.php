@@ -103,11 +103,12 @@ class SyncVeritasTransactions extends Command
         // Calculate payment numbers (sequential cleared deposits per contact)
         $rows = $this->calculatePaymentNumbers($rows);
 
-        // Delete existing records for this source
+        // Delete existing records for this source (cleanup legacy sources)
         try {
-            $deleteSql = "DELETE FROM TblVeritasEligibleDeposits WHERE Source = '{$this->esc($this->source)}'";
+            $deleteSql = $this->buildDeleteSql();
             $sqlConnector->querySqlServer($deleteSql);
-            $this->info("[INFO] Deleted existing {$this->source} records from TblVeritasEligibleDeposits.");
+            $deletedLabel = implode('/', $this->buildDeleteSources($this->source));
+            $this->info("[INFO] Deleted existing {$deletedLabel} records from TblVeritasEligibleDeposits.");
         } catch (\Throwable $e) {
             $this->error("Failed to delete existing records for {$this->source}: " . $e->getMessage());
             Log::error('SyncVeritasTransactions: Delete failed', ['source' => $this->source, 'exception' => $e]);
@@ -197,5 +198,29 @@ class SyncVeritasTransactions extends Command
     private function esc(string $value): string
     {
         return str_replace("'", "''", $value);
+    }
+
+    private function buildDeleteSources(string $source): array
+    {
+        if ($source === 'PLAW') {
+            return ['PLAW', 'ProLaw', 'DP_PLAW'];
+        }
+
+        if ($source === 'LDR') {
+            return ['LDR', 'DP_LDR'];
+        }
+
+        return [$source];
+    }
+
+    private function buildDeleteSql(): string
+    {
+        $sources = $this->buildDeleteSources($this->source);
+        $escaped = array_map(function ($value) {
+            return "'" . $this->esc($value) . "'";
+        }, $sources);
+        $sourceList = implode(', ', $escaped);
+
+        return "DELETE FROM TblVeritasEligibleDeposits WHERE Source IN ({$sourceList})";
     }
 }

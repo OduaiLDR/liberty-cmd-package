@@ -368,11 +368,11 @@ SQL;
     {
         $sourceEsc = $this->escapeSqlString($source);
         
-        // Also delete legacy ProLaw/DP_ rows when syncing PLAW
+        // Delete current source + legacy ProLaw + DP_ variants
         if (strtoupper($source) === 'PLAW') {
-            $sql = "DELETE FROM TblSettlementsNGF WHERE Source IN ('{$sourceEsc}', 'ProLaw', 'DP_PLAW')";
+            $sql = "DELETE FROM TblSettlementsNGF WHERE Source IN ('PLAW', 'ProLaw', 'DP_PLAW')";
         } else {
-            $sql = "DELETE FROM TblSettlementsNGF WHERE Source IN ('{$sourceEsc}', 'DP_LDR')";
+            $sql = "DELETE FROM TblSettlementsNGF WHERE Source IN ('LDR', 'DP_LDR')";
         }
 
         $result = $connector->querySqlServer($sql);

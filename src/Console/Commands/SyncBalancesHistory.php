@@ -22,6 +22,7 @@ class SyncBalancesHistory extends Command
 
         foreach ($connections as $connection) {
             $source = strtoupper($connection);
+            $logSource = $this->buildLogSource($source);
             $totalFetched = 0;
 
             $this->info("[$source] Starting history sync.");
@@ -48,7 +49,7 @@ class SyncBalancesHistory extends Command
                     $deleted = $this->deleteExistingHistory($connector, $source);
                     $this->insertLogRow(
                         $connector,
-                        $source,
+                        $logSource,
                         'DELETE_AND_INSERT',
                         'SUCCESS',
                         0,
@@ -93,7 +94,7 @@ class SyncBalancesHistory extends Command
 
                     $this->insertLogRow(
                         $connector,
-                        $source,
+                        $logSource,
                         'DELETE_AND_INSERT',
                         'SUCCESS',
                         $inserted,
@@ -159,7 +160,7 @@ class SyncBalancesHistory extends Command
 
                     $this->insertLogRow(
                         $connector,
-                        $source,
+                        $logSource,
                         'FAILED',
                         'FAILED',
                         0,
@@ -256,8 +257,8 @@ LIMIT {$pageSize} OFFSET {$offset}";
 
     protected function deleteExistingHistory(DBConnector $connector, string $source): int
     {
-        $sourceEscaped = $this->escapeSqlString($source);
-        $sql = "DELETE FROM TblBalancesHistory WHERE Source = '{$sourceEscaped}';";
+        $sourceList = $this->buildDeleteSourceList($source);
+        $sql = "DELETE FROM TblBalancesHistory WHERE Source IN ({$sourceList});";
 
         $result = $connector->querySqlServer($sql);
 
@@ -470,6 +471,33 @@ SQL;
         }
 
         return mb_substr($value, 0, $maxLength);
+    }
+
+    protected function buildLogSource(string $source): string
+    {
+        return 'DP_' . $source;
+    }
+
+    protected function buildDeleteSourceList(string $source): string
+    {
+        $baseSource = $source;
+        if (str_starts_with($source, 'DP_')) {
+            $baseSource = substr($source, 3);
+        }
+
+        if ($baseSource === 'PLAW') {
+            $sources = ['PLAW', 'ProLaw', 'DP_PLAW'];
+        } elseif ($baseSource === 'LDR') {
+            $sources = ['LDR', 'DP_LDR'];
+        } else {
+            $sources = [$baseSource, $source];
+        }
+
+        $escaped = array_map(function ($value) {
+            return "'" . $this->escapeSqlString((string) $value) . "'";
+        }, $sources);
+
+        return implode(', ', $escaped);
     }
 
     // VBA equivalent uses raw values; normalization helpers removed for strict mirroring.

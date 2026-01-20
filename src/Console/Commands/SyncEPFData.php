@@ -22,6 +22,7 @@ class SyncEPFData extends Command
 
         foreach ($connections as $connection) {
             $source = $this->sourceLabelForConnection($connection);
+            $logSource = $this->buildLogSource($source);
             $this->info("[$source] Starting EPF sync.");
             Log::info('SyncEPFData: starting connection.', [
                 'connection' => $connection,
@@ -46,7 +47,7 @@ class SyncEPFData extends Command
                     $this->warn("[$source] No EPF rows found in Snowflake.");
                     $this->insertLogRow(
                         $connector,
-                        $source,
+                        $logSource,
                         'SYNC_EPF_DATA',
                         'SUCCESS',
                         0,
@@ -65,7 +66,7 @@ class SyncEPFData extends Command
                 }
                 $this->insertLogRow(
                     $connector,
-                    $source,
+                    $logSource,
                     'SYNC_EPF_DATA',
                     'SUCCESS',
                     $inserted,
@@ -102,7 +103,7 @@ class SyncEPFData extends Command
 
                     $this->insertLogRow(
                         $connector,
-                        $source,
+                        $logSource,
                         'SYNC_EPF_DATA',
                         'FAILED',
                         0,
@@ -498,17 +499,13 @@ SQL,
 
     protected function sourceLabelForConnection(string $connection): string
     {
-        if (strcasecmp($connection, 'plaw') === 0) {
-            return 'ProLaw';
-        }
-
         return strtoupper($connection);
     }
 
     protected function deleteEpfBySource(DBConnector $connector, string $source): int
     {
-        $sourceEsc = $this->escapeSqlString($source);
-        $sql = "DELETE FROM TblEPFs WHERE Source = '{$sourceEsc}'";
+        $sourceList = $this->buildDeleteSourceList($source);
+        $sql = "DELETE FROM TblEPFs WHERE Source IN ({$sourceList})";
 
         $result = $connector->querySqlServer($sql);
         if (is_array($result) && isset($result['success']) && $result['success'] === false) {
@@ -524,6 +521,30 @@ SQL,
         }
 
         return 0;
+    }
+
+    protected function buildDeleteSourceList(string $source): string
+    {
+        $baseSource = $source;
+        $sources = [];
+        if ($baseSource === 'PLAW') {
+            $sources = ['PLAW', 'ProLaw', 'DP_PLAW'];
+        } elseif ($baseSource === 'LDR') {
+            $sources = ['LDR', 'DP_LDR'];
+        } else {
+            $sources = [$baseSource, $source];
+        }
+
+        $escaped = array_map(function ($value) {
+            return "'" . $this->escapeSqlString((string) $value) . "'";
+        }, $sources);
+
+        return implode(', ', $escaped);
+    }
+
+    protected function buildLogSource(string $source): string
+    {
+        return 'DP_' . $source;
     }
 
     protected function insertEpfRows(DBConnector $connector, array $rows, string $source): int
