@@ -367,7 +367,13 @@ SQL;
     protected function deleteSettlementsBySource(DBConnector $connector, string $source): int
     {
         $sourceEsc = $this->escapeSqlString($source);
-        $sql = "DELETE FROM TblSettlementsNGF WHERE Source = '{$sourceEsc}'";
+        
+        // Also delete legacy ProLaw/DP_ rows when syncing PLAW
+        if (strtoupper($source) === 'PLAW') {
+            $sql = "DELETE FROM TblSettlementsNGF WHERE Source IN ('{$sourceEsc}', 'ProLaw', 'DP_PLAW')";
+        } else {
+            $sql = "DELETE FROM TblSettlementsNGF WHERE Source IN ('{$sourceEsc}', 'DP_LDR')";
+        }
 
         $result = $connector->querySqlServer($sql);
         if (is_array($result) && isset($result['success']) && $result['success'] === false) {
@@ -513,9 +519,12 @@ SQL;
         $tableName = 'TblSettlementsNGF';
         $macro = 'SyncSettlementData';
         $actionLabel = $action !== '' ? strtoupper($action) : 'SYNC_SETTLEMENT_DATA';
+        
+        // Use DP_ prefix in TblLog for automation tracking
+        $logSource = 'DP_' . strtoupper($source);
 
         $description = $this->truncateString(
-            sprintf('Sync settlements for %s', $source),
+            sprintf('Sync settlements for %s', $logSource),
             255
         );
         $descriptionEsc = $this->escapeSqlString($description);
