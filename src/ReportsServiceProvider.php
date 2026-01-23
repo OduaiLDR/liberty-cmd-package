@@ -30,6 +30,7 @@ use Cmd\Reports\Console\Commands\GenerateWelcomeLetterReport\GenerateWelcomeLett
 use Cmd\Reports\Console\Commands\GenerateWelcomePacketReport\GenerateWelcomePacketReport;
 use Cmd\Reports\Console\Commands\GenerateLookbackSummaryReport\GenerateLookbackSummaryReport;
 use Cmd\Reports\Console\Commands\GenerateLegalReport\GenerateLegalReport;
+use Cmd\Reports\Console\Commands\GenerateReportSummary\GenerateReportSummary;
 
 class ReportsServiceProvider extends ServiceProvider
 {
@@ -92,6 +93,7 @@ class ReportsServiceProvider extends ServiceProvider
                 GenerateCompanyStatsReport::class,
                 GenerateLegalReport::class,
                 GenerateSyncSummary::class,
+                GenerateReportSummary::class,
             ]);
         }
 
