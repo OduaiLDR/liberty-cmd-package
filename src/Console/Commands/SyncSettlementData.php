@@ -368,11 +368,11 @@ SQL;
     {
         $sourceEsc = $this->escapeSqlString($source);
         
-        // Delete current source + legacy ProLaw + DP_ variants
+        // Delete current source with DP_ prefix + legacy ProLaw/PLAW/LDR
         if (strtoupper($source) === 'PLAW') {
-            $sql = "DELETE FROM TblSettlementsNGF WHERE Source IN ('PLAW', 'ProLaw', 'DP_PLAW')";
+            $sql = "DELETE FROM TblSettlementsNGF WHERE Source IN ('DP_PLAW', 'PLAW', 'ProLaw')";
         } else {
-            $sql = "DELETE FROM TblSettlementsNGF WHERE Source IN ('LDR', 'DP_LDR')";
+            $sql = "DELETE FROM TblSettlementsNGF WHERE Source IN ('DP_LDR', 'LDR')";
         }
 
         $result = $connector->querySqlServer($sql);
@@ -423,7 +423,7 @@ SQL;
                 }
 
                 $values .= ", '" . $this->escapeSqlString((string) $row['settlement_id']) . "'";
-                $values .= ", '" . $this->escapeSqlString($source) . "'";
+                $values .= ", '" . $this->escapeSqlString('DP_' . strtoupper($source)) . "'";
                 $values .= ')';
             }
 

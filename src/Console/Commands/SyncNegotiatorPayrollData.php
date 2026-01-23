@@ -146,6 +146,9 @@ class SyncNegotiatorPayrollData extends Command
         if (!empty($rows2)) {
             $this->insertSettlementSummaryBatch($sqlConnector, $rows2, $source);
         }
+        
+        // Log to TblLog
+        $this->insertLogRow($sqlConnector, $source, 'SUCCESS', count($rows1), count($rows2));
     }
 
     private function insertEPFSummaryBatch(DBConnector $connector, array $rows, string $source): void
@@ -163,7 +166,7 @@ class SyncNegotiatorPayrollData extends Command
                 $creditor = $this->esc((string)($row['MEMO'] ?? ''));
                 $settlementDate = $this->esc((string)($row['SDATE'] ?? ''));
                 $negotiatorId = $this->esc((string)($row['NEG_ID'] ?? ''));
-                $sourceEsc = $this->esc($source);
+                $sourceEsc = $this->esc('DP_' . strtoupper($source));
 
                 $values[] = "('{$contactName}', '{$contactId}', '{$collected}', '{$settlementId}', '{$creditor}', '{$settlementDate}', '{$negotiatorId}', '{$sourceEsc}')";
             }
@@ -199,7 +202,7 @@ class SyncNegotiatorPayrollData extends Command
                 $createdDate = $this->esc((string)($row['CREATED_AT'] ?? ''));
                 $settlementAmount = $this->esc((string)($row['SETTLEMENT_AMOUNT'] ?? '0'));
                 $debtId = $this->esc((string)($row['ID'] ?? ''));
-                $sourceEsc = $this->esc($source);
+                $sourceEsc = $this->esc('DP_' . strtoupper($source));
 
                 $values[] = "('{$contactName}', '{$contactId}', '{$debtAmount}', '{$settlementId}', '{$creditor}', '{$collectionCompany}', '{$settlementDate}', '{$negotiatorId}', '{$createdDate}', '{$settlementAmount}', '{$debtId}', '{$sourceEsc}')";
             }
@@ -223,15 +226,16 @@ class SyncNegotiatorPayrollData extends Command
 
     private function buildDeleteSources(string $source): array
     {
+        // Delete DP_ sources + legacy ProLaw/PLAW/LDR
         if ($source === 'PLAW') {
-            return ['PLAW', 'ProLaw', 'DP_PLAW'];
+            return ['DP_PLAW', 'PLAW', 'ProLaw'];
         }
 
         if ($source === 'LDR') {
-            return ['LDR', 'DP_LDR'];
+            return ['DP_LDR', 'LDR'];
         }
 
-        return [$source];
+        return ['DP_' . strtoupper($source), $source];
     }
 
     private function implodeSourceList(array $sources): string
@@ -241,5 +245,39 @@ class SyncNegotiatorPayrollData extends Command
         }, $sources);
 
         return implode(', ', $escaped);
+    }
+
+    private function insertLogRow(DBConnector $connector, string $source, string $status, int $epfCount, int $settlementCount): void
+    {
+        $tableName = 'TblNegotiatorEPFSummary';
+        $macro = 'SyncNegotiatorPayrollData';
+        $logSource = 'DP_' . strtoupper($source);
+        
+        $description = "Sync negotiator payroll for {$logSource}";
+        $resultSummary = "Status={$status} EPF={$epfCount} Settlement={$settlementCount}";
+        $timestamp = now()->format('Y-m-d H:i:s');
+
+        $sql = "
+            DECLARE @hasPK BIT = CASE WHEN COL_LENGTH('dbo.TblLog', 'PK') IS NULL THEN 0 ELSE 1 END;
+            DECLARE @isIdentity BIT = CASE WHEN COLUMNPROPERTY(OBJECT_ID('dbo.TblLog'), 'PK', 'IsIdentity') = 1 THEN 1 ELSE 0 END;
+            IF @hasPK = 1 AND @isIdentity = 0
+            BEGIN
+                DECLARE @nextPK INT = ISNULL((SELECT MAX([PK]) FROM [dbo].[TblLog]), 0) + 1;
+                INSERT INTO [dbo].[TblLog] ([PK], [Table_Name], [Macro], [Description], [Action], [Result], [Timestamp])
+                VALUES (@nextPK, '{$this->esc($tableName)}', '{$this->esc($macro)}', '{$this->esc($description)}', 'SYNC_NEGOTIATOR_PAYROLL', '{$this->esc($resultSummary)}', '{$this->esc($timestamp)}');
+            END
+            ELSE
+            BEGIN
+                INSERT INTO [dbo].[TblLog] ([Table_Name], [Macro], [Description], [Action], [Result], [Timestamp])
+                VALUES ('{$this->esc($tableName)}', '{$this->esc($macro)}', '{$this->esc($description)}', 'SYNC_NEGOTIATOR_PAYROLL', '{$this->esc($resultSummary)}', '{$this->esc($timestamp)}');
+            END;
+        ";
+
+        try {
+            $connector->querySqlServer($sql);
+            $this->info("[INFO] Log entry inserted into TblLog for {$source}.");
+        } catch (\Throwable $e) {
+            Log::error('SyncNegotiatorPayrollData: TblLog insert failed', ['source' => $source, 'exception' => $e]);
+        }
     }
 }

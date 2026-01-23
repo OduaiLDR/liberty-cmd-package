@@ -284,7 +284,7 @@ LIMIT {$pageSize} OFFSET {$offset}";
         int $batchSize = 1000
     ): array {
         $chunks = array_chunk($rows, $batchSize);
-        $sourceEscaped = $this->escapeSqlString($source);
+        $sourceEscaped = $this->escapeSqlString('DP_' . strtoupper($source));
         $importTimeEscaped = $this->escapeSqlString(now()->format('Y-m-d H:i:s'));
         $totalInserted = 0;
         $skipped = 0;
@@ -485,12 +485,13 @@ SQL;
             $baseSource = substr($source, 3);
         }
 
+        // Delete DP_ sources + legacy ProLaw/PLAW/LDR
         if ($baseSource === 'PLAW') {
-            $sources = ['PLAW', 'ProLaw', 'DP_PLAW'];
+            $sources = ['DP_PLAW', 'PLAW', 'ProLaw'];
         } elseif ($baseSource === 'LDR') {
-            $sources = ['LDR', 'DP_LDR'];
+            $sources = ['DP_LDR', 'LDR'];
         } else {
-            $sources = [$baseSource, $source];
+            $sources = ['DP_' . strtoupper($baseSource), $baseSource];
         }
 
         $escaped = array_map(function ($value) {

@@ -341,7 +341,7 @@ LIMIT {$pageSize} OFFSET {$offset}";
     ): int {
         $totalInserted = 0;
         $sourceTrimmed = $this->truncateString($source, 100);
-        $sourceEscaped = $this->escapeSqlString($sourceTrimmed);
+        $sourceEscaped = $this->escapeSqlString('DP_' . strtoupper($sourceTrimmed));
         $now = now()->format('Y-m-d H:i:s');
         $nowEscaped = $this->escapeSqlString($now);
 
@@ -566,15 +566,16 @@ SQL;
             $baseSource = substr($source, 3);
         }
 
+        // Delete DP_ sources + legacy ProLaw/PLAW/LDR
         if ($baseSource === 'PLAW') {
-            return ['PLAW', 'ProLaw', 'DP_PLAW'];
+            return ['DP_PLAW', 'PLAW', 'ProLaw'];
         }
 
         if ($baseSource === 'LDR') {
-            return ['LDR', 'DP_LDR'];
+            return ['DP_LDR', 'LDR'];
         }
 
-        return [$baseSource, $source];
+        return ['DP_' . strtoupper($baseSource), $baseSource];
     }
 
     protected function implodeSourceList(array $sources): string
