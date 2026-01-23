@@ -103,11 +103,12 @@ class SyncVeritasTransactions extends Command
         // Calculate payment numbers (sequential cleared deposits per contact)
         $rows = $this->calculatePaymentNumbers($rows);
 
-        // Delete existing records for this source
+        // Delete existing records for this source (cleanup legacy sources)
         try {
-            $deleteSql = "DELETE FROM TblVeritasEligibleDeposits WHERE Source = '{$this->esc($this->source)}'";
+            $deleteSql = $this->buildDeleteSql();
             $sqlConnector->querySqlServer($deleteSql);
-            $this->info("[INFO] Deleted existing {$this->source} records from TblVeritasEligibleDeposits.");
+            $deletedLabel = implode('/', $this->buildDeleteSources($this->source));
+            $this->info("[INFO] Deleted existing {$deletedLabel} records from TblVeritasEligibleDeposits.");
         } catch (\Throwable $e) {
             $this->error("Failed to delete existing records for {$this->source}: " . $e->getMessage());
             Log::error('SyncVeritasTransactions: Delete failed', ['source' => $this->source, 'exception' => $e]);
@@ -138,6 +139,10 @@ class SyncVeritasTransactions extends Command
         }
 
         $this->info("[SUCCESS] Synced {$inserted} Veritas transactions for {$this->source}.");
+        
+        // Log to TblLog
+        $this->insertLogRow($sqlConnector, $this->source, 'SUCCESS', $inserted);
+        
         return Command::SUCCESS;
     }
 
@@ -182,7 +187,7 @@ class SyncVeritasTransactions extends Command
             $clearedDateStr = $clearedDate ? "'{$this->esc($clearedDate)}'" : 'NULL';
             $returnedDateStr = $returnedDate ? "'{$this->esc($returnedDate)}'" : 'NULL';
 
-            $values[] = "('{$llgId}', {$payment}, {$processDateStr}, {$clearedDateStr}, {$returnedDateStr}, '{$this->esc($this->source)}')";
+            $values[] = "('{$llgId}', {$payment}, {$processDateStr}, {$clearedDateStr}, {$returnedDateStr}, '{$this->esc('DP_' . strtoupper($this->source))}')";
         }
 
         $valuesSql = implode(', ', $values);
@@ -197,5 +202,64 @@ class SyncVeritasTransactions extends Command
     private function esc(string $value): string
     {
         return str_replace("'", "''", $value);
+    }
+
+    private function buildDeleteSources(string $source): array
+    {
+        // Delete DP_ sources + legacy ProLaw/PLAW/LDR
+        if ($source === 'PLAW') {
+            return ['DP_PLAW', 'PLAW', 'ProLaw'];
+        }
+
+        if ($source === 'LDR') {
+            return ['DP_LDR', 'LDR'];
+        }
+
+        return ['DP_' . strtoupper($source), $source];
+    }
+
+    private function buildDeleteSql(): string
+    {
+        $sources = $this->buildDeleteSources($this->source);
+        $escaped = array_map(function ($value) {
+            return "'" . $this->esc($value) . "'";
+        }, $sources);
+        $sourceList = implode(', ', $escaped);
+
+        return "DELETE FROM TblVeritasEligibleDeposits WHERE Source IN ({$sourceList})";
+    }
+
+    private function insertLogRow(DBConnector $connector, string $source, string $status, int $recordsProcessed): void
+    {
+        $tableName = 'TblVeritasEligibleDeposits';
+        $macro = 'SyncVeritasTransactions';
+        $logSource = 'DP_' . strtoupper($source);
+        
+        $description = "Sync Veritas deposits for {$logSource}";
+        $resultSummary = "Status={$status} Processed={$recordsProcessed}";
+        $timestamp = now()->format('Y-m-d H:i:s');
+
+        $sql = "
+            DECLARE @hasPK BIT = CASE WHEN COL_LENGTH('dbo.TblLog', 'PK') IS NULL THEN 0 ELSE 1 END;
+            DECLARE @isIdentity BIT = CASE WHEN COLUMNPROPERTY(OBJECT_ID('dbo.TblLog'), 'PK', 'IsIdentity') = 1 THEN 1 ELSE 0 END;
+            IF @hasPK = 1 AND @isIdentity = 0
+            BEGIN
+                DECLARE @nextPK INT = ISNULL((SELECT MAX([PK]) FROM [dbo].[TblLog]), 0) + 1;
+                INSERT INTO [dbo].[TblLog] ([PK], [Table_Name], [Macro], [Description], [Action], [Result], [Timestamp])
+                VALUES (@nextPK, '{$this->esc($tableName)}', '{$this->esc($macro)}', '{$this->esc($description)}', 'SYNC_VERITAS_TRANSACTIONS', '{$this->esc($resultSummary)}', '{$this->esc($timestamp)}');
+            END
+            ELSE
+            BEGIN
+                INSERT INTO [dbo].[TblLog] ([Table_Name], [Macro], [Description], [Action], [Result], [Timestamp])
+                VALUES ('{$this->esc($tableName)}', '{$this->esc($macro)}', '{$this->esc($description)}', 'SYNC_VERITAS_TRANSACTIONS', '{$this->esc($resultSummary)}', '{$this->esc($timestamp)}');
+            END;
+        ";
+
+        try {
+            $connector->querySqlServer($sql);
+            $this->info("[INFO] Log entry inserted into TblLog for {$source}.");
+        } catch (\Throwable $e) {
+            Log::error('SyncVeritasTransactions: TblLog insert failed', ['source' => $source, 'exception' => $e]);
+        }
     }
 }

@@ -367,7 +367,13 @@ SQL;
     protected function deleteSettlementsBySource(DBConnector $connector, string $source): int
     {
         $sourceEsc = $this->escapeSqlString($source);
-        $sql = "DELETE FROM TblSettlementsNGF WHERE Source = '{$sourceEsc}'";
+        
+        // Delete current source with DP_ prefix + legacy ProLaw/PLAW/LDR
+        if (strtoupper($source) === 'PLAW') {
+            $sql = "DELETE FROM TblSettlementsNGF WHERE Source IN ('DP_PLAW', 'PLAW', 'ProLaw')";
+        } else {
+            $sql = "DELETE FROM TblSettlementsNGF WHERE Source IN ('DP_LDR', 'LDR')";
+        }
 
         $result = $connector->querySqlServer($sql);
         if (is_array($result) && isset($result['success']) && $result['success'] === false) {
@@ -417,7 +423,7 @@ SQL;
                 }
 
                 $values .= ", '" . $this->escapeSqlString((string) $row['settlement_id']) . "'";
-                $values .= ", '" . $this->escapeSqlString($source) . "'";
+                $values .= ", '" . $this->escapeSqlString('DP_' . strtoupper($source)) . "'";
                 $values .= ')';
             }
 
@@ -513,9 +519,12 @@ SQL;
         $tableName = 'TblSettlementsNGF';
         $macro = 'SyncSettlementData';
         $actionLabel = $action !== '' ? strtoupper($action) : 'SYNC_SETTLEMENT_DATA';
+        
+        // Use DP_ prefix in TblLog for automation tracking
+        $logSource = 'DP_' . strtoupper($source);
 
         $description = $this->truncateString(
-            sprintf('Sync settlements for %s', $source),
+            sprintf('Sync settlements for %s', $logSource),
             255
         );
         $descriptionEsc = $this->escapeSqlString($description);

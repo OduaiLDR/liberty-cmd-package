@@ -56,7 +56,7 @@ class SyncBalancesHistory extends Command
                     $deleted = $this->deleteExistingHistory($connector, $deleteSources);
                     $this->insertLogRow(
                         $connector,
-                        $source,
+                        $logSource,
                         'DELETE_AND_INSERT',
                         'SUCCESS',
                         0,
@@ -101,7 +101,7 @@ class SyncBalancesHistory extends Command
 
                     $this->insertLogRow(
                         $connector,
-                        $source,
+                        $logSource,
                         'DELETE_AND_INSERT',
                         'SUCCESS',
                         $inserted,
@@ -167,7 +167,7 @@ class SyncBalancesHistory extends Command
 
                     $this->insertLogRow(
                         $connector,
-                        $source,
+                        $logSource,
                         'FAILED',
                         'FAILED',
                         0,
@@ -490,6 +490,34 @@ SQL;
         }
 
         return mb_substr($value, 0, $maxLength);
+    }
+
+    protected function buildLogSource(string $source): string
+    {
+        return 'DP_' . $source;
+    }
+
+    protected function buildDeleteSourceList(string $source): string
+    {
+        $baseSource = $source;
+        if (str_starts_with($source, 'DP_')) {
+            $baseSource = substr($source, 3);
+        }
+
+        // Delete DP_ sources + legacy ProLaw/PLAW/LDR
+        if ($baseSource === 'PLAW') {
+            $sources = ['DP_PLAW', 'PLAW', 'ProLaw'];
+        } elseif ($baseSource === 'LDR') {
+            $sources = ['DP_LDR', 'LDR'];
+        } else {
+            $sources = ['DP_' . strtoupper($baseSource), $baseSource];
+        }
+
+        $escaped = array_map(function ($value) {
+            return "'" . $this->escapeSqlString((string) $value) . "'";
+        }, $sources);
+
+        return implode(', ', $escaped);
     }
 
     // VBA equivalent uses raw values; normalization helpers removed for strict mirroring.

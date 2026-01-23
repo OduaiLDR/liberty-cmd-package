@@ -237,7 +237,13 @@ SQL;
     protected function deleteNegotiatorDebtsBySource(DBConnector $connector, string $source): int
     {
         $sourceEsc = $this->escapeSqlString($source);
-        $sql = "DELETE FROM TblNegotiatorDebts WHERE Source = '{$sourceEsc}'";
+        
+        // Delete current source with DP_ prefix + legacy ProLaw/PLAW/LDR
+        if (strtoupper($source) === 'PLAW') {
+            $sql = "DELETE FROM TblNegotiatorDebts WHERE Source IN ('DP_PLAW', 'PLAW', 'ProLaw')";
+        } else {
+            $sql = "DELETE FROM TblNegotiatorDebts WHERE Source IN ('DP_LDR', 'LDR')";
+        }
 
         $result = $connector->querySqlServer($sql);
         if (is_array($result) && isset($result['success']) && $result['success'] === false) {
@@ -288,7 +294,7 @@ SQL;
                 $values .= ", '" . $this->escapeSqlString((string) $row['account_number']) . "'";
                 $values .= ", '" . $this->escapeSqlString((string) $row['has_summons']) . "'";
                 $values .= ", '" . $this->escapeSqlString((string) $row['pre_lit']) . "'";
-                $values .= ", '" . $this->escapeSqlString($source) . "'";
+                $values .= ", '" . $this->escapeSqlString('DP_' . strtoupper($source)) . "'";
                 $values .= ')';
             }
 
@@ -406,9 +412,12 @@ SQL;
         $tableName = 'TblNegotiatorDebts';
         $macro = 'SyncSettledDebtsData';
         $actionLabel = $action !== '' ? strtoupper($action) : 'SYNC_SETTLED_DEBTS_DATA';
+        
+        // Use DP_ prefix in TblLog for automation tracking
+        $logSource = 'DP_' . strtoupper($source);
 
         $description = $this->truncateString(
-            sprintf('Sync negotiator debts for %s', $source),
+            sprintf('Sync negotiator debts for %s', $logSource),
             255
         );
         $descriptionEsc = $this->escapeSqlString($description);
