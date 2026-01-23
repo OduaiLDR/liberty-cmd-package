@@ -24,14 +24,12 @@ use Cmd\Reports\Console\Commands\SyncLastDepositDate;
 use Cmd\Reports\Console\Commands\SyncVeritasTransactions;
 use Cmd\Reports\Console\Commands\SyncNegotiatorPayrollData;
 use Cmd\Reports\Console\Commands\SyncEnrollmentDataTemp;
+use Cmd\Reports\Console\Commands\GenerateSyncSummary\GenerateSyncSummary;
 use Cmd\Reports\Console\Commands\GenerateCompanyStatsReport\GenerateCompanyStatsReport;
 use Cmd\Reports\Console\Commands\GenerateWelcomeLetterReport\GenerateWelcomeLetterReport;
 use Cmd\Reports\Console\Commands\GenerateWelcomePacketReport\GenerateWelcomePacketReport;
 use Cmd\Reports\Console\Commands\GenerateLookbackSummaryReport\GenerateLookbackSummaryReport;
 use Cmd\Reports\Console\Commands\GenerateLegalReport\GenerateLegalReport;
-use Cmd\Reports\Console\Commands\GenerateScrubListReport\GenerateScrubListReport;
-use Cmd\Reports\Console\Commands\GenerateReportSummary\GenerateReportSummary;
-use Cmd\Reports\Console\Commands\GenerateSyncSummary\GenerateSyncSummary;
 
 class ReportsServiceProvider extends ServiceProvider
 {
@@ -93,8 +91,6 @@ class ReportsServiceProvider extends ServiceProvider
                 GenerateLookbackSummaryReport::class,
                 GenerateCompanyStatsReport::class,
                 GenerateLegalReport::class,
-                GenerateScrubListReport::class,
-                GenerateReportSummary::class,
                 GenerateSyncSummary::class,
             ]);
         }
