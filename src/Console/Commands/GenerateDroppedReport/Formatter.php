@@ -37,7 +37,7 @@ class Formatter
             $col++;
         }
 
-        // Apply header styling
+        // Apply header style
         $headerRange = 'A1:I1';
         $sheet->getStyle($headerRange)->applyFromArray([
             'font' => ['bold' => true, 'color' => ['argb' => 'FFFFFFFF']],

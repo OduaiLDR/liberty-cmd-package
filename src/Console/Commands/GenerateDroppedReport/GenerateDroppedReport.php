@@ -10,7 +10,7 @@ class GenerateDroppedReport extends Command
 {
     protected $signature = 'Generate:dropped-report {--source=LDR : Source (LDR or PLAW)}';
 
-    protected $description = 'Generate Dropped report (Snowflake) and email it.';
+    protected $description = 'Generate Dropped report (Snowflake) and email it with dropped';
 
     private string $source;
 
