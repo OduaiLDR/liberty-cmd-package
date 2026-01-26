@@ -31,6 +31,7 @@ use Cmd\Reports\Console\Commands\GenerateWelcomePacketReport\GenerateWelcomePack
 use Cmd\Reports\Console\Commands\GenerateLookbackSummaryReport\GenerateLookbackSummaryReport;
 use Cmd\Reports\Console\Commands\GenerateLegalReport\GenerateLegalReport;
 use Cmd\Reports\Console\Commands\GenerateReportSummary\GenerateReportSummary;
+use Cmd\Reports\Console\Commands\GenerateDroppedReport\GenerateDroppedReport;
 
 class ReportsServiceProvider extends ServiceProvider
 {
@@ -92,8 +93,9 @@ class ReportsServiceProvider extends ServiceProvider
                 GenerateLookbackSummaryReport::class,
                 GenerateCompanyStatsReport::class,
                 GenerateLegalReport::class,
-                GenerateSyncSummary::class,
                 GenerateReportSummary::class,
+                GenerateSyncSummary::class,
+                GenerateDroppedReport::class,
             ]);
         }
 
