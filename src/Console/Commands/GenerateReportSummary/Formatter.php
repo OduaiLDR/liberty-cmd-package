@@ -30,7 +30,8 @@ class Formatter
             <table>
                 <thead>
                     <tr>
-                        <th>Report Name</th>
+                        <th>Type</th>
+                        <th>Report/Automation Name</th>
                         <th>Company</th>
                         <th>Schedule</th>
                         <th>Last Run Date</th>
@@ -40,6 +41,7 @@ class Formatter
                 <tbody>';
 
         foreach ($rows as $row) {
+            $type = $row['Type'] ?? $row['TYPE'] ?? '';
             $reportName = $row['Report_Name'] ?? $row['REPORT_NAME'] ?? '';
             $company = $row['Company'] ?? $row['COMPANY'] ?? '';
             $schedule = $row['Schedule'] ?? $row['SCHEDULE'] ?? '';
@@ -52,10 +54,18 @@ class Formatter
                 if ($timestamp !== false) {
                     $lastRunDate = date('m/d/Y g:i A', $timestamp);
                 }
+            } else {
+                $lastRunDate = '<span style="color: #999;">Never run</span>';
+            }
+
+            // If no weekday, show empty
+            if (!$lastRunWeekday || $lastRunWeekday === '') {
+                $lastRunWeekday = '<span style="color: #999;">-</span>';
             }
 
             $html .= "
                     <tr>
+                        <td>{$type}</td>
                         <td>{$reportName}</td>
                         <td>{$company}</td>
                         <td>{$schedule}</td>
