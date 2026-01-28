@@ -64,11 +64,6 @@ class GenerateReportSummary extends Command
         // Send email
         $sent = $formatter->sendReport($html, $this);
 
-        // Update Last_Run_Date if email was sent successfully
-        if ($sent) {
-            $this->updateLastRunDate();
-        }
-
         $this->info('[INFO] Report Summary: completed.');
         return Command::SUCCESS;
     }
@@ -95,19 +90,5 @@ class GenerateReportSummary extends Command
                 PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
             ]
         );
-    }
-
-    private function updateLastRunDate(): void
-    {
-        try {
-            $sql = "
-                UPDATE dbo.TblReports
-                SET Last_Run_Date = GETDATE()
-                WHERE Report_Name IN ('ReportSummary', 'Report Summary')
-            ";
-            $this->sqlConnection->exec($sql);
-        } catch (\Throwable $e) {
-            Log::warning('GenerateReportSummary: Failed to update Last_Run_Date', ['error' => $e->getMessage()]);
-        }
     }
 }
