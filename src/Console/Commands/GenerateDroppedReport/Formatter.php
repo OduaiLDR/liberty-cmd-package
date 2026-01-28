@@ -17,10 +17,6 @@ class Formatter
 {
     public function buildWorkbook(array $rows, string $source, string $reportDate): ?array
     {
-        if (empty($rows)) {
-            return null;
-        }
-
         $filename = "Dropped Report - {$source} - " . date('m-d-Y', strtotime($reportDate)) . '.xlsx';
         $path = storage_path('app/' . $filename);
 
@@ -114,8 +110,9 @@ class Formatter
         ];
 
         $email = new EmailSenderService();
-        $subject = "Dropped Report - {$source} - " . date('m/d/Y', strtotime($reportDate));
-        $body = "Please see the attached Dropped Report for {$source} on " . date('m/d/Y', strtotime($reportDate)) . ".";
+        $displaySource = $source === 'PLAW' ? 'Progress Law' : $source;
+        $subject = "Dropped Report - {$displaySource} - " . date('m/d/Y', strtotime($reportDate));
+        $body = "Please see the attached Dropped Report for {$displaySource} on " . date('m/d/Y', strtotime($reportDate)) . ".";
 
         $sent = $email->sendMailUsingTblReports(
             $connector,
