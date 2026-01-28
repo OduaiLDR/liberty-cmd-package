@@ -399,31 +399,35 @@ SQL;
 
         $fields = "LLG_ID, Creditor, Debt_Buyer, Account_Number, Original_Debt_Amount, Current_Amount, Settlement_Amount, Status, Settlement_Date, Settlement_ID, Source";
         $inserted = 0;
-        $batchSize = 500;
-        $sourceEscaped = $this->escapeSqlString('DP_' . strtoupper($source));
+        $batchSize = 1000;
 
         for ($i = 0; $i < count($rows); $i += $batchSize) {
             $batch = array_slice($rows, $i, $batchSize);
-            $valuesParts = [];
+            $values = '';
 
             foreach ($batch as $row) {
-                $llgId = $this->escapeSqlString($row['llg_id']);
-                $creditor = $this->escapeSqlString($row['creditor']);
-                $debtBuyer = $this->escapeSqlString($row['debt_buyer']);
-                $accountNumber = $this->escapeSqlString($row['account_number']);
-                $originalDebtAmount = $this->escapeSqlString((string) $row['original_debt_amount']);
-                $currentAmount = $this->escapeSqlString((string) $row['current_amount']);
-                $settlementAmount = $this->escapeSqlString((string) $row['settlement_amount']);
-                $status = $this->escapeSqlString((string) $row['status']);
-                $settlementDate = ($row['settlement_date'] === null || $row['settlement_date'] === '') 
-                    ? 'NULL' 
-                    : "'" . $this->escapeSqlString((string) $row['settlement_date']) . "'";
-                $settlementId = $this->escapeSqlString((string) $row['settlement_id']);
+                $values .= ',(';
+                $values .= "'" . $this->escapeSqlString($row['llg_id']) . "'";
+                $values .= ", '" . $this->escapeSqlString($row['creditor']) . "'";
+                $values .= ", '" . $this->escapeSqlString($row['debt_buyer']) . "'";
+                $values .= ", '" . $this->escapeSqlString($row['account_number']) . "'";
+                $values .= ", '" . $this->escapeSqlString((string) $row['original_debt_amount']) . "'";
+                $values .= ", '" . $this->escapeSqlString((string) $row['current_amount']) . "'";
+                $values .= ", '" . $this->escapeSqlString((string) $row['settlement_amount']) . "'";
+                $values .= ", '" . $this->escapeSqlString((string) $row['status']) . "'";
 
-                $valuesParts[] = "('{$llgId}', '{$creditor}', '{$debtBuyer}', '{$accountNumber}', '{$originalDebtAmount}', '{$currentAmount}', '{$settlementAmount}', '{$status}', {$settlementDate}, '{$settlementId}', '{$sourceEscaped}')";
+                if ($row['settlement_date'] === null || $row['settlement_date'] === '') {
+                    $values .= ", NULL";
+                } else {
+                    $values .= ", '" . $this->escapeSqlString((string) $row['settlement_date']) . "'";
+                }
+
+                $values .= ", '" . $this->escapeSqlString((string) $row['settlement_id']) . "'";
+                $values .= ", '" . $this->escapeSqlString('DP_' . strtoupper($source)) . "'";
+                $values .= ')';
             }
 
-            $sql = "INSERT INTO TblSettlementsNGF ({$fields}) VALUES " . implode(',', $valuesParts);
+            $sql = "INSERT INTO TblSettlementsNGF ({$fields}) VALUES " . ltrim($values, ',');
             $result = $connector->querySqlServer($sql);
             if (is_array($result) && isset($result['success']) && $result['success'] === false) {
                 $errorMsg = $result['error'] ?? 'Unknown SQL Server error';
