@@ -15,13 +15,10 @@ use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 
 class Formatter
 {
-    public function buildWorkbook(array $rows, string $source, string $reportDate): ?array
+    public function buildWorkbook(array $rows, string $source, string $dateRange, bool $isMonday): ?array
     {
-        if (empty($rows)) {
-            return null;
-        }
-
-        $filename = "Dropped Report - {$source} - " . date('m-d-Y', strtotime($reportDate)) . '.xlsx';
+        $filenameDatePart = $isMonday ? str_replace('/', '-', $dateRange) : date('m-d-Y', strtotime($dateRange));
+        $filename = "Dropped Report - {$source} - {$filenameDatePart}.xlsx";
         $path = storage_path('app/' . $filename);
 
         $spreadsheet = new Spreadsheet();
@@ -93,9 +90,10 @@ class Formatter
         DBConnector $connector,
         string $path,
         string $filename,
-        string $reportDate,
+        string $dateRange,
         string $source,
-        ?Command $console = null
+        ?Command $console = null,
+        bool $isMonday = false
     ): void {
         if (!is_file($path)) {
             Log::warning('GenerateDroppedReport: report file missing.', ['path' => $path]);
@@ -114,8 +112,15 @@ class Formatter
         ];
 
         $email = new EmailSenderService();
-        $subject = "Dropped Report - {$source} - " . date('m/d/Y', strtotime($reportDate));
-        $body = "Please see the attached Dropped Report for {$source} on " . date('m/d/Y', strtotime($reportDate)) . ".";
+        $displaySource = $source === 'PLAW' ? 'Progress Law' : $source;
+        
+        if ($isMonday) {
+            $subject = "Dropped Report - {$displaySource} - {$dateRange}";
+            $body = "Please see the attached Dropped Report for {$displaySource} for the date range: {$dateRange}.";
+        } else {
+            $subject = "Dropped Report - {$displaySource} - {$dateRange}";
+            $body = "Please see the attached Dropped Report for {$displaySource} on {$dateRange}.";
+        }
 
         $sent = $email->sendMailUsingTblReports(
             $connector,
@@ -138,19 +143,19 @@ class Formatter
         }
 
         // Insert log entry into TblLog
-        $this->insertLogEntry($connector, $source, $reportDate, $console);
+        $this->insertLogEntry($connector, $source, $dateRange, $console);
     }
 
     private function insertLogEntry(
         DBConnector $connector,
         string $source,
-        string $reportDate,
+        string $dateRange,
         ?Command $console = null
     ): void {
         try {
             $tableName = $this->escapeSqlString('TblDroppedReport');
             $macro = $this->escapeSqlString('GenerateDroppedReport');
-            $description = $this->escapeSqlString("DP_{$source} - Dropped Report generated for " . date('m/d/Y', strtotime($reportDate)));
+            $description = $this->escapeSqlString("DP_{$source} - Dropped Report generated for {$dateRange}");
             $action = $this->escapeSqlString('GENERATE_DROPPED_REPORT');
             $result = $this->escapeSqlString('SUCCESS');
             $timestamp = $this->escapeSqlString(date('Y-m-d H:i:s'));
