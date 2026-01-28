@@ -18,12 +18,19 @@ class SyncBalancesHistory extends Command
         Log::info('SyncBalancesHistory command started.');
 
         $connections = ['plaw', 'ldr'];
+        $sourceByConnection = [
+            'plaw' => 'DP_PLAW',
+            'ldr' => 'DP_LDR',
+        ];
         $hadException = false;
 
         foreach ($connections as $connection) {
-            $source = strtoupper($connection);
-            $logSource = $this->buildLogSource($source);
+            $normalizedConnection = strtolower($connection);
+            $source = $sourceByConnection[$normalizedConnection] ?? strtoupper($connection);
+            $legacySource = strtoupper($connection);
+            $deleteSources = array_values(array_unique([$source, $legacySource]));
             $totalFetched = 0;
+            $connector = null;
 
             $this->info("[$source] Starting history sync.");
             Log::info('SyncBalancesHistory: starting connection.', [
@@ -46,7 +53,7 @@ class SyncBalancesHistory extends Command
                         'source' => $source,
                     ]);
 
-                    $deleted = $this->deleteExistingHistory($connector, $source);
+                    $deleted = $this->deleteExistingHistory($connector, $deleteSources);
                     $this->insertLogRow(
                         $connector,
                         $logSource,
@@ -61,7 +68,7 @@ class SyncBalancesHistory extends Command
 
                 $this->info("Fetched {$totalFetched} history rows for {$source}.");
 
-                $deleted = $this->deleteExistingHistory($connector, $source);
+                $deleted = $this->deleteExistingHistory($connector, $deleteSources);
                 $this->info("[$source] Deleted {$deleted} existing history rows.");
 
                 $insertResult = $this->insertHistoryInBatches($connector, $historyRows, $source, 1000);
@@ -138,7 +145,7 @@ class SyncBalancesHistory extends Command
                 ]);
 
                 try {
-                    if (!isset($connector)) {
+                    if (!$connector instanceof DBConnector) {
                         $connector = DBConnector::fromEnvironment($connection);
                         $connector->initializeSqlServer();
                         $this->ensureLogTable($connector);
@@ -255,17 +262,27 @@ LIMIT {$pageSize} OFFSET {$offset}";
         }, $allRows);
     }
 
-    protected function deleteExistingHistory(DBConnector $connector, string $source): int
+    protected function deleteExistingHistory(DBConnector $connector, array $sources): int
     {
-        $sourceList = $this->buildDeleteSourceList($source);
-        $sql = "DELETE FROM TblBalancesHistory WHERE Source IN ({$sourceList});";
+        $sources = array_values(array_filter($sources, fn($value) => is_string($value) && $value !== ''));
+        $sources = array_values(array_unique($sources));
+
+        if (empty($sources)) {
+            return 0;
+        }
+
+        $quotedSources = implode(', ', array_map(
+            fn(string $value) => "'" . $this->escapeSqlString($value) . "'",
+            $sources
+        ));
+        $sql = "DELETE FROM TblBalancesHistory WHERE Source IN ({$quotedSources});";
 
         $result = $connector->querySqlServer($sql);
 
         if (is_array($result)) {
             if (isset($result['success']) && $result['success'] === false) {
                 $error = $result['error'] ?? 'Unknown SQL Server error';
-                throw new \RuntimeException("Failed to delete existing history for source {$source}: {$error}");
+                throw new \RuntimeException("Failed to delete existing history for sources [" . implode(', ', $sources) . "]: {$error}");
             }
             foreach (['rowCount', 'affected_rows', 'row_count'] as $key) {
                 if (isset($result[$key]) && is_numeric($result[$key])) {
@@ -283,14 +300,21 @@ LIMIT {$pageSize} OFFSET {$offset}";
         string $source,
         int $batchSize = 1000
     ): array {
-        $chunks = array_chunk($rows, $batchSize);
-        $sourceEscaped = $this->escapeSqlString('DP_' . strtoupper($source));
-        $importTimeEscaped = $this->escapeSqlString(now()->format('Y-m-d H:i:s'));
+        $paramsPerRow = 5; // (LLG_ID, Balance, Balance_Date, Source, Import_Time)
+        $sqlServerMaxParams = 2100;
+        // Leave headroom so we never hit the server/driver parameter ceiling exactly.
+        $effectiveMaxParams = 2000;
+        $maxRowsPerStatement = max(1, intdiv(min($effectiveMaxParams, $sqlServerMaxParams), $paramsPerRow));
+        $safeBatchSize = $batchSize > 0 ? min($batchSize, $maxRowsPerStatement) : $maxRowsPerStatement;
+
+        $chunks = array_chunk($rows, $safeBatchSize);
+        $importTime = now()->format('Y-m-d H:i:s');
         $totalInserted = 0;
         $skipped = 0;
 
         foreach ($chunks as $index => $chunk) {
-            $values = [];
+            $placeholders = [];
+            $params = [];
 
             foreach ($chunk as $row) {
                 if (!isset($row['CONTACT_ID'], $row['STAMP'])) {
@@ -299,8 +323,6 @@ LIMIT {$pageSize} OFFSET {$offset}";
                 }
 
                 $cid = 'LLG-' . $row['CONTACT_ID'];
-                $cidEscaped = $this->escapeSqlString((string) $cid);
-
                 $balanceValue = is_numeric($row['BALANCE']) ? (float) $row['BALANCE'] : 0;
 
                 $stampValue = $row['STAMP'];
@@ -308,27 +330,24 @@ LIMIT {$pageSize} OFFSET {$offset}";
                     $skipped++;
                     continue;
                 }
-                $stampEscaped = $this->escapeSqlString((string) $stampValue);
 
-                $values[] = sprintf(
-                    "('%s', %s, '%s', '%s', '%s')",
-                    $cidEscaped,
-                    $balanceValue,
-                    $stampEscaped,
-                    $sourceEscaped,
-                    $importTimeEscaped
-                );
+                $placeholders[] = '(?, ?, ?, ?, ?)';
+                $params[] = (string) $cid;
+                $params[] = $balanceValue;
+                $params[] = (string) $stampValue;
+                $params[] = $source;
+                $params[] = $importTime;
             }
 
-            if (empty($values)) {
+            if (empty($placeholders)) {
                 continue;
             }
 
             $sql = 'INSERT INTO TblBalancesHistory (LLG_ID, Balance, Balance_Date, Source, Import_Time) VALUES ' .
-                implode(', ', $values) .
+                implode(', ', $placeholders) .
                 ';';
 
-            $result = $connector->querySqlServer($sql);
+            $result = $connector->querySqlServer($sql, $params);
 
             if (is_array($result)) {
                 if (isset($result['success']) && $result['success'] === false) {
@@ -350,13 +369,13 @@ LIMIT {$pageSize} OFFSET {$offset}";
                 }
             }
 
-            $totalInserted += count($chunk);
+            $totalInserted += count($placeholders);
 
             Log::info('SyncBalancesHistory: batch insert fallback count used.', [
                 'source' => $source,
                 'batchIndex' => $index,
                 'batchSize' => count($chunk),
-                'inserted' => count($chunk),
+                'inserted' => count($placeholders),
                 'skipped' => $skipped,
             ]);
         }
