@@ -132,7 +132,9 @@ class SyncCollectionCompanies extends Command
         array $existingData
     ): int {
         $updated = 0;
+        $toUpdate = [];
 
+        // Collect records that need updating
         foreach ($debtsData as $row) {
             $debtId = $row['ID'] ?? null;
             $newCompany = trim($row['COMPANY'] ?? '');
@@ -141,32 +143,65 @@ class SyncCollectionCompanies extends Command
                 continue;
             }
 
-            // Get existing collection company for this debt
             $existingCompany = $existingData[$debtId] ?? '';
 
             // Only update if different
             if ($newCompany !== $existingCompany) {
+                $toUpdate[] = [
+                    'debt_id' => $debtId,
+                    'company' => $this->escSql($newCompany)
+                ];
+            }
+        }
+
+        if (empty($toUpdate)) {
+            $this->info('[INFO] No updates needed.');
+            return 0;
+        }
+
+        $this->info('[INFO] Found ' . count($toUpdate) . ' records to update');
+
+        // Process in batches of 500
+        $batchSize = 500;
+        $batches = array_chunk($toUpdate, $batchSize);
+        $totalBatches = count($batches);
+
+        foreach ($batches as $batchIndex => $batch) {
+            $this->info("[INFO] Processing batch " . ($batchIndex + 1) . " of {$totalBatches}...");
+
+            try {
+                $whenClauses = [];
+                $debtIds = [];
+
+                foreach ($batch as $item) {
+                    $debtId = $item['debt_id'];
+                    $company = $item['company'];
+                    $whenClauses[] = "WHEN {$debtId} THEN '{$company}'";
+                    $debtIds[] = $debtId;
+                }
+
+                $whenClausesStr = implode("\n                ", $whenClauses);
+                $debtIdsStr = implode(',', $debtIds);
+
                 $sql = "
                     UPDATE TblNegotiatorAssignments
-                    SET Collection_Company = '{$this->escSql($newCompany)}'
-                    WHERE Debt_ID = {$debtId}
+                    SET Collection_Company = CASE Debt_ID
+                        {$whenClausesStr}
+                    END
+                    WHERE Debt_ID IN ({$debtIdsStr})
                 ";
 
-                try {
-                    $connector->querySqlServer($sql);
-                    $updated++;
+                $connector->querySqlServer($sql);
+                $updated += count($batch);
+                $this->info("[INFO] Updated {$updated} records so far...");
 
-                    if ($updated % 100 === 0) {
-                        $this->info("[INFO] Updated {$updated} records...");
-                    }
-                } catch (\Throwable $e) {
-                    $this->warn("[WARN] Failed to update Debt_ID {$debtId}: " . $e->getMessage());
-                    Log::warning('SyncCollectionCompanies: Update failed', [
-                        'debt_id' => $debtId,
-                        'company' => $newCompany,
-                        'error' => $e->getMessage()
-                    ]);
-                }
+            } catch (\Throwable $e) {
+                $this->warn("[WARN] Batch update failed: " . $e->getMessage());
+                Log::warning('SyncCollectionCompanies: Batch update failed', [
+                    'batch_index' => $batchIndex,
+                    'batch_size' => count($batch),
+                    'error' => $e->getMessage()
+                ]);
             }
         }
 
