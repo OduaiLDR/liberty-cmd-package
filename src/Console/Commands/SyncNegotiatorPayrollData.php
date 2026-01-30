@@ -25,9 +25,9 @@ class SyncNegotiatorPayrollData extends Command
             return Command::FAILURE;
         }
 
-        // Calculate date range: last 3 months
+        // Calculate date range: last 12 months to capture full historical data
         $endDate = new \DateTime('last day of this month');
-        $startDate = (clone $endDate)->modify('first day of this month')->modify('-3 months');
+        $startDate = (clone $endDate)->modify('first day of this month')->modify('-12 months');
         $startDateString = $startDate->format('Y-m-d');
         $endDateString = $endDate->format('Y-m-d');
 
