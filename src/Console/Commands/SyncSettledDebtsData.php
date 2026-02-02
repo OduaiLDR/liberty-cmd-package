@@ -125,7 +125,7 @@ class SyncSettledDebtsData extends Command
     {
         $records = [];
         $lastId = 0;
-        $limit = 50000;
+        $limit = 10000;
 
         while (true) {
             $sql = <<<SQL
@@ -269,36 +269,29 @@ SQL;
 
         $fields = "Debt_ID, Settlement_Date, Last_Payment_Date, Account_Number, Has_Summons, Pre_Lit, Source";
         $inserted = 0;
-        $batchSize = 1000;
+        $batchSize = 500;
+        $sourceEscaped = $this->escapeSqlString('DP_' . strtoupper($source));
 
         for ($i = 0; $i < count($rows); $i += $batchSize) {
             $batch = array_slice($rows, $i, $batchSize);
-            $values = '';
+            $valuesParts = [];
 
             foreach ($batch as $row) {
-                $values .= ',(';
-                $values .= "'" . $this->escapeSqlString((string) $row['debt_id']) . "'";
+                $debtId = $this->escapeSqlString((string) $row['debt_id']);
+                $settlementDate = ($row['settlement_date'] === null || $row['settlement_date'] === '') 
+                    ? 'NULL' 
+                    : "'" . $this->escapeSqlString((string) $row['settlement_date']) . "'";
+                $lastPaymentDate = ($row['last_payment_date'] === null || $row['last_payment_date'] === '') 
+                    ? 'NULL' 
+                    : "'" . $this->escapeSqlString((string) $row['last_payment_date']) . "'";
+                $accountNumber = $this->escapeSqlString((string) $row['account_number']);
+                $hasSummons = $this->escapeSqlString((string) $row['has_summons']);
+                $preLit = $this->escapeSqlString((string) $row['pre_lit']);
 
-                if ($row['settlement_date'] === null || $row['settlement_date'] === '') {
-                    $values .= ", NULL";
-                } else {
-                    $values .= ", '" . $this->escapeSqlString((string) $row['settlement_date']) . "'";
-                }
-
-                if ($row['last_payment_date'] === null || $row['last_payment_date'] === '') {
-                    $values .= ", NULL";
-                } else {
-                    $values .= ", '" . $this->escapeSqlString((string) $row['last_payment_date']) . "'";
-                }
-
-                $values .= ", '" . $this->escapeSqlString((string) $row['account_number']) . "'";
-                $values .= ", '" . $this->escapeSqlString((string) $row['has_summons']) . "'";
-                $values .= ", '" . $this->escapeSqlString((string) $row['pre_lit']) . "'";
-                $values .= ", '" . $this->escapeSqlString('DP_' . strtoupper($source)) . "'";
-                $values .= ')';
+                $valuesParts[] = "('{$debtId}', {$settlementDate}, {$lastPaymentDate}, '{$accountNumber}', '{$hasSummons}', '{$preLit}', '{$sourceEscaped}')";
             }
 
-            $sql = "INSERT INTO TblNegotiatorDebts ({$fields}) VALUES " . ltrim($values, ',');
+            $sql = "INSERT INTO TblNegotiatorDebts ({$fields}) VALUES " . implode(',', $valuesParts);
             $result = $connector->querySqlServer($sql);
             if (is_array($result) && isset($result['success']) && $result['success'] === false) {
                 $errorMsg = $result['error'] ?? 'Unknown SQL Server error';
