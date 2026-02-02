@@ -25,9 +25,10 @@ class SyncNegotiatorPayrollData extends Command
             return Command::FAILURE;
         }
 
-        // Calculate date range: last 3 months
+        // Calculate date range: last 24 months to capture all historical data
+        // VBA uses 3 months, but we need to re-sync all legacy data
         $endDate = new \DateTime('last day of this month');
-        $startDate = (clone $endDate)->modify('first day of this month')->modify('-3 months');
+        $startDate = (clone $endDate)->modify('first day of this month')->modify('-24 months');
         $startDateString = $startDate->format('Y-m-d');
         $endDateString = $endDate->format('Y-m-d');
 
@@ -100,7 +101,10 @@ class SyncNegotiatorPayrollData extends Command
             WHERE Settlement_Date BETWEEN '{$this->esc($startDate)}' AND '{$this->esc($endDate)}'
               AND Source IN ({$deleteSourceList})
         ";
-        $sqlConnector->querySqlServer($deleteSql1);
+        $deleteResult1 = $sqlConnector->querySqlServer($deleteSql1);
+        if (!($deleteResult1['success'] ?? false)) {
+            $this->error("[ERROR] Failed to delete EPF Summary: " . ($deleteResult1['error'] ?? 'Unknown error'));
+        }
 
         // Insert EPF Summary data in batches
         if (!empty($rows1)) {
@@ -140,7 +144,10 @@ class SyncNegotiatorPayrollData extends Command
             WHERE Created_Date BETWEEN '{$this->esc($startDate)}' AND '{$this->esc($endDate)}'
               AND Source IN ({$deleteSourceList})
         ";
-        $sqlConnector->querySqlServer($deleteSql2);
+        $deleteResult2 = $sqlConnector->querySqlServer($deleteSql2);
+        if (!($deleteResult2['success'] ?? false)) {
+            $this->error("[ERROR] Failed to delete Settlement Summary: " . ($deleteResult2['error'] ?? 'Unknown error'));
+        }
 
         // Insert Settlement Summary data in batches
         if (!empty($rows2)) {
@@ -164,11 +171,11 @@ class SyncNegotiatorPayrollData extends Command
                 $collected = $this->esc((string)($row['COLLECTED'] ?? '0'));
                 $settlementId = $this->esc((string)($row['SETTLEMENT_ID'] ?? ''));
                 $creditor = $this->esc((string)($row['MEMO'] ?? ''));
-                $settlementDate = $this->esc((string)($row['SDATE'] ?? ''));
+                $settlementDate = $this->formatDate($row['SDATE'] ?? null);
                 $negotiatorId = $this->esc((string)($row['NEG_ID'] ?? ''));
                 $sourceEsc = $this->esc('DP_' . strtoupper($source));
 
-                $values[] = "('{$contactName}', '{$contactId}', '{$collected}', '{$settlementId}', '{$creditor}', '{$settlementDate}', '{$negotiatorId}', '{$sourceEsc}')";
+                $values[] = "('{$contactName}', '{$contactId}', '{$collected}', '{$settlementId}', '{$creditor}', {$settlementDate}, '{$negotiatorId}', '{$sourceEsc}')";
             }
 
             $valueString = implode(', ', $values);
@@ -178,7 +185,12 @@ class SyncNegotiatorPayrollData extends Command
                 VALUES {$valueString}
             ";
 
-            $connector->querySqlServer($sql);
+            $result = $connector->querySqlServer($sql);
+            if (!($result['success'] ?? false)) {
+                $error = $result['error'] ?? 'Unknown error';
+                $this->error("[ERROR] Failed to insert EPF Summary batch " . ($batchIndex + 1) . ": " . $error);
+                throw new \Exception("EPF Summary insert failed: " . $error);
+            }
             $this->info("[INFO] Inserted EPF Summary batch " . ($batchIndex + 1) . " (" . count($batch) . " rows)");
         }
     }
@@ -197,14 +209,14 @@ class SyncNegotiatorPayrollData extends Command
                 $settlementId = $this->esc((string)($row['SETTLEMENT_ID'] ?? ''));
                 $creditor = $this->esc((string)($row['CREDITOR_NAME'] ?? ''));
                 $collectionCompany = $this->esc((string)($row['COLLECTION_COMPANY'] ?? ''));
-                $settlementDate = $this->esc((string)($row['SETTLEMENT_DATE'] ?? ''));
+                $settlementDate = $this->formatDate($row['SETTLEMENT_DATE'] ?? null);
                 $negotiatorId = $this->esc((string)($row['NEG_ID'] ?? ''));
-                $createdDate = $this->esc((string)($row['CREATED_AT'] ?? ''));
+                $createdDate = $this->formatDate($row['CREATED_AT'] ?? null);
                 $settlementAmount = $this->esc((string)($row['SETTLEMENT_AMOUNT'] ?? '0'));
                 $debtId = $this->esc((string)($row['ID'] ?? ''));
                 $sourceEsc = $this->esc('DP_' . strtoupper($source));
 
-                $values[] = "('{$contactName}', '{$contactId}', '{$debtAmount}', '{$settlementId}', '{$creditor}', '{$collectionCompany}', '{$settlementDate}', '{$negotiatorId}', '{$createdDate}', '{$settlementAmount}', '{$debtId}', '{$sourceEsc}')";
+                $values[] = "('{$contactName}', '{$contactId}', '{$debtAmount}', '{$settlementId}', '{$creditor}', '{$collectionCompany}', {$settlementDate}, '{$negotiatorId}', {$createdDate}, '{$settlementAmount}', '{$debtId}', '{$sourceEsc}')";
             }
 
             $valueString = implode(', ', $values);
@@ -214,7 +226,12 @@ class SyncNegotiatorPayrollData extends Command
                 VALUES {$valueString}
             ";
 
-            $connector->querySqlServer($sql);
+            $result = $connector->querySqlServer($sql);
+            if (!($result['success'] ?? false)) {
+                $error = $result['error'] ?? 'Unknown error';
+                $this->error("[ERROR] Failed to insert Settlement Summary batch " . ($batchIndex + 1) . ": " . $error);
+                throw new \Exception("Settlement Summary insert failed: " . $error);
+            }
             $this->info("[INFO] Inserted Settlement Summary batch " . ($batchIndex + 1) . " (" . count($batch) . " rows)");
         }
     }
@@ -224,18 +241,62 @@ class SyncNegotiatorPayrollData extends Command
         return str_replace("'", "''", $value);
     }
 
+    /**
+     * Format date from Snowflake to SQL Server compatible format (YYYY-MM-DD)
+     * Snowflake returns dates in two formats:
+     * - Timestamp: "1760625248.000000000 1440" (unix timestamp with timezone offset in minutes)
+     * - Date: "20388" (days since 1970-01-01)
+     */
+    private function formatDate($date): string
+    {
+        if ($date === null || $date === '' || $date === '0000-00-00') {
+            return 'NULL';
+        }
+        
+        $dateStr = trim((string) $date);
+        
+        // Check if it's a Snowflake timestamp format: "1760625248.000000000 1440"
+        if (preg_match('/^(\d+)\.?\d*\s+\d+$/', $dateStr, $matches)) {
+            $timestamp = (int) $matches[1];
+            $dateTime = new \DateTime();
+            $dateTime->setTimestamp($timestamp);
+            return "'" . $dateTime->format('Y-m-d') . "'";
+        }
+        
+        // Check if it's a Snowflake date format: days since epoch (e.g., "20388")
+        if (preg_match('/^\d+$/', $dateStr) && strlen($dateStr) <= 6) {
+            $days = (int) $dateStr;
+            $dateTime = new \DateTime('1970-01-01');
+            $dateTime->modify("+{$days} days");
+            return "'" . $dateTime->format('Y-m-d') . "'";
+        }
+        
+        // Try to parse as standard date string (YYYY-MM-DD or ISO 8601)
+        try {
+            $dateTime = new \DateTime($dateStr);
+            return "'" . $dateTime->format('Y-m-d') . "'";
+        } catch (\Exception $e) {
+            // If parsing fails, try to extract just the date part (YYYY-MM-DD)
+            if (preg_match('/^(\d{4}-\d{2}-\d{2})/', $dateStr, $matches)) {
+                return "'" . $matches[1] . "'";
+            }
+            return 'NULL';
+        }
+    }
+
     private function buildDeleteSources(string $source): array
     {
-        // Delete DP_ sources + legacy ProLaw/PLAW/LDR
+        // Delete ALL sources for this source type (legacy + DP_ prefixed)
+        // This cleans up old data before inserting fresh DP_ prefixed data
         if ($source === 'PLAW') {
-            return ['DP_PLAW', 'PLAW', 'ProLaw'];
+            return ['DP_PLAW', 'PLAW', 'ProLaw', 'prolaw'];
         }
 
         if ($source === 'LDR') {
-            return ['DP_LDR', 'LDR'];
+            return ['DP_LDR', 'LDR', 'ldr'];
         }
 
-        return ['DP_' . strtoupper($source), $source];
+        return ['DP_' . strtoupper($source), strtoupper($source), strtolower($source)];
     }
 
     private function implodeSourceList(array $sources): string
