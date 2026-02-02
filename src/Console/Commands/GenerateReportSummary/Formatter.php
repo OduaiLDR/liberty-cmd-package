@@ -49,7 +49,8 @@ class Formatter
             <table>
                 <thead>
                     <tr>
-                        <th>Report Name</th>
+                        <th>Type</th>
+                        <th>Report/Automation Name</th>
                         <th>Company</th>
                         <th>Schedule</th>
                         <th>Last Run Date</th>
@@ -135,6 +136,7 @@ class Formatter
 
                 $html .= "
                     <tr>
+                        <td>{$type}</td>
                         <td>{$reportName}</td>
                         <td>{$company}</td>
                         <td>{$schedule}</td>
