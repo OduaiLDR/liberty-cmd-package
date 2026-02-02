@@ -26,19 +26,35 @@ class GenerateDroppedReport extends Command
             return Command::FAILURE;
         }
 
-        $reportDate = date('Y-m-d', strtotime('-1 day'));
+        // Determine date range based on day of week
+        $dayOfWeek = date('N'); // 1=Monday, 7=Sunday
+        $isMonday = ($dayOfWeek == 1);
+        
+        if ($isMonday) {
+            // Monday: Check Friday to Sunday (last 3 days)
+            $startDate = date('Y-m-d', strtotime('-3 days'));
+            $endDate = date('Y-m-d', strtotime('-1 day'));
+            $dateRange = date('m/d/Y', strtotime($startDate)) . ' - ' . date('m/d/Y', strtotime($endDate));
+        } else {
+            // Tuesday-Friday: Check previous day only
+            $startDate = date('Y-m-d', strtotime('-1 day'));
+            $endDate = $startDate;
+            $dateRange = date('m/d/Y', strtotime($startDate));
+        }
+        
+        $this->info("[INFO] Checking dropped clients for date range: {$dateRange}");
         $formatter = new Formatter();
 
         // Generate Progress Law Dropped Report
         try {
             $this->info('[INFO] Generating Progress Law Dropped Report...');
-            $plawRows = $this->fetchDroppedClients($snowflakePlaw, $reportDate);
+            $plawRows = $this->fetchDroppedClients($snowflakePlaw, $startDate, $endDate);
             $this->info('[INFO] Progress Law dropped clients rows: ' . count($plawRows));
             
-            $plawReport = $formatter->buildWorkbook($plawRows, 'Progress Law', $reportDate);
+            $plawReport = $formatter->buildWorkbook($plawRows, 'Progress Law', $dateRange, $isMonday);
             if ($plawReport !== null) {
                 $this->info("[INFO] Progress Law report written to {$plawReport['path']}");
-                $formatter->sendReport($sqlConnector, $plawReport['path'], $plawReport['filename'], $reportDate, 'PLAW', $this);
+                $formatter->sendReport($sqlConnector, $plawReport['path'], $plawReport['filename'], $dateRange, 'PLAW', $this, $isMonday);
             } else {
                 $this->warn('[WARN] Progress Law dropped report file was not created.');
             }
@@ -50,13 +66,13 @@ class GenerateDroppedReport extends Command
         // Generate LDR Dropped Report
         try {
             $this->info('[INFO] Generating LDR Dropped Report...');
-            $ldrRows = $this->fetchDroppedClients($snowflakeLdr, $reportDate);
+            $ldrRows = $this->fetchDroppedClients($snowflakeLdr, $startDate, $endDate);
             $this->info('[INFO] LDR dropped clients rows: ' . count($ldrRows));
             
-            $ldrReport = $formatter->buildWorkbook($ldrRows, 'LDR', $reportDate);
+            $ldrReport = $formatter->buildWorkbook($ldrRows, 'LDR', $dateRange, $isMonday);
             if ($ldrReport !== null) {
                 $this->info("[INFO] LDR report written to {$ldrReport['path']}");
-                $formatter->sendReport($sqlConnector, $ldrReport['path'], $ldrReport['filename'], $reportDate, 'LDR', $this);
+                $formatter->sendReport($sqlConnector, $ldrReport['path'], $ldrReport['filename'], $dateRange, 'LDR', $this, $isMonday);
             } else {
                 $this->warn('[WARN] LDR dropped report file was not created.');
             }
@@ -68,7 +84,7 @@ class GenerateDroppedReport extends Command
         return Command::SUCCESS;
     }
 
-    private function fetchDroppedClients(DBConnector $snowflake, string $reportDate): array
+    private function fetchDroppedClients(DBConnector $snowflake, string $startDate, string $endDate): array
     {
         $sql = "
             SELECT
@@ -93,7 +109,8 @@ class GenerateDroppedReport extends Command
             ) AS d ON c.ID = d.CONTACT_ID
             LEFT JOIN CANCELLATION_REASONS AS cr ON c.DROPPED_REASON = cr.ID
             LEFT JOIN CONTACTS_LEAD_STATUS AS cls ON c.LEADSTATUS = cls.ID
-            WHERE c.DROPPED_DATE = '{$this->esc($reportDate)}'
+            WHERE c.DROPPED_DATE >= '{$this->esc($startDate)}'
+              AND c.DROPPED_DATE <= '{$this->esc($endDate)}'
         ";
 
         $result = $snowflake->query($sql);

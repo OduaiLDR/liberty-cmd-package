@@ -11,22 +11,41 @@ class Formatter
 {
     public function buildHtmlBody(array $rows): string
     {
+        // Separate reports and automations
+        $reports = [];
+        $automations = [];
+        
+        foreach ($rows as $row) {
+            $type = $row['Type'] ?? $row['TYPE'] ?? '';
+            if ($type === 'Automation') {
+                $automations[] = $row;
+            } else {
+                $reports[] = $row;
+            }
+        }
+
         $html = '
         <html>
         <head>
             <style>
                 body { font-family: Calibri, Arial, sans-serif; font-size: 11pt; }
-                table { border-collapse: collapse; width: 100%; }
+                table { border-collapse: collapse; width: 100%; margin-bottom: 30px; }
                 th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
                 th { background-color: #4472C4; color: white; }
                 tr:nth-child(even) { background-color: #f2f2f2; }
                 tr:hover { background-color: #ddd; }
                 h2 { color: #4472C4; }
+                h3 { color: #4472C4; margin-top: 20px; margin-bottom: 10px; }
             </style>
         </head>
         <body>
             <h2>Daily Report Summary</h2>
-            <p>The following reports are configured in the system:</p>
+            <p>The following reports and automations are configured in the system:</p>';
+
+        // Reports Table
+        if (!empty($reports)) {
+            $html .= '
+            <h3>Reports</h3>
             <table>
                 <thead>
                     <tr>
@@ -39,22 +58,29 @@ class Formatter
                 </thead>
                 <tbody>';
 
-        foreach ($rows as $row) {
-            $reportName = $row['Report_Name'] ?? $row['REPORT_NAME'] ?? '';
-            $company = $row['Company'] ?? $row['COMPANY'] ?? '';
-            $schedule = $row['Schedule'] ?? $row['SCHEDULE'] ?? '';
-            $lastRunDate = $row['Last_Run_Date'] ?? $row['LAST_RUN_DATE'] ?? '';
-            $lastRunWeekday = $row['Last_Run_Weekday'] ?? $row['LAST_RUN_WEEKDAY'] ?? '';
+            foreach ($reports as $row) {
+                $reportName = $row['Report_Name'] ?? $row['REPORT_NAME'] ?? '';
+                $company = $row['Company'] ?? $row['COMPANY'] ?? '';
+                $schedule = $row['Schedule'] ?? $row['SCHEDULE'] ?? '';
+                $lastRunDate = $row['Last_Run_Date'] ?? $row['LAST_RUN_DATE'] ?? '';
+                $lastRunWeekday = $row['Last_Run_Weekday'] ?? $row['LAST_RUN_WEEKDAY'] ?? '';
 
-            // Format the date if it's a valid date
-            if ($lastRunDate && $lastRunDate !== '' && $lastRunDate !== null) {
-                $timestamp = strtotime($lastRunDate);
-                if ($timestamp !== false) {
-                    $lastRunDate = date('m/d/Y g:i A', $timestamp);
+                // Format the date if it's a valid date
+                if ($lastRunDate && $lastRunDate !== '' && $lastRunDate !== null) {
+                    $timestamp = strtotime($lastRunDate);
+                    if ($timestamp !== false) {
+                        $lastRunDate = date('m/d/Y g:i A', $timestamp);
+                    }
+                } else {
+                    $lastRunDate = '<span style="color: #999;">Never run</span>';
                 }
-            }
 
-            $html .= "
+                // If no weekday, show empty
+                if (!$lastRunWeekday || $lastRunWeekday === '') {
+                    $lastRunWeekday = '<span style="color: #999;">-</span>';
+                }
+
+                $html .= "
                     <tr>
                         <td>{$reportName}</td>
                         <td>{$company}</td>
@@ -62,11 +88,67 @@ class Formatter
                         <td>{$lastRunDate}</td>
                         <td>{$lastRunWeekday}</td>
                     </tr>";
+            }
+
+            $html .= '
+                </tbody>
+            </table>';
+        }
+
+        // Automations Table
+        if (!empty($automations)) {
+            $html .= '
+            <h3>Automations</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Automation Name</th>
+                        <th>Company</th>
+                        <th>Schedule</th>
+                        <th>Last Run Date</th>
+                        <th>Last Run Weekday</th>
+                    </tr>
+                </thead>
+                <tbody>';
+
+            foreach ($automations as $row) {
+                $reportName = $row['Report_Name'] ?? $row['REPORT_NAME'] ?? '';
+                $company = $row['Company'] ?? $row['COMPANY'] ?? '';
+                $schedule = $row['Schedule'] ?? $row['SCHEDULE'] ?? '';
+                $lastRunDate = $row['Last_Run_Date'] ?? $row['LAST_RUN_DATE'] ?? '';
+                $lastRunWeekday = $row['Last_Run_Weekday'] ?? $row['LAST_RUN_WEEKDAY'] ?? '';
+
+                // Format the date if it's a valid date
+                if ($lastRunDate && $lastRunDate !== '' && $lastRunDate !== null) {
+                    $timestamp = strtotime($lastRunDate);
+                    if ($timestamp !== false) {
+                        $lastRunDate = date('m/d/Y g:i A', $timestamp);
+                    }
+                } else {
+                    $lastRunDate = '<span style="color: #999;">Never run</span>';
+                }
+
+                // If no weekday, show empty
+                if (!$lastRunWeekday || $lastRunWeekday === '') {
+                    $lastRunWeekday = '<span style="color: #999;">-</span>';
+                }
+
+                $html .= "
+                    <tr>
+                        <td>{$reportName}</td>
+                        <td>{$company}</td>
+                        <td>{$schedule}</td>
+                        <td>{$lastRunDate}</td>
+                        <td>{$lastRunWeekday}</td>
+                    </tr>";
+            }
+
+            $html .= '
+                </tbody>
+            </table>';
         }
 
         $html .= '
-                </tbody>
-            </table>
             <br>
             <p>Generated on ' . date('m/d/Y g:i A') . '</p>
         </body>

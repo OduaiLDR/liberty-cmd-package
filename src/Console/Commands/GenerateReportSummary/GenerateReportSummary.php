@@ -26,36 +26,84 @@ class GenerateReportSummary extends Command
             return Command::FAILURE;
         }
 
-        // Query TblLog for all report executions from today
+        // Query ALL reports from TblReports and TblAutomation, then get last run from TblLog
         $sql = "
+            WITH AllReports AS (
+                -- Get all reports from TblReports
+                SELECT 
+                    LTRIM(RTRIM(Report_Name)) AS Report_Name,
+                    CASE 
+                        WHEN LTRIM(RTRIM(Report_Name)) LIKE '%PLAW%' OR LTRIM(RTRIM(Report_Name)) LIKE '%Progress%' THEN 'PLAW'
+                        WHEN LTRIM(RTRIM(Report_Name)) LIKE '%LDR%' THEN 'LDR'
+                        WHEN LTRIM(RTRIM(Report_Name)) LIKE '%Paramount%' THEN 'Paramount'
+                        ELSE 'All'
+                    END AS Company,
+                    COALESCE(LTRIM(RTRIM(Schedule)), 'Not Scheduled') AS Schedule,
+                    'Report' AS Type
+                FROM dbo.TblReports
+                WHERE Report_Name IS NOT NULL 
+                  AND Report_Name <> ''
+                  AND Report_Name NOT IN ('ReportSummary', 'Report Summary')
+                
+                UNION ALL
+                
+                -- Get all automations from TblAutomation
+                SELECT 
+                    LTRIM(RTRIM(Automation_Name)) AS Report_Name,
+                    CASE 
+                        WHEN LTRIM(RTRIM(Automation_Name)) LIKE '%PLAW%' OR LTRIM(RTRIM(Automation_Name)) LIKE '%Progress%' THEN 'PLAW'
+                        WHEN LTRIM(RTRIM(Automation_Name)) LIKE '%LDR%' THEN 'LDR'
+                        WHEN LTRIM(RTRIM(Automation_Name)) LIKE '%Paramount%' THEN 'Paramount'
+                        ELSE 'All'
+                    END AS Company,
+                    COALESCE(LTRIM(RTRIM(Schedule)), 'Not Scheduled') AS Schedule,
+                    'Automation' AS Type
+                FROM dbo.TblAutomation
+                WHERE Automation_Name IS NOT NULL 
+                  AND Automation_Name <> ''
+            ),
+            LastRuns AS (
+                -- Get the most recent run for each report/automation
+                SELECT 
+                    LTRIM(RTRIM([Macro])) AS Report_Name,
+                    MAX([Timestamp]) AS Last_Run_Date
+                FROM dbo.TblLog
+                WHERE [Table_Name] IN ('TblReports', 'TblAutomation')
+                  AND [Macro] IS NOT NULL
+                  AND [Macro] <> ''
+                GROUP BY LTRIM(RTRIM([Macro]))
+            )
             SELECT 
-                [Macro] AS Report_Name,
-                SUBSTRING([Description], CHARINDEX('for ', [Description]) + 4, LEN([Description])) AS Company,
-                'Daily' AS Schedule,
-                [Timestamp] AS Last_Run_Date,
-                DATENAME(WEEKDAY, [Timestamp]) AS Last_Run_Weekday
-            FROM dbo.TblLog
-            WHERE [Table_Name] = 'TblReports'
-              AND CAST([Timestamp] AS DATE) = CAST(GETDATE() AS DATE)
-              AND [Macro] <> 'ReportSummary'
-            ORDER BY [Timestamp] DESC, [Macro]
+                ar.Report_Name,
+                ar.Company,
+                ar.Schedule,
+                ar.Type,
+                lr.Last_Run_Date,
+                CASE 
+                    WHEN lr.Last_Run_Date IS NOT NULL 
+                    THEN DATENAME(WEEKDAY, lr.Last_Run_Date)
+                    ELSE NULL
+                END AS Last_Run_Weekday
+            FROM AllReports ar
+            LEFT JOIN LastRuns lr ON ar.Report_Name = lr.Report_Name
+            ORDER BY ar.Type, ar.Report_Name
         ";
 
         try {
             $stmt = $this->sqlConnection->query($sql);
             $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
         } catch (\Throwable $e) {
-            $this->error('Failed to query TblReports: ' . $e->getMessage());
-            Log::error('GenerateReportSummary: Query failed', ['exception' => $e]);
+            $this->error('Failed to query TblReports/TblAutomation: ' . $e->getMessage());
+            Log::error('GenerateReportSummary: Query failed', ['exception' => $e, 'sql' => $sql]);
             return Command::FAILURE;
         }
 
         if (empty($rows)) {
-            $this->warn('[WARN] No reports found in TblReports.');
+            $this->warn('[WARN] No reports found in TblReports or TblAutomation.');
             return Command::SUCCESS;
         }
 
-        $this->info('[INFO] Found ' . count($rows) . ' reports in TblReports.');
+        $this->info('[INFO] Found ' . count($rows) . ' reports/automations.');
 
         // Build HTML table
         $formatter = new Formatter();
@@ -63,11 +111,6 @@ class GenerateReportSummary extends Command
 
         // Send email
         $sent = $formatter->sendReport($html, $this);
-
-        // Update Last_Run_Date if email was sent successfully
-        if ($sent) {
-            $this->updateLastRunDate();
-        }
 
         $this->info('[INFO] Report Summary: completed.');
         return Command::SUCCESS;
@@ -95,19 +138,5 @@ class GenerateReportSummary extends Command
                 PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
             ]
         );
-    }
-
-    private function updateLastRunDate(): void
-    {
-        try {
-            $sql = "
-                UPDATE dbo.TblReports
-                SET Last_Run_Date = GETDATE()
-                WHERE Report_Name IN ('ReportSummary', 'Report Summary')
-            ";
-            $this->sqlConnection->exec($sql);
-        } catch (\Throwable $e) {
-            Log::warning('GenerateReportSummary: Failed to update Last_Run_Date', ['error' => $e->getMessage()]);
-        }
     }
 }

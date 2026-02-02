@@ -453,46 +453,45 @@ class SyncContactsData extends Command
     {
         $fields = 'Created_Date, Assigned_Date, LLG_ID, External_ID, Campaign, Data_Source, Created_By, Agent, Client, Phone, Email, Address_1, Address_2, City, State, Zip, Stage, Status, Debt_Amount, Debt_Enrolled, Credit_Score, Credit_Utilization, Category, Affiliate_Agent, TP_ID';
 
-        $batchSize = 1000;
+        $batchSize = 500;
         $total = count($data);
         $inserted = 0;
 
         for ($i = 0; $i < $total; $i += $batchSize) {
             $batch = array_slice($data, $i, $batchSize);
-            $values = [];
+            $valuesParts = [];
 
             foreach ($batch as $row) {
-                $values[] = sprintf(
-                    "('%s', %s, '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', %s, '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s')",
-                    $this->formatDate($row['created_date']),
-                    $row['assigned_date'] ? "'" . $this->formatDate($row['assigned_date']) . "'" : 'NULL',
-                    $this->escSql($row['llg_id']),
-                    $this->escSql($row['external_id']),
-                    $this->escSql($row['campaign']),
-                    $this->escSql($row['data_source']),
-                    $this->escSql($row['created_by']),
-                    $this->escSql($row['agent']),
-                    $this->escSql($row['client']),
-                    $this->escSql($row['phone']),
-                    strpos($row['email'], '@') !== false ? "'" . $this->escSql($row['email']) . "'" : 'NULL',
-                    $this->escSql($row['address_1']),
-                    $this->escSql($row['address_2']),
-                    $this->escSql($row['city']),
-                    $this->escSql($row['state']),
-                    $this->escSql($row['zip']),
-                    $this->escSql($row['stage']),
-                    $this->escSql($row['status']),
-                    $row['debt_amount'],
-                    $row['debt_enrolled'],
-                    $row['credit_score'],
-                    $row['credit_utilization'],
-                    $this->escSql($row['category']),
-                    $this->escSql($row['affiliate_agent']),
-                    $this->escSql($row['tp_id'])
-                );
+                $createdDate = $this->formatDate($row['created_date']);
+                $assignedDate = $row['assigned_date'] ? "'" . $this->formatDate($row['assigned_date']) . "'" : 'NULL';
+                $llgId = $this->escSql($row['llg_id']);
+                $externalId = $this->escSql($row['external_id']);
+                $campaign = $this->escSql($row['campaign']);
+                $dataSource = $this->escSql($row['data_source']);
+                $createdBy = $this->escSql($row['created_by']);
+                $agent = $this->escSql($row['agent']);
+                $client = $this->escSql($row['client']);
+                $phone = $this->escSql($row['phone']);
+                $email = strpos($row['email'], '@') !== false ? "'" . $this->escSql($row['email']) . "'" : 'NULL';
+                $address1 = $this->escSql($row['address_1']);
+                $address2 = $this->escSql($row['address_2']);
+                $city = $this->escSql($row['city']);
+                $state = $this->escSql($row['state']);
+                $zip = $this->escSql($row['zip']);
+                $stage = $this->escSql($row['stage']);
+                $status = $this->escSql($row['status']);
+                $debtAmount = $row['debt_amount'];
+                $debtEnrolled = $row['debt_enrolled'];
+                $creditScore = $row['credit_score'];
+                $creditUtil = $row['credit_utilization'];
+                $category = $this->escSql($row['category']);
+                $affiliateAgent = $this->escSql($row['affiliate_agent']);
+                $tpId = $this->escSql($row['tp_id']);
+
+                $valuesParts[] = "('{$createdDate}', {$assignedDate}, '{$llgId}', '{$externalId}', '{$campaign}', '{$dataSource}', '{$createdBy}', '{$agent}', '{$client}', '{$phone}', {$email}, '{$address1}', '{$address2}', '{$city}', '{$state}', '{$zip}', '{$stage}', '{$status}', '{$debtAmount}', '{$debtEnrolled}', '{$creditScore}', '{$creditUtil}', '{$category}', '{$affiliateAgent}', '{$tpId}')";
             }
 
-            $sql = "INSERT INTO {$this->targetTable} ({$fields}) VALUES " . implode(', ', $values);
+            $sql = "INSERT INTO {$this->targetTable} ({$fields}) VALUES " . implode(', ', $valuesParts);
 
             try {
                 $connector->querySqlServer($sql);
