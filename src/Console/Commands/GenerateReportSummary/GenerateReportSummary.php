@@ -32,8 +32,13 @@ class GenerateReportSummary extends Command
                 -- Get all reports from TblReports
                 SELECT 
                     LTRIM(RTRIM(Report_Name)) AS Report_Name,
-                    LTRIM(RTRIM(Company)) AS Company,
-                    LTRIM(RTRIM(Schedule)) AS Schedule,
+                    CASE 
+                        WHEN LTRIM(RTRIM(Report_Name)) LIKE '%PLAW%' OR LTRIM(RTRIM(Report_Name)) LIKE '%Progress%' THEN 'PLAW'
+                        WHEN LTRIM(RTRIM(Report_Name)) LIKE '%LDR%' THEN 'LDR'
+                        WHEN LTRIM(RTRIM(Report_Name)) LIKE '%Paramount%' THEN 'Paramount'
+                        ELSE 'All'
+                    END AS Company,
+                    COALESCE(LTRIM(RTRIM(Schedule)), 'Not Scheduled') AS Schedule,
                     'Report' AS Type
                 FROM dbo.TblReports
                 WHERE Report_Name IS NOT NULL 
@@ -48,9 +53,10 @@ class GenerateReportSummary extends Command
                     CASE 
                         WHEN LTRIM(RTRIM(Automation_Name)) LIKE '%PLAW%' OR LTRIM(RTRIM(Automation_Name)) LIKE '%Progress%' THEN 'PLAW'
                         WHEN LTRIM(RTRIM(Automation_Name)) LIKE '%LDR%' THEN 'LDR'
+                        WHEN LTRIM(RTRIM(Automation_Name)) LIKE '%Paramount%' THEN 'Paramount'
                         ELSE 'All'
                     END AS Company,
-                    LTRIM(RTRIM(Schedule)) AS Schedule,
+                    COALESCE(LTRIM(RTRIM(Schedule)), 'Not Scheduled') AS Schedule,
                     'Automation' AS Type
                 FROM dbo.TblAutomation
                 WHERE Automation_Name IS NOT NULL 
