@@ -17,21 +17,37 @@ use Cmd\Reports\Console\Commands\SyncTimeInProgram;
 use Cmd\Reports\Console\Commands\SyncSettlementData;
 use Cmd\Reports\Console\Commands\SyncSettledDebtsData;
 use Cmd\Reports\Console\Commands\SyncEnrollmentStatus;
+use Cmd\Reports\Console\Commands\SyncEnrollmentData;
+use Cmd\Reports\Console\Commands\SyncDroppedStatus;
 use Cmd\Reports\Console\Commands\SyncVerifiedDebts;
+use Cmd\Reports\Console\Commands\GenerateCompanyStatsReport\GenerateCompanyStatsReport;
+use Cmd\Reports\Console\Commands\GenerateEnrollmentFrequencyReport\GenerateEnrollmentFrequencyReport;
+use Cmd\Reports\Console\Commands\GenerateConsumerAffairsReport\GenerateConsumerAffairsReport;
+use Cmd\Reports\Console\Commands\GenerateConsumerAffairsSettlementReport\GenerateConsumerAffairsSettlementReport;
+use Cmd\Reports\Console\Commands\GenerateReconsiderationReport\GenerateReconsiderationReport;
+use Cmd\Reports\Console\Commands\GenerateLegalReport\GenerateLegalReport;
+use Cmd\Reports\Console\Commands\GenerateNSFReport\GenerateNSFReport;
+use Cmd\Reports\Console\Commands\GenerateEnrollmentSummaryReport\GenerateEnrollmentSummaryReport;
+use Cmd\Reports\Console\Commands\GenerateWelcomeLetterReport\GenerateWelcomeLetterReport;
+use Cmd\Reports\Console\Commands\GenerateWelcomePacketReport\GenerateWelcomePacketReport;
+use Cmd\Reports\Console\Commands\GenerateCancellationReport\GenerateCancellationReport;
+use Cmd\Reports\Console\Commands\GenerateDroppedReport\GenerateDroppedReport;
+use Cmd\Reports\Console\Commands\GeneratePastDueReport\GeneratePastDueReport;
+use Cmd\Reports\Console\Commands\GenerateUnclearedSettlementPaymentsReport\GenerateUnclearedSettlementPaymentsReport;
+use Cmd\Reports\Console\Commands\GenerateNSFCommissionReport\GenerateNSFCommissionReport;
+use Cmd\Reports\Console\Commands\GenerateOfferAuthorizationReport\GenerateOfferAuthorizationReport;
+use Cmd\Reports\Console\Commands\GenerateScrubListReport\GenerateScrubListReport;
+use Cmd\Reports\Console\Commands\GenerateLookbackSummaryReport\GenerateLookbackSummaryReport;
+use Cmd\Reports\Console\Commands\GenerateReportSummary\GenerateReportSummary;
+use Cmd\Reports\Console\Commands\GenerateSyncSummary\GenerateSyncSummary;
 use Cmd\Reports\Console\Commands\SyncContactsData;
 use Cmd\Reports\Console\Commands\SyncCollectionCompanies;
 use Cmd\Reports\Console\Commands\SyncLastDepositDate;
 use Cmd\Reports\Console\Commands\SyncVeritasTransactions;
 use Cmd\Reports\Console\Commands\SyncNegotiatorPayrollData;
-use Cmd\Reports\Console\Commands\SyncEnrollmentData;
-use Cmd\Reports\Console\Commands\GenerateSyncSummary\GenerateSyncSummary;
-use Cmd\Reports\Console\Commands\GenerateCompanyStatsReport\GenerateCompanyStatsReport;
-use Cmd\Reports\Console\Commands\GenerateWelcomeLetterReport\GenerateWelcomeLetterReport;
-use Cmd\Reports\Console\Commands\GenerateWelcomePacketReport\GenerateWelcomePacketReport;
-use Cmd\Reports\Console\Commands\GenerateLookbackSummaryReport\GenerateLookbackSummaryReport;
-use Cmd\Reports\Console\Commands\GenerateLegalReport\GenerateLegalReport;
-use Cmd\Reports\Console\Commands\GenerateReportSummary\GenerateReportSummary;
-use Cmd\Reports\Console\Commands\GenerateDroppedReport\GenerateDroppedReport;
+use Cmd\Reports\Console\Commands\UpdateNegotiatorMonthlyBonusSummary;
+use Cmd\Reports\Console\Commands\ImportConversionSummaryDataCCS;
+use Cmd\Reports\Console\Commands\ImportConversionSummaryDataLDR;
 
 class ReportsServiceProvider extends ServiceProvider
 {
@@ -81,21 +97,37 @@ class ReportsServiceProvider extends ServiceProvider
                 SyncSettlementData::class,
                 SyncSettledDebtsData::class,
                 SyncEnrollmentStatus::class,
+                SyncEnrollmentData::class,
+                SyncDroppedStatus::class,
                 SyncVerifiedDebts::class,
+                GenerateEnrollmentSummaryReport::class,
+                GenerateCompanyStatsReport::class,
+                GenerateEnrollmentFrequencyReport::class,
+                GenerateConsumerAffairsReport::class,
+                GenerateConsumerAffairsSettlementReport::class,
+                GenerateReconsiderationReport::class,
+                GenerateLegalReport::class,
+                GenerateNSFReport::class,
+                GenerateWelcomeLetterReport::class,
+                GenerateWelcomePacketReport::class,
+                GenerateCancellationReport::class,
+                GenerateDroppedReport::class,
+                GeneratePastDueReport::class,
+                GenerateUnclearedSettlementPaymentsReport::class,
+                GenerateNSFCommissionReport::class,
+                GenerateOfferAuthorizationReport::class,
+                GenerateScrubListReport::class,
+                GenerateLookbackSummaryReport::class,
+                GenerateReportSummary::class,
+                GenerateSyncSummary::class,
                 SyncContactsData::class,
                 SyncCollectionCompanies::class,
                 SyncLastDepositDate::class,
                 SyncVeritasTransactions::class,
                 SyncNegotiatorPayrollData::class,
-                SyncEnrollmentData::class,
-                GenerateWelcomeLetterReport::class,
-                GenerateWelcomePacketReport::class,
-                GenerateLookbackSummaryReport::class,
-                GenerateCompanyStatsReport::class,
-                GenerateLegalReport::class,
-                GenerateReportSummary::class,
-                GenerateSyncSummary::class,
-                GenerateDroppedReport::class,
+                UpdateNegotiatorMonthlyBonusSummary::class,
+                ImportConversionSummaryDataCCS::class,
+                ImportConversionSummaryDataLDR::class,
             ]);
         }
 
