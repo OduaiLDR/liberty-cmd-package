@@ -243,9 +243,11 @@ class SyncNegotiatorPayrollData extends Command
 
     /**
      * Format date from Snowflake to SQL Server compatible format (YYYY-MM-DD)
-     * Snowflake returns dates in two formats:
-     * - Timestamp: "1760625248.000000000 1440" (unix timestamp with timezone offset in minutes)
-     * - Date: "20388" (days since 1970-01-01)
+     * Snowflake returns dates in multiple formats:
+     * - Timestamp with TZ: "1760625248.000000000 1440" (unix timestamp with timezone offset)
+     * - Timestamp: "1760625248.000000000" or "1760625248" (unix timestamp)
+     * - Date as days: "20388" (days since 1970-01-01)
+     * - ISO date: "2025-01-15" or "2025-01-15T00:00:00"
      */
     private function formatDate($date): string
     {
@@ -255,7 +257,7 @@ class SyncNegotiatorPayrollData extends Command
         
         $dateStr = trim((string) $date);
         
-        // Check if it's a Snowflake timestamp format: "1760625248.000000000 1440"
+        // Check if it's a Snowflake timestamp format with TZ: "1760625248.000000000 1440"
         if (preg_match('/^(\d+)\.?\d*\s+\d+$/', $dateStr, $matches)) {
             $timestamp = (int) $matches[1];
             $dateTime = new \DateTime();
@@ -263,25 +265,45 @@ class SyncNegotiatorPayrollData extends Command
             return "'" . $dateTime->format('Y-m-d') . "'";
         }
         
-        // Check if it's a Snowflake date format: days since epoch (e.g., "20388")
-        if (preg_match('/^\d+$/', $dateStr) && strlen($dateStr) <= 6) {
-            $days = (int) $dateStr;
-            $dateTime = new \DateTime('1970-01-01');
-            $dateTime->modify("+{$days} days");
+        // Check if it's a pure unix timestamp: "1760625248.000000000" or "1760625248"
+        if (preg_match('/^(\d{10,})\.?\d*$/', $dateStr, $matches)) {
+            $timestamp = (int) $matches[1];
+            $dateTime = new \DateTime();
+            $dateTime->setTimestamp($timestamp);
             return "'" . $dateTime->format('Y-m-d') . "'";
+        }
+        
+        // Check if it's a Snowflake date format: days since epoch (e.g., "20388")
+        // Days since epoch are typically 5-6 digits for dates between 1970-2050
+        if (preg_match('/^\d{4,6}$/', $dateStr)) {
+            $days = (int) $dateStr;
+            // Sanity check: days should be reasonable (between 1970 and 2100)
+            if ($days > 0 && $days < 50000) {
+                $dateTime = new \DateTime('1970-01-01');
+                $dateTime->modify("+{$days} days");
+                return "'" . $dateTime->format('Y-m-d') . "'";
+            }
         }
         
         // Try to parse as standard date string (YYYY-MM-DD or ISO 8601)
         try {
             $dateTime = new \DateTime($dateStr);
-            return "'" . $dateTime->format('Y-m-d') . "'";
-        } catch (\Exception $e) {
-            // If parsing fails, try to extract just the date part (YYYY-MM-DD)
-            if (preg_match('/^(\d{4}-\d{2}-\d{2})/', $dateStr, $matches)) {
-                return "'" . $matches[1] . "'";
+            // Validate the year is reasonable (1970-2100)
+            $year = (int) $dateTime->format('Y');
+            if ($year >= 1970 && $year <= 2100) {
+                return "'" . $dateTime->format('Y-m-d') . "'";
             }
-            return 'NULL';
+        } catch (\Exception $e) {
+            // Fall through to regex extraction
         }
+        
+        // If parsing fails, try to extract just the date part (YYYY-MM-DD)
+        if (preg_match('/(\d{4}-\d{2}-\d{2})/', $dateStr, $matches)) {
+            return "'" . $matches[1] . "'";
+        }
+        
+        // Last resort: return NULL
+        return 'NULL';
     }
 
     private function buildDeleteSources(string $source): array

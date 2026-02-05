@@ -86,7 +86,7 @@ class SyncEnrollmentStatus extends Command
                 }
 
                 $this->info("[$source] Applying enrollment status updates to SQL Server...");
-                $updated = $this->applyEnrollmentStatusUpdates($connector, $rows, $statusMap);
+                $updated = $this->applyEnrollmentStatusUpdates($connector, $rows, $statusMap, $connection);
 
                 $this->info("[$source] Updated {$updated} enrollment rows.");
                 $this->insertLogRow(
@@ -298,7 +298,7 @@ SQL;
         return $statusMap;
     }
 
-    protected function applyEnrollmentStatusUpdates(DBConnector $connector, array $rows, array $statusMap): int
+    protected function applyEnrollmentStatusUpdates(DBConnector $connector, array $rows, array $statusMap, string $connection): int
     {
         $updated = 0;
 
@@ -311,6 +311,15 @@ SQL;
             $newStatus = $this->normalizeString($statusMap[$cid]['status'] ?? '');
             if ($newStatus === '') {
                 continue;
+            }
+
+            // Map "Approved" to appropriate Enrolled status based on connection
+            if ($this->equalsIgnoreCase($newStatus, 'Approved')) {
+                if (stripos($connection, 'plaw') !== false) {
+                    $newStatus = 'ProLaw Enrolled';
+                } else {
+                    $newStatus = 'LDR Enrolled';
+                }
             }
 
             $stamp = $this->normalizeString($statusMap[$cid]['stamp'] ?? '');
