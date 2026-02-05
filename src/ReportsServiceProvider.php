@@ -23,7 +23,7 @@ use Cmd\Reports\Console\Commands\SyncCollectionCompanies;
 use Cmd\Reports\Console\Commands\SyncLastDepositDate;
 use Cmd\Reports\Console\Commands\SyncVeritasTransactions;
 use Cmd\Reports\Console\Commands\SyncNegotiatorPayrollData;
-use Cmd\Reports\Console\Commands\SyncEnrollmentDataTemp;
+use Cmd\Reports\Console\Commands\SyncEnrollmentData;
 use Cmd\Reports\Console\Commands\GenerateSyncSummary\GenerateSyncSummary;
 use Cmd\Reports\Console\Commands\GenerateCompanyStatsReport\GenerateCompanyStatsReport;
 use Cmd\Reports\Console\Commands\GenerateWelcomeLetterReport\GenerateWelcomeLetterReport;
@@ -87,7 +87,7 @@ class ReportsServiceProvider extends ServiceProvider
                 SyncLastDepositDate::class,
                 SyncVeritasTransactions::class,
                 SyncNegotiatorPayrollData::class,
-                SyncEnrollmentDataTemp::class,
+                SyncEnrollmentData::class,
                 GenerateWelcomeLetterReport::class,
                 GenerateWelcomePacketReport::class,
                 GenerateLookbackSummaryReport::class,
