@@ -275,8 +275,16 @@ SQL;
     }
 
     /**
-     * Check Snowflake for scheduled payments where PROCESS_DATE <= CURRENT_DATE - 5
-     * Returns first D payment that is scheduled and not returned
+     * Check Snowflake for scheduled payments - ROLL FORWARD LOGIC
+     * 
+     * Per Jacob's requirements:
+     * - If payment date has passed by 5+ days with no clear, look at the NEXT date
+     * - Keep rolling forward until we find a payment that hasn't passed the 5-day threshold
+     * - This prevents dates from getting "stuck" on old missed payments
+     * 
+     * Logic:
+     * 1. Get FIRST D payment where PROCESS_DATE > CURRENT_DATE - 5 (next upcoming payment)
+     * 2. If no upcoming payment, get the MOST RECENT payment (to show latest expected date)
      */
     protected function fetchScheduledPaymentsFromSnowflake(DBConnector $connector, array $llgIds): array
     {
@@ -299,7 +307,8 @@ SQL;
                 return "('" . $this->escapeSqlString($id) . "')";
             }, $chunk));
 
-            // Get first D payment where PROCESS_DATE <= CURRENT_DATE - 5 and not returned
+            // PRIORITY 1: Get FIRST upcoming payment (PROCESS_DATE > CURRENT_DATE - 5)
+            // This is the next payment we're waiting on
             $sql = <<<SQL
 SELECT
     CONTACT_ID,
@@ -308,12 +317,13 @@ FROM (
     SELECT
         t.CONTACT_ID,
         TO_DATE(t.PROCESS_DATE) AS PROCESS_DATE,
-        ROW_NUMBER() OVER (PARTITION BY t.CONTACT_ID ORDER BY TO_DATE(t.PROCESS_DATE)) AS N
+        ROW_NUMBER() OVER (PARTITION BY t.CONTACT_ID ORDER BY TO_DATE(t.PROCESS_DATE) ASC) AS N
     FROM TRANSACTIONS t
     WHERE t.CONTACT_ID IN (SELECT TO_NUMBER(column1) FROM VALUES {$values})
       AND t.TRANS_TYPE = 'D'
       AND t.RETURNED_DATE IS NULL
-      AND TO_DATE(t.PROCESS_DATE) <= CURRENT_DATE - 5
+      AND t.CLEARED_DATE IS NULL
+      AND TO_DATE(t.PROCESS_DATE) > CURRENT_DATE - 5
 )
 WHERE N = 1
 SQL;
@@ -330,10 +340,64 @@ SQL;
                 }
 
                 $llgId = $contactToLlg[$cid] ?? ('LLG-' . $cid);
-
                 $payments[$llgId] = [
                     'process_date' => $processDate,
                 ];
+            }
+
+            // PRIORITY 2: For contacts not found above, get MOST RECENT uncleared payment
+            // (All payments have passed 5+ days - use latest as "expected" date)
+            $foundContactIds = [];
+            foreach ($rows as $row) {
+                $cid = $this->getRowValue($row, 'CONTACT_ID');
+                if ($cid) {
+                    $foundContactIds[$cid] = true;
+                }
+            }
+
+            $remainingIds = array_filter($chunk, function ($id) use ($foundContactIds) {
+                return !isset($foundContactIds[$id]);
+            });
+
+            if (!empty($remainingIds)) {
+                $remainingValues = implode(', ', array_map(function ($id) {
+                    return "('" . $this->escapeSqlString($id) . "')";
+                }, $remainingIds));
+
+                $sqlFallback = <<<SQL
+SELECT
+    CONTACT_ID,
+    TO_VARCHAR(PROCESS_DATE, 'YYYY-MM-DD') AS PROCESS_DATE
+FROM (
+    SELECT
+        t.CONTACT_ID,
+        TO_DATE(t.PROCESS_DATE) AS PROCESS_DATE,
+        ROW_NUMBER() OVER (PARTITION BY t.CONTACT_ID ORDER BY TO_DATE(t.PROCESS_DATE) DESC) AS N
+    FROM TRANSACTIONS t
+    WHERE t.CONTACT_ID IN (SELECT TO_NUMBER(column1) FROM VALUES {$remainingValues})
+      AND t.TRANS_TYPE = 'D'
+      AND t.RETURNED_DATE IS NULL
+      AND t.CLEARED_DATE IS NULL
+)
+WHERE N = 1
+SQL;
+
+                $resultFallback = $connector->query($sqlFallback);
+                $rowsFallback = $this->extractRows($resultFallback);
+
+                foreach ($rowsFallback as $row) {
+                    $cid = $this->getRowValue($row, 'CONTACT_ID');
+                    $processDate = $this->normalizeDate($this->getRowValue($row, 'PROCESS_DATE'));
+
+                    if (!$cid || !$processDate) {
+                        continue;
+                    }
+
+                    $llgId = $contactToLlg[$cid] ?? ('LLG-' . $cid);
+                    $payments[$llgId] = [
+                        'process_date' => $processDate,
+                    ];
+                }
             }
         }
 

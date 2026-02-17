@@ -574,8 +574,9 @@ SQL,
         $inserted = 0;
         $batchSize = 1000;
         $sourceEsc = $this->escapeSqlString('DP_' . strtoupper($source));
+        $totalRows = count($rows);
 
-        for ($i = 0; $i < count($rows); $i += $batchSize) {
+        for ($i = 0; $i < $totalRows; $i += $batchSize) {
             $batch = array_slice($rows, $i, $batchSize);
             $values = '';
 
@@ -599,7 +600,7 @@ SQL,
             }
 
             $valuesSql = ltrim($values, ',');
-            $sql = "INSERT INTO TblEPFs ({$fields}) VALUES {$valuesSql}";
+            $sql = "SET NOCOUNT ON; INSERT INTO TblEPFs ({$fields}) VALUES {$valuesSql}";
             $result = $connector->querySqlServer($sql);
             if (is_array($result) && isset($result['success']) && $result['success'] === false) {
                 $errorMsg = $result['error'] ?? 'Unknown SQL Server error';
