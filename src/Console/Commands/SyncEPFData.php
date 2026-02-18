@@ -499,41 +499,137 @@ SQL,
 
     protected function sourceLabelForConnection(string $connection): string
     {
-        return strtoupper($connection);
+        // Always use DP_ prefix for new data
+        return 'DP_' . strtoupper($connection);
     }
 
     protected function deleteEpfBySource(DBConnector $connector, string $source): int
     {
         $sourceList = $this->buildDeleteSourceList($source);
-        $sql = "DELETE FROM TblEPFs WHERE Source IN ({$sourceList})";
+        $totalDeleted = 0;
+        $batchSize = 10000; // Delete 10k records at a time as suggested by Jacob
+        $maxIterations = 1000; // Safety limit to prevent infinite loops
+        $iteration = 0;
 
-        $result = $connector->querySqlServer($sql);
-        if (is_array($result) && isset($result['success']) && $result['success'] === false) {
-            $errorMsg = $result['error'] ?? 'Unknown SQL Server error';
-            throw new \RuntimeException('Delete failed: ' . $errorMsg);
-        }
-        if (is_array($result)) {
-            foreach (['rowCount', 'affected_rows', 'row_count'] as $key) {
-                if (isset($result[$key]) && is_numeric($result[$key])) {
-                    return (int) $result[$key];
+        $this->info("[$source] Starting batch deletion (10k records per batch)...");
+        Log::info('SyncEPFData: starting batch deletion.', [
+            'source' => $source,
+            'batch_size' => $batchSize,
+        ]);
+
+        while ($iteration < $maxIterations) {
+            $iteration++;
+            
+            // Check current count
+            $currentCount = $this->countEpfBySource($connector, $source);
+            $this->info("[$source] Iteration {$iteration}: {$currentCount} records remaining");
+            
+            if ($currentCount === 0) {
+                $this->info("[$source] All records deleted successfully. Total deleted: {$totalDeleted}");
+                Log::info('SyncEPFData: batch deletion completed.', [
+                    'source' => $source,
+                    'total_deleted' => $totalDeleted,
+                ]);
+                break;
+            }
+
+            $sql = "DELETE TOP ({$batchSize}) FROM TblEPFs WHERE Source IN ({$sourceList})";
+            $result = $connector->querySqlServer($sql);
+
+            if (is_array($result) && isset($result['success']) && $result['success'] === false) {
+                $errorMsg = $result['error'] ?? 'Unknown SQL Server error';
+                Log::error('SyncEPFData: batch delete failed.', [
+                    'source' => $source,
+                    'iteration' => $iteration,
+                    'error' => $errorMsg,
+                ]);
+                throw new \RuntimeException("Batch delete failed on iteration {$iteration}: " . $errorMsg);
+            }
+
+            $deletedThisBatch = 0;
+            if (is_array($result)) {
+                foreach (['rowCount', 'affected_rows', 'row_count'] as $key) {
+                    if (isset($result[$key]) && is_numeric($result[$key])) {
+                        $deletedThisBatch = (int) $result[$key];
+                        break;
+                    }
                 }
+            }
+
+            $totalDeleted += $deletedThisBatch;
+            $this->info("[$source] Iteration {$iteration}: Deleted {$deletedThisBatch} records");
+            
+            Log::info('SyncEPFData: batch delete iteration completed.', [
+                'source' => $source,
+                'iteration' => $iteration,
+                'deleted_this_batch' => $deletedThisBatch,
+                'total_deleted' => $totalDeleted,
+                'remaining_count' => $currentCount - $deletedThisBatch,
+            ]);
+
+            // If we deleted 0 records but count > 0, something is wrong
+            if ($deletedThisBatch === 0 && $currentCount > 0) {
+                Log::warning('SyncEPFData: delete batch returned 0 but rows still exist.', [
+                    'source' => $source,
+                    'count_before' => $currentCount,
+                ]);
+                // Try one more time with a direct delete (no TOP)
+                $directSql = "DELETE FROM TblEPFs WHERE Source IN ({$sourceList})";
+                $directResult = $connector->querySqlServer($directSql);
+                if (is_array($directResult) && isset($directResult['success']) && $directResult['success'] === false) {
+                    throw new \RuntimeException('Direct delete failed: ' . ($directResult['error'] ?? 'Unknown error'));
+                }
+                break;
+            }
+
+            // If we deleted fewer rows than the batch size, we're done
+            if ($deletedThisBatch < $batchSize) {
+                break;
             }
         }
 
+        if ($iteration >= $maxIterations) {
+            $finalCount = $this->countEpfBySource($connector, $source);
+            Log::error('SyncEPFData: delete reached max iterations safety limit.', [
+                'source' => $source,
+                'total_deleted' => $totalDeleted,
+                'remaining_count' => $finalCount,
+            ]);
+            throw new \RuntimeException("Deletion incomplete after {$maxIterations} iterations. {$finalCount} records remain.");
+        }
+
+        return $totalDeleted;
+    }
+
+    protected function countEpfBySource(DBConnector $connector, string $source): int
+    {
+        $sourceList = $this->buildDeleteSourceList($source);
+        $sql = "SELECT COUNT(*) AS CNT FROM TblEPFs WHERE Source IN ({$sourceList})";
+        $result = $connector->querySqlServer($sql);
+        if (is_array($result) && isset($result['data'][0]) && is_array($result['data'][0])) {
+            $value = $this->valueForKey($result['data'][0], 'CNT');
+            if ($value !== null && is_numeric($value)) {
+                return (int) $value;
+            }
+        }
         return 0;
     }
 
     protected function buildDeleteSourceList(string $source): string
     {
-        $baseSource = $source;
+        // Remove DP_ prefix if present to get base source
+        $baseSource = str_replace('DP_', '', strtoupper($source));
         $sources = [];
-        // Delete DP_ sources + legacy ProLaw/PLAW/LDR
+        
+        // Delete ALL legacy sources + new DP_ sources to prevent duplicates
         if ($baseSource === 'PLAW') {
-            $sources = ['DP_PLAW', 'PLAW', 'ProLaw'];
+            $sources = ['DP_PLAW', 'PLAW', 'ProLaw', 'Prolaw', 'prolaw', 'plaw', 'PROLAW'];
         } elseif ($baseSource === 'LDR') {
-            $sources = ['DP_LDR', 'LDR'];
+            $sources = ['DP_LDR', 'LDR', 'ldr', 'Ldr', 'DP_ldr'];
+        } elseif ($baseSource === 'LT') {
+            $sources = ['DP_LT', 'LT', 'lt', 'Lt'];
         } else {
-            $sources = ['DP_' . strtoupper($baseSource), $baseSource];
+            $sources = ['DP_' . $baseSource, $baseSource, strtolower($baseSource)];
         }
 
         $escaped = array_map(function ($value) {
@@ -545,7 +641,8 @@ SQL,
 
     protected function buildLogSource(string $source): string
     {
-        return 'DP_' . $source;
+        // Source already has DP_ prefix from sourceLabelForConnection
+        return $source;
     }
 
     protected function insertEpfRows(DBConnector $connector, array $rows, string $source): int
@@ -572,8 +669,9 @@ SQL,
         ];
         $fields = implode(', ', $fieldList);
         $inserted = 0;
-        $batchSize = 1000;
-        $sourceEsc = $this->escapeSqlString('DP_' . strtoupper($source));
+        $batchSize = 1000; // SQL Server hard limit is 1000 rows per INSERT statement
+        // Source already has DP_ prefix from sourceLabelForConnection
+        $sourceEsc = $this->escapeSqlString($source);
         $totalRows = count($rows);
 
         for ($i = 0; $i < $totalRows; $i += $batchSize) {
@@ -612,10 +710,12 @@ SQL,
                 throw new \RuntimeException('Insert failed: ' . $errorMsg);
             }
 
-            if (is_array($result) && isset($result['row_count']) && is_numeric($result['row_count'])) {
-                $inserted += (int) $result['row_count'];
-            } else {
-                $inserted += count($batch);
+            // SET NOCOUNT ON means row_count won't be returned, so use batch count
+            $inserted += count($batch);
+            
+            // Show progress every 10k records
+            if ($inserted % 10000 < $batchSize) {
+                $this->info("[{$source}] Inserted {$inserted} / {$totalRows} records...");
             }
         }
 
