@@ -32,6 +32,7 @@ use Cmd\Reports\Console\Commands\SyncContactsData;
 use Cmd\Reports\Console\Commands\SyncCollectionCompanies;
 use Cmd\Reports\Console\Commands\SyncLastDepositDate;
 use Cmd\Reports\Console\Commands\SyncVeritasTransactions;
+use Cmd\Reports\Console\Commands\RefreshForthApiTokens;
 use Cmd\Reports\Console\Commands\SyncNegotiatorPayrollData;
 
 
@@ -99,6 +100,7 @@ class ReportsServiceProvider extends ServiceProvider
                 SyncLastDepositDate::class,
                 SyncVeritasTransactions::class,
                 SyncNegotiatorPayrollData::class,
+                RefreshForthApiTokens::class,
             ]);
         }
 
