@@ -99,10 +99,11 @@ class SyncEnrollmentData extends Command
         ";
 
         $result = $sqlConnector->querySqlServer($sql);
-        $this->info("[INFO] Found " . count($result) . " records with missing Drop_Name or State");
+        $rows = $result['data'] ?? [];
+        $this->info("[INFO] Found " . count($rows) . " records with missing Drop_Name or State");
 
         $updated = 0;
-        foreach ($result as $row) {
+        foreach ($rows as $row) {
             $pk = $row['PK'] ?? null;
             $llgId = $row['LLG_ID'] ?? null;
             $dropName = trim($row['Drop_Name'] ?? '');
@@ -119,12 +120,12 @@ class SyncEnrollmentData extends Command
             if ($dropName === '') {
                 $campaignSql = "SELECT Campaign FROM TblContacts WHERE LLG_ID = '{$this->esc($llgId)}'";
                 $campaignResult = $sqlConnector->querySqlServer($campaignSql);
-                $campaign = $campaignResult[0]['Campaign'] ?? '';
+                $campaign = $campaignResult['data'][0]['Campaign'] ?? '';
 
                 if ($campaign === '') {
                     $leadSql = "SELECT Drop_Name FROM TblLeads WHERE LLG_ID = '{$this->esc($llgId)}'";
                     $leadResult = $sqlConnector->querySqlServer($leadSql);
-                    $campaign = $leadResult[0]['Drop_Name'] ?? '';
+                    $campaign = $leadResult['data'][0]['Drop_Name'] ?? '';
                 }
 
                 if ($campaign !== '') {
@@ -137,12 +138,12 @@ class SyncEnrollmentData extends Command
             if ($state === '') {
                 $stateSql = "SELECT State FROM TblContacts WHERE LLG_ID = '{$this->esc($llgId)}'";
                 $stateResult = $sqlConnector->querySqlServer($stateSql);
-                $stateValue = $stateResult[0]['State'] ?? '';
+                $stateValue = $stateResult['data'][0]['State'] ?? '';
 
                 if ($stateValue === '') {
                     $leadStateSql = "SELECT State FROM TblLeads WHERE LLG_ID = '{$this->esc($llgId)}'";
                     $leadStateResult = $sqlConnector->querySqlServer($leadStateSql);
-                    $stateValue = $leadStateResult[0]['State'] ?? '';
+                    $stateValue = $leadStateResult['data'][0]['State'] ?? '';
                 }
 
                 if ($stateValue !== '') {
@@ -169,7 +170,8 @@ class SyncEnrollmentData extends Command
     {
         // Get all enrollment records with LLG_ID and current Cancel_Date
         $sql = "SELECT LLG_ID, Cancel_Date FROM TblEnrollment WHERE Category = '{$this->esc($this->source)}'";
-        $enrollmentData = $sqlConnector->querySqlServer($sql);
+        $enrollmentResult = $sqlConnector->querySqlServer($sql);
+        $enrollmentData = $enrollmentResult['data'] ?? [];
         $this->info("[INFO] Processing " . count($enrollmentData) . " enrollment records for Cancel_Date");
 
         // Get DROPPED_DATE from Snowflake
@@ -256,7 +258,8 @@ class SyncEnrollmentData extends Command
 
         // Get current payments and payment frequency from TblEnrollment
         $sql = "SELECT LLG_ID, Payments, Payment_Frequency FROM TblEnrollment WHERE Category = '{$this->esc($this->source)}'";
-        $enrollmentData = $sqlConnector->querySqlServer($sql);
+        $enrollmentResult = $sqlConnector->querySqlServer($sql);
+        $enrollmentData = $enrollmentResult['data'] ?? [];
 
         $updated = 0;
         foreach ($enrollmentData as $enrollment) {
