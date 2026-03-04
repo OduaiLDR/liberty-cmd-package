@@ -274,13 +274,14 @@ class SyncEnrollmentData extends Command
             if (isset($paymentsMap[$contactId])) {
                 $rawPaymentCount = $paymentsMap[$contactId];
                 
-                // Adjust payment count based on Payment_Frequency
-                if (stripos($paymentFrequency, 'Weekly') !== false) {
-                    // Weekly: divide by 4
-                    $adjustedPaymentCount = (int) round($rawPaymentCount / 4);
-                } elseif (stripos($paymentFrequency, 'Semi-Monthly') !== false || stripos($paymentFrequency, 'Bi-Weekly') !== false) {
+                // Adjust payment count based on Payment_Frequency.
+                // Check bi-weekly before weekly so "Bi-Weekly" does not match "Weekly".
+                if (stripos($paymentFrequency, 'Semi-Monthly') !== false || stripos($paymentFrequency, 'Bi-Weekly') !== false) {
                     // Semi-Monthly or Bi-Weekly: divide by 2
                     $adjustedPaymentCount = (int) round($rawPaymentCount / 2);
+                } elseif (stripos($paymentFrequency, 'Weekly') !== false) {
+                    // Weekly: divide by 4
+                    $adjustedPaymentCount = (int) round($rawPaymentCount / 4);
                 } else {
                     // Otherwise: full count
                     $adjustedPaymentCount = $rawPaymentCount;
