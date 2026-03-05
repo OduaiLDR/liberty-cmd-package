@@ -278,12 +278,13 @@ SQL;
      * Check Snowflake for scheduled payments - ROLL FORWARD LOGIC
      * 
      * Per Jacob's requirements:
-     * - If payment date has passed by 5+ days with no clear, look at the NEXT date
-     * - Keep rolling forward until we find a payment that hasn't passed the 5-day threshold
+     * - If payment date has passed by 3+ business days with no clear, look at the NEXT date
+     * - Keep rolling forward until we find a payment that hasn't passed the 3 business day threshold
      * - This prevents dates from getting "stuck" on old missed payments
+     * - Business days = weekdays only (no weekends, holidays not considered)
      * 
      * Logic:
-     * 1. Get FIRST D payment where PROCESS_DATE > CURRENT_DATE - 5 (next upcoming payment)
+     * 1. Get FIRST D payment where payment is still within 3 business days window
      * 2. If no upcoming payment, get the MOST RECENT payment (to show latest expected date)
      */
     protected function fetchScheduledPaymentsFromSnowflake(DBConnector $connector, array $llgIds): array
@@ -307,8 +308,9 @@ SQL;
                 return "('" . $this->escapeSqlString($id) . "')";
             }, $chunk));
 
-            // PRIORITY 1: Get FIRST upcoming payment (PROCESS_DATE > CURRENT_DATE - 5)
+            // PRIORITY 1: Get FIRST upcoming payment (within 3 business days window)
             // This is the next payment we're waiting on
+            // Business days calculation: subtract days while skipping weekends
             $sql = <<<SQL
 SELECT
     CONTACT_ID,
@@ -323,7 +325,25 @@ FROM (
       AND t.TRANS_TYPE = 'D'
       AND t.RETURNED_DATE IS NULL
       AND t.CLEARED_DATE IS NULL
-      AND TO_DATE(t.PROCESS_DATE) > CURRENT_DATE - 5
+      AND TO_DATE(t.PROCESS_DATE) >= (
+        CASE 
+          -- Calculate 3 business days back from today (excluding weekends)
+          -- Mon (1): Mon->Fri->Thu->Wed = 5 calendar days back
+          -- Tue (2): Tue->Mon->Fri->Thu = 5 calendar days back  
+          -- Wed (3): Wed->Tue->Mon->Fri = 5 calendar days back
+          -- Thu (4): Thu->Wed->Tue->Mon = 3 calendar days back
+          -- Fri (5): Fri->Thu->Wed->Tue = 3 calendar days back
+          -- Sat (6): Count from Fri: Fri->Thu->Wed = 5 calendar days back (Sat-5=Wed)
+          -- Sun (0): Count from Fri: Fri->Thu->Wed = 6 calendar days back (Sun-6=Wed)
+          WHEN DAYOFWEEK(CURRENT_DATE) = 1 THEN CURRENT_DATE - 5  -- Mon: Wed (prev week)
+          WHEN DAYOFWEEK(CURRENT_DATE) = 2 THEN CURRENT_DATE - 5  -- Tue: Thu (prev week)
+          WHEN DAYOFWEEK(CURRENT_DATE) = 3 THEN CURRENT_DATE - 5  -- Wed: Fri (prev week)
+          WHEN DAYOFWEEK(CURRENT_DATE) = 4 THEN CURRENT_DATE - 3  -- Thu: Mon (this week)
+          WHEN DAYOFWEEK(CURRENT_DATE) = 5 THEN CURRENT_DATE - 3  -- Fri: Tue (this week)
+          WHEN DAYOFWEEK(CURRENT_DATE) = 6 THEN CURRENT_DATE - 5  -- Sat: Wed (from Fri)
+          WHEN DAYOFWEEK(CURRENT_DATE) = 0 THEN CURRENT_DATE - 6  -- Sun: Wed (from Fri)
+        END
+      )
 )
 WHERE N = 1
 SQL;
@@ -346,7 +366,7 @@ SQL;
             }
 
             // PRIORITY 2: For contacts not found above, get MOST RECENT uncleared payment
-            // (All payments have passed 5+ days - use latest as "expected" date)
+            // (All payments have passed 3+ business days - use latest as "expected" date)
             $foundContactIds = [];
             foreach ($rows as $row) {
                 $cid = $this->getRowValue($row, 'CONTACT_ID');
