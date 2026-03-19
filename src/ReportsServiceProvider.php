@@ -34,6 +34,8 @@ use Cmd\Reports\Console\Commands\SyncLastDepositDate;
 use Cmd\Reports\Console\Commands\SyncVeritasTransactions;
 use Cmd\Reports\Console\Commands\RefreshForthApiTokens;
 use Cmd\Reports\Console\Commands\SyncNegotiatorPayrollData;
+use Cmd\Reports\Console\Commands\UpdateLendingUSAStatuses;
+
 
 
 class ReportsServiceProvider extends ServiceProvider
@@ -101,6 +103,7 @@ class ReportsServiceProvider extends ServiceProvider
                 SyncVeritasTransactions::class,
                 SyncNegotiatorPayrollData::class,
                 RefreshForthApiTokens::class,
+                UpdateLendingUSAStatuses::class,
             ]);
         }
 

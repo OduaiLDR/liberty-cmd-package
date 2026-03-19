@@ -47,8 +47,14 @@ class DBConnector
         $this->privateKeyPassphrase = $config['private_key_passphrase'] ?? '';
 
         $this->client = new Client([
-            'timeout' => 300,
+            'timeout' => 60,
+            'connect_timeout' => 10,
+            'read_timeout' => 60,
             'verify' => true,
+            'http_errors' => true,
+            'headers' => [
+                'Connection' => 'keep-alive',
+            ],
         ]);
     }
 
@@ -116,7 +122,6 @@ class DBConnector
             return new self($config['snowflake'][$env]);
         }
         
-     
         if (!isset($config[$mode][$env])) {
             throw new Exception("Unknown environment: {$env} in mode: {$mode}");
         }
@@ -348,7 +353,7 @@ class DBConnector
 
         $requestBody = [
             'statement' => $sql,
-            'timeout' => 300,
+            'timeout' => 60,
             'database' => $this->database,
             'schema' => $this->schema,
             'warehouse' => $this->warehouse,
@@ -736,6 +741,9 @@ class DBConnector
         if (!empty($config['database'])) {
             $dsn .= ';Database=' . $config['database'];
         }
+
+        // Add connection timeout to DSN (default 15 seconds for faster fail)
+        $dsn .= ';LoginTimeout=15;ConnectRetryCount=1;ConnectRetryInterval=1';
 
         if (array_key_exists('trust_server_certificate', $config)) {
             $value = $config['trust_server_certificate'];
