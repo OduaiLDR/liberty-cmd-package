@@ -100,7 +100,25 @@ class SyncFirstPaymentDate extends Command
                     }
                 }
 
-                $totalUpdated = count($clearedPayments) + count($scheduledPayments) + count($cancelledNullIds);
+                // STEP 5: Handle CANCELLED contacts with OVERDUE First_Payment_Date (roll forward)
+                $this->info("[$source] Fetching cancelled IDs with overdue First_Payment_Date...");
+                $cancelledOverdueIds = $this->fetchCancelledWithOverduePaymentDate($connector);
+                $this->info("[$source] Found " . count($cancelledOverdueIds) . " cancelled IDs with overdue payment date.");
+
+                $cancelledRollForward = [];
+                if (!empty($cancelledOverdueIds)) {
+                    $this->info("[$source] Checking Snowflake for future payments for cancelled overdue contacts...");
+                    $cancelledRollForward = $this->fetchFuturePaymentsForCancelled($connector, $cancelledOverdueIds);
+                    $this->info("[$source] Found " . count($cancelledRollForward) . " future payments for cancelled contacts.");
+
+                    if (!empty($cancelledRollForward)) {
+                        $this->info("[$source] Rolling forward cancelled contacts to future payment dates...");
+                        $updatedRollForward = $this->updateCancelledRollForward($connector, $cancelledRollForward);
+                        $this->info("[$source] Updated {$updatedRollForward} cancelled rows with rolled forward dates.");
+                    }
+                }
+
+                $totalUpdated = count($clearedPayments) + count($scheduledPayments) + count($cancelledNullIds) + count($cancelledRollForward);
                 $this->insertLogRow(
                     $connector,
                     $source,
@@ -365,8 +383,8 @@ SQL;
                 ];
             }
 
-            // PRIORITY 2: For contacts not found above, get MOST RECENT uncleared payment
-            // (All payments have passed 3+ business days - use latest as "expected" date)
+            // PRIORITY 2: For contacts not found above, get NEXT FUTURE uncleared payment
+            // (Old payment passed 3+ business days - roll forward to the next scheduled payment)
             $foundContactIds = [];
             foreach ($rows as $row) {
                 $cid = $this->getRowValue($row, 'CONTACT_ID');
@@ -384,6 +402,8 @@ SQL;
                     return "('" . $this->escapeSqlString($id) . "')";
                 }, $remainingIds));
 
+                // Get the NEXT future payment (after today) - this is the "roll forward" logic
+                // If old payment didn't clear after 3+ business days, move to next scheduled date
                 $sqlFallback = <<<SQL
 SELECT
     CONTACT_ID,
@@ -392,12 +412,13 @@ FROM (
     SELECT
         t.CONTACT_ID,
         TO_DATE(t.PROCESS_DATE) AS PROCESS_DATE,
-        ROW_NUMBER() OVER (PARTITION BY t.CONTACT_ID ORDER BY TO_DATE(t.PROCESS_DATE) DESC) AS N
+        ROW_NUMBER() OVER (PARTITION BY t.CONTACT_ID ORDER BY TO_DATE(t.PROCESS_DATE) ASC) AS N
     FROM TRANSACTIONS t
     WHERE t.CONTACT_ID IN (SELECT TO_NUMBER(column1) FROM VALUES {$remainingValues})
       AND t.TRANS_TYPE = 'D'
       AND t.RETURNED_DATE IS NULL
       AND t.CLEARED_DATE IS NULL
+      AND TO_DATE(t.PROCESS_DATE) > CURRENT_DATE
 )
 WHERE N = 1
 SQL;
@@ -635,6 +656,133 @@ SQL;
             
             $sql = "UPDATE dbo.TblEnrollment SET " . implode(", ", $setClauses) . 
                    " WHERE LLG_ID IN ({$idList}) AND First_Payment_Date IS NULL";
+
+            $result = $connector->querySqlServer($sql);
+            $totalUpdated += $this->getRowCount($result);
+        }
+
+        return $totalUpdated;
+    }
+
+    /**
+     * Get CANCELLED contacts with First_Payment_Date that is overdue (3+ business days old)
+     */
+    protected function fetchCancelledWithOverduePaymentDate(DBConnector $connector): array
+    {
+        // Calculate 3 business days back
+        $today = new \DateTime();
+        $dayOfWeek = (int) $today->format('N');
+        $daysBack = match($dayOfWeek) {
+            1 => 5, 2 => 5, 3 => 5, 4 => 3, 5 => 3, 6 => 5, 7 => 6, default => 3,
+        };
+        $cutoffDate = (clone $today)->modify("-{$daysBack} days")->format('Y-m-d');
+
+        $sql = <<<SQL
+SELECT LLG_ID
+FROM dbo.TblEnrollment
+WHERE First_Payment_Date IS NOT NULL
+  AND First_Payment_Cleared_Date IS NULL
+  AND Cancel_Date IS NOT NULL
+  AND First_Payment_Date < '{$cutoffDate}'
+  AND LLG_ID LIKE 'LLG-%'
+  AND TRY_CONVERT(BIGINT, REPLACE(LLG_ID, 'LLG-', '')) IS NOT NULL
+SQL;
+
+        return $this->extractLlgIds($connector->querySqlServer($sql));
+    }
+
+    /**
+     * Fetch NEXT FUTURE payment for cancelled contacts (to roll forward)
+     */
+    protected function fetchFuturePaymentsForCancelled(DBConnector $connector, array $llgIds): array
+    {
+        if (empty($llgIds)) {
+            return [];
+        }
+
+        $contactToLlg = $this->buildContactToLlgMap($llgIds);
+        $contactIds = array_keys($contactToLlg);
+
+        if (empty($contactIds)) {
+            return [];
+        }
+
+        $payments = [];
+        $chunkSize = 500;
+
+        foreach (array_chunk($contactIds, $chunkSize) as $chunk) {
+            $values = implode(', ', array_map(function ($id) {
+                return "('" . $this->escapeSqlString($id) . "')";
+            }, $chunk));
+
+            // Get FIRST future payment (after today)
+            $sql = <<<SQL
+SELECT
+    CONTACT_ID,
+    TO_VARCHAR(PROCESS_DATE, 'YYYY-MM-DD') AS PROCESS_DATE
+FROM (
+    SELECT
+        t.CONTACT_ID,
+        TO_DATE(t.PROCESS_DATE) AS PROCESS_DATE,
+        ROW_NUMBER() OVER (PARTITION BY t.CONTACT_ID ORDER BY TO_DATE(t.PROCESS_DATE) ASC) AS N
+    FROM TRANSACTIONS t
+    WHERE t.CONTACT_ID IN (SELECT TO_NUMBER(column1) FROM VALUES {$values})
+      AND t.TRANS_TYPE = 'D'
+      AND t.RETURNED_DATE IS NULL
+      AND t.CLEARED_DATE IS NULL
+      AND TO_DATE(t.PROCESS_DATE) > CURRENT_DATE
+)
+WHERE N = 1
+SQL;
+
+            $result = $connector->query($sql);
+            $rows = $this->extractRows($result);
+
+            foreach ($rows as $row) {
+                $cid = $this->getRowValue($row, 'CONTACT_ID');
+                $processDate = $this->normalizeDate($this->getRowValue($row, 'PROCESS_DATE'));
+
+                if (!$cid || !$processDate) {
+                    continue;
+                }
+
+                $llgId = $contactToLlg[$cid] ?? ('LLG-' . $cid);
+                $payments[$llgId] = [
+                    'process_date' => $processDate,
+                ];
+            }
+        }
+
+        return $payments;
+    }
+
+    /**
+     * Update cancelled contacts with rolled forward First_Payment_Date
+     */
+    protected function updateCancelledRollForward(DBConnector $connector, array $payments): int
+    {
+        if (empty($payments)) {
+            return 0;
+        }
+
+        $totalUpdated = 0;
+        $batchSize = 500;
+
+        foreach (array_chunk($payments, $batchSize, true) as $chunk) {
+            $casesDate = [];
+            $ids = [];
+
+            foreach ($chunk as $llgId => $data) {
+                $llgEsc = $this->escapeSqlString($llgId);
+                $dateEsc = $this->escapeSqlString($data['process_date']);
+
+                $casesDate[] = "WHEN '{$llgEsc}' THEN '{$dateEsc}'";
+                $ids[] = "'{$llgEsc}'";
+            }
+
+            $idList = implode(', ', $ids);
+            $casesDateSql = implode(' ', $casesDate);
+            $sql = "UPDATE dbo.TblEnrollment SET First_Payment_Date = CASE LLG_ID {$casesDateSql} ELSE First_Payment_Date END WHERE LLG_ID IN ({$idList})";
 
             $result = $connector->querySqlServer($sql);
             $totalUpdated += $this->getRowCount($result);

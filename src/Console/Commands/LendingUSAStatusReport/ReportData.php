@@ -84,6 +84,12 @@ class ReportData
         return $this;
     }
 
+    public function setErrors(array $errors): self
+    {
+        $this->errorList = $errors;
+        return $this;
+    }
+
     public function toArray(): array
     {
         return [

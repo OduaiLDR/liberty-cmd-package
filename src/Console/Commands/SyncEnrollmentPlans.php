@@ -8,9 +8,9 @@ use Illuminate\Support\Facades\Log;
 
 class SyncEnrollmentPlans extends Command
 {
-    protected $signature = 'enrollment:sync-plans';
+    protected $signature = 'enrollment:sync-plans {--diagnose : Show detailed diagnostics for contacts that cannot be matched}';
 
-    protected $description = 'Sync enrollment plans from Snowflake to SQL Server TblEnrollment for contacts missing Enrollment_Plan';
+    protected $desription = 'Sync enrollment plans from Snowflake to SQL Server TblEnrollment for contacts missing Enrollment_Plan';
 
     public function handle(): int
     {
@@ -33,6 +33,7 @@ class SyncEnrollmentPlans extends Command
                 $connector = DBConnector::fromEnvironment($connection);
                 $connector->initializeSqlServer();
                 $this->ensureLogTable($connector);
+                $this->assertSqlServerConnection($connector, $source);
 
                 $missingContacts = $this->fetchMissingContactIds($connector);
 
@@ -52,7 +53,25 @@ class SyncEnrollmentPlans extends Command
 
                 $this->info("[$source] Found " . count($missingContacts) . " contacts missing plans.");
 
-                $plans = $this->fetchPlansFromSnowflake($connector, $missingContacts);
+                $plans = $this->fetchPlansFromSnowflake($connector, $missingContacts, $connection);
+
+                // Log contacts that couldn't be matched in Snowflake
+                $unmatchedIds = array_diff($missingContacts, array_keys($plans));
+                if (!empty($unmatchedIds)) {
+                    $this->warn("[$source] " . count($unmatchedIds) . " contacts could NOT be matched in Snowflake:");
+                    foreach ($unmatchedIds as $uid) {
+                        $this->warn("  - LLG-{$uid}");
+                    }
+                    Log::warning('SyncEnrollmentPlans: unmatched contacts.', [
+                        'source' => $source,
+                        'count' => count($unmatchedIds),
+                        'contact_ids' => array_values($unmatchedIds),
+                    ]);
+
+                    if ($this->option('diagnose')) {
+                        $this->diagnoseUnmatched($connector, $unmatchedIds, $source);
+                    }
+                }
 
                 if (empty($plans)) {
                     $this->warn("[$source] No plans returned from Snowflake for missing contacts.");
@@ -63,7 +82,7 @@ class SyncEnrollmentPlans extends Command
                         'SUCCESS',
                         0,
                         0,
-                        'No matching plans found in Snowflake for missing contacts.'
+                        sprintf('No matching plans found in Snowflake. %d contacts unmatched.', count($unmatchedIds))
                     );
                     continue;
                 }
@@ -137,25 +156,14 @@ class SyncEnrollmentPlans extends Command
     protected function fetchMissingContactIds(DBConnector $connector): array
     {
         $sql = <<<SQL
-SELECT REPLACE(LLG_ID, 'LLG-', '') AS CONTACT_ID
+SELECT LTRIM(RTRIM(REPLACE(LLG_ID, 'LLG-', ''))) AS CONTACT_ID
 FROM TblEnrollment
 WHERE Enrollment_Plan IS NULL
   AND Welcome_Call_Date >= DATEADD(day, -90, GETDATE())
 SQL;
 
         $result = $connector->querySqlServer($sql);
-
-        if (is_array($result)) {
-            if (isset($result['data']) && is_array($result['data'])) {
-                $rows = $result['data'];
-            } elseif (array_is_list($result)) {
-                $rows = $result;
-            } else {
-                $rows = [];
-            }
-        } else {
-            $rows = [];
-        }
+        $rows = $this->extractSqlServerRows($result, 'fetching contacts missing Enrollment_Plan');
 
         $ids = [];
         foreach ($rows as $row) {
@@ -179,12 +187,22 @@ SQL;
         return $ids;
     }
 
-    protected function fetchPlansFromSnowflake(DBConnector $connector, array $contactIds): array
+    protected function getCompanyPrefix(string $connection): string
+    {
+        return match ($connection) {
+            'ldr' => 'LDR',
+            'plaw' => 'Progress Law',
+            default => strtoupper($connection),
+        };
+    }
+
+    protected function fetchPlansFromSnowflake(DBConnector $connector, array $contactIds, string $connection = ''): array
     {
         if (empty($contactIds)) {
             return [];
         }
 
+        $companyPrefix = $this->getCompanyPrefix($connection);
         $chunks = array_chunk($contactIds, 500);
         $plans = [];
 
@@ -194,11 +212,13 @@ SQL;
             }, $chunk);
             $inList = implode(', ', $escapedIds);
 
+            $prefixEsc = $this->escapeSqlString($companyPrefix);
             $sql = <<<SQL
-SELECT ep.CONTACT_ID, ed.TITLE
+SELECT TRIM(TO_VARCHAR(ep.CONTACT_ID)) AS CONTACT_ID,
+       COALESCE(NULLIF(TRIM(ed.TITLE), ''), '{$prefixEsc} Plan ' || ep.PLAN_ID) AS TITLE
 FROM ENROLLMENT_PLAN AS ep
 LEFT JOIN ENROLLMENT_DEFAULTS2 AS ed ON ep.PLAN_ID = ed.id
-WHERE ep.CONTACT_ID IN ({$inList})
+WHERE TRIM(TO_VARCHAR(ep.CONTACT_ID)) IN ({$inList})
 SQL;
 
             $result = $connector->query($sql);
@@ -225,13 +245,21 @@ SQL;
 
                 foreach ($row as $key => $value) {
                     if (strcasecmp($key, 'CONTACT_ID') === 0) {
-                        $cid = (string) $value;
+                        $cid = trim((string) $value);
                     } elseif (strcasecmp($key, 'TITLE') === 0) {
-                        $title = (string) $value;
+                        $title = trim((string) $value);
                     }
                 }
 
-                if ($cid === null || $cid === '' || $title === null || $title === '') {
+                if ($cid === null || $cid === '') {
+                    continue;
+                }
+
+                // If we still have no title after COALESCE, skip but log it
+                if ($title === null || $title === '') {
+                    Log::warning('SyncEnrollmentPlans: contact in ENROLLMENT_PLAN but no title resolvable.', [
+                        'contact_id' => $cid,
+                    ]);
                     continue;
                 }
 
@@ -286,6 +314,7 @@ WHERE LLG_ID IN ({$idList});
 SQL;
 
             $result = $connector->querySqlServer($sql);
+            $this->assertSqlServerResult($result, 'updating TblEnrollment Enrollment_Plan values');
 
             if (is_array($result)) {
                 foreach (['rowCount', 'affected_rows', 'row_count'] as $key) {
@@ -374,7 +403,7 @@ SQL;
             $result = $connector->querySqlServer($sql);
 
             if (is_array($result) && isset($result['success']) && $result['success'] === false) {
-                $errorMsg = $result['error'] ?? 'Unknown SQL Server error';
+                $errorMsg = $this->formatSqlServerError($result['error'] ?? 'Unknown SQL Server error');
                 $this->error(sprintf('[%s] Log insert failed: %s', $source, $errorMsg));
                 Log::error('SyncEnrollmentPlans: log insert failed.', [
                     'source' => $source,
@@ -392,6 +421,97 @@ SQL;
                 'sql' => $sql,
                 'exception' => $e->getMessage(),
             ]);
+        }
+    }
+
+    protected function assertSqlServerConnection(DBConnector $connector, string $source): void
+    {
+        $result = $connector->testSqlServerConnection();
+        if (($result['success'] ?? false) !== true) {
+            $error = $this->formatSqlServerError($result['error'] ?? 'Unknown SQL Server error');
+            throw new \RuntimeException("[{$source}] SQL Server connection failed: {$error}");
+        }
+    }
+
+    protected function extractSqlServerRows(array $result, string $context): array
+    {
+        $this->assertSqlServerResult($result, $context);
+
+        if (isset($result['data']) && is_array($result['data'])) {
+            return $result['data'];
+        }
+
+        return array_is_list($result) ? $result : [];
+    }
+
+    protected function assertSqlServerResult(array $result, string $context): void
+    {
+        if (($result['success'] ?? true) === false) {
+            $error = $this->formatSqlServerError($result['error'] ?? 'Unknown SQL Server error');
+            throw new \RuntimeException("SQL Server query failed while {$context}: {$error}");
+        }
+    }
+
+    protected function formatSqlServerError(string $error): string
+    {
+        if (stripos($error, 'could not find driver') !== false) {
+            return $error . '. The PHP runtime running this command is missing the required PDO driver, usually pdo_sqlsrv.';
+        }
+
+        return $error;
+    }
+
+    protected function diagnoseUnmatched(DBConnector $connector, array $unmatchedIds, string $source): void
+    {
+        $this->info("[$source] Running diagnostics for unmatched contacts...");
+
+        // Check which contacts exist in ENROLLMENT_PLAN at all
+        $chunks = array_chunk($unmatchedIds, 500);
+        foreach ($chunks as $chunk) {
+            $escapedIds = array_map(fn($id) => "'" . $this->escapeSqlString($id) . "'", $chunk);
+            $inList = implode(', ', $escapedIds);
+
+            // Check if they exist in ENROLLMENT_PLAN
+            $sql = "SELECT ep.CONTACT_ID, ep.PLAN_ID, ed.TITLE
+                    FROM ENROLLMENT_PLAN AS ep
+                    LEFT JOIN ENROLLMENT_DEFAULTS2 AS ed ON ep.PLAN_ID = ed.id
+                    WHERE ep.CONTACT_ID IN ({$inList})";
+
+            $result = $connector->query($sql);
+            $rows = [];
+            if (is_array($result)) {
+                $rows = $result['data'] ?? (array_is_list($result) ? $result : []);
+            }
+
+            $foundInEp = [];
+            foreach ($rows as $row) {
+                $cid = null;
+                $planId = null;
+                $title = null;
+                foreach ($row as $key => $value) {
+                    if (strcasecmp($key, 'CONTACT_ID') === 0) $cid = $value;
+                    if (strcasecmp($key, 'PLAN_ID') === 0) $planId = $value;
+                    if (strcasecmp($key, 'TITLE') === 0) $title = $value;
+                }
+                if ($cid !== null) {
+                    $foundInEp[$cid] = ['plan_id' => $planId, 'title' => $title];
+                }
+            }
+
+            foreach ($chunk as $contactId) {
+                if (!isset($foundInEp[$contactId])) {
+                    $this->error("  LLG-{$contactId}: NOT FOUND in Snowflake ENROLLMENT_PLAN table");
+                } else {
+                    $info = $foundInEp[$contactId];
+                    if ($info['plan_id'] === null) {
+                        $this->error("  LLG-{$contactId}: In ENROLLMENT_PLAN but PLAN_ID is NULL");
+                    } elseif ($info['title'] === null || $info['title'] === '') {
+                        $this->error("  LLG-{$contactId}: PLAN_ID={$info['plan_id']} but no matching TITLE in ENROLLMENT_DEFAULTS2");
+                    } else {
+                        $this->warn("  LLG-{$contactId}: Has PLAN_ID={$info['plan_id']}, TITLE='{$info['title']}' (should have matched - possible data issue)");
+                    }
+                }
+            }
         }
     }
 

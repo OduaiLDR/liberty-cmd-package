@@ -14,7 +14,7 @@ class UpdateLendingUSAStatuses extends Command
 {
     protected $signature = 'lending-usa:update-statuses
         {--connection= : Snowflake environment (plaw, ldr, lt). Leave empty to run both LDR and PLAW}
-        {--crm-key= : CRM login API key override}
+        {--crm-key= : Forth API key override}
         {--dry-run : Simulate without writing anything}
         {--limit=0 : Limit number of API records to fetch (0=all)}
         {--contact-id= : Process only this specific contact ID}
@@ -45,7 +45,7 @@ class UpdateLendingUSAStatuses extends Command
     protected ?Client $httpClient = null;
     protected bool $dryRun = false;
     protected bool $verboseDry = false;
-    protected string $crmKey = '';
+    protected string $forthApiKeyOverride = '';
     protected string $currentConnection = 'plaw';
     protected ?string $forthApiKeyCache = null;
 
@@ -64,6 +64,7 @@ class UpdateLendingUSAStatuses extends Command
     protected array $fundedClients = [];
     protected array $declinedClients = [];
     protected array $newClients = [];
+    protected array $errorDetails = [];
 
     // Batch-loaded caches for performance optimization
     protected array $enrollmentStatesCache = [];
@@ -112,13 +113,14 @@ class UpdateLendingUSAStatuses extends Command
             $this->connector->initializeSqlServer();
             $this->info('  Snowflake + SQL Server: OK');
 
-            // 2. Resolve CRM key
-            $this->crmKey = $this->resolveCrmLoginKey($connection, (string) ($this->option('crm-key') ?? ''));
-            if ($this->crmKey === '' && !$this->dryRun) {
-                $this->error('CRM login API key not set. Use --crm-key or set CRM_LOGIN_API_KEY / CRM_LOGIN_API_KEY_PLAW.');
+            // 2. Resolve Forth API key
+            $this->forthApiKeyOverride = (string) ($this->option('crm-key') ?? '');
+            $forthApiKey = $this->resolveForthApiKey();
+            if ($forthApiKey === '' && !$this->dryRun) {
+                $this->error('Forth API key not available. Use --crm-key or configure FORTH_* credentials / TblAPIKeys.');
                 return Command::FAILURE;
             }
-            $this->info('  CRM key: ' . ($this->crmKey !== '' ? 'resolved' : 'not set (dry-run OK)'));
+            $this->info('  Forth API key: ' . ($forthApiKey !== '' ? 'resolved' : 'not set (dry-run may skip CRM checks)'));
 
             // 3. Load current status snapshot from TblLendingUSAStatuses
             $this->info('[2/6] Loading current status snapshot...');
@@ -610,10 +612,6 @@ class UpdateLendingUSAStatuses extends Command
 
     protected function getCrmContactData(string $contactId): ?array
     {
-        if ($this->dryRun && $this->crmKey === '') {
-            return null; // Can't check CRM in dry-run without key
-        }
-
         $apiKey = $this->resolveForthApiKey();
         if ($apiKey === '') {
             return null;
@@ -682,6 +680,7 @@ class UpdateLendingUSAStatuses extends Command
         $apiKey = $this->resolveForthApiKey();
         if ($apiKey === '') {
             $this->warn("  CRM update skipped for CID {$contactId}: no Forth API key");
+            $this->addError($contactId, 'No Forth API key available for CRM workflow update.');
             return false;
         }
 
@@ -710,9 +709,11 @@ class UpdateLendingUSAStatuses extends Command
             }
 
             $this->warn("  CRM update failed for CID {$contactId}: HTTP {$httpCode}");
+            $this->addError($contactId, "CRM workflow update failed with HTTP {$httpCode}.");
             return false;
         } catch (\Throwable $e) {
             $this->warn("  CRM update failed for CID {$contactId}: {$e->getMessage()}");
+            $this->addError($contactId, 'CRM workflow update failed: ' . $e->getMessage());
             return false;
         }
     }
@@ -722,6 +723,7 @@ class UpdateLendingUSAStatuses extends Command
         $apiKey = $this->resolveForthApiKey();
         if ($apiKey === '') {
             $this->warn("  Cannot pause CID {$contactId}: no Forth API key");
+            $this->addError($contactId, 'Unable to pause CRM contact because no Forth API key is available.');
             return;
         }
 
@@ -739,6 +741,7 @@ class UpdateLendingUSAStatuses extends Command
             $this->info("    [PAUSE] CRM contact {$contactId} paused.");
         } catch (\Throwable $e) {
             $this->warn("    [PAUSE] Failed to pause CID {$contactId}: {$e->getMessage()}");
+            $this->addError($contactId, 'Failed to pause CRM contact: ' . $e->getMessage());
             $this->totalErrors++;
         }
     }
@@ -990,39 +993,17 @@ class UpdateLendingUSAStatuses extends Command
         return $this->httpClient;
     }
 
-    protected function resolveCrmLoginKey(string $connection, string $override): string
-    {
-        if ($override !== '') {
-            return $override;
-        }
-
-        if (function_exists('tenant')) {
-            try {
-                $tenantKey = tenant('crm_login_api_key');
-                if (is_string($tenantKey) && $tenantKey !== '') {
-                    return $tenantKey;
-                }
-            } catch (\Throwable $e) {
-            }
-        }
-
-        $connKey = env('CRM_LOGIN_API_KEY_' . strtoupper($connection));
-        if (is_string($connKey) && $connKey !== '') {
-            return $connKey;
-        }
-
-        $defaultKey = env('CRM_LOGIN_API_KEY');
-        return is_string($defaultKey) ? $defaultKey : '';
-    }
-
     protected function resolveForthApiKey(): string
     {
-        // Return cached key if already resolved for this connection
         if ($this->forthApiKeyCache !== null) {
             return $this->forthApiKeyCache;
         }
 
-        // Priority 1: TblAPIKeys database table (authoritative source)
+        if ($this->forthApiKeyOverride !== '') {
+            $this->forthApiKeyCache = $this->forthApiKeyOverride;
+            return $this->forthApiKeyOverride;
+        }
+
         $categoryMap = ['plaw' => 'PLAW', 'ldr' => 'LDR', 'lt' => 'LT'];
         $cat = $categoryMap[$this->currentConnection] ?? strtoupper($this->currentConnection);
 
@@ -1030,27 +1011,95 @@ class UpdateLendingUSAStatuses extends Command
         $result = $this->connector->querySqlServer($sql);
         $dbKey = (string) ($result['data'][0]['API_Key'] ?? '');
         
-        if ($dbKey !== '') {
+        if ($dbKey !== '' && $this->isForthApiKeyValid($dbKey)) {
             $this->forthApiKeyCache = $dbKey;
             return $dbKey;
         }
-        
-        // Priority 2: Environment variables (fallback)
-        $envKeyMap = [
-            'ldr' => 'FORTH_LDR_CLIENT_SECRET',
-            'plaw' => 'FORTH_PLAW_CLIENT_SECRET',
-            'lt' => 'FORTH_LT_CLIENT_SECRET',
-        ];
-        
-        $envKeyName = $envKeyMap[$this->currentConnection] ?? '';
-        if ($envKeyName !== '' && function_exists('env')) {
-            $envKey = (string) env($envKeyName, '');
-            $this->forthApiKeyCache = $envKey;
-            return $envKey;
+
+        $freshKey = $this->fetchForthApiKey();
+        if ($freshKey !== '') {
+            $this->storeForthApiKey($cat, $freshKey);
+            $this->forthApiKeyCache = $freshKey;
+            return $freshKey;
         }
-        
+
         $this->forthApiKeyCache = '';
         return '';
+    }
+
+    protected function isForthApiKeyValid(string $apiKey): bool
+    {
+        try {
+            $response = $this->httpClient()->get('https://api.forthcrm.com/v1/users/current', [
+                'headers' => [
+                    'Api-Key' => $apiKey,
+                    'Accept' => 'application/json',
+                ],
+            ]);
+
+            return $response->getStatusCode() === 200;
+        } catch (\Throwable) {
+            return false;
+        }
+    }
+
+    protected function fetchForthApiKey(): string
+    {
+        $envMap = [
+            'ldr' => ['client_id' => 'FORTH_LDR_KEY_ID', 'client_secret' => 'FORTH_LDR_CLIENT_SECRET'],
+            'plaw' => ['client_id' => 'FORTH_PLAW_KEY_ID', 'client_secret' => 'FORTH_PLAW_CLIENT_SECRET'],
+            'lt' => ['client_id' => 'FORTH_LT_KEY_ID', 'client_secret' => 'FORTH_LT_CLIENT_SECRET'],
+        ];
+
+        $vars = $envMap[$this->currentConnection] ?? null;
+        if ($vars === null) {
+            return '';
+        }
+
+        $clientId = (string) env($vars['client_id'], '');
+        $clientSecret = (string) env($vars['client_secret'], '');
+        if ($clientId === '' || $clientSecret === '') {
+            return '';
+        }
+
+        try {
+            $response = $this->httpClient()->post('https://api.forthcrm.com/v1/auth/token', [
+                'headers' => [
+                    'Accept' => 'application/json',
+                    'Content-Type' => 'application/json',
+                ],
+                'json' => [
+                    'client_id' => $clientId,
+                    'client_secret' => $clientSecret,
+                ],
+            ]);
+
+            if ($response->getStatusCode() !== 200) {
+                return '';
+            }
+
+            $data = json_decode((string) $response->getBody(), true) ?? [];
+            return (string) ($data['response']['api_key'] ?? $data['access_token'] ?? '');
+        } catch (\Throwable) {
+            return '';
+        }
+    }
+
+    protected function storeForthApiKey(string $category, string $apiKey): void
+    {
+        $today = now()->format('Y-m-d');
+        $sql = "
+            MERGE TblAPIKeys AS target
+            USING (SELECT '{$this->esc($category)}' AS Category) AS source
+            ON target.Category = source.Category
+            WHEN MATCHED THEN
+                UPDATE SET API_Key = '{$this->esc($apiKey)}', Creation_Date = '{$today}'
+            WHEN NOT MATCHED THEN
+                INSERT (Category, API_Key, Creation_Date)
+                VALUES ('{$this->esc($category)}', '{$this->esc($apiKey)}', '{$today}');
+        ";
+
+        $this->connector->querySqlServer($sql);
     }
 
     protected function resetCounters(): void
@@ -1067,6 +1116,7 @@ class UpdateLendingUSAStatuses extends Command
         $this->fundedClients = [];
         $this->declinedClients = [];
         $this->newClients = [];
+        $this->errorDetails = [];
         // Clear batch caches
         $this->enrollmentStatesCache = [];
         $this->enrollmentPlansCache = [];
@@ -1245,7 +1295,8 @@ class UpdateLendingUSAStatuses extends Command
             ->setDeclinedClients($this->declinedClients)
             ->setNewClients($this->newClients)
             ->setChangedRecords($this->changedRecords)
-            ->setStatusBreakdown($this->statusBreakdown);
+            ->setStatusBreakdown($this->statusBreakdown)
+            ->setErrors($this->errorDetails);
 
         $formatter = new ReportFormatter();
         $sent = $formatter->sendReport($this->connector, $reportData, $this);
@@ -1255,5 +1306,13 @@ class UpdateLendingUSAStatuses extends Command
         } else {
             Log::warning('UpdateLendingUSAStatuses: email report failed or no recipients.', ['connection' => $connection]);
         }
+    }
+
+    protected function addError(string $cid, string $message): void
+    {
+        $this->errorDetails[] = [
+            'cid' => $cid,
+            'message' => $message,
+        ];
     }
 }

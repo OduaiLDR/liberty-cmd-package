@@ -59,7 +59,9 @@ class ReportFormatter
         $connection = $report['connection'] ?? 'ALL';
         $dryRun = $report['dryRun'] ?? false;
         $totalChanges = $report['totalChanges'] ?? 0;
+        $totalProcessed = $report['totalProcessed'] ?? 0;
         $crmUpdates = $report['crmUpdates'] ?? 0;
+        $noChange = $report['noChange'] ?? 0;
         $errorsCount = $report['errorsCount'] ?? 0;
         
         $html = <<<HTML
@@ -68,7 +70,7 @@ class ReportFormatter
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>LendingUSA Status Report - {$connection}</title>
+    <title>LendingUSA Status Sync Report - {$connection}</title>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; line-height: 1.5; color: #1a1a1a; max-width: 960px; margin: 0 auto; padding: 24px; background-color: #fff; }
         .container { background: #fff; border: 1px solid #e5e5e5; }
@@ -77,8 +79,11 @@ class ReportFormatter
         .header-meta { display: flex; gap: 24px; margin-top: 8px; font-size: 13px; color: #a0a0a0; }
         .header-meta span { display: flex; align-items: center; gap: 6px; }
         .content { padding: 24px 32px; }
-        .stats { display: flex; gap: 16px; margin-bottom: 24px; font-size: 13px; color: #525252; }
+        .stats { display: flex; gap: 16px; margin-bottom: 24px; font-size: 13px; color: #525252; flex-wrap: wrap; }
         .stats strong { color: #1a1a1a; }
+        .section { margin-top: 28px; }
+        .section h2 { font-size: 15px; margin: 0 0 10px; color: #1a1a1a; }
+        .section p { margin: 0 0 10px; color: #525252; font-size: 13px; }
         table { width: 100%; border-collapse: collapse; font-size: 13px; }
         th { background: #f5f5f5; padding: 10px 12px; text-align: left; font-weight: 600; color: #1a1a1a; font-size: 11px; text-transform: uppercase; letter-spacing: 0.03em; border-bottom: 1px solid #e5e5e5; }
         td { padding: 10px 12px; border-bottom: 1px solid #f0f0f0; vertical-align: middle; }
@@ -86,12 +91,15 @@ class ReportFormatter
         .cid { font-family: 'SF Mono', Monaco, 'Courier New', monospace; font-size: 12px; }
         .tag { display: inline-block; padding: 3px 8px; font-size: 11px; font-weight: 500; border-radius: 3px; }
         .tag-before { background: #f5f5f5; color: #525252; }
+        .tag-after { background: #dcfce7; color: #166534; }
         .tag-crm { background: #e0e7ff; color: #3730a3; }
         .tag-skip { background: #f5f5f5; color: #9ca3af; font-style: italic; }
         .tag-error { background: #fee2e2; color: #991b1b; }
         .tag-funded { background: #dcfce7; color: #166534; }
         .no-data { color: #a0a0a0; }
         .more-rows { text-align: center; padding: 12px; color: #666; font-size: 12px; background: #fafafa; border-top: 1px solid #f0f0f0; }
+        .transition { white-space: nowrap; }
+        .muted { color: #737373; }
         .footer { background: #f5f5f5; padding: 16px 32px; font-size: 11px; color: #666; border-top: 1px solid #e5e5e5; }
         .footer p { margin: 4px 0; }
         .dry-run-banner { background: #fef3c7; color: #92400e; padding: 12px 32px; font-size: 13px; font-weight: 500; border-bottom: 1px solid #fcd34d; }
@@ -112,7 +120,7 @@ HTML;
         // Header with clear title
         $html .= <<<HTML
         <div class="header">
-            <h1>LendingUSA Status Report &mdash; {$connection}</h1>
+            <h1>LendingUSA Status Sync Report &mdash; {$connection}</h1>
             <div class="header-meta">
                 <span>{$timestamp}</span>
                 <span>Changes: <strong>{$totalChanges}</strong></span>
@@ -122,24 +130,83 @@ HTML;
         <div class="content">
 HTML;
 
-        // Single table: ID | Name | State | Before | CRM Update
+        $html .= <<<HTML
+        <div class="stats">
+            <span>Processed: <strong>{$totalProcessed}</strong></span>
+            <span>Changes: <strong>{$totalChanges}</strong></span>
+            <span>CRM Updates: <strong>{$crmUpdates}</strong></span>
+            <span>No Change: <strong>{$noChange}</strong></span>
+            <span>Errors: <strong>{$errorsCount}</strong></span>
+        </div>
+HTML;
+
+        if (!empty($report['fundedClients'])) {
+            $html .= '<div class="section"><h2>Funded Clients</h2><table><thead><tr><th>Client ID</th><th>Name</th><th>Previous Status</th><th>State</th><th>Negotiator</th></tr></thead><tbody>';
+            foreach ($report['fundedClients'] as $client) {
+                $cid = htmlspecialchars($client['cid'] ?? '');
+                $name = htmlspecialchars($client['name'] ?? '');
+                $prevStatus = htmlspecialchars($client['prev_status'] ?? 'N/A');
+                $state = htmlspecialchars($client['state'] ?? '-');
+                $negotiator = htmlspecialchars($client['negotiator'] ?? 'Pending');
+                $html .= "<tr><td class=\"cid\">{$cid}</td><td>{$name}</td><td><span class=\"tag tag-before\">{$prevStatus}</span></td><td>{$state}</td><td>{$negotiator}</td></tr>";
+            }
+            $html .= '</tbody></table></div>';
+        }
+
+        if (!empty($report['declinedClients'])) {
+            $html .= '<div class="section"><h2>Declined Clients</h2><table><thead><tr><th>Client ID</th><th>Name</th><th>Transition</th><th>State</th></tr></thead><tbody>';
+            foreach ($report['declinedClients'] as $client) {
+                $cid = htmlspecialchars($client['cid'] ?? '');
+                $name = htmlspecialchars($client['name'] ?? '');
+                $prevStatus = htmlspecialchars($client['prev_status'] ?? 'N/A');
+                $newStatus = htmlspecialchars($client['new_status'] ?? '');
+                $state = htmlspecialchars($client['state'] ?? '-');
+                $transition = "<span class=\"transition\"><span class=\"tag tag-before\">{$prevStatus}</span> → <span class=\"tag tag-after\">{$newStatus}</span></span>";
+                $html .= "<tr><td class=\"cid\">{$cid}</td><td>{$name}</td><td>{$transition}</td><td>{$state}</td></tr>";
+            }
+            $html .= '</tbody></table></div>';
+        }
+
+        if (!empty($report['newClients'])) {
+            $html .= '<div class="section"><h2>New Applications</h2><table><thead><tr><th>Client ID</th><th>Name</th><th>Status</th><th>State</th><th>Plan</th></tr></thead><tbody>';
+            foreach ($report['newClients'] as $client) {
+                $cid = htmlspecialchars($client['cid'] ?? '');
+                $name = htmlspecialchars($client['name'] ?? '');
+                $status = htmlspecialchars($client['status'] ?? '');
+                $state = htmlspecialchars($client['state'] ?? '-');
+                $plan = htmlspecialchars($client['plan'] ?? '-');
+                $html .= "<tr><td class=\"cid\">{$cid}</td><td>{$name}</td><td>{$status}</td><td>{$state}</td><td>{$plan}</td></tr>";
+            }
+            $html .= '</tbody></table></div>';
+        }
+
+        if (!empty($report['statusBreakdown'])) {
+            $html .= '<div class="section"><h2>Status Distribution</h2><table><thead><tr><th>Status</th><th>Count</th></tr></thead><tbody>';
+            foreach ($report['statusBreakdown'] as $status => $count) {
+                $html .= '<tr><td>' . htmlspecialchars((string) $status) . '</td><td>' . htmlspecialchars((string) $count) . '</td></tr>';
+            }
+            $html .= '</tbody></table></div>';
+        }
+
+        // All status changes
         if (!empty($report['changedRecords'])) {
             $count = count($report['changedRecords']);
-            $html .= '<table><thead><tr><th>Client ID</th><th>Name</th><th>State</th><th>Before</th><th>CRM Update</th></tr></thead><tbody>';
+            $html .= '<div class="section"><h2>All Status Changes</h2><p>' . $count . ' records</p><table><thead><tr><th>Client ID</th><th>Name</th><th>State</th><th>Transition</th><th>CRM Update</th></tr></thead><tbody>';
             foreach ($report['changedRecords'] as $rec) {
                 $cid = htmlspecialchars($rec['cid'] ?? '');
                 $name = htmlspecialchars($rec['name'] ?? '');
                 $nameDisplay = $name ?: '<span class="no-data">-</span>';
                 $state = htmlspecialchars($rec['state'] ?? '-');
                 $oldStatus = htmlspecialchars($rec['old_status'] ?? 'N/A');
+                $newStatus = htmlspecialchars($rec['new_status'] ?? '');
                 $crmStatus = $rec['crm_status'] ?? '';
 
-                // Format the CRM Update column clearly
                 $crmHtml = $this->formatCrmCell($crmStatus);
+                $transition = "<span class=\"transition\"><span class=\"tag tag-before\">{$oldStatus}</span> → <span class=\"tag tag-after\">{$newStatus}</span></span>";
                 
-                $html .= "<tr><td class=\"cid\">{$cid}</td><td>{$nameDisplay}</td><td>{$state}</td><td><span class=\"tag tag-before\">{$oldStatus}</span></td><td>{$crmHtml}</td></tr>";
+                $html .= "<tr><td class=\"cid\">{$cid}</td><td>{$nameDisplay}</td><td>{$state}</td><td>{$transition}</td><td>{$crmHtml}</td></tr>";
             }
-            $html .= '</tbody></table>';
+            $html .= '</tbody></table></div>';
         } else {
             $html .= '<p class="no-data">No status changes detected.</p>';
         }
