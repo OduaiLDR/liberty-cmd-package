@@ -1,5 +1,5 @@
 {
-  "name": "ahmedalothmanliberty/cmd-reports",
+  "name": "oduaildr/liberty-cmd-package",
   "description": "DebtPlete CMD and SQL reports module",
   "type": "library",
   "require": {
