@@ -2,15 +2,17 @@
 
 namespace Cmd\Reports\Console\Commands\GenerateReportSummary;
 
+use Cmd\Reports\Console\Commands\GenerateSyncSummary\StatusBuilder;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
 use PDO;
 
 class GenerateReportSummary extends Command
 {
-    protected $signature = 'Generate:report-summary';
+    protected $signature = 'Generate:report-summary
+        {--test-to= : Override recipients for testing (semicolon or comma separated)}';
 
-    protected $description = 'Generate a daily summary of all reports from TblReports and email it.';
+    protected $description = 'Generate a summary of tracked reports and automations, including schedule and last run.';
 
     private ?PDO $sqlConnection = null;
 
@@ -20,119 +22,67 @@ class GenerateReportSummary extends Command
 
         try {
             $this->initializeSqlServerConnection();
+            $rows = (new StatusBuilder($this->sqlConnection))->buildRows();
         } catch (\Throwable $e) {
-            $this->error('Failed to initialize SQL Server connection: ' . $e->getMessage());
-            Log::error('GenerateReportSummary: SQL Server init failed', ['exception' => $e]);
-            return Command::FAILURE;
-        }
-
-        // Query ALL reports from TblReports and TblAutomation, then get last run from TblLog
-        $sql = "
-            WITH AllReports AS (
-                -- Get all reports from TblReports
-                SELECT 
-                    LTRIM(RTRIM(Report_Name)) AS Report_Name,
-                    CASE 
-                        WHEN LTRIM(RTRIM(Report_Name)) LIKE '%PLAW%' OR LTRIM(RTRIM(Report_Name)) LIKE '%Progress%' THEN 'PLAW'
-                        WHEN LTRIM(RTRIM(Report_Name)) LIKE '%LDR%' THEN 'LDR'
-                        WHEN LTRIM(RTRIM(Report_Name)) LIKE '%Paramount%' THEN 'Paramount'
-                        ELSE 'All'
-                    END AS Company,
-                    COALESCE(LTRIM(RTRIM(Schedule)), 'Not Scheduled') AS Schedule,
-                    'Report' AS Type
-                FROM dbo.TblReports
-                WHERE Report_Name IS NOT NULL 
-                  AND Report_Name <> ''
-                  AND Report_Name NOT IN ('ReportSummary', 'Report Summary')
-                
-                UNION ALL
-                
-                -- Get all automations from TblAutomation
-                SELECT 
-                    LTRIM(RTRIM(Automation_Name)) AS Report_Name,
-                    CASE 
-                        WHEN LTRIM(RTRIM(Automation_Name)) LIKE '%PLAW%' OR LTRIM(RTRIM(Automation_Name)) LIKE '%Progress%' THEN 'PLAW'
-                        WHEN LTRIM(RTRIM(Automation_Name)) LIKE '%LDR%' THEN 'LDR'
-                        WHEN LTRIM(RTRIM(Automation_Name)) LIKE '%Paramount%' THEN 'Paramount'
-                        ELSE 'All'
-                    END AS Company,
-                    COALESCE(LTRIM(RTRIM(Schedule)), 'Not Scheduled') AS Schedule,
-                    'Automation' AS Type
-                FROM dbo.TblAutomation
-                WHERE Automation_Name IS NOT NULL 
-                  AND Automation_Name <> ''
-            ),
-            LastRuns AS (
-                -- Get the most recent run for each report/automation
-                SELECT 
-                    LTRIM(RTRIM([Macro])) AS Report_Name,
-                    MAX([Timestamp]) AS Last_Run_Date
-                FROM dbo.TblLog
-                WHERE [Table_Name] IN ('TblReports', 'TblAutomation')
-                  AND [Macro] IS NOT NULL
-                  AND [Macro] <> ''
-                GROUP BY LTRIM(RTRIM([Macro]))
-            )
-            SELECT 
-                ar.Report_Name,
-                ar.Company,
-                ar.Schedule,
-                ar.Type,
-                lr.Last_Run_Date,
-                CASE 
-                    WHEN lr.Last_Run_Date IS NOT NULL 
-                    THEN DATENAME(WEEKDAY, lr.Last_Run_Date)
-                    ELSE NULL
-                END AS Last_Run_Weekday
-            FROM AllReports ar
-            LEFT JOIN LastRuns lr ON ar.Report_Name = lr.Report_Name
-            ORDER BY ar.Type, ar.Report_Name
-        ";
-
-        try {
-            $stmt = $this->sqlConnection->query($sql);
-            $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
-        } catch (\Throwable $e) {
-            $this->error('Failed to query TblReports/TblAutomation: ' . $e->getMessage());
-            Log::error('GenerateReportSummary: Query failed', ['exception' => $e, 'sql' => $sql]);
+            $this->error('Failed to build report summary: ' . $e->getMessage());
+            Log::error('GenerateReportSummary: build failed', ['exception' => $e]);
             return Command::FAILURE;
         }
 
         if (empty($rows)) {
-            $this->warn('[WARN] No reports found in TblReports or TblAutomation.');
+            $this->warn('[WARN] No tracked reports or automations were found.');
             return Command::SUCCESS;
         }
 
-        $this->info('[INFO] Found ' . count($rows) . ' reports/automations.');
+        $this->info('[INFO] Found ' . count($rows) . ' tracked report/automation item(s).');
 
-        // Build HTML table
         $formatter = new Formatter();
         $html = $formatter->buildHtmlBody($rows);
+        $overrideRecipients = $this->parseRecipientOverride((string) ($this->option('test-to') ?? ''));
+        $sent = $formatter->sendReport($html, $overrideRecipients, $this);
 
-        // Send email
-        $sent = $formatter->sendReport($html, $this);
+        if (!$sent) {
+            return Command::FAILURE;
+        }
 
         $this->info('[INFO] Report Summary: completed.');
         return Command::SUCCESS;
     }
 
+    /**
+     * @return array<int, string>
+     */
+    private function parseRecipientOverride(string $raw): array
+    {
+        if ($raw === '') {
+            return [];
+        }
+
+        $parts = preg_split('/[;,]+/', $raw) ?: [];
+        $recipients = [];
+
+        foreach ($parts as $part) {
+            $email = trim($part);
+            if (filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                $recipients[] = $email;
+            }
+        }
+
+        return array_values(array_unique($recipients));
+    }
+
     private function initializeSqlServerConnection(): void
     {
-        // Use dbConfig from package which reads from env variables
         $config = config('dbConfig.sql_server.sql_server_connection');
-        
+
         if (!$config) {
             throw new \RuntimeException('SQL Server connection config not found in dbConfig.sql_server.sql_server_connection');
         }
 
-        $dsn = $config['dsn'];
-        $username = $config['username'];
-        $password = $config['password'];
-
         $this->sqlConnection = new PDO(
-            $dsn,
-            $username,
-            $password,
+            $config['dsn'],
+            $config['username'],
+            $config['password'],
             [
                 PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
                 PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,

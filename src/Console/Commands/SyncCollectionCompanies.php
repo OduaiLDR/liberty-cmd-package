@@ -3,6 +3,7 @@
 namespace Cmd\Reports\Console\Commands;
 
 use Cmd\Reports\Services\DBConnector;
+use Cmd\Reports\Services\TblLogWriter;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
 
@@ -61,28 +62,46 @@ class SyncCollectionCompanies extends Command
             return Command::FAILURE;
         }
 
-        // Step 1: Fetch debts with collection companies from Snowflake
-        $this->info('[STEP 1] Fetching debts with collection companies from Snowflake...');
-        $debtsData = $this->fetchDebtsWithCollectionCompanies($snowflake);
-        $this->info('[INFO] Fetched ' . count($debtsData) . ' debt records');
+        try {
+            // Step 1: Fetch debts with collection companies from Snowflake
+            $this->info('[STEP 1] Fetching debts with collection companies from Snowflake...');
+            $debtsData = $this->fetchDebtsWithCollectionCompanies($snowflake);
+            $this->info('[INFO] Fetched ' . count($debtsData) . ' debt records');
 
-        if (empty($debtsData)) {
-            $this->warn('[WARN] No debts found. Exiting.');
+            if (empty($debtsData)) {
+                $this->warn('[WARN] No debts found. Exiting.');
+                $this->writeAutomationLog($sqlConnector, 'SUCCESS', 0, 'No debts found to update.');
+                return Command::SUCCESS;
+            }
+
+            // Step 2: Fetch existing collection companies from SQL Server
+            $this->info('[STEP 2] Fetching existing collection companies from SQL Server...');
+            $existingData = $this->fetchExistingCollectionCompanies($sqlConnector);
+            $this->info('[INFO] Fetched ' . count($existingData) . ' existing assignments');
+
+            // Step 3: Compare and update differences
+            $this->info('[STEP 3] Comparing and updating differences...');
+            $updated = $this->updateCollectionCompanies($sqlConnector, $debtsData, $existingData);
+            $this->info("[INFO] Updated {$updated} collection company assignments");
+
+            $this->writeAutomationLog(
+                $sqlConnector,
+                'SUCCESS',
+                $updated,
+                sprintf('Fetched=%d Updated=%d', count($debtsData), $updated)
+            );
+
+            $this->info("[SUCCESS] {$this->source} sync completed successfully!");
             return Command::SUCCESS;
+        } catch (\Throwable $e) {
+            Log::error('SyncCollectionCompanies: unhandled sync failure', [
+                'source' => $this->source,
+                'exception' => $e->getMessage(),
+            ]);
+            $this->writeAutomationLog($sqlConnector, 'FAILED', 0, $e->getMessage());
+            $this->error("[ERROR] {$this->source} sync failed: " . $e->getMessage());
+            return Command::FAILURE;
         }
-
-        // Step 2: Fetch existing collection companies from SQL Server
-        $this->info('[STEP 2] Fetching existing collection companies from SQL Server...');
-        $existingData = $this->fetchExistingCollectionCompanies($sqlConnector);
-        $this->info('[INFO] Fetched ' . count($existingData) . ' existing assignments');
-
-        // Step 3: Compare and update differences
-        $this->info('[STEP 3] Comparing and updating differences...');
-        $updated = $this->updateCollectionCompanies($sqlConnector, $debtsData, $existingData);
-        $this->info("[INFO] Updated {$updated} collection company assignments");
-
-        $this->info("[SUCCESS] {$this->source} sync completed successfully!");
-        return Command::SUCCESS;
     }
 
     private function fetchDebtsWithCollectionCompanies(DBConnector $snowflake): array
@@ -223,5 +242,24 @@ class SyncCollectionCompanies extends Command
     protected function escSql(string $value): string
     {
         return str_replace("'", "''", $value);
+    }
+
+    private function writeAutomationLog(DBConnector $connector, string $status, int $recordsProcessed, string $details): void
+    {
+        $result = app(TblLogWriter::class)->logAutomation(
+            $connector,
+            'TblNegotiatorAssignments',
+            'SyncCollectionCompanies',
+            sprintf('Sync collection companies for DP_%s', strtoupper($this->source)),
+            'SYNC_COLLECTION_COMPANIES',
+            $status,
+            $recordsProcessed,
+            0,
+            $details
+        );
+
+        if (($result['success'] ?? false) !== true) {
+            $this->warn(sprintf('[%s] TblLog write failed: %s', $this->source, $result['error'] ?? 'Unknown error'));
+        }
     }
 }

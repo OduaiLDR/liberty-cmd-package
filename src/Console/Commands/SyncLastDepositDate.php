@@ -3,6 +3,7 @@
 namespace Cmd\Reports\Console\Commands;
 
 use Cmd\Reports\Services\DBConnector;
+use Cmd\Reports\Services\TblLogWriter;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
 
@@ -61,23 +62,41 @@ class SyncLastDepositDate extends Command
             return Command::FAILURE;
         }
 
-        // Step 1: Fetch last deposit dates from Snowflake
-        $this->info('[STEP 1] Fetching last deposit dates from Snowflake...');
-        $depositData = $this->fetchLastDepositDates($snowflake);
-        $this->info('[INFO] Fetched ' . count($depositData) . ' last deposit records');
+        try {
+            // Step 1: Fetch last deposit dates from Snowflake
+            $this->info('[STEP 1] Fetching last deposit dates from Snowflake...');
+            $depositData = $this->fetchLastDepositDates($snowflake);
+            $this->info('[INFO] Fetched ' . count($depositData) . ' last deposit records');
 
-        if (empty($depositData)) {
-            $this->warn('[WARN] No deposit data found. Exiting.');
+            if (empty($depositData)) {
+                $this->warn('[WARN] No deposit data found. Exiting.');
+                $this->writeAutomationLog($sqlConnector, 'SUCCESS', 0, 'No deposit data found to update.');
+                return Command::SUCCESS;
+            }
+
+            // Step 2: Update TblEnrollment
+            $this->info('[STEP 2] Updating TblEnrollment...');
+            $updated = $this->updateLastDepositDates($sqlConnector, $depositData);
+            $this->info("[INFO] Updated {$updated} records");
+
+            $this->writeAutomationLog(
+                $sqlConnector,
+                'SUCCESS',
+                $updated,
+                sprintf('Fetched=%d Updated=%d', count($depositData), $updated)
+            );
+
+            $this->info("[SUCCESS] {$this->source} sync completed successfully!");
             return Command::SUCCESS;
+        } catch (\Throwable $e) {
+            Log::error('SyncLastDepositDate: unhandled sync failure', [
+                'source' => $this->source,
+                'exception' => $e->getMessage(),
+            ]);
+            $this->writeAutomationLog($sqlConnector, 'FAILED', 0, $e->getMessage());
+            $this->error("[ERROR] {$this->source} sync failed: " . $e->getMessage());
+            return Command::FAILURE;
         }
-
-        // Step 2: Update TblEnrollment
-        $this->info('[STEP 2] Updating TblEnrollment...');
-        $updated = $this->updateLastDepositDates($sqlConnector, $depositData);
-        $this->info("[INFO] Updated {$updated} records");
-
-        $this->info("[SUCCESS] {$this->source} sync completed successfully!");
-        return Command::SUCCESS;
     }
 
     private function fetchLastDepositDates(DBConnector $snowflake): array
@@ -179,5 +198,24 @@ class SyncLastDepositDate extends Command
     protected function escSql(string $value): string
     {
         return str_replace("'", "''", $value);
+    }
+
+    private function writeAutomationLog(DBConnector $connector, string $status, int $recordsProcessed, string $details): void
+    {
+        $result = app(TblLogWriter::class)->logAutomation(
+            $connector,
+            'TblEnrollment',
+            'SyncLastDepositDate',
+            sprintf('Sync last deposit date for DP_%s', strtoupper($this->source)),
+            'SYNC_LAST_DEPOSIT_DATE',
+            $status,
+            $recordsProcessed,
+            0,
+            $details
+        );
+
+        if (($result['success'] ?? false) !== true) {
+            $this->warn(sprintf('[%s] TblLog write failed: %s', $this->source, $result['error'] ?? 'Unknown error'));
+        }
     }
 }
