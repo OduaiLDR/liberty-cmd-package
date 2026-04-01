@@ -5,6 +5,7 @@ namespace Cmd\Reports\Services;
 use GuzzleHttp\Client;
 use Firebase\JWT\JWT;
 use Exception;
+use Illuminate\Support\Facades\Log;
 use PDO;
 
 /**
@@ -528,7 +529,11 @@ class DBConnector
         }
 
         if ($enabled) {
-            error_log($message);
+            if (class_exists(Log::class)) {
+                Log::debug($message);
+            } else {
+                error_log($message);
+            }
         }
     }
 

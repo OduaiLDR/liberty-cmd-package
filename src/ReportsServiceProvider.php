@@ -20,6 +20,8 @@ use Cmd\Reports\Console\Commands\SyncEnrollmentStatus;
 use Cmd\Reports\Console\Commands\SyncEnrollmentData;
 use Cmd\Reports\Console\Commands\SyncVerifiedDebts;
 use Cmd\Reports\Console\Commands\GenerateCompanyStatsReport\GenerateCompanyStatsReport;
+use Cmd\Reports\Console\Commands\GenerateConsumerAffairsFundedReport\GenerateConsumerAffairsFundedReport;
+use Cmd\Reports\Console\Commands\GenerateConsumerAffairsSettlementReport\GenerateConsumerAffairsSettlementReport;
 use Cmd\Reports\Console\Commands\GenerateLegalReport\GenerateLegalReport;
 use Cmd\Reports\Console\Commands\GenerateWelcomeLetterReport\GenerateWelcomeLetterReport;
 use Cmd\Reports\Console\Commands\GenerateWelcomePacketReport\GenerateWelcomePacketReport;
@@ -35,6 +37,7 @@ use Cmd\Reports\Console\Commands\SyncVeritasTransactions;
 use Cmd\Reports\Console\Commands\RefreshForthApiTokens;
 use Cmd\Reports\Console\Commands\SyncNegotiatorPayrollData;
 use Cmd\Reports\Console\Commands\UpdateLendingUSAStatuses;
+use Cmd\Reports\Console\Commands\ProgramCompletions\ProcessProgramCompletions;
 
 
 
@@ -89,6 +92,8 @@ class ReportsServiceProvider extends ServiceProvider
                 SyncEnrollmentData::class,
                 SyncVerifiedDebts::class,
                 GenerateCompanyStatsReport::class,
+                GenerateConsumerAffairsFundedReport::class,
+                GenerateConsumerAffairsSettlementReport::class,
                 GenerateLegalReport::class,
                 GenerateWelcomeLetterReport::class,
                 GenerateWelcomePacketReport::class,
@@ -104,6 +109,7 @@ class ReportsServiceProvider extends ServiceProvider
                 SyncNegotiatorPayrollData::class,
                 RefreshForthApiTokens::class,
                 UpdateLendingUSAStatuses::class,
+                ProcessProgramCompletions::class,
             ]);
         }
 

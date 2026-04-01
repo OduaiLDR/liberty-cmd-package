@@ -3,6 +3,7 @@
 namespace Cmd\Reports\Console\Commands;
 
 use Cmd\Reports\Services\DBConnector;
+use Cmd\Reports\Services\TblLogWriter;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
 
@@ -62,27 +63,51 @@ class SyncEnrollmentData extends Command
             return Command::FAILURE;
         }
 
-        // Step 1: Update missing Drop_Name and State
-        $this->info('[STEP 1] Updating missing Drop_Name and State...');
-        $this->updateDropNameAndState($sqlConnector);
+        try {
+            // Step 1: Update missing Drop_Name and State
+            $this->info('[STEP 1] Updating missing Drop_Name and State...');
+            $dropStateUpdated = $this->updateDropNameAndState($sqlConnector);
 
-        // Step 2: Update Cancel_Date from Snowflake
-        $this->info('[STEP 2] Updating Cancel_Date from Snowflake...');
-        $this->updateCancelDate($snowflake, $sqlConnector);
+            // Step 2: Update Cancel_Date from Snowflake
+            $this->info('[STEP 2] Updating Cancel_Date from Snowflake...');
+            $cancelDateUpdated = $this->updateCancelDate($snowflake, $sqlConnector);
 
-        // Step 3: Update Payments count from Snowflake
-        $this->info('[STEP 3] Updating Payments count from Snowflake...');
-        $this->updatePayments($snowflake, $sqlConnector);
+            // Step 3: Update Payments count from Snowflake
+            $this->info('[STEP 3] Updating Payments count from Snowflake...');
+            $paymentsUpdated = $this->updatePayments($snowflake, $sqlConnector);
 
-        // Step 4: Update TblContacts.Campaign from TblEnrollment.Drop_Name
-        $this->info('[STEP 4] Updating TblContacts.Campaign...');
-        $this->updateContactsCampaign($sqlConnector);
+            // Step 4: Update TblContacts.Campaign from TblEnrollment.Drop_Name
+            $this->info('[STEP 4] Updating TblContacts.Campaign...');
+            $campaignSynced = $this->updateContactsCampaign($sqlConnector);
 
-        $this->info("[SUCCESS] {$this->source} sync completed successfully!");
-        return Command::SUCCESS;
+            $totalUpdated = $dropStateUpdated + $cancelDateUpdated + $paymentsUpdated;
+            $this->writeAutomationLog(
+                $sqlConnector,
+                'SUCCESS',
+                $totalUpdated,
+                sprintf(
+                    'DropState=%d CancelDate=%d Payments=%d CampaignSync=%s',
+                    $dropStateUpdated,
+                    $cancelDateUpdated,
+                    $paymentsUpdated,
+                    $campaignSynced ? 'YES' : 'NO'
+                )
+            );
+
+            $this->info("[SUCCESS] {$this->source} sync completed successfully!");
+            return Command::SUCCESS;
+        } catch (\Throwable $e) {
+            Log::error('SyncEnrollmentData: unhandled sync failure', [
+                'source' => $this->source,
+                'exception' => $e->getMessage(),
+            ]);
+            $this->writeAutomationLog($sqlConnector, 'FAILED', 0, $e->getMessage());
+            $this->error("[ERROR] {$this->source} sync failed: " . $e->getMessage());
+            return Command::FAILURE;
+        }
     }
 
-    private function updateDropNameAndState(DBConnector $sqlConnector): void
+    private function updateDropNameAndState(DBConnector $sqlConnector): int
     {
         // Get enrollment records with missing Drop_Name or State
         // PLAW filters by last 90 days, LDR gets all
@@ -163,9 +188,10 @@ class SyncEnrollmentData extends Command
         }
 
         $this->info("[INFO] Updated {$updated} records with Drop_Name/State");
+        return $updated;
     }
 
-    private function updateCancelDate(DBConnector $snowflake, DBConnector $sqlConnector): void
+    private function updateCancelDate(DBConnector $snowflake, DBConnector $sqlConnector): int
     {
         // Get all enrollment records with LLG_ID and current Cancel_Date
         $sql = "SELECT LLG_ID, Cancel_Date FROM TblEnrollment WHERE Category = '{$this->esc($this->source)}'";
@@ -225,9 +251,10 @@ class SyncEnrollmentData extends Command
         }
 
         $this->info("[INFO] Updated {$updated} Cancel_Date records");
+        return $updated;
     }
 
-    private function updatePayments(DBConnector $snowflake, DBConnector $sqlConnector): void
+    private function updatePayments(DBConnector $snowflake, DBConnector $sqlConnector): int
     {
         // Get payment counts from BOTH Snowflake databases (LDR and PLAW)
         // Some contacts have Category=LDR but payments in PLAW or vice versa
@@ -346,9 +373,10 @@ class SyncEnrollmentData extends Command
         }
 
         $this->info("[INFO] Updated {$updated} Payments records");
+        return $updated;
     }
 
-    private function updateContactsCampaign(DBConnector $sqlConnector): void
+    private function updateContactsCampaign(DBConnector $sqlConnector): bool
     {
         $sql = "
             UPDATE TblContacts
@@ -362,17 +390,38 @@ class SyncEnrollmentData extends Command
         try {
             $sqlConnector->querySqlServer($sql);
             $this->info("[INFO] Updated TblContacts.Campaign from TblEnrollment.Drop_Name");
+            return true;
         } catch (\Throwable $e) {
             $this->warn("[WARN] Failed to update TblContacts.Campaign: " . $e->getMessage());
             Log::warning('SyncEnrollmentData: Campaign update failed', [
                 'source' => $this->source,
                 'error' => $e->getMessage()
             ]);
+            return false;
         }
     }
 
     protected function esc(string $value): string
     {
         return str_replace("'", "''", $value);
+    }
+
+    private function writeAutomationLog(DBConnector $connector, string $status, int $recordsProcessed, string $details): void
+    {
+        $result = app(TblLogWriter::class)->logAutomation(
+            $connector,
+            'TblEnrollment, TblContacts',
+            'SyncEnrollmentData',
+            sprintf('Sync enrollment data for DP_%s', strtoupper($this->source)),
+            'SYNC_ENROLLMENT_DATA',
+            $status,
+            $recordsProcessed,
+            0,
+            $details
+        );
+
+        if (($result['success'] ?? false) !== true) {
+            $this->warn(sprintf('[%s] TblLog write failed: %s', $this->source, $result['error'] ?? 'Unknown error'));
+        }
     }
 }

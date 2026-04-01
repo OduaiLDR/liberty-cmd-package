@@ -5,191 +5,204 @@ namespace Cmd\Reports\Console\Commands\GenerateSyncSummary;
 use Cmd\Reports\Services\EmailSenderService;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
+use PDO;
 
 class Formatter
 {
-    public function buildHtmlBody(array $rows): string
+    public function buildHtmlBody(array $rows, array $statusRows = []): string
     {
-        $today = date('l, F j, Y');
-        
-        $html = "
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <style>
-                body {
-                    font-family: Arial, sans-serif;
-                    margin: 20px;
-                    background-color: #f5f5f5;
-                }
-                .container {
-                    background-color: white;
-                    padding: 20px;
-                    border-radius: 8px;
-                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-                }
-                h1 {
-                    color: #2c3e50;
-                    border-bottom: 3px solid #3498db;
-                    padding-bottom: 10px;
-                }
-                h2 {
-                    color: #34495e;
-                    margin-top: 30px;
-                }
-                table {
-                    width: 100%;
-                    border-collapse: collapse;
-                    margin-top: 20px;
-                }
-                th {
-                    background-color: #3498db;
-                    color: white;
-                    padding: 12px;
-                    text-align: left;
-                    font-weight: bold;
-                }
-                td {
-                    padding: 10px;
-                    border-bottom: 1px solid #ddd;
-                }
-                tr:hover {
-                    background-color: #f8f9fa;
-                }
-                .date-header {
-                    color: #7f8c8d;
-                    font-size: 14px;
-                    margin-bottom: 20px;
-                }
-                .summary-stats {
-                    background-color: #ecf0f1;
-                    padding: 15px;
-                    border-radius: 5px;
-                    margin-bottom: 20px;
-                }
-                .stat-item {
-                    display: inline-block;
-                    margin-right: 30px;
-                }
-                .stat-number {
-                    font-size: 24px;
-                    font-weight: bold;
-                    color: #2980b9;
-                }
-                .stat-label {
-                    font-size: 12px;
-                    color: #7f8c8d;
-                    text-transform: uppercase;
-                }
-            </style>
-        </head>
-        <body>
-            <div class='container'>
-                <h1>Sync & Macro Execution Summary</h1>
-                <div class='date-header'>Generated on {$today}</div>
-                
-                <div class='summary-stats'>
-                    <div class='stat-item'>
-                        <div class='stat-number'>" . count($rows) . "</div>
-                        <div class='stat-label'>Total Executions Today</div>
-                    </div>
-                </div>
+        $generatedAt = now()->format('F j, Y g:i A T');
+        $attentionRows = array_values(array_filter($statusRows, static fn(array $row): bool => (bool) ($row['needs_attention'] ?? false)));
+        $healthyRows = array_values(array_filter($statusRows, static fn(array $row): bool => !(bool) ($row['needs_attention'] ?? false)));
 
-                <h2>Recent Macro Executions (Today)</h2>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Macro Name</th>
-                            <th>Description</th>
-                            <th>Action</th>
-                            <th>Result</th>
-                            <th>Last Run Date</th>
-                            <th>Weekday</th>
-                        </tr>
-                    </thead>
-                    <tbody>";
+        $priority = [
+            'Failed Last Run' => 0,
+            'Missed' => 1,
+            'No Run Evidence' => 2,
+            'Other Scope Logged' => 3,
+            'Schedule Mismatch' => 4,
+            'Unscheduled' => 5,
+        ];
 
-        foreach ($rows as $row) {
-            $macroName = htmlspecialchars($row['Macro_Name'] ?? 'N/A');
-            $description = htmlspecialchars($row['Description'] ?? 'N/A');
-            $action = htmlspecialchars($row['Action'] ?? 'N/A');
-            $result = htmlspecialchars($row['Result'] ?? 'N/A');
-            $lastRunDate = htmlspecialchars($row['Last_Run_Date'] ?? 'N/A');
-            $weekday = htmlspecialchars($row['Last_Run_Weekday'] ?? 'N/A');
+        usort($attentionRows, function (array $left, array $right) use ($priority): int {
+            $leftPriority = $priority[$left['status'] ?? ''] ?? 99;
+            $rightPriority = $priority[$right['status'] ?? ''] ?? 99;
 
-            $html .= "
-                        <tr>
-                            <td><strong>{$macroName}</strong></td>
-                            <td>{$description}</td>
-                            <td>{$action}</td>
-                            <td>{$result}</td>
-                            <td>{$lastRunDate}</td>
-                            <td>{$weekday}</td>
-                        </tr>";
-        }
+            return [$leftPriority, $left['name'], $left['scope']] <=> [$rightPriority, $right['name'], $right['scope']];
+        });
 
-        $html .= "
-                    </tbody>
-                </table>
+        usort($healthyRows, fn(array $left, array $right): int => [$left['type'], $left['name'], $left['scope']] <=> [$right['type'], $right['name'], $right['scope']]);
 
-                <h2>Upcoming Scheduled Syncs</h2>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Macro Name</th>
-                            <th>Schedule</th>
-                            <th>Next Run</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <tr>
-                            <td><strong>SyncVerifiedDebts</strong></td>
-                            <td>Daily at 2:00 AM</td>
-                            <td>Tomorrow 2:00 AM</td>
-                        </tr>
-                        <tr>
-                            <td><strong>SyncBalances</strong></td>
-                            <td>Daily at 3:00 AM</td>
-                            <td>Tomorrow 3:00 AM</td>
-                        </tr>
-                        <tr>
-                            <td><strong>SyncContactsData</strong></td>
-                            <td>Daily at 4:00 AM</td>
-                            <td>Tomorrow 4:00 AM</td>
-                        </tr>
-                        <tr>
-                            <td><strong>SyncEnrollmentStatus</strong></td>
-                            <td>Daily at 5:00 AM</td>
-                            <td>Tomorrow 5:00 AM</td>
-                        </tr>
-                        <tr>
-                            <td><strong>Report Generation</strong></td>
-                            <td>Daily at 7:00 AM</td>
-                            <td>Tomorrow 7:00 AM</td>
-                        </tr>
-                    </tbody>
-                </table>
+        $recentRows = array_slice($rows, 0, 12);
+        $onTimeCount = count(array_filter($statusRows, static fn(array $row): bool => ($row['status'] ?? '') === 'On Time'));
+        $pendingCount = count(array_filter($statusRows, static fn(array $row): bool => ($row['status'] ?? '') === 'Pending'));
 
-                <div style='margin-top: 30px; padding-top: 20px; border-top: 1px solid #ddd; color: #7f8c8d; font-size: 12px;'>
-                    <p>This is an automated summary generated by the Liberty Debt Relief reporting system.</p>
-                    <p>For questions or issues, please contact the system administrator.</p>
-                </div>
-            </div>
-        </body>
-        </html>
-        ";
+        $html = '<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <style>
+        body { font-family: Arial, sans-serif; margin: 24px; background: #f5f7fb; color: #111827; }
+        .container { max-width: 1180px; margin: 0 auto; background: #ffffff; border: 1px solid #e5e7eb; }
+        .header { padding: 24px 28px; border-bottom: 1px solid #e5e7eb; }
+        .header h1 { margin: 0; font-size: 22px; }
+        .header p { margin: 8px 0 0; color: #6b7280; font-size: 13px; }
+        .summary { display: flex; gap: 12px; flex-wrap: wrap; padding: 20px 28px; border-bottom: 1px solid #e5e7eb; }
+        .card { min-width: 150px; padding: 12px 14px; background: #f9fafb; border: 1px solid #e5e7eb; }
+        .card-label { font-size: 11px; text-transform: uppercase; color: #6b7280; letter-spacing: 0.04em; }
+        .card-value { margin-top: 4px; font-size: 24px; font-weight: 700; }
+        .card-value.attention { color: #b91c1c; }
+        .section { padding: 24px 28px 0; }
+        .section h2 { margin: 0 0 10px; font-size: 16px; }
+        .section p { margin: 0 0 12px; color: #6b7280; font-size: 13px; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th { text-align: left; background: #f3f4f6; color: #111827; padding: 10px 12px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; border-bottom: 1px solid #e5e7eb; }
+        td { padding: 10px 12px; border-bottom: 1px solid #f3f4f6; vertical-align: top; }
+        tr.attention td { background: #fff7f7; }
+        .status { display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; }
+        .status-ok { background: #dcfce7; color: #166534; }
+        .status-pending { background: #dbeafe; color: #1d4ed8; }
+        .status-attention { background: #fee2e2; color: #991b1b; }
+        .status-neutral { background: #f3f4f6; color: #4b5563; }
+        .muted { color: #6b7280; }
+        .footer { padding: 20px 28px 24px; color: #6b7280; font-size: 12px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Sync Status Summary</h1>
+            <p>Generated ' . htmlspecialchars($generatedAt) . '. Inventory comes from TblReports and TblAutomation. Execution evidence is read from TblLog, with Laravel log fallback where available.</p>
+        </div>
+        <div class="summary">
+            <div class="card"><div class="card-label">Tracked Items</div><div class="card-value">' . count($statusRows) . '</div></div>
+            <div class="card"><div class="card-label">Needs Attention</div><div class="card-value attention">' . count($attentionRows) . '</div></div>
+            <div class="card"><div class="card-label">On Time</div><div class="card-value">' . $onTimeCount . '</div></div>
+            <div class="card"><div class="card-label">Pending</div><div class="card-value">' . $pendingCount . '</div></div>
+            <div class="card"><div class="card-label">Recent Log Rows</div><div class="card-value">' . count($recentRows) . '</div></div>
+        </div>
+        <div class="section">
+            <h2>Needs Attention</h2>
+            <p>Only rows that need review are listed here first.</p>
+            ' . $this->renderStatusTable($attentionRows, true) . '
+        </div>
+        <div class="section">
+            <h2>Healthy / Pending</h2>
+            <p>Clean rows are separated so the report is easier to scan.</p>
+            ' . $this->renderStatusTable($healthyRows, false) . '
+        </div>
+        <div class="section">
+            <h2>Recent Execution Evidence</h2>
+            <p>Latest tracked TblLog rows only.</p>
+            ' . $this->renderRecentRows($recentRows) . '
+        </div>
+        <div class="footer">
+            Read-only status view only. No database writes are performed by this summary.
+        </div>
+    </div>
+</body>
+</html>';
 
         return $html;
     }
 
-    public function sendReport(string $html, ?Command $console = null): bool
+    /**
+     * @param array<int, array<string, mixed>> $rows
+     */
+    private function renderStatusTable(array $rows, bool $showEmptyMessage): string
+    {
+        if ($rows === []) {
+            return $showEmptyMessage
+                ? '<p class="muted">No rows need attention.</p>'
+                : '<p class="muted">No additional healthy rows.</p>';
+        }
+
+        $html = '<table><thead><tr><th>Name</th><th>Scope</th><th>Schedule</th><th>Last Run</th><th>Next Expected</th><th>Status</th><th>Evidence</th></tr></thead><tbody>';
+
+        foreach ($rows as $row) {
+            $status = (string) ($row['status'] ?? 'Unknown');
+            $statusClass = match ($status) {
+                'On Time' => 'status status-ok',
+                'Pending', 'Logged' => 'status status-pending',
+                'Unscheduled' => 'status status-neutral',
+                default => 'status status-attention',
+            };
+
+            $html .= '<tr' . (((bool) ($row['needs_attention'] ?? false)) ? ' class="attention"' : '') . '>';
+            $html .= '<td><strong>' . htmlspecialchars((string) ($row['name'] ?? '')) . '</strong><br><span class="muted">' . htmlspecialchars((string) ($row['source'] ?? '')) . '</span></td>';
+            $html .= '<td>' . htmlspecialchars((string) ($row['scope'] ?? '')) . '</td>';
+            $html .= '<td>' . htmlspecialchars((string) ($row['schedule'] ?? 'Not scheduled')) . '</td>';
+            $html .= '<td>' . $this->formatDisplayDate((string) ($row['last_run'] ?? '')) . '</td>';
+            $html .= '<td>' . htmlspecialchars((string) ($row['next_expected'] ?? '')) . '</td>';
+            $html .= '<td><span class="' . $statusClass . '">' . htmlspecialchars($status) . '</span></td>';
+            $html .= '<td>' . htmlspecialchars((string) ($row['evidence'] ?? 'No execution log')) . '</td>';
+            $html .= '</tr>';
+        }
+
+        $html .= '</tbody></table>';
+
+        return $html;
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $rows
+     */
+    private function renderRecentRows(array $rows): string
+    {
+        if ($rows === []) {
+            return '<p class="muted">No recent tracked TblLog rows found.</p>';
+        }
+
+        $html = '<table><thead><tr><th>Macro</th><th>Run</th><th>Result</th></tr></thead><tbody>';
+
+        foreach ($rows as $row) {
+            $result = trim((string) ($row['Result'] ?? ''));
+            if ($result === '') {
+                $result = trim((string) ($row['Action'] ?? ''));
+            }
+            if (strlen($result) > 80) {
+                $result = substr($result, 0, 77) . '...';
+            }
+
+            $html .= '<tr>';
+            $html .= '<td><strong>' . htmlspecialchars((string) ($row['Macro_Name'] ?? '')) . '</strong></td>';
+            $html .= '<td>' . $this->formatDisplayDate((string) ($row['Last_Run_Date'] ?? '')) . '</td>';
+            $html .= '<td>' . htmlspecialchars($result) . '</td>';
+            $html .= '</tr>';
+        }
+
+        $html .= '</tbody></table>';
+
+        return $html;
+    }
+
+    private function formatDisplayDate(string $value): string
+    {
+        $value = trim($value);
+        if ($value === '') {
+            return '<span class="muted">No log</span>';
+        }
+
+        $timestamp = strtotime($value);
+        if ($timestamp === false) {
+            return htmlspecialchars($value);
+        }
+
+        return htmlspecialchars(date('m/d/Y g:i A', $timestamp));
+    }
+
+    /**
+     * @param array<int, string> $overrideRecipients
+     */
+    public function sendReport(string $html, array $overrideRecipients = [], ?Command $console = null): bool
     {
         $email = new EmailSenderService();
 
-        $subject = 'Daily Sync & Macro Summary - ' . date('m/d/Y');
+        $isTest = !empty($overrideRecipients);
+        $subject = ($isTest ? '[TEST] ' : '') . 'Daily Sync & Macro Summary - ' . date('m/d/Y');
         $body = $html;
 
-        $recipients = ['oduai@libertydebtrelief.com'];
+        $recipients = !empty($overrideRecipients) ? $overrideRecipients : $this->getRecipientsFromTblReports();
 
         $sent = $email->sendMailHtml($subject, $body, $recipients);
 
@@ -204,5 +217,72 @@ class Formatter
         }
 
         return $sent;
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    private function getRecipientsFromTblReports(): array
+    {
+        try {
+            $config = config('dbConfig.sql_server.sql_server_connection');
+            if (!$config) {
+                return $this->fallbackRecipients();
+            }
+
+            $pdo = new PDO(
+                $config['dsn'],
+                $config['username'],
+                $config['password'],
+                [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]
+            );
+
+            $sql = "
+                SELECT Send_To, Send_CC, Send_BCC
+                FROM dbo.TblReports
+                WHERE Report_Name IN ('SyncSummary', 'Sync Summary', 'ReportSummary', 'Report Summary')
+            ";
+
+            $stmt = $pdo->query($sql);
+            $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            $emails = [];
+            foreach ($rows as $row) {
+                foreach (['Send_To', 'Send_CC', 'Send_BCC'] as $column) {
+                    $value = $row[$column] ?? '';
+                    if (!$value) {
+                        continue;
+                    }
+
+                    $parts = preg_split('/[;,]+/', $value) ?: [];
+                    foreach ($parts as $email) {
+                        $email = trim($email);
+                        if (filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                            $emails[] = $email;
+                        }
+                    }
+                }
+            }
+
+            $emails = array_values(array_unique($emails));
+
+            return empty($emails) ? $this->fallbackRecipients() : $emails;
+        } catch (\Throwable $e) {
+            Log::warning('GenerateSyncSummary: failed to load TblReports recipients.', ['error' => $e->getMessage()]);
+
+            return $this->fallbackRecipients();
+        }
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    private function fallbackRecipients(): array
+    {
+        return [
+            'oduai@libertydebtrelief.com',
+            'jacob@libertydebtrelief.com',
+            'ahmed@libertydebtrelief.com',
+        ];
     }
 }
