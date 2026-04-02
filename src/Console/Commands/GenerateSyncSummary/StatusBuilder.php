@@ -7,6 +7,10 @@ use PDO;
 class StatusBuilder
 {
     private const MAX_LOG_HISTORY_PER_MACRO = 8;
+    private const SKIPPED_REPORTS = [
+        'ReportSummary',
+        'ScrubListReport',
+    ];
 
     public function __construct(private PDO $sqlConnection)
     {
@@ -71,6 +75,34 @@ class StatusBuilder
             ];
         }
 
+        // Table activity fallback: for automations with no/stale TblLog evidence,
+        // check if the target table was recently modified (concealed server writes)
+        $tableActivityMap = $this->loadTableActivityMap();
+
+        foreach ($rows as &$row) {
+            if ($row['type'] !== 'Automation') {
+                continue;
+            }
+            if (!$row['needs_attention'] || !in_array($row['status'], ['No Run Evidence', 'Missed'], true)) {
+                continue;
+            }
+            $tableActivity = $this->resolveTableActivity($row['scope'], $tableActivityMap);
+            if ($tableActivity === null) {
+                continue;
+            }
+            $lastScheduledTime = $row['last_scheduled'] !== ''
+                ? $this->parseSqlServerTimestamp($row['last_scheduled'])
+                : null;
+            $threshold = $lastScheduledTime ?? (new \DateTimeImmutable('now', $this->appTimeZone()))->modify('-2 days');
+            if ($tableActivity >= $threshold) {
+                $row['status'] = 'Table Active';
+                $row['needs_attention'] = false;
+                $row['is_overdue'] = false;
+                $row['evidence'] = 'Table updated ' . $tableActivity->format('m/d/Y g:i A');
+            }
+        }
+        unset($row);
+
         usort($rows, function (array $left, array $right): int {
             return [$left['type'], $left['name'], $left['scope']] <=> [$right['type'], $right['name'], $right['scope']];
         });
@@ -130,6 +162,9 @@ class StatusBuilder
         foreach ($records as $record) {
             $name = trim((string) ($record['Report_Name'] ?? ''));
             if ($name === '') {
+                continue;
+            }
+            if (in_array($name, self::SKIPPED_REPORTS, true)) {
                 continue;
             }
 
@@ -615,19 +650,20 @@ class StatusBuilder
      */
     private function resolveScheduleAndTiming(string $explicitSchedule, string $baseSignature, array $scheduleMap, array $logData): array
     {
-        if ($explicitSchedule !== '') {
-            return [
-                $explicitSchedule,
-                'Inventory table',
-                $this->determineScheduleTextTiming($explicitSchedule, $logData),
-            ];
-        }
-
+        // Kernel schedule takes priority — it reflects the actual execution mechanism
         if ($baseSignature !== '' && isset($scheduleMap[$baseSignature])) {
             return [
                 (string) ($scheduleMap[$baseSignature]['label'] ?? 'Scheduled'),
                 (string) ($scheduleMap[$baseSignature]['source'] ?? 'Laravel scheduler'),
                 $this->determineKernelTiming($scheduleMap[$baseSignature], $logData),
+            ];
+        }
+
+        if ($explicitSchedule !== '') {
+            return [
+                $explicitSchedule,
+                'Inventory table',
+                $this->determineScheduleTextTiming($explicitSchedule, $logData),
             ];
         }
 
@@ -826,6 +862,20 @@ class StatusBuilder
                     'last_scheduled' => $lastDue->format('Y-m-d g:i A'),
                     'next_expected' => $observedPattern['next_due']->format('Y-m-d g:i A'),
                     'evidence' => $evidence . ' (observed cadence)',
+                ];
+            }
+
+            // Early-run tolerance: if the run was within 12 hours before the due time,
+            // it ran in the same execution window (e.g., concealed server at 4AM, kernel at 8AM)
+            $earlyGapHours = ($lastDue->getTimestamp() - $lastRun->getTimestamp()) / 3600;
+            if ($earlyGapHours > 0 && $earlyGapHours <= 12) {
+                return [
+                    'is_overdue' => false,
+                    'needs_attention' => false,
+                    'status' => 'On Time',
+                    'last_scheduled' => $lastDue->format('Y-m-d g:i A'),
+                    'next_expected' => $nextExpected,
+                    'evidence' => $evidence,
                 ];
             }
 
@@ -1091,6 +1141,82 @@ class StatusBuilder
             'last_due' => $lastDue,
             'next_due' => $nextDue,
         ];
+    }
+
+    /**
+     * @return array<string, \DateTimeImmutable>
+     */
+    private function loadTableActivityMap(): array
+    {
+        $map = [];
+
+        // Direct check for tables with known timestamp columns
+        $directChecks = [
+            'tblbalanceshistory' => "SELECT MAX(Import_Time) AS last_ts FROM dbo.TblBalancesHistory",
+        ];
+
+        foreach ($directChecks as $table => $sql) {
+            try {
+                $stmt = $this->sqlConnection->query($sql);
+                $row = $stmt->fetch(PDO::FETCH_ASSOC);
+                $ts = $this->parseSqlServerTimestamp((string) ($row['last_ts'] ?? ''));
+                if ($ts !== null) {
+                    $map[$table] = $ts;
+                }
+            } catch (\Throwable) {
+            }
+        }
+
+        // DMV-based activity check (covers all tables written to by any server)
+        try {
+            $sql = "
+                SELECT
+                    LOWER(OBJECT_NAME(s.object_id)) AS table_name,
+                    MAX(s.last_user_update) AS last_modified
+                FROM sys.dm_db_index_usage_stats s
+                WHERE s.database_id = DB_ID()
+                  AND s.last_user_update IS NOT NULL
+                GROUP BY OBJECT_NAME(s.object_id)
+            ";
+            $stmt = $this->sqlConnection->query($sql);
+            $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            foreach ($rows as $row) {
+                $name = strtolower(trim((string) ($row['table_name'] ?? '')));
+                $ts = $this->parseSqlServerTimestamp((string) ($row['last_modified'] ?? ''));
+                if ($name !== '' && $ts !== null && !isset($map[$name])) {
+                    $map[$name] = $ts;
+                }
+            }
+        } catch (\Throwable) {
+        }
+
+        return $map;
+    }
+
+    /**
+     * @param array<string, \DateTimeImmutable> $activityMap
+     */
+    private function resolveTableActivity(string $scope, array $activityMap): ?\DateTimeImmutable
+    {
+        if ($scope === '' || $scope === 'N/A' || $scope === 'All') {
+            return null;
+        }
+
+        $tables = preg_split('/\s*,\s*/', $scope) ?: [];
+        $latest = null;
+
+        foreach ($tables as $table) {
+            $normalized = strtolower(trim($table));
+            if ($normalized === '' || !isset($activityMap[$normalized])) {
+                continue;
+            }
+            if ($latest === null || $activityMap[$normalized] > $latest) {
+                $latest = $activityMap[$normalized];
+            }
+        }
+
+        return $latest;
     }
 
     private function appTimeZone(): \DateTimeZone

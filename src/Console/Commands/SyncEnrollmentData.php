@@ -124,10 +124,11 @@ class SyncEnrollmentData extends Command
         ";
 
         $result = $sqlConnector->querySqlServer($sql);
-        $this->info("[INFO] Found " . count($result) . " records with missing Drop_Name or State");
+        $rows = $result['data'] ?? [];
+        $this->info("[INFO] Found " . count($rows) . " records with missing Drop_Name or State");
 
         $updated = 0;
-        foreach ($result as $row) {
+        foreach ($rows as $row) {
             $pk = $row['PK'] ?? null;
             $llgId = $row['LLG_ID'] ?? null;
             $dropName = trim($row['Drop_Name'] ?? '');
@@ -144,12 +145,12 @@ class SyncEnrollmentData extends Command
             if ($dropName === '') {
                 $campaignSql = "SELECT Campaign FROM TblContacts WHERE LLG_ID = '{$this->esc($llgId)}'";
                 $campaignResult = $sqlConnector->querySqlServer($campaignSql);
-                $campaign = $campaignResult[0]['Campaign'] ?? '';
+                $campaign = $campaignResult['data'][0]['Campaign'] ?? '';
 
                 if ($campaign === '') {
                     $leadSql = "SELECT Drop_Name FROM TblLeads WHERE LLG_ID = '{$this->esc($llgId)}'";
                     $leadResult = $sqlConnector->querySqlServer($leadSql);
-                    $campaign = $leadResult[0]['Drop_Name'] ?? '';
+                    $campaign = $leadResult['data'][0]['Drop_Name'] ?? '';
                 }
 
                 if ($campaign !== '') {
@@ -162,12 +163,12 @@ class SyncEnrollmentData extends Command
             if ($state === '') {
                 $stateSql = "SELECT State FROM TblContacts WHERE LLG_ID = '{$this->esc($llgId)}'";
                 $stateResult = $sqlConnector->querySqlServer($stateSql);
-                $stateValue = $stateResult[0]['State'] ?? '';
+                $stateValue = $stateResult['data'][0]['State'] ?? '';
 
                 if ($stateValue === '') {
                     $leadStateSql = "SELECT State FROM TblLeads WHERE LLG_ID = '{$this->esc($llgId)}'";
                     $leadStateResult = $sqlConnector->querySqlServer($leadStateSql);
-                    $stateValue = $leadStateResult[0]['State'] ?? '';
+                    $stateValue = $leadStateResult['data'][0]['State'] ?? '';
                 }
 
                 if ($stateValue !== '') {
@@ -195,7 +196,8 @@ class SyncEnrollmentData extends Command
     {
         // Get all enrollment records with LLG_ID and current Cancel_Date
         $sql = "SELECT LLG_ID, Cancel_Date FROM TblEnrollment WHERE Category = '{$this->esc($this->source)}'";
-        $enrollmentData = $sqlConnector->querySqlServer($sql);
+        $enrollmentResult = $sqlConnector->querySqlServer($sql);
+        $enrollmentData = $enrollmentResult['data'] ?? [];
         $this->info("[INFO] Processing " . count($enrollmentData) . " enrollment records for Cancel_Date");
 
         // Get DROPPED_DATE from Snowflake
@@ -256,8 +258,7 @@ class SyncEnrollmentData extends Command
 
     private function updatePayments(DBConnector $snowflake, DBConnector $sqlConnector): int
     {
-        // Get payment counts from BOTH Snowflake databases (LDR and PLAW)
-        // Some contacts have Category=LDR but payments in PLAW or vice versa
+        // Get payment counts from Snowflake
         $snowflakeSql = "
             SELECT CONTACT_ID, COUNT(*) AS PAYMENT_COUNT
             FROM TRANSACTIONS
@@ -267,54 +268,30 @@ class SyncEnrollmentData extends Command
               AND _FIVETRAN_DELETED = FALSE
             GROUP BY CONTACT_ID
         ";
-
-        // Query current source's Snowflake
         $snowflakeResult = $snowflake->query($snowflakeSql);
         $paymentCounts = $snowflakeResult['data'] ?? [];
-        $this->info("[INFO] Fetched payment counts for " . count($paymentCounts) . " contacts from {$this->source} Snowflake");
 
-        // Query the OTHER source's Snowflake too
-        $otherSource = $this->source === 'LDR' ? 'plaw' : 'ldr';
-        $otherPaymentCounts = [];
-        try {
-            $otherSnowflake = DBConnector::fromEnvironment($otherSource);
-            $otherResult = $otherSnowflake->query($snowflakeSql);
-            $otherPaymentCounts = $otherResult['data'] ?? [];
-            $this->info("[INFO] Fetched payment counts for " . count($otherPaymentCounts) . " contacts from " . strtoupper($otherSource) . " Snowflake");
-        } catch (\Throwable $e) {
-            $this->warn("[WARN] Could not query " . strtoupper($otherSource) . " Snowflake: " . $e->getMessage());
-        }
+        $this->info("[INFO] Fetched payment counts for " . count($paymentCounts) . " contacts");
 
-        // Create lookup map - merge both sources, take the max count per contact
+        // Create lookup map
         $paymentsMap = [];
         foreach ($paymentCounts as $row) {
             $contactId = $row['CONTACT_ID'] ?? null;
             $count = $row['PAYMENT_COUNT'] ?? 0;
             if ($contactId) {
-                $paymentsMap[$contactId] = max((int) $count, $paymentsMap[$contactId] ?? 0);
-            }
-        }
-        foreach ($otherPaymentCounts as $row) {
-            $contactId = $row['CONTACT_ID'] ?? null;
-            $count = $row['PAYMENT_COUNT'] ?? 0;
-            if ($contactId) {
-                $paymentsMap[$contactId] = max((int) $count, $paymentsMap[$contactId] ?? 0);
+                $paymentsMap[$contactId] = $count;
             }
         }
 
-        $this->info("[INFO] Total unique contacts with payments: " . count($paymentsMap));
-
-        // Get current payments and payment frequency from TblEnrollment for this category
-        $sql = "SELECT LLG_ID, Payments, Payment_Frequency FROM TblEnrollment WHERE Category = '{$this->esc($this->source)}'";
+        // Get current payments from TblEnrollment
+        $sql = "SELECT LLG_ID, Payments FROM TblEnrollment WHERE Category = '{$this->esc($this->source)}'";
         $enrollmentResult = $sqlConnector->querySqlServer($sql);
         $enrollmentData = $enrollmentResult['data'] ?? [];
 
-        // Collect updates needed
-        $updates = [];
+        $updated = 0;
         foreach ($enrollmentData as $enrollment) {
             $llgId = $enrollment['LLG_ID'] ?? null;
-            $currentPayments = (float) ($enrollment['Payments'] ?? 0);
-            $paymentFrequency = trim($enrollment['Payment_Frequency'] ?? '');
+            $currentPayments = $enrollment['Payments'] ?? 0;
 
             if (!$llgId) {
                 continue;
@@ -324,52 +301,23 @@ class SyncEnrollmentData extends Command
             $contactId = str_replace('LLG-', '', $llgId);
 
             if (isset($paymentsMap[$contactId])) {
-                $rawPaymentCount = $paymentsMap[$contactId];
-                
-                // Adjust payment count based on Payment_Frequency
-                // Note: Check Bi-Weekly/Semi-Monthly BEFORE Weekly to avoid substring matching issue
-                if (stripos($paymentFrequency, 'Bi-Weekly') !== false || stripos($paymentFrequency, 'Semi-Monthly') !== false) {
-                    $adjustedPaymentCount = (int) round($rawPaymentCount / 2);
-                } elseif (stripos($paymentFrequency, 'Weekly') !== false) {
-                    $adjustedPaymentCount = (int) round($rawPaymentCount / 4);
-                } else {
-                    $adjustedPaymentCount = $rawPaymentCount;
+                $newPaymentCount = $paymentsMap[$contactId];
+
+                // Update if different
+                if ($currentPayments != $newPaymentCount) {
+                    $updateSql = "
+                        UPDATE TblEnrollment
+                        SET Payments = {$newPaymentCount}
+                        WHERE LLG_ID = '{$this->esc($llgId)}'
+                    ";
+                    $sqlConnector->querySqlServer($updateSql);
+                    $updated++;
+
+                    if ($updated % 100 === 0) {
+                        $this->info("[INFO] Updated {$updated} Payments records...");
+                    }
                 }
-
-                // Only add to updates if different
-                if ((int) $currentPayments !== $adjustedPaymentCount) {
-                    $updates[$llgId] = $adjustedPaymentCount;
-                }
             }
-        }
-
-        $this->info("[INFO] Found " . count($updates) . " records needing Payments update");
-
-        // Batch update using CASE statement (500 at a time)
-        $updated = 0;
-        $chunks = array_chunk($updates, 500, true);
-        
-        foreach ($chunks as $chunkIndex => $chunk) {
-            if (empty($chunk)) {
-                continue;
-            }
-
-            $cases = [];
-            $ids = [];
-            foreach ($chunk as $llgId => $paymentCount) {
-                $cases[] = "WHEN '{$this->esc($llgId)}' THEN {$paymentCount}";
-                $ids[] = "'{$this->esc($llgId)}'";
-            }
-
-            $updateSql = "
-                UPDATE TblEnrollment
-                SET Payments = CASE LLG_ID " . implode(' ', $cases) . " END
-                WHERE LLG_ID IN (" . implode(',', $ids) . ")
-            ";
-            
-            $sqlConnector->querySqlServer($updateSql);
-            $updated += count($chunk);
-            $this->info("[INFO] Updated batch " . ($chunkIndex + 1) . " (" . count($chunk) . " records, total: {$updated})");
         }
 
         $this->info("[INFO] Updated {$updated} Payments records");
@@ -401,18 +349,13 @@ class SyncEnrollmentData extends Command
         }
     }
 
-    protected function esc(string $value): string
-    {
-        return str_replace("'", "''", $value);
-    }
-
     private function writeAutomationLog(DBConnector $connector, string $status, int $recordsProcessed, string $details): void
     {
         $result = app(TblLogWriter::class)->logAutomation(
             $connector,
-            'TblEnrollment, TblContacts',
+            'TblEnrollment',
             'SyncEnrollmentData',
-            sprintf('Sync enrollment data for DP_%s', strtoupper($this->source)),
+            sprintf('Sync enrollment data temp for DP_%s', strtoupper($this->source)),
             'SYNC_ENROLLMENT_DATA',
             $status,
             $recordsProcessed,
@@ -420,8 +363,14 @@ class SyncEnrollmentData extends Command
             $details
         );
 
-        if (($result['success'] ?? false) !== true) {
+        if (!$result['success']) {
             $this->warn(sprintf('[%s] TblLog write failed: %s', $this->source, $result['error'] ?? 'Unknown error'));
         }
     }
+
+    protected function esc(string $value): string
+    {
+        return str_replace("'", "''", $value);
+    }
 }
+

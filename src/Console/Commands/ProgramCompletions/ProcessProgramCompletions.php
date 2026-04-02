@@ -44,8 +44,12 @@ class ProcessProgramCompletions extends Command
 
     public function handle(): int
     {
-        $this->warn('Program Completions uses --dry-run for preview mode.');
-        $this->warn('Without --dry-run it will update CRM status to "' . self::CRM_GRADUATED_STATUS_TITLE . '" and add notes.');
+        if ((bool) $this->option('dry-run')) {
+            $this->warn('Program Completions is running in --dry-run preview mode.');
+        } else {
+            $this->warn('Program Completions is running in LIVE mode.');
+            $this->warn('It will update CRM status to "' . self::CRM_GRADUATED_STATUS_TITLE . '" and add notes.');
+        }
         $this->newLine();
 
         $companyFilter = strtoupper(trim((string) ($this->option('company') ?? '')));
@@ -69,11 +73,6 @@ class ProcessProgramCompletions extends Command
             $this->error(str_repeat('=', 60));
             $this->error('WARNING: LIVE MODE - changes will be made to real data.');
             $this->error(str_repeat('=', 60));
-
-            if (!$this->confirm('Are you SURE you want to run in LIVE mode?', false)) {
-                $this->info('Aborted.');
-                return Command::SUCCESS;
-            }
         }
 
         $connections = $this->connectionsForCompany($companyFilter);

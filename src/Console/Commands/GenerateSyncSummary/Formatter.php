@@ -12,8 +12,10 @@ class Formatter
     public function buildHtmlBody(array $rows, array $statusRows = []): string
     {
         $generatedAt = now()->format('F j, Y g:i A T');
+
         $attentionRows = array_values(array_filter($statusRows, static fn(array $row): bool => (bool) ($row['needs_attention'] ?? false)));
-        $healthyRows = array_values(array_filter($statusRows, static fn(array $row): bool => !(bool) ($row['needs_attention'] ?? false)));
+        $healthyAutomations = array_values(array_filter($statusRows, static fn(array $row): bool => !(bool) ($row['needs_attention'] ?? false) && ($row['type'] ?? '') === 'Automation'));
+        $healthyReports = array_values(array_filter($statusRows, static fn(array $row): bool => !(bool) ($row['needs_attention'] ?? false) && ($row['type'] ?? '') === 'Report'));
 
         $priority = [
             'Failed Last Run' => 0,
@@ -31,73 +33,78 @@ class Formatter
             return [$leftPriority, $left['name'], $left['scope']] <=> [$rightPriority, $right['name'], $right['scope']];
         });
 
-        usort($healthyRows, fn(array $left, array $right): int => [$left['type'], $left['name'], $left['scope']] <=> [$right['type'], $right['name'], $right['scope']]);
+        usort($healthyAutomations, fn(array $left, array $right): int => [$left['name'], $left['scope']] <=> [$right['name'], $right['scope']]);
+        usort($healthyReports, fn(array $left, array $right): int => [$left['name'], $left['scope']] <=> [$right['name'], $right['scope']]);
 
         $recentRows = array_slice($rows, 0, 12);
-        $onTimeCount = count(array_filter($statusRows, static fn(array $row): bool => ($row['status'] ?? '') === 'On Time'));
+        $totalCount = count($statusRows);
+        $automationCount = count(array_filter($statusRows, static fn(array $row): bool => ($row['type'] ?? '') === 'Automation'));
+        $reportCount = count(array_filter($statusRows, static fn(array $row): bool => ($row['type'] ?? '') === 'Report'));
+        $attentionCount = count($attentionRows);
+        $onTimeCount = count(array_filter($statusRows, static fn(array $row): bool => in_array(($row['status'] ?? ''), ['On Time', 'Table Active'], true)));
         $pendingCount = count(array_filter($statusRows, static fn(array $row): bool => ($row['status'] ?? '') === 'Pending'));
 
+        $attentionClass = $attentionCount > 0 ? ' red' : '';
+
         $html = '<!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <style>
-        body { font-family: Arial, sans-serif; margin: 24px; background: #f5f7fb; color: #111827; }
-        .container { max-width: 1180px; margin: 0 auto; background: #ffffff; border: 1px solid #e5e7eb; }
-        .header { padding: 24px 28px; border-bottom: 1px solid #e5e7eb; }
-        .header h1 { margin: 0; font-size: 22px; }
-        .header p { margin: 8px 0 0; color: #6b7280; font-size: 13px; }
-        .summary { display: flex; gap: 12px; flex-wrap: wrap; padding: 20px 28px; border-bottom: 1px solid #e5e7eb; }
-        .card { min-width: 150px; padding: 12px 14px; background: #f9fafb; border: 1px solid #e5e7eb; }
+        body { font-family: -apple-system, BlinkMacSystemFont, \'Segoe UI\', Roboto, Helvetica, Arial, sans-serif; line-height: 1.5; color: #1a1a1a; max-width: 1180px; margin: 0 auto; padding: 24px; background: #fafafa; }
+        .container { background: #fff; border: 1px solid #e5e5e5; }
+        .header { background: #111827; color: #fff; padding: 24px 32px; }
+        .header h1 { margin: 0; font-size: 22px; font-weight: 700; }
+        .header p { margin: 8px 0 0; color: #d1d5db; font-size: 13px; }
+        .summary { display: flex; gap: 14px; flex-wrap: wrap; padding: 20px 32px; border-bottom: 1px solid #e5e5e5; }
+        .card { min-width: 140px; padding: 10px 14px; background: #f9fafb; border: 1px solid #e5e7eb; }
         .card-label { font-size: 11px; text-transform: uppercase; color: #6b7280; letter-spacing: 0.04em; }
-        .card-value { margin-top: 4px; font-size: 24px; font-weight: 700; }
-        .card-value.attention { color: #b91c1c; }
-        .section { padding: 24px 28px 0; }
-        .section h2 { margin: 0 0 10px; font-size: 16px; }
+        .card-value { margin-top: 2px; font-size: 22px; font-weight: 700; color: #111827; }
+        .card-value.red { color: #b91c1c; }
+        .content { padding: 0 32px 24px; }
+        .section { margin-top: 28px; }
+        .section h2 { margin: 0 0 10px; font-size: 16px; color: #111827; }
         .section p { margin: 0 0 12px; color: #6b7280; font-size: 13px; }
         table { width: 100%; border-collapse: collapse; font-size: 13px; }
-        th { text-align: left; background: #f3f4f6; color: #111827; padding: 10px 12px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; border-bottom: 1px solid #e5e7eb; }
+        th { background: #f3f4f6; color: #111827; text-align: left; padding: 10px 12px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; border-bottom: 1px solid #e5e7eb; }
         td { padding: 10px 12px; border-bottom: 1px solid #f3f4f6; vertical-align: top; }
-        tr.attention td { background: #fff7f7; }
-        .status { display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; }
+        tr.attention td { background: #fff1f2; }
+        .status { display: inline-block; border-radius: 4px; padding: 3px 8px; font-size: 11px; font-weight: 600; }
         .status-ok { background: #dcfce7; color: #166534; }
         .status-pending { background: #dbeafe; color: #1d4ed8; }
         .status-attention { background: #fee2e2; color: #991b1b; }
-        .status-neutral { background: #f3f4f6; color: #4b5563; }
+        .status-neutral { background: #f3f4f6; color: #6b7280; }
+        .status-table { background: #d1fae5; color: #065f46; }
         .muted { color: #6b7280; }
-        .footer { padding: 20px 28px 24px; color: #6b7280; font-size: 12px; }
+        .empty { color: #9ca3af; font-size: 13px; }
+        .footer { padding: 16px 32px; border-top: 1px solid #e5e5e5; background: #f9fafb; color: #6b7280; font-size: 12px; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>Sync Status Summary</h1>
-            <p>Generated ' . htmlspecialchars($generatedAt) . '. Inventory comes from TblReports and TblAutomation. Execution evidence is read from TblLog, with Laravel log fallback where available.</p>
+            <h1>Automation &amp; Sync Summary</h1>
+            <p>Inventory from TblReports and TblAutomation. Evidence from TblLog, table activity, and Laravel scheduler. Generated ' . $this->escape($generatedAt) . '.</p>
         </div>
         <div class="summary">
-            <div class="card"><div class="card-label">Tracked Items</div><div class="card-value">' . count($statusRows) . '</div></div>
-            <div class="card"><div class="card-label">Needs Attention</div><div class="card-value attention">' . count($attentionRows) . '</div></div>
+            <div class="card"><div class="card-label">Total Items</div><div class="card-value">' . $totalCount . '</div></div>
+            <div class="card"><div class="card-label">Automations</div><div class="card-value">' . $automationCount . '</div></div>
+            <div class="card"><div class="card-label">Reports</div><div class="card-value">' . $reportCount . '</div></div>
+            <div class="card"><div class="card-label">Needs Attention</div><div class="card-value' . $attentionClass . '">' . $attentionCount . '</div></div>
             <div class="card"><div class="card-label">On Time</div><div class="card-value">' . $onTimeCount . '</div></div>
             <div class="card"><div class="card-label">Pending</div><div class="card-value">' . $pendingCount . '</div></div>
-            <div class="card"><div class="card-label">Recent Log Rows</div><div class="card-value">' . count($recentRows) . '</div></div>
         </div>
-        <div class="section">
-            <h2>Needs Attention</h2>
-            <p>Only rows that need review are listed here first.</p>
-            ' . $this->renderStatusTable($attentionRows, true) . '
-        </div>
-        <div class="section">
-            <h2>Healthy / Pending</h2>
-            <p>Clean rows are separated so the report is easier to scan.</p>
-            ' . $this->renderStatusTable($healthyRows, false) . '
-        </div>
-        <div class="section">
-            <h2>Recent Execution Evidence</h2>
-            <p>Latest tracked TblLog rows only.</p>
-            ' . $this->renderRecentRows($recentRows) . '
+        <div class="content">';
+
+        $html .= $this->renderSection('Needs Attention', $attentionRows, true);
+        $html .= $this->renderSection('Healthy Automations', $healthyAutomations, false);
+        $html .= $this->renderSection('Healthy Reports', $healthyReports, false);
+        $html .= $this->renderRecentSection($recentRows);
+
+        $html .= '
         </div>
         <div class="footer">
-            Read-only status view only. No database writes are performed by this summary.
+            Read-only status view. No database writes are performed by this summary.
         </div>
     </div>
 </body>
@@ -109,37 +116,44 @@ class Formatter
     /**
      * @param array<int, array<string, mixed>> $rows
      */
-    private function renderStatusTable(array $rows, bool $showEmptyMessage): string
+    private function renderSection(string $title, array $rows, bool $isAttention): string
     {
+        $html = '<div class="section"><h2>' . $this->escape($title) . '</h2>';
+
         if ($rows === []) {
-            return $showEmptyMessage
-                ? '<p class="muted">No rows need attention.</p>'
-                : '<p class="muted">No additional healthy rows.</p>';
+            $label = $isAttention ? 'No items need attention.' : 'No entries.';
+            $html .= '<p class="empty">' . $label . '</p></div>';
+            return $html;
         }
 
-        $html = '<table><thead><tr><th>Name</th><th>Scope</th><th>Schedule</th><th>Last Run</th><th>Next Expected</th><th>Status</th><th>Evidence</th></tr></thead><tbody>';
+        $html .= '<table><thead><tr><th>Name</th><th>Scope</th><th>Schedule</th><th>Last Run</th><th>Next Expected</th><th>Status</th><th>Evidence</th></tr></thead><tbody>';
 
         foreach ($rows as $row) {
             $status = (string) ($row['status'] ?? 'Unknown');
             $statusClass = match ($status) {
                 'On Time' => 'status status-ok',
+                'Table Active' => 'status status-table',
                 'Pending', 'Logged' => 'status status-pending',
-                'Unscheduled' => 'status status-neutral',
+                'Unscheduled', 'Scheduled' => 'status status-neutral',
                 default => 'status status-attention',
             };
 
-            $html .= '<tr' . (((bool) ($row['needs_attention'] ?? false)) ? ' class="attention"' : '') . '>';
-            $html .= '<td><strong>' . htmlspecialchars((string) ($row['name'] ?? '')) . '</strong><br><span class="muted">' . htmlspecialchars((string) ($row['source'] ?? '')) . '</span></td>';
-            $html .= '<td>' . htmlspecialchars((string) ($row['scope'] ?? '')) . '</td>';
-            $html .= '<td>' . htmlspecialchars((string) ($row['schedule'] ?? 'Not scheduled')) . '</td>';
-            $html .= '<td>' . $this->formatDisplayDate((string) ($row['last_run'] ?? '')) . '</td>';
-            $html .= '<td>' . htmlspecialchars((string) ($row['next_expected'] ?? '')) . '</td>';
-            $html .= '<td><span class="' . $statusClass . '">' . htmlspecialchars($status) . '</span></td>';
-            $html .= '<td>' . htmlspecialchars((string) ($row['evidence'] ?? 'No execution log')) . '</td>';
+            $rowClass = ((bool) ($row['needs_attention'] ?? false)) ? ' class="attention"' : '';
+            $lastRun = $row['last_run'] ?? null;
+            $lastRunDisplay = $lastRun ? $this->formatDisplayDate((string) $lastRun) : '<span class="muted">No log</span>';
+
+            $html .= '<tr' . $rowClass . '>';
+            $html .= '<td><strong>' . $this->escape((string) ($row['name'] ?? '')) . '</strong><br><span class="muted">' . $this->escape((string) ($row['source'] ?? '')) . '</span></td>';
+            $html .= '<td>' . $this->escape((string) ($row['scope'] ?? '')) . '</td>';
+            $html .= '<td>' . $this->escape((string) ($row['schedule'] ?? 'Not scheduled')) . '</td>';
+            $html .= '<td>' . $lastRunDisplay . '</td>';
+            $html .= '<td>' . $this->escape((string) ($row['next_expected'] ?? '')) . '</td>';
+            $html .= '<td><span class="' . $statusClass . '">' . $this->escape($status) . '</span></td>';
+            $html .= '<td>' . $this->escape((string) ($row['evidence'] ?? 'No execution log')) . '</td>';
             $html .= '</tr>';
         }
 
-        $html .= '</tbody></table>';
+        $html .= '</tbody></table></div>';
 
         return $html;
     }
@@ -147,13 +161,17 @@ class Formatter
     /**
      * @param array<int, array<string, mixed>> $rows
      */
-    private function renderRecentRows(array $rows): string
+    private function renderRecentSection(array $rows): string
     {
+        $html = '<div class="section"><h2>Recent Execution Evidence</h2>';
+
         if ($rows === []) {
-            return '<p class="muted">No recent tracked TblLog rows found.</p>';
+            $html .= '<p class="empty">No recent tracked TblLog rows found.</p></div>';
+            return $html;
         }
 
-        $html = '<table><thead><tr><th>Macro</th><th>Run</th><th>Result</th></tr></thead><tbody>';
+        $html .= '<p class="muted">Latest tracked TblLog rows.</p>';
+        $html .= '<table><thead><tr><th>Macro</th><th>Run</th><th>Result</th></tr></thead><tbody>';
 
         foreach ($rows as $row) {
             $result = trim((string) ($row['Result'] ?? ''));
@@ -165,13 +183,13 @@ class Formatter
             }
 
             $html .= '<tr>';
-            $html .= '<td><strong>' . htmlspecialchars((string) ($row['Macro_Name'] ?? '')) . '</strong></td>';
+            $html .= '<td><strong>' . $this->escape((string) ($row['Macro_Name'] ?? '')) . '</strong></td>';
             $html .= '<td>' . $this->formatDisplayDate((string) ($row['Last_Run_Date'] ?? '')) . '</td>';
-            $html .= '<td>' . htmlspecialchars($result) . '</td>';
+            $html .= '<td>' . $this->escape($result) . '</td>';
             $html .= '</tr>';
         }
 
-        $html .= '</tbody></table>';
+        $html .= '</tbody></table></div>';
 
         return $html;
     }
@@ -185,10 +203,15 @@ class Formatter
 
         $timestamp = strtotime($value);
         if ($timestamp === false) {
-            return htmlspecialchars($value);
+            return $this->escape($value);
         }
 
-        return htmlspecialchars(date('m/d/Y g:i A', $timestamp));
+        return $this->escape(date('m/d/Y g:i A', $timestamp));
+    }
+
+    private function escape(string $value): string
+    {
+        return htmlspecialchars($value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
     }
 
     /**
@@ -199,7 +222,7 @@ class Formatter
         $email = new EmailSenderService();
 
         $isTest = !empty($overrideRecipients);
-        $subject = ($isTest ? '[TEST] ' : '') . 'Daily Sync & Macro Summary - ' . date('m/d/Y');
+        $subject = ($isTest ? '[TEST] ' : '') . 'Automation & Sync Summary - ' . date('m/d/Y');
         $body = $html;
 
         $recipients = !empty($overrideRecipients) ? $overrideRecipients : $this->getRecipientsFromTblReports();
@@ -208,9 +231,9 @@ class Formatter
 
         if ($console) {
             if ($sent) {
-                $console->info('[INFO] Sync Summary sent to ' . count($recipients) . ' recipient(s).');
+                $console->info('[INFO] Summary sent to ' . count($recipients) . ' recipient(s).');
             } else {
-                $console->warn('[WARN] Sync Summary send failed.');
+                $console->warn('[WARN] Summary send failed.');
             }
         } elseif (!$sent) {
             Log::warning('GenerateSyncSummary: failed to send email.');
