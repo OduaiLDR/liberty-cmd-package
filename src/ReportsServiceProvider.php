@@ -130,3 +130,4 @@ class ReportsServiceProvider extends ServiceProvider
         //
     }
 }
+
