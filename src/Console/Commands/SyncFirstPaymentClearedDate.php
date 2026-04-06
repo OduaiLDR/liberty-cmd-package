@@ -67,6 +67,16 @@ class SyncFirstPaymentClearedDate extends Command
                     continue;
                 }
 
+                $this->info("[$source] Fetching enrolled debt totals from Snowflake...");
+                $debtTotals = $this->fetchEnrolledDebtTotals($connector, array_keys($payments));
+                $this->info("[$source] Found debt totals for " . count($debtTotals) . " contacts.");
+
+                // Merge debt totals into payments data
+                foreach ($payments as $llgId => &$data) {
+                    $data['debt_amount'] = $debtTotals[$llgId] ?? null;
+                }
+                unset($data);
+
                 $this->info("[$source] Applying first cleared payments to SQL Server...");
                 $updated = $this->updateFirstClearedPayments($connector, $payments);
 
@@ -388,6 +398,84 @@ SQL;
         return $payments;
     }
 
+    /**
+     * Fetch SUM(ORIGINAL_DEBT_AMOUNT) from Snowflake DEBTS for contacts whose
+     * first payment just cleared. This value locks Debt_Amount on TblEnrollment
+     * so it only gets set once (at first payment).
+     *
+     * @param list<string> $llgIds  e.g. ['LLG-123', 'LLG-456']
+     * @return array<string, string> LLG_ID => total debt amount
+     */
+    protected function fetchEnrolledDebtTotals(DBConnector $connector, array $llgIds): array
+    {
+        if (empty($llgIds)) {
+            return [];
+        }
+
+        // Extract numeric contact IDs from LLG IDs
+        $contactToLlg = [];
+        foreach ($llgIds as $llgId) {
+            $numeric = preg_replace('/\D+/', '', (string) $llgId);
+            if ($numeric !== '') {
+                $contactToLlg[$numeric] = (string) $llgId;
+            }
+        }
+
+        if (empty($contactToLlg)) {
+            return [];
+        }
+
+        $contactIds = array_keys($contactToLlg);
+        $debtTotals = [];
+        $chunkSize = 500;
+
+        foreach (array_chunk($contactIds, $chunkSize) as $chunkIndex => $chunk) {
+            $values = implode(', ', array_map(fn($id) => "('" . $this->escapeSqlString($id) . "')", $chunk));
+
+            $sql = <<<SQL
+SELECT
+    CONTACT_ID,
+    SUM(ORIGINAL_DEBT_AMOUNT) AS TOTAL_DEBT
+FROM DEBTS
+WHERE CONTACT_ID IN (SELECT TO_NUMBER(column1) FROM VALUES {$values})
+  AND ENROLLED = 1
+GROUP BY CONTACT_ID
+SQL;
+
+            try {
+                $result = $connector->query($sql);
+                $rows = [];
+
+                if (is_array($result)) {
+                    if (isset($result['data']) && is_array($result['data'])) {
+                        $rows = $result['data'];
+                    } elseif (array_is_list($result)) {
+                        $rows = $result;
+                    }
+                }
+
+                foreach ($rows as $row) {
+                    $cid = (string) ($row['CONTACT_ID'] ?? '');
+                    $totalDebt = $row['TOTAL_DEBT'] ?? null;
+
+                    if ($cid !== '' && $totalDebt !== null && $totalDebt !== '') {
+                        $llgId = $contactToLlg[$cid] ?? ('LLG-' . $cid);
+                        $debtTotals[$llgId] = (string) $totalDebt;
+                        $this->info("  Debt total for {$llgId}: \${$totalDebt}");
+                    }
+                }
+            } catch (\Throwable $e) {
+                $this->error('Snowflake DEBTS query failed: ' . $e->getMessage());
+                Log::error('SyncFirstPaymentClearedDate: DEBTS query failed.', [
+                    'error' => $e->getMessage(),
+                    'chunk' => $chunkIndex + 1,
+                ]);
+            }
+        }
+
+        return $debtTotals;
+    }
+
     protected function updateFirstClearedPayments(DBConnector $connector, array $payments): int
     {
         if (empty($payments)) {
@@ -402,6 +490,7 @@ SQL;
             $casesDate = [];
             $casesProcessDate = [];
             $casesAmount = [];
+            $casesDebt = [];
             $ids = [];
 
             foreach ($chunk as $llgId => $data) {
@@ -421,6 +510,11 @@ SQL;
                     $amountSql = (string) $amountVal;
                 }
 
+                $debtVal = $data['debt_amount'] ?? null;
+                if ($debtVal !== null && $debtVal !== '' && is_numeric($debtVal)) {
+                    $casesDebt[] = "WHEN '{$llgEsc}' THEN {$debtVal}";
+                }
+
                 $casesDate[] = "WHEN '{$llgEsc}' THEN '{$dateEsc}'";
                 if ($processDateEsc !== null) {
                     $casesProcessDate[] = "WHEN '{$llgEsc}' THEN '{$processDateEsc}'";
@@ -436,6 +530,7 @@ SQL;
             $caseDateSql = implode(' ', $casesDate);
             $caseProcessDateSql = implode(' ', $casesProcessDate);
             $caseAmountSql = implode(' ', $casesAmount);
+            $caseDebtSql = implode(' ', $casesDebt);
             $idList = implode(', ', $ids);
 
             $setClauses = [
@@ -445,6 +540,10 @@ SQL;
             ];
             if ($caseProcessDateSql !== '') {
                 $setClauses[] = "First_Payment_Date = CASE LLG_ID {$caseProcessDateSql} ELSE First_Payment_Date END";
+            }
+            // Update Debt_Amount from Snowflake DEBTS only when currently NULL or 0 (locked after first payment)
+            if ($caseDebtSql !== '') {
+                $setClauses[] = "Debt_Amount = CASE WHEN (Debt_Amount IS NULL OR Debt_Amount = 0) THEN CASE LLG_ID {$caseDebtSql} ELSE Debt_Amount END ELSE Debt_Amount END";
             }
             $setSql = implode(",\n    ", $setClauses);
 
