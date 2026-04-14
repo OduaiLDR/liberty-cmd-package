@@ -40,7 +40,7 @@ class TestDatabaseConnections extends Command
     /**
      * Test a single environment
      */
-    private function testSingleEnvironment(string $env, string $mode = null): int
+    private function testSingleEnvironment(string $env, ?string $mode = null): int
     {
         // Let DBConnector auto-detect mode if not provided
         $snowflake = DBConnector::fromEnvironment($env, $mode);
@@ -197,7 +197,7 @@ class TestDatabaseConnections extends Command
     /**
      * Test all environments
      */
-    private function testAllEnvironments(string $mode = null): int
+    private function testAllEnvironments(?string $mode = null): int
     {
         $this->info(str_repeat('=', 50));
         $this->info("Testing ALL environments (auto-detecting mode from credentials)");
