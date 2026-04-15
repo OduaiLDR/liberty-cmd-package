@@ -11,6 +11,7 @@ use Cmd\Reports\Http\Controllers\LeadReportController;
 use Cmd\Reports\Http\Controllers\CreditorContactsReportController;
 use Cmd\Reports\Http\Controllers\EpfPaidReportController;
 use Cmd\Reports\Http\Controllers\EpfDueReportController;
+use Cmd\Reports\Http\Controllers\MailDropExportController;
 use Cmd\Reports\Http\Controllers\MailerDataReportController;
 use Cmd\Reports\Http\Controllers\MarketingReportController;
 use Cmd\Reports\Http\Controllers\MarketingAdminController;
@@ -180,6 +181,13 @@ $registerCmdReportRoutes = function (bool $withNames = true): void {
     Route::get('/drop-summary', [DropSummaryController::class, 'index'])
         ->middleware('can:cmd.reports.drop_summary_report')
         ->name($name('cmd.reports.drop_summary'));
+
+    Route::get('/mail-drop-export', [MailDropExportController::class, 'index'])
+        ->middleware('can:cmd.reports.mail_drop_export')
+        ->name($name('cmd.reports.mail_drop_export'));
+    Route::post('/mail-drop-export', [MailDropExportController::class, 'export'])
+        ->middleware('can:cmd.reports.mail_drop_export')
+        ->name($name('cmd.reports.mail_drop_export.export'));
 };
 
 // Central-domain access (no tenancy), with distinct names to avoid overriding tenant routes.
