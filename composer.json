@@ -3,7 +3,7 @@
   "description": "DebtPlete CMD and SQL reports module",
   "type": "library",
   "require": {
-    "php": "^8.4",
+    "php": "^8.3 || ^8.4",
     "firebase/php-jwt": "^6.0 || ^7.0",
     "guzzlehttp/guzzle": "^7.10",
     "phpoffice/phpspreadsheet": "^1.29",
@@ -26,3 +26,4 @@
   "minimum-stability": "dev",
   "prefer-stable": true
 }
+
