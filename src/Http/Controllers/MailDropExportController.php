@@ -70,31 +70,19 @@ class MailDropExportController extends Controller
                 fprintf($out, chr(0xEF) . chr(0xBB) . chr(0xBF));
 
                 fputcsv($out, [
-                    'Drop TID',
-                    'Drop Name',
-                    'Client',
-                    'External ID',
-                    'Phone',
-                    'Email',
+                    'First Name',
                     'Address',
-                    'City',
-                    'State',
-                    'Zip',
+                    'Debt',
+                    'Phone',
                     'Send Date',
                 ]);
 
                 foreach ($this->repository->exportRows($pks) as $row) {
                     fputcsv($out, [
-                        $row->Drop_PK     ?? '',
-                        $row->Drop_Name   ?? '',
-                        $row->Client      ?? '',
-                        $row->External_ID ?? '',
-                        $row->Phone       ?? '',
-                        $row->Email       ?? '',
+                        $row->First_Name  ?? '',
                         $row->Address     ?? '',
-                        $row->City        ?? '',
-                        $row->State       ?? '',
-                        $row->Zip         ?? '',
+                        $row->Debt        ?? '',
+                        $row->Phone       ?? '',
                         $this->formatCsvDate($row->Send_Date),
                     ]);
 

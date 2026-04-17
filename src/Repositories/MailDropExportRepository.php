@@ -10,10 +10,11 @@ class MailDropExportRepository extends SqlSrvRepository
     /**
      * All drops from TblMarketing for the selector table.
      *
-     * Sort order per spec:
-     *   1. NULL Latest_Export_Date first, sorted Send_Date DESC
-     *   2. Non-null Latest_Export_Date, sorted Latest_Export_Date ASC
-     *   3. Drop_Name ASC as final tiebreaker
+     * Sort order:
+     *   1. Latest_Export_Date — NULLs first (new/unexported drops)
+     *   2. Latest_Export_Date ASC (oldest exports next for max repeat gap)
+     *   3. Send_Date DESC (newest sends first within each group)
+     *   4. Drop_Name ASC (alphabetical tiebreaker)
      */
     public function allDrops(): Collection
     {
@@ -27,6 +28,7 @@ class MailDropExportRepository extends SqlSrvRepository
                     m.PK,
                     m.Drop_Name,
                     m.Send_Date,
+                    m.Debt_Tier,
                     SUM(
                         CASE
                             WHEN NULLIF(LTRIM(RTRIM(e.Phone)), '') IS NULL THEN 0
@@ -40,19 +42,21 @@ class MailDropExportRepository extends SqlSrvRepository
                 GROUP BY
                     m.PK,
                     m.Drop_Name,
-                    m.Send_Date
+                    m.Send_Date,
+                    m.Debt_Tier
             )
             SELECT
                 PK,
                 Drop_Name,
+                Debt_Tier,
                 Send_Date,
                 Amount_Dropped,
                 Latest_Export_Date
             FROM DropStats
             ORDER BY
                 CASE WHEN Latest_Export_Date IS NULL THEN 0 ELSE 1 END ASC,
-                CASE WHEN Latest_Export_Date IS NULL THEN Send_Date ELSE NULL END DESC,
                 Latest_Export_Date ASC,
+                Send_Date DESC,
                 Drop_Name ASC
         ";
 
@@ -153,15 +157,16 @@ class MailDropExportRepository extends SqlSrvRepository
             $batchSize = 10000;
 
             while (true) {
-                $records = $this->connection()->table('TblMailersUniqueEnriched')
-                    ->select('PK', 'Client', 'External_ID', 'Address', 'City', 'State', 'Zip', 'Phone', 'Email')
-                    ->where('Drop_Name', $drop->Drop_Name)
-                    ->where('PK', '>', $lastId)
-                    ->whereRaw("NULLIF(LTRIM(RTRIM(Phone)), '') IS NOT NULL")
-                    ->orderBy('PK')
+                $records = $this->connection()->table('TblMailersUniqueEnriched as e')
+                    ->leftJoin('TblMailersUnique as u', 'u.External_ID', '=', 'e.External_ID')
+                    ->select('e.PK', 'e.Client', 'e.Address', 'e.Phone', 'u.Debt_Amount')
+                    ->where('e.Drop_Name', $drop->Drop_Name)
+                    ->where('e.PK', '>', $lastId)
+                    ->whereRaw("NULLIF(LTRIM(RTRIM(e.Phone)), '') IS NOT NULL")
+                    ->orderBy('e.PK')
                     ->limit($batchSize)
                     ->get();
-                    
+
                 if ($records->isEmpty()) {
                     break;
                 }
@@ -169,18 +174,16 @@ class MailDropExportRepository extends SqlSrvRepository
                 foreach ($records as $row) {
                     $lastId = $row->PK;
 
+                    // Parse first word of Client as the first name.
+                    $clientStr = trim((string) ($row->Client ?? ''));
+                    $firstName = $clientStr !== '' ? explode(' ', $clientStr)[0] : '';
+
                     yield (object) [
-                        'Drop_PK' => $drop->Drop_PK,
-                        'Drop_Name' => $drop->Drop_Name,
-                        'Client' => $row->Client,
-                        'External_ID' => $row->External_ID,
-                        'Phone' => trim((string) $row->Phone),
-                        'Email' => $row->Email,
-                        'Address' => $row->Address,
-                        'City' => $row->City,
-                        'State' => $row->State,
-                        'Zip' => $row->Zip,
-                        'Send_Date' => $drop->Send_Date,
+                        'First_Name' => $firstName,
+                        'Address'    => $row->Address,
+                        'Debt'       => $row->Debt_Amount,
+                        'Phone'      => trim((string) $row->Phone),
+                        'Send_Date'  => $drop->Send_Date,
                     ];
                 }
             }
@@ -189,6 +192,7 @@ class MailDropExportRepository extends SqlSrvRepository
 
     /**
      * Stamp Latest_Export_Date for exported enriched mailer rows.
+     * Adds the column to TblMailersUniqueEnriched if it does not yet exist.
      *
      * @param  array<int>  $pks
      */
@@ -197,7 +201,9 @@ class MailDropExportRepository extends SqlSrvRepository
         $exportedAt = Carbon::today();
 
         if (! $this->enrichedLatestExportDateColumnExists()) {
-            return $exportedAt;
+            $this->connection()->statement(
+                "ALTER TABLE TblMailersUniqueEnriched ADD Latest_Export_Date DATE NULL"
+            );
         }
 
         $dropNames = $this->dropNamesForPks($pks);

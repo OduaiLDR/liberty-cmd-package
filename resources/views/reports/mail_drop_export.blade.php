@@ -42,6 +42,7 @@
                                     <input type="checkbox" id="select-all" class="form-check-input" title="Select all">
                                 </th>
                                 <th>Drop Name</th>
+                                <th>Debt Tier</th>
                                 <th class="text-end">Phone Count</th>
                                 <th>Send Date</th>
                                 <th>Latest Export Date</th>
@@ -60,6 +61,7 @@
                                         >
                                     </td>
                                     <td>{{ $drop->Drop_Name }}</td>
+                                    <td>{{ $drop->Debt_Tier ?? '' }}</td>
                                     <td class="text-end fw-semibold">{{ number_format((int) ($drop->Amount_Dropped ?? 0)) }}</td>
                                     <td>{{ $formatDate($drop->Send_Date) }}</td>
                                     <td class="latest-export-date">
@@ -72,7 +74,7 @@
                                 </tr>
                             @empty
                                 <tr>
-                                    <td colspan="5" class="text-center text-muted">No drops found.</td>
+                                    <td colspan="6" class="text-center text-muted">No drops found.</td>
                                 </tr>
                             @endforelse
                         </tbody>
