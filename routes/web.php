@@ -175,8 +175,9 @@ $registerCmdReportRoutes = function (bool $withNames = true): void {
 
     // New custom reports moved into package
     Route::get('/marketing-admin', [MarketingAdminController::class, 'index'])
-        ->middleware('can:cmd.reports.marketing_admin_report')
         ->name($name('cmd.reports.marketing_admin'));
+    Route::get('/marketing-admin/export', [MarketingAdminController::class, 'export'])
+        ->name($name('cmd.reports.marketing_admin.export'));
 
     Route::get('/drop-summary', [DropSummaryController::class, 'index'])
         ->middleware('can:cmd.reports.drop_summary_report')
