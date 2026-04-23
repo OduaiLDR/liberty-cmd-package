@@ -11,9 +11,19 @@
     "ext-sqlsrv": "*",
     "ext-pdo_sqlsrv": "*"
   },
+  "require-dev": {
+    "illuminate/support": "^11.0 || ^12.0",
+    "phpunit/phpunit": "^11.5",
+    "ramsey/uuid": "^4.7"
+  },
   "autoload": {
     "psr-4": {
       "Cmd\\Reports\\": "src/"
+    }
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "Cmd\\Reports\\Tests\\": "tests/"
     }
   },
   "extra": {
@@ -23,7 +33,9 @@
       ]
     }
   },
+  "scripts": {
+    "test": "vendor/bin/phpunit"
+  },
   "minimum-stability": "dev",
   "prefer-stable": true
 }
-
