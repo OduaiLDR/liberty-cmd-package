@@ -194,6 +194,13 @@ SQL;
      */
     public function auditIntentCounts(): array
     {
+        return Cache::remember('cmdpkg:marketing_admin:audit_intent', 3600, function () {
+            return $this->fetchAuditIntentCounts();
+        });
+    }
+
+    private function fetchAuditIntentCounts(): array
+    {
         $base = $this->connection();
 
         $totalRow = $base->selectOne("SELECT COUNT(DISTINCT Drop_Name) AS cnt FROM TblMarketing");

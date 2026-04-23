@@ -6,9 +6,10 @@
         <div class="card-header">
             <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-2">
                 <h5 class="mb-0">Marketing Admin</h5>
-                <a class="btn btn-outline-secondary" data-bs-toggle="collapse" href="#advFilters" role="button" aria-expanded="false" aria-controls="advFilters" title="Advanced filters">
-                    ⚙️
-                </a>
+                <div class="d-flex align-items-center gap-2">
+                    <a href="{{ url()->current() }}" class="btn btn-outline-danger btn-sm">Reset All</a>
+                    <a class="btn btn-outline-secondary btn-sm" data-bs-toggle="collapse" href="#advFilters" role="button" aria-expanded="false" aria-controls="advFilters" title="Advanced filters">⚙️ Advanced Filters</a>
+                </div>
             </div>
 
             <form method="get" action="/cmd/reports/marketing-admin">
@@ -21,7 +22,7 @@
                         <label class="form-label">Send Date To</label>
                         <input type="date" name="send_end" value="{{ $filters['send_end'] ?? '' }}" class="form-control">
                     </div>
-                    <div class="col-12 col-md-1">
+                    <div class="col-12 col-md-2">
                         <label class="form-label">Per page</label>
                         <select name="per_page" class="form-select">
                             @foreach([10,15,25,50,100] as $opt)
@@ -33,23 +34,14 @@
 
                 <div class="row g-3 mt-1">
                     <div class="col-12">
-                        <label class="form-label">Drop Names</label>
-                        <div class="input-group">
-                            <input list="dropsList" name="drops" class="form-control" placeholder="Type to search, comma-separated"
-                                   value="{{ isset($filters['drops']) && is_array($filters['drops']) ? implode(', ', $filters['drops']) : (is_string($filters['drops'] ?? '') ? $filters['drops'] : '') }}">
-                        </div>
+                        <label class="form-label">Drop Names <small class="text-muted">(comma separated)</small></label>
+                        <input list="dropsList" name="drops" class="form-control" placeholder="Type to search, comma-separated"
+                               value="{{ isset($filters['drops']) && is_array($filters['drops']) ? implode(', ', $filters['drops']) : (is_string($filters['drops'] ?? '') ? $filters['drops'] : '') }}">
                         <datalist id="dropsList">
                             @foreach(($allDrops ?? []) as $drop)
                                 <option value="{{ $drop }}"></option>
                             @endforeach
                         </datalist>
-                        <small class="text-muted">Type to search. Separate multiple selections with commas.</small>
-                    </div>
-                </div>
-
-                <div class="row g-3 align-items-end">
-                    <div class="col-12 col-md-12 d-flex justify-content-end">
-                        <button type="submit" class="btn btn-primary">Apply</button>
                     </div>
                 </div>
 
@@ -58,13 +50,12 @@
                         <div class="col-12 col-md-3">
                             <label class="form-label">Intent</label>
                             <select name="intent" class="form-select">
-                                @php $intentVal = $filters['intent'] ?? 'all'; @endphp
-                                <option value="all" @if($intentVal === 'all') selected @endif>All</option>
-                                <option value="yes" @if($intentVal === 'yes') selected @endif>Yes (Has intent)</option>
-                                <option value="no" @if($intentVal === 'no') selected @endif>No (No intent)</option>
+                                <option value="all" @if(($filters['intent'] ?? 'all') === 'all') selected @endif>All</option>
+                                <option value="yes" @if(($filters['intent'] ?? 'all') === 'yes') selected @endif>Yes (Has Intent)</option>
+                                <option value="no" @if(($filters['intent'] ?? 'all') === 'no') selected @endif>No (No Intent)</option>
                             </select>
                         </div>
-                        <div class="col-12 col-md-4">
+                        <div class="col-12 col-md-3">
                             <label class="form-label">State</label>
                             <select name="state" class="form-select">
                                 <option value="">All States</option>
@@ -73,25 +64,6 @@
                                 @endforeach
                             </select>
                         </div>
-
-                        <div class="col-12 col-md-6">
-                            <label class="form-label">Debt Range</label>
-                            <div class="d-flex gap-2">
-                                <input type="number" name="debt_min" value="{{ $filters['debt_min'] ?? '' }}" class="form-control" placeholder="Debt min">
-                                <input type="number" name="debt_max" value="{{ $filters['debt_max'] ?? '' }}" class="form-control" placeholder="Debt max">
-                            </div>
-                        </div>
-
-                        <div class="col-12 col-md-6">
-                            <label class="form-label">Credit</label>
-                            <div class="d-flex gap-2">
-                                <input type="number" name="fico_min" value="{{ $filters['fico_min'] ?? '' }}" class="form-control" placeholder="FICO min">
-                                <input type="number" name="fico_max" value="{{ $filters['fico_max'] ?? '' }}" class="form-control" placeholder="FICO max">
-                            </div>
-                        </div>
-
-                        <div class="col-12"><hr class="my-2"></div>
-
                         <div class="col-12 col-md-3">
                             <label class="form-label">Month</label>
                             <select name="month" class="form-select">
@@ -128,7 +100,7 @@
                                 @endforeach
                             </select>
                         </div>
-                        <div class="col-12 col-md-6">
+                        <div class="col-12 col-md-3">
                             <label class="form-label">Data Provider</label>
                             <select name="data_provider" class="form-select">
                                 <option value="">All Data Providers</option>
@@ -137,7 +109,7 @@
                                 @endforeach
                             </select>
                         </div>
-                        <div class="col-12 col-md-6">
+                        <div class="col-12 col-md-3">
                             <label class="form-label">Marketing Type</label>
                             <select name="marketing_type" class="form-select">
                                 <option value="">All Types</option>
@@ -147,17 +119,31 @@
                             </select>
                         </div>
                         <div class="col-12 col-md-6">
+                            <label class="form-label">Debt Range</label>
+                            <div class="d-flex gap-2">
+                                <input type="number" name="debt_min" value="{{ $filters['debt_min'] ?? '' }}" class="form-control" placeholder="Min">
+                                <input type="number" name="debt_max" value="{{ $filters['debt_max'] ?? '' }}" class="form-control" placeholder="Max">
+                            </div>
+                        </div>
+                        <div class="col-12 col-md-6">
+                            <label class="form-label">Credit (FICO)</label>
+                            <div class="d-flex gap-2">
+                                <input type="number" name="fico_min" value="{{ $filters['fico_min'] ?? '' }}" class="form-control" placeholder="Min">
+                                <input type="number" name="fico_max" value="{{ $filters['fico_max'] ?? '' }}" class="form-control" placeholder="Max">
+                            </div>
+                        </div>
+                        <div class="col-12 col-md-6">
                             <div class="d-flex gap-2">
                                 <div class="flex-fill">
                                     <label class="form-label">Sort</label>
                                     <select name="sort" class="form-select">
                                         @php $sorts = ['send_date' => 'Send Date','created_date' => 'Created Date','campaign' => 'Campaign','debt' => 'Debt Amount','fico' => 'FICO','util' => 'Utilization']; @endphp
-                                        @foreach($sorts as $k=>$lbl)
+                                        @foreach($sorts as $k => $lbl)
                                             <option value="{{ $k }}" @if(($filters['sort'] ?? 'send_date') === $k) selected @endif>{{ $lbl }}</option>
                                         @endforeach
                                     </select>
                                 </div>
-                                <div style="width: 140px">
+                                <div style="width:140px">
                                     <label class="form-label">Direction</label>
                                     <select name="dir" class="form-select">
                                         <option value="asc" @if(($filters['dir'] ?? 'asc') === 'asc') selected @endif>Ascending</option>
@@ -168,29 +154,58 @@
                         </div>
                     </div>
                 </div>
+
+                <div class="row g-3 mt-1">
+                    <div class="col-12 d-flex justify-content-end gap-2">
+                        <button type="submit" class="btn btn-primary">Apply Filters</button>
+                        <a href="{{ url('/cmd/reports/marketing-admin/export') . '?' . http_build_query(request()->except(['_token'])) }}" class="btn btn-outline-success">Export CSV</a>
+                    </div>
+                </div>
             </form>
         </div>
+
+        @isset($intentAudit)
+        <div class="card-body border-bottom">
+            <div class="row g-3">
+                <div class="col-6 col-md-4">
+                    <div class="border rounded p-3 text-center">
+                        <div class="fs-4 fw-bold">{{ $intentAudit['total'] ?? 0 }}</div>
+                        <div class="text-muted small text-uppercase">Total Drops</div>
+                    </div>
+                </div>
+                <div class="col-6 col-md-4">
+                    <div class="border rounded p-3 text-center">
+                        <div class="fs-4 fw-bold text-success">{{ $intentAudit['with'] ?? 0 }}</div>
+                        <div class="text-muted small text-uppercase">With Intent</div>
+                    </div>
+                </div>
+                <div class="col-6 col-md-4">
+                    <div class="border rounded p-3 text-center">
+                        <div class="fs-4 fw-bold text-warning">{{ $intentAudit['without'] ?? 0 }}</div>
+                        <div class="text-muted small text-uppercase">Without Intent</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        @endisset
+
         <div class="card-body">
             @isset($error)
                 <div class="alert alert-danger">{{ $error }}</div>
             @endisset
 
-            @isset($intentAudit)
-                <div class="alert alert-info mb-3">
-                    <div class="fw-bold mb-1">Audit:</div>
-                    <div class="d-flex flex-wrap gap-3">
-                        <span>Total: {{ $intentAudit['total'] ?? 0 }}</span>
-                        <span>With intent: {{ $intentAudit['with'] ?? 0 }}</span>
-                        <span>Without intent: {{ $intentAudit['without'] ?? 0 }}</span>
-                    </div>
-                </div>
-            @endisset
-
-            @if (empty($columns))
-                <div class="text-muted">No columns found.</div>
+            @if (!($submitted ?? false))
+                <div class="text-muted py-4 text-center">Set your filters above and click <strong>Apply Filters</strong> to load data.</div>
+            @elseif (empty($columns))
+                <div class="text-muted">No records found.</div>
             @else
+                <div class="d-flex align-items-center justify-content-between mb-2 flex-wrap gap-2">
+                    <h6 class="mb-0 fw-semibold">Marketing Drop Data</h6>
+                    <span class="text-muted small">Total: {{ $total }}</span>
+                </div>
+
                 <div class="table-responsive">
-                    <table class="table table-striped">
+                    <table class="table table-striped table-hover align-middle">
                         <thead>
                         <tr>
                             @foreach ($columns as $col)
@@ -237,17 +252,21 @@
                     $lastPage = max(1, (int) ceil(($total ?? 0) / ($perPage ?? 15)));
                     $baseQuery = request()->except('page');
                     $baseUrl = url()->current();
+                    $current = $page ?? 1;
+                    $window = 2;
+                    $start = max(1, $current - $window);
+                    $end = min($lastPage, $current + $window);
+                    if ($end - $start < $window * 2) { $start = max(1, $end - $window * 2); }
                 @endphp
-                <div class="d-flex justify-content-between align-items-center">
-                    <div>Total: {{ $total }}</div>
+                <div class="d-flex justify-content-between align-items-center mt-3 flex-wrap gap-2">
+                    <div class="text-muted small">Showing page {{ $current }} of {{ $lastPage }} &mdash; {{ $total }} total records</div>
                     <nav>
-                        <ul class="pagination mb-0">
-                            @php $current = $page ?? 1; $window = 2; $start = max(1, $current - $window); $end = min($lastPage, $current + $window); if ($end - $start < $window * 2) { $start = max(1, $end - $window * 2); } @endphp
+                        <ul class="pagination pagination-sm mb-0">
                             <li class="page-item @if($current <= 1) disabled @endif">
                                 <a class="page-link" href="{{ $baseUrl . '?' . http_build_query(array_merge($baseQuery, ['page' => 1, 'per_page' => $perPage])) }}">First</a>
                             </li>
                             <li class="page-item @if($current <= 1) disabled @endif">
-                                <a class="page-link" href="{{ $baseUrl . '?' . http_build_query(array_merge($baseQuery, ['page' => max(1, $current-1), 'per_page' => $perPage])) }}">Previous</a>
+                                <a class="page-link" href="{{ $baseUrl . '?' . http_build_query(array_merge($baseQuery, ['page' => max(1, $current - 1), 'per_page' => $perPage])) }}">Prev</a>
                             </li>
                             @for ($p = $start; $p <= $end; $p++)
                                 <li class="page-item @if($p == $current) active @endif">
@@ -255,7 +274,7 @@
                                 </li>
                             @endfor
                             <li class="page-item @if($current >= $lastPage) disabled @endif">
-                                <a class="page-link" href="{{ $baseUrl . '?' . http_build_query(array_merge($baseQuery, ['page' => min($lastPage, $current+1), 'per_page' => $perPage])) }}">Next</a>
+                                <a class="page-link" href="{{ $baseUrl . '?' . http_build_query(array_merge($baseQuery, ['page' => min($lastPage, $current + 1), 'per_page' => $perPage])) }}">Next</a>
                             </li>
                             <li class="page-item @if($current >= $lastPage) disabled @endif">
                                 <a class="page-link" href="{{ $baseUrl . '?' . http_build_query(array_merge($baseQuery, ['page' => $lastPage, 'per_page' => $perPage])) }}">Last</a>
@@ -263,6 +282,7 @@
                         </ul>
                     </nav>
                 </div>
+
             @endif
         </div>
     </div>
