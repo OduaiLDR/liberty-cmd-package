@@ -176,6 +176,8 @@ $registerCmdReportRoutes = function (bool $withNames = true): void {
     // New custom reports moved into package
     Route::get('/marketing-admin', [MarketingAdminController::class, 'index'])
         ->name($name('cmd.reports.marketing_admin'));
+    Route::get('/marketing-admin/chart-data', [MarketingAdminController::class, 'chartData'])
+        ->name($name('cmd.reports.marketing_admin.chart_data'));
     Route::get('/marketing-admin/export', [MarketingAdminController::class, 'export'])
         ->name($name('cmd.reports.marketing_admin.export'));
 

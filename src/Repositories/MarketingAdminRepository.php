@@ -3,7 +3,6 @@
 namespace Cmd\Reports\Repositories;
 
 use Illuminate\Support\Facades\Cache;
-use Illuminate\Support\Facades\DB;
 
 class MarketingAdminRepository extends SqlSrvRepository
 {
@@ -16,7 +15,7 @@ class MarketingAdminRepository extends SqlSrvRepository
         return Cache::remember('cmdpkg:marketing_admin:lists:drops', 600, function () {
             return array_map(
                 fn ($o) => $o->Drop_Name,
-                $this->connection()->select("SELECT TOP 500 Drop_Name FROM TblMarketing ORDER BY Send_Date DESC, Drop_Name DESC")
+                $this->connection()->select("SELECT DISTINCT TOP 500 Drop_Name FROM TblMarketing WHERE Drop_Name IS NOT NULL ORDER BY Drop_Name")
             );
         });
     }
@@ -88,6 +87,7 @@ class MarketingAdminRepository extends SqlSrvRepository
         if ($sendEnd !== '') { $whereParts[] = 'm.Send_Date < ?'; $whereParams[] = date('Y-m-d', strtotime($sendEnd.' +1 day')); }
         $month = (int) ($filters['month'] ?? 0);
         $year = (int) ($filters['year'] ?? 0);
+        $state = (string) ($filters['state'] ?? '');
         $tier = (string) ($filters['tier'] ?? '');
         $vendor = (string) ($filters['vendor'] ?? '');
         $dataProvider = (string) ($filters['data_provider'] ?? '');
@@ -95,6 +95,10 @@ class MarketingAdminRepository extends SqlSrvRepository
         $intent = (string) ($filters['intent'] ?? 'all');
         if ($month >= 1 && $month <= 12) { $whereParts[] = 'MONTH(m.Send_Date) = ?'; $whereParams[] = $month; }
         if ($year >= 2020 && $year <= 2100) { $whereParts[] = 'YEAR(m.Send_Date) = ?'; $whereParams[] = $year; }
+        if ($state !== '') {
+            $whereParts[] = 'EXISTS (SELECT 1 FROM TblContacts sc WHERE sc.Campaign = m.Drop_Name AND sc.State = ?)';
+            $whereParams[] = $state;
+        }
         if ($tier !== '') { $whereParts[] = 'm.Debt_Tier = ?'; $whereParams[] = $tier; }
         if ($vendor !== '') { $whereParts[] = 'm.Vendor = ?'; $whereParams[] = $vendor; }
         if ($dataProvider !== '') { $whereParts[] = 'm.Data_Type = ?'; $whereParams[] = $dataProvider; }
@@ -163,7 +167,22 @@ SQL;
             .'COALESCE(esum.avg_debt, 0) AS [Average Debt], '
             .'CAST(0 AS MONEY) AS [Veritas Enrollment], CAST(0 AS MONEY) AS [Veritas Monthly]';
 
-        $orderSql = ' ORDER BY m.Send_Date '.($filters['dir'] === 'desc' ? 'DESC' : 'ASC').', m.Drop_Name ASC';
+        $sortMap = [
+            'send_date' => 'm.Send_Date',
+            'drop_name' => 'm.Drop_Name',
+            'tier' => 'm.Debt_Tier',
+            'vendor' => 'm.Vendor',
+            'drop_cost' => '(COALESCE(m.Data_Drop_Cost, 0) + COALESCE(m.Mail_Drop_Cost, 0))',
+            'calls' => 'COALESCE(m.Calls, 0)',
+            'total_leads' => 'COALESCE(csum.total_leads, 0)',
+            'total_enrollments' => 'COALESCE(esum.total_enrollments, 0)',
+        ];
+
+        $sortKey = strtolower((string) ($filters['sort'] ?? 'send_date'));
+        $sortExpression = $sortMap[$sortKey] ?? $sortMap['send_date'];
+        $sortDirection = strtolower((string) ($filters['dir'] ?? 'asc')) === 'desc' ? 'DESC' : 'ASC';
+
+        $orderSql = ' ORDER BY ' . $sortExpression . ' ' . $sortDirection . ', m.Drop_Name ASC';
 
         $countSql = $cteHeader . ' SELECT COUNT(1) AS cnt ' . $joins . $whereSql;
         $dataSql  = $cteHeader . ' ' . $selectCols . $joins . $whereSql . $orderSql . ' OFFSET '.$offset.' ROWS FETCH NEXT '.$perPage.' ROWS ONLY';
