@@ -334,16 +334,20 @@ class SyncEnrollmentData extends Command
                 // Adjust payment count based on Payment_Frequency
                 // Note: Check Bi-Weekly/Semi-Monthly BEFORE Weekly to avoid substring matching issue
                 if (stripos($paymentFrequency, 'Bi-Weekly') !== false || stripos($paymentFrequency, 'Semi-Monthly') !== false) {
-                    $adjustedPaymentCount = (int) round($rawPaymentCount / 2);
+                    $adjustedPaymentCount = $rawPaymentCount / 2;
                 } elseif (stripos($paymentFrequency, 'Weekly') !== false) {
-                    $adjustedPaymentCount = (int) round($rawPaymentCount / 4);
+                    $adjustedPaymentCount = $rawPaymentCount / 4;
                 } else {
                     $adjustedPaymentCount = $rawPaymentCount;
                 }
 
+                // Format the adjusted payment count to 2 decimal places to match SQL Server DECIMAL type
+                $adjustedPaymentCountStr = number_format((float) $adjustedPaymentCount, 2, '.', '');
+                $currentPaymentsStr = number_format((float) $currentPayments, 2, '.', '');
+
                 // Only add to updates if different
-                if ((int) $currentPayments !== $adjustedPaymentCount) {
-                    $updates[$llgId] = $adjustedPaymentCount;
+                if ($currentPaymentsStr !== $adjustedPaymentCountStr) {
+                    $updates[$llgId] = $adjustedPaymentCountStr;
                 }
             }
         }
