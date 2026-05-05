@@ -258,7 +258,8 @@ class SyncEnrollmentData extends Command
 
     private function updatePayments(DBConnector $snowflake, DBConnector $sqlConnector): int
     {
-        // Get payment counts from Snowflake
+        // Get payment counts from BOTH Snowflake databases (LDR and PLAW)
+        // Some contacts have Category=LDR but payments in PLAW or vice versa
         $snowflakeSql = "
             SELECT CONTACT_ID, COUNT(*) AS PAYMENT_COUNT
             FROM TRANSACTIONS
@@ -268,30 +269,57 @@ class SyncEnrollmentData extends Command
               AND _FIVETRAN_DELETED = FALSE
             GROUP BY CONTACT_ID
         ";
+
+        // Query current source's Snowflake
         $snowflakeResult = $snowflake->query($snowflakeSql);
         $paymentCounts = $snowflakeResult['data'] ?? [];
+        $this->info("[INFO] Fetched payment counts for " . count($paymentCounts) . " contacts from {$this->source} Snowflake");
 
-        $this->info("[INFO] Fetched payment counts for " . count($paymentCounts) . " contacts");
+        // Query the OTHER source's Snowflake too
+        $otherSource = $this->source === 'LDR' ? 'plaw' : 'ldr';
+        $otherPaymentCounts = [];
+        try {
+            $otherSnowflake = DBConnector::fromEnvironment($otherSource);
+            $otherResult = $otherSnowflake->query($snowflakeSql);
+            $otherPaymentCounts = $otherResult['data'] ?? [];
+            $this->info("[INFO] Fetched payment counts for " . count($otherPaymentCounts) . " contacts from " . strtoupper($otherSource) . " Snowflake");
+        } catch (\Throwable $e) {
+            $this->warn("[WARN] Could not query " . strtoupper($otherSource) . " Snowflake: " . $e->getMessage());
+        }
 
-        // Create lookup map
+        // Create lookup map - merge both sources, take the max count per contact
         $paymentsMap = [];
         foreach ($paymentCounts as $row) {
             $contactId = $row['CONTACT_ID'] ?? null;
             $count = $row['PAYMENT_COUNT'] ?? 0;
             if ($contactId) {
-                $paymentsMap[$contactId] = $count;
+                $paymentsMap[$contactId] = max((int) $count, $paymentsMap[$contactId] ?? 0);
+            }
+        }
+        foreach ($otherPaymentCounts as $row) {
+            $contactId = $row['CONTACT_ID'] ?? null;
+            $count = $row['PAYMENT_COUNT'] ?? 0;
+            if ($contactId) {
+                $paymentsMap[$contactId] = max((int) $count, $paymentsMap[$contactId] ?? 0);
             }
         }
 
-        // Get current payments from TblEnrollment
-        $sql = "SELECT LLG_ID, Payments FROM TblEnrollment WHERE Category = '{$this->esc($this->source)}'";
-        $enrollmentResult = $sqlConnector->querySqlServer($sql);
-        $enrollmentData = $enrollmentResult['data'] ?? [];
+        $this->info("[INFO] Total unique contacts with payments: " . count($paymentsMap));
 
-        $updated = 0;
+        // Get current payments and payment frequency from TblEnrollment for this category
+        $sql = "SELECT LLG_ID, Payments, Payment_Frequency FROM TblEnrollment WHERE Category = '{$this->esc($this->source)}'";
+        $enrollmentResult = $sqlConnector->querySqlServer($sql);
+        // SQL Server returns data directly as array, not wrapped in ['data']
+        $enrollmentData = is_array($enrollmentResult) && isset($enrollmentResult['data']) 
+            ? $enrollmentResult['data'] 
+            : (is_array($enrollmentResult) ? $enrollmentResult : []);
+
+        // Collect updates needed
+        $updates = [];
         foreach ($enrollmentData as $enrollment) {
             $llgId = $enrollment['LLG_ID'] ?? null;
-            $currentPayments = $enrollment['Payments'] ?? 0;
+            $currentPayments = (float) ($enrollment['Payments'] ?? 0);
+            $paymentFrequency = trim($enrollment['Payment_Frequency'] ?? '');
 
             if (!$llgId) {
                 continue;
@@ -301,23 +329,56 @@ class SyncEnrollmentData extends Command
             $contactId = str_replace('LLG-', '', $llgId);
 
             if (isset($paymentsMap[$contactId])) {
-                $newPaymentCount = $paymentsMap[$contactId];
+                $rawPaymentCount = $paymentsMap[$contactId];
+                
+                // Adjust payment count based on Payment_Frequency
+                // Note: Check Bi-Weekly/Semi-Monthly BEFORE Weekly to avoid substring matching issue
+                if (stripos($paymentFrequency, 'Bi-Weekly') !== false || stripos($paymentFrequency, 'Semi-Monthly') !== false) {
+                    $adjustedPaymentCount = $rawPaymentCount / 2;
+                } elseif (stripos($paymentFrequency, 'Weekly') !== false) {
+                    $adjustedPaymentCount = $rawPaymentCount / 4;
+                } else {
+                    $adjustedPaymentCount = $rawPaymentCount;
+                }
 
-                // Update if different
-                if ($currentPayments != $newPaymentCount) {
-                    $updateSql = "
-                        UPDATE TblEnrollment
-                        SET Payments = {$newPaymentCount}
-                        WHERE LLG_ID = '{$this->esc($llgId)}'
-                    ";
-                    $sqlConnector->querySqlServer($updateSql);
-                    $updated++;
+                // Format the adjusted payment count to 2 decimal places to match SQL Server DECIMAL type
+                $adjustedPaymentCountStr = number_format((float) $adjustedPaymentCount, 2, '.', '');
+                $currentPaymentsStr = number_format((float) $currentPayments, 2, '.', '');
 
-                    if ($updated % 100 === 0) {
-                        $this->info("[INFO] Updated {$updated} Payments records...");
-                    }
+                // Only add to updates if different
+                if ($currentPaymentsStr !== $adjustedPaymentCountStr) {
+                    $updates[$llgId] = $adjustedPaymentCountStr;
                 }
             }
+        }
+
+        $this->info("[INFO] Found " . count($updates) . " records needing Payments update");
+
+        // Batch update using CASE statement (500 at a time)
+        $updated = 0;
+        $chunks = array_chunk($updates, 500, true);
+        
+        foreach ($chunks as $chunkIndex => $chunk) {
+            if (empty($chunk)) {
+                continue;
+            }
+
+            $cases = [];
+            $ids = [];
+            foreach ($chunk as $llgId => $paymentCount) {
+                $cases[] = "WHEN '{$this->esc($llgId)}' THEN {$paymentCount}";
+                $ids[] = "'{$this->esc($llgId)}'";
+            }
+
+            $updateSql = "
+                UPDATE TblEnrollment
+                SET Payments = CASE LLG_ID " . implode(' ', $cases) . " END
+                WHERE LLG_ID IN (" . implode(',', $ids) . ")
+            ";
+            
+            $sqlConnector->querySqlServer($updateSql);
+            $updated += count($chunk);
+            $this->info("[INFO] Updated batch " . ($chunkIndex + 1) . " (" . count($chunk) . " records, total: {$updated})");
         }
 
         $this->info("[INFO] Updated {$updated} Payments records");
