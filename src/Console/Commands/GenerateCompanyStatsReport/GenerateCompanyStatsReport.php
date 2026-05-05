@@ -324,8 +324,8 @@ class GenerateCompanyStatsReport extends Command
 
     private function initializeSqlServerConnector(): DBConnector
     {
-        $connector = new DBConnector([]);
-        $connector->initializeSqlServer();
+        $connector = DBConnector::fromEnvironment('ldr');
+        $connector->initializeSqlServer('ldr');
         return $connector;
     }
 

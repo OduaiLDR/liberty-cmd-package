@@ -424,23 +424,29 @@ class SyncContactsData extends Command
 
     private function clearTargetTable(DBConnector $connector): void
     {
+        try {
+            $connector->querySqlServer("TRUNCATE TABLE {$this->targetTable}");
+            $this->info("[INFO] Target table truncated instantly.");
+            return;
+        } catch (\Throwable $e) {
+            $this->info("[INFO] TRUNCATE failed, falling back to batch DELETE.");
+        }
+
         $deletedTotal = 0;
 
         do {
-            $sql = "DELETE TOP (10000) FROM {$this->targetTable}";
+            $sql = "DELETE TOP (50000) FROM {$this->targetTable}";
             try {
                 $connector->querySqlServer($sql);
             } catch (\Throwable $e) {
                 // Ignore errors
             }
 
-            sleep(5);
-
             $sql = "SELECT COUNT(*) AS cnt FROM {$this->targetTable}";
             $result = $connector->querySqlServer($sql);
             $count = $result[0]['cnt'] ?? 0;
 
-            $deletedTotal += 10000;
+            $deletedTotal += 50000;
             if ($count > 0) {
                 $this->info("[INFO] Deleted batch, {$count} rows remaining...");
             }
@@ -506,12 +512,13 @@ class SyncContactsData extends Command
 
     private function updateRelatedTables(DBConnector $connector): void
     {
-        // Update TblContacts.LLG_ID
+        // Update TblContacts.LLG_ID (Optimized JOIN avoiding REPLACE function)
         $sql = "
             UPDATE TblContacts
             SET TblContacts.LLG_ID = {$this->targetTable}.LLG_ID
-            FROM TblContacts, {$this->targetTable}
-            WHERE REPLACE(TblContacts.LLG_ID, 'LLG-', '') = {$this->targetTable}.External_ID
+            FROM TblContacts
+            INNER JOIN {$this->targetTable} 
+              ON TblContacts.LLG_ID = 'LLG-' + CAST({$this->targetTable}.External_ID AS VARCHAR(50))
         ";
         try {
             $connector->querySqlServer($sql);
