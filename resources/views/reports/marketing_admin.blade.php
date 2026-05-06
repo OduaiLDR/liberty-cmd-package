@@ -288,7 +288,7 @@
                                                 } elseif (in_array($col, ['Enrolled Debt','Average Debt'], true)) {
                                                     $out = '$' . number_format((float) $val, 0);
                                                 } elseif ($col === 'Lead Rate') {
-                                                    $out = number_format(((float) $val) * 100, 4) . '%';
+                                                    $out = number_format((float) $val, 4) . '%';
                                                 } elseif (in_array($col, ['Conversion Rate %', 'Retention Rate %'], true)) {
                                                     $out = number_format((float) $val, 2) . '%';
                                                 } elseif ($col === 'ROI Ratio') {

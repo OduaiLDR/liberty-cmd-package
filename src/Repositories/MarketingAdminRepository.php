@@ -14,7 +14,7 @@ class MarketingAdminRepository extends SqlSrvRepository
     {
         return Cache::remember('cmdpkg:marketing_admin:lists:drops', 600, function () {
             return array_map(
-                fn ($o) => $o->Drop_Name,
+                fn($o) => $o->Drop_Name,
                 $this->connection()->select("SELECT DISTINCT TOP 500 Drop_Name FROM TblMarketing WHERE Drop_Name IS NOT NULL ORDER BY Drop_Name")
             );
         });
@@ -27,7 +27,7 @@ class MarketingAdminRepository extends SqlSrvRepository
     {
         return Cache::remember('cmdpkg:marketing_admin:lists:states', 600, function () {
             return array_map(
-                fn ($o) => $o->State,
+                fn($o) => $o->State,
                 $this->connection()->select("SELECT DISTINCT State FROM TblContacts WHERE State IS NOT NULL AND LEN(State)=2 AND State LIKE '[A-Z][A-Z]' ORDER BY State")
             );
         });
@@ -40,7 +40,7 @@ class MarketingAdminRepository extends SqlSrvRepository
     {
         return Cache::remember('cmdpkg:marketing_admin:lists:vendors', 600, function () {
             return array_map(
-                fn ($o) => $o->Vendor,
+                fn($o) => $o->Vendor,
                 $this->connection()->select("SELECT DISTINCT Vendor FROM TblMarketing WHERE Vendor IS NOT NULL ORDER BY Vendor")
             );
         });
@@ -53,7 +53,7 @@ class MarketingAdminRepository extends SqlSrvRepository
     {
         return Cache::remember('cmdpkg:marketing_admin:lists:data_providers', 600, function () {
             return array_map(
-                fn ($o) => $o->Data_Type,
+                fn($o) => $o->Data_Type,
                 $this->connection()->select("SELECT DISTINCT Data_Type FROM TblMarketing WHERE Data_Type IS NOT NULL ORDER BY Data_Type")
             );
         });
@@ -81,7 +81,7 @@ class MarketingAdminRepository extends SqlSrvRepository
 
         if (count($selectedDrops) > 0) {
             $ph = implode(',', array_fill(0, count($selectedDrops), '?'));
-            $marketingWhereParts[] = 'm.Drop_Name IN ('.$ph.')';
+            $marketingWhereParts[] = 'm.Drop_Name IN (' . $ph . ')';
             foreach ($selectedDrops as $dropName) {
                 $marketingWhereParams[] = $dropName;
             }
@@ -89,19 +89,19 @@ class MarketingAdminRepository extends SqlSrvRepository
 
         $sendStart = (string) ($filters['send_start'] ?? '');
         $sendEnd = (string) ($filters['send_end'] ?? '');
-        
+
         // PERFORMANCE FIX: Default to last 90 days if no date range specified to prevent full table scans
         if ($sendStart === '' && $sendEnd === '') {
             $sendStart = date('Y-m-d', strtotime('-90 days'));
         }
-        
+
         if ($sendStart !== '') {
             $marketingWhereParts[] = 'm.Send_Date >= ?';
             $marketingWhereParams[] = $sendStart;
         }
         if ($sendEnd !== '') {
             $marketingWhereParts[] = 'm.Send_Date < ?';
-            $marketingWhereParams[] = date('Y-m-d', strtotime($sendEnd.' +1 day'));
+            $marketingWhereParams[] = date('Y-m-d', strtotime($sendEnd . ' +1 day'));
         }
 
         $month = (int) ($filters['month'] ?? 0);
@@ -133,7 +133,7 @@ class MarketingAdminRepository extends SqlSrvRepository
             $marketingWhereParams[] = $dataProvider;
         }
         if ($marketingType !== '') {
-            $marketingWhereParts[] = 'm.Drop_Type = ?';
+            $marketingWhereParts[] = "CASE WHEN RIGHT(m.Drop_Name, 3) = 'NAO' THEN 'NAO' WHEN RIGHT(m.Drop_Name, 2) = 'AO' THEN 'AO' ELSE 'X' END = ?";
             $marketingWhereParams[] = $marketingType;
         }
         if ($intent === 'yes') {
@@ -172,12 +172,17 @@ class MarketingAdminRepository extends SqlSrvRepository
             $contactWhereParams[] = (int) $ficoMax;
         }
 
-        $marketingWhereSql = count($marketingWhereParts) > 0 ? ' WHERE '.implode(' AND ', $marketingWhereParts) : '';
-        $contactWhereSql = count($contactWhereParts) > 0 ? ' WHERE '.implode(' AND ', $contactWhereParts) : '';
+        $marketingWhereSql = count($marketingWhereParts) > 0 ? ' WHERE ' . implode(' AND ', $marketingWhereParts) : '';
+        $contactWhereSql = count($contactWhereParts) > 0 ? ' WHERE ' . implode(' AND ', $contactWhereParts) : '';
         $resultWhereSql = count($contactWhereParts) > 0
             ? ' WHERE EXISTS (SELECT 1 FROM contact_filtered cf WHERE cf.Drop_Name = f.Drop_Name AND cf.Send_Date = f.Send_Date)'
             : '';
-        $allParams = array_merge($marketingWhereParams, $contactWhereParams);
+
+        $veritasStart = $sendStart !== '' ? $sendStart : date('Y-m-d', strtotime('-90 days'));
+        $veritasEnd   = $sendEnd   !== '' ? date('Y-m-d', strtotime($sendEnd . ' +1 day')) : date('Y-m-d');
+        $veritasDateParams = [$veritasStart, $veritasEnd, $veritasStart, $veritasEnd];
+
+        $allParams = array_merge($marketingWhereParams, $contactWhereParams, $veritasDateParams);
 
         $cteHeader = <<<SQL
 WITH filtered AS (
@@ -185,7 +190,11 @@ WITH filtered AS (
     m.Drop_Name,
     m.Debt_Tier,
     CONVERT(date, m.Send_Date) AS Send_Date,
-    m.Drop_Type,
+    CASE
+      WHEN RIGHT(m.Drop_Name, 3) = 'NAO' THEN 'NAO'
+      WHEN RIGHT(m.Drop_Name, 2) = 'AO'  THEN 'AO'
+      ELSE 'X'
+    END AS Drop_Type,
     m.Vendor,
     m.Data_Type,
     m.Mail_Style,
@@ -226,6 +235,20 @@ WITH filtered AS (
   FROM contact_filtered cf
   WHERE cf.Debt_Amount >= 7500
   GROUP BY cf.Drop_Name, cf.Send_Date
+), veritas_fees AS (
+  SELECT LLG_ID,
+         SUM(enrollment_fee)   AS enrollment_fee,
+         SUM(monthly_fee_rate) AS monthly_fee_rate
+  FROM (
+    SELECT LLG_ID, Enrollment_Fee AS enrollment_fee, Monthly_Fee AS monthly_fee_rate
+    FROM TblVeritasEnrollments
+    WHERE Payment_Date >= ? AND Payment_Date <= ?
+    UNION ALL
+    SELECT LLG_ID, Enrollment_Fee AS enrollment_fee, Monthly_Fee AS monthly_fee_rate
+    FROM TblProgressLawEnrollments
+    WHERE Payment_Date >= ? AND Payment_Date <= ?
+  ) v
+  GROUP BY LLG_ID
 ), esum AS (
   SELECT
     cf.Drop_Name,
@@ -236,13 +259,59 @@ WITH filtered AS (
     SUM(CASE WHEN e.Cancel_Date IS NOT NULL THEN 1 ELSE 0 END) AS cancels,
     SUM(CASE WHEN e.NSF_Date IS NOT NULL THEN 1 ELSE 0 END) AS nsfs,
     SUM(CASE WHEN e.Cancel_Date IS NULL AND e.NSF_Date IS NULL THEN COALESCE(e.Debt_Amount, 0) ELSE 0 END) AS retained_debt,
-    -- Veritas-style economics: only count active enrollments (non-canceled, non-NSF)
-    -- Enrollment fee = 15% of debt for active enrollments only
-    -- Monthly fee = program payment for active enrollments only
-    SUM(CASE WHEN e.Cancel_Date IS NULL AND e.NSF_Date IS NULL THEN COALESCE(e.Debt_Amount, 0) * 0.15 ELSE 0 END) AS veritas_enrollment_fee,
-    SUM(CASE WHEN e.Cancel_Date IS NULL AND e.NSF_Date IS NULL THEN COALESCE(e.Program_Payment, 0) ELSE 0 END) AS veritas_monthly_fee
+    SUM(CASE
+      WHEN COALESCE(e.Payment_Date_2, e.Payment_Date_1) IS NOT NULL
+       AND (e.Cancel_Date IS NULL
+            OR e.Cancel_Date > DATEADD(month, 1, DATEFROMPARTS(
+                  YEAR(COALESCE(e.Payment_Date_2, e.Payment_Date_1)),
+                  MONTH(COALESCE(e.Payment_Date_2, e.Payment_Date_1)), 1)))
+       AND (e.NSF_Date IS NULL
+            OR e.NSF_Date > DATEADD(month, 1, DATEFROMPARTS(
+                  YEAR(COALESCE(e.Payment_Date_2, e.Payment_Date_1)),
+                  MONTH(COALESCE(e.Payment_Date_2, e.Payment_Date_1)), 1)))
+      THEN 1 ELSE 0
+    END) AS first_payment_cleared,
+    SUM(COALESCE(vf.enrollment_fee, 0)) AS veritas_enrollment_fee,
+    SUM(
+      CASE
+        WHEN vf.monthly_fee_rate IS NOT NULL
+         AND vf.monthly_fee_rate > 0
+         AND COALESCE(e.Payment_Date_2, e.Payment_Date_1) IS NOT NULL
+        THEN vf.monthly_fee_rate *
+             CASE
+               WHEN DATEDIFF(month,
+                    DATEADD(month, 1, DATEFROMPARTS(
+                      YEAR(COALESCE(e.Payment_Date_2, e.Payment_Date_1)),
+                      MONTH(COALESCE(e.Payment_Date_2, e.Payment_Date_1)), 1)),
+                    CASE
+                      WHEN e.Cancel_Date IS NOT NULL
+                           AND (e.NSF_Date IS NULL OR e.Cancel_Date <= e.NSF_Date)
+                        THEN e.Cancel_Date
+                      WHEN e.NSF_Date IS NOT NULL
+                        THEN e.NSF_Date
+                      ELSE CAST(GETDATE() AS date)
+                    END
+               ) < 0 THEN 0
+               ELSE DATEDIFF(month,
+                    DATEADD(month, 1, DATEFROMPARTS(
+                      YEAR(COALESCE(e.Payment_Date_2, e.Payment_Date_1)),
+                      MONTH(COALESCE(e.Payment_Date_2, e.Payment_Date_1)), 1)),
+                    CASE
+                      WHEN e.Cancel_Date IS NOT NULL
+                           AND (e.NSF_Date IS NULL OR e.Cancel_Date <= e.NSF_Date)
+                        THEN e.Cancel_Date
+                      WHEN e.NSF_Date IS NOT NULL
+                        THEN e.NSF_Date
+                      ELSE CAST(GETDATE() AS date)
+                    END
+               )
+             END
+        ELSE 0
+      END
+    ) AS veritas_monthly_fee
   FROM contact_filtered cf
   JOIN TblEnrollment e ON e.LLG_ID = cf.LLG_ID
+  LEFT JOIN veritas_fees vf ON vf.LLG_ID = cf.LLG_ID
   GROUP BY cf.Drop_Name, cf.Send_Date
 ), active_reps AS (
   SELECT
@@ -258,57 +327,57 @@ WITH filtered AS (
 SQL;
 
         $selectCols = 'SELECT '
-            .'COUNT(1) OVER() AS _total_count, '
-            .'f.Drop_Name AS [Drop Name], '
-            .'f.Debt_Tier AS [Tier], '
-            .'f.Send_Date AS [Send Date], '
-            .'f.Drop_Type AS [Marketing Type], '
-            .'f.Vendor AS [Vendor], '
-            .'f.Data_Type AS [Data Provider], '
-            .'f.Intent AS [Intent], '
-            .'f.Mail_Style AS [Mail Style], '
-            .'f.Amount_Dropped AS [Amount Dropped], '
-            .'(f.Data_Drop_Cost + f.Mail_Drop_Cost) AS [Drop Cost], '
-            .'f.Calls AS [Calls], '
-            .'COALESCE(csum.total_leads, 0) AS [Total Leads], '
-            .'COALESCE(qsum.qualified_leads, 0) AS [Qualified Leads], '
-            .'COALESCE(csum.total_leads, 0) - COALESCE(qsum.qualified_leads, 0) AS [Unqualified Leads], '
-            .'COALESCE(csum.assigned_leads, 0) AS [Assigned Leads], '
-            .'COALESCE(ar.active_reps, 0) AS [Active Reps], '
+            . 'COUNT(1) OVER() AS _total_count, '
+            . 'f.Drop_Name AS [Drop Name], '
+            . 'f.Debt_Tier AS [Tier], '
+            . 'f.Send_Date AS [Send Date], '
+            . 'f.Drop_Type AS [Marketing Type], '
+            . 'f.Vendor AS [Vendor], '
+            . 'f.Data_Type AS [Data Provider], '
+            . 'f.Intent AS [Intent], '
+            . 'f.Mail_Style AS [Mail Style], '
+            . 'f.Amount_Dropped AS [Amount Dropped], '
+            . '(f.Data_Drop_Cost + f.Mail_Drop_Cost) AS [Drop Cost], '
+            . 'f.Calls AS [Calls], '
+            . 'COALESCE(csum.total_leads, 0) AS [Total Leads], '
+            . 'COALESCE(qsum.qualified_leads, 0) AS [Qualified Leads], '
+            . 'COALESCE(csum.total_leads, 0) - COALESCE(qsum.qualified_leads, 0) AS [Unqualified Leads], '
+            . 'COALESCE(csum.assigned_leads, 0) AS [Assigned Leads], '
+            . 'COALESCE(ar.active_reps, 0) AS [Active Reps], '
             // LEAD RATE: Percentage of mail drops that resulted in contact/lead (not enrollment)
-            .'COALESCE(CAST(csum.total_leads AS FLOAT) / NULLIF(CAST(f.Amount_Dropped AS FLOAT), 0), 0) AS [Lead Rate], '
-            .'COALESCE(CAST(f.Calls AS FLOAT) / NULLIF(CAST(ar.active_reps AS FLOAT), 0), 0) AS [Calls Per Rep], '
-            .'COALESCE(CAST((f.Data_Drop_Cost + f.Mail_Drop_Cost) AS FLOAT) / NULLIF(CAST(f.Calls AS FLOAT), 0), 0) AS [Cost Per Call], '
-            .'COALESCE(CAST(f.Amount_Dropped AS FLOAT) / NULLIF(CAST(ar.active_reps AS FLOAT), 0), 0) AS [Amount Per Rep], '
-            .'COALESCE(CAST((f.Data_Drop_Cost + f.Mail_Drop_Cost) AS FLOAT) / NULLIF(CAST(f.Amount_Dropped AS FLOAT), 0), 0) AS [Price Per Drop], '
-            .'COALESCE(esum.total_enrollments, 0) AS [Total Enrollments], '
-            .'COALESCE(esum.cancels, 0) AS [Cancels], '
-            .'COALESCE(esum.nsfs, 0) AS [NSFs], '
-            .'COALESCE(esum.total_enrollments, 0) - (COALESCE(esum.cancels, 0) + COALESCE(esum.nsfs, 0)) AS [Net Enrollments], '
-            .'COALESCE(CAST((f.Data_Drop_Cost + f.Mail_Drop_Cost) AS FLOAT) / NULLIF(CAST(esum.total_enrollments AS FLOAT), 0), 0) AS [CPA], '
-            .'COALESCE(esum.enrolled_debt, 0) AS [Enrolled Debt], '
-            .'COALESCE(esum.avg_debt, 0) AS [Average Debt], '
+            . 'COALESCE(CAST(csum.total_leads AS FLOAT) / NULLIF(CAST(f.Amount_Dropped AS FLOAT), 0) * 100, 0) AS [Lead Rate], '
+            . 'COALESCE(CAST(f.Calls AS FLOAT) / NULLIF(CAST(ar.active_reps AS FLOAT), 0), 0) AS [Calls Per Rep], '
+            . 'COALESCE(CAST((f.Data_Drop_Cost + f.Mail_Drop_Cost) AS FLOAT) / NULLIF(CAST(f.Calls AS FLOAT), 0), 0) AS [Cost Per Call], '
+            . 'COALESCE(CAST(f.Amount_Dropped AS FLOAT) / NULLIF(CAST(ar.active_reps AS FLOAT), 0), 0) AS [Amount Per Rep], '
+            . 'COALESCE(CAST((f.Data_Drop_Cost + f.Mail_Drop_Cost) AS FLOAT) / NULLIF(CAST(f.Amount_Dropped AS FLOAT), 0), 0) AS [Price Per Drop], '
+            . 'COALESCE(esum.total_enrollments, 0) AS [Total Enrollments], '
+            . 'COALESCE(esum.cancels, 0) AS [Cancels], '
+            . 'COALESCE(esum.nsfs, 0) AS [NSFs], '
+            . 'COALESCE(esum.total_enrollments, 0) - (COALESCE(esum.cancels, 0) + COALESCE(esum.nsfs, 0)) AS [Net Enrollments], '
+            . 'COALESCE(CAST((f.Data_Drop_Cost + f.Mail_Drop_Cost) AS FLOAT) / NULLIF(CAST(esum.first_payment_cleared AS FLOAT), 0), 0) AS [CPA], '
+            . 'COALESCE(esum.enrolled_debt, 0) AS [Enrolled Debt], '
+            . 'COALESCE(esum.avg_debt, 0) AS [Average Debt], '
             // CONVERSION RATE: Lead-to-enrollment funnel efficiency
-            .'COALESCE(CAST(esum.total_enrollments AS FLOAT) / NULLIF(CAST(csum.total_leads AS FLOAT), 0) * 100, 0) AS [Conversion Rate %], '
+            . 'COALESCE(CAST(esum.total_enrollments AS FLOAT) / NULLIF(CAST(csum.total_leads AS FLOAT), 0) * 100, 0) AS [Conversion Rate %], '
             // ROI METRICS: Based on 25% revenue assumption (typical debt settlement fee-to-debt ratio)
             // WARNING: These are PROJECTED metrics - actual revenue realizes over 24-48 month program lifecycle
             // ROI Ratio = (Projected Revenue - Marketing Cost) / Marketing Cost
-            .'COALESCE(CAST((esum.retained_debt * 0.25) - (f.Data_Drop_Cost + f.Mail_Drop_Cost) AS FLOAT) / NULLIF(CAST((f.Data_Drop_Cost + f.Mail_Drop_Cost) AS FLOAT), 0), 0) AS [ROI Ratio], '
+            . 'COALESCE(CAST((esum.retained_debt * 0.25) - (f.Data_Drop_Cost + f.Mail_Drop_Cost) AS FLOAT) / NULLIF(CAST((f.Data_Drop_Cost + f.Mail_Drop_Cost) AS FLOAT), 0), 0) AS [ROI Ratio], '
             // Est Revenue = Retained Debt × 25% (industry standard fee structure)
-            .'COALESCE(esum.retained_debt * 0.25, 0) AS [Est Revenue], '
+            . 'COALESCE(esum.retained_debt * 0.25, 0) AS [Est Revenue], '
             // Est Profit = Projected Revenue - Marketing Cost (does not account for operational costs or time-to-revenue)
-            .'COALESCE((esum.retained_debt * 0.25) - (f.Data_Drop_Cost + f.Mail_Drop_Cost), 0) AS [Est Profit], '
-            .'COALESCE(CAST((esum.total_enrollments - COALESCE(esum.cancels, 0) - COALESCE(esum.nsfs, 0)) AS FLOAT) / NULLIF(CAST(esum.total_enrollments AS FLOAT), 0) * 100, 0) AS [Retention Rate %], '
-            .'COALESCE(CAST((f.Data_Drop_Cost + f.Mail_Drop_Cost) AS FLOAT) / NULLIF(CAST(csum.total_leads AS FLOAT), 0), 0) AS [Cost Per Lead], '
-            .'COALESCE(CAST(esum.retained_debt * 0.25 AS FLOAT) / NULLIF(CAST(csum.total_leads AS FLOAT), 0), 0) AS [Revenue Per Lead], '
-            .'COALESCE(esum.veritas_enrollment_fee, 0) AS [Veritas Enrollment], '
-            .'COALESCE(esum.veritas_monthly_fee, 0) AS [Veritas Monthly]';
+            . 'COALESCE((esum.retained_debt * 0.25) - (f.Data_Drop_Cost + f.Mail_Drop_Cost), 0) AS [Est Profit], '
+            . 'COALESCE(CAST((esum.total_enrollments - COALESCE(esum.cancels, 0) - COALESCE(esum.nsfs, 0)) AS FLOAT) / NULLIF(CAST(esum.total_enrollments AS FLOAT), 0) * 100, 0) AS [Retention Rate %], '
+            . 'COALESCE(CAST((f.Data_Drop_Cost + f.Mail_Drop_Cost) AS FLOAT) / NULLIF(CAST(csum.total_leads AS FLOAT), 0), 0) AS [Cost Per Lead], '
+            . 'COALESCE(CAST(esum.retained_debt * 0.25 AS FLOAT) / NULLIF(CAST(csum.total_leads AS FLOAT), 0), 0) AS [Revenue Per Lead], '
+            . 'COALESCE(esum.veritas_enrollment_fee, 0) AS [Veritas Enrollment], '
+            . 'COALESCE(esum.veritas_monthly_fee, 0) AS [Veritas Monthly]';
 
         $joins = ' FROM filtered f '
-            .'LEFT JOIN csum ON csum.Drop_Name = f.Drop_Name AND csum.Send_Date = f.Send_Date '
-            .'LEFT JOIN qsum ON qsum.Drop_Name = f.Drop_Name AND qsum.Send_Date = f.Send_Date '
-            .'LEFT JOIN esum ON esum.Drop_Name = f.Drop_Name AND esum.Send_Date = f.Send_Date '
-            .'LEFT JOIN active_reps ar ON ar.Send_Date = f.Send_Date';
+            . 'LEFT JOIN csum ON csum.Drop_Name = f.Drop_Name AND csum.Send_Date = f.Send_Date '
+            . 'LEFT JOIN qsum ON qsum.Drop_Name = f.Drop_Name AND qsum.Send_Date = f.Send_Date '
+            . 'LEFT JOIN esum ON esum.Drop_Name = f.Drop_Name AND esum.Send_Date = f.Send_Date '
+            . 'LEFT JOIN active_reps ar ON ar.Send_Date = f.Send_Date';
 
         $sortMap = [
             'send_date' => 'f.Send_Date',
@@ -328,7 +397,7 @@ SQL;
         $sortExpression = $sortMap[$sortKey] ?? $sortMap['send_date'];
         $sortDirection = strtolower((string) ($filters['dir'] ?? 'asc')) === 'desc' ? 'DESC' : 'ASC';
 
-        $orderParts = [$sortExpression.' '.$sortDirection];
+        $orderParts = [$sortExpression . ' ' . $sortDirection];
         if (strtolower($sortExpression) !== 'f.drop_name') {
             $orderParts[] = 'f.Drop_Name ASC';
         }
@@ -336,25 +405,57 @@ SQL;
             $orderParts[] = 'f.Send_Date ASC';
         }
 
-        $orderSql = ' ORDER BY '.implode(', ', $orderParts);
+        $orderSql = ' ORDER BY ' . implode(', ', $orderParts);
 
         // PERFORMANCE FIX: Single query with window function to get count + data in one pass
-        $dataSql = $cteHeader.' '.$selectCols.$joins.$resultWhereSql.$orderSql.' OFFSET '.$offset.' ROWS FETCH NEXT '.$perPage.' ROWS ONLY';
+        $dataSql = $cteHeader . ' ' . $selectCols . $joins . $resultWhereSql . $orderSql . ' OFFSET ' . $offset . ' ROWS FETCH NEXT ' . $perPage . ' ROWS ONLY';
 
         $rows = $this->connection()->select($dataSql, $allParams);
         $total = !empty($rows) ? (int) ($rows[0]->_total_count ?? 0) : 0;
-        
+
         // Remove internal _total_count from result rows
         foreach ($rows as $row) {
             unset($row->_total_count);
         }
 
         $finalColumns = [
-            'Drop Name','Tier','Send Date','Marketing Type','Vendor','Data Provider','Intent','Mail Style','Amount Dropped','Drop Cost','Calls',
-            'Total Leads','Qualified Leads','Unqualified Leads','Assigned Leads','Active Reps',
-            'Lead Rate','Calls Per Rep','Cost Per Call','Amount Per Rep','Price Per Drop',
-            'Total Enrollments','Cancels','NSFs','Net Enrollments','CPA','Enrolled Debt','Average Debt','Conversion Rate %','ROI Ratio','Est Revenue','Est Profit','Retention Rate %','Cost Per Lead','Revenue Per Lead',
-            'Veritas Enrollment','Veritas Monthly'
+            'Drop Name',
+            'Tier',
+            'Send Date',
+            'Marketing Type',
+            'Vendor',
+            'Data Provider',
+            'Intent',
+            'Mail Style',
+            'Amount Dropped',
+            'Drop Cost',
+            'Calls',
+            'Total Leads',
+            'Qualified Leads',
+            'Unqualified Leads',
+            'Assigned Leads',
+            'Active Reps',
+            'Lead Rate',
+            'Calls Per Rep',
+            'Cost Per Call',
+            'Amount Per Rep',
+            'Price Per Drop',
+            'Total Enrollments',
+            'Cancels',
+            'NSFs',
+            'Net Enrollments',
+            'CPA',
+            'Enrolled Debt',
+            'Average Debt',
+            'Conversion Rate %',
+            'ROI Ratio',
+            'Est Revenue',
+            'Est Profit',
+            'Retention Rate %',
+            'Cost Per Lead',
+            'Revenue Per Lead',
+            'Veritas Enrollment',
+            'Veritas Monthly'
         ];
 
         return [
