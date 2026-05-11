@@ -84,7 +84,7 @@ class Formatter
     <div class="container">
         <div class="header">
             <h1>Automation &amp; Sync Summary</h1>
-            <p>Inventory from TblReports and TblAutomation. Evidence from TblLog, table activity, and Laravel scheduler. Generated ' . $this->escape($generatedAt) . '.</p>
+            <p>Inventory from cmd-runner automations, TblReports, and TblAutomation. Automation evidence prioritizes cmd-runner automation_logs, then TblLog/table activity fallback. Generated ' . $this->escape($generatedAt) . '.</p>
         </div>
         <div class="summary">
             <div class="card"><div class="card-label">Total Items</div><div class="card-value">' . $totalCount . '</div></div>

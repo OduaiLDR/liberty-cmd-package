@@ -2,6 +2,8 @@
 
 namespace Cmd\Reports\Console\Commands\GenerateSyncSummary;
 
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use PDO;
 
 class StatusBuilder
@@ -197,9 +199,14 @@ class StatusBuilder
             ORDER BY LTRIM(RTRIM([Automation_Name]))
         ";
 
-        $stmt = $this->sqlConnection->query($sql);
-        $records = $stmt->fetchAll(PDO::FETCH_ASSOC);
-        $items = [];
+        $items = $this->loadCmdRunnerAutomationItems();
+
+        try {
+            $stmt = $this->sqlConnection->query($sql);
+            $records = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        } catch (\Throwable) {
+            return array_values($items);
+        }
 
         foreach ($records as $record) {
             $name = trim((string) ($record['Automation_Name'] ?? ''));
@@ -207,17 +214,153 @@ class StatusBuilder
                 continue;
             }
 
-            $items[] = [
+            $scope = trim((string) ($record['Table_Name'] ?? '')) ?: 'N/A';
+            $items[$this->automationItemKey($name, $scope)] ??= [
                 'name' => $name,
                 'type' => 'Automation',
-                'scope' => trim((string) ($record['Table_Name'] ?? '')) ?: 'N/A',
+                'scope' => $scope,
                 'source' => 'TblAutomation',
                 'schedule_text' => trim((string) ($record['Schedule'] ?? '')),
                 'candidates' => [$name],
             ];
         }
 
+        return array_values($items);
+    }
+
+    /**
+     * @return array<string, array<string, mixed>>
+     */
+    private function loadCmdRunnerAutomationItems(): array
+    {
+        if (!$this->hasCmdRunnerTable('automations')) {
+            return [];
+        }
+
+        try {
+            $records = DB::table('automations')
+                ->select([
+                    'id',
+                    'name',
+                    'slug',
+                    'command',
+                    'schedule_mode',
+                    'timezone',
+                    'daily_time',
+                    'run_times',
+                    'day_times',
+                    'weekly_days',
+                    'specific_dates',
+                    'is_active',
+                ])
+                ->orderBy('name')
+                ->get();
+        } catch (\Throwable) {
+            return [];
+        }
+
+        $items = [];
+
+        foreach ($records as $record) {
+            $name = trim((string) ($record->name ?? ''));
+            $command = trim((string) ($record->command ?? ''));
+            if ($name === '' && $command === '') {
+                continue;
+            }
+
+            $displayName = $name !== '' ? $name : $command;
+            $scope = $command !== '' ? $command : 'cmd-runner';
+
+            $items[$this->automationItemKey($displayName, $scope)] = [
+                'name' => $displayName,
+                'type' => 'Automation',
+                'scope' => $scope,
+                'source' => 'cmd-runner automations',
+                'schedule_text' => $this->formatCmdRunnerSchedule((array) $record),
+                'candidates' => array_values(array_filter([
+                    $displayName,
+                    $command,
+                    strtok($command, ' ') ?: '',
+                    (string) ($record->slug ?? ''),
+                ])),
+            ];
+        }
+
         return $items;
+    }
+
+    private function automationItemKey(string $name, string $scope): string
+    {
+        return $this->normalizeName($name) . '|' . $this->normalizeName($scope);
+    }
+
+    private function hasCmdRunnerTable(string $table): bool
+    {
+        try {
+            return Schema::hasTable($table);
+        } catch (\Throwable) {
+            return false;
+        }
+    }
+
+    /**
+     * @param array<string, mixed> $automation
+     */
+    private function formatCmdRunnerSchedule(array $automation): string
+    {
+        $mode = (string) ($automation['schedule_mode'] ?? 'daily');
+        $runTimes = $this->decodeJsonArray($automation['run_times'] ?? null);
+        $dayTimes = $this->decodeJsonArray($automation['day_times'] ?? null);
+        $specificDates = $this->decodeJsonArray($automation['specific_dates'] ?? null);
+        $dailyTime = trim((string) ($automation['daily_time'] ?? ''));
+
+        if ($mode === 'specific_dates') {
+            $dates = array_values(array_filter(array_map('strval', $specificDates)));
+            $times = $runTimes !== [] ? $runTimes : ($dailyTime !== '' ? [$dailyTime] : []);
+
+            if ($dates !== [] && $times !== []) {
+                return 'Monthly ' . implode(', ', $dates) . ' ' . implode(', ', $times);
+            }
+        }
+
+        if ($mode === 'custom' && $dayTimes !== []) {
+            $parts = [];
+            foreach ($dayTimes as $day => $times) {
+                if (!is_array($times) || $times === []) {
+                    continue;
+                }
+                $parts[] = ucfirst((string) $day) . ' ' . implode(', ', array_map('strval', $times));
+            }
+
+            if ($parts !== []) {
+                return implode('; ', $parts);
+            }
+        }
+
+        $times = $runTimes !== [] ? $runTimes : ($dailyTime !== '' ? [$dailyTime] : []);
+        if ($times !== []) {
+            return 'Daily at ' . implode(', ', array_map('strval', $times));
+        }
+
+        return ((int) ($automation['is_active'] ?? 1) === 1) ? 'Scheduled' : 'Inactive';
+    }
+
+    /**
+     * @return array<int|string, mixed>
+     */
+    private function decodeJsonArray(mixed $value): array
+    {
+        if (is_array($value)) {
+            return $value;
+        }
+
+        if ($value === null || $value === '') {
+            return [];
+        }
+
+        $decoded = json_decode((string) $value, true);
+
+        return is_array($decoded) ? $decoded : [];
     }
 
     /**
@@ -389,6 +532,12 @@ class StatusBuilder
             }
         }
 
+        foreach ($this->loadCmdRunnerAutomationLogHistoryMap() as $normalized => $entries) {
+            foreach ($entries as $entry) {
+                $this->appendHistoryEntry($historyMap, $normalized, $entry);
+            }
+        }
+
         foreach ($historyMap as &$entries) {
             usort($entries, fn(array $left, array $right): int => ($right['last_run'] ?? null) <=> ($left['last_run'] ?? null));
             $entries = array_slice($entries, 0, self::MAX_LOG_HISTORY_PER_MACRO);
@@ -490,6 +639,76 @@ class StatusBuilder
     }
 
     /**
+     * @return array<string, array<int, array<string, mixed>>>
+     */
+    private function loadCmdRunnerAutomationLogHistoryMap(): array
+    {
+        if (!$this->hasCmdRunnerTable('automation_logs') || !$this->hasCmdRunnerTable('automations')) {
+            return [];
+        }
+
+        try {
+            $records = DB::table('automation_logs')
+                ->join('automations', 'automation_logs.automation_id', '=', 'automations.id')
+                ->select([
+                    'automations.name',
+                    'automations.slug',
+                    'automations.command',
+                    'automation_logs.status',
+                    'automation_logs.output',
+                    'automation_logs.error',
+                    'automation_logs.triggered_by',
+                    'automation_logs.started_at',
+                    'automation_logs.finished_at',
+                ])
+                ->orderByDesc('automation_logs.started_at')
+                ->limit(500)
+                ->get();
+        } catch (\Throwable) {
+            return [];
+        }
+
+        $map = [];
+
+        foreach ($records as $record) {
+            $name = trim((string) ($record->name ?? ''));
+            $command = trim((string) ($record->command ?? ''));
+            $status = trim((string) ($record->status ?? ''));
+            $error = trim((string) ($record->error ?? ''));
+            $triggeredBy = trim((string) ($record->triggered_by ?? ''));
+            $runAt = (string) (($record->finished_at ?? null) ?: ($record->started_at ?? ''));
+            $result = $status !== '' ? $status : 'unknown';
+
+            if ($error !== '') {
+                $result .= ': ' . $error;
+            }
+
+            if ($triggeredBy !== '') {
+                $result .= ' (triggered by ' . $triggeredBy . ')';
+            }
+
+            $entry = [
+                'macro' => $command !== '' ? $command : $name,
+                'description' => $name,
+                'action' => $command,
+                'result' => $result,
+                'last_run' => $this->parseSqlServerTimestamp($runAt),
+                'source' => 'cmd-runner automation_logs',
+                'scopes' => $this->extractScopes($name, $command . ' ' . $result),
+            ];
+
+            foreach ([$name, $command, strtok($command, ' ') ?: '', (string) ($record->slug ?? '')] as $candidate) {
+                $normalized = $this->normalizeName((string) $candidate);
+                if ($normalized !== '') {
+                    $this->appendHistoryEntry($map, $normalized, $entry);
+                }
+            }
+        }
+
+        return $map;
+    }
+
+    /**
      * @param array<int, string> $candidates
      * @param array<string, array<int, array<string, mixed>>> $historyMap
      * @return array{best:array<string, mixed>|null,history:array<int, array<string, mixed>>,match_quality:string}
@@ -531,6 +750,19 @@ class StatusBuilder
         }
 
         if ($type !== 'Report') {
+            $cmdRunnerEntries = array_values(array_filter(
+                $entries,
+                static fn(array $entry): bool => (string) ($entry['source'] ?? '') === 'cmd-runner automation_logs'
+            ));
+
+            if ($cmdRunnerEntries !== []) {
+                return [
+                    'best' => $cmdRunnerEntries[0],
+                    'history' => $cmdRunnerEntries,
+                    'match_quality' => 'generic',
+                ];
+            }
+
             $tblLogEntries = array_values(array_filter(
                 $entries,
                 static fn(array $entry): bool => (string) ($entry['source'] ?? '') === 'TblLog'

@@ -63,7 +63,7 @@ class Formatter
     <div class="container">
         <div class="header">
             <h1>Automation Run Summary</h1>
-            <p>Inventory sourced from TblReports and TblAutomation. Generated {$generatedAt}.</p>
+            <p>Inventory sourced from cmd-runner automations, TblReports, and TblAutomation. Automation run evidence prioritizes cmd-runner automation_logs. Generated {$generatedAt}.</p>
         </div>
         <div class="summary">
             <div class="summary-item">
@@ -101,7 +101,7 @@ HTML;
         $html .= <<<HTML
         </div>
         <div class="footer">
-            This report is read-only. It compares configured inventory from TblReports and TblAutomation against available execution evidence.
+            This report is read-only. It compares configured inventory from cmd-runner automations, TblReports, and TblAutomation against available execution evidence.
         </div>
     </div>
 </body>
