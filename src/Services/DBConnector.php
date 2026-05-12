@@ -28,7 +28,7 @@ class DBConnector
     private ?string $accessToken = null;
     private ?int $tokenExpiry = null;
     private Client $client;
-    
+
     // SQL Server connection properties
     private ?PDO $sqlServerConnection = null;
     private ?array $sqlServerConfig = null;
@@ -37,7 +37,7 @@ class DBConnector
     {
         // Validate required Snowflake configuration
         $this->validateSnowflakeConfig($config);
-        
+
         $this->account = $config['account'];
         $this->user = strtoupper($config['user']);
         $this->database = $config['database'] ?? 'DPP_DATA';
@@ -76,7 +76,7 @@ class DBConnector
         if (!empty($missing)) {
             throw new Exception(
                 'Missing required Snowflake configuration: ' . implode(', ', $missing) . '. ' .
-                'Please set the appropriate environment variables or update the configuration file.'
+                    'Please set the appropriate environment variables or update the configuration file.'
             );
         }
     }
@@ -88,7 +88,7 @@ class DBConnector
     public static function fromEnvironment(string $env, string $mode = null): self
     {
         $config = self::loadConfiguration();
-        
+
         // Auto-detect mode based on credentials if not specified
         if (!$mode) {
             // Check if we have snowflake config
@@ -104,7 +104,7 @@ class DBConnector
                 $mode = 'production'; // Default
             }
         }
-        
+
         // Check if we have the new configuration structure with mode support
         if (isset($config['snowflake']) && isset($config[$mode])) {
             // New structure with both production and sandbox: config[mode][env]
@@ -113,7 +113,7 @@ class DBConnector
             }
             return new self($config[$mode][$env]);
         }
-        
+
         // Check if we have only production snowflake configuration
         if (isset($config['snowflake'])) {
             // New structure: config['snowflake'][env] (production only)
@@ -122,7 +122,7 @@ class DBConnector
             }
             return new self($config['snowflake'][$env]);
         }
-        
+
         if (!isset($config[$mode][$env])) {
             throw new Exception("Unknown environment: {$env} in mode: {$mode}");
         }
@@ -227,7 +227,7 @@ class DBConnector
     private function generateJWT(): string
     {
         $now = time();
-        
+
         // For unencrypted keys, passphrase is not needed
         $privateKey = openssl_pkey_get_private($this->privateKey, $this->privateKeyPassphrase ?: null);
         if (!$privateKey) {
@@ -236,13 +236,13 @@ class DBConnector
             $this->debugLog("Key starts with: " . substr($this->privateKey, 0, 50));
             throw new Exception('Failed to load private key: ' . $error);
         }
-        
+
         // Validate key type
         $keyDetails = openssl_pkey_get_details($privateKey);
         if ($keyDetails['type'] !== OPENSSL_KEYTYPE_RSA) {
             throw new Exception('Private key must be RSA type, got: ' . $keyDetails['type']);
         }
-        
+
         $this->debugLog("Private key loaded successfully. Key size: " . $keyDetails['bits'] . " bits");
 
         // Get public key details for fingerprint
@@ -256,7 +256,7 @@ class DBConnector
         $publicKeyDer = $this->pemToDer($publicKeyPem);
         $sha256Fingerprint = hash('sha256', $publicKeyDer, true);
         $fingerprintB64 = base64_encode($sha256Fingerprint);
-        
+
         // JWT Header - Simple format as per Snowflake docs
         $header = [
             'alg' => 'RS256',
@@ -266,10 +266,10 @@ class DBConnector
         // JWT Payload - Snowflake official format
         $qualifiedUser = $this->getQualifiedUsername();
         $audienceUrl = 'https://' . strtolower($this->account) . '.snowflakecomputing.com';
-        
+
         // iss format: account_identifier.user.SHA256:public_key_fingerprint
         $issuer = $qualifiedUser . '.SHA256:' . $fingerprintB64;
-        
+
         $payload = [
             'iss' => $issuer,
             'sub' => $qualifiedUser,
@@ -279,7 +279,7 @@ class DBConnector
         ];
 
         $jwt = JWT::encode($payload, $privateKey, 'RS256', null, $header);
-        
+
         // Debug output
         $this->debugLog("Generated JWT for {$this->account}: " . substr($jwt, 0, 100) . "...");
         $this->debugLog("Issuer (iss): {$payload['iss']}");
@@ -288,7 +288,7 @@ class DBConnector
         $this->debugLog("Public Key Fingerprint: {$fingerprintB64}");
         $this->debugLog("JWT Header: " . json_encode($header));
         $this->debugLog("JWT Payload: " . json_encode($payload));
-        
+
         return $jwt;
     }
 
@@ -305,7 +305,7 @@ class DBConnector
         try {
             $this->debugLog("Requesting token from: {$url}");
             $this->debugLog("JWT assertion: " . substr($jwt, 0, 100) . "...");
-            
+
             $response = $this->client->post($url, [
                 'form_params' => [
                     'grant_type' => 'urn:ietf:params:oauth:grant-type:jwt-bearer',
@@ -315,25 +315,24 @@ class DBConnector
 
             $responseBody = $response->getBody()->getContents();
             $this->debugLog("Token response: " . substr($responseBody, 0, 100) . "...");
-            
+
             // Snowflake returns the JWT token directly, not in JSON format
             if (empty($responseBody)) {
                 throw new Exception('Empty response from Snowflake token endpoint');
             }
-            
+
             // Check if it's a JWT (starts with eyJ which is base64 for {"alg":...)
             if (strpos($responseBody, 'eyJ') === 0) {
                 return $responseBody; // It's a JWT token
             }
-            
+
             // Try parsing as JSON (fallback)
             $data = json_decode($responseBody, true);
             if (isset($data['access_token'])) {
                 return $data['access_token'];
             }
-            
+
             throw new Exception('Unexpected token response format: ' . substr($responseBody, 0, 200));
-            
         } catch (\GuzzleHttp\Exception\ClientException $e) {
             $errorResponse = $e->getResponse()->getBody()->getContents();
             $this->debugLog("Token exchange error: " . $errorResponse);
@@ -354,7 +353,7 @@ class DBConnector
 
         $requestBody = [
             'statement' => $sql,
-            'timeout' => 60,
+            'timeout' => 300,
             'database' => $this->database,
             'schema' => $this->schema,
             'warehouse' => $this->warehouse,
@@ -366,7 +365,7 @@ class DBConnector
         }
 
         $this->debugLog("Making API request with token: " . substr($token, 0, 50) . "...");
-        
+
         $response = $this->client->post($url, [
             'headers' => [
                 'Authorization' => 'Bearer ' . $token,
@@ -386,7 +385,7 @@ class DBConnector
                 $statusUrl = 'https://' . strtolower($this->account) . '.snowflakecomputing.com' . $statusUrl;
             }
 
-            for ($i = 0; $i < 60; $i++) {
+            for ($i = 0; $i < 300; $i++) {
                 // Small delay between polls
                 sleep(1);
 
@@ -428,7 +427,7 @@ class DBConnector
         $partitionInfo = $result['resultSetMetaData']['partitionInfo'] ?? [];
         $statementHandle = $result['statementHandle'] ?? null;
         $totalPartitions = count($partitionInfo);
-        
+
         $this->debugLog('Partitions found: ' . $totalPartitions);
         $this->debugLog('Statement handle: ' . ($statementHandle ?? 'null'));
 
@@ -555,7 +554,7 @@ class DBConnector
         // Remove PEM headers/footers and whitespace
         $pem = preg_replace('/-----[^-]+-----/', '', $pem);
         $pem = preg_replace('/\s+/', '', $pem);
-        
+
         return base64_decode($pem);
     }
 
@@ -605,16 +604,16 @@ class DBConnector
 
         $publicKeyDetails = openssl_pkey_get_details($privateKey);
         $publicKeyPem = $publicKeyDetails['key'];
-        
+
         // Remove headers and format for Snowflake
         $publicKeyClean = preg_replace('/-----[^-]+-----/', '', $publicKeyPem);
         $publicKeyClean = preg_replace('/\s+/', '', $publicKeyClean);
-        
+
         // Calculate fingerprint
         $publicKeyDer = $this->pemToDer($publicKeyPem);
         $sha256Fingerprint = hash('sha256', $publicKeyDer, true);
         $fingerprintB64 = base64_encode($sha256Fingerprint);
-        
+
         return [
             'public_key_pem' => $publicKeyPem,
             'public_key_clean' => $publicKeyClean,
@@ -806,7 +805,7 @@ class DBConnector
     {
         try {
             $pdo = $this->getSqlServerConnection();
-            
+
             $stmt = $pdo->query("SELECT @@SERVERNAME as server_name, DB_NAME() as current_db, GETDATE() as server_time");
             $result = $stmt->fetch();
 
