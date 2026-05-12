@@ -35,7 +35,13 @@ class SyncContactsData extends Command
         // No --source given: spawn all three in parallel and stream their output here
         $this->info("[INFO] Sync Contacts Data: starting LDR, PLAW, and LT in parallel.");
 
-        $php      = PHP_BINARY;
+        $php = PHP_BINARY;
+        // When triggered via web (php-fpm), PHP_BINARY is the FPM daemon which
+        // cannot run artisan. Find the actual CLI binary instead.
+        if (str_contains(basename($php), 'fpm')) {
+            $cli = trim((string) shell_exec('which php8.3 2>/dev/null || which php8.2 2>/dev/null || which php 2>/dev/null'));
+            $php = $cli ?: 'php';
+        }
         $artisan  = base_path('artisan');
         $sources  = ['LDR', 'PLAW', 'LT'];
         $results  = [];
