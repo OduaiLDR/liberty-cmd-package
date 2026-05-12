@@ -20,7 +20,7 @@ class SyncContactsData extends Command
 
     public function handle(): int
     {
-        ini_set('memory_limit', '4G');
+        ini_set('memory_limit', '1024M');
 
         // Single-source mode: used by the parallel sub-processes spawned below
         $source = strtoupper((string) $this->option('source'));
@@ -122,14 +122,16 @@ class SyncContactsData extends Command
 
         $startDate = '2021-07-01';
 
-        // Load both SQL Server lookups before the slow Snowflake fetch
-        $this->info("[DEBUG] Loading enrollment data and drop names...");
-        $enrollmentData = $this->loadEnrollmentData($sqlConnector);
-        $dropNames      = $this->fetchAllDropNames($sqlConnector);
-        $this->info("[DEBUG] Lookups loaded. Fetching Snowflake contacts...");
-
+        // Fetch Snowflake contacts first so the SQL Server lookups can be filtered
+        // to only the rows we actually need — avoids loading entire large tables into memory.
+        $this->info("[DEBUG] Fetching Snowflake contacts...");
         $contactsData = $this->fetchContactsData($snowflake, $startDate);
         $this->info("[DEBUG] Snowflake contacts fetched (" . \count($contactsData) . " rows).");
+
+        $this->info("[DEBUG] Loading filtered enrollment data and drop names...");
+        $enrollmentData = $this->loadEnrollmentDataFiltered($sqlConnector, $contactsData);
+        $dropNames      = $this->fetchDropNamesFiltered($sqlConnector, $contactsData);
+        $this->info("[DEBUG] Lookups loaded.");
 
         // Single pass: build insert-ready rows AND collect enrollment changes simultaneously,
         // replacing the original two separate full iterations over $contactsData.
@@ -156,15 +158,46 @@ class SyncContactsData extends Command
         return Command::SUCCESS;
     }
 
-    private function loadEnrollmentData(DBConnector $connector): array
+    /**
+     * Loads enrollment data only for contacts that are enrolled in this batch.
+     * Uses a SQL Server temp table instead of loading all of TblEnrollment —
+     * avoids pulling the entire table into PHP memory on memory-constrained servers.
+     */
+    private function loadEnrollmentDataFiltered(DBConnector $connector, array $contactsData): array
     {
-        $sql = "
-            SELECT LLG_ID, Category, Agent, Affiliate_Agent
-            FROM TblEnrollment
-            WHERE Category NOT IN ('', 'FDR', 'CSS', 'CNI')
-        ";
+        $empty = ['categories' => [], 'assigned_agents' => [], 'affiliate_agents' => []];
 
-        $result = $connector->querySqlServer($sql);
+        // Only enrolled contacts can have category/affiliate changes worth checking
+        $enrolledIds = [];
+        foreach ($contactsData as $row) {
+            if (!empty($row['ENROLLED_DATE'])) {
+                $id = (string) ($row['LLG_ID'] ?? '');
+                if ($id !== '') {
+                    $enrolledIds[] = $id;
+                }
+            }
+        }
+
+        if (empty($enrolledIds)) {
+            return $empty;
+        }
+
+        $connector->querySqlServer("CREATE TABLE #TmpEnrollFilter (ContactId VARCHAR(20))");
+        foreach (\array_chunk($enrolledIds, 1000) as $chunk) {
+            $values = \implode(', ', \array_map(
+                fn($id) => "('" . \str_replace("'", "''", $id) . "')",
+                $chunk
+            ));
+            $connector->querySqlServer("INSERT INTO #TmpEnrollFilter VALUES {$values}");
+        }
+
+        $result = $connector->querySqlServer("
+            SELECT e.LLG_ID, e.Category, e.Agent, e.Affiliate_Agent
+            FROM TblEnrollment e
+            JOIN #TmpEnrollFilter f ON e.LLG_ID = 'LLG-' + f.ContactId
+            WHERE e.Category NOT IN ('', 'FDR', 'CSS', 'CNI')
+        ");
+        $connector->querySqlServer("DROP TABLE #TmpEnrollFilter");
 
         $categories      = [];
         $assignedAgents  = [];
@@ -250,10 +283,50 @@ class SyncContactsData extends Command
         return $result['data'] ?? [];
     }
 
-    private function fetchAllDropNames(DBConnector $connector): array
+    /**
+     * Fetches drop names only for the External_IDs present in this batch of contacts.
+     * Uses a SQL Server temp table to avoid loading all of TblMailers into memory.
+     * Preserves the original fallback matching on the last 9 characters of External_ID.
+     */
+    private function fetchDropNamesFiltered(DBConnector $connector, array $contactsData): array
     {
-        $sql    = "SELECT External_ID, Drop_Name FROM TblMailers WHERE External_ID IS NOT NULL";
-        $result = $connector->querySqlServer($sql);
+        $externalIds = [];
+        foreach ($contactsData as $row) {
+            $tpId = \trim((string) ($row['EXTERNAL_ID'] ?? ''));
+            if ($tpId !== '') {
+                $externalIds[$tpId] = true;
+            }
+        }
+
+        if (empty($externalIds)) {
+            return [];
+        }
+
+        $externalIds = \array_keys($externalIds);
+
+        $connector->querySqlServer("CREATE TABLE #TmpMailerFilter (ExtId VARCHAR(50))");
+        foreach (\array_chunk($externalIds, 1000) as $chunk) {
+            $values = \implode(', ', \array_map(
+                fn($id) => "('" . \str_replace("'", "''", \substr($id, 0, 50)) . "')",
+                $chunk
+            ));
+            $connector->querySqlServer("INSERT INTO #TmpMailerFilter VALUES {$values}");
+        }
+
+        // Exact match OR last-9-char suffix match (mirrors the PHP-side fallback lookup)
+        $result = $connector->querySqlServer("
+            SELECT m.External_ID, m.Drop_Name
+            FROM TblMailers m
+            WHERE m.External_ID IS NOT NULL
+              AND m.Drop_Name IS NOT NULL
+              AND (
+                  m.External_ID IN (SELECT ExtId FROM #TmpMailerFilter)
+                  OR (LEN(m.External_ID) > 9 AND RIGHT(m.External_ID, 9) IN (
+                      SELECT RIGHT(ExtId, 9) FROM #TmpMailerFilter WHERE LEN(ExtId) > 9
+                  ))
+              )
+        ");
+        $connector->querySqlServer("DROP TABLE #TmpMailerFilter");
 
         $lookup = [];
         foreach ($result['data'] ?? [] as $row) {
@@ -261,15 +334,15 @@ class SyncContactsData extends Command
             $dropName   = $row['Drop_Name'] ?? '';
             if ($externalId && $dropName) {
                 $lookup[$externalId] = $dropName;
-                // Also store last 9 chars for fallback matching
                 if (\strlen($externalId) > 9) {
-                    $last9 = substr($externalId, -9);
+                    $last9 = \substr($externalId, -9);
                     if (!isset($lookup[$last9])) {
                         $lookup[$last9] = $dropName;
                     }
                 }
             }
         }
+
         return $lookup;
     }
 
