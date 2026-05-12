@@ -434,9 +434,8 @@ class SyncContactsData extends Command
             . 'Zip, Stage, Status, Debt_Amount, Debt_Enrolled, Credit_Score, Credit_Utilization, '
             . 'Category, Affiliate_Agent, TP_ID';
 
-        // 5 000 rows per batch: ~5× fewer SQL round-trips than the previous 1 000.
-        // SQL Server handles INSERT ... VALUES with thousands of rows comfortably.
-        $batchSize = 5000;
+        // SQL Server hard-limits INSERT ... VALUES to exactly 1 000 rows per statement.
+        $batchSize = 1000;
         $total     = \count($data);
         $inserted  = 0;
 
