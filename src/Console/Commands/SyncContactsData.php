@@ -20,7 +20,7 @@ class SyncContactsData extends Command
 
     public function handle(): int
     {
-        ini_set('memory_limit', '2G');
+        ini_set('memory_limit', '4G');
 
         // Single-source mode: used by the parallel sub-processes spawned below
         $source = strtoupper((string) $this->option('source'));
