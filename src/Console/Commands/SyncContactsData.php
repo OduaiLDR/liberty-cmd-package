@@ -13,6 +13,8 @@ class SyncContactsData extends Command
 
     protected $description = 'Sync contacts data from Snowflake to SQL Server (TblContactsLDR, TblContactsPLAW, and TblContactsLT)';
 
+    private const PAGE_SIZE = 10000;
+
     private string $source;
     private int $debtAmountCustomId;
     private int $agentCustomId;
@@ -20,9 +22,8 @@ class SyncContactsData extends Command
 
     public function handle(): int
     {
-        ini_set('memory_limit', '1024M');
+        ini_set('memory_limit', '512M');
 
-        // Single-source mode: used by the parallel sub-processes spawned below
         $source = strtoupper((string) $this->option('source'));
         if ($source !== '') {
             if (!in_array($source, ['LDR', 'PLAW', 'LT'], true)) {
@@ -32,12 +33,9 @@ class SyncContactsData extends Command
             return $this->syncForSource($source);
         }
 
-        // No --source given: spawn all three in parallel and stream their output here
         $this->info("[INFO] Sync Contacts Data: starting LDR, PLAW, and LT in parallel.");
 
         $php = PHP_BINARY;
-        // When triggered via web (php-fpm), PHP_BINARY is the FPM daemon which
-        // cannot run artisan. Find the actual CLI binary instead.
         if (str_contains(basename($php), 'fpm')) {
             $cli = trim((string) shell_exec('which php8.3 2>/dev/null || which php8.2 2>/dev/null || which php 2>/dev/null'));
             $php = $cli ?: 'php';
@@ -85,7 +83,6 @@ class SyncContactsData extends Command
         $this->source = $source;
         $this->info("[INFO] Sync Contacts Data: starting for {$this->source}.");
 
-        // Set source-specific configuration
         if ($this->source === 'PLAW') {
             $this->debtAmountCustomId = 743019;
             $this->agentCustomId      = 742153;
@@ -120,37 +117,70 @@ class SyncContactsData extends Command
         }
         $this->info("[DEBUG] SQL Server connector OK.");
 
-        $startDate = '2021-07-01';
+        $this->clearTargetTable($sqlConnector);
 
-        // Fetch Snowflake contacts first so the SQL Server lookups can be filtered
-        // to only the rows we actually need — avoids loading entire large tables into memory.
-        $this->info("[DEBUG] Fetching Snowflake contacts...");
-        $contactsData = $this->fetchContactsData($snowflake, $startDate);
-        $this->info("[DEBUG] Snowflake contacts fetched (" . \count($contactsData) . " rows).");
+        // Streaming pipeline:
+        //   Fetch 10 000 rows from Snowflake → load only the SQL Server lookup rows
+        //   that match THIS chunk → process → insert → free memory → repeat.
+        //
+        // Peak memory stays at O(PAGE_SIZE) regardless of total row count.
+        // $seenTpIds and enrollment-change arrays are the only state kept across chunks;
+        // both are small compared to the full contact dataset.
 
-        $this->info("[DEBUG] Loading filtered enrollment data and drop names...");
-        $enrollmentData = $this->loadEnrollmentDataFiltered($sqlConnector, $contactsData);
-        $dropNames      = $this->fetchDropNamesFiltered($sqlConnector, $contactsData);
-        $this->info("[DEBUG] Lookups loaded.");
+        $startDate        = '2021-07-01';
+        $lastId           = 0;
+        $seenTpIds        = [];
+        $categoryChanges  = [];
+        $affiliateChanges = [];
+        $totalFetched     = 0;
+        $totalInserted    = 0;
 
-        // Single pass: build insert-ready rows AND collect enrollment changes simultaneously,
-        // replacing the original two separate full iterations over $contactsData.
-        [$processedData, $categoryChanges, $affiliateChanges] = $this->processAndCollectChanges(
-            $contactsData,
-            $dropNames,
-            $enrollmentData
-        );
+        do {
+            $chunk     = $this->fetchContactsPage($snowflake, $startDate, $lastId, self::PAGE_SIZE);
+            $chunkSize = \count($chunk);
 
-        $this->info('[INFO] Fetched ' . \count($contactsData) . ' → processed ' . \count($processedData) . ' records');
-        $this->info('[INFO] Enrollment updates: ' . \count($categoryChanges) . ' category, ' . \count($affiliateChanges) . ' affiliate agent');
+            if ($chunkSize === 0) {
+                break;
+            }
+
+            $totalFetched += $chunkSize;
+            $lastId        = (int) end($chunk)['LLG_ID'];
+
+            // SQL Server lookups scoped to this chunk — each is a tiny targeted query
+            $enrollmentData = $this->loadEnrollmentDataFiltered($sqlConnector, $chunk);
+            $dropNames      = $this->fetchDropNamesFiltered($sqlConnector, $chunk);
+
+            // Single pass: build insert rows + collect enrollment changes
+            [$processedChunk, $newCatChanges, $newAffChanges] = $this->processChunk(
+                $chunk,
+                $dropNames,
+                $enrollmentData,
+                $seenTpIds   // passed by reference — survives across chunks for TP_ID dedup
+            );
+
+            // Merge enrollment changes (small arrays — just IDs + category strings)
+            foreach ($newCatChanges as $c) {
+                $categoryChanges[] = $c;
+            }
+            foreach ($newAffChanges as $c) {
+                $affiliateChanges[] = $c;
+            }
+
+            $totalInserted += \count($processedChunk);
+            $this->insertChunk($sqlConnector, $processedChunk);
+
+            // Free everything from this iteration before fetching the next chunk
+            unset($chunk, $enrollmentData, $dropNames, $processedChunk, $newCatChanges, $newAffChanges);
+            \gc_collect_cycles();
+
+            $this->info("[INFO] Progress: {$totalFetched} fetched, {$totalInserted} inserted...");
+        } while ($chunkSize === self::PAGE_SIZE);
+
+        $this->info("[INFO] Completed: {$totalInserted} records inserted into {$this->targetTable}.");
+        $this->info("[INFO] Enrollment updates: " . \count($categoryChanges) . " category, " . \count($affiliateChanges) . " affiliate agent");
 
         $this->applyEnrollmentCategoryUpdates($sqlConnector, $categoryChanges);
         $this->applyEnrollmentAffiliateUpdates($sqlConnector, $affiliateChanges);
-
-        $this->clearTargetTable($sqlConnector);
-
-        $this->info('[INFO] Inserting into ' . $this->targetTable . '...');
-        $this->insertContactData($sqlConnector, $processedData);
 
         $this->updateRelatedTables($sqlConnector);
 
@@ -158,72 +188,21 @@ class SyncContactsData extends Command
         return Command::SUCCESS;
     }
 
+    // -------------------------------------------------------------------------
+    // Data fetching
+    // -------------------------------------------------------------------------
+
     /**
-     * Loads enrollment data only for contacts that are enrolled in this batch.
-     * Uses a SQL Server temp table instead of loading all of TblEnrollment —
-     * avoids pulling the entire table into PHP memory on memory-constrained servers.
+     * Fetches one page of contacts from Snowflake using cursor-based pagination on c.ID.
+     * Cursor pagination (WHERE c.ID > $lastId) is faster than OFFSET because Snowflake
+     * can filter early on the indexed ID column instead of scanning and discarding rows.
      */
-    private function loadEnrollmentDataFiltered(DBConnector $connector, array $contactsData): array
-    {
-        $empty = ['categories' => [], 'assigned_agents' => [], 'affiliate_agents' => []];
-
-        // Only enrolled contacts can have category/affiliate changes worth checking
-        $enrolledIds = [];
-        foreach ($contactsData as $row) {
-            if (!empty($row['ENROLLED_DATE'])) {
-                $id = (string) ($row['LLG_ID'] ?? '');
-                if ($id !== '') {
-                    $enrolledIds[] = $id;
-                }
-            }
-        }
-
-        if (empty($enrolledIds)) {
-            return $empty;
-        }
-
-        $connector->querySqlServer("CREATE TABLE #TmpEnrollFilter (ContactId VARCHAR(20))");
-        foreach (\array_chunk($enrolledIds, 1000) as $chunk) {
-            $values = \implode(', ', \array_map(
-                fn($id) => "('" . \str_replace("'", "''", $id) . "')",
-                $chunk
-            ));
-            $connector->querySqlServer("INSERT INTO #TmpEnrollFilter VALUES {$values}");
-        }
-
-        $result = $connector->querySqlServer("
-            SELECT e.LLG_ID, e.Category, e.Agent, e.Affiliate_Agent
-            FROM TblEnrollment e
-            JOIN #TmpEnrollFilter f ON e.LLG_ID = 'LLG-' + f.ContactId
-            WHERE e.Category NOT IN ('', 'FDR', 'CSS', 'CNI')
-        ");
-        $connector->querySqlServer("DROP TABLE #TmpEnrollFilter");
-
-        $categories      = [];
-        $assignedAgents  = [];
-        $affiliateAgents = [];
-
-        foreach ($result['data'] ?? [] as $row) {
-            $llgId = $row['LLG_ID'] ?? '';
-            if (preg_match('/LLG-(\d+)/', $llgId, $matches)) {
-                $contactId                   = $matches[1];
-                $categories[$contactId]      = $row['Category'] ?? '';
-                $assignedAgents[$contactId]  = $row['Agent'] ?? '';
-                $affiliateAgents[$contactId] = $row['Affiliate_Agent'] ?? '';
-            }
-        }
-
-        return [
-            'categories'       => $categories,
-            'assigned_agents'  => $assignedAgents,
-            'affiliate_agents' => $affiliateAgents,
-        ];
-    }
-
-    private function fetchContactsData(DBConnector $snowflake, string $startDate): array
-    {
-        // QUALIFY filters ROW_NUMBER directly in Snowflake, eliminating the outer
-        // subquery wrapper. Snowflake optimises QUALIFY before materialising rows.
+    private function fetchContactsPage(
+        DBConnector $snowflake,
+        string $startDate,
+        int $lastId,
+        int $limit
+    ): array {
         $sql = "
             SELECT
                 TIMEADD(hour, -7, c.CREATED) AS CREATED,
@@ -276,7 +255,10 @@ class SyncContactsData extends Command
             WHERE TIMEADD(hour, -7, COALESCE(c.MODIFIED, c.CREATED)) >= '{$this->esc($startDate)}'
               AND COALESCE(c.FIRSTNAME, '') <> ''
               AND ISCOAPP = 0
+              AND c.ID > {$lastId}
             QUALIFY ROW_NUMBER() OVER(PARTITION BY c.ID ORDER BY s.STAMP DESC) = 1
+            ORDER BY c.ID
+            LIMIT {$limit}
         ";
 
         $result = $snowflake->query($sql);
@@ -284,14 +266,74 @@ class SyncContactsData extends Command
     }
 
     /**
-     * Fetches drop names only for the External_IDs present in this batch of contacts.
-     * Uses a SQL Server temp table to avoid loading all of TblMailers into memory.
-     * Preserves the original fallback matching on the last 9 characters of External_ID.
+     * Loads enrollment data scoped to enrolled contacts in this chunk.
+     * A temp table passes the IDs to SQL Server, avoiding a full TblEnrollment table scan.
      */
-    private function fetchDropNamesFiltered(DBConnector $connector, array $contactsData): array
+    private function loadEnrollmentDataFiltered(DBConnector $connector, array $chunk): array
+    {
+        $empty = ['categories' => [], 'assigned_agents' => [], 'affiliate_agents' => []];
+
+        $enrolledIds = [];
+        foreach ($chunk as $row) {
+            if (!empty($row['ENROLLED_DATE'])) {
+                $id = (string) ($row['LLG_ID'] ?? '');
+                if ($id !== '') {
+                    $enrolledIds[] = $id;
+                }
+            }
+        }
+
+        if (empty($enrolledIds)) {
+            return $empty;
+        }
+
+        $connector->querySqlServer("CREATE TABLE #TmpEnrollFilter (ContactId VARCHAR(20))");
+        foreach (\array_chunk($enrolledIds, 1000) as $batch) {
+            $values = \implode(', ', \array_map(
+                fn($id) => "('" . \str_replace("'", "''", $id) . "')",
+                $batch
+            ));
+            $connector->querySqlServer("INSERT INTO #TmpEnrollFilter VALUES {$values}");
+        }
+
+        $result = $connector->querySqlServer("
+            SELECT e.LLG_ID, e.Category, e.Agent, e.Affiliate_Agent
+            FROM TblEnrollment e
+            JOIN #TmpEnrollFilter f ON e.LLG_ID = 'LLG-' + f.ContactId
+            WHERE e.Category NOT IN ('', 'FDR', 'CSS', 'CNI')
+        ");
+        $connector->querySqlServer("DROP TABLE #TmpEnrollFilter");
+
+        $categories      = [];
+        $assignedAgents  = [];
+        $affiliateAgents = [];
+
+        foreach ($result['data'] ?? [] as $row) {
+            $llgId = $row['LLG_ID'] ?? '';
+            if (preg_match('/LLG-(\d+)/', $llgId, $matches)) {
+                $contactId                   = $matches[1];
+                $categories[$contactId]      = $row['Category'] ?? '';
+                $assignedAgents[$contactId]  = $row['Agent'] ?? '';
+                $affiliateAgents[$contactId] = $row['Affiliate_Agent'] ?? '';
+            }
+        }
+
+        return [
+            'categories'       => $categories,
+            'assigned_agents'  => $assignedAgents,
+            'affiliate_agents' => $affiliateAgents,
+        ];
+    }
+
+    /**
+     * Fetches drop names only for the External_IDs present in this chunk.
+     * Uses a SQL Server temp table to avoid loading all of TblMailers.
+     * Preserves fallback matching on the last 9 characters of External_ID.
+     */
+    private function fetchDropNamesFiltered(DBConnector $connector, array $chunk): array
     {
         $externalIds = [];
-        foreach ($contactsData as $row) {
+        foreach ($chunk as $row) {
             $tpId = \trim((string) ($row['EXTERNAL_ID'] ?? ''));
             if ($tpId !== '') {
                 $externalIds[$tpId] = true;
@@ -305,15 +347,14 @@ class SyncContactsData extends Command
         $externalIds = \array_keys($externalIds);
 
         $connector->querySqlServer("CREATE TABLE #TmpMailerFilter (ExtId VARCHAR(50))");
-        foreach (\array_chunk($externalIds, 1000) as $chunk) {
+        foreach (\array_chunk($externalIds, 1000) as $batch) {
             $values = \implode(', ', \array_map(
                 fn($id) => "('" . \str_replace("'", "''", \substr($id, 0, 50)) . "')",
-                $chunk
+                $batch
             ));
             $connector->querySqlServer("INSERT INTO #TmpMailerFilter VALUES {$values}");
         }
 
-        // Exact match OR last-9-char suffix match (mirrors the PHP-side fallback lookup)
         $result = $connector->querySqlServer("
             SELECT m.External_ID, m.Drop_Name
             FROM TblMailers m
@@ -346,33 +387,34 @@ class SyncContactsData extends Command
         return $lookup;
     }
 
+    // -------------------------------------------------------------------------
+    // Processing
+    // -------------------------------------------------------------------------
+
     /**
-     * Single-pass over $contactsData: builds the insert-ready rows AND collects
-     * enrollment category/affiliate changes at the same time, replacing the original
-     * two separate full iterations (processContactData + updateEnrollmentPerContact).
+     * Processes one chunk of Snowflake rows.
+     * $seenTpIds is passed by reference so TP_ID deduplication persists across chunks.
      *
-     * Dates are pre-formatted here so the insert hot-loop never constructs DateTime objects.
-     *
+     * @param  array  $seenTpIds  Mutable dedup map — survives across all chunks in a run.
      * @return array{0: array, 1: array, 2: array}  [processedRows, categoryChanges, affiliateChanges]
      */
-    private function processAndCollectChanges(
-        array $contactsData,
+    private function processChunk(
+        array $chunk,
         array $dropNames,
-        array $enrollmentData
+        array $enrollmentData,
+        array &$seenTpIds
     ): array {
         $processed        = [];
-        $seenTpIds        = [];
         $categoryChanges  = [];
         $affiliateChanges = [];
 
         $existingCategories = $enrollmentData['categories'];
         $existingAffiliates = $enrollmentData['affiliate_agents'];
 
-        foreach ($contactsData as $row) {
+        foreach ($chunk as $row) {
             $contactId = $row['LLG_ID'] ?? '';
             $tpId      = $row['EXTERNAL_ID'] ?? '';
 
-            // Early exits before any work — skip rows we know we'll discard
             if (($row['STATUS'] ?? '') === 'Duplicate Lead') {
                 continue;
             }
@@ -391,54 +433,47 @@ class SyncContactsData extends Command
 
             $campaign = '';
             if ($tpId) {
-                $campaign = $dropNames[$tpId] ?? ($dropNames[substr($tpId, -9)] ?? '');
+                $campaign = $dropNames[$tpId] ?? ($dropNames[\substr($tpId, -9)] ?? '');
             }
 
-            // Pre-format dates once here; the insert loop reads plain strings, never
-            // constructs \DateTime objects, which is measurably faster at scale.
-            $createdFormatted  = $this->formatDate($row['CREATED'] ?? null);
-            $assignedFormatted = $this->formatDate($row['ASSIGNED_ON'] ?? null);
-
             $processed[] = [
-                'created_date'       => $createdFormatted,
-                'assigned_date'      => $assignedFormatted,
+                'created_date'       => $this->formatDate($row['CREATED'] ?? null),
+                'assigned_date'      => $this->formatDate($row['ASSIGNED_ON'] ?? null),
                 'llg_id'             => 'LLG-' . $contactId,
-                'external_id'        => substr($tpId, 0, 50),
-                'campaign'           => substr($campaign, 0, 255),
-                'data_source'        => substr($row['DATA_SOURCE'] ?? '', 0, 255),
-                'created_by'         => substr($row['CREATED_BY'] ?? '', 0, 255),
-                'agent'              => substr($agent, 0, 255),
-                'client'             => substr($row['FULLNAME'] ?? '', 0, 255),
-                'phone'              => substr($this->cleanPhone($row['CELL_PHONE'] ?? ''), 0, 50),
+                'external_id'        => \substr($tpId, 0, 50),
+                'campaign'           => \substr($campaign, 0, 255),
+                'data_source'        => \substr($row['DATA_SOURCE'] ?? '', 0, 255),
+                'created_by'         => \substr($row['CREATED_BY'] ?? '', 0, 255),
+                'agent'              => \substr($agent, 0, 255),
+                'client'             => \substr($row['FULLNAME'] ?? '', 0, 255),
+                'phone'              => \substr($this->cleanPhone($row['CELL_PHONE'] ?? ''), 0, 50),
                 'email'              => $row['EMAIL'] ?? '',
-                'address_1'          => substr($row['ADDRESS1'] ?? '', 0, 255),
-                'address_2'          => substr($row['ADDRESS2'] ?? '', 0, 255),
-                'city'               => substr($row['CITY'] ?? '', 0, 100),
-                'state'              => substr($row['STATE'] ?? '', 0, 20),
-                'zip'                => substr($row['ZIP'] ?? '', 0, 20),
+                'address_1'          => \substr($row['ADDRESS1'] ?? '', 0, 255),
+                'address_2'          => \substr($row['ADDRESS2'] ?? '', 0, 255),
+                'city'               => \substr($row['CITY'] ?? '', 0, 100),
+                'state'              => \substr($row['STATE'] ?? '', 0, 20),
+                'zip'                => \substr($row['ZIP'] ?? '', 0, 20),
                 'stage'              => $row['STAGE'] ?? '',
                 'status'             => $row['STATUS'] ?? '',
-                'debt_amount'        => floor($debtAmount / 1000) * 1000,
+                'debt_amount'        => \floor($debtAmount / 1000) * 1000,
                 'debt_enrolled'      => $debtAmount,
                 'credit_score'       => $row['CREDIT_SCORE'] ?? 0,
                 'credit_utilization' => $creditUtil,
                 'category'           => $category,
-                'affiliate_agent'    => substr($agent, 0, 255),
-                'tp_id'              => substr($tpId, 0, 50),
+                'affiliate_agent'    => \substr($agent, 0, 255),
+                'tp_id'              => \substr($tpId, 0, 50),
             ];
 
-            // Enrollment change detection — same pass, no second loop needed
+            // Enrollment change detection in the same pass
             $enrolledDate = $row['ENROLLED_DATE'] ?? '';
             if (!empty($enrolledDate) && isset($existingCategories[$contactId]) && $category !== '') {
                 $llgId = "LLG-{$contactId}";
-
                 if ($existingCategories[$contactId] !== $category) {
                     $categoryChanges[] = ['llg_id' => $llgId, 'category' => $category];
                 }
-
                 if ($category !== 'LDR') {
                     $existingAffiliate = $existingAffiliates[$contactId] ?? '';
-                    if ($agent !== '' && $existingAffiliate !== $agent && !str_ends_with(strtolower($agent), ' user')) {
+                    if ($agent !== '' && $existingAffiliate !== $agent && !\str_ends_with(\strtolower($agent), ' user')) {
                         $affiliateChanges[] = ['llg_id' => $llgId, 'agent' => $agent];
                     }
                 }
@@ -448,127 +483,73 @@ class SyncContactsData extends Command
         return [$processed, $categoryChanges, $affiliateChanges];
     }
 
-    private function normalizePlanTitle(string $title): string
-    {
-        if (empty($title)) {
-            return '';
-        }
-        if (stripos($title, 'CCS') !== false) {
-            return 'CCS';
-        }
-        return 'LDR';
-    }
+    // -------------------------------------------------------------------------
+    // Insertion
+    // -------------------------------------------------------------------------
 
-    private function parseCreditUtilization(string $value): int
+    /**
+     * Inserts one processed chunk into the target table.
+     * Each chunk gets its own transaction — keeps lock duration short and limits
+     * rollback scope to a single 10 000-row chunk rather than the entire run.
+     */
+    private function insertChunk(DBConnector $connector, array $data): void
     {
-        if (empty($value)) {
-            return 0;
-        }
-        if (preg_match('/^\s*([\d.]+)/', $value, $matches)) {
-            $util = \floatval($matches[1]);
-            if ($util < 1) {
-                $util *= 100;
-            }
-            return \intval($util);
-        }
-        return 0;
-    }
-
-    private function cleanPhone(string $phone): string
-    {
-        return preg_replace('/[^0-9]/', '', $phone);
-    }
-
-    private function clearTargetTable(DBConnector $connector): void
-    {
-        $truncateResult = $connector->querySqlServer("TRUNCATE TABLE {$this->targetTable}");
-        if ($truncateResult['success'] ?? false) {
-            $this->info("[INFO] Target table truncated instantly.");
+        if (empty($data)) {
             return;
         }
-        $this->info("[INFO] TRUNCATE failed ({$truncateResult['error']}), falling back to batch DELETE.");
 
-        do {
-            $connector->querySqlServer("DELETE TOP (50000) FROM {$this->targetTable}");
-            $result = $connector->querySqlServer("SELECT COUNT(*) AS cnt FROM {$this->targetTable}");
-            $count  = $result['data'][0]['cnt'] ?? 0;
-            if ($count > 0) {
-                $this->info("[INFO] Deleted batch, {$count} rows remaining...");
-            }
-        } while ($count > 0);
-
-        $this->info("[INFO] Target table cleared");
-    }
-
-    private function insertContactData(DBConnector $connector, array $data): void
-    {
         $fields = 'Created_Date, Assigned_Date, LLG_ID, External_ID, Campaign, Data_Source, '
             . 'Created_By, Agent, Client, Phone, Email, Address_1, Address_2, City, State, '
             . 'Zip, Stage, Status, Debt_Amount, Debt_Enrolled, Credit_Score, Credit_Utilization, '
             . 'Category, Affiliate_Agent, TP_ID';
 
-        // SQL Server hard-limits INSERT ... VALUES to exactly 1 000 rows per statement.
-        $batchSize = 1000;
-        $total     = \count($data);
-        $inserted  = 0;
-
-        // Obtain the raw PDO handle once. All INSERT batches run through $pdo->exec()
-        // directly — avoids the querySqlServer() wrapper overhead on every batch and
-        // guarantees the inserts execute within the transaction started below.
         $pdo = $connector->getSqlServerConnection();
-
         $pdo->beginTransaction();
+
         try {
-            // array_chunk avoids the array_slice memory copy on every iteration.
-            foreach (array_chunk($data, $batchSize) as $batch) {
+            // SQL Server hard-limits INSERT ... VALUES to 1 000 rows per statement
+            foreach (\array_chunk($data, 1000) as $batch) {
                 $valuesParts = [];
 
                 foreach ($batch as $row) {
-                    // Dates are pre-formatted strings from processAndCollectChanges —
-                    // no \DateTime construction happens here.
                     $createdDate  = $row['created_date'] ?: '';
                     $assignedDate = $row['assigned_date'] ? "'{$row['assigned_date']}'" : 'NULL';
+                    $email        = \strpos($row['email'], '@') !== false
+                        ? "'" . $this->escSql($row['email']) . "'"
+                        : 'NULL';
 
-                    $llgId        = $this->escSql($row['llg_id']);
-                    $externalId   = $this->escSql($row['external_id']);
-                    $campaign     = $this->escSql($row['campaign']);
-                    $dataSource   = $this->escSql($row['data_source']);
-                    $createdBy    = $this->escSql($row['created_by']);
-                    $agent        = $this->escSql($row['agent']);
-                    $client       = $this->escSql($row['client']);
-                    $phone        = $this->escSql($row['phone']);
-                    $email        = strpos($row['email'], '@') !== false ? "'" . $this->escSql($row['email']) . "'" : 'NULL';
-                    $address1     = $this->escSql($row['address_1']);
-                    $address2     = $this->escSql($row['address_2']);
-                    $city         = $this->escSql($row['city']);
-                    $state        = $this->escSql($row['state']);
-                    $zip          = $this->escSql($row['zip']);
-                    $stage        = $this->escSql($row['stage']);
-                    $status       = $this->escSql($row['status']);
-                    $debtAmount   = (int) $row['debt_amount'];
-                    $debtEnrolled = (float) $row['debt_enrolled'];
-                    $creditScore  = (int) $row['credit_score'];
-                    $creditUtil   = (int) $row['credit_utilization'];
-                    $category     = $this->escSql($row['category']);
-                    $affiliate    = $this->escSql($row['affiliate_agent']);
-                    $tpId         = $this->escSql($row['tp_id']);
-
-                    $valuesParts[] = "('{$createdDate}', {$assignedDate}, '{$llgId}', '{$externalId}', "
-                        . "'{$campaign}', '{$dataSource}', '{$createdBy}', '{$agent}', '{$client}', "
-                        . "'{$phone}', {$email}, '{$address1}', '{$address2}', '{$city}', '{$state}', "
-                        . "'{$zip}', '{$stage}', '{$status}', '{$debtAmount}', '{$debtEnrolled}', "
-                        . "'{$creditScore}', '{$creditUtil}', '{$category}', '{$affiliate}', '{$tpId}')";
+                    $valuesParts[] = "('{$createdDate}', {$assignedDate}, "
+                        . "'{$this->escSql($row['llg_id'])}', "
+                        . "'{$this->escSql($row['external_id'])}', "
+                        . "'{$this->escSql($row['campaign'])}', "
+                        . "'{$this->escSql($row['data_source'])}', "
+                        . "'{$this->escSql($row['created_by'])}', "
+                        . "'{$this->escSql($row['agent'])}', "
+                        . "'{$this->escSql($row['client'])}', "
+                        . "'{$this->escSql($row['phone'])}', "
+                        . "{$email}, "
+                        . "'{$this->escSql($row['address_1'])}', "
+                        . "'{$this->escSql($row['address_2'])}', "
+                        . "'{$this->escSql($row['city'])}', "
+                        . "'{$this->escSql($row['state'])}', "
+                        . "'{$this->escSql($row['zip'])}', "
+                        . "'{$this->escSql($row['stage'])}', "
+                        . "'{$this->escSql($row['status'])}', "
+                        . ((int) $row['debt_amount']) . ", "
+                        . ((float) $row['debt_enrolled']) . ", "
+                        . ((int) $row['credit_score']) . ", "
+                        . ((int) $row['credit_utilization']) . ", "
+                        . "'{$this->escSql($row['category'])}', "
+                        . "'{$this->escSql($row['affiliate_agent'])}', "
+                        . "'{$this->escSql($row['tp_id'])}')";
                 }
 
-                $sql = "INSERT INTO {$this->targetTable} ({$fields}) VALUES " . implode(', ', $valuesParts);
+                $sql = "INSERT INTO {$this->targetTable} ({$fields}) VALUES " . \implode(', ', $valuesParts);
 
                 if ($pdo->exec($sql) === false) {
                     $err = $pdo->errorInfo();
                     throw new \RuntimeException('INSERT batch failed: ' . ($err[2] ?? 'unknown PDO error'));
                 }
-
-                $inserted += \count($batch);
-                $this->info("[INFO] Inserted {$inserted}/{$total} records");
             }
 
             $pdo->commit();
@@ -576,10 +557,14 @@ class SyncContactsData extends Command
             if ($pdo->inTransaction()) {
                 $pdo->rollBack();
             }
-            $this->error('Insert transaction failed: ' . $e->getMessage());
-            Log::error('SyncContactsData: Insert transaction failed', ['error' => $e->getMessage()]);
+            $this->error('Insert failed: ' . $e->getMessage());
+            Log::error('SyncContactsData: Insert failed', ['source' => $this->source, 'error' => $e->getMessage()]);
         }
     }
+
+    // -------------------------------------------------------------------------
+    // Enrollment updates
+    // -------------------------------------------------------------------------
 
     private function applyEnrollmentCategoryUpdates(DBConnector $connector, array $changes): void
     {
@@ -589,8 +574,8 @@ class SyncContactsData extends Command
 
         $connector->querySqlServer("CREATE TABLE #TmpCatUpd (LLG_ID VARCHAR(50), NewCat VARCHAR(50))");
 
-        foreach (array_chunk($changes, 500) as $chunk) {
-            $values = implode(', ', array_map(
+        foreach (\array_chunk($changes, 500) as $chunk) {
+            $values = \implode(', ', \array_map(
                 fn($c) => "('{$this->escSql($c['llg_id'])}', '{$this->escSql($c['category'])}')",
                 $chunk
             ));
@@ -616,8 +601,8 @@ class SyncContactsData extends Command
 
         $connector->querySqlServer("CREATE TABLE #TmpAffUpd (LLG_ID VARCHAR(50), NewAffiliate NVARCHAR(100))");
 
-        foreach (array_chunk($changes, 500) as $chunk) {
-            $values = implode(', ', array_map(
+        foreach (\array_chunk($changes, 500) as $chunk) {
+            $values = \implode(', ', \array_map(
                 fn($c) => "('{$this->escSql($c['llg_id'])}', '{$this->escSql($c['agent'])}')",
                 $chunk
             ));
@@ -636,67 +621,111 @@ class SyncContactsData extends Command
         $connector->querySqlServer("DROP TABLE #TmpAffUpd");
     }
 
+    // -------------------------------------------------------------------------
+    // Table maintenance
+    // -------------------------------------------------------------------------
+
+    private function clearTargetTable(DBConnector $connector): void
+    {
+        $truncateResult = $connector->querySqlServer("TRUNCATE TABLE {$this->targetTable}");
+        if ($truncateResult['success'] ?? false) {
+            $this->info("[INFO] Target table truncated instantly.");
+            return;
+        }
+        $this->info("[INFO] TRUNCATE failed ({$truncateResult['error']}), falling back to batch DELETE.");
+
+        do {
+            $connector->querySqlServer("DELETE TOP (50000) FROM {$this->targetTable}");
+            $result = $connector->querySqlServer("SELECT COUNT(*) AS cnt FROM {$this->targetTable}");
+            $count  = $result['data'][0]['cnt'] ?? 0;
+            if ($count > 0) {
+                $this->info("[INFO] Deleted batch, {$count} rows remaining...");
+            }
+        } while ($count > 0);
+
+        $this->info("[INFO] Target table cleared");
+    }
+
     private function updateRelatedTables(DBConnector $connector): void
     {
-        // Update TblContacts.LLG_ID
-        $sql = "
-            UPDATE TblContacts
-            SET TblContacts.LLG_ID = {$this->targetTable}.LLG_ID
-            FROM TblContacts
-            INNER JOIN {$this->targetTable}
-              ON TblContacts.LLG_ID = 'LLG-' + CAST({$this->targetTable}.External_ID AS VARCHAR(50))
-        ";
-        try {
-            $connector->querySqlServer($sql);
-            $this->info('[INFO] Updated TblContacts.LLG_ID');
-        } catch (\Throwable $e) {
-            $this->warn('[WARN] Failed to update TblContacts.LLG_ID: ' . $e->getMessage());
+        $sqls = [
+            "UPDATE TblContacts
+             SET TblContacts.LLG_ID = {$this->targetTable}.LLG_ID
+             FROM TblContacts
+             INNER JOIN {$this->targetTable}
+               ON TblContacts.LLG_ID = 'LLG-' + CAST({$this->targetTable}.External_ID AS VARCHAR(50))"
+            => '[INFO] Updated TblContacts.LLG_ID',
+
+            "UPDATE TblEnrollment
+             SET TblEnrollment.Agent = TblContacts.Agent
+             FROM TblEnrollment, TblContacts
+             WHERE TblEnrollment.LLG_ID = TblContacts.LLG_ID"
+            => '[INFO] Updated TblEnrollment.Agent',
+        ];
+
+        foreach ($sqls as $sql => $label) {
+            try {
+                $connector->querySqlServer($sql);
+                $this->info($label);
+            } catch (\Throwable $e) {
+                $this->warn('[WARN] ' . $label . ' failed: ' . $e->getMessage());
+            }
         }
 
-        // Update TblEnrollment.Agent
-        $sql = "
-            UPDATE TblEnrollment
-            SET TblEnrollment.Agent = TblContacts.Agent
-            FROM TblEnrollment, TblContacts
-            WHERE TblEnrollment.LLG_ID = TblContacts.LLG_ID
-        ";
-        try {
-            $connector->querySqlServer($sql);
-            $this->info('[INFO] Updated TblEnrollment.Agent');
-        } catch (\Throwable $e) {
-            $this->warn('[WARN] Failed to update TblEnrollment.Agent: ' . $e->getMessage());
-        }
-
-        // Source-specific final update
         if ($this->source === 'LDR') {
-            $sql = "
-                UPDATE TblEnrollment
-                SET TblEnrollment.Drop_Name = TblContacts.Campaign
-                FROM TblEnrollment, TblContacts
-                WHERE TblEnrollment.LLG_ID = TblContacts.LLG_ID
-                  AND COALESCE(TblContacts.Campaign, '') <> ''
-            ";
-            try {
-                $connector->querySqlServer($sql);
-                $this->info('[INFO] Updated TblEnrollment.Drop_Name');
-            } catch (\Throwable $e) {
-                $this->warn('[WARN] Failed to update TblEnrollment.Drop_Name: ' . $e->getMessage());
-            }
+            $sql = "UPDATE TblEnrollment
+                    SET TblEnrollment.Drop_Name = TblContacts.Campaign
+                    FROM TblEnrollment, TblContacts
+                    WHERE TblEnrollment.LLG_ID = TblContacts.LLG_ID
+                      AND COALESCE(TblContacts.Campaign, '') <> ''";
+            $label = '[INFO] Updated TblEnrollment.Drop_Name';
         } else {
-            $sql = "
-                UPDATE TblEnrollment
-                SET TblEnrollment.Agent = TblContacts.Agent
-                FROM TblEnrollment, TblContacts
-                WHERE TblEnrollment.LLG_ID = TblContacts.LLG_ID
-                  AND COALESCE(TblContacts.Agent, '') <> ''
-            ";
-            try {
-                $connector->querySqlServer($sql);
-                $this->info('[INFO] Updated TblEnrollment.Agent (PLAW-specific)');
-            } catch (\Throwable $e) {
-                $this->warn('[WARN] Failed to update TblEnrollment.Agent (PLAW): ' . $e->getMessage());
-            }
+            $sql = "UPDATE TblEnrollment
+                    SET TblEnrollment.Agent = TblContacts.Agent
+                    FROM TblEnrollment, TblContacts
+                    WHERE TblEnrollment.LLG_ID = TblContacts.LLG_ID
+                      AND COALESCE(TblContacts.Agent, '') <> ''";
+            $label = '[INFO] Updated TblEnrollment.Agent (PLAW/LT-specific)';
         }
+
+        try {
+            $connector->querySqlServer($sql);
+            $this->info($label);
+        } catch (\Throwable $e) {
+            $this->warn('[WARN] ' . $label . ' failed: ' . $e->getMessage());
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------
+
+    private function normalizePlanTitle(string $title): string
+    {
+        if (empty($title)) {
+            return '';
+        }
+        return stripos($title, 'CCS') !== false ? 'CCS' : 'LDR';
+    }
+
+    private function parseCreditUtilization(string $value): int
+    {
+        if (empty($value)) {
+            return 0;
+        }
+        if (preg_match('/^\s*([\d.]+)/', $value, $matches)) {
+            $util = \floatval($matches[1]);
+            if ($util < 1) {
+                $util *= 100;
+            }
+            return \intval($util);
+        }
+        return 0;
+    }
+
+    private function cleanPhone(string $phone): string
+    {
+        return preg_replace('/[^0-9]/', '', $phone);
     }
 
     private function formatDate($value): string
@@ -707,10 +736,9 @@ class SyncContactsData extends Command
         if ($value instanceof \DateTimeInterface) {
             return $value->format('Y-m-d H:i:s');
         }
-        // Fast path: Snowflake returns timestamps as 'YYYY-MM-DD HH:MM:SS[.ffffff]'.
-        // A simple substr avoids constructing a \DateTime object for every row.
+        // Fast path: Snowflake returns timestamps as 'YYYY-MM-DD HH:MM:SS[.ffffff]'
         if (\is_string($value) && \strlen($value) >= 19 && $value[4] === '-' && $value[7] === '-') {
-            return substr($value, 0, 19);
+            return \substr($value, 0, 19);
         }
         try {
             return (new \DateTime($value))->format('Y-m-d H:i:s');
