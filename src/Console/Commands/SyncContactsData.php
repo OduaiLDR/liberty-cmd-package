@@ -101,6 +101,7 @@ class SyncContactsData extends Command
             $this->targetTable        = 'TblContactsLDR';
         }
 
+        $this->info("[DEBUG] Initializing Snowflake connector...");
         try {
             $snowflake = $this->initializeSnowflakeConnector();
         } catch (\Throwable $e) {
@@ -108,7 +109,9 @@ class SyncContactsData extends Command
             Log::error('SyncContactsData: Snowflake init failed', ['exception' => $e]);
             return Command::FAILURE;
         }
+        $this->info("[DEBUG] Snowflake connector OK.");
 
+        $this->info("[DEBUG] Initializing SQL Server connector...");
         try {
             $sqlConnector = $this->initializeSqlServerConnector();
         } catch (\Throwable $e) {
@@ -116,11 +119,15 @@ class SyncContactsData extends Command
             Log::error('SyncContactsData: SQL Server init failed', ['exception' => $e]);
             return Command::FAILURE;
         }
+        $this->info("[DEBUG] SQL Server connector OK.");
 
         $startDate = '2021-07-01';
 
+        $this->info("[DEBUG] Loading enrollment data...");
         $enrollmentData = $this->loadEnrollmentData($sqlConnector);
+        $this->info("[DEBUG] Enrollment loaded. Fetching Snowflake contacts...");
         $contactsData   = $this->fetchContactsData($snowflake, $startDate);
+        $this->info("[DEBUG] Snowflake contacts fetched.");
         $dropNames      = $this->fetchAllDropNames($sqlConnector);
         $processedData  = $this->processContactData($contactsData, $dropNames);
 
