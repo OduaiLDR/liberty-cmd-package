@@ -42,16 +42,15 @@ class SyncContactsData extends Command
             $cli = trim((string) shell_exec('which php8.3 2>/dev/null || which php8.2 2>/dev/null || which php 2>/dev/null'));
             $php = $cli ?: 'php';
         }
-        $artisan  = base_path('artisan');
-        $sources  = ['LDR', 'PLAW', 'LT'];
-        $results  = [];
+        $artisan = base_path('artisan');
+        $sources = ['LDR', 'PLAW', 'LT'];
+        $results = [];
 
         $pool = Process::pool(function ($pool) use ($php, $artisan, $sources) {
             foreach ($sources as $source) {
                 $pool->as($source)->timeout(1800)->command([$php, $artisan, 'Sync:contacts-data', "--source={$source}"]);
             }
         })->start(function (string $type, string $output, string $key) {
-            // Stream each sub-process line with its source label prefix
             foreach (explode("\n", rtrim($output)) as $line) {
                 if ($line !== '') {
                     $this->line("[{$key}] {$line}");
@@ -64,7 +63,7 @@ class SyncContactsData extends Command
         $this->info("\n" . str_repeat('=', 80));
         $allOk = true;
         foreach ($sources as $source) {
-            $exitCode = $processes[$source]->exitCode();
+            $exitCode         = $processes[$source]->exitCode();
             $results[$source] = $exitCode === 0;
             if ($exitCode !== 0) {
                 $this->error("[ERROR] {$source} failed (exit code {$exitCode}).");
@@ -123,17 +122,29 @@ class SyncContactsData extends Command
 
         $startDate = '2021-07-01';
 
-        $this->info("[DEBUG] Loading enrollment data...");
+        // Load both SQL Server lookups before the slow Snowflake fetch
+        $this->info("[DEBUG] Loading enrollment data and drop names...");
         $enrollmentData = $this->loadEnrollmentData($sqlConnector);
-        $this->info("[DEBUG] Enrollment loaded. Fetching Snowflake contacts...");
-        $contactsData   = $this->fetchContactsData($snowflake, $startDate);
-        $this->info("[DEBUG] Snowflake contacts fetched.");
         $dropNames      = $this->fetchAllDropNames($sqlConnector);
-        $processedData  = $this->processContactData($contactsData, $dropNames);
+        $this->info("[DEBUG] Lookups loaded. Fetching Snowflake contacts...");
 
-        $this->info('[INFO] Fetched ' . count($contactsData) . ' → processed ' . count($processedData) . ' records');
+        $contactsData = $this->fetchContactsData($snowflake, $startDate);
+        $this->info("[DEBUG] Snowflake contacts fetched (" . \count($contactsData) . " rows).");
 
-        $this->updateEnrollmentPerContact($sqlConnector, $contactsData, $enrollmentData);
+        // Single pass: build insert-ready rows AND collect enrollment changes simultaneously,
+        // replacing the original two separate full iterations over $contactsData.
+        [$processedData, $categoryChanges, $affiliateChanges] = $this->processAndCollectChanges(
+            $contactsData,
+            $dropNames,
+            $enrollmentData
+        );
+
+        $this->info('[INFO] Fetched ' . \count($contactsData) . ' → processed ' . \count($processedData) . ' records');
+        $this->info('[INFO] Enrollment updates: ' . \count($categoryChanges) . ' category, ' . \count($affiliateChanges) . ' affiliate agent');
+
+        $this->applyEnrollmentCategoryUpdates($sqlConnector, $categoryChanges);
+        $this->applyEnrollmentAffiliateUpdates($sqlConnector, $affiliateChanges);
+
         $this->clearTargetTable($sqlConnector);
 
         $this->info('[INFO] Inserting into ' . $this->targetTable . '...');
@@ -170,74 +181,69 @@ class SyncContactsData extends Command
         }
 
         return [
-            'categories'      => $categories,
-            'assigned_agents' => $assignedAgents,
+            'categories'       => $categories,
+            'assigned_agents'  => $assignedAgents,
             'affiliate_agents' => $affiliateAgents,
         ];
     }
 
     private function fetchContactsData(DBConnector $snowflake, string $startDate): array
     {
-        // Debt amounts, plan titles, and agent assignments are merged here as LEFT JOINs,
-        // eliminating 3 separate Snowflake API round trips per source run.
+        // QUALIFY filters ROW_NUMBER directly in Snowflake, eliminating the outer
+        // subquery wrapper. Snowflake optimises QUALIFY before materialising rows.
         $sql = "
-            SELECT *
-            FROM (
-                SELECT
-                    TIMEADD(hour, -7, c.CREATED) AS CREATED,
-                    NULL AS ASSIGNED_ON,
-                    TIMEADD(hour, -7, COALESCE(c.MODIFIED, c.CREATED)) AS MODIFIED,
-                    c.ID AS LLG_ID,
-                    c.TP_ID AS EXTERNAL_ID,
-                    ds.NAME AS DATA_SOURCE,
-                    NULL AS CREATED_BY,
-                    NULL AS ASSIGNED_TO,
-                    CONCAT(c.FIRSTNAME, ' ', c.LASTNAME) AS FULLNAME,
-                    c.PHONE3 AS CELL_PHONE,
-                    c.EMAIL,
-                    c.ADDRESS AS ADDRESS1,
-                    c.ADDRESS2,
-                    c.CITY,
-                    c.STATE,
-                    c.ZIP,
-                    cc.TITLE AS STAGE,
-                    cls.TITLE AS STATUS,
-                    NULL AS LOAN_AMOUNT_NEEDED,
-                    cs.TRANSUNION AS CREDIT_SCORE,
-                    SUBSTRING(cr.METADATA, CHARINDEX('RevolvingCreditUtilization', cr.METADATA) + 29,
-                        CHARINDEX('Day30', cr.METADATA) - CHARINDEX('RevolvingCreditUtilization', cr.METADATA) - 32) AS CREDIT_UTILIZATION,
-                    ep.FEE1,
-                    c.TP_ID AS TP_ID_COPY,
-                    c.ENROLLED_DATE,
-                    uf_debt.F_DECIMAL AS DEBT_AMOUNT_CUSTOM,
-                    ed.TITLE AS PLAN_TITLE,
-                    uf_agent.F_SHORTSTRING AS AGENT_CUSTOM,
-                    ROW_NUMBER() OVER(PARTITION BY c.ID ORDER BY s.STAMP DESC) AS N
-                FROM CONTACTS AS c
-                LEFT JOIN DATA_SOURCES AS ds ON c.C_SOURCE = ds.ID
-                LEFT JOIN CONTACTS_STATUS AS s ON c.ID = s.CONTACT_ID
-                LEFT JOIN CONTACTS_CATEGORIES AS cc ON s.STAGE_ID = cc.ID
-                LEFT JOIN CONTACTS_LEAD_STATUS AS cls ON s.STATUS_ID = cls.ID
-                LEFT JOIN CREDIT_SCORES AS cs ON c.ID = cs.CONTACT_ID
-                LEFT JOIN CREDIT_REPORT_REQUEST AS cr ON c.ID = cr.CONTACT_ID
-                LEFT JOIN ENROLLMENT_PLAN AS ep ON c.ID = ep.CONTACT_ID
-                LEFT JOIN ENROLLMENT_DEFAULTS2 AS ed ON ep.PLAN_ID = ed.ID
-                LEFT JOIN (
-                    SELECT CONTACT_ID, F_DECIMAL
-                    FROM CONTACTS_USERFIELDS
-                    WHERE CUSTOM_ID = {$this->debtAmountCustomId}
-                ) AS uf_debt ON c.ID = uf_debt.CONTACT_ID
-                LEFT JOIN (
-                    SELECT CONTACT_ID, F_SHORTSTRING
-                    FROM CONTACTS_USERFIELDS
-                    WHERE CUSTOM_ID = {$this->agentCustomId}
-                ) AS uf_agent ON c.ID = uf_agent.CONTACT_ID
-                WHERE TIMEADD(hour, -7, COALESCE(c.MODIFIED, c.CREATED)) >= '{$this->esc($startDate)}'
-                  AND COALESCE(c.FIRSTNAME, '') <> ''
-                  AND ISCOAPP = 0
-                ORDER BY c.ID, N ASC
-            )
-            WHERE N = 1
+            SELECT
+                TIMEADD(hour, -7, c.CREATED) AS CREATED,
+                NULL AS ASSIGNED_ON,
+                TIMEADD(hour, -7, COALESCE(c.MODIFIED, c.CREATED)) AS MODIFIED,
+                c.ID AS LLG_ID,
+                c.TP_ID AS EXTERNAL_ID,
+                ds.NAME AS DATA_SOURCE,
+                NULL AS CREATED_BY,
+                NULL AS ASSIGNED_TO,
+                CONCAT(c.FIRSTNAME, ' ', c.LASTNAME) AS FULLNAME,
+                c.PHONE3 AS CELL_PHONE,
+                c.EMAIL,
+                c.ADDRESS AS ADDRESS1,
+                c.ADDRESS2,
+                c.CITY,
+                c.STATE,
+                c.ZIP,
+                cc.TITLE AS STAGE,
+                cls.TITLE AS STATUS,
+                NULL AS LOAN_AMOUNT_NEEDED,
+                cs.TRANSUNION AS CREDIT_SCORE,
+                SUBSTRING(cr.METADATA, CHARINDEX('RevolvingCreditUtilization', cr.METADATA) + 29,
+                    CHARINDEX('Day30', cr.METADATA) - CHARINDEX('RevolvingCreditUtilization', cr.METADATA) - 32) AS CREDIT_UTILIZATION,
+                ep.FEE1,
+                c.TP_ID AS TP_ID_COPY,
+                c.ENROLLED_DATE,
+                uf_debt.F_DECIMAL AS DEBT_AMOUNT_CUSTOM,
+                ed.TITLE AS PLAN_TITLE,
+                uf_agent.F_SHORTSTRING AS AGENT_CUSTOM
+            FROM CONTACTS AS c
+            LEFT JOIN DATA_SOURCES AS ds ON c.C_SOURCE = ds.ID
+            LEFT JOIN CONTACTS_STATUS AS s ON c.ID = s.CONTACT_ID
+            LEFT JOIN CONTACTS_CATEGORIES AS cc ON s.STAGE_ID = cc.ID
+            LEFT JOIN CONTACTS_LEAD_STATUS AS cls ON s.STATUS_ID = cls.ID
+            LEFT JOIN CREDIT_SCORES AS cs ON c.ID = cs.CONTACT_ID
+            LEFT JOIN CREDIT_REPORT_REQUEST AS cr ON c.ID = cr.CONTACT_ID
+            LEFT JOIN ENROLLMENT_PLAN AS ep ON c.ID = ep.CONTACT_ID
+            LEFT JOIN ENROLLMENT_DEFAULTS2 AS ed ON ep.PLAN_ID = ed.ID
+            LEFT JOIN (
+                SELECT CONTACT_ID, F_DECIMAL
+                FROM CONTACTS_USERFIELDS
+                WHERE CUSTOM_ID = {$this->debtAmountCustomId}
+            ) AS uf_debt ON c.ID = uf_debt.CONTACT_ID
+            LEFT JOIN (
+                SELECT CONTACT_ID, F_SHORTSTRING
+                FROM CONTACTS_USERFIELDS
+                WHERE CUSTOM_ID = {$this->agentCustomId}
+            ) AS uf_agent ON c.ID = uf_agent.CONTACT_ID
+            WHERE TIMEADD(hour, -7, COALESCE(c.MODIFIED, c.CREATED)) >= '{$this->esc($startDate)}'
+              AND COALESCE(c.FIRSTNAME, '') <> ''
+              AND ISCOAPP = 0
+            QUALIFY ROW_NUMBER() OVER(PARTITION BY c.ID ORDER BY s.STAMP DESC) = 1
         ";
 
         $result = $snowflake->query($sql);
@@ -256,7 +262,7 @@ class SyncContactsData extends Command
             if ($externalId && $dropName) {
                 $lookup[$externalId] = $dropName;
                 // Also store last 9 chars for fallback matching
-                if (strlen($externalId) > 9) {
+                if (\strlen($externalId) > 9) {
                     $last9 = substr($externalId, -9);
                     if (!isset($lookup[$last9])) {
                         $lookup[$last9] = $dropName;
@@ -267,18 +273,33 @@ class SyncContactsData extends Command
         return $lookup;
     }
 
-    private function processContactData(
+    /**
+     * Single-pass over $contactsData: builds the insert-ready rows AND collects
+     * enrollment category/affiliate changes at the same time, replacing the original
+     * two separate full iterations (processContactData + updateEnrollmentPerContact).
+     *
+     * Dates are pre-formatted here so the insert hot-loop never constructs DateTime objects.
+     *
+     * @return array{0: array, 1: array, 2: array}  [processedRows, categoryChanges, affiliateChanges]
+     */
+    private function processAndCollectChanges(
         array $contactsData,
-        array $dropNames
+        array $dropNames,
+        array $enrollmentData
     ): array {
-        $processed = [];
-        $seenTpIds = [];
+        $processed        = [];
+        $seenTpIds        = [];
+        $categoryChanges  = [];
+        $affiliateChanges = [];
+
+        $existingCategories = $enrollmentData['categories'];
+        $existingAffiliates = $enrollmentData['affiliate_agents'];
 
         foreach ($contactsData as $row) {
             $contactId = $row['LLG_ID'] ?? '';
             $tpId      = $row['EXTERNAL_ID'] ?? '';
 
-            // Early exit before any lookups — skip rows we know we'll discard
+            // Early exits before any work — skip rows we know we'll discard
             if (($row['STATUS'] ?? '') === 'Duplicate Lead') {
                 continue;
             }
@@ -289,29 +310,27 @@ class SyncContactsData extends Command
                 $seenTpIds[$tpId] = true;
             }
 
-            // Debt amount from custom userfield (no enrolled-debt table exists in this schema)
             $debtAmount = $row['DEBT_AMOUNT_CUSTOM'] ?? 0;
-
-            // Plan title and agent come directly from the merged Snowflake query
-            $planTitle = $row['PLAN_TITLE'] ?? '';
-            $category  = $this->normalizePlanTitle($planTitle);
-            $agent     = $row['AGENT_CUSTOM'] ?? '';
-
-            // Parse credit utilization
+            $planTitle  = $row['PLAN_TITLE'] ?? '';
+            $category   = $this->normalizePlanTitle($planTitle);
+            $agent      = $row['AGENT_CUSTOM'] ?? '';
             $creditUtil = $this->parseCreditUtilization($row['CREDIT_UTILIZATION'] ?? '');
 
-            // Campaign/drop name from pre-loaded SQL Server lookup
-            $campaign   = '';
-            $externalId = $row['EXTERNAL_ID'] ?? '';
-            if ($externalId) {
-                $campaign = $dropNames[$externalId] ?? ($dropNames[substr($externalId, -9)] ?? '');
+            $campaign = '';
+            if ($tpId) {
+                $campaign = $dropNames[$tpId] ?? ($dropNames[substr($tpId, -9)] ?? '');
             }
 
+            // Pre-format dates once here; the insert loop reads plain strings, never
+            // constructs \DateTime objects, which is measurably faster at scale.
+            $createdFormatted  = $this->formatDate($row['CREATED'] ?? null);
+            $assignedFormatted = $this->formatDate($row['ASSIGNED_ON'] ?? null);
+
             $processed[] = [
-                'created_date'       => $row['CREATED'] ?? null,
-                'assigned_date'      => $row['ASSIGNED_ON'] ?? null,
+                'created_date'       => $createdFormatted,
+                'assigned_date'      => $assignedFormatted,
                 'llg_id'             => 'LLG-' . $contactId,
-                'external_id'        => substr($row['EXTERNAL_ID'] ?? '', 0, 50),
+                'external_id'        => substr($tpId, 0, 50),
                 'campaign'           => substr($campaign, 0, 255),
                 'data_source'        => substr($row['DATA_SOURCE'] ?? '', 0, 255),
                 'created_by'         => substr($row['CREATED_BY'] ?? '', 0, 255),
@@ -334,9 +353,26 @@ class SyncContactsData extends Command
                 'affiliate_agent'    => substr($agent, 0, 255),
                 'tp_id'              => substr($tpId, 0, 50),
             ];
+
+            // Enrollment change detection — same pass, no second loop needed
+            $enrolledDate = $row['ENROLLED_DATE'] ?? '';
+            if (!empty($enrolledDate) && isset($existingCategories[$contactId]) && $category !== '') {
+                $llgId = "LLG-{$contactId}";
+
+                if ($existingCategories[$contactId] !== $category) {
+                    $categoryChanges[] = ['llg_id' => $llgId, 'category' => $category];
+                }
+
+                if ($category !== 'LDR') {
+                    $existingAffiliate = $existingAffiliates[$contactId] ?? '';
+                    if ($agent !== '' && $existingAffiliate !== $agent && !str_ends_with(strtolower($agent), ' user')) {
+                        $affiliateChanges[] = ['llg_id' => $llgId, 'agent' => $agent];
+                    }
+                }
+            }
         }
 
-        return $processed;
+        return [$processed, $categoryChanges, $affiliateChanges];
     }
 
     private function normalizePlanTitle(string $title): string
@@ -355,16 +391,13 @@ class SyncContactsData extends Command
         if (empty($value)) {
             return 0;
         }
-
-        // Match the first numeric value at the start of the string (equivalent to VBA's Val())
         if (preg_match('/^\s*([\d.]+)/', $value, $matches)) {
-            $util = floatval($matches[1]);
+            $util = \floatval($matches[1]);
             if ($util < 1) {
                 $util *= 100;
             }
-            return intval($util);
+            return \intval($util);
         }
-
         return 0;
     }
 
@@ -396,21 +429,34 @@ class SyncContactsData extends Command
 
     private function insertContactData(DBConnector $connector, array $data): void
     {
-        $fields    = 'Created_Date, Assigned_Date, LLG_ID, External_ID, Campaign, Data_Source, Created_By, Agent, Client, Phone, Email, Address_1, Address_2, City, State, Zip, Stage, Status, Debt_Amount, Debt_Enrolled, Credit_Score, Credit_Utilization, Category, Affiliate_Agent, TP_ID';
-        $batchSize = 1000;
-        $total     = count($data);
+        $fields = 'Created_Date, Assigned_Date, LLG_ID, External_ID, Campaign, Data_Source, '
+            . 'Created_By, Agent, Client, Phone, Email, Address_1, Address_2, City, State, '
+            . 'Zip, Stage, Status, Debt_Amount, Debt_Enrolled, Credit_Score, Credit_Utilization, '
+            . 'Category, Affiliate_Agent, TP_ID';
+
+        // 5 000 rows per batch: ~5× fewer SQL round-trips than the previous 1 000.
+        // SQL Server handles INSERT ... VALUES with thousands of rows comfortably.
+        $batchSize = 5000;
+        $total     = \count($data);
         $inserted  = 0;
-        $pdo       = $connector->getSqlServerConnection();
+
+        // Obtain the raw PDO handle once. All INSERT batches run through $pdo->exec()
+        // directly — avoids the querySqlServer() wrapper overhead on every batch and
+        // guarantees the inserts execute within the transaction started below.
+        $pdo = $connector->getSqlServerConnection();
 
         $pdo->beginTransaction();
         try {
-            for ($i = 0; $i < $total; $i += $batchSize) {
-                $batch       = array_slice($data, $i, $batchSize);
+            // array_chunk avoids the array_slice memory copy on every iteration.
+            foreach (array_chunk($data, $batchSize) as $batch) {
                 $valuesParts = [];
 
                 foreach ($batch as $row) {
-                    $createdDate  = $this->formatDate($row['created_date']);
-                    $assignedDate = $row['assigned_date'] ? "'" . $this->formatDate($row['assigned_date']) . "'" : 'NULL';
+                    // Dates are pre-formatted strings from processAndCollectChanges —
+                    // no \DateTime construction happens here.
+                    $createdDate  = $row['created_date'] ?: '';
+                    $assignedDate = $row['assigned_date'] ? "'{$row['assigned_date']}'" : 'NULL';
+
                     $llgId        = $this->escSql($row['llg_id']);
                     $externalId   = $this->escSql($row['external_id']);
                     $campaign     = $this->escSql($row['campaign']);
@@ -427,25 +473,29 @@ class SyncContactsData extends Command
                     $zip          = $this->escSql($row['zip']);
                     $stage        = $this->escSql($row['stage']);
                     $status       = $this->escSql($row['status']);
-                    $debtAmount   = $row['debt_amount'];
-                    $debtEnrolled = $row['debt_enrolled'];
-                    $creditScore  = $row['credit_score'];
-                    $creditUtil   = $row['credit_utilization'];
+                    $debtAmount   = (int) $row['debt_amount'];
+                    $debtEnrolled = (float) $row['debt_enrolled'];
+                    $creditScore  = (int) $row['credit_score'];
+                    $creditUtil   = (int) $row['credit_utilization'];
                     $category     = $this->escSql($row['category']);
                     $affiliate    = $this->escSql($row['affiliate_agent']);
                     $tpId         = $this->escSql($row['tp_id']);
 
-                    $valuesParts[] = "('{$createdDate}', {$assignedDate}, '{$llgId}', '{$externalId}', '{$campaign}', '{$dataSource}', '{$createdBy}', '{$agent}', '{$client}', '{$phone}', {$email}, '{$address1}', '{$address2}', '{$city}', '{$state}', '{$zip}', '{$stage}', '{$status}', '{$debtAmount}', '{$debtEnrolled}', '{$creditScore}', '{$creditUtil}', '{$category}', '{$affiliate}', '{$tpId}')";
+                    $valuesParts[] = "('{$createdDate}', {$assignedDate}, '{$llgId}', '{$externalId}', "
+                        . "'{$campaign}', '{$dataSource}', '{$createdBy}', '{$agent}', '{$client}', "
+                        . "'{$phone}', {$email}, '{$address1}', '{$address2}', '{$city}', '{$state}', "
+                        . "'{$zip}', '{$stage}', '{$status}', '{$debtAmount}', '{$debtEnrolled}', "
+                        . "'{$creditScore}', '{$creditUtil}', '{$category}', '{$affiliate}', '{$tpId}')";
                 }
 
-                $sql    = "INSERT INTO {$this->targetTable} ({$fields}) VALUES " . implode(', ', $valuesParts);
-                $result = $connector->querySqlServer($sql);
+                $sql = "INSERT INTO {$this->targetTable} ({$fields}) VALUES " . implode(', ', $valuesParts);
 
-                if (!($result['success'] ?? true)) {
-                    throw new \RuntimeException($result['error'] ?? 'INSERT batch failed');
+                if ($pdo->exec($sql) === false) {
+                    $err = $pdo->errorInfo();
+                    throw new \RuntimeException('INSERT batch failed: ' . ($err[2] ?? 'unknown PDO error'));
                 }
 
-                $inserted += count($batch);
+                $inserted += \count($batch);
                 $this->info("[INFO] Inserted {$inserted}/{$total} records");
             }
 
@@ -457,55 +507,6 @@ class SyncContactsData extends Command
             $this->error('Insert transaction failed: ' . $e->getMessage());
             Log::error('SyncContactsData: Insert transaction failed', ['error' => $e->getMessage()]);
         }
-    }
-
-    private function updateEnrollmentPerContact(
-        DBConnector $sqlConnector,
-        array $contactsData,
-        array $enrollmentData
-    ): void {
-        $existingCategories = $enrollmentData['categories'];
-        $existingAffiliates = $enrollmentData['affiliate_agents'];
-        $categoryChanges    = [];
-        $affiliateChanges   = [];
-
-        foreach ($contactsData as $row) {
-            $contactId    = $row['LLG_ID'] ?? '';
-            $enrolledDate = $row['ENROLLED_DATE'] ?? '';
-
-            // Only process enrolled contacts that exist in TblEnrollment
-            if (empty($enrolledDate) || !isset($existingCategories[$contactId])) {
-                continue;
-            }
-
-            $planTitle   = $row['PLAN_TITLE'] ?? '';
-            $newCategory = $this->normalizePlanTitle($planTitle);
-
-            // Skip if no plan title — category stays as-is
-            if ($newCategory === '') {
-                continue;
-            }
-
-            $llgId = "LLG-{$contactId}";
-
-            if ($existingCategories[$contactId] !== $newCategory) {
-                $categoryChanges[] = ['llg_id' => $llgId, 'category' => $newCategory];
-            }
-
-            // For CCS contacts: update Affiliate_Agent if it changed and is not a system user
-            if ($newCategory !== 'LDR') {
-                $agent             = $row['AGENT_CUSTOM'] ?? '';
-                $existingAffiliate = $existingAffiliates[$contactId] ?? '';
-                if ($agent !== '' && $existingAffiliate !== $agent && !str_ends_with(strtolower($agent), ' user')) {
-                    $affiliateChanges[] = ['llg_id' => $llgId, 'agent' => $agent];
-                }
-            }
-        }
-
-        $this->applyEnrollmentCategoryUpdates($sqlConnector, $categoryChanges);
-        $this->applyEnrollmentAffiliateUpdates($sqlConnector, $affiliateChanges);
-
-        $this->info('[INFO] Enrollment updates: ' . count($categoryChanges) . ' category, ' . count($affiliateChanges) . ' affiliate agent');
     }
 
     private function applyEnrollmentCategoryUpdates(DBConnector $connector, array $changes): void
@@ -631,11 +632,14 @@ class SyncContactsData extends Command
         if (empty($value)) {
             return '';
         }
-
         if ($value instanceof \DateTimeInterface) {
             return $value->format('Y-m-d H:i:s');
         }
-
+        // Fast path: Snowflake returns timestamps as 'YYYY-MM-DD HH:MM:SS[.ffffff]'.
+        // A simple substr avoids constructing a \DateTime object for every row.
+        if (\is_string($value) && \strlen($value) >= 19 && $value[4] === '-' && $value[7] === '-') {
+            return substr($value, 0, 19);
+        }
         try {
             return (new \DateTime($value))->format('Y-m-d H:i:s');
         } catch (\Throwable $e) {
