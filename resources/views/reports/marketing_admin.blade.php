@@ -98,6 +98,24 @@
                             </select>
                         </div>
                         <div class="col-12 col-md-3">
+                            <label class="form-label">Mail Style</label>
+                            <select name="mail_style" class="form-select">
+                                <option value="">All Mail Styles</option>
+                                @foreach(($allMailStyles ?? []) as $ms)
+                                    <option value="{{ $ms }}" @if(($filters['mail_style'] ?? '') === $ms) selected @endif>{{ $ms }}</option>
+                                @endforeach
+                            </select>
+                        </div>
+                        <div class="col-12 col-md-3">
+                            <label class="form-label">ELT Score Range</label>
+                            <select name="elt_score_range" class="form-select">
+                                <option value="">All Score Ranges</option>
+                                @foreach(($allEltScoreRanges ?? []) as $sr)
+                                    <option value="{{ $sr }}" @if(($filters['elt_score_range'] ?? '') === $sr) selected @endif>{{ $sr }}</option>
+                                @endforeach
+                            </select>
+                        </div>
+                        <div class="col-12 col-md-3">
                             <label class="form-label">Data Provider</label>
                             <select name="data_provider" class="form-select">
                                 <option value="">All Data Providers</option>

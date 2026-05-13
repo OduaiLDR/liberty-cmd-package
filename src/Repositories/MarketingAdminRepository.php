@@ -49,6 +49,32 @@ class MarketingAdminRepository extends SqlSrvRepository
     /**
      * @return array<int,string>
      */
+    public function listEltScoreRanges(): array
+    {
+        return Cache::remember('cmdpkg:marketing_admin:lists:elt_score_ranges', 600, function () {
+            return array_map(
+                fn($o) => $o->Score_Range,
+                $this->connection()->select("SELECT DISTINCT Score_Range FROM TblMailerELTSummary WHERE Score_Range IS NOT NULL AND LEN(Score_Range) > 0 ORDER BY Score_Range")
+            );
+        });
+    }
+
+    /**
+     * @return array<int,string>
+     */
+    public function listMailStyles(): array
+    {
+        return Cache::remember('cmdpkg:marketing_admin:lists:mail_styles', 600, function () {
+            return array_map(
+                fn($o) => $o->Mail_Style,
+                $this->connection()->select("SELECT DISTINCT Mail_Style FROM TblMarketing WHERE Mail_Style IS NOT NULL AND LEN(Mail_Style) > 0 ORDER BY Mail_Style")
+            );
+        });
+    }
+
+    /**
+     * @return array<int,string>
+     */
     public function listDataProviders(): array
     {
         return ['A', 'E', 'S'];
@@ -121,6 +147,11 @@ class MarketingAdminRepository extends SqlSrvRepository
             $marketingWhereParts[] = 'm.Vendor = ?';
             $marketingWhereParams[] = $vendor;
         }
+        $mailStyle = trim((string) ($filters['mail_style'] ?? ''));
+        if ($mailStyle !== '') {
+            $marketingWhereParts[] = 'm.Mail_Style = ?';
+            $marketingWhereParams[] = $mailStyle;
+        }
         if ($dataProvider !== '') {
             $marketingWhereParts[] = "CASE WHEN RIGHT(REPLACE(REPLACE(UPPER(m.Drop_Name), 'NAO', ''), 'AO', ''), 1) = 'A' THEN 'A' WHEN RIGHT(REPLACE(REPLACE(UPPER(m.Drop_Name), 'NAO', ''), 'AO', ''), 1) = 'E' THEN 'E' ELSE 'S' END = ?";
             $marketingWhereParams[] = $dataProvider;
@@ -128,6 +159,11 @@ class MarketingAdminRepository extends SqlSrvRepository
         if ($marketingType !== '') {
             $marketingWhereParts[] = "CASE WHEN RIGHT(m.Drop_Name, 3) = 'NAO' THEN 'NAO' WHEN RIGHT(m.Drop_Name, 2) = 'AO' THEN 'AO' ELSE 'X' END = ?";
             $marketingWhereParams[] = $marketingType;
+        }
+        $eltScoreRange = trim((string) ($filters['elt_score_range'] ?? ''));
+        if ($eltScoreRange !== '') {
+            $marketingWhereParts[] = "EXISTS (SELECT 1 FROM TblMailerELTSummary elt WHERE elt.Drop_Name = m.Drop_Name AND elt.Score_Range = ?)";
+            $marketingWhereParams[] = $eltScoreRange;
         }
         $contactWhereParts = [];
         $contactWhereParams = [];
