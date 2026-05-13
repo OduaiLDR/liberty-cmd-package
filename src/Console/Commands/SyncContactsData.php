@@ -88,9 +88,9 @@ class SyncContactsData extends Command
             $this->agentCustomId      = 742153;
             $this->targetTable        = 'TblContactsPLAW';
         } elseif ($this->source === 'LT') {
-            $this->debtAmountCustomId = 743020;
-            $this->agentCustomId      = 742154;
-            $this->targetTable        = 'TblContactsLT';
+            $this->debtAmountCustomId = 387843;  // loan amount needed field
+            $this->agentCustomId      = 0;        // agent comes from USERS join, not custom field
+            $this->targetTable        = 'TblContacts';
         } else {
             $this->debtAmountCustomId = 745839;
             $this->agentCustomId      = 742152;
@@ -166,8 +166,17 @@ class SyncContactsData extends Command
                 $affiliateChanges[] = $c;
             }
 
-            $totalInserted += \count($processedChunk);
-            $this->insertChunk($sqlConnector, $processedChunk);
+            try {
+                $totalInserted += $this->insertChunk($sqlConnector, $processedChunk);
+            } catch (\Throwable $e) {
+                $this->error("[ERROR] Insert failed on chunk ending at ID {$lastId}: " . $e->getMessage());
+                Log::error('SyncContactsData: chunk insert failed', [
+                    'source'  => $this->source,
+                    'last_id' => $lastId,
+                    'error'   => $e->getMessage(),
+                ]);
+                return Command::FAILURE;
+            }
 
             // Free everything from this iteration before fetching the next chunk
             unset($chunk, $enrollmentData, $dropNames, $processedChunk, $newCatChanges, $newAffChanges);
@@ -203,7 +212,17 @@ class SyncContactsData extends Command
         int $lastId,
         int $limit
     ): array {
-        $sql = "
+        $sql = $this->source === 'LT'
+            ? $this->buildLTQuery($startDate, $lastId, $limit)
+            : $this->buildStandardQuery($startDate, $lastId, $limit);
+
+        $result = $snowflake->query($sql);
+        return $result['data'] ?? [];
+    }
+
+    private function buildStandardQuery(string $startDate, int $lastId, int $limit): string
+    {
+        return "
             SELECT
                 TIMEADD(hour, -7, c.CREATED) AS CREATED,
                 NULL AS ASSIGNED_ON,
@@ -260,9 +279,68 @@ class SyncContactsData extends Command
             ORDER BY c.ID
             LIMIT {$limit}
         ";
+    }
 
-        $result = $snowflake->query($sql);
-        return $result['data'] ?? [];
+    private function buildLTQuery(string $startDate, int $lastId, int $limit): string
+    {
+        // LT uses real ASSIGNED_ON/CREATED_BY/ASSIGNED_TO from joined tables.
+        // Agent = ASSIGNED_TO (u2), no custom-field agent lookup.
+        // Date filter includes a.STAMP. Duplicate leads filtered in Snowflake.
+        return "
+            SELECT
+                TIMEADD(hour, -7, c.CREATED) AS CREATED,
+                a.STAMP AS ASSIGNED_ON,
+                TIMEADD(hour, -7, COALESCE(c.MODIFIED, a.STAMP)) AS MODIFIED,
+                c.ID AS LLG_ID,
+                c.TP_ID AS EXTERNAL_ID,
+                ds.NAME AS DATA_SOURCE,
+                CONCAT(u1.FIRSTNAME, ' ', u1.LASTNAME) AS CREATED_BY,
+                CONCAT(u2.FIRSTNAME, ' ', u2.LASTNAME) AS ASSIGNED_TO,
+                CONCAT(c.FIRSTNAME, ' ', c.LASTNAME) AS FULLNAME,
+                c.PHONE3 AS CELL_PHONE,
+                c.EMAIL,
+                c.ADDRESS AS ADDRESS1,
+                c.ADDRESS2,
+                c.CITY,
+                c.STATE,
+                c.ZIP,
+                cc.TITLE AS STAGE,
+                cls.TITLE AS STATUS,
+                NULL AS LOAN_AMOUNT_NEEDED,
+                cs.TRANSUNION AS CREDIT_SCORE,
+                SUBSTRING(cr.METADATA, CHARINDEX('RevolvingCreditUtilization', cr.METADATA) + 29,
+                    CHARINDEX('Day30', cr.METADATA) - CHARINDEX('RevolvingCreditUtilization', cr.METADATA) - 32) AS CREDIT_UTILIZATION,
+                ep.FEE1,
+                c.TP_ID AS TP_ID_COPY,
+                c.ENROLLED_DATE,
+                uf_debt.F_DECIMAL AS DEBT_AMOUNT_CUSTOM,
+                NULL AS PLAN_TITLE,
+                NULL AS AGENT_CUSTOM
+            FROM CONTACTS AS c
+            LEFT JOIN CONTACTS_ASSIGNED AS a ON c.ID = a.CONTACT_ID
+            LEFT JOIN DATA_SOURCES AS ds ON c.C_SOURCE = ds.ID
+            LEFT JOIN USERS AS u1 ON c.CREATED_BY = u1.UID
+            LEFT JOIN USERS AS u2 ON c.ASSIGNED_TO = u2.UID
+            LEFT JOIN CONTACTS_STATUS AS s ON c.ID = s.CONTACT_ID
+            LEFT JOIN CONTACTS_CATEGORIES AS cc ON s.STAGE_ID = cc.ID
+            LEFT JOIN CONTACTS_LEAD_STATUS AS cls ON s.STATUS_ID = cls.ID
+            LEFT JOIN CREDIT_SCORES AS cs ON c.ID = cs.CONTACT_ID
+            LEFT JOIN CREDIT_REPORT_REQUEST AS cr ON c.ID = cr.CONTACT_ID
+            LEFT JOIN ENROLLMENT_PLAN AS ep ON c.ID = ep.CONTACT_ID
+            LEFT JOIN (
+                SELECT CONTACT_ID, F_DECIMAL
+                FROM CONTACTS_USERFIELDS
+                WHERE CUSTOM_ID = {$this->debtAmountCustomId}
+            ) AS uf_debt ON c.ID = uf_debt.CONTACT_ID
+            WHERE TIMEADD(hour, -7, COALESCE(c.MODIFIED, a.STAMP, c.CREATED)) >= '{$this->esc($startDate)}'
+              AND COALESCE(c.FIRSTNAME, '') <> ''
+              AND ISCOAPP = 0
+              AND cls.TITLE <> 'Duplicate Lead'
+              AND c.ID > {$lastId}
+            QUALIFY ROW_NUMBER() OVER(PARTITION BY c.ID ORDER BY s.STAMP DESC) = 1
+            ORDER BY c.ID
+            LIMIT {$limit}
+        ";
     }
 
     /**
@@ -428,7 +506,10 @@ class SyncContactsData extends Command
             $debtAmount = $row['DEBT_AMOUNT_CUSTOM'] ?? 0;
             $planTitle  = $row['PLAN_TITLE'] ?? '';
             $category   = $this->normalizePlanTitle($planTitle);
-            $agent      = $row['AGENT_CUSTOM'] ?? '';
+            // LT: agent is the assigned user from USERS join; LDR/PLAW: from custom field
+            $agent      = $this->source === 'LT'
+                ? ($row['ASSIGNED_TO'] ?? '')
+                : ($row['AGENT_CUSTOM'] ?? '');
             $creditUtil = $this->parseCreditUtilization($row['CREDIT_UTILIZATION'] ?? '');
 
             $campaign = '';
@@ -436,7 +517,7 @@ class SyncContactsData extends Command
                 $campaign = $dropNames[$tpId] ?? ($dropNames[\substr($tpId, -9)] ?? '');
             }
 
-            $processed[] = [
+            $processedRow = [
                 'created_date'       => $this->formatDate($row['CREATED'] ?? null),
                 'assigned_date'      => $this->formatDate($row['ASSIGNED_ON'] ?? null),
                 'llg_id'             => 'LLG-' . $contactId,
@@ -461,8 +542,14 @@ class SyncContactsData extends Command
                 'credit_utilization' => $creditUtil,
                 'category'           => $category,
                 'affiliate_agent'    => \substr($agent, 0, 255),
-                'tp_id'              => \substr($tpId, 0, 50),
             ];
+
+            // LT inserts into TblContacts which has no TP_ID column
+            if ($this->source !== 'LT') {
+                $processedRow['tp_id'] = \substr($tpId, 0, 50);
+            }
+
+            $processed[] = $processedRow;
 
             // Enrollment change detection in the same pass
             $enrolledDate = $row['ENROLLED_DATE'] ?? '';
@@ -492,16 +579,23 @@ class SyncContactsData extends Command
      * Each chunk gets its own transaction — keeps lock duration short and limits
      * rollback scope to a single 10 000-row chunk rather than the entire run.
      */
-    private function insertChunk(DBConnector $connector, array $data): void
+    /**
+     * Inserts one processed chunk and returns the number of rows inserted.
+     * Throws on any failure so the caller can abort the run immediately
+     * rather than silently continuing with a partially-written table.
+     */
+    private function insertChunk(DBConnector $connector, array $data): int
     {
         if (empty($data)) {
-            return;
+            return 0;
         }
 
+        // TblContacts (LT) has 24 columns — no TP_ID. TblContactsLDR/PLAW have 25.
         $fields = 'Created_Date, Assigned_Date, LLG_ID, External_ID, Campaign, Data_Source, '
             . 'Created_By, Agent, Client, Phone, Email, Address_1, Address_2, City, State, '
             . 'Zip, Stage, Status, Debt_Amount, Debt_Enrolled, Credit_Score, Credit_Utilization, '
-            . 'Category, Affiliate_Agent, TP_ID';
+            . 'Category, Affiliate_Agent'
+            . ($this->source !== 'LT' ? ', TP_ID' : '');
 
         $pdo = $connector->getSqlServerConnection();
         $pdo->beginTransaction();
@@ -553,12 +647,12 @@ class SyncContactsData extends Command
             }
 
             $pdo->commit();
+            return \count($data);
         } catch (\Throwable $e) {
             if ($pdo->inTransaction()) {
                 $pdo->rollBack();
             }
-            $this->error('Insert failed: ' . $e->getMessage());
-            Log::error('SyncContactsData: Insert failed', ['source' => $this->source, 'error' => $e->getMessage()]);
+            throw $e;
         }
     }
 
@@ -648,12 +742,19 @@ class SyncContactsData extends Command
 
     private function updateRelatedTables(DBConnector $connector): void
     {
-        $sqls = [
+        // LT inserts into TblContacts directly — no cross-table updates needed
+        if ($this->source === 'LT') {
+            return;
+        }
+
+        $table = $this->targetTable;
+
+        $steps = [
             "UPDATE TblContacts
-             SET TblContacts.LLG_ID = {$this->targetTable}.LLG_ID
+             SET TblContacts.LLG_ID = {$table}.LLG_ID
              FROM TblContacts
-             INNER JOIN {$this->targetTable}
-               ON TblContacts.LLG_ID = 'LLG-' + CAST({$this->targetTable}.External_ID AS VARCHAR(50))"
+             INNER JOIN {$table}
+               ON TblContacts.LLG_ID = 'LLG-' + CAST({$table}.External_ID AS VARCHAR(50))"
             => '[INFO] Updated TblContacts.LLG_ID',
 
             "UPDATE TblEnrollment
@@ -661,38 +762,23 @@ class SyncContactsData extends Command
              FROM TblEnrollment, TblContacts
              WHERE TblEnrollment.LLG_ID = TblContacts.LLG_ID"
             => '[INFO] Updated TblEnrollment.Agent',
+
+            // Both LDR and PLAW update Drop_Name
+            "UPDATE TblEnrollment
+             SET TblEnrollment.Drop_Name = TblContacts.Campaign
+             FROM TblEnrollment, TblContacts
+             WHERE TblEnrollment.LLG_ID = TblContacts.LLG_ID
+               AND COALESCE(TblContacts.Campaign, '') <> ''"
+            => '[INFO] Updated TblEnrollment.Drop_Name',
         ];
 
-        foreach ($sqls as $sql => $label) {
+        foreach ($steps as $sql => $label) {
             try {
                 $connector->querySqlServer($sql);
                 $this->info($label);
             } catch (\Throwable $e) {
                 $this->warn('[WARN] ' . $label . ' failed: ' . $e->getMessage());
             }
-        }
-
-        if ($this->source === 'LDR') {
-            $sql = "UPDATE TblEnrollment
-                    SET TblEnrollment.Drop_Name = TblContacts.Campaign
-                    FROM TblEnrollment, TblContacts
-                    WHERE TblEnrollment.LLG_ID = TblContacts.LLG_ID
-                      AND COALESCE(TblContacts.Campaign, '') <> ''";
-            $label = '[INFO] Updated TblEnrollment.Drop_Name';
-        } else {
-            $sql = "UPDATE TblEnrollment
-                    SET TblEnrollment.Agent = TblContacts.Agent
-                    FROM TblEnrollment, TblContacts
-                    WHERE TblEnrollment.LLG_ID = TblContacts.LLG_ID
-                      AND COALESCE(TblContacts.Agent, '') <> ''";
-            $label = '[INFO] Updated TblEnrollment.Agent (PLAW/LT-specific)';
-        }
-
-        try {
-            $connector->querySqlServer($sql);
-            $this->info($label);
-        } catch (\Throwable $e) {
-            $this->warn('[WARN] ' . $label . ' failed: ' . $e->getMessage());
         }
     }
 
