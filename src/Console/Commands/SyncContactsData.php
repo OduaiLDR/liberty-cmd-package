@@ -9,7 +9,9 @@ use Illuminate\Support\Facades\Process;
 
 class SyncContactsData extends Command
 {
-    protected $signature = 'Sync:contacts-data {--source= : Run a single source only (LDR, PLAW, or LT)}';
+    protected $signature = 'Sync:contacts-data
+        {--source= : Run a single source only (LDR, PLAW, or LT)}
+        {--full    : Force a full refresh even when a previous sync timestamp exists}';
 
     protected $description = 'Sync contacts data from Snowflake to SQL Server (TblContactsLDR, TblContactsPLAW, and TblContactsLT)';
 
@@ -117,17 +119,36 @@ class SyncContactsData extends Command
         }
         $this->info("[DEBUG] SQL Server connector OK.");
 
-        $this->clearTargetTable($sqlConnector);
+        // Determine sync mode.
+        // Incremental: fetch only contacts modified since the last successful run,
+        //   then DELETE+INSERT per chunk (no truncate — existing unchanged rows stay).
+        // Full refresh: truncate the table and re-sync everything since 2021-07-01.
+        $lastSyncAt    = $this->option('full') ? null : $this->readLastSyncTime($this->source);
+        $isIncremental = $lastSyncAt !== null;
 
-        // Streaming pipeline:
-        //   Fetch 10 000 rows from Snowflake → load only the SQL Server lookup rows
-        //   that match THIS chunk → process → insert → free memory → repeat.
-        //
-        // Peak memory stays at O(PAGE_SIZE) regardless of total row count.
-        // $seenTpIds and enrollment-change arrays are the only state kept across chunks;
-        // both are small compared to the full contact dataset.
+        if ($isIncremental) {
+            // Subtract 10 minutes as a safety buffer against clock skew / in-flight writes
+            // that were being saved during the previous run's window.
+            $startDate = date('Y-m-d H:i:s', strtotime($lastSyncAt) - 600);
+            $this->info("[INFO] Incremental mode: fetching contacts modified since {$startDate}.");
+        } else {
+            $startDate = '2021-07-01';
+            $this->info("[INFO] Full refresh mode.");
+            $this->clearTargetTable($sqlConnector);
+        }
 
-        $startDate        = '2021-07-01';
+        // Record the sync start time before any data is fetched.
+        // This timestamp is written to the file only after the entire run succeeds,
+        // ensuring a failed/partial run never advances the watermark.
+        $syncStartedAt = date('Y-m-d H:i:s');
+
+        // Dump the actual column list for the target table to diagnose schema mismatches.
+        $schemaResult = $sqlConnector->querySqlServer(
+            "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '{$this->targetTable}' ORDER BY ORDINAL_POSITION"
+        );
+        $actualCols = array_column($schemaResult['data'] ?? [], 'COLUMN_NAME');
+        $this->info("[DEBUG] {$this->targetTable} actual columns: " . implode(', ', $actualCols));
+
         $lastId           = 0;
         $seenTpIds        = [];
         $categoryChanges  = [];
@@ -146,19 +167,16 @@ class SyncContactsData extends Command
             $totalFetched += $chunkSize;
             $lastId        = (int) end($chunk)['LLG_ID'];
 
-            // SQL Server lookups scoped to this chunk — each is a tiny targeted query
             $enrollmentData = $this->loadEnrollmentDataFiltered($sqlConnector, $chunk);
             $dropNames      = $this->fetchDropNamesFiltered($sqlConnector, $chunk);
 
-            // Single pass: build insert rows + collect enrollment changes
             [$processedChunk, $newCatChanges, $newAffChanges] = $this->processChunk(
                 $chunk,
                 $dropNames,
                 $enrollmentData,
-                $seenTpIds   // passed by reference — survives across chunks for TP_ID dedup
+                $seenTpIds
             );
 
-            // Merge enrollment changes (small arrays — just IDs + category strings)
             foreach ($newCatChanges as $c) {
                 $categoryChanges[] = $c;
             }
@@ -167,7 +185,7 @@ class SyncContactsData extends Command
             }
 
             try {
-                $totalInserted += $this->insertChunk($sqlConnector, $processedChunk);
+                $totalInserted += $this->insertChunk($sqlConnector, $processedChunk, $isIncremental);
             } catch (\Throwable $e) {
                 $this->error("[ERROR] Insert failed on chunk ending at ID {$lastId}: " . $e->getMessage());
                 Log::error('SyncContactsData: chunk insert failed', [
@@ -178,20 +196,22 @@ class SyncContactsData extends Command
                 return Command::FAILURE;
             }
 
-            // Free everything from this iteration before fetching the next chunk
             unset($chunk, $enrollmentData, $dropNames, $processedChunk, $newCatChanges, $newAffChanges);
             \gc_collect_cycles();
 
-            $this->info("[INFO] Progress: {$totalFetched} fetched, {$totalInserted} inserted...");
+            $this->info("[INFO] Progress: {$totalFetched} fetched, {$totalInserted} upserted...");
         } while ($chunkSize === self::PAGE_SIZE);
 
-        $this->info("[INFO] Completed: {$totalInserted} records inserted into {$this->targetTable}.");
+        $this->info("[INFO] Completed: {$totalInserted} records upserted into {$this->targetTable}.");
         $this->info("[INFO] Enrollment updates: " . \count($categoryChanges) . " category, " . \count($affiliateChanges) . " affiliate agent");
 
         $this->applyEnrollmentCategoryUpdates($sqlConnector, $categoryChanges);
         $this->applyEnrollmentAffiliateUpdates($sqlConnector, $affiliateChanges);
-
         $this->updateRelatedTables($sqlConnector);
+
+        // Persist the watermark only after a fully successful run
+        $this->writeLastSyncTime($this->source, $syncStartedAt);
+        $this->info("[INFO] Sync watermark saved: {$syncStartedAt}");
 
         $this->info("[SUCCESS] {$this->source} sync completed successfully!");
         return Command::SUCCESS;
@@ -271,8 +291,8 @@ class SyncContactsData extends Command
                 FROM CONTACTS_USERFIELDS
                 WHERE CUSTOM_ID = {$this->agentCustomId}
             ) AS uf_agent ON c.ID = uf_agent.CONTACT_ID
-            WHERE TIMEADD(hour, -7, COALESCE(c.MODIFIED, c.CREATED)) >= '{$this->esc($startDate)}'
-              AND COALESCE(c.FIRSTNAME, '') <> ''
+            WHERE COALESCE(c.MODIFIED, c.CREATED) >= DATEADD(hour, 7, '{$this->esc($startDate)}'::TIMESTAMP_NTZ)
+              AND c.FIRSTNAME IS NOT NULL AND c.FIRSTNAME <> ''
               AND ISCOAPP = 0
               AND c.ID > {$lastId}
             QUALIFY ROW_NUMBER() OVER(PARTITION BY c.ID ORDER BY s.STAMP DESC) = 1
@@ -332,8 +352,8 @@ class SyncContactsData extends Command
                 FROM CONTACTS_USERFIELDS
                 WHERE CUSTOM_ID = {$this->debtAmountCustomId}
             ) AS uf_debt ON c.ID = uf_debt.CONTACT_ID
-            WHERE TIMEADD(hour, -7, COALESCE(c.MODIFIED, a.STAMP, c.CREATED)) >= '{$this->esc($startDate)}'
-              AND COALESCE(c.FIRSTNAME, '') <> ''
+            WHERE COALESCE(c.MODIFIED, a.STAMP, c.CREATED) >= DATEADD(hour, 7, '{$this->esc($startDate)}'::TIMESTAMP_NTZ)
+              AND c.FIRSTNAME IS NOT NULL AND c.FIRSTNAME <> ''
               AND ISCOAPP = 0
               AND cls.TITLE <> 'Duplicate Lead'
               AND c.ID > {$lastId}
@@ -575,16 +595,15 @@ class SyncContactsData extends Command
     // -------------------------------------------------------------------------
 
     /**
-     * Inserts one processed chunk into the target table.
-     * Each chunk gets its own transaction — keeps lock duration short and limits
-     * rollback scope to a single 10 000-row chunk rather than the entire run.
+     * Inserts one processed chunk and returns the number of rows upserted.
+     * Throws on any failure so the caller can abort the run immediately.
+     *
+     * Full refresh mode:  plain INSERT (table was already truncated).
+     * Incremental mode:   DELETE matching LLG_IDs first, then INSERT — this
+     *                     handles both updated existing contacts and brand-new ones
+     *                     without needing a full-table MERGE statement.
      */
-    /**
-     * Inserts one processed chunk and returns the number of rows inserted.
-     * Throws on any failure so the caller can abort the run immediately
-     * rather than silently continuing with a partially-written table.
-     */
-    private function insertChunk(DBConnector $connector, array $data): int
+    private function insertChunk(DBConnector $connector, array $data, bool $incremental = false): int
     {
         if (empty($data)) {
             return 0;
@@ -601,6 +620,21 @@ class SyncContactsData extends Command
         $pdo->beginTransaction();
 
         try {
+            // Incremental: remove stale rows for every LLG_ID we are about to re-insert
+            if ($incremental) {
+                foreach (\array_chunk($data, 1000) as $deleteBatch) {
+                    $ids = \implode(', ', \array_map(
+                        fn($row) => "'" . $this->escSql($row['llg_id']) . "'",
+                        $deleteBatch
+                    ));
+                    $sql = "DELETE FROM {$this->targetTable} WHERE LLG_ID IN ({$ids})";
+                    if ($pdo->exec($sql) === false) {
+                        $err = $pdo->errorInfo();
+                        throw new \RuntimeException('DELETE batch failed: ' . ($err[2] ?? 'unknown PDO error'));
+                    }
+                }
+            }
+
             // SQL Server hard-limits INSERT ... VALUES to 1 000 rows per statement
             foreach (\array_chunk($data, 1000) as $batch) {
                 $valuesParts = [];
@@ -846,13 +880,50 @@ class SyncContactsData extends Command
     protected function initializeSqlServerConnector(): DBConnector
     {
         try {
-            $connector = DBConnector::fromEnvironment(strtolower($this->source));
+            // LT Snowflake data lands in the LDR SQL Server database (same CNLDR connection).
+            // The 'lt' environment key points to CNCCS which has a different TblContacts schema.
+            $envKey    = $this->source === 'LT' ? 'ldr' : strtolower($this->source);
+            $connector = DBConnector::fromEnvironment($envKey);
             $connector->initializeSqlServer();
             return $connector;
         } catch (\Throwable $e) {
             throw new \RuntimeException("Unable to initialize SQL Server connector for {$this->source}: {$e->getMessage()}");
         }
     }
+
+    // -------------------------------------------------------------------------
+    // Sync timestamp (incremental watermark)
+    // -------------------------------------------------------------------------
+
+    private function timestampFilePath(): string
+    {
+        return storage_path('app/sync_timestamps.json');
+    }
+
+    private function readLastSyncTime(string $source): ?string
+    {
+        $path = $this->timestampFilePath();
+        if (!\file_exists($path)) {
+            return null;
+        }
+        $data = \json_decode(\file_get_contents($path), true);
+        return $data[$source] ?? null;
+    }
+
+    private function writeLastSyncTime(string $source, string $datetime): void
+    {
+        $path = $this->timestampFilePath();
+        $data = [];
+        if (\file_exists($path)) {
+            $data = \json_decode(\file_get_contents($path), true) ?? [];
+        }
+        $data[$source] = $datetime;
+        \file_put_contents($path, \json_encode($data, JSON_PRETTY_PRINT));
+    }
+
+    // -------------------------------------------------------------------------
+    // String escaping
+    // -------------------------------------------------------------------------
 
     protected function esc(string $value): string
     {
