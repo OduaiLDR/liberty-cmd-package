@@ -13,7 +13,7 @@ class SyncContactsData extends Command
 
     protected $description = 'Sync contacts data from Snowflake to SQL Server (TblContactsLDR, TblContactsPLAW, and TblContactsLT)';
 
-    private const PAGE_SIZE = 10000;
+    private const PAGE_SIZE = 50000;
 
     private string $source;
     private int $debtAmountCustomId;
@@ -46,7 +46,7 @@ class SyncContactsData extends Command
 
         $pool = Process::pool(function ($pool) use ($php, $artisan, $sources) {
             foreach ($sources as $source) {
-                $pool->as($source)->timeout(1800)->command([$php, $artisan, 'Sync:contacts-data', "--source={$source}"]);
+                $pool->as($source)->timeout(7200)->command([$php, $artisan, 'Sync:contacts-data', "--source={$source}"]);
             }
         })->start(function (string $type, string $output, string $key) {
             foreach (explode("\n", rtrim($output)) as $line) {
