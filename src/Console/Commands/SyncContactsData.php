@@ -634,8 +634,9 @@ class SyncContactsData extends Command
                         . ((int) $row['credit_score']) . ", "
                         . ((int) $row['credit_utilization']) . ", "
                         . "'{$this->escSql($row['category'])}', "
-                        . "'{$this->escSql($row['affiliate_agent'])}', "
-                        . "'{$this->escSql($row['tp_id'])}')";
+                        . "'{$this->escSql($row['affiliate_agent'])}'"
+                        . ($this->source !== 'LT' ? ", '{$this->escSql($row['tp_id'])}'" : '')
+                        . ')';
                 }
 
                 $sql = "INSERT INTO {$this->targetTable} ({$fields}) VALUES " . \implode(', ', $valuesParts);
