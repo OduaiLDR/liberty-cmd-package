@@ -669,13 +669,13 @@ class SyncContactsData extends Command
                 $valuesParts = [];
 
                 foreach ($batch as $row) {
-                    $createdDate  = $row['created_date'] ?: '';
+                    $createdDate  = $row['created_date'] ? "'{$row['created_date']}'" : 'NULL';
                     $assignedDate = $row['assigned_date'] ? "'{$row['assigned_date']}'" : 'NULL';
                     $email        = \strpos($row['email'], '@') !== false
                         ? "'" . $this->escSql($row['email']) . "'"
                         : 'NULL';
 
-                    $valuesParts[] = "('{$createdDate}', {$assignedDate}, "
+                    $valuesParts[] = "({$createdDate}, {$assignedDate}, "
                         . "'{$this->escSql($row['llg_id'])}', "
                         . "'{$this->escSql($row['external_id'])}', "
                         . "'{$this->escSql($row['campaign'])}', "
