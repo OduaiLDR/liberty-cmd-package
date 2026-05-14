@@ -10,8 +10,9 @@ use Illuminate\Support\Facades\Process;
 class SyncContactsData extends Command
 {
     protected $signature = 'Sync:contacts-data
-        {--source= : Run a single source only (LDR, PLAW, or LT)}
-        {--full    : Force a full refresh even when a previous sync timestamp exists}';
+        {--source=   : Run a single source only (LDR, PLAW, or LT)}
+        {--full      : Force a full refresh even when a previous sync timestamp exists}
+        {--no-match  : Skip post-sync table matching (internal flag used by the orchestrator)}';
 
     protected $description = 'Sync contacts data from Snowflake to SQL Server (TblContactsLDR, TblContactsPLAW, and TblContactsLT)';
 
@@ -35,49 +36,79 @@ class SyncContactsData extends Command
             return $this->syncForSource($source);
         }
 
-        $this->info("[INFO] Sync Contacts Data: starting LDR, PLAW, and LT in parallel.");
+        // LT holds the primary contact data (TblContacts). It must complete before
+        // LDR/PLAW run, because the final matching step joins TblContactsLDR/PLAW
+        // back to TblContacts — which only has correct data after LT finishes.
 
         $php = PHP_BINARY;
         if (str_contains(basename($php), 'fpm')) {
             $cli = trim((string) shell_exec('which php8.3 2>/dev/null || which php8.2 2>/dev/null || which php 2>/dev/null'));
             $php = $cli ?: 'php';
         }
-        $artisan = base_path('artisan');
-        $sources = ['LDR', 'PLAW', 'LT'];
-        $results = [];
+        $artisan  = base_path('artisan');
+        $fullFlag = $this->option('full') ? ['--full'] : [];
 
-        $pool = Process::pool(function ($pool) use ($php, $artisan, $sources) {
-            foreach ($sources as $source) {
-                $pool->as($source)->timeout(7200)->command([$php, $artisan, 'Sync:contacts-data', "--source={$source}"]);
+        // ── Step 1: LT ────────────────────────────────────────────────────────
+        $this->info("[INFO] Step 1/3: Syncing LT (primary contacts)...");
+        $ltPool = Process::pool(function ($pool) use ($php, $artisan, $fullFlag) {
+            $pool->as('LT')->timeout(7200)->command(
+                array_merge([$php, $artisan, 'Sync:contacts-data', '--source=LT', '--no-match'], $fullFlag)
+            );
+        })->start(function (string $type, string $output, string $key) {
+            foreach (explode("\n", rtrim($output)) as $line) {
+                if ($line !== '') $this->line("[{$key}] {$line}");
+            }
+        });
+        $ltProcesses = $ltPool->wait();
+
+        if ($ltProcesses['LT']->exitCode() !== 0) {
+            $this->info("\n" . str_repeat('=', 80));
+            $this->error('[ERROR] LT failed — aborting LDR/PLAW to avoid incomplete matching.');
+            return Command::FAILURE;
+        }
+
+        // ── Step 2: LDR + PLAW (parallel) ────────────────────────────────────
+        $this->info("[INFO] Step 2/3: Syncing LDR and PLAW in parallel...");
+        $pool = Process::pool(function ($pool) use ($php, $artisan, $fullFlag) {
+            foreach (['LDR', 'PLAW'] as $src) {
+                $pool->as($src)->timeout(7200)->command(
+                    array_merge([$php, $artisan, 'Sync:contacts-data', "--source={$src}", '--no-match'], $fullFlag)
+                );
             }
         })->start(function (string $type, string $output, string $key) {
             foreach (explode("\n", rtrim($output)) as $line) {
-                if ($line !== '') {
-                    $this->line("[{$key}] {$line}");
-                }
+                if ($line !== '') $this->line("[{$key}] {$line}");
             }
         });
-
         $processes = $pool->wait();
 
-        $this->info("\n" . str_repeat('=', 80));
         $allOk = true;
-        foreach ($sources as $source) {
-            $exitCode         = $processes[$source]->exitCode();
-            $results[$source] = $exitCode === 0;
-            if ($exitCode !== 0) {
-                $this->error("[ERROR] {$source} failed (exit code {$exitCode}).");
+        foreach (['LDR', 'PLAW'] as $src) {
+            if ($processes[$src]->exitCode() !== 0) {
+                $this->error("[ERROR] {$src} failed (exit code {$processes[$src]->exitCode()}).");
                 $allOk = false;
             }
         }
-
-        if ($allOk) {
-            $this->info('[SUCCESS] All syncs (LDR, PLAW, LT) completed successfully!');
-            return Command::SUCCESS;
+        if (!$allOk) {
+            $this->info("\n" . str_repeat('=', 80));
+            $this->error('[ERROR] LDR or PLAW failed — skipping final matching.');
+            return Command::FAILURE;
         }
 
-        $this->error('[ERROR] One or more syncs failed. Check logs for details.');
-        return Command::FAILURE;
+        // ── Step 3: Final matching ─────────────────────────────────────────────
+        $this->info("[INFO] Step 3/3: Running final table matching...");
+        try {
+            $connector = DBConnector::fromEnvironment('ldr');
+            $connector->initializeSqlServer();
+            $this->runFinalMatching($connector);
+        } catch (\Throwable $e) {
+            $this->error('[ERROR] Final matching failed: ' . $e->getMessage());
+            return Command::FAILURE;
+        }
+
+        $this->info("\n" . str_repeat('=', 80));
+        $this->info('[SUCCESS] All syncs (LT → LDR, PLAW → matching) completed successfully!');
+        return Command::SUCCESS;
     }
 
     private function syncForSource(string $source): int
@@ -200,7 +231,12 @@ class SyncContactsData extends Command
 
         $this->applyEnrollmentCategoryUpdates($sqlConnector, $categoryChanges);
         $this->applyEnrollmentAffiliateUpdates($sqlConnector, $affiliateChanges);
-        $this->updateRelatedTables($sqlConnector);
+
+        // When called from the orchestrator (no --source flag), matching is deferred
+        // to handle() so it runs after ALL sources finish. Skip it here in that case.
+        if (!$this->option('no-match')) {
+            $this->updateRelatedTables($sqlConnector);
+        }
 
         // Persist the watermark only after a fully successful run
         $this->writeLastSyncTime($this->source, $syncStartedAt);
@@ -801,6 +837,51 @@ class SyncContactsData extends Command
         ];
 
         foreach ($steps as $sql => $label) {
+            try {
+                $connector->querySqlServer($sql);
+                $this->info($label);
+            } catch (\Throwable $e) {
+                $this->warn('[WARN] ' . $label . ' failed: ' . $e->getMessage());
+            }
+        }
+    }
+
+    // Runs once after ALL sources complete (LT → LDR+PLAW → this).
+    // Matches TblContactsLDR/PLAW back to TblContacts (now fully populated by LT),
+    // then refreshes TblEnrollment.Agent and Drop_Name from TblContacts.
+    private function runFinalMatching(DBConnector $connector): void
+    {
+        foreach (['TblContactsLDR', 'TblContactsPLAW'] as $table) {
+            try {
+                $connector->querySqlServer("
+                    UPDATE TblContacts
+                    SET TblContacts.LLG_ID = {$table}.LLG_ID
+                    FROM TblContacts
+                    INNER JOIN {$table}
+                      ON TblContacts.LLG_ID = 'LLG-' + CAST({$table}.External_ID AS VARCHAR(50))
+                ");
+                $this->info("[INFO] Updated TblContacts.LLG_ID from {$table}");
+            } catch (\Throwable $e) {
+                $this->warn("[WARN] LLG_ID update from {$table} failed: " . $e->getMessage());
+            }
+        }
+
+        $enrollmentSteps = [
+            "UPDATE TblEnrollment
+             SET TblEnrollment.Agent = TblContacts.Agent
+             FROM TblEnrollment, TblContacts
+             WHERE TblEnrollment.LLG_ID = TblContacts.LLG_ID"
+            => '[INFO] Updated TblEnrollment.Agent',
+
+            "UPDATE TblEnrollment
+             SET TblEnrollment.Drop_Name = TblContacts.Campaign
+             FROM TblEnrollment, TblContacts
+             WHERE TblEnrollment.LLG_ID = TblContacts.LLG_ID
+               AND COALESCE(TblContacts.Campaign, '') <> ''"
+            => '[INFO] Updated TblEnrollment.Drop_Name',
+        ];
+
+        foreach ($enrollmentSteps as $sql => $label) {
             try {
                 $connector->querySqlServer($sql);
                 $this->info($label);
