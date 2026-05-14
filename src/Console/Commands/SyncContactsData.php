@@ -273,9 +273,9 @@ class SyncContactsData extends Command
     {
         return "
             SELECT
-                TIMEADD(hour, -7, c.CREATED) AS CREATED,
+                TO_CHAR(TIMEADD(hour, -7, c.CREATED), 'YYYY-MM-DD HH24:MI:SS') AS CREATED,
                 NULL AS ASSIGNED_ON,
-                TIMEADD(hour, -7, COALESCE(c.MODIFIED, c.CREATED)) AS MODIFIED,
+                TO_CHAR(TIMEADD(hour, -7, COALESCE(c.MODIFIED, c.CREATED)), 'YYYY-MM-DD HH24:MI:SS') AS MODIFIED,
                 c.ID AS LLG_ID,
                 c.TP_ID AS EXTERNAL_ID,
                 ds.NAME AS DATA_SOURCE,
@@ -297,7 +297,7 @@ class SyncContactsData extends Command
                     CHARINDEX('Day30', cr.METADATA) - CHARINDEX('RevolvingCreditUtilization', cr.METADATA) - 32) AS CREDIT_UTILIZATION,
                 ep.FEE1,
                 c.TP_ID AS TP_ID_COPY,
-                c.ENROLLED_DATE,
+                TO_CHAR(c.ENROLLED_DATE, 'YYYY-MM-DD HH24:MI:SS') AS ENROLLED_DATE,
                 uf_debt.F_DECIMAL AS DEBT_AMOUNT_CUSTOM,
                 ed.TITLE AS PLAN_TITLE,
                 uf_agent.F_SHORTSTRING AS AGENT_CUSTOM
@@ -337,9 +337,9 @@ class SyncContactsData extends Command
         // Date filter includes a.STAMP. Duplicate leads filtered in Snowflake.
         return "
             SELECT
-                TIMEADD(hour, -7, c.CREATED) AS CREATED,
-                a.STAMP AS ASSIGNED_ON,
-                TIMEADD(hour, -7, COALESCE(c.MODIFIED, a.STAMP)) AS MODIFIED,
+                TO_CHAR(TIMEADD(hour, -7, c.CREATED), 'YYYY-MM-DD HH24:MI:SS') AS CREATED,
+                TO_CHAR(a.STAMP, 'YYYY-MM-DD HH24:MI:SS') AS ASSIGNED_ON,
+                TO_CHAR(TIMEADD(hour, -7, COALESCE(c.MODIFIED, a.STAMP)), 'YYYY-MM-DD HH24:MI:SS') AS MODIFIED,
                 c.ID AS LLG_ID,
                 c.TP_ID AS EXTERNAL_ID,
                 ds.NAME AS DATA_SOURCE,
@@ -361,7 +361,7 @@ class SyncContactsData extends Command
                     CHARINDEX('Day30', cr.METADATA) - CHARINDEX('RevolvingCreditUtilization', cr.METADATA) - 32) AS CREDIT_UTILIZATION,
                 ep.FEE1,
                 c.TP_ID AS TP_ID_COPY,
-                c.ENROLLED_DATE,
+                TO_CHAR(c.ENROLLED_DATE, 'YYYY-MM-DD HH24:MI:SS') AS ENROLLED_DATE,
                 uf_debt.F_DECIMAL AS DEBT_AMOUNT_CUSTOM,
                 NULL AS PLAN_TITLE,
                 NULL AS AGENT_CUSTOM
