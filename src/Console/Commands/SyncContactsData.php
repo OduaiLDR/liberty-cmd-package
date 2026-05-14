@@ -142,13 +142,6 @@ class SyncContactsData extends Command
         // ensuring a failed/partial run never advances the watermark.
         $syncStartedAt = date('Y-m-d H:i:s');
 
-        // Dump the actual column list for the target table to diagnose schema mismatches.
-        $schemaResult = $sqlConnector->querySqlServer(
-            "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '{$this->targetTable}' ORDER BY ORDINAL_POSITION"
-        );
-        $actualCols = array_column($schemaResult['data'] ?? [], 'COLUMN_NAME');
-        $this->info("[DEBUG] {$this->targetTable} actual columns: " . implode(', ', $actualCols));
-
         $lastId           = 0;
         $seenTpIds        = [];
         $categoryChanges  = [];
@@ -880,10 +873,7 @@ class SyncContactsData extends Command
     protected function initializeSqlServerConnector(): DBConnector
     {
         try {
-            // LT Snowflake data lands in the LDR SQL Server database (same CNLDR connection).
-            // The 'lt' environment key points to CNCCS which has a different TblContacts schema.
-            $envKey    = $this->source === 'LT' ? 'ldr' : strtolower($this->source);
-            $connector = DBConnector::fromEnvironment($envKey);
+            $connector = DBConnector::fromEnvironment(strtolower($this->source));
             $connector->initializeSqlServer();
             return $connector;
         } catch (\Throwable $e) {
