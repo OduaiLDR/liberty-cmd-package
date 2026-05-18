@@ -35,6 +35,7 @@ use Cmd\Reports\Console\Commands\SyncVeritasTransactions;
 use Cmd\Reports\Console\Commands\RefreshForthApiTokens;
 use Cmd\Reports\Console\Commands\SyncNegotiatorPayrollData;
 use Cmd\Reports\Console\Commands\UpdateLendingUSAStatuses;
+use Cmd\Reports\Console\Commands\CacheMarketingAdminSnapshot;
 
 
 
@@ -104,6 +105,7 @@ class ReportsServiceProvider extends ServiceProvider
                 SyncNegotiatorPayrollData::class,
                 RefreshForthApiTokens::class,
                 UpdateLendingUSAStatuses::class,
+                CacheMarketingAdminSnapshot::class,
             ]);
         }
 

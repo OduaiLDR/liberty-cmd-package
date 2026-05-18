@@ -4,55 +4,38 @@ namespace Cmd\Reports\Http\Controllers;
 
 use Cmd\Reports\Repositories\MarketingAdminRepository;
 use Illuminate\Contracts\View\View;
+use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Routing\Controller;
+use Illuminate\Http\Response;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 
 class MarketingAdminController extends Controller
 {
-    public function __construct(protected MarketingAdminRepository $repo) {}
+    public function __construct(protected MarketingAdminRepository $repo)
+    {
+    }
 
+    /**
+     * Render the page shell only — no heavy queries here.
+     * Summary, chart, and table data each load asynchronously via AJAX.
+     */
     public function index(Request $request): View
     {
-        $perPage = (int) $request->query('per_page', 15);
-        if ($perPage < 5) {
-            $perPage = 5;
-        }
-        if ($perPage > 100) {
-            $perPage = 100;
-        }
-        $page = max(1, (int) $request->query('page', 1));
-
         $filters = $this->filtersFromRequest($request);
 
-        $submitted = $request->query->count() > 0;
-
-        $data = $submitted
-            ? $this->repo->summary($filters, $page, $perPage)
-            : ['columns' => [], 'rows' => [], 'total' => 0, 'report' => 'marketing_admin'];
-
-        // Temporarily disabled: slow remote SQL queries (9+ seconds)
-        // $audit = $this->repo->auditIntentCounts();
-        $audit = ['total' => 0, 'with' => 0, 'without' => 0];
-
-        // CHART DATA FIX: Charts need ALL filtered rows to show accurate trends, not just current page
-        // With optimized single-query approach, this should be acceptable performance
-        $chartRows = $submitted ? $this->loadAllRowsForCharts($filters) : [];
-
-        return view('reports::reports.marketing_admin', array_merge($data, [
-            'perPage' => $perPage,
-            'page' => $page,
-            'filters' => $filters,
-            'submitted' => $submitted,
-            'allDrops' => $this->repo->listDrops(),
-            'allStates' => $this->repo->listStates(),
-            'allVendors' => $this->repo->listVendors(),
-            'allMailStyles' => $this->repo->listMailStyles(),
-            'allEltScoreRanges' => $this->repo->listEltScoreRanges(),
-            'intentAudit' => $audit,
+        return view('reports::reports.marketing_admin', [
+            'filters'          => $filters,
+            'snapshotAt'       => $this->repo->snapshotAt(),
+            'allDrops'         => $this->repo->listDrops(),
+            'allStates'        => $this->repo->listStates(),
+            'allVendors'       => $this->repo->listVendors(),
             'allDataProviders' => $this->repo->listDataProviders(),
-            'chartJson' => $submitted ? $this->buildChartData($chartRows) : 'null',
-        ]));
+            'allTiers'         => $this->repo->listTiers(),
+            'allYears'         => $this->repo->listYears(),
+            'allMailStyles'    => $this->repo->listMailStyles(),
+            'allDropTypes'     => $this->repo->listDropTypes(),
+        ]);
     }
 
     /** @return array<string, mixed> */
@@ -60,130 +43,91 @@ class MarketingAdminController extends Controller
     {
         $intent = strtolower((string) $request->query('intent', 'all'));
 
-        return [
-            'send_start' => trim((string) $request->query('send_start', '')),
-            'send_end' => trim((string) $request->query('send_end', '')),
-            'state' => strtoupper(trim((string) $request->query('state', ''))),
-            'debt_min' => $request->query('debt_min'),
-            'debt_max' => $request->query('debt_max'),
-            'fico_min' => $request->query('fico_min'),
-            'fico_max' => $request->query('fico_max'),
-            'drops' => $request->query('drops'),
-            'month' => (int) $request->query('month', 0),
-            'year' => (int) $request->query('year', 0),
-            'tier' => strtoupper(trim((string) $request->query('tier', ''))),
-            'vendor' => trim((string) $request->query('vendor', '')),
-            'mail_style' => trim((string) $request->query('mail_style', '')),
-            'elt_score_range' => trim((string) $request->query('elt_score_range', '')),
-            'data_provider' => trim((string) $request->query('data_provider', '')),
-            'marketing_type' => strtoupper(trim((string) $request->query('marketing_type', ''))),
-            'unique' => (int) $request->query('unique', 0) === 1,
-            'sort' => strtolower((string) $request->query('sort', 'send_date')),
-            'dir' => strtolower((string) $request->query('dir', 'asc')),
-            'intent' => in_array($intent, ['all', 'yes', 'no'], true) ? $intent : 'all',
-        ];
-    }
-
-    /**
-     * @param array<string,mixed> $filters
-     * @return array<int,object>
-     */
-    private function loadAllRowsForCharts(array $filters): array
-    {
-        // OPTIMIZATION: With window function fix, we can fetch all rows in one query
-        // Set a reasonable limit to prevent memory issues (1000 drops should cover most filters)
-        $allRowsResult = $this->repo->summary($filters, 1, 1000);
-
-        return $allRowsResult['rows'] ?? [];
-    }
-
-    /** @param array<int, object> $rows */
-    private function buildChartData(array $rows): string
-    {
-        $overview = [
-            'totalRoi'           => 0.0,
-            'totalDropCost'      => 0.0,
-            'totalCapitalPartner' => 0.0,
-            'totalVeritas'       => 0.0,
-            'totalNetEnrollments' => 0,
-            'totalLeads'         => 0,
-        ];
-
-        $monthlyBuckets = [];
-
-        foreach ($rows as $row) {
-            $r               = (array) $row;
-            $roi             = (float) ($r['ROI'] ?? 0);
-            $dropCost        = (float) ($r['Drop Cost'] ?? 0);
-            $capitalPartner  = (float) ($r['Capital Partner'] ?? 0);
-            $veritas         = (float) ($r['Veritas Enrollment'] ?? 0) + (float) ($r['Veritas Monthly'] ?? 0);
-            $netEnrollments  = (int)   ($r['Net Enrollments'] ?? 0);
-            $totalLeads      = (int)   ($r['Total Leads'] ?? 0);
-
-            $overview['totalRoi']            += $roi;
-            $overview['totalDropCost']       += $dropCost;
-            $overview['totalCapitalPartner'] += $capitalPartner;
-            $overview['totalVeritas']        += $veritas;
-            $overview['totalNetEnrollments'] += $netEnrollments;
-            $overview['totalLeads']          += $totalLeads;
-
-            $sendDate = $r['Send Date'] ?? null;
-            if ($sendDate) {
-                try {
-                    $dateObj = $sendDate instanceof \DateTimeInterface
-                        ? \DateTimeImmutable::createFromInterface($sendDate)
-                        : new \DateTimeImmutable((string) $sendDate);
-
-                    $monthKey = $dateObj->format('Y-m');
-                    if (!isset($monthlyBuckets[$monthKey])) {
-                        $monthlyBuckets[$monthKey] = [
-                            'label'          => $dateObj->format('M Y'),
-                            'roi'            => 0.0,
-                            'dropCost'       => 0.0,
-                            'capitalPartner' => 0.0,
-                            'veritas'        => 0.0,
-                        ];
-                    }
-                    $monthlyBuckets[$monthKey]['roi']            += $roi;
-                    $monthlyBuckets[$monthKey]['dropCost']       += $dropCost;
-                    $monthlyBuckets[$monthKey]['capitalPartner'] += $capitalPartner;
-                    $monthlyBuckets[$monthKey]['veritas']        += $veritas;
-                } catch (\Exception $e) {
-                    // skip invalid dates
-                }
+        $normalizeArray = static function (mixed $v): array {
+            if (is_array($v)) {
+                return array_values(array_filter(array_map('trim', $v)));
             }
-        }
+            if (is_string($v) && $v !== '') {
+                return array_values(array_filter(array_map('trim', explode(',', $v))));
+            }
+            return [];
+        };
 
-        ksort($monthlyBuckets);
-        $bucketValues = array_values($monthlyBuckets);
-
-        return json_encode([
-            'overview' => $overview,
-            'roiTrend' => [
-                'labels'         => array_map(static fn(array $b): string => $b['label'], $bucketValues),
-                'roi'            => array_map(static fn(array $b): float => $b['roi'], $bucketValues),
-                'dropCost'       => array_map(static fn(array $b): float => $b['dropCost'], $bucketValues),
-                'capitalPartner' => array_map(static fn(array $b): float => $b['capitalPartner'], $bucketValues),
-                'veritas'        => array_map(static fn(array $b): float => $b['veritas'], $bucketValues),
-            ],
-        ], JSON_THROW_ON_ERROR);
+        return [
+            'send_start'      => trim((string) $request->query('send_start', '')),
+            'send_end'        => trim((string) $request->query('send_end', '')),
+            'drops'           => $normalizeArray($request->query('drops', [])),
+            'states'          => $normalizeArray($request->query('states', [])),
+            'tiers'           => $normalizeArray($request->query('tiers', [])),
+            'vendors'         => $normalizeArray($request->query('vendors', [])),
+            'data_providers'  => $normalizeArray($request->query('data_providers', [])),
+            'marketing_types' => $normalizeArray($request->query('marketing_types', [])),
+            'mail_styles'     => $normalizeArray($request->query('mail_styles', [])),
+            'months'          => array_values(array_filter(array_map('intval', $normalizeArray($request->query('months', []))), fn ($m) => $m >= 1 && $m <= 12)),
+            'years'           => array_values(array_filter(array_map('intval', $normalizeArray($request->query('years', []))), fn ($y) => $y >= 2000 && $y <= 2100)),
+            'debt_min'        => $request->query('debt_min'),
+            'debt_max'        => $request->query('debt_max'),
+            'fico_min'        => $request->query('fico_min'),
+            'fico_max'        => $request->query('fico_max'),
+            'unique'          => (int) $request->query('unique', 0) === 1,
+            'sort'            => strtolower((string) $request->query('sort', 'send_date')),
+            'dir'             => strtolower((string) $request->query('dir', 'asc')),
+            'intent'          => in_array($intent, ['all', 'yes', 'no'], true) ? $intent : 'all',
+            'chart_period'    => in_array($request->query('chart_period', 'weekly'), ['weekly', 'monthly']) ? $request->query('chart_period', 'weekly') : 'weekly',
+        ];
     }
 
-    public function chartData(Request $request)
+    /** Lightweight time-series for the line chart (AJAX). */
+    public function chartData(Request $request): JsonResponse
     {
         $filters = $this->filtersFromRequest($request);
 
-        $chartJson = $this->buildChartData($this->loadAllRowsForCharts($filters));
+        return response()->json($this->repo->timeSeries($filters, $filters['chart_period']));
+    }
 
-        return response()->json(json_decode($chartJson, true));
+    /** Drop Summary aggregates panel (AJAX, returns rendered HTML). */
+    public function summaryData(Request $request): View
+    {
+        $filters           = $this->filtersFromRequest($request);
+        $summaryAggregates = $this->repo->summaryAggregates($filters);
+
+        return view('reports::reports.partials.marketing_admin_summary', [
+            'summaryAggregates' => $summaryAggregates,
+        ]);
+    }
+
+    /** Paginated data table (AJAX, returns rendered HTML — only fetched when toggled open). */
+    public function tableData(Request $request): View
+    {
+        $perPage = max(5, min(100, (int) $request->query('per_page', 15)));
+        $page    = max(1, (int) $request->query('page', 1));
+        $filters = $this->filtersFromRequest($request);
+
+        $data = $this->repo->summary($filters, $page, $perPage);
+
+        return view('reports::reports.partials.marketing_admin_table', array_merge($data, [
+            'page'    => $page,
+            'perPage' => $perPage,
+        ]));
+    }
+
+    /** Rebuild the nightly snapshot on demand (AJAX). */
+    public function refresh(Request $request): JsonResponse
+    {
+        $at = $this->repo->cacheSnapshot();
+
+        return response()->json([
+            'success'     => true,
+            'snapshot_at' => $at->diffForHumans(),
+            'snapshot_ts' => $at->toDateTimeString(),
+        ]);
     }
 
     public function export(Request $request): StreamedResponse
     {
-        $filters = $this->filtersFromRequest($request);
-
-        $data = $this->repo->summary($filters, 1, 10000);
-        $filename = 'marketing_admin_report_' . date('Y-m-d_H-i-s') . '.csv';
+        $filters  = $this->filtersFromRequest($request);
+        $data     = $this->repo->summary($filters, 1, 10000);
+        $filename = 'marketing_admin_report_'.date('Y-m-d_H-i-s').'.csv';
 
         return response()->streamDownload(function () use ($data) {
             $output = fopen('php://output', 'w');
@@ -191,15 +135,15 @@ class MarketingAdminController extends Controller
             foreach ($data['rows'] as $row) {
                 $csvRow = [];
                 foreach ($data['columns'] as $column) {
-                    $value = $row->{$column} ?? '';
+                    $value    = $row->{$column} ?? '';
                     $csvRow[] = is_numeric($value) ? $value : str_replace(['"', "\n", "\r"], ['""', ' ', ' '], (string) $value);
                 }
                 fputcsv($output, $csvRow);
             }
             fclose($output);
         }, $filename, [
-            'Content-Type' => 'text/csv',
-            'Content-Disposition' => 'attachment; filename="' . $filename . '"',
+            'Content-Type'        => 'text/csv',
+            'Content-Disposition' => 'attachment; filename="'.$filename.'"',
         ]);
     }
 }

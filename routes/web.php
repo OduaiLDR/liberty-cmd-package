@@ -178,8 +178,14 @@ $registerCmdReportRoutes = function (bool $withNames = true): void {
         ->name($name('cmd.reports.marketing_admin'));
     Route::get('/marketing-admin/chart-data', [MarketingAdminController::class, 'chartData'])
         ->name($name('cmd.reports.marketing_admin.chart_data'));
+    Route::get('/marketing-admin/summary-data', [MarketingAdminController::class, 'summaryData'])
+        ->name($name('cmd.reports.marketing_admin.summary_data'));
+    Route::get('/marketing-admin/table-data', [MarketingAdminController::class, 'tableData'])
+        ->name($name('cmd.reports.marketing_admin.table_data'));
     Route::get('/marketing-admin/export', [MarketingAdminController::class, 'export'])
         ->name($name('cmd.reports.marketing_admin.export'));
+    Route::post('/marketing-admin/refresh', [MarketingAdminController::class, 'refresh'])
+        ->name($name('cmd.reports.marketing_admin.refresh'));
 
     Route::get('/drop-summary', [DropSummaryController::class, 'index'])
         ->middleware('can:cmd.reports.drop_summary_report')
