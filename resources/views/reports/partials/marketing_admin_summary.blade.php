@@ -2,7 +2,7 @@
   <div class="card-body text-center text-muted py-4" style="font-size:13px;">No data for the selected filters</div>
 @else
   @php $s = $summaryAggregates; @endphp
-  <div class="card-body p-0" style="overflow-y:auto;max-height:70vh;">
+  <div class="card-body p-0">
     <table class="table table-sm mar-summary-table mb-0">
       <tbody>
         <tr><td>Amount Dropped</td><td>{{ number_format($s->amount_dropped) }}</td></tr>
