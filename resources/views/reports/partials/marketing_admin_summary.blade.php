@@ -27,6 +27,7 @@
         <tr><td>Average Debt</td><td>${{ number_format($s->average_debt, 0) }}</td></tr>
         <tr><td>Debt Buyer 8%</td><td>${{ number_format($s->debt_buyer_8pct, 2) }}</td></tr>
         <tr><td>Veritas Enroll Fees</td><td>${{ number_format($s->veritas_enrollment_fees, 0) }}</td></tr>
+        <tr><td>Veritas Monthly Fees</td><td>${{ number_format($s->veritas_monthly_fees, 0) }}</td></tr>
         <tr><td>Total Gross Revenue</td><td>${{ number_format($s->total_gross_revenue, 0) }}</td></tr>
         <tr class="row-div"><td>Cancels</td><td>{{ number_format($s->cancels) }}</td></tr>
         <tr><td>NSFs</td><td>{{ number_format($s->nsfs) }}</td></tr>

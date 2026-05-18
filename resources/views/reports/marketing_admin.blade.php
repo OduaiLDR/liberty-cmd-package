@@ -469,9 +469,18 @@
     if (chartCtrl) chartCtrl.abort();
     chartCtrl = new AbortController();
     fetch('/cmd/reports/marketing-admin/chart-data?' + serializeFilters().toString(), { signal: chartCtrl.signal })
-      .then(function(r){ return r.json(); })
+      .then(function(r){
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
       .then(function(d){ overlay.classList.remove('show'); applyToChart(d, buildFilterLabel()); })
-      .catch(function(e){ if (e.name!=='AbortError') overlay.classList.remove('show'); });
+      .catch(function(e){
+        if (e.name === 'AbortError') return;
+        overlay.classList.remove('show');
+        container.style.display = 'none';
+        emptyMsg.classList.add('show');
+        emptyMsg.textContent = 'Error loading chart: ' + e.message;
+      });
   }
 
   /* ── AJAX: summary ── */
@@ -491,9 +500,15 @@
     if (sumCtrl) sumCtrl.abort();
     sumCtrl = new AbortController();
     fetch('/cmd/reports/marketing-admin/summary-data?' + serializeFilters().toString(), { signal: sumCtrl.signal })
-      .then(function(r){ return r.text(); })
+      .then(function(r){
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.text();
+      })
       .then(function(html){ sumBody.innerHTML = html; sumBadge.style.display = ''; })
-      .catch(function(e){ if (e.name!=='AbortError') sumBody.innerHTML = '<div class="card-body text-danger" style="font-size:13px;">Failed to load summary.</div>'; });
+      .catch(function(e){
+        if (e.name === 'AbortError') return;
+        sumBody.innerHTML = '<div class="card-body text-danger" style="font-size:13px;">Failed to load summary: ' + e.message + '</div>';
+      });
   }
 
   /* ── AJAX: table (lazy) ── */
@@ -508,9 +523,15 @@
     if (tableCtrl) tableCtrl.abort();
     tableCtrl = new AbortController();
     fetch('/cmd/reports/marketing-admin/table-data?' + p.toString(), { signal: tableCtrl.signal })
-      .then(function(r){ return r.text(); })
+      .then(function(r){
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.text();
+      })
       .then(function(html){ tableBody.innerHTML = html; tableLoaded = true; })
-      .catch(function(e){ if (e.name!=='AbortError') tableBody.innerHTML = '<div class="card-body text-danger" style="font-size:13px;">Failed to load table.</div>'; });
+      .catch(function(e){
+        if (e.name === 'AbortError') return;
+        tableBody.innerHTML = '<div class="card-body text-danger" style="font-size:13px;">Failed to load table: ' + e.message + '</div>';
+      });
   }
 
   toggleBtn.addEventListener('click', function() {
@@ -532,15 +553,18 @@
   var refreshTimer = null;
   function refreshAll() {
     clearTimeout(refreshTimer);
+    tableLoaded = false; // always invalidate so table reloads with new filters when opened
     refreshTimer = setTimeout(function() {
       fetchChart();
       fetchSummary();
-      if (tableWrap.style.display === 'block') { tableLoaded = false; fetchTable(1); }
+      if (tableWrap.style.display === 'block') { fetchTable(1); }
     }, 600);
   }
 
   form.addEventListener('change', function(e) {
+    // skip sort/pagination controls and select2-managed selects (they bind change.select2 directly)
     if (['sort','dir','per_page'].indexOf(e.target.name) >= 0) return;
+    if (e.target.classList && e.target.classList.contains('select2-hidden-accessible')) return;
     refreshAll();
   });
   form.addEventListener('input', function(e) {
