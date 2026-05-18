@@ -21,9 +21,17 @@ class MarketingAdminRepository extends SqlSrvRepository
     public function listStates(): array
     {
         return Cache::remember('cmdpkg:marketing_admin:lists:states', 3600, function () {
+            // ASCII 65–90 = A–Z; avoids collation-dependent LIKE [A-Z] matching lowercase/digits
             return array_map(
                 fn ($o) => $o->State,
-                $this->connection()->select("SELECT DISTINCT State FROM TblContacts WHERE State IS NOT NULL AND LEN(State)=2 AND State LIKE '[A-Z][A-Z]' ORDER BY State")
+                $this->connection()->select(
+                    "SELECT DISTINCT State FROM TblContacts
+                     WHERE State IS NOT NULL
+                       AND LEN(State) = 2
+                       AND ASCII(LEFT(State,1)) BETWEEN 65 AND 90
+                       AND ASCII(RIGHT(State,1)) BETWEEN 65 AND 90
+                     ORDER BY State"
+                )
             );
         });
     }

@@ -261,7 +261,7 @@
         <span class="mar-pill" id="mar-snapshot-badge" style="font-size:10px;">
           @if($snapshotAt) Data: {{ $snapshotAt->diffForHumans() }} @else No cache — click Refresh @endif
         </span>
-        <button type="button" class="btn btn-sm btn-outline-light" id="mar-refresh-btn" style="font-size:11px;padding:2px 10px;">Refresh Data</button>
+        <button type="button" class="btn btn-sm btn-light" id="mar-refresh-btn" style="font-size:11px;padding:2px 10px;color:#0f172a;font-weight:600;">Refresh Data</button>
       </div>
     </div>
     <div class="card-body">
