@@ -1,0 +1,666 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Cmd\Reports\Pmod\Services;
+
+use Cmd\Reports\Pmod\Contracts\PmodExecutionGateway;
+use Cmd\Reports\Pmod\Data\PmodWorkItem;
+use Cmd\Reports\Pmod\Support\PmodBusinessDateResolver;
+use Cmd\Reports\Services\DBConnector;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Http;
+
+final class ForthPayPmodExecutionGateway implements PmodExecutionGateway
+{
+    private const FORTH_CRM_BASE_URL = 'https://api.forthcrm.com/v1';
+    private const FORTH_PAY_BASE_URL = 'https://api.forthpay.com/v1';
+
+    private ?DBConnector $dbConnector = null;
+    private array $apiKeyCache = [];
+
+    private function getDbConnector(): DBConnector
+    {
+        if ($this->dbConnector === null) {
+            $this->dbConnector = DBConnector::fromEnvironment('plaw');
+            $this->dbConnector->initializeSqlServer();
+        }
+        return $this->dbConnector;
+    }
+
+    private function getApiKey(string $tenantId): string
+    {
+        $category = strtoupper($tenantId);
+
+        if (isset($this->apiKeyCache[$category])) {
+            return $this->apiKeyCache[$category];
+        }
+
+        $cacheKey = "pmod_api_key_{$category}";
+        $apiKey = Cache::get($cacheKey);
+
+        if ($apiKey) {
+            $this->apiKeyCache[$category] = $apiKey;
+            return $apiKey;
+        }
+
+        try {
+            $connector = $this->getDbConnector();
+            $sql = "SELECT API_Key FROM TblAPIKeys WHERE Category = ?";
+            $result = $connector->querySqlServer($sql, [$category]);
+
+            if ($result['success'] && !empty($result['data'])) {
+                $apiKey = $result['data'][0]['API_Key'] ?? null;
+
+                if ($apiKey) {
+                    Cache::put($cacheKey, $apiKey, now()->addHours(1));
+                    $this->apiKeyCache[$category] = $apiKey;
+
+                    Log::info('PMOD: Fetched API key from TblAPIKeys', [
+                        'tenant' => $tenantId,
+                        'category' => $category,
+                    ]);
+
+                    return $apiKey;
+                }
+            }
+
+            Log::warning('PMOD: API key not found in TblAPIKeys, falling back to env', [
+                'tenant' => $tenantId,
+                'category' => $category,
+            ]);
+        } catch (\Throwable $e) {
+            Log::warning('PMOD: Failed to fetch API key from database, falling back to env', [
+                'tenant' => $tenantId,
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        $apiKey = match ($tenantId) {
+            'ldr' => config('services.crm.ldr_api_key'),
+            'plaw' => config('services.crm.plaw_api_key'),
+            'lt' => config('services.crm.lt_api_key'),
+            default => throw new \InvalidArgumentException("Unknown tenant: {$tenantId}"),
+        };
+
+        if (empty($apiKey)) {
+            throw new \RuntimeException("CRM API key not configured for tenant: {$tenantId}");
+        }
+
+        return $apiKey;
+    }
+
+    private function crmClient(string $tenantId): \Illuminate\Http\Client\PendingRequest
+    {
+        return Http::acceptJson()
+            ->timeout(120)
+            ->baseUrl(self::FORTH_CRM_BASE_URL)
+            ->withHeaders([
+                'Api-Key' => $this->getApiKey($tenantId),
+            ]);
+    }
+
+    private function payClient(string $tenantId): \Illuminate\Http\Client\PendingRequest
+    {
+        return Http::acceptJson()
+            ->timeout(120)
+            ->baseUrl(self::FORTH_PAY_BASE_URL)
+            ->withHeaders([
+                'Api-Key' => $this->getApiKey($tenantId),
+            ]);
+    }
+
+    public function getContactTransactions(PmodWorkItem $workItem): array
+    {
+        Log::info('PMOD: Fetching contact transactions', [
+            'contact_id' => $workItem->contactId,
+            'tenant_id' => $workItem->tenantId,
+            'idempotency_key' => $workItem->idempotencyKey,
+        ]);
+
+        $response = $this->crmClient($workItem->tenantId)
+            ->get("/contacts/{$workItem->contactId}/transactions");
+
+        if (!$response->successful()) {
+            Log::error('PMOD: Failed to fetch contact transactions', [
+                'contact_id' => $workItem->contactId,
+                'tenant_id' => $workItem->tenantId,
+                'status' => $response->status(),
+                'response' => $response->body(),
+            ]);
+
+            return [];
+        }
+
+        $grouped = $response->json('response.results') ?? [];
+
+        // Flatten grouped transactions (keyed by type: D, DPG, SF, PF, C).
+        // For draft (D) transactions, alias transaction_id → draft_id since
+        // Forth CRM's transaction_id IS the Forth Pay draft identifier.
+        $transactions = [];
+        foreach ($grouped as $type => $items) {
+            if (is_array($items)) {
+                foreach ($items as $tx) {
+                    if (is_array($tx)) {
+                        if ($type === 'D' && isset($tx['transaction_id']) && !isset($tx['draft_id'])) {
+                            $tx['draft_id'] = $tx['transaction_id'];
+                        }
+                        $transactions[] = $tx;
+                    }
+                }
+            }
+        }
+
+        Log::info('PMOD: Contact transactions fetched', [
+            'contact_id' => $workItem->contactId,
+            'transaction_count' => count($transactions),
+            'types' => array_keys($grouped),
+        ]);
+
+        return $transactions;
+    }
+
+    public function createContactNote(PmodWorkItem $workItem, string $content, bool $public = true): array
+    {
+        Log::info('PMOD: Creating contact note', [
+            'contact_id' => $workItem->contactId,
+            'tenant_id' => $workItem->tenantId,
+            'public' => $public,
+            'dry_run' => $workItem->dryRun,
+            'idempotency_key' => $workItem->idempotencyKey,
+        ]);
+
+        if ($workItem->dryRun) {
+            Log::info('PMOD: DRY RUN - Would create contact note', [
+                'contact_id' => $workItem->contactId,
+                'content_length' => strlen($content),
+            ]);
+            return [
+                'note_id' => 'dry_run_note_' . uniqid(),
+                'contact_id' => $workItem->contactId,
+                'content' => $content,
+                'dry_run' => true,
+            ];
+        }
+
+        $response = $this->crmClient($workItem->tenantId)
+            ->post("/contacts/{$workItem->contactId}/notes", [
+                'content' => $content,
+                'public' => $public,
+                'note_type' => 2,
+            ]);
+
+        if (!$response->successful()) {
+            Log::error('PMOD: Failed to create contact note', [
+                'contact_id' => $workItem->contactId,
+                'tenant_id' => $workItem->tenantId,
+                'status' => $response->status(),
+                'response' => $response->body(),
+            ]);
+
+            throw new \RuntimeException('Failed to create contact note');
+        }
+
+        $noteData = $response->json('response', []);
+
+        Log::info('PMOD: Contact note created', [
+            'contact_id' => $workItem->contactId,
+            'note_id' => $noteData['note_id'] ?? null,
+        ]);
+
+        return $noteData;
+    }
+
+    public function createDraft(PmodWorkItem $workItem, array $payload): array
+    {
+        $payload = $this->withBusinessProcessDate($payload);
+
+        Log::info('PMOD: Creating draft', [
+            'contact_id' => $workItem->contactId,
+            'tenant_id' => $workItem->tenantId,
+            'payload' => $payload,
+            'idempotency_key' => $workItem->idempotencyKey,
+            'dry_run' => $workItem->dryRun,
+        ]);
+
+        if ($workItem->dryRun) {
+            Log::info('PMOD: DRY RUN - Would create draft', ['payload' => $payload]);
+            return ['draft_id' => 'dry_run_' . uniqid(), 'status' => 'dry_run'];
+        }
+
+        $response = null;
+        for ($attempt = 1; $attempt <= 7; $attempt++) {
+            $response = $this->payClient($workItem->tenantId)
+                ->post('/drafts', $payload);
+
+            if ($response->successful() || ! $this->shouldRetryWithNextDate($response->body(), $payload)) {
+                break;
+            }
+
+            $payload['process_date'] = PmodBusinessDateResolver::nextBusinessDay(
+                PmodBusinessDateResolver::nextDay((string) $payload['process_date'])
+            );
+        }
+
+        if ($response === null || !$response->successful()) {
+            Log::error('PMOD: Failed to create draft', [
+                'contact_id' => $workItem->contactId,
+                'tenant_id' => $workItem->tenantId,
+                'status' => $response->status(),
+                'response' => $response->body(),
+            ]);
+
+            throw new \RuntimeException('Failed to create draft');
+        }
+
+        $draftData = $response->json();
+
+        Log::info('PMOD: Draft created', [
+            'contact_id' => $workItem->contactId,
+            'draft_id' => $draftData['draft_id'] ?? null,
+        ]);
+
+        return $draftData;
+    }
+
+    public function updateDraft(PmodWorkItem $workItem, string $draftId, array $payload): array
+    {
+        $payload = $this->withBusinessProcessDate($payload);
+
+        Log::info('PMOD: Updating draft', [
+            'draft_id' => $draftId,
+            'contact_id' => $workItem->contactId,
+            'tenant_id' => $workItem->tenantId,
+            'payload' => $payload,
+            'idempotency_key' => $workItem->idempotencyKey,
+            'dry_run' => $workItem->dryRun,
+        ]);
+
+        if ($workItem->dryRun) {
+            Log::info('PMOD: DRY RUN - Would update draft', ['draft_id' => $draftId, 'payload' => $payload]);
+            return ['draft_id' => $draftId, 'status' => 'dry_run'];
+        }
+
+        $response = null;
+        for ($attempt = 1; $attempt <= 7; $attempt++) {
+            $response = $this->payClient($workItem->tenantId)
+                ->put("/drafts/{$draftId}", $payload);
+
+            if ($response->successful() || ! $this->shouldRetryWithNextDate($response->body(), $payload)) {
+                break;
+            }
+
+            $payload['process_date'] = PmodBusinessDateResolver::nextBusinessDay(
+                PmodBusinessDateResolver::nextDay((string) $payload['process_date'])
+            );
+        }
+
+        if ($response === null || !$response->successful()) {
+            Log::error('PMOD: Failed to update draft', [
+                'draft_id' => $draftId,
+                'tenant_id' => $workItem->tenantId,
+                'status' => $response->status(),
+                'response' => $response->body(),
+            ]);
+
+            throw new \RuntimeException('Failed to update draft');
+        }
+
+        $draftData = $response->json();
+
+        Log::info('PMOD: Draft updated', ['draft_id' => $draftId]);
+
+        return $draftData;
+    }
+
+    /**
+     * @param array<string, mixed> $payload
+     * @return array<string, mixed>
+     */
+    private function withBusinessProcessDate(array $payload): array
+    {
+        if (! empty($payload['process_date'])) {
+            $payload['process_date'] = PmodBusinessDateResolver::nextBusinessDay((string) $payload['process_date']);
+        }
+
+        return $payload;
+    }
+
+    /**
+     * @param array<string, mixed> $payload
+     */
+    private function shouldRetryWithNextDate(string $responseBody, array $payload): bool
+    {
+        return ! empty($payload['process_date'])
+            && PmodBusinessDateResolver::looksLikeDateRejection($responseBody);
+    }
+
+    public function cancelDraft(PmodWorkItem $workItem, string $draftId): array
+    {
+        Log::info('PMOD: Cancelling draft', [
+            'draft_id' => $draftId,
+            'contact_id' => $workItem->contactId,
+            'tenant_id' => $workItem->tenantId,
+            'idempotency_key' => $workItem->idempotencyKey,
+            'dry_run' => $workItem->dryRun,
+        ]);
+
+        if ($workItem->dryRun) {
+            Log::info('PMOD: DRY RUN - Would cancel draft', ['draft_id' => $draftId]);
+            return ['draft_id' => $draftId, 'status' => 'dry_run_cancelled'];
+        }
+
+        $response = $this->payClient($workItem->tenantId)
+            ->post("/drafts/{$draftId}/cancel");
+
+        if (!$response->successful()) {
+            Log::error('PMOD: Failed to cancel draft', [
+                'draft_id' => $draftId,
+                'tenant_id' => $workItem->tenantId,
+                'status' => $response->status(),
+                'response' => $response->body(),
+            ]);
+
+            throw new \RuntimeException('Failed to cancel draft');
+        }
+
+        $draftData = $response->json();
+
+        Log::info('PMOD: Draft cancelled', ['draft_id' => $draftId]);
+
+        return $draftData;
+    }
+
+    public function voidSettlementOffer(PmodWorkItem $workItem, string $settlementId): array
+    {
+        Log::info('PMOD: Voiding settlement offer', [
+            'settlement_id' => $settlementId,
+            'contact_id' => $workItem->contactId,
+            'tenant_id' => $workItem->tenantId,
+            'idempotency_key' => $workItem->idempotencyKey,
+            'dry_run' => $workItem->dryRun,
+        ]);
+
+        if ($workItem->dryRun) {
+            Log::info('PMOD: DRY RUN - Would void settlement', ['settlement_id' => $settlementId]);
+            return ['settlement_id' => $settlementId, 'status' => 'dry_run_voided'];
+        }
+
+        $response = $this->crmClient($workItem->tenantId)
+            ->post("/settlements/{$settlementId}/void");
+
+        if (!$response->successful()) {
+            Log::error('PMOD: Failed to void settlement offer', [
+                'settlement_id' => $settlementId,
+                'tenant_id' => $workItem->tenantId,
+                'status' => $response->status(),
+                'response' => $response->body(),
+            ]);
+
+            throw new \RuntimeException('Failed to void settlement offer');
+        }
+
+        $settlementData = $response->json('response', []);
+
+        Log::info('PMOD: Settlement offer voided', ['settlement_id' => $settlementId]);
+
+        return $settlementData;
+    }
+
+    public function resumePayments(PmodWorkItem $workItem): array
+    {
+        Log::info('PMOD: Resuming payments', [
+            'contact_id' => $workItem->contactId,
+            'tenant_id' => $workItem->tenantId,
+            'idempotency_key' => $workItem->idempotencyKey,
+            'dry_run' => $workItem->dryRun,
+        ]);
+
+        if ($workItem->dryRun) {
+            Log::info('PMOD: DRY RUN - Would resume payments', ['contact_id' => $workItem->contactId]);
+            return ['contact_id' => $workItem->contactId, 'status' => 'dry_run_resumed'];
+        }
+
+        $response = $this->crmClient($workItem->tenantId)
+            ->post("/contacts/{$workItem->contactId}/resume-payments");
+
+        if (!$response->successful()) {
+            Log::error('PMOD: Failed to resume payments', [
+                'contact_id' => $workItem->contactId,
+                'tenant_id' => $workItem->tenantId,
+                'status' => $response->status(),
+                'response' => $response->body(),
+            ]);
+
+            throw new \RuntimeException('Failed to resume payments');
+        }
+
+        $paymentData = $response->json('response', []);
+
+        Log::info('PMOD: Payments resumed', ['contact_id' => $workItem->contactId]);
+
+        return $paymentData;
+    }
+
+    public function createRefund(PmodWorkItem $workItem, array $payload): array
+    {
+        Log::info('PMOD: Creating refund', [
+            'contact_id' => $workItem->contactId,
+            'tenant_id' => $workItem->tenantId,
+            'payload' => $payload,
+            'idempotency_key' => $workItem->idempotencyKey,
+            'dry_run' => $workItem->dryRun,
+        ]);
+
+        if ($workItem->dryRun) {
+            Log::info('PMOD: DRY RUN - Would create refund', ['payload' => $payload]);
+            return ['refund_id' => 'dry_run_' . uniqid(), 'status' => 'dry_run'];
+        }
+
+        $response = $this->payClient($workItem->tenantId)
+            ->post('/refunds', $payload);
+
+        if (!$response->successful()) {
+            Log::error('PMOD: Failed to create refund', [
+                'contact_id' => $workItem->contactId,
+                'tenant_id' => $workItem->tenantId,
+                'status' => $response->status(),
+                'response' => $response->body(),
+            ]);
+
+            throw new \RuntimeException('Failed to create refund');
+        }
+
+        $refundData = $response->json();
+
+        Log::info('PMOD: Refund created', [
+            'contact_id' => $workItem->contactId,
+            'refund_id' => $refundData['id'] ?? $refundData['refund_id'] ?? null,
+        ]);
+
+        return $refundData;
+    }
+
+    public function refundDraft(PmodWorkItem $workItem, string $draftId, array $payload): array
+    {
+        return $this->createRefund($workItem, [
+            ...$payload,
+            'client_id' => $payload['client_id'] ?? $workItem->contactId,
+            'draft_id' => $draftId,
+        ]);
+    }
+
+    public function getContactDebts(PmodWorkItem $workItem): array
+    {
+        Log::info('PMOD: Fetching contact debts', [
+            'contact_id' => $workItem->contactId,
+            'tenant_id'  => $workItem->tenantId,
+        ]);
+
+        $response = $this->crmClient($workItem->tenantId)
+            ->get("/contacts/{$workItem->contactId}/debts");
+
+        if (!$response->successful()) {
+            Log::error('PMOD: Failed to fetch contact debts', [
+                'contact_id' => $workItem->contactId,
+                'status'     => $response->status(),
+                'response'   => $response->body(),
+            ]);
+            return [];
+        }
+
+        return $response->json('response.results', []);
+    }
+
+    public function getContactSummary(PmodWorkItem $workItem): array
+    {
+        Log::info('PMOD: Fetching contact summary', [
+            'contact_id' => $workItem->contactId,
+            'tenant_id'  => $workItem->tenantId,
+        ]);
+
+        $response = $this->crmClient($workItem->tenantId)
+            ->get("/contacts/{$workItem->contactId}/summary");
+
+        if (!$response->successful()) {
+            Log::error('PMOD: Failed to fetch contact summary', [
+                'contact_id' => $workItem->contactId,
+                'status'     => $response->status(),
+                'response'   => $response->body(),
+            ]);
+            return [];
+        }
+
+        return $response->json('response', []);
+    }
+
+    public function addBankAccount(PmodWorkItem $workItem, array $payload): array
+    {
+        Log::info('PMOD: Adding bank account', [
+            'contact_id'      => $workItem->contactId,
+            'tenant_id'       => $workItem->tenantId,
+            'idempotency_key' => $workItem->idempotencyKey,
+            'dry_run'         => $workItem->dryRun,
+        ]);
+
+        if ($workItem->dryRun) {
+            Log::info('PMOD: DRY RUN - Would add bank account', ['contact_id' => $workItem->contactId]);
+            return ['bank_account_id' => 'dry_run_' . uniqid(), 'status' => 'dry_run'];
+        }
+
+        $response = $this->crmClient($workItem->tenantId)
+            ->post("/contacts/{$workItem->contactId}/bank-accounts", $payload);
+
+        if (!$response->successful()) {
+            Log::error('PMOD: Failed to add bank account', [
+                'contact_id' => $workItem->contactId,
+                'status'     => $response->status(),
+                'response'   => $response->body(),
+            ]);
+            throw new \RuntimeException('Failed to add bank account');
+        }
+
+        $data = $response->json('response', []);
+        Log::info('PMOD: Bank account added', ['contact_id' => $workItem->contactId]);
+        return $data;
+    }
+
+    public function uploadContactDocument(PmodWorkItem $workItem, string $base64Content, string $fileName, string $description): array
+    {
+        Log::info('PMOD: Uploading contact document', [
+            'contact_id' => $workItem->contactId,
+            'tenant_id'  => $workItem->tenantId,
+            'file_name'  => $fileName,
+            'dry_run'    => $workItem->dryRun,
+        ]);
+
+        if ($workItem->dryRun) {
+            Log::info('PMOD: DRY RUN - Would upload document', ['file_name' => $fileName]);
+            return ['document_id' => 'dry_run_' . uniqid(), 'status' => 'dry_run'];
+        }
+
+        $response = $this->crmClient($workItem->tenantId)
+            ->post("/contacts/{$workItem->contactId}/documents", [
+                'file_name'   => $fileName,
+                'description' => $description,
+                'content'     => $base64Content,
+            ]);
+
+        if (!$response->successful()) {
+            Log::error('PMOD: Failed to upload contact document', [
+                'contact_id' => $workItem->contactId,
+                'status'     => $response->status(),
+                'response'   => $response->body(),
+            ]);
+            throw new \RuntimeException('Failed to upload contact document');
+        }
+
+        $data = $response->json('response', []);
+        Log::info('PMOD: Document uploaded', ['contact_id' => $workItem->contactId, 'file_name' => $fileName]);
+        return $data;
+    }
+
+    public function createDebt(PmodWorkItem $workItem, array $payload): array
+    {
+        Log::info('PMOD: Creating debt', [
+            'contact_id'      => $workItem->contactId,
+            'tenant_id'       => $workItem->tenantId,
+            'idempotency_key' => $workItem->idempotencyKey,
+            'dry_run'         => $workItem->dryRun,
+        ]);
+
+        if ($workItem->dryRun) {
+            Log::info('PMOD: DRY RUN - Would create debt', ['payload' => $payload]);
+            return ['debt_id' => 'dry_run_' . uniqid(), 'status' => 'dry_run'];
+        }
+
+        $response = $this->crmClient($workItem->tenantId)
+            ->post("/contacts/{$workItem->contactId}/debts", $payload);
+
+        if (!$response->successful()) {
+            Log::error('PMOD: Failed to create debt', [
+                'contact_id' => $workItem->contactId,
+                'status'     => $response->status(),
+                'response'   => $response->body(),
+            ]);
+            throw new \RuntimeException('Failed to create debt');
+        }
+
+        $data = $response->json('response', []);
+        Log::info('PMOD: Debt created', ['contact_id' => $workItem->contactId]);
+        return $data;
+    }
+
+    public function cancelDebt(PmodWorkItem $workItem, string $debtId): array
+    {
+        Log::info('PMOD: Cancelling debt', [
+            'debt_id'         => $debtId,
+            'contact_id'      => $workItem->contactId,
+            'tenant_id'       => $workItem->tenantId,
+            'idempotency_key' => $workItem->idempotencyKey,
+            'dry_run'         => $workItem->dryRun,
+        ]);
+
+        if ($workItem->dryRun) {
+            Log::info('PMOD: DRY RUN - Would cancel debt', ['debt_id' => $debtId]);
+            return ['debt_id' => $debtId, 'status' => 'dry_run_cancelled'];
+        }
+
+        $response = $this->crmClient($workItem->tenantId)
+            ->post("/debts/{$debtId}/cancel");
+
+        if (!$response->successful()) {
+            Log::error('PMOD: Failed to cancel debt', [
+                'debt_id'  => $debtId,
+                'status'   => $response->status(),
+                'response' => $response->body(),
+            ]);
+            throw new \RuntimeException('Failed to cancel debt');
+        }
+
+        $data = $response->json('response', []);
+        Log::info('PMOD: Debt cancelled', ['debt_id' => $debtId]);
+        return $data;
+    }
+}
