@@ -31,6 +31,7 @@ use Cmd\Reports\Console\Commands\GenerateLookbackSummaryReport\GenerateLookbackS
 use Cmd\Reports\Console\Commands\GenerateReportSummary\GenerateReportSummary;
 use Cmd\Reports\Console\Commands\GenerateSyncSummary\GenerateSyncSummary;
 use Cmd\Reports\Console\Commands\SyncContactsData;
+use Cmd\Reports\Console\Commands\SyncContactsCCS;
 use Cmd\Reports\Console\Commands\SyncCollectionCompanies;
 use Cmd\Reports\Console\Commands\SyncLastDepositDate;
 use Cmd\Reports\Console\Commands\SyncVeritasTransactions;
@@ -103,6 +104,7 @@ class ReportsServiceProvider extends ServiceProvider
                 GenerateReportSummary::class,
                 GenerateSyncSummary::class,
                 SyncContactsData::class,
+                SyncContactsCCS::class,
                 SyncCollectionCompanies::class,
                 SyncLastDepositDate::class,
                 SyncVeritasTransactions::class,
