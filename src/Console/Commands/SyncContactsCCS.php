@@ -7,6 +7,22 @@ use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
 use PDO;
 
+/**
+ * Sync CCS contacts: Snowflake → TblContacts (CCS DB) → TblContactsCCS (LDR DB).
+ *
+ * Campaign (Drop_Name) is resolved per-chunk in PHP via temp-table-filtered
+ * lookups against TblEnrollmentOverrides and TblMailers, then INSERTed with
+ * the row — no post-INSERT UPDATE pass.
+ *
+ * The 3-step precedence is preserved:
+ *   1) TblEnrollmentOverrides matched by CID — overrides both External_ID and Campaign.
+ *   2) TblMailers matched by (overridden) External_ID — sets Campaign if empty.
+ *   3) TblMailers matched by Address_1 — fallback only when Campaign is still empty
+ *      and Data_Source does not contain "non-mailer".
+ *
+ * --full is non-routine. Daily cron runs incremental (small, fast). Use --full
+ * only for: schema changes, data recovery, or initial backfill.
+ */
 class SyncContactsCCS extends Command
 {
     protected $signature = 'Sync:contacts-ccs
@@ -85,6 +101,7 @@ class SyncContactsCCS extends Command
         $totalFetched  = 0;
         $totalInserted = 0;
         $processedCids = [];
+        $seenTpIds     = [];
 
         // ── Fetch + insert loop ───────────────────────────────────────────────
         do {
@@ -98,7 +115,7 @@ class SyncContactsCCS extends Command
             $totalFetched += $chunkSize;
             $lastId        = (int) end($chunk)['CONTACT_ID'];
 
-            $rows = $this->processChunk($chunk);
+            $rows = $this->processChunk($ccsPdo, $chunk, $seenTpIds);
 
             // Collect CIDs only for incremental copy (full refresh uses OFFSET/FETCH)
             if ($isIncremental) {
@@ -125,15 +142,6 @@ class SyncContactsCCS extends Command
         } while ($chunkSize === self::PAGE_SIZE);
 
         $this->info("[INFO] Completed: {$totalInserted} records upserted into TblContacts (CCS).");
-
-        // ── Campaign matching ─────────────────────────────────────────────────
-        $this->info('[INFO] Running campaign matching...');
-        try {
-            $this->runCampaignMatching($ccsPdo);
-        } catch (\Throwable $e) {
-            $this->error('[ERROR] Campaign matching failed: ' . $e->getMessage());
-            return Command::FAILURE;
-        }
 
         // ── Copy to LDR TblContactsCCS ────────────────────────────────────────
         $this->info('[INFO] Copying to LDR TblContactsCCS...');
@@ -173,6 +181,135 @@ class SyncContactsCCS extends Command
             PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
         ]);
+    }
+
+    // -------------------------------------------------------------------------
+    // Per-chunk lookup fetchers (campaign matching)
+    // -------------------------------------------------------------------------
+
+    /**
+     * @return array<string, array{drop_name: string, external_id: string}>
+     */
+    private function fetchOverridesFiltered(PDO $ccsPdo, array $cids): array
+    {
+        $cids = array_values(array_unique(array_filter(array_map('strval', $cids), fn($v) => $v !== '')));
+        if (empty($cids)) {
+            return [];
+        }
+
+        $ccsPdo->exec("CREATE TABLE #TmpOverrideFilter (CID VARCHAR(50))");
+        foreach (array_chunk($cids, 1000) as $batch) {
+            $values = implode(', ', array_map(
+                fn($id) => "('" . $this->escSql($id) . "')",
+                $batch
+            ));
+            $ccsPdo->exec("INSERT INTO #TmpOverrideFilter VALUES {$values}");
+        }
+
+        $stmt = $ccsPdo->query("
+            SELECT o.CID, o.Drop_Name, o.External_ID
+            FROM TblEnrollmentOverrides o
+            JOIN #TmpOverrideFilter f ON o.CID = f.CID
+        ");
+        $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        $ccsPdo->exec("DROP TABLE #TmpOverrideFilter");
+
+        $map = [];
+        foreach ($rows as $row) {
+            $cid = (string) ($row['CID'] ?? '');
+            if ($cid === '') {
+                continue;
+            }
+            $map[$cid] = [
+                'drop_name'   => (string) ($row['Drop_Name'] ?? ''),
+                'external_id' => (string) ($row['External_ID'] ?? ''),
+            ];
+        }
+        return $map;
+    }
+
+    /**
+     * @return array<string, string>  ExternalID => Drop_Name
+     */
+    private function fetchMailersByExtIdFiltered(PDO $ccsPdo, array $externalIds): array
+    {
+        $externalIds = array_values(array_unique(array_filter(
+            array_map(fn($v) => trim((string) $v), $externalIds),
+            fn($v) => $v !== ''
+        )));
+        if (empty($externalIds)) {
+            return [];
+        }
+
+        $ccsPdo->exec("CREATE TABLE #TmpMailerExtFilter (ExtId VARCHAR(50))");
+        foreach (array_chunk($externalIds, 1000) as $batch) {
+            $values = implode(', ', array_map(
+                fn($id) => "('" . $this->escSql(substr($id, 0, 50)) . "')",
+                $batch
+            ));
+            $ccsPdo->exec("INSERT INTO #TmpMailerExtFilter VALUES {$values}");
+        }
+
+        $stmt = $ccsPdo->query("
+            SELECT m.External_ID, m.Drop_Name
+            FROM TblMailers m
+            JOIN #TmpMailerExtFilter f ON m.External_ID = f.ExtId
+            WHERE m.External_ID IS NOT NULL AND m.Drop_Name IS NOT NULL
+        ");
+        $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        $ccsPdo->exec("DROP TABLE #TmpMailerExtFilter");
+
+        $map = [];
+        foreach ($rows as $row) {
+            $ext = (string) ($row['External_ID'] ?? '');
+            $drop = (string) ($row['Drop_Name'] ?? '');
+            if ($ext !== '' && $drop !== '' && !isset($map[$ext])) {
+                $map[$ext] = $drop;
+            }
+        }
+        return $map;
+    }
+
+    /**
+     * @return array<string, string>  Address => Drop_Name
+     */
+    private function fetchMailersByAddressFiltered(PDO $ccsPdo, array $addresses): array
+    {
+        $addresses = array_values(array_unique(array_filter(
+            array_map(fn($v) => trim((string) $v), $addresses),
+            fn($v) => $v !== ''
+        )));
+        if (empty($addresses)) {
+            return [];
+        }
+
+        $ccsPdo->exec("CREATE TABLE #TmpMailerAddrFilter (Address VARCHAR(255))");
+        foreach (array_chunk($addresses, 1000) as $batch) {
+            $values = implode(', ', array_map(
+                fn($a) => "('" . $this->escSql(substr($a, 0, 255)) . "')",
+                $batch
+            ));
+            $ccsPdo->exec("INSERT INTO #TmpMailerAddrFilter VALUES {$values}");
+        }
+
+        $stmt = $ccsPdo->query("
+            SELECT m.Address, m.Drop_Name
+            FROM TblMailers m
+            JOIN #TmpMailerAddrFilter f ON m.Address = f.Address
+            WHERE m.Address IS NOT NULL AND m.Drop_Name IS NOT NULL
+        ");
+        $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        $ccsPdo->exec("DROP TABLE #TmpMailerAddrFilter");
+
+        $map = [];
+        foreach ($rows as $row) {
+            $addr = (string) ($row['Address'] ?? '');
+            $drop = (string) ($row['Drop_Name'] ?? '');
+            if ($addr !== '' && $drop !== '' && !isset($map[$addr])) {
+                $map[$addr] = $drop;
+            }
+        }
+        return $map;
     }
 
     // -------------------------------------------------------------------------
@@ -272,13 +409,111 @@ class SyncContactsCCS extends Command
     // Processing
     // -------------------------------------------------------------------------
 
-    private function processChunk(array $chunk): array
+    private function processChunk(PDO $ccsPdo, array $chunk, array &$seenTpIds): array
     {
-        $processed = [];
+        // ── First pass: gather CIDs and apply TP_ID dedup + test-email filter ─────
+        $candidates = [];
+        $cids       = [];
 
         foreach ($chunk as $row) {
             if (($row['EMAIL'] ?? '') === 'testing@example.com') {
                 continue;
+            }
+
+            $tpId = trim((string) ($row['EXTERNAL_ID'] ?? ''));
+            if ($tpId !== '' && isset($seenTpIds[$tpId])) {
+                continue;
+            }
+            if ($tpId !== '') {
+                $seenTpIds[$tpId] = true;
+            }
+
+            $cid = (string) ($row['CONTACT_ID'] ?? '');
+            if ($cid === '') {
+                continue;
+            }
+
+            $candidates[] = $row;
+            $cids[]       = $cid;
+        }
+
+        if (empty($candidates)) {
+            return [];
+        }
+
+        // ── Step 1: TblEnrollmentOverrides by CID — overrides External_ID + Campaign ─
+        $overrides = $this->fetchOverridesFiltered($ccsPdo, $cids);
+
+        // Resolve the effective External_ID for each candidate (override wins).
+        // Collect distinct ExtIDs needed for the step-2 mailer lookup.
+        $effectiveExtIds = [];
+        $extIdsForLookup = [];
+        foreach ($candidates as $idx => $row) {
+            $cid          = (string) ($row['CONTACT_ID'] ?? '');
+            $rawExtId     = substr(trim((string) ($row['EXTERNAL_ID'] ?? '')), 0, 50);
+            $effective    = isset($overrides[$cid]) ? substr((string) $overrides[$cid]['external_id'], 0, 50) : $rawExtId;
+            $effectiveExtIds[$idx] = $effective;
+            if ($effective !== '') {
+                $extIdsForLookup[$effective] = true;
+            }
+        }
+
+        // ── Step 2: TblMailers by External_ID ────────────────────────────────────
+        $mailersByExt = $this->fetchMailersByExtIdFiltered($ccsPdo, array_keys($extIdsForLookup));
+
+        // ── Step 3 prep: collect Address_1 values for rows that still need fallback ─
+        $addressesForLookup = [];
+        foreach ($candidates as $idx => $row) {
+            $cid       = (string) ($row['CONTACT_ID'] ?? '');
+            $effExt    = $effectiveExtIds[$idx];
+            $haveCampaign =
+                (isset($overrides[$cid]) && $overrides[$cid]['drop_name'] !== '')
+                || ($effExt !== '' && isset($mailersByExt[$effExt]));
+
+            if ($haveCampaign) {
+                continue;
+            }
+
+            $dataSource = (string) ($row['DATA_SOURCE'] ?? '');
+            if (stripos($dataSource, 'non-mailer') !== false) {
+                continue;
+            }
+
+            $address = substr(trim((string) ($row['ADDRESS1'] ?? '')), 0, 255);
+            if ($address !== '') {
+                $addressesForLookup[$address] = true;
+            }
+        }
+
+        $mailersByAddress = $this->fetchMailersByAddressFiltered($ccsPdo, array_keys($addressesForLookup));
+
+        // ── Final assembly with resolved campaign + final external_id ────────────
+        $processed = [];
+        foreach ($candidates as $idx => $row) {
+            $cid       = (string) ($row['CONTACT_ID'] ?? '');
+            $rawExtId  = substr(trim((string) ($row['EXTERNAL_ID'] ?? '')), 0, 50);
+            $effExtId  = $effectiveExtIds[$idx];
+
+            $campaign  = '';
+            $finalExt  = $rawExtId;
+
+            if (isset($overrides[$cid])) {
+                $campaign = (string) $overrides[$cid]['drop_name'];
+                $finalExt = substr((string) $overrides[$cid]['external_id'], 0, 50);
+            }
+
+            if ($campaign === '' && $effExtId !== '' && isset($mailersByExt[$effExtId])) {
+                $campaign = $mailersByExt[$effExtId];
+            }
+
+            if ($campaign === '') {
+                $dataSource = (string) ($row['DATA_SOURCE'] ?? '');
+                if (stripos($dataSource, 'non-mailer') === false) {
+                    $address = substr(trim((string) ($row['ADDRESS1'] ?? '')), 0, 255);
+                    if ($address !== '' && isset($mailersByAddress[$address])) {
+                        $campaign = $mailersByAddress[$address];
+                    }
+                }
             }
 
             $loanNeeded   = (float) ($row['LOAN_AMOUNT_NEEDED'] ?? 0);
@@ -289,8 +524,9 @@ class SyncContactsCCS extends Command
             $debtAmount = (int) (floor($debtRaw / 1000) * 1000);
 
             $processed[] = [
-                'cid'                        => (string) ($row['CONTACT_ID'] ?? ''),
-                'external_id'                => substr(trim((string) ($row['EXTERNAL_ID'] ?? '')), 0, 50),
+                'cid'                        => $cid,
+                'external_id'                => $finalExt,
+                'campaign'                   => substr($campaign, 0, 255),
                 'created_date'               => $this->formatDate($row['CREATED'] ?? null),
                 'assigned_date'              => $this->formatDate($row['ASSIGNED_ON'] ?? null),
                 'data_source'                => substr($row['DATA_SOURCE'] ?? '', 0, 255),
@@ -368,7 +604,7 @@ class SyncContactsCCS extends Command
                     $valuesParts[] = "({$createdDate}, {$assignedDate}, "
                         . "'{$this->escSql($row['cid'])}', "
                         . "'{$this->escSql($row['external_id'])}', "
-                        . "'', "  // Campaign — populated by runCampaignMatching()
+                        . "'{$this->escSql($row['campaign'])}', "
                         . "'{$this->escSql($row['data_source'])}', "
                         . "'{$this->escSql($row['created_by'])}', "
                         . "'{$this->escSql($row['agent'])}', "
@@ -410,43 +646,6 @@ class SyncContactsCCS extends Command
     }
 
     // -------------------------------------------------------------------------
-    // Campaign matching (all on CCS SQL Server)
-    // -------------------------------------------------------------------------
-
-    private function runCampaignMatching(PDO $pdo): void
-    {
-        // Step 1: Match by CID → TblEnrollmentOverrides (also overwrites External_ID)
-        $pdo->exec("
-            UPDATE TblContacts
-            SET Campaign    = o.Drop_Name,
-                External_ID = o.External_ID
-            FROM TblContacts
-            JOIN TblEnrollmentOverrides o ON TblContacts.CID = o.CID
-        ");
-        $this->info('[INFO] Campaign matching: step 1 (TblEnrollmentOverrides by CID) done.');
-
-        // Step 2: Match by External_ID → TblMailers
-        $pdo->exec("
-            UPDATE TblContacts
-            SET Campaign = m.Drop_Name
-            FROM TblContacts
-            JOIN TblMailers m ON TblContacts.External_ID = m.External_ID
-        ");
-        $this->info('[INFO] Campaign matching: step 2 (TblMailers by External_ID) done.');
-
-        // Step 3: Fallback — match by Address_1 for contacts still missing a campaign
-        $pdo->exec("
-            UPDATE TblContacts
-            SET Campaign = m.Drop_Name
-            FROM TblContacts
-            JOIN TblMailers m ON TblContacts.Address_1 = m.Address
-            WHERE COALESCE(TblContacts.Campaign, '') = ''
-              AND TblContacts.Data_Source NOT LIKE '%non-mailer%'
-        ");
-        $this->info('[INFO] Campaign matching: step 3 (TblMailers by Address_1 fallback) done.');
-    }
-
-    // -------------------------------------------------------------------------
     // Copy CCS TblContacts → LDR TblContactsCCS
     // -------------------------------------------------------------------------
 
@@ -459,18 +658,21 @@ class SyncContactsCCS extends Command
             . 'First_Payment_Cleared_Date, First_Payment_Returned_Date, First_Payment_Amount, Payment_Frequency';
 
         if (!$incremental) {
-            // Full refresh: truncate LDR table, then page through CCS and copy everything
+            // Full refresh: truncate LDR table, then page through CCS using cursor
+            // pagination on CID. OFFSET would re-scan all prior rows each batch
+            // (quadratic on 360K+ rows); WHERE CID > $lastCid is constant per batch.
             $this->clearTable($ldrPdo, 'TblContactsCCS');
 
-            $offset      = 0;
+            $lastCid     = 0;
             $totalCopied = 0;
+            $pageSize    = self::COPY_PAGE_SIZE;
 
             do {
                 $stmt = $ccsPdo->query("
-                    SELECT {$fields}
+                    SELECT TOP ({$pageSize}) {$fields}
                     FROM TblContacts
+                    WHERE CAST(CID AS BIGINT) > {$lastCid}
                     ORDER BY CAST(CID AS BIGINT)
-                    OFFSET {$offset} ROWS FETCH NEXT " . self::COPY_PAGE_SIZE . " ROWS ONLY
                 ");
                 $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
@@ -480,9 +682,9 @@ class SyncContactsCCS extends Command
 
                 $this->insertBatch($ldrPdo, 'TblContactsCCS', $fields, $rows);
                 $totalCopied += count($rows);
-                $offset      += count($rows);
+                $lastCid      = (int) end($rows)['CID'];
                 $this->info("[INFO] LDR copy progress: {$totalCopied} rows...");
-            } while (count($rows) === self::COPY_PAGE_SIZE);
+            } while (count($rows) === $pageSize);
 
             $this->info("[INFO] Full copy to TblContactsCCS complete: {$totalCopied} rows.");
             return;
