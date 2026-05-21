@@ -172,7 +172,6 @@ class SyncContactsCCS extends Command
         return new PDO($dsn, $username, $password, [
             PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-            PDO::ATTR_TIMEOUT            => 300,
         ]);
     }
 
@@ -316,7 +315,7 @@ class SyncContactsCCS extends Command
                 'payments'                   => (int) ($row['PAYMENTS'] ?? 0),
                 'enrollment_plan'            => substr($row['PLAN_TITLE'] ?? '', 0, 255),
                 'first_payment_cleared_date' => $this->formatDate($row['FPC_DATE'] ?? null),
-                'first_payment_returned_date'=> $this->formatDate($row['FPR_DATE'] ?? null),
+                'first_payment_returned_date' => $this->formatDate($row['FPR_DATE'] ?? null),
                 'first_payment_amount'       => (float) ($row['FIRST_PAYMENT_AMOUNT'] ?? 0),
                 'payment_frequency'          => substr($row['PAYMENT_FREQUENCY'] ?? '', 0, 50),
             ];
@@ -361,7 +360,7 @@ class SyncContactsCCS extends Command
                     $enrolledDate = $row['enrolled_date']              ? "'{$row['enrolled_date']}'"              : 'NULL';
                     $droppedDate  = $row['dropped_date']               ? "'{$row['dropped_date']}'"               : 'NULL';
                     $fpcDate      = $row['first_payment_cleared_date'] ? "'{$row['first_payment_cleared_date']}'" : 'NULL';
-                    $fprDate      = $row['first_payment_returned_date']? "'{$row['first_payment_returned_date']}'" : 'NULL';
+                    $fprDate      = $row['first_payment_returned_date'] ? "'{$row['first_payment_returned_date']}'" : 'NULL';
                     $email        = strpos($row['email'], '@') !== false
                         ? "'" . $this->escSql($row['email']) . "'"
                         : 'NULL';
@@ -392,8 +391,7 @@ class SyncContactsCCS extends Command
                         . "'{$this->escSql($row['enrollment_plan'])}', "
                         . "{$fpcDate}, {$fprDate}, "
                         . ((float) $row['first_payment_amount']) . ', '
-                        . "'{$this->escSql($row['payment_frequency'])}')"
-                    ;
+                        . "'{$this->escSql($row['payment_frequency'])}')";
                 }
 
                 $pdo->exec(
@@ -531,7 +529,7 @@ class SyncContactsCCS extends Command
                 $enrolledDate = !empty($row['Enrolled_Date'])              ? "'" . $this->escSql($row['Enrolled_Date']) . "'"              : 'NULL';
                 $droppedDate  = !empty($row['Dropped_Date'])               ? "'" . $this->escSql($row['Dropped_Date']) . "'"               : 'NULL';
                 $fpcDate      = !empty($row['First_Payment_Cleared_Date']) ? "'" . $this->escSql($row['First_Payment_Cleared_Date']) . "'" : 'NULL';
-                $fprDate      = !empty($row['First_Payment_Returned_Date'])? "'" . $this->escSql($row['First_Payment_Returned_Date']) . "'" : 'NULL';
+                $fprDate      = !empty($row['First_Payment_Returned_Date']) ? "'" . $this->escSql($row['First_Payment_Returned_Date']) . "'" : 'NULL';
                 $email        = strpos((string) ($row['Email'] ?? ''), '@') !== false
                     ? "'" . $this->escSql($row['Email']) . "'"
                     : 'NULL';
@@ -562,8 +560,7 @@ class SyncContactsCCS extends Command
                     . "'{$this->escSql($row['Enrollment_Plan'] ?? '')}', "
                     . "{$fpcDate}, {$fprDate}, "
                     . ((float) ($row['First_Payment_Amount'] ?? 0)) . ', '
-                    . "'{$this->escSql($row['Payment_Frequency'] ?? '')}')"
-                ;
+                    . "'{$this->escSql($row['Payment_Frequency'] ?? '')}')";
             }
 
             $pdo->exec("INSERT INTO {$table} ({$fields}) VALUES " . implode(', ', $valuesParts));
