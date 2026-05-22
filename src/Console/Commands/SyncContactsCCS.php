@@ -14,11 +14,12 @@ use PDO;
  * lookups against TblEnrollmentOverrides and TblMailers, then INSERTed with
  * the row — no post-INSERT UPDATE pass.
  *
- * The 3-step precedence is preserved:
- *   1) TblEnrollmentOverrides matched by CID — overrides both External_ID and Campaign.
- *   2) TblMailers matched by (overridden) External_ID — sets Campaign if empty.
+ * The 3-step precedence matches the legacy VBA exactly:
+ *   1) TblEnrollmentOverrides matched by CID — sets External_ID and an initial Campaign.
+ *   2) TblMailers matched by the (overridden) External_ID — UNCONDITIONALLY overwrites
+ *      Campaign when a match exists (mirrors VBA: no "WHERE Campaign = ''" filter).
  *   3) TblMailers matched by Address_1 — fallback only when Campaign is still empty
- *      and Data_Source does not contain "non-mailer".
+ *      AND Data_Source does not contain "non-mailer".
  *
  * --full is non-routine. Daily cron runs incremental (small, fast). Use --full
  * only for: schema changes, data recovery, or initial backfill.
@@ -502,7 +503,10 @@ class SyncContactsCCS extends Command
                 $finalExt = substr((string) $overrides[$cid]['external_id'], 0, 50);
             }
 
-            if ($campaign === '' && $effExtId !== '' && isset($mailersByExt[$effExtId])) {
+            // Step 2 mirrors the VBA: no "WHERE Campaign = ''" guard, so a TblMailers
+            // hit on the (possibly overridden) External_ID overwrites the override's
+            // Drop_Name. Address fallback (step 3) still only runs when Campaign is empty.
+            if ($effExtId !== '' && isset($mailersByExt[$effExtId])) {
                 $campaign = $mailersByExt[$effExtId];
             }
 
