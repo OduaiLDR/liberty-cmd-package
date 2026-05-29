@@ -538,10 +538,17 @@ class SyncContactsData extends Command
         $existingCategories = $enrollmentData['categories'];
         $existingAffiliates = $enrollmentData['affiliate_agents'];
 
+        // Ghost Snowflake records that don't exist in LT CRM — excluded permanently
+        // because they share a TP_ID with valid contacts and win the dedup due to lower IDs.
+        $ghostIds = [1212313502, 1212314964, 1212315478, 1212329195, 1212342404];
+
         foreach ($chunk as $row) {
             $contactId = $row['LLG_ID'] ?? '';
             $tpId      = $row['EXTERNAL_ID'] ?? '';
 
+            if (in_array((int) $contactId, $ghostIds, true)) {
+                continue;
+            }
             if (($row['STATUS'] ?? '') === 'Duplicate Lead') {
                 continue;
             }
