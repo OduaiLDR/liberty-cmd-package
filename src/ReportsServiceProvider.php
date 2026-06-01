@@ -36,6 +36,7 @@ use Cmd\Reports\Console\Commands\SyncContactsCCS;
 use Cmd\Reports\Console\Commands\SyncCollectionCompanies;
 use Cmd\Reports\Console\Commands\SyncLastDepositDate;
 use Cmd\Reports\Console\Commands\SyncVeritasTransactions;
+use Cmd\Reports\Console\Commands\SyncPhoneNumbers;
 use Cmd\Reports\Console\Commands\RefreshForthApiTokens;
 use Cmd\Reports\Console\Commands\SyncNegotiatorPayrollData;
 use Cmd\Reports\Console\Commands\UpdateLendingUSAStatuses;
@@ -110,6 +111,7 @@ class ReportsServiceProvider extends ServiceProvider
                 SyncCollectionCompanies::class,
                 SyncLastDepositDate::class,
                 SyncVeritasTransactions::class,
+                SyncPhoneNumbers::class,
                 SyncNegotiatorPayrollData::class,
                 RefreshForthApiTokens::class,
                 UpdateLendingUSAStatuses::class,
