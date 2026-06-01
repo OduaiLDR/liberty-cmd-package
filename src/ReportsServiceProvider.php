@@ -26,6 +26,7 @@ use Cmd\Reports\Console\Commands\GenerateLegalReport\GenerateLegalReport;
 use Cmd\Reports\Console\Commands\GenerateWelcomeLetterReport\GenerateWelcomeLetterReport;
 use Cmd\Reports\Console\Commands\GenerateWelcomePacketReport\GenerateWelcomePacketReport;
 use Cmd\Reports\Console\Commands\GenerateDroppedReport\GenerateDroppedReport;
+use Cmd\Reports\Console\Commands\GenerateNoOffersReport\GenerateNoOffersReport;
 use Cmd\Reports\Console\Commands\GenerateScrubListReport\GenerateScrubListReport;
 use Cmd\Reports\Console\Commands\GenerateLookbackSummaryReport\GenerateLookbackSummaryReport;
 use Cmd\Reports\Console\Commands\GenerateReportSummary\GenerateReportSummary;
@@ -99,6 +100,7 @@ class ReportsServiceProvider extends ServiceProvider
                 GenerateWelcomeLetterReport::class,
                 GenerateWelcomePacketReport::class,
                 GenerateDroppedReport::class,
+                GenerateNoOffersReport::class,
                 GenerateScrubListReport::class,
                 GenerateLookbackSummaryReport::class,
                 GenerateReportSummary::class,
