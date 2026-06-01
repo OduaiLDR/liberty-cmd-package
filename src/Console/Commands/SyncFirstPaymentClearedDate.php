@@ -33,6 +33,12 @@ class SyncFirstPaymentClearedDate extends Command
                 $connector->initializeSqlServer();
                 $this->ensureLogTable($connector);
 
+                $this->info("[$source] Checking for previously synced payments that were returned...");
+                $reverted = $this->revertReturnedFirstPayments($connector, $source);
+                if ($reverted > 0) {
+                    $this->info("[$source] Cleared {$reverted} contacts whose first cleared payment was returned.");
+                }
+
                 $this->info("[$source] Fetching IDs missing First_Payment_Cleared_Date from SQL Server...");
                 $missingIds = $this->fetchMissingIdsFromSqlServer($connector);
 
@@ -66,6 +72,16 @@ class SyncFirstPaymentClearedDate extends Command
                     );
                     continue;
                 }
+
+                $this->info("[$source] Fetching enrolled debt totals from Snowflake...");
+                $debtTotals = $this->fetchEnrolledDebtTotals($connector, array_keys($payments));
+                $this->info("[$source] Found debt totals for " . count($debtTotals) . " contacts.");
+
+                // Merge debt totals into payments data
+                foreach ($payments as $llgId => &$data) {
+                    $data['debt_amount'] = $debtTotals[$llgId] ?? null;
+                }
+                unset($data);
 
                 $this->info("[$source] Applying first cleared payments to SQL Server...");
                 $updated = $this->updateFirstClearedPayments($connector, $payments);
@@ -245,31 +261,11 @@ FROM (
       AND t.TRANS_TYPE = 'D'
       AND t.CLEARED_DATE IS NOT NULL
       AND t.RETURNED_DATE IS NULL
+      AND (t.RETURN_CODE IS NULL OR t.RETURN_CODE = '')
+      AND t._FIVETRAN_DELETED = FALSE
 )
 WHERE N = 1
 SQL;
-
-            $this->info('SQL Query for chunk ' . ($chunkIndex + 1) . ':');
-            $this->info(substr($sql, 0, 400) . '...');
-
-            // DEBUG: Check if data exists at all for first 5 IDs
-            if ($chunkIndex === 0) {
-                $debugIds = array_slice($chunk, 0, 5);
-                $debugIdList = implode(',', $debugIds);
-                $debugSql = "SELECT CONTACT_ID, TRANS_TYPE, CLEARED_DATE, RETURNED_DATE FROM TRANSACTIONS WHERE CONTACT_ID IN ({$debugIdList}) AND TRANS_TYPE = 'D' LIMIT 10";
-                try {
-                    $this->info('DEBUG: Checking if any data exists for first 5 contact IDs...');
-                    $debugResult = $connector->query($debugSql);
-                    if (isset($debugResult['data']) && count($debugResult['data']) > 0) {
-                        $this->info('DEBUG: Found ' . count($debugResult['data']) . ' rows in TRANSACTIONS');
-                        $this->info('DEBUG Sample: ' . json_encode($debugResult['data'][0]));
-                    } else {
-                        $this->error('DEBUG: NO DATA FOUND in TRANSACTIONS for these contact IDs!');
-                    }
-                } catch (\Throwable $e) {
-                    $this->error('DEBUG query failed: ' . $e->getMessage());
-                }
-            }
 
             try {
                 $this->info('Executing Snowflake query for chunk ' . ($chunkIndex + 1) . '...');
@@ -372,20 +368,87 @@ SQL;
             $this->info('Chunk ' . ($chunkIndex + 1) . ' complete. Total payments so far: ' . count($payments));
         }
 
-        $this->info('=== FINAL RESULT ===');
-        $this->info('Fetched ' . count($payments) . ' first cleared payments from Snowflake');
-
-        if (count($payments) > 0) {
-            $this->info('Sample payments: ' . json_encode(array_slice($payments, 0, 3, true)));
-        } else {
-            $this->error('NO PAYMENTS FOUND');
-            $this->info('This means either:');
-            $this->info('1. No contacts had their FIRST payment occur in the last 7 days');
-            $this->info('2. PROCESS_DATE is also NULL (run the debug query above to check)');
-            $this->info('3. Different database/schema than VBA uses');
-        }
+        $this->info('Fetched ' . count($payments) . ' first cleared payments from Snowflake.');
 
         return $payments;
+    }
+
+    /**
+     * Fetch SUM(ORIGINAL_DEBT_AMOUNT) from Snowflake DEBTS for contacts whose
+     * first payment just cleared. This value locks Debt_Amount on TblEnrollment
+     * so it only gets set once (at first payment).
+     *
+     * @param list<string> $llgIds  e.g. ['LLG-123', 'LLG-456']
+     * @return array<string, string> LLG_ID => total debt amount
+     */
+    protected function fetchEnrolledDebtTotals(DBConnector $connector, array $llgIds): array
+    {
+        if (empty($llgIds)) {
+            return [];
+        }
+
+        // Extract numeric contact IDs from LLG IDs
+        $contactToLlg = [];
+        foreach ($llgIds as $llgId) {
+            $numeric = preg_replace('/\D+/', '', (string) $llgId);
+            if ($numeric !== '') {
+                $contactToLlg[$numeric] = (string) $llgId;
+            }
+        }
+
+        if (empty($contactToLlg)) {
+            return [];
+        }
+
+        $contactIds = array_keys($contactToLlg);
+        $debtTotals = [];
+        $chunkSize = 500;
+
+        foreach (array_chunk($contactIds, $chunkSize) as $chunkIndex => $chunk) {
+            $values = implode(', ', array_map(fn($id) => "('" . $this->escapeSqlString($id) . "')", $chunk));
+
+            $sql = <<<SQL
+SELECT
+    CONTACT_ID,
+    SUM(ORIGINAL_DEBT_AMOUNT) AS TOTAL_DEBT
+FROM DEBTS
+WHERE CONTACT_ID IN (SELECT TO_NUMBER(column1) FROM VALUES {$values})
+  AND ENROLLED = 1
+GROUP BY CONTACT_ID
+SQL;
+
+            try {
+                $result = $connector->query($sql);
+                $rows = [];
+
+                if (is_array($result)) {
+                    if (isset($result['data']) && is_array($result['data'])) {
+                        $rows = $result['data'];
+                    } elseif (array_is_list($result)) {
+                        $rows = $result;
+                    }
+                }
+
+                foreach ($rows as $row) {
+                    $cid = (string) ($row['CONTACT_ID'] ?? '');
+                    $totalDebt = $row['TOTAL_DEBT'] ?? null;
+
+                    if ($cid !== '' && $totalDebt !== null && $totalDebt !== '') {
+                        $llgId = $contactToLlg[$cid] ?? ('LLG-' . $cid);
+                        $debtTotals[$llgId] = (string) $totalDebt;
+                        $this->info("  Debt total for {$llgId}: \${$totalDebt}");
+                    }
+                }
+            } catch (\Throwable $e) {
+                $this->error('Snowflake DEBTS query failed: ' . $e->getMessage());
+                Log::error('SyncFirstPaymentClearedDate: DEBTS query failed.', [
+                    'error' => $e->getMessage(),
+                    'chunk' => $chunkIndex + 1,
+                ]);
+            }
+        }
+
+        return $debtTotals;
     }
 
     protected function updateFirstClearedPayments(DBConnector $connector, array $payments): int
@@ -402,6 +465,7 @@ SQL;
             $casesDate = [];
             $casesProcessDate = [];
             $casesAmount = [];
+            $casesDebt = [];
             $ids = [];
 
             foreach ($chunk as $llgId => $data) {
@@ -421,6 +485,11 @@ SQL;
                     $amountSql = (string) $amountVal;
                 }
 
+                $debtVal = $data['debt_amount'] ?? null;
+                if ($debtVal !== null && $debtVal !== '' && is_numeric($debtVal)) {
+                    $casesDebt[] = "WHEN '{$llgEsc}' THEN {$debtVal}";
+                }
+
                 $casesDate[] = "WHEN '{$llgEsc}' THEN '{$dateEsc}'";
                 if ($processDateEsc !== null) {
                     $casesProcessDate[] = "WHEN '{$llgEsc}' THEN '{$processDateEsc}'";
@@ -436,6 +505,7 @@ SQL;
             $caseDateSql = implode(' ', $casesDate);
             $caseProcessDateSql = implode(' ', $casesProcessDate);
             $caseAmountSql = implode(' ', $casesAmount);
+            $caseDebtSql = implode(' ', $casesDebt);
             $idList = implode(', ', $ids);
 
             $setClauses = [
@@ -445,6 +515,10 @@ SQL;
             ];
             if ($caseProcessDateSql !== '') {
                 $setClauses[] = "First_Payment_Date = CASE LLG_ID {$caseProcessDateSql} ELSE First_Payment_Date END";
+            }
+            // Update Debt_Amount from Snowflake DEBTS only when currently NULL or 0 (locked after first payment)
+            if ($caseDebtSql !== '') {
+                $setClauses[] = "Debt_Amount = CASE WHEN (Debt_Amount IS NULL OR Debt_Amount = 0) THEN CASE LLG_ID {$caseDebtSql} ELSE Debt_Amount END ELSE Debt_Amount END";
             }
             $setSql = implode(",\n    ", $setClauses);
 
@@ -493,6 +567,136 @@ SQL;
         }
 
         return $totalUpdated;
+    }
+
+    protected function revertReturnedFirstPayments(DBConnector $connector, string $source): int
+    {
+        // Fetch contacts that already have First_Payment_Cleared_Date set
+        $sql = <<<SQL
+SELECT LLG_ID
+FROM dbo.TblEnrollment
+WHERE First_Payment_Cleared_Date IS NOT NULL
+  AND Cancel_Date IS NULL
+  AND LLG_ID LIKE 'LLG-%'
+  AND TRY_CONVERT(BIGINT, REPLACE(LLG_ID, 'LLG-', '')) IS NOT NULL
+SQL;
+
+        $result = $connector->querySqlServer($sql);
+
+        if (!is_array($result) || ($result['success'] ?? null) !== true) {
+            return 0;
+        }
+
+        $rows = $result['data'] ?? [];
+
+        $contactToLlg = [];
+        foreach ($rows as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            foreach ($row as $key => $value) {
+                if (strcasecmp($key, 'LLG_ID') === 0 && $value !== null && $value !== '') {
+                    $numeric = preg_replace('/\D+/', '', (string) $value);
+                    if ($numeric !== '' && !isset($contactToLlg[$numeric])) {
+                        $contactToLlg[$numeric] = (string) $value;
+                    }
+                    break;
+                }
+            }
+        }
+
+        if (empty($contactToLlg)) {
+            return 0;
+        }
+
+        $contactIds = array_keys($contactToLlg);
+        $toRevert = [];
+        $chunkSize = 500;
+
+        foreach (array_chunk($contactIds, $chunkSize) as $chunk) {
+            $values = implode(', ', array_map(fn($id) => "('" . $this->escapeSqlString($id) . "')", $chunk));
+
+            // Find contacts whose FIRST D transaction (by CLEARED_DATE) was returned
+            $snowflakeSql = <<<SQL
+SELECT CONTACT_ID
+FROM (
+    SELECT
+        t.CONTACT_ID,
+        t.RETURNED_DATE,
+        t.RETURN_CODE,
+        ROW_NUMBER() OVER (PARTITION BY t.CONTACT_ID ORDER BY TO_DATE(t.CLEARED_DATE)) AS N
+    FROM TRANSACTIONS t
+    WHERE t.CONTACT_ID IN (SELECT TO_NUMBER(column1) FROM VALUES {$values})
+      AND t.TRANS_TYPE = 'D'
+      AND t.CLEARED_DATE IS NOT NULL
+      AND t._FIVETRAN_DELETED = FALSE
+)
+WHERE N = 1
+  AND (RETURNED_DATE IS NOT NULL OR (RETURN_CODE IS NOT NULL AND RETURN_CODE != ''))
+SQL;
+
+            try {
+                $sfResult = $connector->query($snowflakeSql);
+                $sfRows = $sfResult['data'] ?? [];
+
+                foreach ($sfRows as $sfRow) {
+                    $cid = (string) ($sfRow['CONTACT_ID'] ?? '');
+                    if ($cid === '') {
+                        continue;
+                    }
+                    $llgId = $contactToLlg[$cid] ?? ('LLG-' . $cid);
+                    $toRevert[] = $llgId;
+                    $this->warn("[{$source}] Reverting returned first payment for {$llgId}");
+                    Log::info('SyncFirstPaymentClearedDate: reverting returned first payment.', [
+                        'source' => $source,
+                        'llg_id' => $llgId,
+                    ]);
+                }
+            } catch (\Throwable $e) {
+                $this->error("[{$source}] Snowflake revert check failed: " . $e->getMessage());
+                Log::error('SyncFirstPaymentClearedDate: revert check failed.', [
+                    'source' => $source,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        if (empty($toRevert)) {
+            return 0;
+        }
+
+        $totalReverted = 0;
+
+        foreach (array_chunk($toRevert, 500) as $chunk) {
+            $idList = implode(', ', array_map(
+                fn($id) => "'" . $this->escapeSqlString($this->truncateString($id, 100)) . "'",
+                $chunk
+            ));
+
+            $updateSql = <<<SQL
+UPDATE TblEnrollment
+SET First_Payment_Cleared_Date = NULL,
+    First_Payment_Date         = NULL,
+    First_Payment_Status       = NULL,
+    Program_Payment            = NULL
+WHERE LLG_ID IN ({$idList})
+SQL;
+
+            $updateResult = $connector->querySqlServer($updateSql);
+
+            if (is_array($updateResult) && isset($updateResult['success']) && $updateResult['success'] === false) {
+                $this->error("[{$source}] Revert update failed: " . ($updateResult['error'] ?? 'Unknown error'));
+                Log::error('SyncFirstPaymentClearedDate: revert update failed.', [
+                    'source' => $source,
+                    'result' => $updateResult,
+                ]);
+                continue;
+            }
+
+            $totalReverted += count($chunk);
+        }
+
+        return $totalReverted;
     }
 
     protected function ensureLogTable(DBConnector $connector): void

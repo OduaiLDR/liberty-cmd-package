@@ -10,16 +10,12 @@ use Cmd\Reports\Pmod\Data\PmodResult;
 use Cmd\Reports\Pmod\Data\PmodWorkItem;
 use Cmd\Reports\Pmod\Enums\PmodActionType;
 
-/**
- * Handles Add Creditor and Extend Program action - adds a new creditor and extends program duration.
- */
 final class AddCreditorAndExtendProgramAction implements PmodActionHandler
 {
     public function __construct(
         private readonly PmodExecutionGateway $gateway,
         private readonly bool $allowLiveDraftUpdates = false,
-    ) {
-    }
+    ) {}
 
     public function actionType(): PmodActionType
     {
@@ -29,93 +25,127 @@ final class AddCreditorAndExtendProgramAction implements PmodActionHandler
     public function handle(PmodWorkItem $workItem): PmodResult
     {
         $creditorChange = $workItem->creditorChange;
-        $monthsToExtend = $workItem->normalizedPayload['months_to_extend'] ?? null;
-        $amount = $workItem->amount;
+        $monthsToExtend = (int) ($workItem->normalizedPayload['months_to_extend'] ?? $workItem->creditorChange['months_to_extend'] ?? 0);
+        $amount         = $workItem->amount;
 
         if (empty($creditorChange)) {
-            $this->gateway->createContactNote(
-                $workItem,
-                "Add Creditor and Extend Program Failed\n" .
-                "Reason: No creditor information provided\n" .
-                "Contact ID: {$workItem->contactId}\n" .
-                "Requested by: {$workItem->requestedBy}\n" .
-                "Timestamp: " . now()->toIso8601String()
-            );
-            
-            return PmodResult::failed(
-                'Add Creditor and Extend Program requires creditor information.',
-                ['reason' => 'missing_creditor_info', 'action_type' => 'add_creditor_and_extend_program', 'contact_id' => $workItem->contactId]
-            );
+            return $this->capture($workItem, 'Add Creditor and Extend Program requires creditor information.', ['reason' => 'missing_creditor_info']);
         }
 
-        if ($monthsToExtend === null || $monthsToExtend <= 0) {
-            $this->gateway->createContactNote(
-                $workItem,
-                "Add Creditor and Extend Program Failed\n" .
-                "Reason: Invalid months to extend\n" .
-                "Contact ID: {$workItem->contactId}\n" .
-                "Requested by: {$workItem->requestedBy}\n" .
-                "Months to extend: " . ($monthsToExtend ?? 'missing') . "\n" .
-                "Timestamp: " . now()->toIso8601String()
-            );
-            
-            return PmodResult::failed(
-                'Add Creditor and Extend Program requires valid months_to_extend value.',
-                ['reason' => 'invalid_months', 'months_to_extend' => $monthsToExtend, 'action_type' => 'add_creditor_and_extend_program', 'contact_id' => $workItem->contactId]
-            );
+        if ($monthsToExtend <= 0 || $monthsToExtend > 60) {
+            return $this->capture($workItem, 'Add Creditor and Extend Program requires months_to_extend between 1 and 60.', [
+                'reason'          => 'invalid_months',
+                'months_to_extend' => $monthsToExtend,
+            ]);
+        }
+
+        if ($amount === null || (float) $amount <= 0) {
+            return $this->capture($workItem, 'Add Creditor and Extend Program requires a valid payment amount.', [
+                'reason' => 'missing_amount',
+            ]);
         }
 
         if (!$this->allowLiveDraftUpdates || $workItem->dryRun) {
-            $this->gateway->createContactNote(
-                $workItem,
-                "Add Creditor and Extend Program - Live Updates Disabled\n" .
-                "Would add creditor and extend program but mutations are not allowed\n" .
-                "Reason: " . ($workItem->dryRun ? 'Dry run mode' : 'PMOD_LIVE_DRAFT_UPDATES=false') . "\n" .
-                "Contact ID: {$workItem->contactId}\n" .
-                "Requested by: {$workItem->requestedBy}\n" .
-                "Creditor: " . ($creditorChange['creditor_name'] ?? 'N/A') . "\n" .
-                "Months to extend: {$monthsToExtend}\n" .
-                "Timestamp: " . now()->toIso8601String()
-            );
-            
-            return PmodResult::failed(
-                'Add Creditor and Extend Program would process but live updates are disabled.',
-                ['reason' => $workItem->dryRun ? 'dry_run_only' : 'live_draft_updates_disabled', 'months_to_extend' => $monthsToExtend, 'action_type' => 'add_creditor_and_extend_program', 'contact_id' => $workItem->contactId]
-            );
+            return $this->capture($workItem, 'Add Creditor and Extend Program matched but live updates are disabled.', [
+                'reason'          => $workItem->dryRun ? 'dry_run_only' : 'live_draft_updates_disabled',
+                'months_to_extend' => $monthsToExtend,
+            ]);
+        }
+
+        // Step 1: create debt — Forth API requires creditor ID
+        $creditorId = $creditorChange['creditor_id'] ?? null;
+        if ($creditorId === null) {
+            return $this->capture($workItem, 'Add Creditor and Extend Program requires creditor_id (Forth CRM creditor ID).', [
+                'reason'        => 'missing_creditor_id',
+                'creditor_name' => $creditorChange['creditor_name'] ?? null,
+            ]);
+        }
+
+        $debtResult = $this->gateway->createDebt($workItem, [
+            'creditor'       => $creditorId,
+            'account_number' => $creditorChange['account_number'] ?? null,
+            'balance'        => $creditorChange['balance'] ?? null,
+            'original_amount' => $creditorChange['balance'] ?? null,
+        ]);
+
+        $debtId = $debtResult['id'] ?? $debtResult['debt_id'] ?? null;
+
+        // Step 2: generate extension drafts after the last existing draft
+        $transactions = $this->gateway->getContactTransactions($workItem);
+        $lastDate     = null;
+        foreach ($transactions as $txn) {
+            $d = $txn['process_date'] ?? '';
+            if ($txn['type'] === 'D' && $txn['active'] === '1' && ($lastDate === null || $d > $lastDate)) {
+                $lastDate = $d;
+            }
+        }
+
+        $extensionResults = [];
+        $extensionErrors  = [];
+
+        if ($lastDate !== null) {
+            $cursor = new \DateTime($lastDate);
+            for ($i = 0; $i < $monthsToExtend; $i++) {
+                $cursor->modify('+1 month');
+                try {
+                    $extensionResults[] = $this->gateway->createDraft($workItem, [
+                        'client_id'    => $workItem->contactId,
+                        'amount'       => $amount,
+                        'process_date' => $cursor->format('Y-m-d'),
+                        'memo'         => sprintf('Add Creditor Extension - $%s by System Admin', number_format((float) $amount, 2)),
+                    ]);
+                } catch (\Throwable $e) {
+                    $extensionErrors[] = ['date' => $cursor->format('Y-m-d'), 'error' => $e->getMessage()];
+                }
+            }
         }
 
         $noteLines = [
             'Add Creditor and Extend Program Request:',
-            'Request Status: Captured for Processing',
+            'Request Status: ' . (empty($extensionErrors) ? 'Successful' : 'Partial — see errors'),
             'Name: ' . ($workItem->normalizedPayload['name'] ?? 'Client'),
             'Customer Id: ' . $workItem->contactId,
             'Action: Add Creditor and Extend Program',
             'Creditor Name: ' . ($creditorChange['creditor_name'] ?? 'N/A'),
             'Account Number: ' . ($creditorChange['account_number'] ?? 'N/A'),
             'Balance: $' . number_format((float) ($creditorChange['balance'] ?? 0), 2),
-            'Months to Extend: ' . $monthsToExtend,
+            'Months Extended: ' . $monthsToExtend,
+            'Drafts Created: ' . count($extensionResults),
+            'Monthly Payment: $' . number_format((float) $amount, 2),
+            'User: ' . ($workItem->requestedBy ?? 'Client'),
         ];
-
-        if ($amount) {
-            $noteLines[] = 'Monthly Payment Amount: $' . number_format((float) $amount, 2);
-        }
-
-        $noteLines[] = 'User: ' . ($workItem->requestedBy ?? 'Client');
-        $noteLines[] = '';
-        $noteLines[] = '⚠️ Manual Processing Required: Creditor addition and program extension require admin action in CRM.';
 
         $this->gateway->createContactNote($workItem, implode("\n", $noteLines));
 
         return new PmodResult(
-            status: 'captured_for_processing',
-            message: sprintf('Add Creditor and Extend Program request captured for contact [%s]. Manual processing required.', $workItem->contactId),
+            status:   empty($extensionErrors) ? 'updated' : 'captured_for_manual_review',
+            message:  sprintf('Add Creditor and Extend Program: debt created, %d draft(s) added for contact [%s].', count($extensionResults), $workItem->contactId),
             metadata: [
-                'action_type' => $workItem->actionType->value,
-                'contact_id' => $workItem->contactId,
-                'creditor_name' => $creditorChange['creditor_name'] ?? null,
+                'action_type'      => $workItem->actionType->value,
+                'contact_id'       => $workItem->contactId,
+                'debt_id'          => $debtId,
+                'creditor_name'    => $creditorChange['creditor_name'] ?? null,
                 'months_to_extend' => $monthsToExtend,
-                'requires_manual_processing' => true,
-            ]
+                'drafts_created'   => count($extensionResults),
+                'extension_errors' => $extensionErrors,
+            ],
+        );
+    }
+
+    /** @param array<string, mixed> $metadata */
+    private function capture(PmodWorkItem $workItem, string $message, array $metadata): PmodResult
+    {
+        $this->gateway->createContactNote($workItem, implode("\n", [
+            'PMOD Add Creditor and Extend Program requires manual review.',
+            'Reason: ' . $message,
+            'Contact ID: ' . $workItem->contactId,
+            'Requested By: ' . $workItem->requestedBy,
+        ]));
+
+        return new PmodResult(
+            status:   'captured_for_manual_review',
+            message:  $message,
+            metadata: [...$metadata, 'action_type' => $workItem->actionType->value, 'contact_id' => $workItem->contactId],
         );
     }
 }

@@ -10,16 +10,12 @@ use Cmd\Reports\Pmod\Data\PmodResult;
 use Cmd\Reports\Pmod\Data\PmodWorkItem;
 use Cmd\Reports\Pmod\Enums\PmodActionType;
 
-/**
- * Handles Add Creditor and Increase Payment action - adds a new creditor and increases payment amount.
- */
 final class AddCreditorAndIncreasePaymentAction implements PmodActionHandler
 {
     public function __construct(
         private readonly PmodExecutionGateway $gateway,
         private readonly bool $allowLiveDraftUpdates = false,
-    ) {
-    }
+    ) {}
 
     public function actionType(): PmodActionType
     {
@@ -28,64 +24,72 @@ final class AddCreditorAndIncreasePaymentAction implements PmodActionHandler
 
     public function handle(PmodWorkItem $workItem): PmodResult
     {
-        $creditorChange = $workItem->creditorChange;
+        $creditorChange   = $workItem->creditorChange;
         $newPaymentAmount = $workItem->amount;
 
         if (empty($creditorChange)) {
-            $this->gateway->createContactNote(
-                $workItem,
-                "Add Creditor and Increase Payment Failed\n" .
-                "Reason: No creditor information provided\n" .
-                "Contact ID: {$workItem->contactId}\n" .
-                "Requested by: {$workItem->requestedBy}\n" .
-                "Timestamp: " . now()->toIso8601String()
-            );
-            
-            return PmodResult::failed(
-                'Add Creditor and Increase Payment requires creditor information.',
-                ['reason' => 'missing_creditor_info', 'action_type' => 'add_creditor_and_increase_payment', 'contact_id' => $workItem->contactId]
-            );
+            return $this->capture($workItem, 'Add Creditor and Increase Payment requires creditor information.', ['reason' => 'missing_creditor_info']);
         }
 
-        if ($newPaymentAmount === null || $newPaymentAmount <= 0) {
-            $this->gateway->createContactNote(
-                $workItem,
-                "Add Creditor and Increase Payment Failed\n" .
-                "Reason: Invalid payment amount\n" .
-                "Contact ID: {$workItem->contactId}\n" .
-                "Requested by: {$workItem->requestedBy}\n" .
-                "Amount: " . ($newPaymentAmount ?? 'missing') . "\n" .
-                "Timestamp: " . now()->toIso8601String()
-            );
-            
-            return PmodResult::failed(
-                'Add Creditor and Increase Payment requires a valid payment amount.',
-                ['reason' => 'invalid_payment_amount', 'amount' => $newPaymentAmount, 'action_type' => 'add_creditor_and_increase_payment', 'contact_id' => $workItem->contactId]
-            );
+        if ($newPaymentAmount === null || (float) $newPaymentAmount <= 0) {
+            return $this->capture($workItem, 'Add Creditor and Increase Payment requires a valid payment amount.', [
+                'reason' => 'invalid_payment_amount',
+                'amount' => $newPaymentAmount,
+            ]);
         }
 
         if (!$this->allowLiveDraftUpdates || $workItem->dryRun) {
-            $this->gateway->createContactNote(
-                $workItem,
-                "Add Creditor and Increase Payment - Live Updates Disabled\n" .
-                "Would add creditor and increase payment but mutations are not allowed\n" .
-                "Reason: " . ($workItem->dryRun ? 'Dry run mode' : 'PMOD_LIVE_DRAFT_UPDATES=false') . "\n" .
-                "Contact ID: {$workItem->contactId}\n" .
-                "Requested by: {$workItem->requestedBy}\n" .
-                "Creditor: " . ($creditorChange['creditor_name'] ?? 'N/A') . "\n" .
-                "New Payment Amount: \$" . number_format((float) $newPaymentAmount, 2) . "\n" .
-                "Timestamp: " . now()->toIso8601String()
-            );
-            
-            return PmodResult::failed(
-                'Add Creditor and Increase Payment would process but live updates are disabled.',
-                ['reason' => $workItem->dryRun ? 'dry_run_only' : 'live_draft_updates_disabled', 'new_amount' => $newPaymentAmount, 'action_type' => 'add_creditor_and_increase_payment', 'contact_id' => $workItem->contactId]
-            );
+            return $this->capture($workItem, 'Add Creditor and Increase Payment matched but live updates are disabled.', [
+                'reason'     => $workItem->dryRun ? 'dry_run_only' : 'live_draft_updates_disabled',
+                'new_amount' => $newPaymentAmount,
+            ]);
+        }
+
+        // Step 1: create the debt — Forth API requires creditor ID
+        // creditor_id must be the Forth CRM creditor ID — if missing, capture for manual review
+        $creditorId = $creditorChange['creditor_id'] ?? null;
+        if ($creditorId === null) {
+            return $this->capture($workItem, 'Add Creditor and Increase Payment requires creditor_id (Forth CRM creditor ID).', [
+                'reason'        => 'missing_creditor_id',
+                'creditor_name' => $creditorChange['creditor_name'] ?? null,
+            ]);
+        }
+
+        $debtResult = $this->gateway->createDebt($workItem, [
+            'creditor'        => $creditorId,
+            'account_number'  => $creditorChange['account_number'] ?? null,
+            'balance'         => $creditorChange['balance'] ?? null,
+            'original_amount' => $creditorChange['balance'] ?? null,
+        ]);
+
+        $debtId = $debtResult['id'] ?? $debtResult['debt_id'] ?? null;
+
+        // Step 2: increase all future drafts — if this fails we note the partial state so a human can fix it
+        $futureDrafts    = $this->gateway->getContactTransactions($workItem);
+        $updateResults   = [];
+        $updateErrors    = [];
+        $today           = now()->toDateString();
+
+        foreach ($futureDrafts as $txn) {
+            $processDate = $txn['process_date'] ?? '';
+            if ($txn['type'] !== 'D' || $txn['active'] !== '1' || $processDate < $today) {
+                continue;
+            }
+            try {
+                $updateResults[] = $this->gateway->updateDraft($workItem, (string) $txn['transaction_id'], [
+                    'client_id'    => $workItem->contactId,
+                    'amount'       => $newPaymentAmount,
+                    'process_date' => $processDate,
+                    'memo'         => sprintf('Add Creditor - Amount updated to $%s by System Admin', number_format((float) $newPaymentAmount, 2)),
+                ]);
+            } catch (\Throwable $e) {
+                $updateErrors[] = ['draft_id' => $txn['transaction_id'], 'error' => $e->getMessage()];
+            }
         }
 
         $noteLines = [
             'Add Creditor and Increase Payment Request:',
-            'Request Status: Captured for Processing',
+            'Request Status: ' . (empty($updateErrors) ? 'Successful' : 'Partial — see errors'),
             'Name: ' . ($workItem->normalizedPayload['name'] ?? 'Client'),
             'Customer Id: ' . $workItem->contactId,
             'Action: Add Creditor and Increase Payment',
@@ -93,23 +97,40 @@ final class AddCreditorAndIncreasePaymentAction implements PmodActionHandler
             'Account Number: ' . ($creditorChange['account_number'] ?? 'N/A'),
             'Balance: $' . number_format((float) ($creditorChange['balance'] ?? 0), 2),
             'New Monthly Payment: $' . number_format((float) $newPaymentAmount, 2),
+            'Drafts Updated: ' . count($updateResults),
             'User: ' . ($workItem->requestedBy ?? 'Client'),
-            '',
-            '⚠️ Manual Processing Required: Creditor addition and payment increase require admin action in CRM.',
         ];
 
         $this->gateway->createContactNote($workItem, implode("\n", $noteLines));
 
         return new PmodResult(
-            status: 'captured_for_processing',
-            message: sprintf('Add Creditor and Increase Payment request captured for contact [%s]. Manual processing required.', $workItem->contactId),
+            status:   empty($updateErrors) ? 'updated' : 'captured_for_manual_review',
+            message:  sprintf('Add Creditor and Increase Payment: debt created, %d draft(s) updated for contact [%s].', count($updateResults), $workItem->contactId),
             metadata: [
-                'action_type' => $workItem->actionType->value,
-                'contact_id' => $workItem->contactId,
-                'creditor_name' => $creditorChange['creditor_name'] ?? null,
-                'new_payment_amount' => $newPaymentAmount,
-                'requires_manual_processing' => true,
-            ]
+                'action_type'    => $workItem->actionType->value,
+                'contact_id'     => $workItem->contactId,
+                'debt_id'        => $debtId,
+                'creditor_name'  => $creditorChange['creditor_name'] ?? null,
+                'drafts_updated' => count($updateResults),
+                'update_errors'  => $updateErrors,
+            ],
+        );
+    }
+
+    /** @param array<string, mixed> $metadata */
+    private function capture(PmodWorkItem $workItem, string $message, array $metadata): PmodResult
+    {
+        $this->gateway->createContactNote($workItem, implode("\n", [
+            'PMOD Add Creditor and Increase Payment requires manual review.',
+            'Reason: ' . $message,
+            'Contact ID: ' . $workItem->contactId,
+            'Requested By: ' . $workItem->requestedBy,
+        ]));
+
+        return new PmodResult(
+            status:   'captured_for_manual_review',
+            message:  $message,
+            metadata: [...$metadata, 'action_type' => $workItem->actionType->value, 'contact_id' => $workItem->contactId],
         );
     }
 }

@@ -35,7 +35,22 @@ use Cmd\Reports\Console\Commands\SyncVeritasTransactions;
 use Cmd\Reports\Console\Commands\RefreshForthApiTokens;
 use Cmd\Reports\Console\Commands\SyncNegotiatorPayrollData;
 use Cmd\Reports\Console\Commands\UpdateLendingUSAStatuses;
-use Cmd\Reports\Console\Commands\CacheMarketingAdminSnapshot;
+use Cmd\Reports\Pmod\Actions\AdditionalPaymentAction;
+use Cmd\Reports\Pmod\Actions\CapturePmodRequestAction;
+use Cmd\Reports\Pmod\Actions\ChangePaymentAction;
+use Cmd\Reports\Pmod\Actions\IncreaseAllFuturePaymentsAction;
+use Cmd\Reports\Pmod\Actions\PaymentRefundAction;
+use Cmd\Reports\Pmod\Actions\PmodExtendProgramAction;
+use Cmd\Reports\Pmod\Actions\PmodIncreasePaymentsAction;
+use Cmd\Reports\Pmod\Actions\PmodIncreasePaymentsAndExtendProgramAction;
+use Cmd\Reports\Pmod\Actions\PmodLumpSumAction;
+use Cmd\Reports\Pmod\Actions\RescheduleAllPaymentsAction;
+use Cmd\Reports\Pmod\Actions\SkipPaymentAction;
+use Cmd\Reports\Pmod\Contracts\PmodExecutionGateway;
+use Cmd\Reports\Pmod\Enums\PmodActionType;
+use Cmd\Reports\Pmod\Services\ForthPayPmodExecutionGateway;
+use Cmd\Reports\Pmod\Services\PmodDispatcher;
+use Cmd\Reports\Pmod\Services\PmodEmailNotificationService;
 
 
 
@@ -105,7 +120,6 @@ class ReportsServiceProvider extends ServiceProvider
                 SyncNegotiatorPayrollData::class,
                 RefreshForthApiTokens::class,
                 UpdateLendingUSAStatuses::class,
-                CacheMarketingAdminSnapshot::class,
             ]);
         }
 
@@ -123,6 +137,31 @@ class ReportsServiceProvider extends ServiceProvider
 
     public function register()
     {
-        //
+        // Bind the Forth CRM/Pay execution gateway as the default implementation.
+        // Host apps that need a different gateway can override this binding in their
+        // own service provider after calling parent::register().
+        $this->app->singleton(PmodExecutionGateway::class, ForthPayPmodExecutionGateway::class);
+        $this->app->singleton(PmodEmailNotificationService::class);
+
+        $this->app->singleton(PmodDispatcher::class, function ($app) {
+            $gateway = $app->make(PmodExecutionGateway::class);
+            $liveDraftUpdates = (bool) config('services.pmod.live_draft_updates', false);
+
+            return new PmodDispatcher([
+                // Full automation handlers
+                new ChangePaymentAction($gateway, $liveDraftUpdates),
+                new AdditionalPaymentAction($gateway, $liveDraftUpdates),
+                new SkipPaymentAction($gateway, $liveDraftUpdates),
+                new RescheduleAllPaymentsAction($gateway, $liveDraftUpdates),
+                new IncreaseAllFuturePaymentsAction($gateway, $liveDraftUpdates),
+                new PmodLumpSumAction($gateway, $liveDraftUpdates),
+                new PmodIncreasePaymentsAction($gateway, $liveDraftUpdates),
+                new PmodIncreasePaymentsAndExtendProgramAction($gateway, $liveDraftUpdates),
+                new PmodExtendProgramAction($gateway, $liveDraftUpdates),
+                new PaymentRefundAction($gateway, $liveDraftUpdates),
+                new CapturePmodRequestAction($gateway, PmodActionType::VOID_SETTLEMENT),
+                new CapturePmodRequestAction($gateway, PmodActionType::SETTLEMENT_APPROVAL),
+            ]);
+        });
     }
 }

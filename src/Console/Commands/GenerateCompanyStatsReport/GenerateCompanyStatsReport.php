@@ -306,20 +306,27 @@ class GenerateCompanyStatsReport extends Command
 
     private function initializeSnowflakeConnector(?string $preferredEnv = null): DBConnector
     {
-        $candidates = $preferredEnv !== null
-            ? [$preferredEnv]
-            : ['ldr', 'plaw', 'lt'];
-        $errors = [];
+        $env = strtoupper($preferredEnv ?? 'LDR');
 
-        foreach ($candidates as $env) {
-            try {
-                return DBConnector::fromEnvironment($env);
-            } catch (\Throwable $e) {
-                $errors[] = "{$env}: {$e->getMessage()}";
-            }
+        $config = [
+            'account'                => env("SNOWFLAKE_{$env}_ACCOUNT"),
+            'user'                   => env("SNOWFLAKE_{$env}_USER"),
+            'private_key'            => env("SNOWFLAKE_{$env}_PRIVATE_KEY"),
+            'private_key_passphrase' => env("SNOWFLAKE_{$env}_PRIVATE_KEY_PASSPHRASE", ''),
+            'database'               => env("SNOWFLAKE_{$env}_DATABASE", 'DPP_DATA'),
+            'schema'                 => env("SNOWFLAKE_{$env}_SCHEMA", 'READER'),
+            'warehouse'              => env("SNOWFLAKE_{$env}_WAREHOUSE", 'DEFAULT_WH'),
+            'role'                   => env("SNOWFLAKE_{$env}_ROLE", 'ACCOUNTADMIN'),
+        ];
+
+        if (empty($config['account']) || empty($config['user']) || empty($config['private_key'])) {
+            throw new \RuntimeException(
+                "Missing required Snowflake configuration for env '{$preferredEnv}': "
+                . 'Please set SNOWFLAKE_' . $env . '_ACCOUNT, SNOWFLAKE_' . $env . '_USER, SNOWFLAKE_' . $env . '_PRIVATE_KEY in .env'
+            );
         }
 
-        throw new \RuntimeException('Unable to initialize Snowflake connector. Tried: ' . implode('; ', $errors));
+        return new DBConnector($config);
     }
 
     private function initializeSqlServerConnector(): DBConnector

@@ -549,14 +549,26 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway
             return ['bank_account_id' => 'dry_run_' . uniqid(), 'status' => 'dry_run'];
         }
 
+        // Try PUT (update) first, then POST (create) if that fails
         $response = $this->crmClient($workItem->tenantId)
-            ->post("/contacts/{$workItem->contactId}/bank-accounts", $payload);
+            ->put("/contacts/{$workItem->contactId}/bank-account", $payload);
 
         if (!$response->successful()) {
+            $response = $this->crmClient($workItem->tenantId)
+                ->post("/contacts/{$workItem->contactId}/bank-account", $payload);
+        }
+
+        if (!$response->successful()) {
+            $body = $response->body();
+            // Treat "already existing" as success — the account is already set, goal achieved
+            if (str_contains($body, 'already existing') || str_contains($body, 'Bank Account already')) {
+                Log::info('PMOD: Bank account already exists — treating as success', ['contact_id' => $workItem->contactId]);
+                return ['status' => 'already_exists', 'contact_id' => $workItem->contactId];
+            }
             Log::error('PMOD: Failed to add bank account', [
                 'contact_id' => $workItem->contactId,
                 'status'     => $response->status(),
-                'response'   => $response->body(),
+                'response'   => $body,
             ]);
             throw new \RuntimeException('Failed to add bank account');
         }
@@ -616,7 +628,7 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway
         }
 
         $response = $this->crmClient($workItem->tenantId)
-            ->post("/contacts/{$workItem->contactId}/debts", $payload);
+            ->post('/debts', array_merge($payload, ['client_id' => $workItem->contactId]));
 
         if (!$response->successful()) {
             Log::error('PMOD: Failed to create debt', [
