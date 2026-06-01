@@ -192,127 +192,84 @@ final class PmodEmailNotificationService
     /** @param array<string, mixed> $details */
     private function capturedBody(PmodWorkItem $workItem, array $details): string
     {
-        $action      = $this->actionLabel($workItem);
-        $contactId   = htmlspecialchars($workItem->contactId, ENT_QUOTES, 'UTF-8');
-        $company     = htmlspecialchars($workItem->company->value, ENT_QUOTES, 'UTF-8');
-        $requestedBy = htmlspecialchars($workItem->requestedBy ?? 'Unknown', ENT_QUOTES, 'UTF-8');
-        $date        = now()->format('m/d/Y g:i A');
-        $e           = fn (mixed $v): string => htmlspecialchars((string) $v, ENT_QUOTES, 'UTF-8');
-
-        [$instructions, $detailRows] = $this->capturedInstructionsAndDetails($workItem);
-
-        $detailHtml = '';
-        if (!empty($detailRows)) {
-            $detailHtml = '<table border="1" cellspacing="0" cellpadding="8" style="border-collapse:collapse;margin-bottom:16px;width:100%">';
-            foreach ($detailRows as $label => $value) {
-                $detailHtml .= '<tr><th align="left" style="background:#fff8e1;width:200px">' . $e($label) . '</th><td>' . $e($value) . '</td></tr>';
-            }
-            $detailHtml .= '</table>';
-        }
-
-        return <<<HTML
-        <p>Hi,</p>
-        <p>A payment modification request was submitted that requires <strong>manual action in Forth CRM</strong>.</p>
-
-        <table border="1" cellspacing="0" cellpadding="8" style="border-collapse:collapse;margin-bottom:16px;width:100%">
-            <tr><th align="left" style="background:#f5f5f5;width:200px">Action Required</th><td><strong>{$action}</strong></td></tr>
-            <tr><th align="left" style="background:#f5f5f5">Contact ID</th><td>{$contactId}</td></tr>
-            <tr><th align="left" style="background:#f5f5f5">Company</th><td>{$company}</td></tr>
-            <tr><th align="left" style="background:#f5f5f5">Requested By</th><td>{$requestedBy}</td></tr>
-            <tr><th align="left" style="background:#f5f5f5">Date Submitted</th><td>{$date}</td></tr>
-        </table>
-
-        {$detailHtml}
-
-        <p><strong>Steps to complete in Forth CRM:</strong></p>
-        <p style="padding:12px;background:#fff3cd;border-left:4px solid #ffc107">{$instructions}</p>
-
-        <p>Once complete, please mark this request as processed:<br>
-        <a href="http://54.67.76.23/admin/pmod-requests">http://54.67.76.23/admin/pmod-requests</a></p>
-        HTML;
-    }
-
-    /**
-     * Returns [instructions string, detail rows array] dynamically built from workItem.
-     *
-     * @return array{0: string, 1: array<string, string>}
-     */
-    private function capturedInstructionsAndDetails(PmodWorkItem $workItem): array
-    {
+        $e        = fn (mixed $v): string => htmlspecialchars((string) $v, ENT_QUOTES, 'UTF-8');
+        $action   = $this->actionLabel($workItem);
+        $date     = now()->format('m/d/Y g:i A');
         $payload  = $workItem->normalizedPayload;
         $banking  = $workItem->bankingUpdate;
         $creditor = $workItem->creditorChange;
         $sponsor  = $workItem->sponsorUpdate;
-        $amounts  = $workItem->amounts;
-        $amount   = $workItem->amount ?? ($amounts[0] ?? null);
+        $amount   = $workItem->amount ?? ($workItem->amounts[0] ?? null);
+        $months   = (int) ($payload['months_to_extend'] ?? $payload['months_to_decrease']
+                        ?? $creditor['months_to_extend'] ?? $creditor['months_to_decrease'] ?? 0);
 
-        switch ($workItem->actionType->value) {
-            case 'add_bank_account':
-                $rows = array_filter([
-                    'Account Type'     => $banking['account_type'] ?? null,
-                    'Bank Name'        => $banking['bank_name'] ?? null,
-                    'Routing Number'   => !empty($banking['routing_number']) ? '***' . substr($banking['routing_number'], -4) : null,
-                    'Account Number'   => !empty($banking['account_number']) ? '***' . substr($banking['account_number'], -4) : null,
-                    'Account Holder'   => $banking['account_holder_name'] ?? $banking['name_on_account'] ?? null,
-                ]);
-                $instructions = 'Open the contact in Forth CRM → go to <strong>Banking</strong> → update the bank account with the details listed above.';
-                break;
+        // Build request detail rows from what was actually submitted
+        $requestRows = array_filter([
+            'Action'          => $action,
+            'Contact ID'      => $workItem->contactId,
+            'Company'         => strtoupper($workItem->company->value),
+            'Requested By'    => $workItem->requestedBy,
+            'Date'            => $date,
+        ]);
 
-            case 'capture_sponsor_banking':
-                $rows = array_filter([
-                    'Sponsor Name'           => $sponsor['sponsor_name'] ?? null,
-                    'Sponsor Account Type'   => $sponsor['sponsor_account_type'] ?? null,
-                    'Sponsor Bank Name'      => $sponsor['sponsor_bank_name'] ?? null,
-                    'Sponsor Routing Number' => !empty($sponsor['sponsor_routing_number']) ? '***' . substr($sponsor['sponsor_routing_number'], -4) : null,
-                    'Sponsor Account Number' => !empty($sponsor['sponsor_account_number']) ? '***' . substr($sponsor['sponsor_account_number'], -4) : null,
-                ]);
-                $instructions = 'Open the contact in Forth CRM → go to <strong>Banking</strong> → update the <strong>sponsor</strong> bank account with the details listed above.';
-                break;
+        // Build the specific details the agent/client submitted
+        $submittedRows = match ($workItem->actionType->value) {
+            'add_bank_account' => array_filter([
+                'Bank Name'        => $banking['bank_name'] ?? null,
+                'Account Type'     => $banking['account_type'] ?? null,
+                'Routing Number'   => !empty($banking['routing_number']) ? '***' . substr($banking['routing_number'], -4) : null,
+                'Account Number'   => !empty($banking['account_number']) ? '***' . substr($banking['account_number'], -4) : null,
+                'Account Holder'   => $banking['account_holder_name'] ?? $banking['name_on_account'] ?? null,
+            ]),
+            'capture_sponsor_banking' => array_filter([
+                'Sponsor Name'           => $sponsor['sponsor_name'] ?? null,
+                'Sponsor Bank Name'      => $sponsor['sponsor_bank_name'] ?? null,
+                'Account Type'           => $sponsor['sponsor_account_type'] ?? null,
+                'Routing Number'         => !empty($sponsor['sponsor_routing_number']) ? '***' . substr($sponsor['sponsor_routing_number'], -4) : null,
+                'Account Number'         => !empty($sponsor['sponsor_account_number']) ? '***' . substr($sponsor['sponsor_account_number'], -4) : null,
+            ]),
+            'add_creditor_and_increase_payment' => array_filter([
+                'Creditor Name'       => $creditor['creditor_name'] ?? null,
+                'Creditor Account #'  => $creditor['account_number'] ?? null,
+                'Balance'             => !empty($creditor['balance']) ? '$' . number_format((float) $creditor['balance'], 2) : null,
+                'New Monthly Payment' => $amount ? '$' . number_format((float) $amount, 2) : null,
+            ]),
+            'add_creditor_and_extend_program' => array_filter([
+                'Creditor Name'      => $creditor['creditor_name'] ?? null,
+                'Creditor Account #' => $creditor['account_number'] ?? null,
+                'Balance'            => !empty($creditor['balance']) ? '$' . number_format((float) $creditor['balance'], 2) : null,
+                'Monthly Payment'    => $amount ? '$' . number_format((float) $amount, 2) : null,
+                'Months to Extend'   => $months > 0 ? (string) $months : null,
+            ]),
+            'remove_creditor_and_decrease_payment' => array_filter([
+                'Creditor'            => $creditor['creditor_name'] ?? $creditor['creditor_id'] ?? null,
+                'New Monthly Payment' => $amount ? '$' . number_format((float) $amount, 2) : null,
+            ]),
+            'remove_creditor_and_decrease_term' => array_filter([
+                'Creditor'          => $creditor['creditor_name'] ?? $creditor['creditor_id'] ?? null,
+                'Months to Remove'  => $months > 0 ? (string) $months : null,
+            ]),
+            default => [],
+        };
 
-            case 'add_creditor_and_increase_payment':
-                $rows = array_filter([
-                    'Creditor Name'       => $creditor['creditor_name'] ?? null,
-                    'Account Number'      => $creditor['account_number'] ?? null,
-                    'Balance'             => !empty($creditor['balance']) ? '$' . number_format((float) $creditor['balance'], 2) : null,
-                    'New Monthly Payment' => $amount ? '$' . number_format((float) $amount, 2) : null,
-                ]);
-                $instructions = 'Open the contact in Forth CRM → go to <strong>Debts</strong> → add the new creditor with the details above → then go to <strong>Payment Settings</strong> and update the monthly payment to the new amount shown.';
-                break;
+        $buildTable = function (array $rows) use ($e): string {
+            $html = '<table border="1" cellspacing="0" cellpadding="8" style="border-collapse:collapse;width:100%;margin-bottom:16px">';
+            foreach ($rows as $label => $value) {
+                $html .= '<tr><th align="left" style="background:#f5f5f5;width:180px;font-weight:600">'
+                    . $e($label) . '</th><td>' . $e($value) . '</td></tr>';
+            }
+            return $html . '</table>';
+        };
 
-            case 'add_creditor_and_extend_program':
-                $months = (int) ($payload['months_to_extend'] ?? $creditor['months_to_extend'] ?? 0);
-                $rows = array_filter([
-                    'Creditor Name'     => $creditor['creditor_name'] ?? null,
-                    'Account Number'    => $creditor['account_number'] ?? null,
-                    'Balance'           => !empty($creditor['balance']) ? '$' . number_format((float) $creditor['balance'], 2) : null,
-                    'Monthly Payment'   => $amount ? '$' . number_format((float) $amount, 2) : null,
-                    'Months to Extend'  => $months > 0 ? $months : null,
-                ]);
-                $instructions = 'Open the contact in Forth CRM → go to <strong>Debts</strong> → add the new creditor → then go to <strong>Payment Settings</strong> and extend the program by <strong>' . $months . ' month(s)</strong> by adding that many new drafts after the last existing one at the monthly payment shown.';
-                break;
+        $submittedSection = !empty($submittedRows)
+            ? '<p style="margin:16px 0 4px"><strong>Request Details:</strong></p>' . $buildTable($submittedRows)
+            : '';
 
-            case 'remove_creditor_and_decrease_payment':
-                $rows = array_filter([
-                    'Creditor to Remove'  => $creditor['creditor_name'] ?? $creditor['creditor_id'] ?? null,
-                    'New Monthly Payment' => $amount ? '$' . number_format((float) $amount, 2) : null,
-                ]);
-                $instructions = 'Open the contact in Forth CRM → go to <strong>Debts</strong> → find the creditor listed above and cancel/remove it → then go to <strong>Payment Settings</strong> and update the monthly payment to the new amount shown.';
-                break;
-
-            case 'remove_creditor_and_decrease_term':
-                $months = (int) ($payload['months_to_decrease'] ?? $creditor['months_to_decrease'] ?? 0);
-                $rows = array_filter([
-                    'Creditor to Remove'  => $creditor['creditor_name'] ?? $creditor['creditor_id'] ?? null,
-                    'Months to Remove'    => $months > 0 ? $months : null,
-                ]);
-                $instructions = 'Open the contact in Forth CRM → go to <strong>Debts</strong> → find the creditor listed above and cancel/remove it → then go to <strong>Transactions</strong> and cancel the last <strong>' . $months . ' draft(s)</strong> to shorten the program term.';
-                break;
-
-            default:
-                $rows = [];
-                $instructions = 'Open the contact in Forth CRM and manually complete the payment modification shown.';
-        }
-
-        return [$instructions, $rows];
+        return '<p>Hi,</p>'
+            . '<p>The following payment modification request needs to be completed manually in Forth CRM.</p>'
+            . $buildTable($requestRows)
+            . $submittedSection
+            . '<p>Once complete, please mark this request as processed:<br>'
+            . '<a href="http://54.67.76.23/admin/pmod-requests">http://54.67.76.23/admin/pmod-requests</a></p>';
     }
 }
