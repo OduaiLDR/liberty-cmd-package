@@ -20,22 +20,26 @@ use Cmd\Reports\Console\Commands\SyncEnrollmentStatus;
 use Cmd\Reports\Console\Commands\SyncEnrollmentData;
 use Cmd\Reports\Console\Commands\SyncVerifiedDebts;
 use Cmd\Reports\Console\Commands\GenerateCompanyStatsReport\GenerateCompanyStatsReport;
+use Cmd\Reports\Console\Commands\GenerateConsumerAffairsFundedReport\GenerateConsumerAffairsFundedReport;
+use Cmd\Reports\Console\Commands\GenerateConsumerAffairsSettlementReport\GenerateConsumerAffairsSettlementReport;
 use Cmd\Reports\Console\Commands\GenerateLegalReport\GenerateLegalReport;
 use Cmd\Reports\Console\Commands\GenerateWelcomeLetterReport\GenerateWelcomeLetterReport;
 use Cmd\Reports\Console\Commands\GenerateWelcomePacketReport\GenerateWelcomePacketReport;
 use Cmd\Reports\Console\Commands\GenerateDroppedReport\GenerateDroppedReport;
+use Cmd\Reports\Console\Commands\GenerateNoOffersReport\GenerateNoOffersReport;
 use Cmd\Reports\Console\Commands\GenerateScrubListReport\GenerateScrubListReport;
 use Cmd\Reports\Console\Commands\GenerateLookbackSummaryReport\GenerateLookbackSummaryReport;
 use Cmd\Reports\Console\Commands\GenerateReportSummary\GenerateReportSummary;
 use Cmd\Reports\Console\Commands\GenerateSyncSummary\GenerateSyncSummary;
 use Cmd\Reports\Console\Commands\SyncContactsData;
+use Cmd\Reports\Console\Commands\SyncContactsCCS;
 use Cmd\Reports\Console\Commands\SyncCollectionCompanies;
 use Cmd\Reports\Console\Commands\SyncLastDepositDate;
 use Cmd\Reports\Console\Commands\SyncVeritasTransactions;
 use Cmd\Reports\Console\Commands\RefreshForthApiTokens;
 use Cmd\Reports\Console\Commands\SyncNegotiatorPayrollData;
 use Cmd\Reports\Console\Commands\UpdateLendingUSAStatuses;
-use Cmd\Reports\Console\Commands\CacheMarketingAdminSnapshot;
+use Cmd\Reports\Console\Commands\ProgramCompletions\ProcessProgramCompletions;
 
 
 
@@ -90,22 +94,26 @@ class ReportsServiceProvider extends ServiceProvider
                 SyncEnrollmentData::class,
                 SyncVerifiedDebts::class,
                 GenerateCompanyStatsReport::class,
+                GenerateConsumerAffairsFundedReport::class,
+                GenerateConsumerAffairsSettlementReport::class,
                 GenerateLegalReport::class,
                 GenerateWelcomeLetterReport::class,
                 GenerateWelcomePacketReport::class,
                 GenerateDroppedReport::class,
+                GenerateNoOffersReport::class,
                 GenerateScrubListReport::class,
                 GenerateLookbackSummaryReport::class,
                 GenerateReportSummary::class,
                 GenerateSyncSummary::class,
                 SyncContactsData::class,
+                SyncContactsCCS::class,
                 SyncCollectionCompanies::class,
                 SyncLastDepositDate::class,
                 SyncVeritasTransactions::class,
                 SyncNegotiatorPayrollData::class,
                 RefreshForthApiTokens::class,
                 UpdateLendingUSAStatuses::class,
-                CacheMarketingAdminSnapshot::class,
+                ProcessProgramCompletions::class,
             ]);
         }
 
@@ -126,3 +134,4 @@ class ReportsServiceProvider extends ServiceProvider
         //
     }
 }
+
