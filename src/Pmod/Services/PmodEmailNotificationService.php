@@ -269,7 +269,6 @@ final class PmodEmailNotificationService
             . '<p>The following payment modification request needs to be completed manually in Forth CRM.</p>'
             . $buildTable($requestRows)
             . $submittedSection
-            . '<p>Once complete, please mark this request as processed:<br>'
-            . '<a href="http://54.67.76.23/admin/pmod-requests">http://54.67.76.23/admin/pmod-requests</a></p>';
+            ;
     }
 }
