@@ -549,8 +549,15 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway
             return ['bank_account_id' => 'dry_run_' . uniqid(), 'status' => 'dry_run'];
         }
 
+        // Try PUT first (update existing) — Forth returns 404 "already existing" on POST if one exists
         $response = $this->crmClient($workItem->tenantId)
-            ->post("/contacts/{$workItem->contactId}/bank-account", $payload);
+            ->put("/contacts/{$workItem->contactId}/bank-account", $payload);
+
+        if (!$response->successful()) {
+            // Fall back to POST (create new)
+            $response = $this->crmClient($workItem->tenantId)
+                ->post("/contacts/{$workItem->contactId}/bank-account", $payload);
+        }
 
         if (!$response->successful()) {
             Log::error('PMOD: Failed to add bank account', [
@@ -616,7 +623,7 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway
         }
 
         $response = $this->crmClient($workItem->tenantId)
-            ->post('/debts', array_merge($payload, ['contact_id' => $workItem->contactId]));
+            ->post('/debts', array_merge($payload, ['client_id' => $workItem->contactId]));
 
         if (!$response->successful()) {
             Log::error('PMOD: Failed to create debt', [
