@@ -20,27 +20,37 @@ use Cmd\Reports\Console\Commands\SyncEnrollmentStatus;
 use Cmd\Reports\Console\Commands\SyncEnrollmentData;
 use Cmd\Reports\Console\Commands\SyncVerifiedDebts;
 use Cmd\Reports\Console\Commands\GenerateCompanyStatsReport\GenerateCompanyStatsReport;
-use Cmd\Reports\Console\Commands\GenerateConsumerAffairsFundedReport\GenerateConsumerAffairsFundedReport;
-use Cmd\Reports\Console\Commands\GenerateConsumerAffairsSettlementReport\GenerateConsumerAffairsSettlementReport;
 use Cmd\Reports\Console\Commands\GenerateLegalReport\GenerateLegalReport;
 use Cmd\Reports\Console\Commands\GenerateWelcomeLetterReport\GenerateWelcomeLetterReport;
 use Cmd\Reports\Console\Commands\GenerateWelcomePacketReport\GenerateWelcomePacketReport;
 use Cmd\Reports\Console\Commands\GenerateDroppedReport\GenerateDroppedReport;
-use Cmd\Reports\Console\Commands\GenerateNoOffersReport\GenerateNoOffersReport;
 use Cmd\Reports\Console\Commands\GenerateScrubListReport\GenerateScrubListReport;
 use Cmd\Reports\Console\Commands\GenerateLookbackSummaryReport\GenerateLookbackSummaryReport;
 use Cmd\Reports\Console\Commands\GenerateReportSummary\GenerateReportSummary;
 use Cmd\Reports\Console\Commands\GenerateSyncSummary\GenerateSyncSummary;
 use Cmd\Reports\Console\Commands\SyncContactsData;
-use Cmd\Reports\Console\Commands\SyncContactsCCS;
 use Cmd\Reports\Console\Commands\SyncCollectionCompanies;
 use Cmd\Reports\Console\Commands\SyncLastDepositDate;
 use Cmd\Reports\Console\Commands\SyncVeritasTransactions;
-use Cmd\Reports\Console\Commands\SyncPhoneNumbers;
 use Cmd\Reports\Console\Commands\RefreshForthApiTokens;
 use Cmd\Reports\Console\Commands\SyncNegotiatorPayrollData;
 use Cmd\Reports\Console\Commands\UpdateLendingUSAStatuses;
-use Cmd\Reports\Console\Commands\ProgramCompletions\ProcessProgramCompletions;
+use Cmd\Reports\Pmod\Actions\AdditionalPaymentAction;
+use Cmd\Reports\Pmod\Actions\CapturePmodRequestAction;
+use Cmd\Reports\Pmod\Actions\ChangePaymentAction;
+use Cmd\Reports\Pmod\Actions\IncreaseAllFuturePaymentsAction;
+use Cmd\Reports\Pmod\Actions\PaymentRefundAction;
+use Cmd\Reports\Pmod\Actions\PmodExtendProgramAction;
+use Cmd\Reports\Pmod\Actions\PmodIncreasePaymentsAction;
+use Cmd\Reports\Pmod\Actions\PmodIncreasePaymentsAndExtendProgramAction;
+use Cmd\Reports\Pmod\Actions\PmodLumpSumAction;
+use Cmd\Reports\Pmod\Actions\RescheduleAllPaymentsAction;
+use Cmd\Reports\Pmod\Actions\SkipPaymentAction;
+use Cmd\Reports\Pmod\Contracts\PmodExecutionGateway;
+use Cmd\Reports\Pmod\Enums\PmodActionType;
+use Cmd\Reports\Pmod\Services\ForthPayPmodExecutionGateway;
+use Cmd\Reports\Pmod\Services\PmodDispatcher;
+use Cmd\Reports\Pmod\Services\PmodEmailNotificationService;
 
 
 
@@ -95,27 +105,21 @@ class ReportsServiceProvider extends ServiceProvider
                 SyncEnrollmentData::class,
                 SyncVerifiedDebts::class,
                 GenerateCompanyStatsReport::class,
-                GenerateConsumerAffairsFundedReport::class,
-                GenerateConsumerAffairsSettlementReport::class,
                 GenerateLegalReport::class,
                 GenerateWelcomeLetterReport::class,
                 GenerateWelcomePacketReport::class,
                 GenerateDroppedReport::class,
-                GenerateNoOffersReport::class,
                 GenerateScrubListReport::class,
                 GenerateLookbackSummaryReport::class,
                 GenerateReportSummary::class,
                 GenerateSyncSummary::class,
                 SyncContactsData::class,
-                SyncContactsCCS::class,
                 SyncCollectionCompanies::class,
                 SyncLastDepositDate::class,
                 SyncVeritasTransactions::class,
-                SyncPhoneNumbers::class,
                 SyncNegotiatorPayrollData::class,
                 RefreshForthApiTokens::class,
                 UpdateLendingUSAStatuses::class,
-                ProcessProgramCompletions::class,
             ]);
         }
 
@@ -133,7 +137,31 @@ class ReportsServiceProvider extends ServiceProvider
 
     public function register()
     {
-        //
+        // Bind the Forth CRM/Pay execution gateway as the default implementation.
+        // Host apps that need a different gateway can override this binding in their
+        // own service provider after calling parent::register().
+        $this->app->singleton(PmodExecutionGateway::class, ForthPayPmodExecutionGateway::class);
+        $this->app->singleton(PmodEmailNotificationService::class);
+
+        $this->app->singleton(PmodDispatcher::class, function ($app) {
+            $gateway = $app->make(PmodExecutionGateway::class);
+            $liveDraftUpdates = (bool) config('services.pmod.live_draft_updates', false);
+
+            return new PmodDispatcher([
+                // Full automation handlers
+                new ChangePaymentAction($gateway, $liveDraftUpdates),
+                new AdditionalPaymentAction($gateway, $liveDraftUpdates),
+                new SkipPaymentAction($gateway, $liveDraftUpdates),
+                new RescheduleAllPaymentsAction($gateway, $liveDraftUpdates),
+                new IncreaseAllFuturePaymentsAction($gateway, $liveDraftUpdates),
+                new PmodLumpSumAction($gateway, $liveDraftUpdates),
+                new PmodIncreasePaymentsAction($gateway, $liveDraftUpdates),
+                new PmodIncreasePaymentsAndExtendProgramAction($gateway, $liveDraftUpdates),
+                new PmodExtendProgramAction($gateway, $liveDraftUpdates),
+                new PaymentRefundAction($gateway, $liveDraftUpdates),
+                new CapturePmodRequestAction($gateway, PmodActionType::VOID_SETTLEMENT),
+                new CapturePmodRequestAction($gateway, PmodActionType::SETTLEMENT_APPROVAL),
+            ]);
+        });
     }
 }
-
