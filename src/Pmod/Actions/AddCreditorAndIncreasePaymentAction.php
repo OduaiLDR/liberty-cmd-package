@@ -45,11 +45,21 @@ final class AddCreditorAndIncreasePaymentAction implements PmodActionHandler
             ]);
         }
 
-        // Step 1: create the debt — if this fails the exception propagates and no draft is touched
+        // Step 1: create the debt — Forth API requires creditor ID
+        // creditor_id must be the Forth CRM creditor ID — if missing, capture for manual review
+        $creditorId = $creditorChange['creditor_id'] ?? null;
+        if ($creditorId === null) {
+            return $this->capture($workItem, 'Add Creditor and Increase Payment requires creditor_id (Forth CRM creditor ID).', [
+                'reason'        => 'missing_creditor_id',
+                'creditor_name' => $creditorChange['creditor_name'] ?? null,
+            ]);
+        }
+
         $debtResult = $this->gateway->createDebt($workItem, [
-            'creditor_name'   => $creditorChange['creditor_name'] ?? null,
+            'creditor'        => $creditorId,
             'account_number'  => $creditorChange['account_number'] ?? null,
             'balance'         => $creditorChange['balance'] ?? null,
+            'original_amount' => $creditorChange['balance'] ?? null,
         ]);
 
         $debtId = $debtResult['id'] ?? $debtResult['debt_id'] ?? null;

@@ -14,6 +14,7 @@ final class AddCreditorAndIncreasePaymentActionTest extends TestCase
     private function validCreditor(): array
     {
         return [
+            'creditor_id'    => '12345678',
             'creditor_name'  => 'Chase Visa',
             'account_number' => 'ACC-123',
             'balance'        => '5000.00',
@@ -80,6 +81,22 @@ final class AddCreditorAndIncreasePaymentActionTest extends TestCase
         self::assertSame('invalid_payment_amount', $result->metadata['reason']);
     }
 
+    public function test_captures_when_creditor_id_missing(): void
+    {
+        $gateway = new FakePmodExecutionGateway();
+        $action  = new AddCreditorAndIncreasePaymentAction($gateway, true);
+
+        $result = $action->handle($this->makeWorkItem([
+            'actionType'     => PmodActionType::ADD_CREDITOR_AND_INCREASE_PAYMENT,
+            'creditorChange' => ['creditor_name' => 'Chase Visa', 'balance' => '5000.00'],
+            'amount'         => '30.00',
+        ]));
+
+        self::assertSame('captured_for_manual_review', $result->status);
+        self::assertSame('missing_creditor_id', $result->metadata['reason']);
+        self::assertCount(0, $gateway->debtCalls);
+    }
+
     public function test_captures_when_live_updates_disabled(): void
     {
         $gateway = new FakePmodExecutionGateway();
@@ -130,7 +147,7 @@ final class AddCreditorAndIncreasePaymentActionTest extends TestCase
         self::assertSame('updated', $result->status);
         // Debt created once
         self::assertCount(1, $gateway->debtCalls);
-        self::assertSame('Chase Visa', $gateway->debtCalls[0]['payload']['creditor_name']);
+        self::assertSame('12345678', $gateway->debtCalls[0]['payload']['creditor']);
         self::assertSame('5000.00', $gateway->debtCalls[0]['payload']['balance']);
         // Only active type-D drafts updated (draft-1 and draft-2, not DPG or inactive)
         self::assertSame(2, $result->metadata['drafts_updated']);

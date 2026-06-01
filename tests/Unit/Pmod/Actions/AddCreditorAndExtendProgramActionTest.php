@@ -14,6 +14,7 @@ final class AddCreditorAndExtendProgramActionTest extends TestCase
     private function validCreditor(): array
     {
         return [
+            'creditor_id'    => '87654321',
             'creditor_name'  => 'Bank of America',
             'account_number' => 'ACC-456',
             'balance'        => '8000.00',
@@ -98,6 +99,23 @@ final class AddCreditorAndExtendProgramActionTest extends TestCase
         self::assertCount(0, $gateway->debtCalls);
     }
 
+    public function test_captures_when_creditor_id_missing(): void
+    {
+        $gateway = new FakePmodExecutionGateway();
+        $action  = new AddCreditorAndExtendProgramAction($gateway, true);
+
+        $result = $action->handle($this->makeWorkItem([
+            'actionType'        => PmodActionType::ADD_CREDITOR_AND_EXTEND_PROGRAM,
+            'creditorChange'    => ['creditor_name' => 'Bank of America', 'balance' => '8000.00'],
+            'amount'            => '25.00',
+            'normalizedPayload' => ['months_to_extend' => 3],
+        ]));
+
+        self::assertSame('captured_for_manual_review', $result->status);
+        self::assertSame('missing_creditor_id', $result->metadata['reason']);
+        self::assertCount(0, $gateway->debtCalls);
+    }
+
     public function test_captures_when_live_updates_disabled(): void
     {
         $gateway = new FakePmodExecutionGateway();
@@ -151,7 +169,7 @@ final class AddCreditorAndExtendProgramActionTest extends TestCase
         self::assertSame('updated', $result->status);
         // Debt created once
         self::assertCount(1, $gateway->debtCalls);
-        self::assertSame('Bank of America', $gateway->debtCalls[0]['payload']['creditor_name']);
+        self::assertSame('87654321', $gateway->debtCalls[0]['payload']['creditor']);
         // 3 extension drafts created after 2030-09-01
         self::assertSame(3, $result->metadata['drafts_created']);
         self::assertCount(3, $gateway->draftCreations);

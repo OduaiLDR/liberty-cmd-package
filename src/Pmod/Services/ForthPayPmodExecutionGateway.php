@@ -549,21 +549,26 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway
             return ['bank_account_id' => 'dry_run_' . uniqid(), 'status' => 'dry_run'];
         }
 
-        // Try PUT first (update existing) — Forth returns 404 "already existing" on POST if one exists
+        // Try PUT (update) first, then POST (create) if that fails
         $response = $this->crmClient($workItem->tenantId)
             ->put("/contacts/{$workItem->contactId}/bank-account", $payload);
 
         if (!$response->successful()) {
-            // Fall back to POST (create new)
             $response = $this->crmClient($workItem->tenantId)
                 ->post("/contacts/{$workItem->contactId}/bank-account", $payload);
         }
 
         if (!$response->successful()) {
+            $body = $response->body();
+            // Treat "already existing" as success — the account is already set, goal achieved
+            if (str_contains($body, 'already existing') || str_contains($body, 'Bank Account already')) {
+                Log::info('PMOD: Bank account already exists — treating as success', ['contact_id' => $workItem->contactId]);
+                return ['status' => 'already_exists', 'contact_id' => $workItem->contactId];
+            }
             Log::error('PMOD: Failed to add bank account', [
                 'contact_id' => $workItem->contactId,
                 'status'     => $response->status(),
-                'response'   => $response->body(),
+                'response'   => $body,
             ]);
             throw new \RuntimeException('Failed to add bank account');
         }

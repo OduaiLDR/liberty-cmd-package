@@ -52,11 +52,20 @@ final class AddCreditorAndExtendProgramAction implements PmodActionHandler
             ]);
         }
 
-        // Step 1: create debt — if this throws, nothing else runs
+        // Step 1: create debt — Forth API requires creditor ID
+        $creditorId = $creditorChange['creditor_id'] ?? null;
+        if ($creditorId === null) {
+            return $this->capture($workItem, 'Add Creditor and Extend Program requires creditor_id (Forth CRM creditor ID).', [
+                'reason'        => 'missing_creditor_id',
+                'creditor_name' => $creditorChange['creditor_name'] ?? null,
+            ]);
+        }
+
         $debtResult = $this->gateway->createDebt($workItem, [
-            'creditor_name'  => $creditorChange['creditor_name'] ?? null,
+            'creditor'       => $creditorId,
             'account_number' => $creditorChange['account_number'] ?? null,
             'balance'        => $creditorChange['balance'] ?? null,
+            'original_amount' => $creditorChange['balance'] ?? null,
         ]);
 
         $debtId = $debtResult['id'] ?? $debtResult['debt_id'] ?? null;
