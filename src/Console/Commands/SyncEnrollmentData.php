@@ -3,7 +3,6 @@
 namespace Cmd\Reports\Console\Commands;
 
 use Cmd\Reports\Services\DBConnector;
-use Cmd\Reports\Services\TblLogWriter;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
 
@@ -63,51 +62,27 @@ class SyncEnrollmentData extends Command
             return Command::FAILURE;
         }
 
-        try {
-            // Step 1: Update missing Drop_Name and State
-            $this->info('[STEP 1] Updating missing Drop_Name and State...');
-            $dropStateUpdated = $this->updateDropNameAndState($sqlConnector);
+        // Step 1: Update missing Drop_Name and State
+        $this->info('[STEP 1] Updating missing Drop_Name and State...');
+        $this->updateDropNameAndState($sqlConnector);
 
-            // Step 2: Update Cancel_Date from Snowflake
-            $this->info('[STEP 2] Updating Cancel_Date from Snowflake...');
-            $cancelDateUpdated = $this->updateCancelDate($snowflake, $sqlConnector);
+        // Step 2: Update Cancel_Date from Snowflake
+        $this->info('[STEP 2] Updating Cancel_Date from Snowflake...');
+        $this->updateCancelDate($snowflake, $sqlConnector);
 
-            // Step 3: Update Payments count from Snowflake
-            $this->info('[STEP 3] Updating Payments count from Snowflake...');
-            $paymentsUpdated = $this->updatePayments($snowflake, $sqlConnector);
+        // Step 3: Update Payments count from Snowflake
+        $this->info('[STEP 3] Updating Payments count from Snowflake...');
+        $this->updatePayments($snowflake, $sqlConnector);
 
-            // Step 4: Update TblContacts.Campaign from TblEnrollment.Drop_Name
-            $this->info('[STEP 4] Updating TblContacts.Campaign...');
-            $campaignSynced = $this->updateContactsCampaign($sqlConnector);
+        // Step 4: Update TblContacts.Campaign from TblEnrollment.Drop_Name
+        $this->info('[STEP 4] Updating TblContacts.Campaign...');
+        $this->updateContactsCampaign($sqlConnector);
 
-            $totalUpdated = $dropStateUpdated + $cancelDateUpdated + $paymentsUpdated;
-            $this->writeAutomationLog(
-                $sqlConnector,
-                'SUCCESS',
-                $totalUpdated,
-                sprintf(
-                    'DropState=%d CancelDate=%d Payments=%d CampaignSync=%s',
-                    $dropStateUpdated,
-                    $cancelDateUpdated,
-                    $paymentsUpdated,
-                    $campaignSynced ? 'YES' : 'NO'
-                )
-            );
-
-            $this->info("[SUCCESS] {$this->source} sync completed successfully!");
-            return Command::SUCCESS;
-        } catch (\Throwable $e) {
-            Log::error('SyncEnrollmentData: unhandled sync failure', [
-                'source' => $this->source,
-                'exception' => $e->getMessage(),
-            ]);
-            $this->writeAutomationLog($sqlConnector, 'FAILED', 0, $e->getMessage());
-            $this->error("[ERROR] {$this->source} sync failed: " . $e->getMessage());
-            return Command::FAILURE;
-        }
+        $this->info("[SUCCESS] {$this->source} sync completed successfully!");
+        return Command::SUCCESS;
     }
 
-    private function updateDropNameAndState(DBConnector $sqlConnector): int
+    private function updateDropNameAndState(DBConnector $sqlConnector): void
     {
         // Get enrollment records with missing Drop_Name or State
         // PLAW filters by last 90 days, LDR gets all
@@ -124,11 +99,10 @@ class SyncEnrollmentData extends Command
         ";
 
         $result = $sqlConnector->querySqlServer($sql);
-        $rows = $result['data'] ?? [];
-        $this->info("[INFO] Found " . count($rows) . " records with missing Drop_Name or State");
+        $this->info("[INFO] Found " . count($result) . " records with missing Drop_Name or State");
 
         $updated = 0;
-        foreach ($rows as $row) {
+        foreach ($result as $row) {
             $pk = $row['PK'] ?? null;
             $llgId = $row['LLG_ID'] ?? null;
             $dropName = trim($row['Drop_Name'] ?? '');
@@ -145,12 +119,12 @@ class SyncEnrollmentData extends Command
             if ($dropName === '') {
                 $campaignSql = "SELECT Campaign FROM TblContacts WHERE LLG_ID = '{$this->esc($llgId)}'";
                 $campaignResult = $sqlConnector->querySqlServer($campaignSql);
-                $campaign = $campaignResult['data'][0]['Campaign'] ?? '';
+                $campaign = $campaignResult[0]['Campaign'] ?? '';
 
                 if ($campaign === '') {
                     $leadSql = "SELECT Drop_Name FROM TblLeads WHERE LLG_ID = '{$this->esc($llgId)}'";
                     $leadResult = $sqlConnector->querySqlServer($leadSql);
-                    $campaign = $leadResult['data'][0]['Drop_Name'] ?? '';
+                    $campaign = $leadResult[0]['Drop_Name'] ?? '';
                 }
 
                 if ($campaign !== '') {
@@ -163,12 +137,12 @@ class SyncEnrollmentData extends Command
             if ($state === '') {
                 $stateSql = "SELECT State FROM TblContacts WHERE LLG_ID = '{$this->esc($llgId)}'";
                 $stateResult = $sqlConnector->querySqlServer($stateSql);
-                $stateValue = $stateResult['data'][0]['State'] ?? '';
+                $stateValue = $stateResult[0]['State'] ?? '';
 
                 if ($stateValue === '') {
                     $leadStateSql = "SELECT State FROM TblLeads WHERE LLG_ID = '{$this->esc($llgId)}'";
                     $leadStateResult = $sqlConnector->querySqlServer($leadStateSql);
-                    $stateValue = $leadStateResult['data'][0]['State'] ?? '';
+                    $stateValue = $leadStateResult[0]['State'] ?? '';
                 }
 
                 if ($stateValue !== '') {
@@ -189,15 +163,13 @@ class SyncEnrollmentData extends Command
         }
 
         $this->info("[INFO] Updated {$updated} records with Drop_Name/State");
-        return $updated;
     }
 
-    private function updateCancelDate(DBConnector $snowflake, DBConnector $sqlConnector): int
+    private function updateCancelDate(DBConnector $snowflake, DBConnector $sqlConnector): void
     {
         // Get all enrollment records with LLG_ID and current Cancel_Date
         $sql = "SELECT LLG_ID, Cancel_Date FROM TblEnrollment WHERE Category = '{$this->esc($this->source)}'";
-        $enrollmentResult = $sqlConnector->querySqlServer($sql);
-        $enrollmentData = $enrollmentResult['data'] ?? [];
+        $enrollmentData = $sqlConnector->querySqlServer($sql);
         $this->info("[INFO] Processing " . count($enrollmentData) . " enrollment records for Cancel_Date");
 
         // Get DROPPED_DATE from Snowflake
@@ -253,10 +225,9 @@ class SyncEnrollmentData extends Command
         }
 
         $this->info("[INFO] Updated {$updated} Cancel_Date records");
-        return $updated;
     }
 
-    private function updatePayments(DBConnector $snowflake, DBConnector $sqlConnector): int
+    private function updatePayments(DBConnector $snowflake, DBConnector $sqlConnector): void
     {
         // Get payment counts from BOTH Snowflake databases (LDR and PLAW)
         // Some contacts have Category=LDR but payments in PLAW or vice versa
@@ -309,10 +280,7 @@ class SyncEnrollmentData extends Command
         // Get current payments and payment frequency from TblEnrollment for this category
         $sql = "SELECT LLG_ID, Payments, Payment_Frequency FROM TblEnrollment WHERE Category = '{$this->esc($this->source)}'";
         $enrollmentResult = $sqlConnector->querySqlServer($sql);
-        // SQL Server returns data directly as array, not wrapped in ['data']
-        $enrollmentData = is_array($enrollmentResult) && isset($enrollmentResult['data']) 
-            ? $enrollmentResult['data'] 
-            : (is_array($enrollmentResult) ? $enrollmentResult : []);
+        $enrollmentData = $enrollmentResult['data'] ?? [];
 
         // Collect updates needed
         $updates = [];
@@ -334,20 +302,16 @@ class SyncEnrollmentData extends Command
                 // Adjust payment count based on Payment_Frequency
                 // Note: Check Bi-Weekly/Semi-Monthly BEFORE Weekly to avoid substring matching issue
                 if (stripos($paymentFrequency, 'Bi-Weekly') !== false || stripos($paymentFrequency, 'Semi-Monthly') !== false) {
-                    $adjustedPaymentCount = $rawPaymentCount / 2;
+                    $adjustedPaymentCount = (int) round($rawPaymentCount / 2);
                 } elseif (stripos($paymentFrequency, 'Weekly') !== false) {
-                    $adjustedPaymentCount = $rawPaymentCount / 4;
+                    $adjustedPaymentCount = (int) round($rawPaymentCount / 4);
                 } else {
                     $adjustedPaymentCount = $rawPaymentCount;
                 }
 
-                // Format the adjusted payment count to 2 decimal places to match SQL Server DECIMAL type
-                $adjustedPaymentCountStr = number_format((float) $adjustedPaymentCount, 2, '.', '');
-                $currentPaymentsStr = number_format((float) $currentPayments, 2, '.', '');
-
                 // Only add to updates if different
-                if ($currentPaymentsStr !== $adjustedPaymentCountStr) {
-                    $updates[$llgId] = $adjustedPaymentCountStr;
+                if ((int) $currentPayments !== $adjustedPaymentCount) {
+                    $updates[$llgId] = $adjustedPaymentCount;
                 }
             }
         }
@@ -382,10 +346,9 @@ class SyncEnrollmentData extends Command
         }
 
         $this->info("[INFO] Updated {$updated} Payments records");
-        return $updated;
     }
 
-    private function updateContactsCampaign(DBConnector $sqlConnector): bool
+    private function updateContactsCampaign(DBConnector $sqlConnector): void
     {
         $sql = "
             UPDATE TblContacts
@@ -399,33 +362,12 @@ class SyncEnrollmentData extends Command
         try {
             $sqlConnector->querySqlServer($sql);
             $this->info("[INFO] Updated TblContacts.Campaign from TblEnrollment.Drop_Name");
-            return true;
         } catch (\Throwable $e) {
             $this->warn("[WARN] Failed to update TblContacts.Campaign: " . $e->getMessage());
             Log::warning('SyncEnrollmentData: Campaign update failed', [
                 'source' => $this->source,
                 'error' => $e->getMessage()
             ]);
-            return false;
-        }
-    }
-
-    private function writeAutomationLog(DBConnector $connector, string $status, int $recordsProcessed, string $details): void
-    {
-        $result = app(TblLogWriter::class)->logAutomation(
-            $connector,
-            'TblEnrollment',
-            'SyncEnrollmentData',
-            sprintf('Sync enrollment data temp for DP_%s', strtoupper($this->source)),
-            'SYNC_ENROLLMENT_DATA',
-            $status,
-            $recordsProcessed,
-            0,
-            $details
-        );
-
-        if (!$result['success']) {
-            $this->warn(sprintf('[%s] TblLog write failed: %s', $this->source, $result['error'] ?? 'Unknown error'));
         }
     }
 
@@ -434,4 +376,3 @@ class SyncEnrollmentData extends Command
         return str_replace("'", "''", $value);
     }
 }
-

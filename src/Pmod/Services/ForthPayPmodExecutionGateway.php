@@ -550,7 +550,7 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway
         }
 
         $response = $this->crmClient($workItem->tenantId)
-            ->post("/contacts/{$workItem->contactId}/bank-accounts", $payload);
+            ->post("/contacts/{$workItem->contactId}/bank-account", $payload);
 
         if (!$response->successful()) {
             Log::error('PMOD: Failed to add bank account', [
@@ -616,7 +616,7 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway
         }
 
         $response = $this->crmClient($workItem->tenantId)
-            ->post("/contacts/{$workItem->contactId}/debts", $payload);
+            ->post('/debts', array_merge($payload, ['contact_id' => $workItem->contactId]));
 
         if (!$response->successful()) {
             Log::error('PMOD: Failed to create debt', [

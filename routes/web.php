@@ -11,6 +11,7 @@ use Cmd\Reports\Http\Controllers\LeadReportController;
 use Cmd\Reports\Http\Controllers\CreditorContactsReportController;
 use Cmd\Reports\Http\Controllers\EpfPaidReportController;
 use Cmd\Reports\Http\Controllers\EpfDueReportController;
+use Cmd\Reports\Http\Controllers\MailDropExportController;
 use Cmd\Reports\Http\Controllers\MailerDataReportController;
 use Cmd\Reports\Http\Controllers\MarketingReportController;
 use Cmd\Reports\Http\Controllers\MarketingAdminController;
@@ -174,12 +175,28 @@ $registerCmdReportRoutes = function (bool $withNames = true): void {
 
     // New custom reports moved into package
     Route::get('/marketing-admin', [MarketingAdminController::class, 'index'])
-        ->middleware('can:cmd.reports.marketing_admin_report')
         ->name($name('cmd.reports.marketing_admin'));
+    Route::get('/marketing-admin/chart-data', [MarketingAdminController::class, 'chartData'])
+        ->name($name('cmd.reports.marketing_admin.chart_data'));
+    Route::get('/marketing-admin/summary-data', [MarketingAdminController::class, 'summaryData'])
+        ->name($name('cmd.reports.marketing_admin.summary_data'));
+    Route::get('/marketing-admin/table-data', [MarketingAdminController::class, 'tableData'])
+        ->name($name('cmd.reports.marketing_admin.table_data'));
+    Route::get('/marketing-admin/export', [MarketingAdminController::class, 'export'])
+        ->name($name('cmd.reports.marketing_admin.export'));
+    Route::post('/marketing-admin/refresh', [MarketingAdminController::class, 'refresh'])
+        ->name($name('cmd.reports.marketing_admin.refresh'));
 
     Route::get('/drop-summary', [DropSummaryController::class, 'index'])
         ->middleware('can:cmd.reports.drop_summary_report')
         ->name($name('cmd.reports.drop_summary'));
+
+    Route::get('/mail-drop-export', [MailDropExportController::class, 'index'])
+        ->middleware('can:cmd.reports.mail_drop_export')
+        ->name($name('cmd.reports.mail_drop_export'));
+    Route::post('/mail-drop-export', [MailDropExportController::class, 'export'])
+        ->middleware('can:cmd.reports.mail_drop_export')
+        ->name($name('cmd.reports.mail_drop_export.export'));
 };
 
 // Central-domain access (no tenancy), with distinct names to avoid overriding tenant routes.

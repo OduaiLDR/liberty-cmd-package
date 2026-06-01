@@ -48,7 +48,7 @@ class Formatter
 
         $sent = $email->sendMailUsingTblReportsHtml(
             $sqlConnector,
-            ['CompanyStatsReport', 'Company Stats'],
+            ['Company Stats'],
             ['LDR'],
             $subject,
             $body
@@ -75,7 +75,7 @@ class Formatter
 
         $sent = $email->sendMailUsingTblReportsHtml(
             $sqlConnector,
-            ['CompanyStatsReport', 'Company Stats'],
+            ['Company Stats'],
             ['PLAW'],
             $subject,
             $body
