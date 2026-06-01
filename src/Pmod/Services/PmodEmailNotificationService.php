@@ -23,13 +23,15 @@ final class PmodEmailNotificationService
             return false;
         }
 
-        $success = in_array($result->status, ['updated', 'success'], true);
+        $success   = in_array($result->status, ['updated', 'success'], true);
+        $captured  = $result->status === 'captured_for_manual_review';
+
         return $this->send(
-            workItem: $workItem,
-            statusLabel: $success ? 'Success' : 'Failure',
-            subjectPrefix: $success ? 'PMOD Success' : 'HIGH PRIORITY: PMOD Failure',
-            summary: $result->message,
-            details: $result->metadata,
+            workItem:      $workItem,
+            statusLabel:   $success ? 'Success' : ($captured ? 'Captured' : 'Failure'),
+            subjectPrefix: $success ? 'PMOD Success' : ($captured ? 'ACTION REQUIRED: PMOD Manual Review' : 'HIGH PRIORITY: PMOD Failure'),
+            summary:       $result->message,
+            details:       $result->metadata,
         );
     }
 
@@ -64,9 +66,14 @@ final class PmodEmailNotificationService
     ): bool {
         try {
             $failureType = $this->failureType($details);
+            $dbStatus = match ($statusLabel) {
+                'Success'  => 'success',
+                'Captured' => 'captured',
+                default    => 'failure',
+            };
             $settings = ($this->settings ?? new PmodEmailSettings())->for(
                 workItem: $workItem,
-                status: $statusLabel === 'Failure' ? 'failure' : 'success',
+                status: $dbStatus,
                 failureType: $failureType,
             );
 
