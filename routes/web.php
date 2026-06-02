@@ -11,6 +11,7 @@ use Cmd\Reports\Http\Controllers\LeadReportController;
 use Cmd\Reports\Http\Controllers\CreditorContactsReportController;
 use Cmd\Reports\Http\Controllers\EpfPaidReportController;
 use Cmd\Reports\Http\Controllers\EpfDueReportController;
+use Cmd\Reports\Http\Controllers\EpfAuditReportController;
 use Cmd\Reports\Http\Controllers\MailDropExportController;
 use Cmd\Reports\Http\Controllers\MailerDataReportController;
 use Cmd\Reports\Http\Controllers\MarketingReportController;
@@ -74,6 +75,8 @@ $registerCmdReportRoutes = function (bool $withNames = true): void {
         ->name($name('cmd.reports.epf_paid_report'));
     Route::get('/epf-due-report', [EpfDueReportController::class, 'index'])
         ->name($name('cmd.reports.epf_due_report'));
+    Route::get('/epf-audit-report', [EpfAuditReportController::class, 'index'])
+        ->name($name('cmd.reports.epf_audit_report'));
     Route::get('/capital-report', [CapitalReportController::class, 'index'])
         ->name($name('cmd.reports.capital_report'));
     Route::get('/jordan-expenses-report', [JordanExpensesReportController::class, 'index'])
