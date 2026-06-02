@@ -15,6 +15,8 @@ class EpfAuditReportController extends Controller
 
     public function index(Request $request): View|StreamedResponse
     {
+        set_time_limit(300);
+
         $cutoff = $this->resolveCutoff((string) $request->query('cutoff', ''));
         $fromDate = $this->resolveFromDate((string) $request->query('from_date', ''));
         $tab = strtolower((string) $request->query('tab', 'epfs'));
@@ -35,10 +37,10 @@ class EpfAuditReportController extends Controller
             return $this->exportXlsx($cutoff, $fromDate);
         }
 
-        $rows = match ($tab) {
-            'advances' => $this->repo->getAdvances($cutoff, $fromDate),
-            'summary'  => $this->repo->getSummary($cutoff, $fromDate),
-            default    => $this->repo->getEpfs($cutoff, $fromDate),
+        $data = match ($tab) {
+            'advances' => $this->repo->getAdvances($cutoff, $fromDate, $page, $perPage),
+            'summary'  => $this->repo->getSummary($cutoff, $fromDate, $page, $perPage),
+            default    => $this->repo->getEpfs($cutoff, $fromDate, $page, $perPage),
         };
 
         $columns = match ($tab) {
@@ -47,17 +49,13 @@ class EpfAuditReportController extends Controller
             default    => $this->repo->epfColumns(),
         };
 
-        $total = count($rows);
-        $offset = ($page - 1) * $perPage;
-        $pageRows = array_slice($rows, $offset, $perPage);
-
         return view('reports::reports.epf_audit', [
             'cutoff'   => $cutoff,
             'fromDate' => $fromDate,
             'tab'      => $tab,
-            'rows'     => $pageRows,
+            'rows'     => $data['rows'],
             'columns'  => $columns,
-            'total'    => $total,
+            'total'    => $data['total'],
             'page'     => $page,
             'perPage'  => $perPage,
         ]);
@@ -65,9 +63,11 @@ class EpfAuditReportController extends Controller
 
     private function exportXlsx(string $cutoff, string $fromDate): StreamedResponse
     {
-        $epfs     = $this->repo->getEpfs($cutoff, $fromDate);
-        $advances = $this->repo->getAdvances($cutoff, $fromDate);
-        $summary  = $this->repo->getSummary($cutoff, $fromDate);
+        set_time_limit(600);
+
+        $epfs     = $this->repo->getEpfs($cutoff, $fromDate)['rows'];
+        $advances = $this->repo->getAdvances($cutoff, $fromDate)['rows'];
+        $summary  = $this->repo->getSummary($cutoff, $fromDate)['rows'];
 
         $path = (new EpfAuditExcelFormatter())->buildWorkbook(
             $epfs,

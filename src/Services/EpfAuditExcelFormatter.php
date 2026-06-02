@@ -65,7 +65,7 @@ class EpfAuditExcelFormatter
         if (!empty($rows)) {
             $data = [];
             foreach ($rows as $row) {
-                $data[] = array_values($row);
+                $data[] = array_values((array) $row);
             }
             $sheet->fromArray($data, null, 'A2');
         }

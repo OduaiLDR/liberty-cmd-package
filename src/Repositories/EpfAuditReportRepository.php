@@ -6,13 +6,15 @@ class EpfAuditReportRepository extends SqlSrvRepository
 {
     /**
      * Sheet 1 — EPFs from TblEPFs.
+     * Pass $perPage = 0 to fetch all rows (used by Excel export).
      *
-     * @return array<int, array<string, mixed>>
+     * @return array{rows: array<int, object>, total: int}
      */
-    public function getEpfs(string $cutoff, string $fromDate): array
+    public function getEpfs(string $cutoff, string $fromDate, int $page = 1, int $perPage = 0): array
     {
         $sql = "
             SELECT
+                COUNT(1) OVER()      AS _total,
                 e.Source             AS [Source],
                 e.LLG_ID             AS [LLG ID],
                 e.Amount             AS [Amount],
@@ -33,22 +35,28 @@ class EpfAuditReportRepository extends SqlSrvRepository
             ORDER BY e.Draft_Date DESC, e.PK DESC
         ";
 
-        $rows = $this->connection()->select($sql, ['10362', $fromDate, $cutoff]);
+        $params = ['10362', $fromDate, $cutoff];
+        if ($perPage > 0) {
+            $sql .= ' OFFSET ? ROWS FETCH NEXT ? ROWS ONLY';
+            $params[] = max(0, ($page - 1) * $perPage);
+            $params[] = $perPage;
+        }
 
-        return array_map(static fn($r) => (array) $r, $rows);
+        return $this->paginatedResult($this->connection()->select($sql, $params));
     }
 
     /**
      * Sheet 2 — Advances/deductions from TblEPFsDeductions.
-     * Source is derived per-LLG by picking any matching TblEPFs row.
+     * Source is derived per-LLG via OUTER APPLY (index-friendly than correlated subquery).
      *
-     * @return array<int, array<string, mixed>>
+     * @return array{rows: array<int, object>, total: int}
      */
-    public function getAdvances(string $cutoff, string $fromDate): array
+    public function getAdvances(string $cutoff, string $fromDate, int $page = 1, int $perPage = 0): array
     {
         $sql = "
             SELECT
-                (SELECT TOP 1 ee.Source FROM TblEPFs ee WHERE ee.LLG_ID = d.LLG_ID) AS [Source],
+                COUNT(1) OVER()  AS _total,
+                src.Source       AS [Source],
                 d.LLG_ID         AS [LLG ID],
                 d.Amount         AS [Amount],
                 d.Process_Date   AS [Process Date],
@@ -56,26 +64,35 @@ class EpfAuditReportRepository extends SqlSrvRepository
                 d.Paid_To        AS [Paid To],
                 d.Linked_To      AS [Linked To]
             FROM TblEPFsDeductions d
+            OUTER APPLY (
+                SELECT TOP 1 ee.Source FROM TblEPFs ee WHERE ee.LLG_ID = d.LLG_ID
+            ) src
             WHERE d.Paid_To IN (?, ?)
               AND d.Process_Date >= ?
               AND d.Process_Date <  ?
             ORDER BY d.Process_Date DESC, d.PK DESC
         ";
 
-        $rows = $this->connection()->select($sql, ['27745', '35281', $fromDate, $cutoff]);
+        $params = ['27745', '35281', $fromDate, $cutoff];
+        if ($perPage > 0) {
+            $sql .= ' OFFSET ? ROWS FETCH NEXT ? ROWS ONLY';
+            $params[] = max(0, ($page - 1) * $perPage);
+            $params[] = $perPage;
+        }
 
-        return array_map(static fn($r) => (array) $r, $rows);
+        return $this->paginatedResult($this->connection()->select($sql, $params));
     }
 
     /**
      * Sheet 3 — Enrolled clients summary from TblEnrollment.
      *
-     * @return array<int, array<string, mixed>>
+     * @return array{rows: array<int, object>, total: int}
      */
-    public function getSummary(string $cutoff, string $fromDate): array
+    public function getSummary(string $cutoff, string $fromDate, int $page = 1, int $perPage = 0): array
     {
         $sql = "
             SELECT
+                COUNT(1) OVER()     AS _total,
                 e.LLG_ID            AS [LLG ID],
                 e.Client            AS [Client],
                 e.Agent             AS [Assigned To],
@@ -95,9 +112,29 @@ class EpfAuditReportRepository extends SqlSrvRepository
             ORDER BY e.Client ASC
         ";
 
-        $rows = $this->connection()->select($sql, [$fromDate, $cutoff]);
+        $params = [$fromDate, $cutoff];
+        if ($perPage > 0) {
+            $sql .= ' OFFSET ? ROWS FETCH NEXT ? ROWS ONLY';
+            $params[] = max(0, ($page - 1) * $perPage);
+            $params[] = $perPage;
+        }
 
-        return array_map(static fn($r) => (array) $r, $rows);
+        return $this->paginatedResult($this->connection()->select($sql, $params));
+    }
+
+    /**
+     * Strip the _total window column off each row and return {rows, total}.
+     *
+     * @param  array<int, object> $rows
+     * @return array{rows: array<int, object>, total: int}
+     */
+    private function paginatedResult(array $rows): array
+    {
+        $total = !empty($rows) ? (int) ($rows[0]->_total ?? 0) : 0;
+        foreach ($rows as $row) {
+            unset($row->_total);
+        }
+        return ['rows' => $rows, 'total' => $total];
     }
 
     /** @return array<int, string> */

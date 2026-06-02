@@ -75,11 +75,10 @@
                     </thead>
                     <tbody>
                         @forelse($rows as $row)
-                            @php $vals = array_values($row); @endphp
                             <tr>
-                                @foreach($columns as $i => $col)
+                                @foreach($columns as $col)
                                     @php
-                                        $val = $vals[$i] ?? '';
+                                        $val = $row->{$col} ?? '';
                                         $out = $val;
                                         if ($val !== null && $val !== '') {
                                             $lower = strtolower((string) $col);
