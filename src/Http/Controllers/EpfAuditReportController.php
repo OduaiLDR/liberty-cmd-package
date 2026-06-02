@@ -15,11 +15,8 @@ class EpfAuditReportController extends Controller
 
     public function index(Request $request): View|StreamedResponse
     {
-        ini_set('memory_limit', '2G');
-        set_time_limit(600);
-
         $cutoff = $this->resolveCutoff((string) $request->query('cutoff', ''));
-        $fromDate = $this->resolveOptionalDate((string) $request->query('from_date', ''));
+        $fromDate = $this->resolveFromDate((string) $request->query('from_date', ''));
         $tab = strtolower((string) $request->query('tab', 'epfs'));
         if (!in_array($tab, ['epfs', 'advances', 'summary'], true)) {
             $tab = 'epfs';
@@ -55,23 +52,19 @@ class EpfAuditReportController extends Controller
         $pageRows = array_slice($rows, $offset, $perPage);
 
         return view('reports::reports.epf_audit', [
-            'cutoff'    => $cutoff,
-            'fromDate'  => $fromDate,
-            'tab'       => $tab,
-            'rows'      => $pageRows,
-            'columns'   => $columns,
-            'total'     => $total,
-            'page'      => $page,
-            'perPage'   => $perPage,
-            'loadErrors' => $this->repo->lastErrors(),
+            'cutoff'   => $cutoff,
+            'fromDate' => $fromDate,
+            'tab'      => $tab,
+            'rows'     => $pageRows,
+            'columns'  => $columns,
+            'total'    => $total,
+            'page'     => $page,
+            'perPage'  => $perPage,
         ]);
     }
 
     private function exportXlsx(string $cutoff, string $fromDate): StreamedResponse
     {
-        ini_set('memory_limit', '2G');
-        set_time_limit(600);
-
         $epfs     = $this->repo->getEpfs($cutoff, $fromDate);
         $advances = $this->repo->getAdvances($cutoff, $fromDate);
         $summary  = $this->repo->getSummary($cutoff, $fromDate);
@@ -110,7 +103,7 @@ class EpfAuditReportController extends Controller
         return date('Y-m-d', strtotime('first day of next month'));
     }
 
-    private function resolveOptionalDate(string $raw): string
+    private function resolveFromDate(string $raw): string
     {
         $raw = trim($raw);
         if ($raw !== '' && preg_match('/^\d{4}-\d{2}-\d{2}$/', $raw) === 1) {

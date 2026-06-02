@@ -60,18 +60,6 @@
                 @endforeach
             </ul>
 
-            @if(!empty($loadErrors))
-                <div class="alert alert-warning">
-                    <strong>Some data could not be loaded:</strong>
-                    <ul class="mb-0 mt-2">
-                        @foreach($loadErrors as $err)
-                            <li><code>{{ $err }}</code></li>
-                        @endforeach
-                    </ul>
-                    <small class="text-muted">Configure the Snowflake credentials (<code>SNOWFLAKE_LDR_*</code> / <code>SNOWFLAKE_PLAW_*</code>) in your <code>.env</code> to load this data.</small>
-                </div>
-            @endif
-
             <div class="d-flex align-items-center justify-content-between mb-2 flex-wrap gap-2">
                 <div class="text-muted small">Total: {{ number_format($total) }} record(s)</div>
             </div>

@@ -2,137 +2,102 @@
 
 namespace Cmd\Reports\Repositories;
 
-use Cmd\Reports\Services\DBConnector;
-use Throwable;
-
-class EpfAuditReportRepository
+class EpfAuditReportRepository extends SqlSrvRepository
 {
-    /** @var array<int, string> */
-    private array $lastErrors = [];
-
-    /** @return array<int, string> */
-    public function lastErrors(): array
-    {
-        return $this->lastErrors;
-    }
-
     /**
-     * Query 1 — EPFs (TRANS_TYPE = 'PF', PAID_TO <> 10362).
+     * Sheet 1 — EPFs from TblEPFs.
      *
      * @return array<int, array<string, mixed>>
      */
-    public function getEpfs(string $cutoff, string $fromDate = ''): array
+    public function getEpfs(string $cutoff, string $fromDate): array
     {
-        $fromClause = $fromDate !== '' ? "AND t1.CREATED_AT >= DATE '{$fromDate}'" : '';
         $sql = "
             SELECT
-                t1.CONTACT_ID,
-                t1.AMOUNT,
-                TO_CHAR(t1.PROCESS_DATE,  'YYYY-MM-DD') AS PROCESS_DATE,
-                TO_CHAR(t1.CLEARED_DATE,  'YYYY-MM-DD') AS CLEARED_DATE,
-                TO_CHAR(t1.RETURNED_DATE, 'YYYY-MM-DD') AS RETURNED_DATE,
-                t1.CANCELLED,
-                t1.ACTIVE,
-                so.DEBT_ID,
-                t1.PAID_TO,
-                LEFT(t1._FIVETRAN_SYNCED, 10) AS FIVETRAN_SYNCED,
-                LEFT(t1.CREATED_AT, 10)      AS CREATED_AT,
-                t1.TRANS_TYPE
-            FROM TRANSACTIONS AS t1
-            LEFT JOIN TRANSACTIONS AS t2
-                ON t1.LINKED_TO = t2.ID AND t2.TRANS_TYPE = 'S'
-            LEFT JOIN SETTLEMENT_OFFERS AS so
-                ON t2.LINKED_TO = so.ID
-            WHERE t1.TRANS_TYPE IN ('PF')
-              AND t1.PAID_TO <> 10362
-              AND t1.CREATED_AT < DATE '{$cutoff}'
-              {$fromClause}
+                e.Source             AS [Source],
+                e.LLG_ID             AS [LLG ID],
+                e.Amount             AS [Amount],
+                e.Process_Date       AS [Process Date],
+                e.Cleared_Date       AS [Cleared Date],
+                e.Returned_Date      AS [Returned Date],
+                e.Settlement_ID      AS [Settlement ID],
+                e.Paid_To            AS [Paid To],
+                e.Draft_Date         AS [Draft Date],
+                e.Payment_Number     AS [Payment Number],
+                e.Original_Amount    AS [Original Amount],
+                e.Settlement_Amount  AS [Settlement Amount],
+                e.Creditor_Name      AS [Creditor Name]
+            FROM TblEPFs e
+            WHERE e.Paid_To <> ?
+              AND e.Draft_Date >= ?
+              AND e.Draft_Date <  ?
+            ORDER BY e.Draft_Date DESC, e.PK DESC
         ";
 
-        return $this->runOnBoth($sql);
+        $rows = $this->connection()->select($sql, ['10362', $fromDate, $cutoff]);
+
+        return array_map(static fn($r) => (array) $r, $rows);
     }
 
     /**
-     * Query 2 — Advances (TRANS_TYPE IN SA/RV/T/C, PAID_TO IN known IDs).
+     * Sheet 2 — Advances/deductions from TblEPFsDeductions.
+     * Source is derived per-LLG by picking any matching TblEPFs row.
      *
      * @return array<int, array<string, mixed>>
      */
-    public function getAdvances(string $cutoff, string $fromDate = ''): array
+    public function getAdvances(string $cutoff, string $fromDate): array
     {
-        $fromClause = $fromDate !== '' ? "AND t1.CREATED_AT >= DATE '{$fromDate}'" : '';
         $sql = "
             SELECT
-                t1.CONTACT_ID,
-                t1.AMOUNT,
-                TO_CHAR(t1.PROCESS_DATE,  'YYYY-MM-DD') AS PROCESS_DATE,
-                TO_CHAR(t1.CLEARED_DATE,  'YYYY-MM-DD') AS CLEARED_DATE,
-                TO_CHAR(t1.RETURNED_DATE, 'YYYY-MM-DD') AS RETURNED_DATE,
-                t1.CANCELLED,
-                t1.ACTIVE,
-                so.DEBT_ID,
-                t1.PAID_TO,
-                LEFT(t1._FIVETRAN_SYNCED, 10) AS FIVETRAN_SYNCED,
-                LEFT(t1.CREATED_AT, 10)      AS CREATED_AT,
-                t1.TRANS_TYPE,
-                t1.MEMO
-            FROM TRANSACTIONS AS t1
-            LEFT JOIN TRANSACTIONS AS t2
-                ON t1.LINKED_TO = t2.ID AND t2.TRANS_TYPE = 'PF'
-            LEFT JOIN TRANSACTIONS AS t3
-                ON t2.LINKED_TO = t3.ID AND t3.TRANS_TYPE = 'S'
-            LEFT JOIN SETTLEMENT_OFFERS AS so
-                ON t3.LINKED_TO = so.ID
-            WHERE t1.TRANS_TYPE IN ('SA', 'RV', 'T', 'C')
-              AND t1.PAID_TO IN (27745, 35281)
-              AND t1.CREATED_AT < DATE '{$cutoff}'
-              {$fromClause}
+                (SELECT TOP 1 ee.Source FROM TblEPFs ee WHERE ee.LLG_ID = d.LLG_ID) AS [Source],
+                d.LLG_ID         AS [LLG ID],
+                d.Amount         AS [Amount],
+                d.Process_Date   AS [Process Date],
+                d.Cleared_Date   AS [Cleared Date],
+                d.Paid_To        AS [Paid To],
+                d.Linked_To      AS [Linked To]
+            FROM TblEPFsDeductions d
+            WHERE d.Paid_To IN (?, ?)
+              AND d.Process_Date >= ?
+              AND d.Process_Date <  ?
+            ORDER BY d.Process_Date DESC, d.PK DESC
         ";
 
-        return $this->runOnBoth($sql);
+        $rows = $this->connection()->select($sql, ['27745', '35281', $fromDate, $cutoff]);
+
+        return array_map(static fn($r) => (array) $r, $rows);
     }
 
     /**
-     * Query 3 — Summary (enrolled contacts + debts + creditors + EPF rate).
+     * Sheet 3 — Enrolled clients summary from TblEnrollment.
      *
      * @return array<int, array<string, mixed>>
      */
-    public function getSummary(string $cutoff, string $fromDate = ''): array
+    public function getSummary(string $cutoff, string $fromDate): array
     {
-        $fromClause = $fromDate !== '' ? "AND c.ENROLLED_DATE >= DATE '{$fromDate}'" : "AND c.ENROLLED_DATE >= DATE '2021-07-01'";
         $sql = "
             SELECT
-                c.ID                                          AS LLG_ID,
-                CONCAT(c.FIRSTNAME, ' ', c.LASTNAME)          AS CLIENT,
-                CONCAT(u.FIRSTNAME, ' ', u.LASTNAME)          AS ASSIGNED_TO,
-                ed.TITLE,
-                TO_CHAR(c.ENROLLED_DATE,   'YYYY-MM-DD')      AS ENROLLED_DATE,
-                c.STATE,
-                TO_CHAR(c.DROPPED_DATE,    'YYYY-MM-DD')      AS DROPPED_DATE,
-                d.ID                                          AS DEBT_PK,
-                cr.COMPANY,
-                TO_CHAR(d.SETTLEMENT_DATE, 'YYYY-MM-DD')      AS SETTLEMENT_DATE,
-                d.SETTLEMENT_ID,
-                ep.FEE1                                       AS EPF_RATE,
-                d.ORIGINAL_DEBT_AMOUNT
-            FROM CONTACTS AS c
-            LEFT JOIN DEBTS              AS d  ON c.ID = d.CONTACT_ID
-            LEFT JOIN USERS              AS u  ON c.ASSIGNED_TO = u.UID
-            LEFT JOIN ENROLLMENT_PLAN    AS ep ON c.ID = ep.CONTACT_ID
-            LEFT JOIN ENROLLMENT_DEFAULTS2 AS ed ON ep.PLAN_ID = ed.ID
-            LEFT JOIN CREDITORS          AS cr ON d.CREDITOR_ID = cr.ID
-            WHERE ep.CONTACT_ID IN (SELECT ID FROM CONTACTS)
-              AND d.ENROLLED = 1
-              AND c.DEL = 0
-              AND UPPER(c.FIRSTNAME) <> 'TEST'
-              AND UPPER(c.LASTNAME) <> 'TEST'
-              AND CONCAT(c.FIRSTNAME, ' ', c.LASTNAME) <> 'Bryan Roland'
-              AND COALESCE(CONCAT(u.FIRSTNAME, ' ', u.LASTNAME), 'xxx') <> 'Debt PayPro'
-              {$fromClause}
-              AND c.ENROLLED_DATE < DATE '{$cutoff}'
-            ORDER BY c.LASTNAME ASC, c.FIRSTNAME ASC
+                e.LLG_ID            AS [LLG ID],
+                e.Client            AS [Client],
+                e.Agent             AS [Assigned To],
+                e.Enrollment_Plan   AS [Title],
+                e.Submitted_Date    AS [Enrolled Date],
+                e.State             AS [State],
+                e.Cancel_Date       AS [Dropped Date],
+                e.Debt_Amount       AS [Original Debt Amount],
+                e.EPF_Rate          AS [EPF Rate]
+            FROM TblEnrollment e
+            WHERE e.Submitted_Date >= ?
+              AND e.Submitted_Date <  ?
+              AND (e.Client IS NULL OR UPPER(e.Client) NOT LIKE 'TEST %')
+              AND (e.Client IS NULL OR UPPER(e.Client) NOT LIKE '% TEST')
+              AND COALESCE(e.Client, '') <> 'Bryan Roland'
+              AND COALESCE(e.Agent, 'xxx') <> 'Debt PayPro'
+            ORDER BY e.Client ASC
         ";
 
-        return $this->runOnBoth($sql);
+        $rows = $this->connection()->select($sql, [$fromDate, $cutoff]);
+
+        return array_map(static fn($r) => (array) $r, $rows);
     }
 
     /** @return array<int, string> */
@@ -140,18 +105,18 @@ class EpfAuditReportRepository
     {
         return [
             'Source',
-            'Contact ID',
+            'LLG ID',
             'Amount',
             'Process Date',
             'Cleared Date',
             'Returned Date',
-            'Cancelled',
-            'Active',
-            'Debt ID',
+            'Settlement ID',
             'Paid To',
-            'Fivetran Synced',
-            'Created At',
-            'Trans Type',
+            'Draft Date',
+            'Payment Number',
+            'Original Amount',
+            'Settlement Amount',
+            'Creditor Name',
         ];
     }
 
@@ -160,19 +125,12 @@ class EpfAuditReportRepository
     {
         return [
             'Source',
-            'Contact ID',
+            'LLG ID',
             'Amount',
             'Process Date',
             'Cleared Date',
-            'Returned Date',
-            'Cancelled',
-            'Active',
-            'Debt ID',
             'Paid To',
-            'Fivetran Synced',
-            'Created At',
-            'Trans Type',
-            'Memo',
+            'Linked To',
         ];
     }
 
@@ -180,7 +138,6 @@ class EpfAuditReportRepository
     public function summaryColumns(): array
     {
         return [
-            'Source',
             'LLG ID',
             'Client',
             'Assigned To',
@@ -188,36 +145,8 @@ class EpfAuditReportRepository
             'Enrolled Date',
             'State',
             'Dropped Date',
-            'Debt PK',
-            'Company',
-            'Settlement Date',
-            'Settlement ID',
-            'EPF Rate',
             'Original Debt Amount',
+            'EPF Rate',
         ];
-    }
-
-    /**
-     * Run the given SQL against both LDR and PLAW Snowflake environments,
-     * prefixing each row with its Source.
-     *
-     * @return array<int, array<string, mixed>>
-     */
-    private function runOnBoth(string $sql): array
-    {
-        $tagged = [];
-
-        foreach (['LDR' => 'ldr', 'PLAW' => 'plaw'] as $label => $env) {
-            try {
-                $rows = DBConnector::fromEnvironment($env)->query($sql)['data'] ?? [];
-                foreach ($rows as $row) {
-                    $tagged[] = ['SOURCE' => $label] + $row;
-                }
-            } catch (Throwable $e) {
-                $this->lastErrors[] = $label . ': ' . $e->getMessage();
-            }
-        }
-
-        return $tagged;
     }
 }
