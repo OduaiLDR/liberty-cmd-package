@@ -51,6 +51,7 @@ use Cmd\Reports\Pmod\Enums\PmodActionType;
 use Cmd\Reports\Pmod\Services\ForthPayPmodExecutionGateway;
 use Cmd\Reports\Pmod\Services\PmodDispatcher;
 use Cmd\Reports\Pmod\Services\PmodEmailNotificationService;
+use Cmd\Reports\Console\Commands\SyncAgentCommissionTierEnrollments;
 
 
 
@@ -120,6 +121,7 @@ class ReportsServiceProvider extends ServiceProvider
                 SyncNegotiatorPayrollData::class,
                 RefreshForthApiTokens::class,
                 UpdateLendingUSAStatuses::class,
+                SyncAgentCommissionTierEnrollments::class,
             ]);
         }
 
