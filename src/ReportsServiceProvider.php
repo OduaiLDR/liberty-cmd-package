@@ -33,6 +33,7 @@ use Cmd\Reports\Console\Commands\SyncContactsData;
 use Cmd\Reports\Console\Commands\SyncCollectionCompanies;
 use Cmd\Reports\Console\Commands\SyncLastDepositDate;
 use Cmd\Reports\Console\Commands\SyncVeritasTransactions;
+use Cmd\Reports\Console\Commands\ProcessAgentTrainingCompletions;
 use Cmd\Reports\Console\Commands\SyncPhoneNumbers;
 use Cmd\Reports\Console\Commands\SyncCalls;
 use Cmd\Reports\Console\Commands\RefreshForthApiTokens;
@@ -122,6 +123,7 @@ class ReportsServiceProvider extends ServiceProvider
                 SyncCollectionCompanies::class,
                 SyncLastDepositDate::class,
                 SyncVeritasTransactions::class,
+                ProcessAgentTrainingCompletions::class,
                 SyncPhoneNumbers::class,
                 SyncCalls::class,
                 SyncNegotiatorPayrollData::class,
