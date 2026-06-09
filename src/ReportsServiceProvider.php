@@ -23,6 +23,8 @@ use Cmd\Reports\Console\Commands\GenerateCompanyStatsReport\GenerateCompanyStats
 use Cmd\Reports\Console\Commands\GenerateLegalReport\GenerateLegalReport;
 use Cmd\Reports\Console\Commands\GenerateNSFReport\GenerateNSFReport;
 use Cmd\Reports\Console\Commands\GeneratePauseHoldReport\GeneratePauseHoldReport;
+use Cmd\Reports\Console\Commands\GenerateGraduationReport\GenerateGraduationReport;
+use Cmd\Reports\Console\Commands\GenerateSuppressionReport\GenerateSuppressionReport;
 use Cmd\Reports\Console\Commands\GenerateWelcomeLetterReport\GenerateWelcomeLetterReport;
 use Cmd\Reports\Console\Commands\GenerateWelcomePacketReport\GenerateWelcomePacketReport;
 use Cmd\Reports\Console\Commands\GenerateDroppedReport\GenerateDroppedReport;
@@ -114,6 +116,8 @@ class ReportsServiceProvider extends ServiceProvider
                 GenerateLegalReport::class,
                 GenerateNSFReport::class,
                 GeneratePauseHoldReport::class,
+                GenerateGraduationReport::class,
+                GenerateSuppressionReport::class,
                 GenerateWelcomeLetterReport::class,
                 GenerateWelcomePacketReport::class,
                 GenerateDroppedReport::class,
