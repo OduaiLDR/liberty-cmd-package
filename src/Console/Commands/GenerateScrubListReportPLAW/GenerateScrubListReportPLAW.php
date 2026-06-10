@@ -9,7 +9,7 @@ use Illuminate\Support\Facades\Log;
 /**
  * Faithful port of VBA GenerateScrubListReport("Progress Law").
  * Single Snowflake source (PLAW). No enrollment-plan filter (VBA has none).
- * Keeps the Negotiator column. Picks the most recent CONTACT_BALANCES row.
+ * Negotiator column dropped (data not accurate). Picks the most recent CONTACT_BALANCES row.
  * Email recipients are hardcoded exactly as the VBA (To/CC), not TblReports.
  */
 class GenerateScrubListReportPLAW extends Command
@@ -84,15 +84,14 @@ class GenerateScrubListReportPLAW extends Command
      */
     private function buildRows(DBConnector $snowflake): array
     {
-        // VBA: no plan filter; ENROLLMENT_PLAN/ENROLLMENT_DEFAULTS2 joined but unused in WHERE.
+        // Negotiator dropped (data not accurate). Progress Law: no plan filter.
         $sql = "
             SELECT
                 ID,
                 First_Name,
                 Last_Name,
                 SSN,
-                TO_VARCHAR(DOB, 'MM/DD/YYYY') AS DOB,
-                Negotiator
+                TO_VARCHAR(DOB, 'MM/DD/YYYY') AS DOB
             FROM (
                 SELECT
                     c.ID,
@@ -100,11 +99,8 @@ class GenerateScrubListReportPLAW extends Command
                     c.LASTNAME AS Last_Name,
                     c.SSN,
                     c.DOB,
-                    CONCAT(u.FIRSTNAME, ' ', u.LASTNAME) AS Negotiator,
                     ROW_NUMBER() OVER (PARTITION BY c.ID ORDER BY c.ID ASC) AS n
                 FROM CONTACTS AS c
-                LEFT JOIN USERS_ASSIGNMENT AS ua ON c.ID = ua.CONTACT_ID
-                LEFT JOIN USERS AS u ON ua.USER_ID = u.UID
                 LEFT JOIN ENROLLMENT_PLAN AS ep ON c.ID = ep.CONTACT_ID
                 LEFT JOIN ENROLLMENT_DEFAULTS2 AS ed ON ep.PLAN_ID = ed.ID
                 WHERE c.ENROLLED = 1

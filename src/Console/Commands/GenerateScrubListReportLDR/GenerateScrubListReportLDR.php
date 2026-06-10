@@ -7,24 +7,30 @@ use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
 
 /**
- * Faithful port of VBA GenerateScrubListReport("LDR").
- * Single Snowflake source (LDR). Keeps the LDR enrollment-plan filter
- * (ed.TITLE LIKE 'LDR%' OR 'LT LDR%') and the Negotiator column.
- * Picks the most recent CONTACT_BALANCES row.
- * Email recipients are hardcoded exactly as the VBA LDR branch (To/CC).
+ * Port of VBA GenerateScrubListReport for the LDR Snowflake source.
+ * That instance holds two companies, split by enrollment-plan title:
+ *   - LDR        => ed.TITLE NOT LIKE 'PLAW%'
+ *   - Paramount  => ed.TITLE LIKE 'PLAW%'
+ * Builds and emails one report per company. Negotiator column dropped
+ * (data not accurate). Recipients come from dbo.TblReports by Company.
  */
 class GenerateScrubListReportLDR extends Command
 {
     protected $signature = 'Generate:scrub-list-report-ldr';
 
-    protected $description = 'Generate the LDR Scrub List report from Snowflake and email it.';
+    protected $description = 'Generate the LDR + Paramount Law Scrub List reports from Snowflake and email them.';
 
     private const SOURCE_ENV = 'ldr';
-    private const CATEGORY = 'LDR';
+
+    /** @var array<int, array{category:string, company:string, filter:string}> */
+    private const REPORTS = [
+        ['category' => 'LDR',           'company' => 'LDR',       'filter' => "AND ed.TITLE NOT LIKE 'PLAW%'"],
+        ['category' => 'Paramount Law', 'company' => 'Paramount', 'filter' => "AND ed.TITLE LIKE 'PLAW%'"],
+    ];
 
     public function handle(): int
     {
-        $this->info('[INFO] LDR Scrub List report: starting.');
+        $this->info('[INFO] LDR/Paramount Scrub List report: starting.');
 
         try {
             $snowflake = DBConnector::fromEnvironment(self::SOURCE_ENV);
@@ -42,39 +48,54 @@ class GenerateScrubListReportLDR extends Command
             return Command::FAILURE;
         }
 
-        try {
-            $rows = $this->buildRows($snowflake);
-            $this->info('[INFO] Filtered Scrub List rows: ' . count($rows));
-
-            if (empty($rows)) {
-                $this->warn('[WARN] No LDR Scrub List rows. Skipping workbook and email.');
-                return Command::SUCCESS;
+        foreach (self::REPORTS as $def) {
+            try {
+                $this->generateOne($snowflake, $sqlConnector, $def);
+            } catch (\Throwable $e) {
+                $this->error("{$def['category']} Scrub List Report failed: " . $e->getMessage());
+                Log::error('GenerateScrubListReportLDR: report failed', [
+                    'category' => $def['category'],
+                    'exception' => $e,
+                ]);
+                // Continue to the next company rather than aborting the whole run.
             }
-
-            $coAppRows = $this->fetchCoApplicants($snowflake);
-            $this->info('[INFO] Co-applicant rows: ' . count($coAppRows));
-
-            $formatter = new Formatter();
-            $report = $formatter->buildWorkbook($rows, $coAppRows, self::CATEGORY);
-
-            if ($report === null) {
-                $this->warn('[WARN] Scrub List report file was not created.');
-                return Command::SUCCESS;
-            }
-
-            $this->info("[INFO] Report written to {$report['path']}");
-            $formatter->sendReport($sqlConnector, $report['path'], $report['filename'], self::CATEGORY, $this);
-
-            if (is_file($report['path'])) {
-                @unlink($report['path']);
-            }
-        } catch (\Throwable $e) {
-            $this->error('LDR Scrub List Report failed: ' . $e->getMessage());
-            Log::error('GenerateScrubListReportLDR: report failed', ['exception' => $e]);
-            return Command::FAILURE;
         }
 
         return Command::SUCCESS;
+    }
+
+    /**
+     * @param  array{category:string, company:string, filter:string}  $def
+     */
+    private function generateOne(DBConnector $snowflake, DBConnector $sqlConnector, array $def): void
+    {
+        $this->info("[INFO] Generating {$def['category']} Scrub List Report...");
+
+        $rows = $this->buildRows($snowflake, $def['filter']);
+        $this->info("[INFO] {$def['category']} filtered rows: " . count($rows));
+
+        if (empty($rows)) {
+            $this->warn("[WARN] No {$def['category']} Scrub List rows. Skipping.");
+            return;
+        }
+
+        $coAppRows = $this->fetchCoApplicants($snowflake);
+        $this->info("[INFO] {$def['category']} co-applicant rows: " . count($coAppRows));
+
+        $formatter = new Formatter();
+        $report = $formatter->buildWorkbook($rows, $coAppRows, $def['category']);
+
+        if ($report === null) {
+            $this->warn("[WARN] {$def['category']} report file was not created.");
+            return;
+        }
+
+        $this->info("[INFO] Report written to {$report['path']}");
+        $formatter->sendReport($sqlConnector, $report['path'], $report['filename'], $def['category'], $def['company'], $this);
+
+        if (is_file($report['path'])) {
+            @unlink($report['path']);
+        }
     }
 
     /**
@@ -83,17 +104,16 @@ class GenerateScrubListReportLDR extends Command
      *
      * @return array<int, array<string, mixed>>
      */
-    private function buildRows(DBConnector $snowflake): array
+    private function buildRows(DBConnector $snowflake, string $titleFilter): array
     {
-        // VBA LDR branch: AND (ed.TITLE LIKE 'LDR%' OR ed.TITLE LIKE 'LT LDR%').
+        // Negotiator dropped (data not accurate). Plan-title filter injected per company.
         $sql = "
             SELECT
                 ID,
                 First_Name,
                 Last_Name,
                 SSN,
-                TO_VARCHAR(DOB, 'MM/DD/YYYY') AS DOB,
-                Negotiator
+                TO_VARCHAR(DOB, 'MM/DD/YYYY') AS DOB
             FROM (
                 SELECT
                     c.ID,
@@ -101,16 +121,13 @@ class GenerateScrubListReportLDR extends Command
                     c.LASTNAME AS Last_Name,
                     c.SSN,
                     c.DOB,
-                    CONCAT(u.FIRSTNAME, ' ', u.LASTNAME) AS Negotiator,
                     ROW_NUMBER() OVER (PARTITION BY c.ID ORDER BY c.ID ASC) AS n
                 FROM CONTACTS AS c
-                LEFT JOIN USERS_ASSIGNMENT AS ua ON c.ID = ua.CONTACT_ID
-                LEFT JOIN USERS AS u ON ua.USER_ID = u.UID
                 LEFT JOIN ENROLLMENT_PLAN AS ep ON c.ID = ep.CONTACT_ID
                 LEFT JOIN ENROLLMENT_DEFAULTS2 AS ed ON ep.PLAN_ID = ed.ID
                 WHERE c.ENROLLED = 1
                   AND c.GRADUATED = 0
-                  AND (ed.TITLE LIKE 'LDR%' OR ed.TITLE LIKE 'LT LDR%')
+                  {$titleFilter}
             )
             WHERE n = 1
         ";

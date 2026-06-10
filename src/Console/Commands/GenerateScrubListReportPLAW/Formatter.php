@@ -16,7 +16,7 @@ use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 /**
  * Builds the Scrub List workbook matching the VBA layout:
  * row 1 merged "Applicant" (A:E) / "Co-Applicant" (F:I) / blank (J), row 2 sub-headers,
- * data A-I plus the Negotiator column J. Emails To/CC hardcoded as in the VBA.
+ * data A-I. Negotiator column dropped (data not accurate). Recipients from dbo.TblReports (Company 'PLAW').
  */
 class Formatter
 {
@@ -49,10 +49,9 @@ class Formatter
         $sheet->setTitle("{$category} Scrub List");
         $sheet->setShowGridlines(false);
 
-        // Row 1 merged group headers (J1:J2 merged, left blank as in the VBA).
+        // Row 1 merged group headers.
         $sheet->mergeCells('A1:E1');
         $sheet->mergeCells('F1:I1');
-        $sheet->mergeCells('J1:J2');
         $sheet->setCellValue('A1', 'Applicant');
         $sheet->setCellValue('F1', 'Co-Applicant');
 
@@ -67,7 +66,7 @@ class Formatter
         $sheet->setCellValue('H2', 'SSN');
         $sheet->setCellValue('I2', 'DOB');
 
-        $sheet->getStyle('A1:J2')->applyFromArray([
+        $sheet->getStyle('A1:I2')->applyFromArray([
             'font' => ['bold' => true],
             'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER, 'vertical' => Alignment::VERTICAL_CENTER],
             'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['argb' => 'FFD9D9D9']],
@@ -100,9 +99,6 @@ class Formatter
                 }
             }
 
-            // Column J = Negotiator (VBA keeps the 10th column).
-            $sheet->setCellValue("J{$rowIndex}", $row['NEGOTIATOR'] ?? '');
-
             $rowIndex++;
         }
 
@@ -117,9 +113,9 @@ class Formatter
             $sheet->getStyle("{$col}3:{$col}{$lastRow}")->getAlignment()->setHorizontal(Alignment::HORIZONTAL_RIGHT);
         }
 
-        $sheet->getStyle("A1:J{$lastRow}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
+        $sheet->getStyle("A1:I{$lastRow}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
 
-        foreach (['A', 'B', 'C', 'D', 'F', 'G', 'H', 'J'] as $col) {
+        foreach (['A', 'B', 'C', 'D', 'F', 'G', 'H'] as $col) {
             $sheet->getColumnDimension($col)->setAutoSize(true);
         }
         $sheet->getColumnDimension('E')->setWidth(12);
@@ -127,14 +123,14 @@ class Formatter
 
         for ($r = 3; $r <= $lastRow; $r++) {
             if ($r % 2 === 0) {
-                $sheet->getStyle("A{$r}:J{$r}")
+                $sheet->getStyle("A{$r}:I{$r}")
                     ->getFill()->setFillType(Fill::FILL_SOLID)
                     ->getStartColor()->setARGB('FFF5F7FA');
             }
         }
 
         $sheet->freezePane('A3');
-        $sheet->getStyle("A1:J{$lastRow}")->getFont()->setName('Calibri')->setSize(9);
+        $sheet->getStyle("A1:I{$lastRow}")->getFont()->setName('Calibri')->setSize(9);
         $sheet->setSelectedCells('A1');
 
         $filename = "{$category} Scrub List Report.xlsx";

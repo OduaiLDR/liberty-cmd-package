@@ -14,15 +14,13 @@ use PhpOffice\PhpSpreadsheet\Style\Fill;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 
 /**
- * Builds the Scrub List workbook matching the VBA layout:
- * row 1 merged "Applicant" (A:E) / "Co-Applicant" (F:I) / blank (J), row 2 sub-headers,
- * data A-I plus the Negotiator column J. Emails To/CC hardcoded as in the VBA LDR branch.
+ * Builds the Scrub List workbook: row 1 merged "Applicant" (A:E) / "Co-Applicant" (F:I),
+ * row 2 sub-headers, data A-I. Negotiator column dropped (data not accurate).
+ * Recipients pulled from dbo.TblReports by Report_Name + Company (passed in per company).
  */
 class Formatter
 {
-    // Recipients come from dbo.TblReports (Report_Name 'ScrubListReport', Company 'LDR').
     private const REPORT_NAMES = ['ScrubListReport', 'Scrub List Report'];
-    private const COMPANY = 'LDR';
 
     /**
      * @param  array<int, array<string, mixed>>  $rows
@@ -49,10 +47,9 @@ class Formatter
         $sheet->setTitle("{$category} Scrub List");
         $sheet->setShowGridlines(false);
 
-        // Row 1 merged group headers (J1:J2 merged, left blank as in the VBA).
+        // Row 1 merged group headers.
         $sheet->mergeCells('A1:E1');
         $sheet->mergeCells('F1:I1');
-        $sheet->mergeCells('J1:J2');
         $sheet->setCellValue('A1', 'Applicant');
         $sheet->setCellValue('F1', 'Co-Applicant');
 
@@ -67,7 +64,7 @@ class Formatter
         $sheet->setCellValue('H2', 'SSN');
         $sheet->setCellValue('I2', 'DOB');
 
-        $sheet->getStyle('A1:J2')->applyFromArray([
+        $sheet->getStyle('A1:I2')->applyFromArray([
             'font' => ['bold' => true],
             'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER, 'vertical' => Alignment::VERTICAL_CENTER],
             'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['argb' => 'FFD9D9D9']],
@@ -100,9 +97,6 @@ class Formatter
                 }
             }
 
-            // Column J = Negotiator (VBA keeps the 10th column).
-            $sheet->setCellValue("J{$rowIndex}", $row['NEGOTIATOR'] ?? '');
-
             $rowIndex++;
         }
 
@@ -117,9 +111,9 @@ class Formatter
             $sheet->getStyle("{$col}3:{$col}{$lastRow}")->getAlignment()->setHorizontal(Alignment::HORIZONTAL_RIGHT);
         }
 
-        $sheet->getStyle("A1:J{$lastRow}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
+        $sheet->getStyle("A1:I{$lastRow}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
 
-        foreach (['A', 'B', 'C', 'D', 'F', 'G', 'H', 'J'] as $col) {
+        foreach (['A', 'B', 'C', 'D', 'F', 'G', 'H'] as $col) {
             $sheet->getColumnDimension($col)->setAutoSize(true);
         }
         $sheet->getColumnDimension('E')->setWidth(12);
@@ -127,14 +121,14 @@ class Formatter
 
         for ($r = 3; $r <= $lastRow; $r++) {
             if ($r % 2 === 0) {
-                $sheet->getStyle("A{$r}:J{$r}")
+                $sheet->getStyle("A{$r}:I{$r}")
                     ->getFill()->setFillType(Fill::FILL_SOLID)
                     ->getStartColor()->setARGB('FFF5F7FA');
             }
         }
 
         $sheet->freezePane('A3');
-        $sheet->getStyle("A1:J{$lastRow}")->getFont()->setName('Calibri')->setSize(9);
+        $sheet->getStyle("A1:I{$lastRow}")->getFont()->setName('Calibri')->setSize(9);
         $sheet->setSelectedCells('A1');
 
         $filename = "{$category} Scrub List Report.xlsx";
@@ -160,7 +154,7 @@ class Formatter
         return (string) $value;
     }
 
-    public function sendReport(DBConnector $connector, string $path, string $filename, string $category, ?Command $console = null): bool
+    public function sendReport(DBConnector $connector, string $path, string $filename, string $category, string $company, ?Command $console = null): bool
     {
         if (!is_file($path)) {
             Log::warning('GenerateScrubListReportLDR: report file missing.', ['path' => $path]);
@@ -183,7 +177,7 @@ class Formatter
         $sent = $email->sendMailUsingTblReports(
             $connector,
             self::REPORT_NAMES,
-            [self::COMPANY],
+            [$company],
             $subject,
             $body,
             $attachments,
@@ -192,12 +186,12 @@ class Formatter
 
         if ($console) {
             if ($sent) {
-                $console->info('[INFO] Scrub List report sent.');
+                $console->info("[INFO] {$category} Scrub List report sent.");
             } else {
-                $console->warn('[WARN] Scrub List report not sent (send failed or missing Graph config).');
+                $console->warn("[WARN] {$category} Scrub List report not sent (send failed or missing Graph config).");
             }
         } elseif (!$sent) {
-            Log::warning('GenerateScrubListReportLDR: failed to send email.');
+            Log::warning('GenerateScrubListReportLDR: failed to send email.', ['category' => $category]);
         }
 
         return $sent;
