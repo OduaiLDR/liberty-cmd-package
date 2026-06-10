@@ -31,8 +31,8 @@ class ReportBuilder
     private const BORDER_COLOR = '999999';
 
     private const BLOCK_WIDTH = 3300;
-    private const W_AGENT = 1900;
-    private const W_VALUE = 1400;
+    private const W_AGENT = 1700;
+    private const W_VALUE = 1600;
     private const W_SEP = 200;
 
     public function build(
@@ -201,6 +201,7 @@ class ReportBuilder
             'borderColor' => self::BORDER_COLOR,
             'cellMargin' => 20,
             'alignment' => JcTable::CENTER,
+            'layout' => \PhpOffice\PhpWord\Style\Table::LAYOUT_FIXED,
         ];
 
         $table = $cell->addTable($tableStyle);
