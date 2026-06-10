@@ -6,15 +6,10 @@ use Cmd\Reports\Services\DBConnector;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
 
-/**
- * Faithful port of VBA GenerateScrubListReport("Progress Law").
- * Single Snowflake source (PLAW). No enrollment-plan filter (VBA has none).
- * Negotiator column dropped (data not accurate). Picks the most recent CONTACT_BALANCES row.
- * Email recipients are hardcoded exactly as the VBA (To/CC), not TblReports.
- */
 class GenerateScrubListReportPLAW extends Command
 {
-    protected $signature = 'Generate:scrub-list-report-plaw';
+    protected $signature = 'Generate:scrub-list-report-plaw
+        {--force-id= : Comma-separated CONTACT_IDs to force onto the report (co-app testing; bypasses the enrolled/ratio filters)}';
 
     protected $description = 'Generate the Progress Law (PLAW) Scrub List report from Snowflake and email it.';
 
@@ -41,8 +36,13 @@ class GenerateScrubListReportPLAW extends Command
             return Command::FAILURE;
         }
 
+        $forceIds = $this->parseForceIds();
+        if (!empty($forceIds)) {
+            $this->warn('[FORCE] Forcing client IDs onto report (filters bypassed): ' . implode(', ', $forceIds));
+        }
+
         try {
-            $rows = $this->buildRows($snowflake);
+            $rows = $this->buildRows($snowflake, $forceIds);
             $this->info('[INFO] Filtered Scrub List rows: ' . count($rows));
 
             if (empty($rows)) {
@@ -82,7 +82,7 @@ class GenerateScrubListReportPLAW extends Command
      *
      * @return array<int, array<string, mixed>>
      */
-    private function buildRows(DBConnector $snowflake): array
+    private function buildRows(DBConnector $snowflake, array $forceIds = []): array
     {
         // Negotiator dropped (data not accurate). Progress Law: no plan filter.
         $sql = "
@@ -111,6 +111,12 @@ class GenerateScrubListReportPLAW extends Command
 
         $result = $snowflake->query($sql);
         $rows = $result['data'] ?? [];
+
+        // Force-include specific clients (co-app testing): fetch them directly,
+        // bypassing the enrolled/graduated filter, and merge if not already present.
+        if (!empty($forceIds)) {
+            $rows = $this->mergeForcedRows($snowflake, $rows, $forceIds);
+        }
 
         if (empty($rows)) {
             return [];
@@ -186,6 +192,8 @@ class GenerateScrubListReportPLAW extends Command
         }
 
         // VBA: clear row if M (balance/debt) < 0.15 OR P (projected balance) < 0.
+        // Forced IDs are always kept (co-app testing).
+        $forceSet = array_flip(array_map('strval', $forceIds));
         $kept = [];
         foreach ($rows as $row) {
             $cid = $row['ID'];
@@ -196,12 +204,72 @@ class GenerateScrubListReportPLAW extends Command
             $withdrawals = $txData[$cid]['withdrawals'] ?? 0.0;
             $projected = $balance + $deposits - $withdrawals;
 
-            if ($ratio >= 0.15 && $projected >= 0) {
+            if (isset($forceSet[(string) $cid]) || ($ratio >= 0.15 && $projected >= 0)) {
                 $kept[] = $row;
             }
         }
 
         return $kept;
+    }
+
+    /**
+     * Fetch the forced client IDs directly (no enrolled/graduated filter) and append
+     * any not already in $rows. Used only for co-app verification via --force-id.
+     *
+     * @param  array<int, array<string, mixed>>  $rows
+     * @param  array<int, string>  $forceIds
+     * @return array<int, array<string, mixed>>
+     */
+    private function mergeForcedRows(DBConnector $snowflake, array $rows, array $forceIds): array
+    {
+        $idList = implode(',', array_map(static fn ($id) => (int) $id, $forceIds));
+        if ($idList === '') {
+            return $rows;
+        }
+
+        $sql = "
+            SELECT ID, First_Name, Last_Name, SSN, TO_VARCHAR(DOB, 'MM/DD/YYYY') AS DOB
+            FROM (
+                SELECT
+                    c.ID,
+                    c.FIRSTNAME AS First_Name,
+                    c.LASTNAME AS Last_Name,
+                    c.SSN,
+                    c.DOB,
+                    ROW_NUMBER() OVER (PARTITION BY c.ID ORDER BY c.ID ASC) AS n
+                FROM CONTACTS AS c
+                WHERE c.ID IN ({$idList})
+            )
+            WHERE n = 1
+        ";
+
+        $forced = $snowflake->query($sql)['data'] ?? [];
+        $existing = array_flip(array_map(static fn ($r) => (string) ($r['ID'] ?? ''), $rows));
+
+        foreach ($forced as $fr) {
+            $fid = (string) ($fr['ID'] ?? '');
+            if ($fid !== '' && !isset($existing[$fid])) {
+                $rows[] = $fr;
+            }
+        }
+
+        return $rows;
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    private function parseForceIds(): array
+    {
+        $raw = (string) $this->option('force-id');
+        if (trim($raw) === '') {
+            return [];
+        }
+
+        return array_values(array_filter(
+            array_map('trim', explode(',', $raw)),
+            static fn ($v) => $v !== ''
+        ));
     }
 
     /**
