@@ -175,8 +175,8 @@ class ReportBuilder
             // Block title (large bold centered)
             $cell->addText(
                 $title,
-                ['bold' => true, 'size' => 16, 'name' => 'Calibri'],
-                ['alignment' => 'center', 'spaceAfter' => 80]
+                ['bold' => true, 'size' => 14, 'name' => 'Calibri'],
+                ['alignment' => 'center', 'spaceAfter' => 40]
             );
 
             $this->buildBlockTable($cell, $rows, $valueKey, $sortDir, $format, $valueHeader);
@@ -199,7 +199,7 @@ class ReportBuilder
         $tableStyle = [
             'borderSize' => 6,
             'borderColor' => self::BORDER_COLOR,
-            'cellMargin' => 40,
+            'cellMargin' => 20,
             'alignment' => JcTable::CENTER,
         ];
 
@@ -240,21 +240,26 @@ class ReportBuilder
             }
         }
 
-        // Total + Average rows
+        // Total + Average rows (always emit both so all tables have matching row counts)
         if ($count > 0) {
             $sumBg = ['bgColor' => self::SUMMARY_BG];
             $sumFont = ['bold' => true, 'size' => 8];
 
+            // Total row — emit for all formats. For percent, value cell is left blank
+            // (summing percentages is meaningless) but the row is present so all tables align.
+            $table->addRow();
+            $table->addCell(self::W_AGENT, $sumBg)->addText('Total', $sumFont);
             if (in_array($format, ['int', 'money_k'], true)) {
-                $table->addRow();
-                $table->addCell(self::W_AGENT, $sumBg)->addText('Total', $sumFont);
                 $table->addCell(self::W_VALUE, $sumBg)->addText(
                     $this->formatValue($total, $format),
                     $sumFont,
                     ['alignment' => 'right']
                 );
+            } else {
+                $table->addCell(self::W_VALUE, $sumBg);
             }
 
+            // Average row
             $table->addRow();
             $table->addCell(self::W_AGENT, $sumBg)->addText('Average', $sumFont);
             $table->addCell(self::W_VALUE, $sumBg)->addText(
