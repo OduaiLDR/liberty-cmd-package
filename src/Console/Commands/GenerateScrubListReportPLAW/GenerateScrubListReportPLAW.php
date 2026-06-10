@@ -205,7 +205,8 @@ class GenerateScrubListReportPLAW extends Command
     }
 
     /**
-     * Co-applicant rows (CONTACTS_USERFIELDS CUSTOM_ID 286824), keyed later by CONTACT_ID.
+     * Co-applicant rows (CONTACTS_USERFIELDS CUSTOM_ID 742226 on the Progress Law account),
+     * keyed later by CONTACT_ID.
      *
      * @return array<int, array<string, mixed>>
      */
@@ -221,7 +222,7 @@ class GenerateScrubListReportPLAW extends Command
                 TO_VARCHAR(c.DOB, 'MM/DD/YYYY') AS DOB
             FROM CONTACTS AS c
             LEFT JOIN CONTACTS_USERFIELDS AS cu ON cu.F_INT = c.ID
-            WHERE cu.CUSTOM_ID = 286824
+            WHERE cu.CUSTOM_ID = 742226
               AND COALESCE(c.FIRSTNAME, '') <> ''
         ";
 

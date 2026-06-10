@@ -228,7 +228,8 @@ class GenerateScrubListReportLDR extends Command
     }
 
     /**
-     * Co-applicant rows (CONTACTS_USERFIELDS CUSTOM_ID 286824), keyed later by CONTACT_ID.
+     * Co-applicant rows (CONTACTS_USERFIELDS CUSTOM_ID 742225 on the LDR account),
+     * keyed later by CONTACT_ID.
      *
      * @return array<int, array<string, mixed>>
      */
@@ -244,7 +245,7 @@ class GenerateScrubListReportLDR extends Command
                 TO_VARCHAR(c.DOB, 'MM/DD/YYYY') AS DOB
             FROM CONTACTS AS c
             LEFT JOIN CONTACTS_USERFIELDS AS cu ON cu.F_INT = c.ID
-            WHERE cu.CUSTOM_ID = 286824
+            WHERE cu.CUSTOM_ID = 742225
               AND COALESCE(c.FIRSTNAME, '') <> ''
         ";
 
