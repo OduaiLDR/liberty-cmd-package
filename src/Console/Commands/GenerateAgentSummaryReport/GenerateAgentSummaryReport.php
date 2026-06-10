@@ -14,7 +14,7 @@ class GenerateAgentSummaryReport extends Command
         {--end-date= : Period end date (YYYY-MM-DD); defaults to last day of current month}
         {--month-offset=0 : Offset for default period in months (e.g. -1 for previous month). Ignored if --start-date is set.}';
 
-    protected $description = 'Generate Agent Summary report PDF(s) from LDR SQL Server and email per Data Source.';
+    protected $description = 'Generate Agent Summary report PDF(s) from LDR SQL Server and email them in one consolidated email.';
 
     public function handle(): int
     {
@@ -48,6 +48,9 @@ class GenerateAgentSummaryReport extends Command
         $builder = new ReportBuilder();
         $formatter = new Formatter();
 
+        $generatedFiles = [];
+        $generatedDataSources = [];
+
         foreach ($dataSources as $dataSource) {
             try {
                 $this->info("[INFO] [{$dataSource}] Fetching metrics...");
@@ -55,7 +58,7 @@ class GenerateAgentSummaryReport extends Command
                 $this->info(sprintf('[INFO] [%s] Agents: %d', $dataSource, count($rows)));
 
                 if (empty($rows)) {
-                    $this->warn("[WARN] [{$dataSource}] No data. Skipping PDF and email.");
+                    $this->warn("[WARN] [{$dataSource}] No data. Skipping PDF.");
                     continue;
                 }
 
@@ -63,26 +66,41 @@ class GenerateAgentSummaryReport extends Command
                 $result = $builder->build($rows, $dataSource, $startDate, $endDate, $continuation);
                 $this->info("[INFO] [{$dataSource}] PDF written to {$result['path']}");
 
-                $formatter->sendReport(
-                    $sqlConnector,
-                    $result['path'],
-                    $result['filename'],
-                    $dataSource,
-                    $continuation,
-                    $startDate,
-                    $endDate,
-                    $this
-                );
-
-                if (is_file($result['path'])) {
-                    @unlink($result['path']);
-                }
+                $generatedFiles[] = [
+                    'name' => $result['filename'],
+                    'path' => $result['path'],
+                ];
+                $generatedDataSources[] = $dataSource;
             } catch (\Throwable $e) {
                 $this->error("[{$dataSource}] failed: " . $e->getMessage());
                 Log::error('GenerateAgentSummaryReport: data source failed', [
                     'data_source' => $dataSource,
                     'exception' => $e,
                 ]);
+            }
+        }
+
+        if (empty($generatedFiles)) {
+            $this->warn('[WARN] No PDFs generated. Nothing to email.');
+            return Command::SUCCESS;
+        }
+
+        $this->info(sprintf('[INFO] Sending one email with %d attachment%s...', count($generatedFiles), count($generatedFiles) === 1 ? '' : 's'));
+
+        $formatter->sendCombinedReport(
+            $sqlConnector,
+            $generatedFiles,
+            $generatedDataSources,
+            $continuation,
+            $startDate,
+            $endDate,
+            $this
+        );
+
+        // Cleanup temp files after sending
+        foreach ($generatedFiles as $file) {
+            if (is_file($file['path'])) {
+                @unlink($file['path']);
             }
         }
 
