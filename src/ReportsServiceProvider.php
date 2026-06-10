@@ -30,6 +30,8 @@ use Cmd\Reports\Console\Commands\GenerateWelcomeLetterReport\GenerateWelcomeLett
 use Cmd\Reports\Console\Commands\GenerateWelcomePacketReport\GenerateWelcomePacketReport;
 use Cmd\Reports\Console\Commands\GenerateDroppedReport\GenerateDroppedReport;
 use Cmd\Reports\Console\Commands\GenerateScrubListReport\GenerateScrubListReport;
+use Cmd\Reports\Console\Commands\GenerateScrubListReportPLAW\GenerateScrubListReportPLAW;
+use Cmd\Reports\Console\Commands\GenerateScrubListReportLDR\GenerateScrubListReportLDR;
 use Cmd\Reports\Console\Commands\GenerateLookbackSummaryReport\GenerateLookbackSummaryReport;
 use Cmd\Reports\Console\Commands\GenerateReportSummary\GenerateReportSummary;
 use Cmd\Reports\Console\Commands\GenerateSyncSummary\GenerateSyncSummary;
@@ -124,6 +126,8 @@ class ReportsServiceProvider extends ServiceProvider
                 GenerateWelcomePacketReport::class,
                 GenerateDroppedReport::class,
                 GenerateScrubListReport::class,
+                GenerateScrubListReportPLAW::class,
+                GenerateScrubListReportLDR::class,
                 GenerateLookbackSummaryReport::class,
                 GenerateReportSummary::class,
                 GenerateSyncSummary::class,
