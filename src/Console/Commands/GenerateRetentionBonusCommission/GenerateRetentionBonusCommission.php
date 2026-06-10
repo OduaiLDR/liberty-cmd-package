@@ -281,7 +281,7 @@ class GenerateRetentionBonusCommission extends Command
             $rd = $r['RETENTION_DATE'] ?? null;
             if (!$rd) continue;
             
-            $ts = is_numeric($rd) ? (int)$rd : strtotime($rd);
+            $ts = is_numeric($rd) ? (int)$rd * 86400 : strtotime($rd);
             if ($ts >= $startTs && $ts <= $endTs) {
                 $filtered[] = $r;
             }

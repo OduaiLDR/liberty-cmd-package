@@ -23,8 +23,8 @@ class GenerateCancelRequestsAgentReport extends Command
     protected $description = 'Generate Cancel Requests Agent Report for LDR and/or PLAW.';
 
     private const SOURCE_CONFIG = [
-        'ldr'  => ['display' => 'LDR',          'custom_cancel' => 742098, 'custom_agent' => 742096],
-        'plaw' => ['display' => 'Progress Law',  'custom_cancel' => 742100, 'custom_agent' => 742097],
+        'ldr'  => ['display' => 'LDR',          'custom_cancel' => 742098, 'custom_agent' => 742103],
+        'plaw' => ['display' => 'Progress Law',  'custom_cancel' => 742100, 'custom_agent' => 742104],
     ];
 
     public function handle(): int
