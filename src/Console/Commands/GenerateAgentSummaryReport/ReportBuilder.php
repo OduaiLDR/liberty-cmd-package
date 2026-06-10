@@ -30,9 +30,10 @@ class ReportBuilder
     private const ALT_ROW_BG = 'F5F7FA';
     private const BORDER_COLOR = '999999';
 
-    private const BLOCK_WIDTH = 3500;
-    private const W_AGENT = 2400;
-    private const W_VALUE = 1100;
+    private const BLOCK_WIDTH = 3300;
+    private const W_AGENT = 1900;
+    private const W_VALUE = 1400;
+    private const W_SEP = 200;
 
     public function build(
         array $agentMetrics,
@@ -158,14 +159,15 @@ class ReportBuilder
     private function buildMetricRow(Section $section, array $rows, array $configs): void
     {
         $outerStyle = [
-            'cellMargin' => 100,
+            'cellMargin' => 0,
             'alignment' => JcTable::CENTER,
         ];
 
         $outer = $section->addTable($outerStyle);
         $outer->addRow();
 
-        foreach ($configs as $config) {
+        $lastIndex = count($configs) - 1;
+        foreach ($configs as $i => $config) {
             [$title, $valueKey, $sortDir, $format, $valueHeader] = $config;
 
             $cell = $outer->addCell(self::BLOCK_WIDTH, ['valign' => 'top']);
@@ -178,6 +180,11 @@ class ReportBuilder
             );
 
             $this->buildBlockTable($cell, $rows, $valueKey, $sortDir, $format, $valueHeader);
+
+            // Empty separator cell between blocks for visual gap
+            if ($i < $lastIndex) {
+                $outer->addCell(self::W_SEP, ['valign' => 'top']);
+            }
         }
     }
 
