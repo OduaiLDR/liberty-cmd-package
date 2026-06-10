@@ -5,21 +5,38 @@ namespace Cmd\Reports\Console\Commands\GenerateAgentSummaryReport;
 use Illuminate\Support\Facades\Log;
 use PhpOffice\PhpWord\IOFactory;
 use PhpOffice\PhpWord\PhpWord;
+use PhpOffice\PhpWord\Element\Section;
+use PhpOffice\PhpWord\Element\Table;
 use PhpOffice\PhpWord\SimpleType\JcTable;
-use PhpOffice\PhpWord\Style\Language;
 use Symfony\Component\Process\Process;
 
+/**
+ * Builds the Agent Summary Report PDF.
+ *
+ * Loads the LDR-branded template (Agent Summary Report Template.docx) which provides
+ * page setup, header, footer, and watermark. The body (which is empty in the template)
+ * gets filled with the title and 3 wide multi-block tables matching the original VBA layout:
+ *
+ *   Table 1 (Production): Contacts | Deals | Conversion | Debt — 4 metric blocks side-by-side
+ *   Table 2 (Risk):       Cancels | NSFs | Cancels % | NSFs % — 4 metric blocks
+ *   Table 3 (Quality):    Avg Debt | SMP — 2 metric blocks
+ *
+ * Each block has its own sort order; row N in a block shows the Nth-ranked agent for that metric.
+ */
 class ReportBuilder
 {
-    private const TABLE_BORDER_SIZE = 6;
-    private const TABLE_BORDER_COLOR = '999999';
+    private const TEMPLATE_PATH = __DIR__ . '/../../../../resources/templates/Agent Summary Report Template.docx';
+
     private const HEADER_FILL = '17853B';
     private const HEADER_TEXT_COLOR = 'FFFFFF';
+    private const SUMMARY_FILL = 'E0E6EC';
     private const ALT_ROW_FILL = 'F5F7FA';
+    private const BORDER_COLOR = '999999';
 
-    private const COL_AGENT_WIDTH = 3000;
-    private const COL_VAR_WIDTH = 1500;
-    private const COL_VAL_WIDTH = 1800;
+    private const W_AGENT = 1500;
+    private const W_VAR = 600;
+    private const W_VALUE = 1100;
+    private const W_SEP = 300;
 
     public function build(
         array $agentMetrics,
@@ -61,176 +78,268 @@ class ReportBuilder
         string $endDate,
         bool $continuation
     ): PhpWord {
-        $phpWord = new PhpWord();
-        $phpWord->getSettings()->setThemeFontLang(new Language(Language::EN_US));
+        $templatePath = realpath(self::TEMPLATE_PATH);
+        if ($templatePath === false || !is_file($templatePath)) {
+            throw new \RuntimeException('Agent Summary Report template not found at ' . self::TEMPLATE_PATH);
+        }
 
+        $phpWord = IOFactory::load($templatePath, 'Word2007');
         $phpWord->setDefaultFontName('Calibri');
         $phpWord->setDefaultFontSize(9);
 
-        $section = $phpWord->addSection([
-            'orientation' => 'landscape',
-            'marginLeft' => 720,
-            'marginRight' => 720,
-            'marginTop' => 720,
-            'marginBottom' => 720,
-        ]);
+        $sections = $phpWord->getSections();
+        if (empty($sections)) {
+            throw new \RuntimeException('Template has no sections.');
+        }
+        $section = $sections[0];
 
+        // Title block at top of body
         $titleText = $this->buildTitle($dataSource, $endDate, $continuation, $startDate);
         $section->addText(
             $titleText,
-            ['bold' => true, 'size' => 14],
-            ['alignment' => 'center', 'spaceAfter' => 200]
+            ['bold' => true, 'size' => 14, 'name' => 'Calibri'],
+            ['alignment' => 'center', 'spaceAfter' => 100]
         );
 
         $section->addText(
             'Period: ' . date('m/d/Y', strtotime($startDate)) . ' – ' . date('m/d/Y', strtotime($endDate)),
-            ['size' => 9, 'italic' => true],
-            ['alignment' => 'center', 'spaceAfter' => 300]
+            ['size' => 9, 'italic' => true, 'name' => 'Calibri'],
+            ['alignment' => 'center', 'spaceAfter' => 200]
         );
 
-        // Table 1: Contacts | Deals | Conversion | Debt
-        $this->addSectionHeading($section, 'Production');
-        $this->addMetricSubTable($section, 'Contacts',   $rows, 'contacts',         'contacts',         'desc', 'int',     false,           $continuation);
-        $this->addMetricSubTable($section, 'Deals',      $rows, 'deals_current',    'deals_eom',        'desc', 'int',     $continuation,   $continuation);
-        $this->addMetricSubTable($section, 'Conversion', $rows, 'conversion_current','conversion_eom',  'desc', 'percent', true,            $continuation);
-        $this->addMetricSubTable($section, 'Debt',       $rows, 'debt_current',     'debt_eom',         'desc', 'money_k', true,            $continuation);
+        // Table 1: Production (Contacts | Deals | Conversion | Debt)
+        $this->buildProductionTable($section, $rows, $continuation);
 
-        $section->addPageBreak();
+        // Table 2: Risk (Cancels | NSFs | Cancels % | NSFs %)
+        $section->addTextBreak(1);
+        $this->buildRiskTable($section, $rows);
 
-        // Table 2: Cancels | NSFs | Cancels % | NSFs %
-        $this->addSectionHeading($section, 'Risk');
-        $this->addMetricSubTable($section, 'Cancels',     $rows, 'cancels_current',     'cancels_eom',     'asc',  'int',     true, $continuation);
-        $this->addMetricSubTable($section, 'NSFs',        $rows, 'nsfs_current',        'nsfs_eom',        'asc',  'int',     true, $continuation);
-        $this->addMetricSubTable($section, 'Cancels %',   $rows, 'cancels_pct_current', 'cancels_pct_eom', 'asc',  'percent', true, $continuation);
-        $this->addMetricSubTable($section, 'NSFs %',      $rows, 'nsfs_pct_current',    'nsfs_pct_eom',    'asc',  'percent', true, $continuation);
-
-        $section->addPageBreak();
-
-        // Table 3: Average Debt | SMP
-        $this->addSectionHeading($section, 'Quality');
-        $this->addMetricSubTable($section, 'Average Debt', $rows, 'avg_debt_current', 'avg_debt_eom', 'desc', 'money_k', true, $continuation);
-        $this->addMetricSubTable($section, 'SMP',          $rows, 'smp_current',      'smp_eom',      'desc', 'int',     true, $continuation);
+        // Table 3: Quality (Avg Debt | SMP)
+        $section->addTextBreak(1);
+        $this->buildQualityTable($section, $rows);
 
         return $phpWord;
     }
 
-    private function addSectionHeading($section, string $heading): void
+    private function buildProductionTable(Section $section, array $rows, bool $continuation): void
     {
-        $section->addText(
-            $heading,
-            ['bold' => true, 'size' => 12, 'color' => self::HEADER_FILL],
-            ['spaceBefore' => 200, 'spaceAfter' => 100]
-        );
+        $this->addSectionHeading($section, 'Production');
+
+        $blocks = [
+            $this->makeBlock('Contacts',   $rows, 'contacts',          'contacts',         'desc', 'int',     false),
+            $this->makeBlock('Deals',      $rows, 'deals_current',     'deals_eom',        'desc', 'int',     $continuation),
+            $this->makeBlock('Conversion', $rows, 'conversion_current', 'conversion_eom',   'desc', 'percent', true),
+            $this->makeBlock('Debt',       $rows, 'debt_current',      'debt_eom',         'desc', 'money_k', true),
+        ];
+
+        $this->renderWideTable($section, $blocks);
     }
 
-    private function addMetricSubTable(
-        $section,
-        string $metricLabel,
+    private function buildRiskTable(Section $section, array $rows): void
+    {
+        $this->addSectionHeading($section, 'Risk');
+
+        $blocks = [
+            $this->makeBlock('Cancels',   $rows, 'cancels_current',     'cancels_eom',     'asc', 'int',     true),
+            $this->makeBlock('NSFs',      $rows, 'nsfs_current',        'nsfs_eom',        'asc', 'int',     true),
+            $this->makeBlock('Cancels %', $rows, 'cancels_pct_current', 'cancels_pct_eom', 'asc', 'percent', true),
+            $this->makeBlock('NSFs %',    $rows, 'nsfs_pct_current',    'nsfs_pct_eom',    'asc', 'percent', true),
+        ];
+
+        $this->renderWideTable($section, $blocks);
+    }
+
+    private function buildQualityTable(Section $section, array $rows): void
+    {
+        $this->addSectionHeading($section, 'Quality');
+
+        $blocks = [
+            $this->makeBlock('Average Debt', $rows, 'avg_debt_current', 'avg_debt_eom', 'desc', 'money_k', true),
+            $this->makeBlock('SMP',          $rows, 'smp_current',      'smp_eom',      'desc', 'int',     true),
+        ];
+
+        $this->renderWideTable($section, $blocks);
+    }
+
+    /**
+     * Build the metadata for one metric block (header label, sorted agents, format).
+     */
+    private function makeBlock(
+        string $label,
         array $rows,
         string $currentKey,
         string $eomKey,
         string $sortDir,
         string $valueFormat,
-        bool $showVariance,
-        bool $continuation
-    ): void {
-        $section->addText(
-            $metricLabel,
-            ['bold' => true, 'size' => 10],
-            ['spaceBefore' => 150, 'spaceAfter' => 50]
-        );
+        bool $showVariance
+    ): array {
+        return [
+            'label' => $label,
+            'sorted' => $this->sortRows($rows, $currentKey, $sortDir),
+            'current_key' => $currentKey,
+            'eom_key' => $eomKey,
+            'value_format' => $valueFormat,
+            'show_variance' => $showVariance,
+        ];
+    }
 
-        $sorted = $this->sortRows($rows, $currentKey, $sortDir);
+    /**
+     * Render one wide table with N side-by-side metric blocks.
+     * Each block contributes [Agent | (Variance) | Value] columns plus a separator between blocks.
+     */
+    private function renderWideTable(Section $section, array $blocks): void
+    {
+        if (empty($blocks) || empty($blocks[0]['sorted'])) {
+            return;
+        }
+
+        $maxRows = 0;
+        foreach ($blocks as $block) {
+            $maxRows = max($maxRows, count($block['sorted']));
+        }
 
         $tableStyle = [
-            'borderSize' => self::TABLE_BORDER_SIZE,
-            'borderColor' => self::TABLE_BORDER_COLOR,
+            'borderSize' => 6,
+            'borderColor' => self::BORDER_COLOR,
             'cellMargin' => 60,
             'alignment' => JcTable::CENTER,
         ];
 
         $table = $section->addTable($tableStyle);
 
+        // ── Header row ──
+        $this->addHeaderRow($table, $blocks);
+
+        // ── Data rows ──
+        $blockTotals = array_fill(0, count($blocks), 0.0);
+        $blockCounts = array_fill(0, count($blocks), 0);
+
+        for ($i = 0; $i < $maxRows; $i++) {
+            $isEven = $i % 2 === 1;
+            $rowBg = $isEven ? ['bgColor' => self::ALT_ROW_FILL] : [];
+            $table->addRow();
+
+            foreach ($blocks as $bi => $block) {
+                $rowData = $block['sorted'][$i] ?? null;
+                $this->addBlockCells($table, $block, $rowData, $rowBg);
+
+                if ($bi < count($blocks) - 1) {
+                    $table->addCell(self::W_SEP, []);
+                }
+
+                if ($rowData !== null) {
+                    $value = $rowData[$block['current_key']] ?? 0;
+                    if (is_numeric($value)) {
+                        $blockTotals[$bi] += (float) $value;
+                        $blockCounts[$bi]++;
+                    }
+                }
+            }
+        }
+
+        // ── Total + Average rows ──
+        $this->addSummaryRow($table, $blocks, $blockTotals, $blockCounts, 'Total');
+        $this->addSummaryRow($table, $blocks, $blockTotals, $blockCounts, 'Average');
+    }
+
+    private function addHeaderRow(Table $table, array $blocks): void
+    {
         $headerCellStyle = ['bgColor' => self::HEADER_FILL];
         $headerFontStyle = ['bold' => true, 'color' => self::HEADER_TEXT_COLOR, 'size' => 9];
 
         $table->addRow();
-        $table->addCell(self::COL_AGENT_WIDTH, $headerCellStyle)->addText('Agent', $headerFontStyle);
-        if ($showVariance) {
-            $table->addCell(self::COL_VAR_WIDTH, $headerCellStyle)->addText('Variance', $headerFontStyle, ['alignment' => 'center']);
-        }
-        $table->addCell(self::COL_VAL_WIDTH, $headerCellStyle)->addText($metricLabel, $headerFontStyle, ['alignment' => 'center']);
-
-        $rowIndex = 0;
-        $totalCurrent = 0;
-        $totalCount = 0;
-        foreach ($sorted as $row) {
-            $rowIndex++;
-            $isEven = $rowIndex % 2 === 0;
-            $cellStyle = $isEven ? ['bgColor' => self::ALT_ROW_FILL] : [];
-
-            $current = $row[$currentKey] ?? 0;
-            $eom = $row[$eomKey] ?? 0;
-            $variance = $this->computeVariance($current, $eom, $valueFormat);
-
-            $table->addRow();
-            $table->addCell(self::COL_AGENT_WIDTH, $cellStyle)->addText((string) ($row['agent'] ?? ''), ['size' => 9]);
-            if ($showVariance) {
-                $table->addCell(self::COL_VAR_WIDTH, $cellStyle)->addText(
-                    $this->formatVariance($variance, $valueFormat),
-                    ['size' => 9],
-                    ['alignment' => 'right']
-                );
+        foreach ($blocks as $bi => $block) {
+            $table->addCell(self::W_AGENT, $headerCellStyle)->addText('Agent', $headerFontStyle);
+            if ($block['show_variance']) {
+                $table->addCell(self::W_VAR, $headerCellStyle)
+                    ->addText('Var', $headerFontStyle, ['alignment' => 'center']);
+            } else {
+                $table->addCell(self::W_VAR, $headerCellStyle);
             }
-            $table->addCell(self::COL_VAL_WIDTH, $cellStyle)->addText(
-                $this->formatValue($current, $valueFormat),
-                ['size' => 9],
-                ['alignment' => 'right']
-            );
+            $table->addCell(self::W_VALUE, $headerCellStyle)
+                ->addText($block['label'], $headerFontStyle, ['alignment' => 'center']);
 
-            $totalCurrent += is_numeric($current) ? (float) $current : 0;
-            $totalCount++;
-        }
-
-        // Total + Average summary rows
-        if ($totalCount > 0 && $this->shouldShowTotalAverage($valueFormat)) {
-            $summaryCellStyle = ['bgColor' => 'E0E6EC'];
-            $summaryFontStyle = ['bold' => true, 'size' => 9];
-
-            if ($this->shouldShowTotal($valueFormat)) {
-                $table->addRow();
-                $table->addCell(self::COL_AGENT_WIDTH, $summaryCellStyle)->addText('Total', $summaryFontStyle);
-                if ($showVariance) {
-                    $table->addCell(self::COL_VAR_WIDTH, $summaryCellStyle)->addText('');
-                }
-                $table->addCell(self::COL_VAL_WIDTH, $summaryCellStyle)->addText(
-                    $this->formatValue($totalCurrent, $valueFormat),
-                    $summaryFontStyle,
-                    ['alignment' => 'right']
-                );
+            if ($bi < count($blocks) - 1) {
+                $table->addCell(self::W_SEP, $headerCellStyle);
             }
-
-            $table->addRow();
-            $table->addCell(self::COL_AGENT_WIDTH, $summaryCellStyle)->addText('Average', $summaryFontStyle);
-            if ($showVariance) {
-                $table->addCell(self::COL_VAR_WIDTH, $summaryCellStyle)->addText('');
-            }
-            $table->addCell(self::COL_VAL_WIDTH, $summaryCellStyle)->addText(
-                $this->formatValue($totalCurrent / $totalCount, $valueFormat),
-                $summaryFontStyle,
-                ['alignment' => 'right']
-            );
         }
     }
 
-    private function shouldShowTotal(string $format): bool
+    private function addBlockCells(Table $table, array $block, ?array $rowData, array $rowBg): void
     {
-        return in_array($format, ['int', 'money_k'], true);
+        if ($rowData === null) {
+            $table->addCell(self::W_AGENT, $rowBg);
+            $table->addCell(self::W_VAR, $rowBg);
+            $table->addCell(self::W_VALUE, $rowBg);
+            return;
+        }
+
+        $current = $rowData[$block['current_key']] ?? 0;
+        $eom = $rowData[$block['eom_key']] ?? 0;
+
+        $table->addCell(self::W_AGENT, $rowBg)
+            ->addText((string) ($rowData['agent'] ?? ''), ['size' => 8]);
+
+        if ($block['show_variance']) {
+            $variance = $this->computeVariance($current, $eom, $block['value_format']);
+            $table->addCell(self::W_VAR, $rowBg)
+                ->addText(
+                    $this->formatVariance($variance, $block['value_format']),
+                    ['size' => 8],
+                    ['alignment' => 'right']
+                );
+        } else {
+            $table->addCell(self::W_VAR, $rowBg);
+        }
+
+        $table->addCell(self::W_VALUE, $rowBg)
+            ->addText(
+                $this->formatValue($current, $block['value_format']),
+                ['size' => 8],
+                ['alignment' => 'right']
+            );
     }
 
-    private function shouldShowTotalAverage(string $format): bool
+    private function addSummaryRow(
+        Table $table,
+        array $blocks,
+        array $totals,
+        array $counts,
+        string $label
+    ): void {
+        $bg = ['bgColor' => self::SUMMARY_FILL];
+        $fontStyle = ['bold' => true, 'size' => 8];
+
+        $table->addRow();
+        foreach ($blocks as $bi => $block) {
+            $table->addCell(self::W_AGENT, $bg)->addText($label, $fontStyle);
+            $table->addCell(self::W_VAR, $bg);
+
+            $format = $block['value_format'];
+            $showThisRow = $label === 'Average' || in_array($format, ['int', 'money_k'], true);
+            $shouldDisplay = $showThisRow && $counts[$bi] > 0;
+
+            if ($shouldDisplay) {
+                $value = $label === 'Total' ? $totals[$bi] : ($totals[$bi] / $counts[$bi]);
+                $table->addCell(self::W_VALUE, $bg)
+                    ->addText($this->formatValue($value, $format), $fontStyle, ['alignment' => 'right']);
+            } else {
+                $table->addCell(self::W_VALUE, $bg);
+            }
+
+            if ($bi < count($blocks) - 1) {
+                $table->addCell(self::W_SEP, $bg);
+            }
+        }
+    }
+
+    private function addSectionHeading(Section $section, string $heading): void
     {
-        return true;
+        $section->addText(
+            $heading,
+            ['bold' => true, 'size' => 12, 'color' => self::HEADER_FILL, 'name' => 'Calibri'],
+            ['spaceBefore' => 150, 'spaceAfter' => 60]
+        );
     }
 
     private function sortRows(array $rows, string $key, string $dir): array
@@ -266,18 +375,12 @@ class ReportBuilder
         if (abs($variance) < 1e-9) {
             return '';
         }
-
         $sign = $variance > 0 ? '+' : '-';
-        $abs = abs($variance);
-
-        return $sign . $this->formatAbsValue($abs, $format);
+        return $sign . $this->formatAbsValue(abs($variance), $format);
     }
 
     private function formatValue($value, string $format): string
     {
-        if ($value === null || $value === '') {
-            $value = 0;
-        }
         $num = is_numeric($value) ? (float) $value : 0;
         return $this->formatAbsValue($num, $format);
     }
@@ -320,8 +423,10 @@ class ReportBuilder
         $process = new Process([
             $binary,
             '--headless',
-            '--convert-to', 'pdf',
-            '--outdir', $outputDir,
+            '--convert-to',
+            'pdf',
+            '--outdir',
+            $outputDir,
             $docxPath,
         ]);
         $process->setTimeout(180);
