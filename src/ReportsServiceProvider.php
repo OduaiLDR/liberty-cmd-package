@@ -28,6 +28,10 @@ use Cmd\Reports\Console\Commands\GenerateScrubListReport\GenerateScrubListReport
 use Cmd\Reports\Console\Commands\GenerateLookbackSummaryReport\GenerateLookbackSummaryReport;
 use Cmd\Reports\Console\Commands\GenerateReportSummary\GenerateReportSummary;
 use Cmd\Reports\Console\Commands\GenerateSyncSummary\GenerateSyncSummary;
+use Cmd\Reports\Console\Commands\GenerateRetentionCommissionReport\GenerateRetentionCommissionReport;
+use Cmd\Reports\Console\Commands\GenerateRetentionCommissionSummary\GenerateRetentionCommissionSummary;
+use Cmd\Reports\Console\Commands\GenerateCancelRequestsAgentReport\GenerateCancelRequestsAgentReport;
+use Cmd\Reports\Console\Commands\GenerateRetentionBonusCommission\GenerateRetentionBonusCommission;
 use Cmd\Reports\Console\Commands\SyncContactsData;
 use Cmd\Reports\Console\Commands\SyncCollectionCompanies;
 use Cmd\Reports\Console\Commands\SyncLastDepositDate;
@@ -113,6 +117,10 @@ class ReportsServiceProvider extends ServiceProvider
                 GenerateLookbackSummaryReport::class,
                 GenerateReportSummary::class,
                 GenerateSyncSummary::class,
+                GenerateRetentionCommissionReport::class,
+                GenerateRetentionCommissionSummary::class,
+                GenerateCancelRequestsAgentReport::class,
+                GenerateRetentionBonusCommission::class,
                 SyncContactsData::class,
                 SyncCollectionCompanies::class,
                 SyncLastDepositDate::class,
