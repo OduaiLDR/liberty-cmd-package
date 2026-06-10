@@ -1,0 +1,276 @@
+<?php
+
+namespace Cmd\Reports\Console\Commands\GenerateScrubListReportLDR;
+
+use Cmd\Reports\Services\DBConnector;
+use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Log;
+
+/**
+ * Port of VBA GenerateScrubListReport for the LDR Snowflake source.
+ * That instance holds two companies, split by enrollment-plan title:
+ *   - LDR        => ed.TITLE NOT LIKE 'PLAW%'
+ *   - Paramount  => ed.TITLE LIKE 'PLAW%'
+ * Builds and emails one report per company. Negotiator column dropped
+ * (data not accurate). Recipients come from dbo.TblReports by Company.
+ */
+class GenerateScrubListReportLDR extends Command
+{
+    protected $signature = 'Generate:scrub-list-report-ldr';
+
+    protected $description = 'Generate the LDR + Paramount Law Scrub List reports from Snowflake and email them.';
+
+    private const SOURCE_ENV = 'ldr';
+
+    /** @var array<int, array{category:string, company:string, filter:string}> */
+    private const REPORTS = [
+        ['category' => 'LDR',           'company' => 'LDR',       'filter' => "AND ed.TITLE NOT LIKE 'PLAW%'"],
+        ['category' => 'Paramount Law', 'company' => 'Paramount', 'filter' => "AND ed.TITLE LIKE 'PLAW%'"],
+    ];
+
+    public function handle(): int
+    {
+        $this->info('[INFO] LDR/Paramount Scrub List report: starting.');
+
+        try {
+            $snowflake = DBConnector::fromEnvironment(self::SOURCE_ENV);
+        } catch (\Throwable $e) {
+            $this->error('Failed to initialize LDR Snowflake connector: ' . $e->getMessage());
+            Log::error('GenerateScrubListReportLDR: Snowflake init failed', ['exception' => $e]);
+            return Command::FAILURE;
+        }
+
+        try {
+            $sqlConnector = $this->initializeSqlServerConnector();
+        } catch (\Throwable $e) {
+            $this->error('Failed to initialize SQL Server connector: ' . $e->getMessage());
+            Log::error('GenerateScrubListReportLDR: SQL Server init failed', ['exception' => $e]);
+            return Command::FAILURE;
+        }
+
+        foreach (self::REPORTS as $def) {
+            try {
+                $this->generateOne($snowflake, $sqlConnector, $def);
+            } catch (\Throwable $e) {
+                $this->error("{$def['category']} Scrub List Report failed: " . $e->getMessage());
+                Log::error('GenerateScrubListReportLDR: report failed', [
+                    'category' => $def['category'],
+                    'exception' => $e,
+                ]);
+                // Continue to the next company rather than aborting the whole run.
+            }
+        }
+
+        return Command::SUCCESS;
+    }
+
+    /**
+     * @param  array{category:string, company:string, filter:string}  $def
+     */
+    private function generateOne(DBConnector $snowflake, DBConnector $sqlConnector, array $def): void
+    {
+        $this->info("[INFO] Generating {$def['category']} Scrub List Report...");
+
+        $rows = $this->buildRows($snowflake, $def['filter']);
+        $this->info("[INFO] {$def['category']} filtered rows: " . count($rows));
+
+        if (empty($rows)) {
+            $this->warn("[WARN] No {$def['category']} Scrub List rows. Skipping.");
+            return;
+        }
+
+        $coAppRows = $this->fetchCoApplicants($snowflake);
+        $this->info("[INFO] {$def['category']} co-applicant rows: " . count($coAppRows));
+
+        $formatter = new Formatter();
+        $report = $formatter->buildWorkbook($rows, $coAppRows, $def['category']);
+
+        if ($report === null) {
+            $this->warn("[WARN] {$def['category']} report file was not created.");
+            return;
+        }
+
+        $this->info("[INFO] Report written to {$report['path']}");
+        $formatter->sendReport($sqlConnector, $report['path'], $report['filename'], $def['category'], $def['company'], $this);
+
+        if (is_file($report['path'])) {
+            @unlink($report['path']);
+        }
+    }
+
+    /**
+     * Main applicant query + balance/debt/transaction enrichment + VBA drop filter
+     * (drop when balance/debt ratio < 0.15 OR projected balance < 0).
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    private function buildRows(DBConnector $snowflake, string $titleFilter): array
+    {
+        // Negotiator dropped (data not accurate). Plan-title filter injected per company.
+        $sql = "
+            SELECT
+                ID,
+                First_Name,
+                Last_Name,
+                SSN,
+                TO_VARCHAR(DOB, 'MM/DD/YYYY') AS DOB
+            FROM (
+                SELECT
+                    c.ID,
+                    c.FIRSTNAME AS First_Name,
+                    c.LASTNAME AS Last_Name,
+                    c.SSN,
+                    c.DOB,
+                    ROW_NUMBER() OVER (PARTITION BY c.ID ORDER BY c.ID ASC) AS n
+                FROM CONTACTS AS c
+                LEFT JOIN ENROLLMENT_PLAN AS ep ON c.ID = ep.CONTACT_ID
+                LEFT JOIN ENROLLMENT_DEFAULTS2 AS ed ON ep.PLAN_ID = ed.ID
+                WHERE c.ENROLLED = 1
+                  AND c.GRADUATED = 0
+                  {$titleFilter}
+            )
+            WHERE n = 1
+        ";
+
+        $result = $snowflake->query($sql);
+        $rows = $result['data'] ?? [];
+
+        if (empty($rows)) {
+            return [];
+        }
+
+        // VBA sorts column A (ID) ascending after building the sheet.
+        usort($rows, static fn ($a, $b) => ((int) ($a['ID'] ?? 0)) <=> ((int) ($b['ID'] ?? 0)));
+
+        $contactIds = array_values(array_filter(array_map(
+            static fn ($r) => $r['ID'] ?? null,
+            $rows
+        ), static fn ($v) => $v !== null && $v !== ''));
+
+        if (empty($contactIds)) {
+            return [];
+        }
+
+        $idList = implode(',', array_map(static fn ($id) => (int) $id, $contactIds));
+
+        // Most recent balance per contact (VBA VLOOKUP after ORDER BY STAMP DESC = first = newest).
+        $balanceData = [];
+        $balanceSql = "
+            SELECT CONTACT_ID, \"CURRENT\"
+            FROM CONTACT_BALANCES
+            WHERE STAMP > '" . date('Y-m-d', strtotime('-14 days')) . "'
+              AND CONTACT_ID IN ({$idList})
+            ORDER BY STAMP DESC
+        ";
+        foreach ($snowflake->query($balanceSql)['data'] ?? [] as $r) {
+            $cid = $r['CONTACT_ID'];
+            if (!isset($balanceData[$cid])) {
+                $balanceData[$cid] = (float) $r['CURRENT'];
+            }
+        }
+
+        // Enrolled, unsettled debt total per contact.
+        $debtData = [];
+        $debtSql = "
+            SELECT CONTACT_ID, SUM(ORIGINAL_DEBT_AMOUNT) AS TOTAL_DEBT
+            FROM DEBTS
+            WHERE ENROLLED = 1
+              AND SETTLED = 0
+              AND CONTACT_ID IN ({$idList})
+            GROUP BY CONTACT_ID
+        ";
+        foreach ($snowflake->query($debtSql)['data'] ?? [] as $r) {
+            $debtData[$r['CONTACT_ID']] = (float) $r['TOTAL_DEBT'];
+        }
+
+        // Pending transactions in the window: deposits (D) minus everything else.
+        $txData = [];
+        $txSql = "
+            SELECT CONTACT_ID, TRANS_TYPE, AMOUNT
+            FROM TRANSACTIONS
+            WHERE ACTIVE = 1
+              AND CANCELLED = 0
+              AND CLEARED_DATE IS NULL
+              AND RETURNED_DATE IS NULL
+              AND PROCESS_DATE > '" . date('Y-m-d', strtotime('-1 day')) . "'
+              AND PROCESS_DATE <= '" . date('Y-m-d', strtotime('+90 days')) . "'
+              AND CONTACT_ID IN ({$idList})
+        ";
+        foreach ($snowflake->query($txSql)['data'] ?? [] as $r) {
+            $cid = $r['CONTACT_ID'];
+            if (!isset($txData[$cid])) {
+                $txData[$cid] = ['deposits' => 0.0, 'withdrawals' => 0.0];
+            }
+            if (($r['TRANS_TYPE'] ?? '') === 'D') {
+                $txData[$cid]['deposits'] += (float) $r['AMOUNT'];
+            } else {
+                $txData[$cid]['withdrawals'] += (float) $r['AMOUNT'];
+            }
+        }
+
+        // VBA: clear row if M (balance/debt) < 0.15 OR P (projected balance) < 0.
+        $kept = [];
+        foreach ($rows as $row) {
+            $cid = $row['ID'];
+            $balance = $balanceData[$cid] ?? 0.0;
+            $debt = $debtData[$cid] ?? 0.0;
+            $ratio = $debt > 0 ? $balance / $debt : 0.0;
+            $deposits = $txData[$cid]['deposits'] ?? 0.0;
+            $withdrawals = $txData[$cid]['withdrawals'] ?? 0.0;
+            $projected = $balance + $deposits - $withdrawals;
+
+            if ($ratio >= 0.15 && $projected >= 0) {
+                $kept[] = $row;
+            }
+        }
+
+        return $kept;
+    }
+
+    /**
+     * Co-applicant rows (CONTACTS_USERFIELDS CUSTOM_ID 286824), keyed later by CONTACT_ID.
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    private function fetchCoApplicants(DBConnector $snowflake): array
+    {
+        $sql = "
+            SELECT
+                cu.CONTACT_ID,
+                c.ID,
+                c.FIRSTNAME,
+                c.LASTNAME,
+                c.SSN,
+                TO_VARCHAR(c.DOB, 'MM/DD/YYYY') AS DOB
+            FROM CONTACTS AS c
+            LEFT JOIN CONTACTS_USERFIELDS AS cu ON cu.F_INT = c.ID
+            WHERE cu.CUSTOM_ID = 286824
+              AND COALESCE(c.FIRSTNAME, '') <> ''
+        ";
+
+        return $snowflake->query($sql)['data'] ?? [];
+    }
+
+    /**
+     * SQL Server connector for reading recipients from dbo.TblReports.
+     * DBConnector's constructor needs Snowflake creds, so build from an available
+     * env then attach the SQL Server connection (only querySqlServer() is used here).
+     */
+    protected function initializeSqlServerConnector(): DBConnector
+    {
+        $candidates = ['ldr', 'plaw', 'production', 'sandbox'];
+        $errors = [];
+
+        foreach ($candidates as $env) {
+            try {
+                $connector = DBConnector::fromEnvironment($env);
+                $connector->initializeSqlServer();
+                return $connector;
+            } catch (\Throwable $e) {
+                $errors[] = "{$env}: {$e->getMessage()}";
+            }
+        }
+
+        throw new \RuntimeException('Unable to initialize SQL Server connector. Tried: ' . implode('; ', $errors));
+    }
+}

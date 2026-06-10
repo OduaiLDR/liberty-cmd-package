@@ -30,14 +30,13 @@ final class ForwardPmodToCmdRunnerJob implements ShouldQueue
         public readonly string $idempotencyKey,
         public readonly string $baseUrl,
         public readonly string $token,
+        public readonly string $path = '/api/payment-adjustments/webhook',
+        public readonly int $timeout = 30,
     ) {
     }
 
     public function handle(): void
     {
-        $path = '/api/payment-adjustments/webhook';
-        $timeout = 30;
-
         if (empty($this->baseUrl) || empty($this->token)) {
             Log::channel($this->logChannel())->error('CMD Runner not configured', [
                 'idempotency_key' => $this->idempotencyKey,
@@ -47,10 +46,10 @@ final class ForwardPmodToCmdRunnerJob implements ShouldQueue
             throw new \RuntimeException('CMD Runner is not configured. Check base_url and token.');
         }
 
-        $url = rtrim($this->baseUrl, '/') . $path;
+        $url = rtrim($this->baseUrl, '/') . $this->path;
 
         $response = Http::withToken($this->token)
-            ->timeout($timeout)
+            ->timeout($this->timeout)
             ->retry(3, function (int $attempt, Throwable $exception) {
                 $delay = $attempt === 1 ? 500 : 1000;
 

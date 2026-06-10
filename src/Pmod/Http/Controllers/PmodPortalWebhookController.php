@@ -40,6 +40,7 @@ final class PmodPortalWebhookController extends Controller
             ...$normalizedPayload,
             'tenant_id' => $tenantId,
             'idempotency_key' => $idempotencyKey,
+            'dry_run' => !((bool) config('services.pmod.live_draft_updates', false)),
         ];
 
         ForwardPmodToCmdRunnerJob::dispatch(
