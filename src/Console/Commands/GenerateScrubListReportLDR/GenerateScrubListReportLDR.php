@@ -16,7 +16,8 @@ use Illuminate\Support\Facades\Log;
  */
 class GenerateScrubListReportLDR extends Command
 {
-    protected $signature = 'Generate:scrub-list-report-ldr';
+    protected $signature = 'Generate:scrub-list-report-ldr
+        {--force-id= : Comma-separated CONTACT_IDs to force onto both reports (co-app testing; bypasses the enrolled/ratio/plan filters)}';
 
     protected $description = 'Generate the LDR + Paramount Law Scrub List reports from Snowflake and email them.';
 
@@ -48,9 +49,14 @@ class GenerateScrubListReportLDR extends Command
             return Command::FAILURE;
         }
 
+        $forceIds = $this->parseForceIds();
+        if (!empty($forceIds)) {
+            $this->warn('[FORCE] Forcing client IDs onto both reports (filters bypassed): ' . implode(', ', $forceIds));
+        }
+
         foreach (self::REPORTS as $def) {
             try {
-                $this->generateOne($snowflake, $sqlConnector, $def);
+                $this->generateOne($snowflake, $sqlConnector, $def, $forceIds);
             } catch (\Throwable $e) {
                 $this->error("{$def['category']} Scrub List Report failed: " . $e->getMessage());
                 Log::error('GenerateScrubListReportLDR: report failed', [
@@ -66,12 +72,13 @@ class GenerateScrubListReportLDR extends Command
 
     /**
      * @param  array{category:string, company:string, filter:string}  $def
+     * @param  array<int, string>  $forceIds
      */
-    private function generateOne(DBConnector $snowflake, DBConnector $sqlConnector, array $def): void
+    private function generateOne(DBConnector $snowflake, DBConnector $sqlConnector, array $def, array $forceIds = []): void
     {
         $this->info("[INFO] Generating {$def['category']} Scrub List Report...");
 
-        $rows = $this->buildRows($snowflake, $def['filter']);
+        $rows = $this->buildRows($snowflake, $def['filter'], $forceIds);
         $this->info("[INFO] {$def['category']} filtered rows: " . count($rows));
 
         if (empty($rows)) {
@@ -104,7 +111,7 @@ class GenerateScrubListReportLDR extends Command
      *
      * @return array<int, array<string, mixed>>
      */
-    private function buildRows(DBConnector $snowflake, string $titleFilter): array
+    private function buildRows(DBConnector $snowflake, string $titleFilter, array $forceIds = []): array
     {
         // Negotiator dropped (data not accurate). Plan-title filter injected per company.
         $sql = "
@@ -134,6 +141,12 @@ class GenerateScrubListReportLDR extends Command
 
         $result = $snowflake->query($sql);
         $rows = $result['data'] ?? [];
+
+        // Force-include specific clients (co-app testing): fetch them directly,
+        // bypassing the enrolled/graduated/plan filter, and merge if not present.
+        if (!empty($forceIds)) {
+            $rows = $this->mergeForcedRows($snowflake, $rows, $forceIds);
+        }
 
         if (empty($rows)) {
             return [];
@@ -209,6 +222,8 @@ class GenerateScrubListReportLDR extends Command
         }
 
         // VBA: clear row if M (balance/debt) < 0.15 OR P (projected balance) < 0.
+        // Forced IDs are always kept (co-app testing).
+        $forceSet = array_flip(array_map('strval', $forceIds));
         $kept = [];
         foreach ($rows as $row) {
             $cid = $row['ID'];
@@ -219,12 +234,72 @@ class GenerateScrubListReportLDR extends Command
             $withdrawals = $txData[$cid]['withdrawals'] ?? 0.0;
             $projected = $balance + $deposits - $withdrawals;
 
-            if ($ratio >= 0.15 && $projected >= 0) {
+            if (isset($forceSet[(string) $cid]) || ($ratio >= 0.15 && $projected >= 0)) {
                 $kept[] = $row;
             }
         }
 
         return $kept;
+    }
+
+    /**
+     * Fetch the forced client IDs directly (no enrolled/graduated/plan filter) and append
+     * any not already in $rows. Used only for co-app verification via --force-id.
+     *
+     * @param  array<int, array<string, mixed>>  $rows
+     * @param  array<int, string>  $forceIds
+     * @return array<int, array<string, mixed>>
+     */
+    private function mergeForcedRows(DBConnector $snowflake, array $rows, array $forceIds): array
+    {
+        $idList = implode(',', array_map(static fn ($id) => (int) $id, $forceIds));
+        if ($idList === '') {
+            return $rows;
+        }
+
+        $sql = "
+            SELECT ID, First_Name, Last_Name, SSN, TO_VARCHAR(DOB, 'MM/DD/YYYY') AS DOB
+            FROM (
+                SELECT
+                    c.ID,
+                    c.FIRSTNAME AS First_Name,
+                    c.LASTNAME AS Last_Name,
+                    c.SSN,
+                    c.DOB,
+                    ROW_NUMBER() OVER (PARTITION BY c.ID ORDER BY c.ID ASC) AS n
+                FROM CONTACTS AS c
+                WHERE c.ID IN ({$idList})
+            )
+            WHERE n = 1
+        ";
+
+        $forced = $snowflake->query($sql)['data'] ?? [];
+        $existing = array_flip(array_map(static fn ($r) => (string) ($r['ID'] ?? ''), $rows));
+
+        foreach ($forced as $fr) {
+            $fid = (string) ($fr['ID'] ?? '');
+            if ($fid !== '' && !isset($existing[$fid])) {
+                $rows[] = $fr;
+            }
+        }
+
+        return $rows;
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    private function parseForceIds(): array
+    {
+        $raw = (string) $this->option('force-id');
+        if (trim($raw) === '') {
+            return [];
+        }
+
+        return array_values(array_filter(
+            array_map('trim', explode(',', $raw)),
+            static fn ($v) => $v !== ''
+        ));
     }
 
     /**
