@@ -113,14 +113,21 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway
 
     public function getContactTransactions(PmodWorkItem $workItem): array
     {
-        Log::info('PMOD: Fetching contact transactions', [
+        Log::info('PMOD: Fetching contact transactions via ForthPay reports', [
             'contact_id' => $workItem->contactId,
             'tenant_id' => $workItem->tenantId,
             'idempotency_key' => $workItem->idempotencyKey,
         ]);
 
-        $response = $this->crmClient($workItem->tenantId)
-            ->get("/contacts/{$workItem->contactId}/transactions");
+        // ForthPay /reports/transactions returns ALL records; the Forth CRM
+        // /contacts/{id}/transactions endpoint is capped at 100 with no
+        // pagination (confirmed with Forth team), so we use the reports endpoint.
+        $response = $this->payClient($workItem->tenantId)
+            ->post('/reports/transactions', [
+                'client_id' => ['values' => [[$workItem->contactId]]],
+                '_offset' => null,
+                '_limit' => 5000,
+            ]);
 
         if (!$response->successful()) {
             Log::error('PMOD: Failed to fetch contact transactions', [
@@ -133,29 +140,61 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway
             return [];
         }
 
-        $grouped = $response->json('response.results') ?? [];
+        $items = $response->json('response') ?? [];
 
-        // Flatten grouped transactions (keyed by type: D, DPG, SF, PF, C).
-        // For draft (D) transactions, alias transaction_id → draft_id since
-        // Forth CRM's transaction_id IS the Forth Pay draft identifier.
+        // Map ForthPay reports shape to the structure all action handlers
+        // and PmodTransactionMatcher expect. Critical conversions:
+        //  - transaction_type "Draft" -> type "D" (filters check uppercase 'D')
+        //  - active bool -> "1"/"0" string (creditor actions strict-compare === '1')
+        //  - transaction_status "Cancel" -> cancelled true (filters use empty())
+        //  - id -> draft_id (for D-type, used by extractAuthoritativeDraftId)
+        $typeMap = [
+            'Draft'            => 'D',
+            'DPG Fee'          => 'DPG',
+            'ACH Credit Fee'   => 'C',
+            'Disbursement Fee' => 'DF',
+            'Settlement'       => 'SF',
+            'Performance Fee'  => 'PF',
+        ];
+
         $transactions = [];
-        foreach ($grouped as $type => $items) {
-            if (is_array($items)) {
-                foreach ($items as $tx) {
-                    if (is_array($tx)) {
-                        if ($type === 'D' && isset($tx['transaction_id']) && !isset($tx['draft_id'])) {
-                            $tx['draft_id'] = $tx['transaction_id'];
-                        }
-                        $transactions[] = $tx;
-                    }
-                }
+        foreach ($items as $tx) {
+            if (!is_array($tx)) {
+                continue;
             }
+
+            $shortType = $typeMap[$tx['transaction_type'] ?? ''] ?? '?';
+            $isActive = (bool) ($tx['active'] ?? false);
+            $status = $tx['transaction_status'] ?? null;
+
+            $mapped = [
+                'transaction_id'   => isset($tx['id']) ? (string) $tx['id'] : null,
+                'type'             => $shortType,
+                'transaction_type' => $tx['transaction_type'] ?? null,
+                'process_date'     => $tx['process_date'] ?? null,
+                'amount'           => $tx['amount'] ?? null,
+                'memo'             => $tx['memo'] ?? null,
+                'active'           => $isActive ? '1' : '0',
+                'cancelled'        => $status === 'Cancel',
+                'completed'        => (bool) ($tx['completed'] ?? false),
+                'status_label'     => $status,
+                'client_id'        => $tx['client_id'] ?? null,
+                'linked_to'        => $tx['linked_to'] ?? null,
+                'sub_type'         => $tx['sub_type'] ?? null,
+                'cleared_date'     => $tx['cleared_date'] ?? null,
+                'returned_date'    => $tx['returned_date'] ?? null,
+            ];
+
+            if ($shortType === 'D' && $mapped['transaction_id'] !== null) {
+                $mapped['draft_id'] = $mapped['transaction_id'];
+            }
+
+            $transactions[] = $mapped;
         }
 
         Log::info('PMOD: Contact transactions fetched', [
             'contact_id' => $workItem->contactId,
             'transaction_count' => count($transactions),
-            'types' => array_keys($grouped),
         ]);
 
         return $transactions;
