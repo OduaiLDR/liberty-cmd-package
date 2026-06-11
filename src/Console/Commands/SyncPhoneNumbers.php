@@ -82,13 +82,13 @@ class SyncPhoneNumbers extends Command
     private function fetchPhonesFromSnowflake(DBConnector $snowflake): array
     {
         $sql = "
-            SELECT PHONE AS PHONE FROM CONTACTS WHERE PHONE IS NOT NULL
+            SELECT ID, PHONE AS PHONE FROM CONTACTS WHERE PHONE IS NOT NULL
             UNION ALL
-            SELECT PHONE2 FROM CONTACTS WHERE PHONE2 IS NOT NULL
+            SELECT ID, PHONE2 AS PHONE FROM CONTACTS WHERE PHONE2 IS NOT NULL
             UNION ALL
-            SELECT PHONE3 FROM CONTACTS WHERE PHONE3 IS NOT NULL
+            SELECT ID, PHONE3 AS PHONE FROM CONTACTS WHERE PHONE3 IS NOT NULL
             UNION ALL
-            SELECT PHONE4 FROM CONTACTS WHERE PHONE4 IS NOT NULL
+            SELECT ID, PHONE4 AS PHONE FROM CONTACTS WHERE PHONE4 IS NOT NULL
         ";
 
         $result = $snowflake->query($sql);
@@ -104,7 +104,10 @@ class SyncPhoneNumbers extends Command
             if ($digits === '') {
                 continue;
             }
-            $normalized[] = str_pad($digits, 10, '0', STR_PAD_LEFT);
+            $normalized[] = [
+                'phone' => str_pad($digits, 10, '0', STR_PAD_LEFT),
+                'cid'   => isset($row['ID']) ? (int) $row['ID'] : null,
+            ];
         }
         return $normalized;
     }
@@ -125,16 +128,17 @@ class SyncPhoneNumbers extends Command
 
         foreach ($chunks as $index => $chunk) {
             $values = [];
-            foreach ($chunk as $phone) {
-                $phoneEsc = $this->esc($phone);
-                $values[] = "('{$phoneEsc}', '{$sourceEsc}')";
+            foreach ($chunk as $item) {
+                $phoneEsc = $this->esc($item['phone']);
+                $cid = $item['cid'] !== null ? (int) $item['cid'] : 'NULL';
+                $values[] = "('{$phoneEsc}', '{$sourceEsc}', {$cid})";
             }
 
             if (empty($values)) {
                 continue;
             }
 
-            $sql = 'INSERT INTO TblPhoneNumbers (Phone, Source) VALUES ' . implode(', ', $values);
+            $sql = 'INSERT INTO TblPhoneNumbers (Phone, Source, CID) VALUES ' . implode(', ', $values);
             $result = $connector->querySqlServer($sql);
             $affected = $this->extractAffected($result);
             $inserted = $affected > 0 ? $affected : count($chunk);
