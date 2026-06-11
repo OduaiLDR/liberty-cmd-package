@@ -198,8 +198,13 @@ class GenerateRetentionBonusCommission extends Command
             unset($row);
 
             // Build and send workbook
+            $agentNames  = array_values(array_unique(array_filter(
+                array_map(fn ($r) => (string) ($r['RETENTION_AGENT'] ?? ''), $rows)
+            )));
+            $locationMap = $this->fetchLocationMap($sql, $agentNames);
+
             $formatter = new BonusFormatter();
-            $file = $formatter->buildWorkbook($rows, $display, $startDate, $endDate);
+            $file = $formatter->buildWorkbook($rows, $display, $startDate, $endDate, $locationMap);
 
             if ($file) {
                 $this->info("[INFO] [$display] Workbook: {$file['filename']}");
@@ -352,6 +357,23 @@ class GenerateRetentionBonusCommission extends Command
             // VBA SendTo: jacob@, rama@ → use fallback until TblReports populated
             $email->sendMailHtml($subject, $body, ['oduai@libertydebtrelief.com'], [], [], [$att]);
         }
+    }
+
+    private function fetchLocationMap(DBConnector $sql, array $agents): array
+    {
+        if (empty($agents)) {
+            return [];
+        }
+        $list = implode(',', array_map(fn ($a) => "'" . str_replace("'", "''", $a) . "'", $agents));
+        $res  = $sql->querySqlServer(
+            "SELECT Employee_Name, Location FROM TblEmployees WHERE Employee_Name IN ($list)"
+        );
+        $map = [];
+        foreach ($res['data'] ?? [] as $row) {
+            $name       = strtoupper((string) ($row['Employee_Name'] ?? $row['employee_name'] ?? ''));
+            $map[$name] = (string) ($row['Location'] ?? $row['location'] ?? '');
+        }
+        return $map;
     }
 
     private function initSqlServer(string $source): DBConnector
