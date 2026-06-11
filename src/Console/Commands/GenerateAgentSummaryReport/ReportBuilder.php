@@ -300,7 +300,7 @@ class ReportBuilder
             case 'percent':
                 return number_format($num * 100, 2) . '%';
             case 'money_k':
-                return '$' . number_format($num / 1000) . 'k';
+                return number_format($num / 1000) . 'k';
             case 'int':
             default:
                 return number_format($num);
