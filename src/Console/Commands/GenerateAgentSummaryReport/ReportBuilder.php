@@ -426,7 +426,7 @@ class ReportBuilder
         foreach (['libreoffice', 'soffice'] as $bin) {
             $which = trim((string) @shell_exec("command -v {$bin} 2>/dev/null"));
             if ($which !== '') {
-                return $bin;
+                return $bin; 
             }
         }
         return 'libreoffice';
