@@ -32,6 +32,7 @@ use Cmd\Reports\Console\Commands\GenerateDroppedReport\GenerateDroppedReport;
 use Cmd\Reports\Console\Commands\GenerateScrubListReport\GenerateScrubListReport;
 use Cmd\Reports\Console\Commands\GenerateScrubListReportPLAW\GenerateScrubListReportPLAW;
 use Cmd\Reports\Console\Commands\GenerateScrubListReportLDR\GenerateScrubListReportLDR;
+use Cmd\Reports\Console\Commands\GenerateSettlementReports\GenerateSettlementReports;
 use Cmd\Reports\Console\Commands\GenerateLookbackSummaryReport\GenerateLookbackSummaryReport;
 use Cmd\Reports\Console\Commands\GenerateReportSummary\GenerateReportSummary;
 use Cmd\Reports\Console\Commands\GenerateSyncSummary\GenerateSyncSummary;
@@ -132,6 +133,7 @@ class ReportsServiceProvider extends ServiceProvider
                 GenerateScrubListReport::class,
                 GenerateScrubListReportPLAW::class,
                 GenerateScrubListReportLDR::class,
+                GenerateSettlementReports::class,
                 GenerateLookbackSummaryReport::class,
                 GenerateReportSummary::class,
                 GenerateSyncSummary::class,
