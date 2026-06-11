@@ -22,6 +22,7 @@ use Cmd\Reports\Console\Commands\SyncVerifiedDebts;
 use Cmd\Reports\Console\Commands\GenerateCompanyStatsReport\GenerateCompanyStatsReport;
 use Cmd\Reports\Console\Commands\GenerateLegalReport\GenerateLegalReport;
 use Cmd\Reports\Console\Commands\GenerateAgentSummaryReport\GenerateAgentSummaryReport;
+use Cmd\Reports\Console\Commands\GenerateDPPPastDueReport\GenerateDPPPastDueReport;
 use Cmd\Reports\Console\Commands\GenerateNSFReport\GenerateNSFReport;
 use Cmd\Reports\Console\Commands\GeneratePauseHoldReport\GeneratePauseHoldReport;
 use Cmd\Reports\Console\Commands\GenerateGraduationReport\GenerateGraduationReport;
@@ -123,6 +124,7 @@ class ReportsServiceProvider extends ServiceProvider
                 GenerateCompanyStatsReport::class,
                 GenerateLegalReport::class,
                 GenerateAgentSummaryReport::class,
+                GenerateDPPPastDueReport::class,
                 GenerateNSFReport::class,
                 GeneratePauseHoldReport::class,
                 GenerateGraduationReport::class,
