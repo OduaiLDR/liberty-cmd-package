@@ -35,6 +35,11 @@ class ReportBuilder
     private const W_VALUE = 1600;
     private const W_SEP = 200;
 
+    // Fixed row height in twips for every data/summary row.
+    // 1 twip = 1/20 of a point, so 220 twips ≈ 11pt — tight but still readable for 8pt text.
+    // Same height applied to every block so all 4 tables line up exactly.
+    private const ROW_HEIGHT = 220;
+
     public function build(
         array $agentMetrics,
         string $dataSource,
@@ -182,8 +187,8 @@ class ReportBuilder
             // Block title (large bold centered)
             $cell->addText(
                 $title,
-                ['bold' => true, 'size' => 14, 'name' => 'Calibri'],
-                ['alignment' => 'center', 'spaceAfter' => 40]
+                ['bold' => true, 'size' => 13, 'name' => 'Calibri'],
+                ['alignment' => 'center', 'spaceBefore' => 0, 'spaceAfter' => 20]
             );
 
             $this->buildBlockTable($cell, $rows, $valueKey, $sortDir, $format, $valueHeader);
@@ -217,7 +222,8 @@ class ReportBuilder
         $headerBg = ['bgColor' => self::HEADER_BG];
         $headerFont = ['bold' => true, 'color' => self::HEADER_TEXT, 'size' => 9];
 
-        $table->addRow(null, ['tblHeader' => true]);
+        $rowStyle = ['tblHeader' => true, 'exactHeight' => true, 'cantSplit' => true];
+        $table->addRow(self::ROW_HEIGHT, $rowStyle);
         $table->addCell(self::W_AGENT, $headerBg)
             ->addText('Assigned to Agent', $headerFont);
         $table->addCell(self::W_VALUE, $headerBg)
@@ -225,12 +231,13 @@ class ReportBuilder
 
         // Sort + data rows
         $sorted = $this->sortRows($rows, $valueKey, $sortDir);
+        $dataRowStyle = ['exactHeight' => true, 'cantSplit' => true];
 
         $total = 0.0;
         $count = 0;
         foreach ($sorted as $i => $row) {
             $bg = ($i % 2 === 1) ? ['bgColor' => self::ALT_ROW_BG] : [];
-            $table->addRow();
+            $table->addRow(self::ROW_HEIGHT, $dataRowStyle);
             $table->addCell(self::W_AGENT, $bg)
                 ->addText((string) ($row['agent'] ?? ''), ['size' => 8]);
 
@@ -255,7 +262,7 @@ class ReportBuilder
 
             // Total row — emit for all formats. For percent, value cell is left blank
             // (summing percentages is meaningless) but the row is present so all tables align.
-            $table->addRow();
+            $table->addRow(self::ROW_HEIGHT, $dataRowStyle);
             $table->addCell(self::W_AGENT, $sumBg)->addText('Total', $sumFont);
             if (in_array($format, ['int', 'money_k'], true)) {
                 $table->addCell(self::W_VALUE, $sumBg)->addText(
@@ -268,7 +275,7 @@ class ReportBuilder
             }
 
             // Average row
-            $table->addRow();
+            $table->addRow(self::ROW_HEIGHT, $dataRowStyle);
             $table->addCell(self::W_AGENT, $sumBg)->addText('Average', $sumFont);
             $table->addCell(self::W_VALUE, $sumBg)->addText(
                 $this->formatValue($total / $count, $format),
