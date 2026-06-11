@@ -207,13 +207,7 @@ class GenerateSettlementReports extends Command
                 t.AMOUNT                                  AS AMOUNT,
                 tt.TITLE                                  AS TRANS_TYPE,
                 t.CONTACT_ID                              AS CONTACT_ID,
-                (
-                    SELECT CONCAT(au.FIRSTNAME, ' ', au.LASTNAME)
-                    FROM USERS_ASSIGNMENT ua
-                    JOIN USERS au ON au.UID = ua.USER_ID
-                    WHERE ua.CONTACT_ID = t.CONTACT_ID
-                    LIMIT 1
-                )                                         AS ASSIGNED_TO,
+                CONCAT(au.FIRSTNAME, ' ', au.LASTNAME)    AS ASSIGNED_TO,
                 s.CREDITOR_NAME                           AS CREDITOR_NAME,
                 sub.TITLE                                 AS SUB_TYPE
             FROM TRANSACTIONS t
@@ -222,6 +216,12 @@ class GenerateSettlementReports extends Command
             LEFT JOIN TRANSACTION_STATUSES st   ON st.ID = t.STATUS
             LEFT JOIN TRANSACTION_TYPES tt      ON tt.TRANS_TYPE = t.TRANS_TYPE
             LEFT JOIN TRANSACTION_SUBTYPES sub  ON sub.ID = t.SUB_TYPE
+            LEFT JOIN (
+                SELECT CONTACT_ID, USER_ID,
+                       ROW_NUMBER() OVER (PARTITION BY CONTACT_ID ORDER BY CONTACT_ID ASC) AS rn
+                FROM USERS_ASSIGNMENT
+            ) ua ON ua.CONTACT_ID = t.CONTACT_ID AND ua.rn = 1
+            LEFT JOIN USERS au ON au.UID = ua.USER_ID
             WHERE t.TRANS_TYPE = 'S'
               AND t.STATUS IN (0, 14, 20)
               AND t.ACTIVE = 1
