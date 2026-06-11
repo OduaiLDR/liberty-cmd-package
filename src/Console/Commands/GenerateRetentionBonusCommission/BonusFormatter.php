@@ -1,18 +1,17 @@
 <?php
 
+declare(strict_types=1);
+
 namespace Cmd\Reports\Console\Commands\GenerateRetentionBonusCommission;
 
+use Illuminate\Support\Facades\Log;
+use PhpOffice\PhpSpreadsheet\Shared\Date as XlDate;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Style\Alignment;
 use PhpOffice\PhpSpreadsheet\Style\Border;
 use PhpOffice\PhpSpreadsheet\Style\Fill;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
-use Illuminate\Support\Facades\Log;
 
-/**
- * Builds the Retention Bonus Commission Excel workbook.
- * Single sheet "Retention Data" mirroring VBA column layout.
- */
 class BonusFormatter
 {
     private const HEADER_FILL = 'FF17853B';
@@ -22,7 +21,11 @@ class BonusFormatter
     private const MONEY2_FMT  = '$#,##0.00';
     private const PCT_FMT     = '0%';
 
-    public function buildWorkbook(array $rows, string $source, string $start, string $end): ?array
+    /**
+     * @param array<int,array<string,mixed>> $rows
+     * @param array<string,string> $locationMap  UPPER(agent_name) => location
+     */
+    public function buildWorkbook(array $rows, string $source, string $start, string $end, array $locationMap = []): ?array
     {
         try {
             $sp    = new Spreadsheet();
@@ -30,45 +33,55 @@ class BonusFormatter
             $sheet->setTitle('Retention Data');
             $sheet->setShowGridlines(false);
 
-            // Headers mirror VBA column order
             $headers = [
-                'ID','Client','Retention Agent','Retention Date','Immediate Results',
-                'Enrolled Debt','Reconsideration Date','Retained Date','Dropped Date',
-                'First Payment Cleared','Cutoff','Payments','Agent','Commission Rate',
-                'Violations','Retention Commission','Agent Deduction',
+                'ID', 'Client', 'Retention Agent', 'Retention Date', 'Immediate Results',
+                'Enrolled Debt', 'Reconsideration Date', 'Retained Date', 'Dropped Date',
+                'First Payment Cleared', 'Cutoff', 'Payments', 'Agent', 'Commission Rate',
+                'Violations', 'Retention Commission', 'Agent Deduction',
             ];
-            $cols = array_merge(range('A','Z'), ['AA']);  // A-Q needed
+
+            $cols = array_merge(range('A', 'Z'), ['AA']);
             foreach ($headers as $i => $h) {
-                $sheet->setCellValue($cols[$i] . '1', $h);
+                if ($h !== null) {
+                    $sheet->setCellValue($cols[$i] . '1', $h);
+                }
             }
-            $this->headerStyle($sheet, 'A1:Q1');
+            $this->applyHeaderStyle($sheet, 'A1:Q1');
+
+            // Payroll date = 15th of current month (e.g. 6/15/2026)
+            $payrollDate = date('n/15/Y');
 
             $r = 2;
             foreach ($rows as $row) {
-                $sheet->setCellValue("A$r", $row['ID']                         ?? '');
-                $sheet->setCellValue("B$r", $row['CLIENT']                     ?? '');
-                $sheet->setCellValue("C$r", $row['RETENTION_AGENT']            ?? '');
-                $this->setDate($sheet, "D$r", $row['RETENTION_DATE']           ?? null);
-                $sheet->setCellValue("E$r", $row['IMMEDIATE_RESULTS']          ?? '');
-                $sheet->setCellValue("F$r", (float)($row['ENROLLED_DEBT']      ?? 0));
-                $this->setDate($sheet, "G$r", $row['RECONSIDERATION_DATE']     ?? null);
-                $this->setDate($sheet, "H$r", $row['RETAINED_DATE']            ?? null);
-                $this->setDate($sheet, "I$r", $row['DROPPED_DATE']             ?? null);
-                $this->setDate($sheet, "J$r", $row['FIRST_PAYMENT_CLEARED_DATE'] ?? null);
-                $this->setDate($sheet, "K$r", $row['CUTOFF']                   ?? null);
-                $sheet->setCellValue("L$r", (int)($row['PAYMENTS']             ?? 0));
-                $sheet->setCellValue("M$r", $row['AGENT']                      ?? '');
-                $sheet->setCellValue("N$r", $row['COMMISSION_RATE']            ?? '');
-                $sheet->setCellValue("O$r", $row['VIOLATIONS']                 ?? '');
-                $sheet->setCellValue("P$r", $row['RETENTION_COMMISSION']       ?? '');
-                $sheet->setCellValue("Q$r", $row['AGENT_DEDUCTION']            ?? '');
+                $id        = $row['ID']                 ?? '';
+                $agent     = $row['AGENT']              ?? '';
+                $client    = $row['CLIENT']             ?? '';
+                $comm      = $row['RETENTION_COMMISSION'] ?? 0;
+                $deduction = $row['AGENT_DEDUCTION']    ?? 0;
+
+                $sheet->setCellValue("A$r", $id);
+                $sheet->setCellValue("B$r", $client);
+                $sheet->setCellValue("C$r", $row['RETENTION_AGENT']                 ?? '');
+                $this->setDateCell($sheet, "D$r", $row['RETENTION_DATE']            ?? null);
+                $sheet->setCellValue("E$r", $row['IMMEDIATE_RESULTS']               ?? '');
+                $sheet->setCellValue("F$r", (float) ($row['ENROLLED_DEBT']          ?? 0));
+                $this->setDateCell($sheet, "G$r", $row['RECONSIDERATION_DATE']      ?? null);
+                $this->setDateCell($sheet, "H$r", $row['RETAINED_DATE']             ?? null);
+                $this->setDateCell($sheet, "I$r", $row['DROPPED_DATE']              ?? null);
+                $this->setDateCell($sheet, "J$r", $row['FIRST_PAYMENT_CLEARED_DATE'] ?? null);
+                $this->setDateCell($sheet, "K$r", $row['CUTOFF']                    ?? null);
+                $sheet->setCellValue("L$r", (int) ($row['PAYMENTS']                 ?? 0));
+                $sheet->setCellValue("M$r", $agent);
+                $sheet->setCellValue("N$r", $row['COMMISSION_RATE']                 ?? '');
+                $sheet->setCellValue("O$r", $row['VIOLATIONS']                      ?? '');
+                $sheet->setCellValue("P$r", $comm);
+                $sheet->setCellValue("Q$r", $deduction);
                 $r++;
             }
 
-            $last = max($r-1, 1);
+            $last = max($r - 1, 1);
 
-            // Number formats (mirrors VBA)
-            foreach (['D','G','H','I','J','K'] as $c) {
+            foreach (['D', 'G', 'H', 'I', 'J', 'K'] as $c) {
                 $sheet->getStyle("{$c}2:{$c}{$last}")->getNumberFormat()->setFormatCode(self::DATE_FMT);
             }
             $sheet->getStyle("F2:F{$last}")->getNumberFormat()->setFormatCode(self::MONEY_FMT);
@@ -78,9 +91,54 @@ class BonusFormatter
             if ($last > 1) {
                 $sheet->getStyle("A1:Q{$last}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
             }
-            foreach (range('A','Q') as $c) $sheet->getColumnDimension($c)->setAutoSize(true);
+            foreach (range('A', 'Q') as $c) {
+                $sheet->getColumnDimension($c)->setAutoSize(true);
+            }
             $sheet->getStyle("A1:Q{$last}")->getFont()->setName('Calibri')->setSize(9);
+            $sheet->freezePane('A2');
             $sheet->setSelectedCells('A1');
+
+            // ── Summary sheet ─────────────────────────────────────────────────
+            $summary = $sp->createSheet();
+            $summary->setTitle('Agent Summary');
+            $summary->setShowGridlines(false);
+
+            $summary->setCellValue('A1', 'Retention Agent');
+            $summary->setCellValue('B1', 'Total Commission');
+            $summary->setCellValue('C1', 'Location');
+            $this->applyHeaderStyle($summary, 'A1:C1');
+
+            // Aggregate commission per retention agent
+            $agentTotals = [];
+            foreach ($rows as $row) {
+                $agentName = (string) ($row['RETENTION_AGENT'] ?? '');
+                $comm      = (float)  ($row['RETENTION_COMMISSION'] ?? 0);
+                $agentTotals[$agentName] = ($agentTotals[$agentName] ?? 0.0) + $comm;
+            }
+            arsort($agentTotals);
+
+            $sr = 2;
+            foreach ($agentTotals as $agentName => $total) {
+                $summary->setCellValue("A{$sr}", $agentName);
+                $summary->setCellValue("B{$sr}", round($total, 2, PHP_ROUND_HALF_EVEN));
+                $summary->setCellValue("C{$sr}", $locationMap[strtoupper($agentName)] ?? '');
+                $sr++;
+            }
+
+            $lastSr = max($sr - 1, 1);
+            $summary->getStyle("B2:B{$lastSr}")->getNumberFormat()->setFormatCode(self::MONEY2_FMT);
+            if ($lastSr > 1) {
+                $summary->getStyle("A1:C{$lastSr}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
+            }
+            foreach (['A', 'B', 'C'] as $c) {
+                $summary->getColumnDimension($c)->setAutoSize(true);
+            }
+            $summary->getStyle("A1:C{$lastSr}")->getFont()->setName('Calibri')->setSize(9);
+            $summary->freezePane('A2');
+            $summary->setSelectedCells('A1');
+
+            // Set active sheet back to data tab
+            $sp->setActiveSheetIndex(0);
 
             $filename = "Retention Bonus Commission - {$source}.xlsx";
             $path     = storage_path("app/{$filename}");
@@ -88,26 +146,26 @@ class BonusFormatter
 
             return ['filename' => $filename, 'path' => $path];
         } catch (\Throwable $e) {
-            Log::error('BonusFormatter::buildWorkbook failed', ['err' => $e->getMessage()]);
+            Log::error('RetentionBonusCommissionFormatter::buildWorkbook failed', ['err' => $e->getMessage()]);
             return null;
         }
     }
 
-    private function headerStyle(\PhpOffice\PhpSpreadsheet\Worksheet\Worksheet $s, string $range): void
+    private function applyHeaderStyle(\PhpOffice\PhpSpreadsheet\Worksheet\Worksheet $sheet, string $range): void
     {
-        $s->getStyle($range)->applyFromArray([
-            'font'      => ['bold'=>true,'color'=>['argb'=>self::HEADER_FONT]],
-            'alignment' => ['horizontal'=>Alignment::HORIZONTAL_CENTER],
-            'fill'      => ['fillType'=>Fill::FILL_SOLID,'startColor'=>['argb'=>self::HEADER_FILL]],
-            'borders'   => ['allBorders'=>['borderStyle'=>Border::BORDER_THIN]],
+        $sheet->getStyle($range)->applyFromArray([
+            'font'      => ['bold' => true, 'color' => ['argb' => self::HEADER_FONT]],
+            'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER],
+            'fill'      => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['argb' => self::HEADER_FILL]],
+            'borders'   => ['allBorders' => ['borderStyle' => Border::BORDER_THIN]],
         ]);
     }
 
-    private function setDate(\PhpOffice\PhpSpreadsheet\Worksheet\Worksheet $s, string $cell, ?string $val): void
+    private function setDateCell(\PhpOffice\PhpSpreadsheet\Worksheet\Worksheet $sheet, string $cell, ?string $val): void
     {
-        if ($val && strtotime($val) !== false) {
-            $s->setCellValue($cell, \PhpOffice\PhpSpreadsheet\Shared\Date::PHPToExcel(strtotime($val)));
-            $s->getStyle($cell)->getNumberFormat()->setFormatCode(self::DATE_FMT);
+        if ($val !== null && $val !== '' && strtotime($val) !== false) {
+            $sheet->setCellValue($cell, XlDate::PHPToExcel(strtotime($val)));
+            $sheet->getStyle($cell)->getNumberFormat()->setFormatCode(self::DATE_FMT);
         }
     }
 }

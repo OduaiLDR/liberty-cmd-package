@@ -20,8 +20,6 @@ use Illuminate\Support\Facades\Log;
  */
 class CancelRequestFormatter
 {
-    private const GREEN = 'FF92D050';   // VBA RGB(146,208,80)
-    private const RED   = 'FFFF0000';   // VBA RGB(255,0,0)
     private const HEADER_FILL = 'FF17853B';
     private const HEADER_FONT = 'FFFFFFFF';
     private const DATE_FORMAT = 'mm/dd/yyyy';
@@ -85,6 +83,8 @@ class CancelRequestFormatter
         }
         foreach (range('A','D') as $c) $s->getColumnDimension($c)->setAutoSize(true);
         $s->getStyle("A1:D{$last}")->getFont()->setName('Calibri')->setSize(9);
+        $s->freezePane('A2');
+        $s->setSelectedCells('A1');
     }
 
     private function buildSummarySheet(\PhpOffice\PhpSpreadsheet\Worksheet\Worksheet $s, array $summary): void
@@ -92,28 +92,25 @@ class CancelRequestFormatter
         $s->setShowGridlines(false);
         $s->setCellValue('A1', 'Agent');
         $s->setCellValue('B1', 'Cancellation Requests');
-        $this->applyHeaderStyle($s, 'A1:B1');
+        $s->setCellValue('C1', 'Location');
+        $this->applyHeaderStyle($s, 'A1:C1');
 
         $r = 2;
         foreach ($summary as $row) {
             $s->setCellValue("A$r", $row['agent']);
             $s->setCellValue("B$r", $row['count']);
-
-            // VBA color coding
-            $fill = $row['terminated'] ? self::RED : self::GREEN;
-            $s->getStyle("A{$r}:B{$r}")->getFill()
-              ->setFillType(Fill::FILL_SOLID)
-              ->getStartColor()->setARGB($fill);
-
+            $s->setCellValue("C$r", $row['location'] ?? '');
             $r++;
         }
 
         $last = max($r-1, 1);
         if ($last > 1) {
-            $s->getStyle("A1:B{$last}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
+            $s->getStyle("A1:C{$last}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
         }
-        foreach (range('A','B') as $c) $s->getColumnDimension($c)->setAutoSize(true);
-        $s->getStyle("A1:B{$last}")->getFont()->setName('Calibri')->setSize(9);
+        foreach (range('A','C') as $c) $s->getColumnDimension($c)->setAutoSize(true);
+        $s->getStyle("A1:C{$last}")->getFont()->setName('Calibri')->setSize(9);
+        $s->freezePane('A2');
+        $s->setSelectedCells('A1');
     }
 
     private function applyHeaderStyle(\PhpOffice\PhpSpreadsheet\Worksheet\Worksheet $s, string $range): void
@@ -128,12 +125,9 @@ class CancelRequestFormatter
 
     private function setDate(\PhpOffice\PhpSpreadsheet\Worksheet\Worksheet $s, string $cell, ?string $val): void
     {
-        if ($val) {
-            $ts = is_numeric($val) ? (int)$val : strtotime($val);
-            if ($ts !== false && $ts > 0) {
-                $s->setCellValue($cell, \PhpOffice\PhpSpreadsheet\Shared\Date::PHPToExcel($ts));
-                $s->getStyle($cell)->getNumberFormat()->setFormatCode(self::DATE_FORMAT);
-            }
+        if ($val && strtotime($val) !== false) {
+            $s->setCellValue($cell, \PhpOffice\PhpSpreadsheet\Shared\Date::PHPToExcel(strtotime($val)));
+            $s->getStyle($cell)->getNumberFormat()->setFormatCode(self::DATE_FORMAT);
         }
     }
 }
