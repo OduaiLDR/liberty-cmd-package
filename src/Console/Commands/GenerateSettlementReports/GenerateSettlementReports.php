@@ -141,19 +141,19 @@ class GenerateSettlementReports extends Command
                 TO_VARCHAR(t.PROCESS_DATE, 'Mon DD YYYY') AS PROCESS_DATE,
                 t.AMOUNT                                  AS AMOUNT,
                 s.CREDITOR_NAME                           AS CREDITOR_NAME,
-                s.CREDITOR_NAME                           AS DEBT_THIRD_PARTY,
+                tp.THIRD_PARTY                            AS DEBT_THIRD_PARTY,
                 st.NAME                                   AS STATUS,
                 s.REF                                     AS SETT_REF,
                 t.TRANSID                                 AS TRANS_ID,
                 tt.TITLE                                  AS TRANS_TYPE,
-                CONCAT(u.FIRSTNAME, ' ', u.LASTNAME)      AS NEGOTIATOR
+                neg.NEG_NAME                              AS NEGOTIATOR
             FROM TRANSACTIONS t
             LEFT JOIN SETTLEMENTS s            ON s.TRANS_ID = t.ID
             LEFT JOIN CONTACTS c               ON c.ID = t.CONTACT_ID
             LEFT JOIN TRANSACTION_STATUSES st  ON st.ID = t.STATUS
             LEFT JOIN TRANSACTION_TYPES tt     ON tt.TRANS_TYPE = t.TRANS_TYPE
-            LEFT JOIN SETTLEMENT_OFFERS o      ON o.ID = s.OFFER_ID
-            LEFT JOIN USERS u                  ON u.UID = o.NEG_ID
+            {$this->negotiatorJoin()}
+            {$this->thirdPartyJoin()}
             WHERE t.TRANS_TYPE = 'S'
               AND t.STATUS = 1
               AND t.ACTIVE = 1
@@ -177,14 +177,13 @@ class GenerateSettlementReports extends Command
                 t.ID                                      AS TRANS_ROW_ID,
                 t.TRANSID                                 AS TRANS_ID,
                 s.CONF                                    AS SETTLEMENT_CONFIRMATION,
-                CONCAT(u.FIRSTNAME, ' ', u.LASTNAME)      AS NEGOTIATOR
+                neg.NEG_NAME                              AS NEGOTIATOR
             FROM TRANSACTIONS t
             LEFT JOIN SETTLEMENTS s             ON s.TRANS_ID = t.ID
             LEFT JOIN CONTACTS c                ON c.ID = t.CONTACT_ID
             LEFT JOIN TRANSACTION_STATUSES st   ON st.ID = t.STATUS
             LEFT JOIN TRANSACTION_SUBTYPES sub  ON sub.ID = t.SUB_TYPE
-            LEFT JOIN SETTLEMENT_OFFERS o       ON o.ID = s.OFFER_ID
-            LEFT JOIN USERS u                   ON u.UID = o.NEG_ID
+            {$this->negotiatorJoin()}
             WHERE t.TRANS_TYPE = 'S'
               AND t.STATUS = 20
               AND t.ACTIVE = 1
@@ -227,6 +226,52 @@ class GenerateSettlementReports extends Command
               AND t.ACTIVE = 1
               AND t.PROCESS_DATE < CURRENT_DATE
             ORDER BY t.PROCESS_DATE
+        ";
+    }
+
+    /**
+     * Negotiator per settlement (CONTACT_ID + Sett Ref). DebtPayPro shows the
+     * negotiator tied to the settlement, not the individual transaction's offer —
+     * so we pull it from any offer of that settlement that has a real negotiator.
+     * Deduped to one row per (contact, ref) so it never multiplies transaction rows.
+     */
+    private function negotiatorJoin(): string
+    {
+        return "
+            LEFT JOIN (
+                SELECT
+                    s2.CONTACT_ID,
+                    s2.REF,
+                    CONCAT(u2.FIRSTNAME, ' ', u2.LASTNAME) AS NEG_NAME,
+                    ROW_NUMBER() OVER (PARTITION BY s2.CONTACT_ID, s2.REF ORDER BY o2.CREATED_AT DESC) AS rn
+                FROM SETTLEMENTS s2
+                JOIN SETTLEMENT_OFFERS o2 ON o2.ID = s2.OFFER_ID
+                JOIN USERS u2 ON u2.UID = o2.NEG_ID
+                WHERE o2.NEG_ID IS NOT NULL AND o2.NEG_ID <> 0
+            ) neg ON neg.CONTACT_ID = t.CONTACT_ID AND neg.REF = s.REF AND neg.rn = 1
+        ";
+    }
+
+    /**
+     * "Debt - Third Party" per settlement (CONTACT_ID + Sett Ref): the debt buyer
+     * (DEBTS.DEBT_BUYER) resolved to its CREDITORS.COMPANY name. Deduped per
+     * (contact, ref) so it fills consistently and never multiplies transaction rows.
+     */
+    private function thirdPartyJoin(): string
+    {
+        return "
+            LEFT JOIN (
+                SELECT
+                    s3.CONTACT_ID,
+                    s3.REF,
+                    cr.COMPANY AS THIRD_PARTY,
+                    ROW_NUMBER() OVER (PARTITION BY s3.CONTACT_ID, s3.REF ORDER BY o3.CREATED_AT DESC) AS rn
+                FROM SETTLEMENTS s3
+                JOIN SETTLEMENT_OFFERS o3 ON o3.ID = s3.OFFER_ID
+                JOIN DEBTS d3 ON d3.ID = o3.DEBT_ID
+                JOIN CREDITORS cr ON cr.ID = d3.DEBT_BUYER
+                WHERE d3.DEBT_BUYER IS NOT NULL AND d3.DEBT_BUYER <> 0
+            ) tp ON tp.CONTACT_ID = t.CONTACT_ID AND tp.REF = s.REF AND tp.rn = 1
         ";
     }
 
