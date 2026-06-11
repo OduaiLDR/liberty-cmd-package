@@ -76,6 +76,7 @@ class ReportsServiceProvider extends ServiceProvider
     public function boot()
     {
         $this->loadRoutesFrom(__DIR__ . '/../routes/web.php');
+        $this->loadRoutesFrom(__DIR__ . '/../routes/pmod.php');
         $this->loadViewsFrom(__DIR__ . '/../resources/views', 'reports');
 
         // Try new dbConfig first, fallback to legacy configs
