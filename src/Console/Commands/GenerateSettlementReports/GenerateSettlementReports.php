@@ -36,17 +36,17 @@ class GenerateSettlementReports extends Command
      */
     private const PORTALS = [
         [
-            'env' => 'ldr', 'portal' => 'LDR', 'company' => 'LDR',
+            'env' => 'ldr', 'portal' => 'LDR', 'company' => 'LDR', 'date_fmt' => 'Mon DD YYYY',
             'reports' => [
-                ['key' => 'pending', 'title' => 'Settlements - Pending Payments'],
-                ['key' => 'shipped', 'title' => 'Settlements - Shipped Uncollected Checks'],
+                ['key' => 'pending', 'title' => 'Settlements - Pending Payments', 'id_prefix' => ''],
+                ['key' => 'shipped', 'title' => 'Settlements - Shipped Uncollected Checks', 'id_prefix' => ''],
             ],
         ],
         [
-            'env' => 'plaw', 'portal' => 'Progress Law', 'company' => 'Progress Law',
+            'env' => 'plaw', 'portal' => 'Progress Law', 'company' => 'Progress Law', 'date_fmt' => 'MM/DD/YYYY',
             'reports' => [
-                ['key' => 'uncollected', 'title' => 'Settlements - Uncollected'],
-                ['key' => 'shipped', 'title' => 'Settlements - Uncollected Check Shipments'],
+                ['key' => 'uncollected', 'title' => 'Settlements - Uncollected', 'id_prefix' => ''],
+                ['key' => 'shipped', 'title' => 'Settlements - Uncollected Check Shipments', 'id_prefix' => 'LLG-'],
             ],
         ],
     ];
@@ -91,7 +91,7 @@ class GenerateSettlementReports extends Command
         $attachments = [];
 
         foreach ($portal['reports'] as $report) {
-            $rows = $this->fetch($report['key'], $snowflake);
+            $rows = $this->fetch($report['key'], $snowflake, $portal['date_fmt'], $report['id_prefix'] ?? '');
             $this->info("[INFO] {$portal['portal']} - {$report['title']}: " . count($rows) . ' rows');
 
             if (empty($rows)) {
@@ -119,12 +119,17 @@ class GenerateSettlementReports extends Command
     /**
      * @return array<int, array<string, mixed>>
      */
-    private function fetch(string $key, DBConnector $snowflake): array
+    private function fetch(string $key, DBConnector $snowflake, string $dateFmt, string $idPrefix): array
     {
+        // Contact-id display: optionally prefixed (PLAW Check Shipments shows "LLG-<id>").
+        $idExpr = $idPrefix !== ''
+            ? "CONCAT('" . str_replace("'", "''", $idPrefix) . "', t.CONTACT_ID)"
+            : 't.CONTACT_ID';
+
         $sql = match ($key) {
-            'pending' => $this->pendingSql(),
-            'shipped' => $this->shippedSql(),
-            'uncollected' => $this->uncollectedSql(),
+            'pending' => $this->pendingSql($dateFmt, $idExpr),
+            'shipped' => $this->shippedSql($dateFmt, $idExpr),
+            'uncollected' => $this->uncollectedSql($dateFmt, $idExpr),
             default => throw new \InvalidArgumentException("Unknown report key: {$key}"),
         };
 
@@ -132,13 +137,13 @@ class GenerateSettlementReports extends Command
     }
 
     /** LDR "Pending Payments": settlement payments still Pending (STATUS 1). */
-    private function pendingSql(): string
+    private function pendingSql(string $dateFmt, string $idExpr): string
     {
         return "
             SELECT
-                t.CONTACT_ID                              AS CONTACT_ID,
+                {$idExpr}                                 AS CONTACT_ID,
                 CONCAT(c.FIRSTNAME, ' ', c.LASTNAME)      AS FULL_NAME,
-                TO_VARCHAR(t.PROCESS_DATE, 'Mon DD YYYY') AS PROCESS_DATE,
+                TO_VARCHAR(t.PROCESS_DATE, '{$dateFmt}')  AS PROCESS_DATE,
                 t.AMOUNT                                  AS AMOUNT,
                 s.CREDITOR_NAME                           AS CREDITOR_NAME,
                 tp.THIRD_PARTY                            AS DEBT_THIRD_PARTY,
@@ -162,13 +167,13 @@ class GenerateSettlementReports extends Command
     }
 
     /** "Shipped / Uncollected Check Shipments": settlement payments Shipped (STATUS 20). */
-    private function shippedSql(): string
+    private function shippedSql(string $dateFmt, string $idExpr): string
     {
         return "
             SELECT
-                t.CONTACT_ID                              AS CONTACT_ID,
+                {$idExpr}                                 AS CONTACT_ID,
                 CONCAT(c.FIRSTNAME, ' ', c.LASTNAME)      AS FULL_NAME,
-                TO_VARCHAR(t.PROCESS_DATE, 'Mon DD YYYY') AS PROCESS_DATE,
+                TO_VARCHAR(t.PROCESS_DATE, '{$dateFmt}')  AS PROCESS_DATE,
                 t.AMOUNT                                  AS AMOUNT,
                 s.REF                                     AS SETT_REF,
                 sub.TITLE                                 AS SUB_TYPE,
@@ -196,16 +201,16 @@ class GenerateSettlementReports extends Command
      * STATUS Open(0) / Low Balance(14) / Shipped(20), process date before today.
      * Uses "Assigned To" (the contact's assigned user) instead of Negotiator.
      */
-    private function uncollectedSql(): string
+    private function uncollectedSql(string $dateFmt, string $idExpr): string
     {
         return "
             SELECT
                 CONCAT(c.FIRSTNAME, ' ', c.LASTNAME)      AS FULL_NAME,
-                TO_VARCHAR(t.PROCESS_DATE, 'MM/DD/YYYY')  AS PROCESS_DATE,
+                TO_VARCHAR(t.PROCESS_DATE, '{$dateFmt}')  AS PROCESS_DATE,
                 st.NAME                                   AS STATUS,
                 t.AMOUNT                                  AS AMOUNT,
                 tt.TITLE                                  AS TRANS_TYPE,
-                t.CONTACT_ID                              AS CONTACT_ID,
+                {$idExpr}                                 AS CONTACT_ID,
                 CONCAT(au.FIRSTNAME, ' ', au.LASTNAME)    AS ASSIGNED_TO,
                 s.CREDITOR_NAME                           AS CREDITOR_NAME,
                 sub.TITLE                                 AS SUB_TYPE
