@@ -20,9 +20,8 @@ use Illuminate\Support\Facades\Log;
  */
 class GenerateRetentionBonusCommission extends Command
 {
-    protected $signature = 'reports:generate-retention-bonus-commission 
-                            {source? : Brand to generate report for (ldr, plaw, or both)}
-                            {--month= : Specific month to run for, e.g. 2026-04}';
+    protected $signature = 'reports:generate-retention-bonus-commission
+                            {source=both : ldr | plaw | both}';
 
     protected $description = 'Generate Retention Bonus Commission report for LDR and/or PLAW.';
 
@@ -59,19 +58,12 @@ class GenerateRetentionBonusCommission extends Command
 
     private function runForSource(string $source): void
     {
-        $cfg = self::SOURCE_CONFIG[$source];
+        $cfg     = self::SOURCE_CONFIG[$source];
         $display = $cfg['display'];
         $this->info("[INFO] GenerateRetentionBonusCommission – $display");
 
-        $targetMonth = $this->option('month');
-        if ($targetMonth) {
-            $startDate = date('Y-m-01', strtotime($targetMonth . '-01'));
-            $endDate   = date('Y-m-t', strtotime($targetMonth . '-01'));
-        } else {
-            // VBA logic: Previous month
-            $startDate = date('Y-m-d', strtotime('first day of last month'));
-            $endDate   = date('Y-m-d', strtotime('last day of last month'));
-        }
+        $startDate = date('Y-m-01', strtotime('first day of last month'));
+        $endDate   = date('Y-m-t', strtotime($startDate));
         $this->info("[INFO] Period: $startDate → $endDate");
 
         try {
@@ -87,17 +79,20 @@ class GenerateRetentionBonusCommission extends Command
             $rows = $this->fetchBase($sf, $cfg, $startDate, $endDate);
             $this->info("[INFO] [$display] Base rows: " . count($rows));
 
-            $ids = array_filter(array_map(fn($r) => (int)($r['ID'] ?? 0), $rows));
+            $ids = array_filter(array_map(fn($r) => (int) $this->rowValue($r, 'ID', 0), $rows));
             $idList = empty($ids) ? '0' : implode(',', $ids);
 
             // STEP 2 – reconsideration dates
             $reconMap = $this->fetchReconsiderationDates($sf, $cfg['recon_status_id'], $idList);
             foreach ($rows as &$row) {
-                $id = (string)($row['ID'] ?? '');
+                $id = (string) $this->rowValue($row, 'ID', '');
                 if (!empty($reconMap[$id])) {
                     $row['RECONSIDERATION_DATE'] = $reconMap[$id];
                 } else {
-                    $dates = array_filter([$row['RETENTION_DATE'] ?? null, $row['DROPPED_DATE'] ?? null]);
+                    $dates = array_filter([
+                        $this->dateValue($this->rowValue($row, 'RETENTION_DATE')),
+                        $this->dateValue($this->rowValue($row, 'DROPPED_DATE')),
+                    ]);
                     $row['RECONSIDERATION_DATE'] = $dates ? min($dates) : null;
                 }
             }
@@ -106,12 +101,13 @@ class GenerateRetentionBonusCommission extends Command
             // STEP 3 – retained dates
             $retainedMap = $this->fetchRetainedDates($sf, $idList);
             foreach ($rows as &$row) {
-                $recon = $row['RECONSIDERATION_DATE'] ?? null;
+                $recon = $this->dateValue($row['RECONSIDERATION_DATE'] ?? null);
                 $row['RETAINED_DATE'] = null;
-                $id = (string)($row['ID'] ?? '');
+                $id = (string) $this->rowValue($row, 'ID', '');
                 if ($recon && !empty($retainedMap[$id])) {
                     foreach ($retainedMap[$id] as $rd) {
-                        if ($rd >= $recon) { $row['RETAINED_DATE'] = $rd; break; }
+                        $retainedDate = $this->dateValue($rd);
+                        if ($retainedDate && $retainedDate >= $recon) { $row['RETAINED_DATE'] = $retainedDate; break; }
                     }
                 }
             }
@@ -119,28 +115,31 @@ class GenerateRetentionBonusCommission extends Command
 
             // STEP 4 – SQL Server enrollment data per contact
             foreach ($rows as &$row) {
-                $id   = (string)($row['ID'] ?? '');
+                $id   = (string) $this->rowValue($row, 'ID', '');
                 $llg  = "LLG-$id";
-                $safe = str_replace("'", "''", $llg);
                 $res  = $sql->querySqlServer(
-                    "SELECT First_Payment_Cleared_Date, NULL AS filler, Payments, Agent, Commission_Rate
-                     FROM TblEnrollment WHERE LLG_ID='$safe'"
+                    "SELECT First_Payment_Cleared_Date AS first_payment_cleared_date,
+                            Payments AS payments,
+                            Agent AS agent,
+                            Commission_Rate AS commission_rate
+                     FROM TblEnrollment WHERE LLG_ID = ?",
+                    [$llg]
                 );
                 $en = ($res['data'] ?? [])[0] ?? null;
-                $row['FIRST_PAYMENT_CLEARED_DATE'] = $en ? ($en['First_Payment_Cleared_Date'] ?? null) : null;
-                $row['PAYMENTS']                   = $en ? (int)($en['Payments']                ?? 0)  : 0;
-                $row['AGENT']                      = $en ? ($en['Agent']                        ?? null) : null;
-                $row['COMMISSION_RATE']             = $en ? (float)($en['Commission_Rate']      ?? 0)  : 0;
+                $row['FIRST_PAYMENT_CLEARED_DATE'] = $en ? $this->dateValue($this->rowValue($en, 'first_payment_cleared_date')) : null;
+                $row['PAYMENTS']                   = $en ? (int) $this->rowValue($en, 'payments', 0) : 0;
+                $row['AGENT']                      = $en ? $this->rowValue($en, 'agent') : null;
+                $row['COMMISSION_RATE']            = $en ? (float) $this->rowValue($en, 'commission_rate', 0) : 0;
             }
             unset($row);
 
             // VBA: remove rows with Payments < 2
-            $rows = array_values(array_filter($rows, fn($r) => (int)($r['PAYMENTS'] ?? 0) >= 2));
+            $rows = array_values(array_filter($rows, fn($r) => (int) $this->rowValue($r, 'PAYMENTS', 0) >= 2));
 
             // STEP 5 – calculate cutoff (first payment + 3 months) and filter
             foreach ($rows as &$row) {
-                $fp = $row['FIRST_PAYMENT_CLEARED_DATE'] ?? null;
-                if ($fp && strtotime($fp) !== false) {
+                $fp = $this->dateValue($row['FIRST_PAYMENT_CLEARED_DATE'] ?? null);
+                if ($fp) {
                     $row['CUTOFF'] = date('Y-m-d', strtotime('+3 months', strtotime($fp)));
                 } else {
                     $row['CUTOFF'] = null;
@@ -148,39 +147,21 @@ class GenerateRetentionBonusCommission extends Command
             }
             unset($row);
 
-            // Format dates to Y-m-d so string comparisons work correctly
-            foreach ($rows as &$row) {
-                foreach (['RETENTION_DATE', 'DROPPED_DATE'] as $dtField) {
-                    $val = $row[$dtField] ?? null;
-                    if ($val) {
-                        if (is_numeric($val)) {
-                            // Snowflake returns DATE fields as days since epoch if they aren't formatted strings
-                            $ts = $val < 100000 ? (int)$val * 86400 : (int)$val;
-                        } else {
-                            $ts = strtotime($val);
-                        }
-                        if ($ts) {
-                            $row[$dtField] = date('Y-m-d', $ts);
-                        }
-                    }
-                }
-            }
-            unset($row);
-
             // VBA filter conditions
             $rows = array_values(array_filter($rows, function($row) use ($endDate) {
-                $retenDate = $row['RETENTION_DATE'] ?? null;
-                $dropped   = $row['DROPPED_DATE']   ?? null;
-                $cutoff    = $row['CUTOFF']          ?? null;
+                $retenDate = $this->dateValue($this->rowValue($row, 'RETENTION_DATE'));
+                $dropped   = $this->dateValue($this->rowValue($row, 'DROPPED_DATE'));
+                $cutoff    = $this->dateValue($row['CUTOFF'] ?? null);
 
                 // If retention_date > cutoff → remove
+                if (!$cutoff) return false;
                 if ($retenDate && $cutoff && $retenDate > $cutoff) return false;
                 // If dropped and dropped <= cutoff → remove
-                if ($dropped && $cutoff && $dropped !== '' && $dropped <= $cutoff) return false;
+                if ($dropped && $cutoff && $dropped <= $cutoff) return false;
                 // If cutoff > endDate → remove
                 if ($cutoff && $cutoff > $endDate) return false;
                 // If payments < 3 → remove
-                if ((int)($row['PAYMENTS'] ?? 0) < 3) return false;
+                if ((int) $this->rowValue($row, 'PAYMENTS', 0) < 3) return false;
 
                 return true;
             }));
@@ -188,9 +169,9 @@ class GenerateRetentionBonusCommission extends Command
 
             // STEP 6 – commission and violation deductions
             foreach ($rows as &$row) {
-                $id   = (string)($row['ID'] ?? '');
-                $debt = (float)($row['ENROLLED_DEBT'] ?? 0);
-                $rate = (float)($row['COMMISSION_RATE'] ?? 0);
+                $id   = (string) $this->rowValue($row, 'ID', '');
+                $debt = (float) $this->rowValue($row, 'ENROLLED_DEBT', 0);
+                $rate = (float) $this->rowValue($row, 'COMMISSION_RATE', 0);
 
                 if ($rate == 0) {
                     // Default rate: 0.38%
@@ -204,7 +185,7 @@ class GenerateRetentionBonusCommission extends Command
                     $res  = $sql->querySqlServer(
                         "SELECT ISNULL(SUM(Points),0) AS pts FROM TblSalesAgentViolations WHERE CID='$safe'"
                     );
-                    $pts = (float)(($res['data'] ?? [])[0]['pts'] ?? 0);
+                    $pts = (float) $this->rowValue(($res['data'] ?? [])[0] ?? [], 'pts', 0);
                     $violations = min($pts / 10, 1.0);
                     $row['VIOLATIONS'] = $violations;
 
@@ -240,6 +221,7 @@ class GenerateRetentionBonusCommission extends Command
         $ca = (int)$cfg['custom_agent'];
         $cd = (int)$cfg['custom_date'];
         $cr = (int)$cfg['custom_results'];
+        $nextDay = date('Y-m-d', strtotime('+1 day', strtotime($end)));
 
         $sql = "
             WITH PivotedFields AS (
@@ -256,37 +238,61 @@ class GenerateRetentionBonusCommission extends Command
                 c.ID,
                 CONCAT(c.FIRSTNAME,' ',c.LASTNAME)  AS CLIENT,
                 p.RETENTION_AGENT,
-                p.RETENTION_DATE,
+                LEFT(p.RETENTION_DATE, 10) AS RETENTION_DATE,
                 p.IMMEDIATE_RESULTS,
                 d.ENROLLED_DEBT,
-                c.DROPPED_DATE
+                LEFT(c.DROPPED_DATE, 10) AS DROPPED_DATE
             FROM PivotedFields p
             JOIN CONTACTS c ON c.ID = p.CONTACT_ID
             LEFT JOIN (
                 SELECT CONTACT_ID, SUM(ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT
                 FROM DEBTS WHERE ENROLLED=1 AND _FIVETRAN_DELETED=FALSE GROUP BY CONTACT_ID
             ) d ON c.ID=d.CONTACT_ID
-            WHERE p.IMMEDIATE_RESULTS = 'Retained'
+            WHERE p.RETENTION_DATE >= '$start'
+              AND p.RETENTION_DATE < '$nextDay'
+              AND TRIM(p.IMMEDIATE_RESULTS) = 'Retained'
               AND p.RETENTION_AGENT IS NOT NULL
             ORDER BY p.RETENTION_AGENT ASC
         ";
         $res = $sf->query($sql);
-        $rows = $res['data'] ?? [];
+        return $res['data'] ?? [];
+    }
 
-        $startTs = strtotime($start);
-        $endTs = strtotime($end . ' 23:59:59');
+    private function rowValue(array $row, string $key, mixed $default = null): mixed
+    {
+        if (array_key_exists($key, $row)) {
+            return $row[$key];
+        }
 
-        $filtered = [];
-        foreach ($rows as $r) {
-            $rd = $r['RETENTION_DATE'] ?? null;
-            if (!$rd) continue;
-            
-            $ts = is_numeric($rd) ? (int)$rd * 86400 : strtotime($rd);
-            if ($ts >= $startTs && $ts <= $endTs) {
-                $filtered[] = $r;
+        $lowerKey = strtolower($key);
+        foreach ($row as $rowKey => $value) {
+            if (strtolower((string) $rowKey) === $lowerKey) {
+                return $value;
             }
         }
-        return $filtered;
+
+        return $default;
+    }
+
+    private function dateValue(mixed $value): ?string
+    {
+        if ($value instanceof \DateTimeInterface) {
+            return $value->format('Y-m-d');
+        }
+
+        if ($value === null || $value === '') {
+            return null;
+        }
+
+        if (is_numeric($value)) {
+            $timestamp = (int) $value;
+
+            return $timestamp > 0 ? date('Y-m-d', $timestamp) : null;
+        }
+
+        $timestamp = strtotime((string) $value);
+
+        return $timestamp === false ? null : date('Y-m-d', $timestamp);
     }
 
     private function fetchReconsiderationDates(DBConnector $sf, int $statusId, string $idList): array

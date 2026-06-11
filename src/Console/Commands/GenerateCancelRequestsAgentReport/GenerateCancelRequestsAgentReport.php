@@ -86,54 +86,45 @@ class GenerateCancelRequestsAgentReport extends Command
     // ─────────────────────────────────────────────────────────────────────────
     private function fetchCancelData(DBConnector $sf, array $cfg, string $start, string $end): array
     {
-        $cc = (int)$cfg['custom_cancel'];
-        $ca = (int)$cfg['custom_agent'];
-
-        $startTs = strtotime($start);
-        $endTs = strtotime($end . ' 23:59:59');
+        $cc      = (int) $cfg['custom_cancel'];
+        $ca      = (int) $cfg['custom_agent'];
+        $nextDay = date('Y-m-d', strtotime('+1 day', strtotime($end)));
 
         $sql = "
             WITH PivotedFields AS (
-                SELECT 
+                SELECT
                     CONTACT_ID,
-                    MAX(CASE WHEN CUSTOM_ID = $cc THEN F_DATETIME END) AS CANCEL_REQUEST_DATE,
+                    MAX(CASE WHEN CUSTOM_ID = $cc THEN TO_DATE(F_DATETIME) END) AS CANCEL_REQUEST_DATE,
                     MAX(CASE WHEN CUSTOM_ID = $ca THEN F_SHORTSTRING END) AS AGENT
                 FROM CONTACTS_USERFIELDS
                 WHERE CUSTOM_ID IN ($cc, $ca)
                 GROUP BY CONTACT_ID
             )
             SELECT
-                CONCAT('LLG-', c.ID) AS LLG_ID,
-                p.CANCEL_REQUEST_DATE,
+                CONCAT('LLG-', c.ID)                         AS LLG_ID,
+                TO_VARCHAR(p.CANCEL_REQUEST_DATE, 'MM/DD/YYYY') AS CANCEL_REQUEST_DATE,
                 p.AGENT,
-                c.DROPPED_DATE
+                LEFT(c.DROPPED_DATE, 10)                     AS DROPPED_DATE
             FROM PivotedFields p
             JOIN CONTACTS c ON c.ID = p.CONTACT_ID
-            WHERE p.AGENT IS NOT NULL
+            WHERE p.CANCEL_REQUEST_DATE >= '$start'
+              AND p.CANCEL_REQUEST_DATE <  '$nextDay'
+              AND p.AGENT IS NOT NULL
+              AND p.AGENT NOT LIKE '%@%'
+              AND p.AGENT NOT LIKE '$%'
+              AND p.AGENT NOT RLIKE '^[0-9]'
+              AND p.AGENT NOT RLIKE '^,'
+              AND LENGTH(TRIM(p.AGENT)) > 2
+              AND LOWER(TRIM(p.AGENT)) NOT IN ('sales','email','system','client','voicemail','forth','support','system(text)')
             ORDER BY p.AGENT ASC, p.CANCEL_REQUEST_DATE ASC
         ";
         $res = $sf->query($sql);
-        $rows = $res['data'] ?? [];
-
-        $startTs = strtotime($start);
-        $endTs = strtotime($end . ' 23:59:59');
-
-        $filtered = [];
-        foreach ($rows as $r) {
-            $cd = $r['CANCEL_REQUEST_DATE'] ?? null;
-            if (!$cd) continue;
-            
-            $ts = is_numeric($cd) ? (int)$cd : strtotime($cd);
-            if ($ts >= $startTs && $ts <= $endTs) {
-                $filtered[] = $r;
-            }
-        }
-        return $filtered;
+        return $res['data'] ?? [];
     }
 
     /**
      * Group by agent and check SQL Server TblEmployees for termination.
-     * Returns array of [agent, count, is_terminated].
+     * Returns array of [agent, count, terminated, location].
      */
     private function buildAgentSummary(DBConnector $sqlConn, array $rows): array
     {
@@ -144,19 +135,33 @@ class GenerateCancelRequestsAgentReport extends Command
             $counts[$ag] = ($counts[$ag] ?? 0) + 1;
         }
 
+        // Batch-fetch termination status and location in one query
+        $empMap = [];
+        if (!empty($counts)) {
+            $inList = implode(',', array_map(
+                fn ($a) => "'" . str_replace("'", "''", $a) . "'",
+                array_keys($counts)
+            ));
+            $empRes = $sqlConn->querySqlServer(
+                "SELECT Employee_Name, Location, Term_Date FROM TblEmployees WHERE Employee_Name IN ($inList)"
+            );
+            foreach ($empRes['data'] ?? [] as $empRow) {
+                $name = (string)($empRow['Employee_Name'] ?? $empRow['employee_name'] ?? '');
+                $empMap[$name] = [
+                    'location'   => (string)($empRow['Location']  ?? $empRow['location']  ?? ''),
+                    'terminated' => !empty($empRow['Term_Date']   ?? $empRow['term_date']  ?? null),
+                ];
+            }
+        }
+
         $summary = [];
         foreach ($counts as $agent => $count) {
-            $safe = str_replace("'", "''", $agent);
-            $res  = $sqlConn->querySqlServer(
-                "SELECT COUNT(*) AS cnt FROM TblEmployees WHERE Employee_Name='$safe' AND Term_Date IS NOT NULL"
-            );
-            $row  = ($res['data'] ?? [])[0] ?? null;
-            $terminated = $row ? ((int)($row['cnt'] ?? 0) > 0) : false;
-
+            $emp = $empMap[$agent] ?? null;
             $summary[] = [
-                'agent'       => $agent,
-                'count'       => $count,
-                'terminated'  => $terminated,
+                'agent'      => $agent,
+                'count'      => $count,
+                'terminated' => $emp ? $emp['terminated'] : false,
+                'location'   => $emp ? $emp['location']   : '',
             ];
         }
 
