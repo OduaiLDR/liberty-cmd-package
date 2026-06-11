@@ -158,9 +158,16 @@ class ReportBuilder
      */
     private function buildMetricRow(Section $section, array $rows, array $configs): void
     {
+        // Compute total table width: N blocks + (N-1) separators
+        $blockCount = count($configs);
+        $totalWidth = ($blockCount * self::BLOCK_WIDTH) + (($blockCount - 1) * self::W_SEP);
+
         $outerStyle = [
             'cellMargin' => 0,
             'alignment' => JcTable::CENTER,
+            'layout' => \PhpOffice\PhpWord\Style\Table::LAYOUT_FIXED,
+            'width' => $totalWidth,
+            'unit' => 'dxa',
         ];
 
         $outer = $section->addTable($outerStyle);
