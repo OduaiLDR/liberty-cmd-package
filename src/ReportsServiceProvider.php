@@ -38,7 +38,6 @@ use Cmd\Reports\Console\Commands\GenerateLookbackSummaryReport\GenerateLookbackS
 use Cmd\Reports\Console\Commands\GenerateReportSummary\GenerateReportSummary;
 use Cmd\Reports\Console\Commands\GenerateSyncSummary\GenerateSyncSummary;
 use Cmd\Reports\Console\Commands\GenerateRetentionCommissionReport\GenerateRetentionCommissionReport;
-use Cmd\Reports\Console\Commands\GenerateRetentionCommissionSummary\GenerateRetentionCommissionSummary;
 use Cmd\Reports\Console\Commands\GenerateCancelRequestsAgentReport\GenerateCancelRequestsAgentReport;
 use Cmd\Reports\Console\Commands\GenerateRetentionBonusCommission\GenerateRetentionBonusCommission;
 use Cmd\Reports\Console\Commands\SyncContactsData;
@@ -141,7 +140,6 @@ class ReportsServiceProvider extends ServiceProvider
                 GenerateReportSummary::class,
                 GenerateSyncSummary::class,
                 GenerateRetentionCommissionReport::class,
-                GenerateRetentionCommissionSummary::class,
                 GenerateCancelRequestsAgentReport::class,
                 GenerateRetentionBonusCommission::class,
                 SyncContactsData::class,
