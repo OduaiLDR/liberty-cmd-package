@@ -10,7 +10,7 @@ class GenerateDPPPastDueReport extends Command
 {
     protected $signature = 'Generate:dpp-past-due-report';
 
-    protected $description = 'Generate DPP Past Due report (DPG transactions older than 45 days) for LDR and Progress Law (Snowflake) and email it.';
+    protected $description = 'Generate DPP Past Due report (PF and C transactions older than 45 days), split into Active/Graduated/Dropped sheets, for LDR and Progress Law (Snowflake).';
 
     private const PAST_DUE_DAYS = 45;
 
@@ -30,42 +30,40 @@ class GenerateDPPPastDueReport extends Command
 
         $formatter = new Formatter();
 
-        // LDR
-        try {
-            $this->info('[INFO] Generating LDR DPP Past Due Report...');
-            $ldrRows = $this->fetchPastDueRows($snowflakeLdr);
-            $this->info('[INFO] LDR rows: ' . count($ldrRows));
+        foreach (['LDR' => $snowflakeLdr, 'PLAW' => $snowflakePlaw] as $company => $snowflake) {
+            try {
+                $this->info("[INFO] Generating {$company} DPP Past Due Report...");
+                $rows = $this->fetchPastDueRows($snowflake);
+                $partitioned = $this->partitionByStatus($rows);
 
-            $ldrResult = $formatter->buildWorkbook($ldrRows, 'LDR');
-            $this->info("[INFO] LDR DPP Past Due Report written to {$ldrResult['path']}");
+                $this->info(sprintf(
+                    '[INFO] %s rows: Active=%d, Graduated=%d, Dropped=%d (total=%d)',
+                    $company,
+                    count($partitioned['Active']),
+                    count($partitioned['Graduated']),
+                    count($partitioned['Dropped']),
+                    count($rows)
+                ));
 
-            $formatter->sendReport($sqlConnector, $ldrResult['path'], $ldrResult['filename'], 'LDR', count($ldrRows), $this);
+                $result = $formatter->buildWorkbook($partitioned, $company);
+                $this->info("[INFO] {$company} workbook written to {$result['path']}");
 
-            if (is_file($ldrResult['path'])) {
-                @unlink($ldrResult['path']);
+                $formatter->sendReport(
+                    $sqlConnector,
+                    $result['path'],
+                    $result['filename'],
+                    $company,
+                    $partitioned,
+                    $this
+                );
+
+                if (is_file($result['path'])) {
+                    @unlink($result['path']);
+                }
+            } catch (\Throwable $e) {
+                $this->error("{$company} DPP Past Due Report failed: " . $e->getMessage());
+                Log::error('GenerateDPPPastDueReport: failed', ['company' => $company, 'exception' => $e]);
             }
-        } catch (\Throwable $e) {
-            $this->error('LDR DPP Past Due Report failed: ' . $e->getMessage());
-            Log::error('GenerateDPPPastDueReport: LDR failed', ['exception' => $e]);
-        }
-
-        // PLAW
-        try {
-            $this->info('[INFO] Generating PLAW DPP Past Due Report...');
-            $plawRows = $this->fetchPastDueRows($snowflakePlaw);
-            $this->info('[INFO] PLAW rows: ' . count($plawRows));
-
-            $plawResult = $formatter->buildWorkbook($plawRows, 'PLAW');
-            $this->info("[INFO] PLAW DPP Past Due Report written to {$plawResult['path']}");
-
-            $formatter->sendReport($sqlConnector, $plawResult['path'], $plawResult['filename'], 'PLAW', count($plawRows), $this);
-
-            if (is_file($plawResult['path'])) {
-                @unlink($plawResult['path']);
-            }
-        } catch (\Throwable $e) {
-            $this->error('PLAW DPP Past Due Report failed: ' . $e->getMessage());
-            Log::error('GenerateDPPPastDueReport: PLAW failed', ['exception' => $e]);
         }
 
         return Command::SUCCESS;
@@ -77,24 +75,50 @@ class GenerateDPPPastDueReport extends Command
 
         $sql = "
             SELECT
-                CONTACT_ID,
-                AMOUNT,
-                TO_VARCHAR(PROCESS_DATE::date, 'YYYY-MM-DD') AS PROCESS_DATE,
-                TRANS_TYPE,
-                ID
-            FROM TRANSACTIONS
-            WHERE TRANS_TYPE IN ('DPG')
-              AND PROCESS_DATE <= '{$cutoffDate}'
-              AND CLEARED_DATE IS NULL
-              AND RETURNED_DATE IS NULL
-              AND ACTIVE = 1
-              AND CANCELLED = 0
-              AND AMOUNT > 0
-            ORDER BY PROCESS_DATE ASC
+                t.CONTACT_ID,
+                CONCAT(COALESCE(c.FIRSTNAME, ''), ' ', COALESCE(c.LASTNAME, '')) AS CONTACT_NAME,
+                t.AMOUNT,
+                TO_VARCHAR(t.PROCESS_DATE::date, 'YYYY-MM-DD') AS PROCESS_DATE,
+                t.TRANS_TYPE,
+                CASE
+                    WHEN c.DROPPED = 1 THEN 'Dropped'
+                    WHEN c.GRADUATED = 1 THEN 'Graduated'
+                    WHEN c.ENROLLED = 1 THEN 'Active'
+                    ELSE 'Other'
+                END AS STATUS_CATEGORY
+            FROM TRANSACTIONS t
+            LEFT JOIN CONTACTS c ON t.CONTACT_ID = c.ID
+            WHERE t.TRANS_TYPE IN ('PF', 'C')
+              AND t.PROCESS_DATE <= '{$cutoffDate}'
+              AND t.CLEARED_DATE IS NULL
+              AND t.RETURNED_DATE IS NULL
+              AND t.ACTIVE = 1
+              AND t.CANCELLED = 0
+              AND t.AMOUNT > 0
+              AND (c.DROPPED = 1 OR c.GRADUATED = 1 OR c.ENROLLED = 1)
+            ORDER BY t.PROCESS_DATE ASC
         ";
 
         $result = $snowflake->query($sql);
         return $result['data'] ?? [];
+    }
+
+    private function partitionByStatus(array $rows): array
+    {
+        $partitioned = [
+            'Active' => [],
+            'Graduated' => [],
+            'Dropped' => [],
+        ];
+
+        foreach ($rows as $row) {
+            $category = $row['STATUS_CATEGORY'] ?? null;
+            if (isset($partitioned[$category])) {
+                $partitioned[$category][] = $row;
+            }
+        }
+
+        return $partitioned;
     }
 
     protected function initializeSqlServerConnector(): DBConnector

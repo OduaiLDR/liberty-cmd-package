@@ -17,16 +17,28 @@ use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 
 class Formatter
 {
-    public function buildWorkbook(array $rows, string $source): array
+    /** @var string[] Sheet order matches Jacob's request */
+    private const SHEET_ORDER = ['Active', 'Graduated', 'Dropped'];
+
+    /**
+     * Build a single workbook with 3 sheets (Active / Graduated / Dropped).
+     *
+     * @param array $partitioned ['Active' => [...], 'Graduated' => [...], 'Dropped' => [...]]
+     */
+    public function buildWorkbook(array $partitioned, string $source): array
     {
         $spreadsheet = new Spreadsheet();
-        $sheet = $spreadsheet->getActiveSheet();
+        $spreadsheet->removeSheetByIndex(0);
 
-        $sheet->setTitle($this->truncateSheetTitle('DPP Past Due Report'));
-        $sheet->setShowGridlines(false);
+        foreach (self::SHEET_ORDER as $sheetName) {
+            $sheet = $spreadsheet->createSheet();
+            $sheet->setTitle($this->truncateSheetTitle($sheetName));
+            $sheet->setShowGridlines(false);
+            $this->buildSheet($sheet, $partitioned[$sheetName] ?? []);
+        }
 
-        $this->buildSheet($sheet, $rows);
-        $sheet->setSelectedCells('A1');
+        $spreadsheet->setActiveSheetIndexByName('Active');
+        $spreadsheet->getActiveSheet()->setSelectedCells('A1');
 
         $filename = 'DPP Past Due Report - ' . $source . ' - ' . date('m-d-Y') . '.xlsx';
         $path = storage_path('app/' . $filename);
@@ -46,7 +58,7 @@ class Formatter
         string $path,
         string $filename,
         string $company,
-        int $rowCount,
+        array $partitioned,
         ?Command $console = null
     ): bool {
         if (!is_file($path)) {
@@ -69,12 +81,15 @@ class Formatter
         $today = date('m/d/Y');
         $subject = 'DPP Past Due Report - ' . $company . ' - ' . $today;
 
-        $countNote = $rowCount === 0
-            ? 'No past-due DPG transactions were found for this period.'
-            : sprintf('Found %d past-due DPG transaction%s for review.', $rowCount, $rowCount === 1 ? '' : 's');
+        $activeCount = count($partitioned['Active'] ?? []);
+        $graduatedCount = count($partitioned['Graduated'] ?? []);
+        $droppedCount = count($partitioned['Dropped'] ?? []);
 
         $body = 'Please see the attached DPP Past Due Report for ' . $company . ' on ' . $today . '.<br><br>'
-            . $countNote . '<br><br>'
+            . 'Breakdown of past-due PF/C transactions by client status:<br>'
+            . '&bull; <b>Active:</b> ' . number_format($activeCount) . '<br>'
+            . '&bull; <b>Graduated:</b> ' . number_format($graduatedCount) . '<br>'
+            . '&bull; <b>Dropped:</b> ' . number_format($droppedCount) . '<br><br>'
             . 'Can you review this attachment and cancel these past due fees or advise on what we should do with these fees?<br><br>'
             . 'Thanks';
 
@@ -105,37 +120,49 @@ class Formatter
     {
         $headers = [
             'Contact ID',
+            'Contact Name',
             'Amount',
             'Process Date',
             'Trans Type',
-            'ID',
         ];
 
         $sheet->fromArray($headers, null, 'A1');
         $this->styleHeader($sheet, 'A1:E1');
 
+        if (empty($rows)) {
+            $sheet->setCellValue('A2', 'No past-due transactions found.');
+            $sheet->mergeCells('A2:E2');
+            $sheet->getStyle('A2')
+                ->getFont()->setItalic(true)->setSize(10);
+            $sheet->getStyle('A2')
+                ->getAlignment()->setHorizontal(Alignment::HORIZONTAL_CENTER);
+            $this->applyAutoWidths($sheet, 5);
+            $this->applyFont($sheet, "A1:E2");
+            return;
+        }
+
         $rowIndex = 2;
         foreach ($rows as $row) {
             $this->setIdCell($sheet, "A{$rowIndex}", $row['CONTACT_ID'] ?? null);
+            $sheet->setCellValue("B{$rowIndex}", trim((string) ($row['CONTACT_NAME'] ?? '')));
 
             $amount = $row['AMOUNT'] ?? null;
             if ($amount === null || $amount === '') {
-                $sheet->setCellValue("B{$rowIndex}", 0);
+                $sheet->setCellValue("C{$rowIndex}", 0);
             } else {
-                $sheet->setCellValue("B{$rowIndex}", (float) $amount);
+                $sheet->setCellValue("C{$rowIndex}", (float) $amount);
             }
 
-            $this->setDateCell($sheet, "C{$rowIndex}", $row['PROCESS_DATE'] ?? null);
-            $sheet->setCellValue("D{$rowIndex}", (string) ($row['TRANS_TYPE'] ?? ''));
-            $this->setIdCell($sheet, "E{$rowIndex}", $row['ID'] ?? null);
+            $this->setDateCell($sheet, "D{$rowIndex}", $row['PROCESS_DATE'] ?? null);
+            $sheet->setCellValue("E{$rowIndex}", (string) ($row['TRANS_TYPE'] ?? ''));
 
             $rowIndex++;
         }
 
         $lastRow = max(2, $rowIndex - 1);
 
-        $sheet->getStyle("B2:B{$lastRow}")->getNumberFormat()->setFormatCode('$#,##0.00');
-        $sheet->getStyle("C2:C{$lastRow}")->getNumberFormat()->setFormatCode('mm/dd/yyyy');
+        $sheet->getStyle("C2:C{$lastRow}")->getNumberFormat()->setFormatCode('$#,##0.00');
+        $sheet->getStyle("D2:D{$lastRow}")->getNumberFormat()->setFormatCode('mm/dd/yyyy');
 
         $this->applyBorders($sheet, "A1:E{$lastRow}");
         $this->applyAutoWidths($sheet, 5);
