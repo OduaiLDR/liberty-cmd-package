@@ -12,7 +12,7 @@ class SyncPhoneNumbers extends Command
 
     protected $description = 'Sync LT phone numbers from Snowflake CONTACTS into LDR SQL Server TblPhoneNumbers.';
 
-    private const SOURCE = 'LT';
+    private const SOURCE = 'DP';
     private const SNOWFLAKE_ENV = 'lt';
 
     public function handle(): int
