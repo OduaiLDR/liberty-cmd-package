@@ -196,7 +196,7 @@ class SyncEnrollmentData extends Command
             SELECT cs.CONTACT_ID, LEFT(cs.STAMP, 10) AS CANCEL_DATE
             FROM CONTACTS_STATUS cs
             JOIN CONTACTS_LEAD_STATUS cls ON cs.STATUS_ID = cls.ID
-            WHERE UPPER(TRIM(cls.TITLE)) = 'DROPPED / CANCELLED'
+            WHERE UPPER(cls.TITLE) LIKE '%CANCELLED%'
               AND cs._FIVETRAN_DELETED = FALSE
             QUALIFY ROW_NUMBER() OVER (PARTITION BY cs.CONTACT_ID ORDER BY cs.STAMP DESC) = 1
         ";
