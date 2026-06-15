@@ -74,8 +74,15 @@ class GenerateLookbackSummaryReport extends Command
             LEFT JOIN TblEnrollment AS e3 ON e1.LLG_ID = e3.LLG_ID AND e3.Lookback_Date IS NOT NULL
             WHERE e1.Debt_Sold_To = 'NGF'
               AND e1.Cancel_Date IS NOT NULL
-              AND e1.Cancel_Date >= DATEADD(day, 3, d.Payment_Date)
-              AND e1.Cancel_Date <= DATEADD(day, 57, d.Payment_Date)
+              AND (
+                  (d.Tranche <= 46
+                    AND e1.Cancel_Date >= DATEADD(day, 3, d.Payment_Date)
+                    AND e1.Cancel_Date <= DATEADD(day, 57, d.Payment_Date))
+                  OR
+                  (d.Tranche >= 47
+                    AND e1.Cancel_Date > d.Payment_Date
+                    AND e1.Cancel_Date <= DATEADD(day, 59, d.Payment_Date))
+              )
             GROUP BY d.Tranche, d.Payment_Date
             ORDER BY d.Tranche DESC
         ";
