@@ -67,7 +67,7 @@ class Formatter
         $sent = $email->sendMailHtml(
             $subject,
             $body,
-            ['oduai@libertydebtrelief.com', 'jacob@libertydebtrelief.com']
+            ['oduai@libertydebtrelief.com']
         );
         
         if ($sent) {
