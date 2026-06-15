@@ -172,25 +172,46 @@ class SyncEnrollmentData extends Command
         $enrollmentData = $sqlConnector->querySqlServer($sql);
         $this->info("[INFO] Processing " . count($enrollmentData) . " enrollment records for Cancel_Date");
 
-        // Get DROPPED_DATE from Snowflake
+        // Primary source: CONTACTS.DROPPED_DATE
         $snowflakeSql = "
-            SELECT ID, DROPPED_DATE
+            SELECT ID, LEFT(DROPPED_DATE, 10) AS DROPPED_DATE
             FROM CONTACTS
             WHERE _FIVETRAN_DELETED = FALSE
               AND DROPPED_DATE IS NOT NULL
         ";
-        $snowflakeResult = $snowflake->query($snowflakeSql);
-        $droppedDates = $snowflakeResult['data'] ?? [];
+        $droppedDates = $snowflake->query($snowflakeSql)['data'] ?? [];
 
-        // Create lookup map
         $droppedMap = [];
         foreach ($droppedDates as $row) {
             $id = $row['ID'] ?? null;
-            $droppedDate = $row['DROPPED_DATE'] ?? null;
-            if ($id && $droppedDate) {
-                $droppedMap[$id] = $droppedDate;
+            $date = $row['DROPPED_DATE'] ?? null;
+            if ($id && $date) {
+                $droppedMap[(string) $id] = $date;
             }
         }
+
+        // Fallback source: CONTACTS_STATUS with "Dropped / Cancelled" lead status
+        // Covers contacts where DROPPED_DATE was never set in CONTACTS
+        $statusSql = "
+            SELECT cs.CONTACT_ID, LEFT(cs.STAMP, 10) AS CANCEL_DATE
+            FROM CONTACTS_STATUS cs
+            JOIN CONTACTS_LEAD_STATUS cls ON cs.STATUS_ID = cls.ID
+            WHERE UPPER(TRIM(cls.TITLE)) = 'DROPPED / CANCELLED'
+              AND cs._FIVETRAN_DELETED = FALSE
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY cs.CONTACT_ID ORDER BY cs.STAMP DESC) = 1
+        ";
+        $statusDates = $snowflake->query($statusSql)['data'] ?? [];
+
+        $statusMap = [];
+        foreach ($statusDates as $row) {
+            $id = $row['CONTACT_ID'] ?? null;
+            $date = $row['CANCEL_DATE'] ?? null;
+            if ($id && $date) {
+                $statusMap[(string) $id] = $date;
+            }
+        }
+
+        $this->info("[INFO] Found " . count($droppedMap) . " DROPPED_DATE entries, " . count($statusMap) . " status-based cancel dates");
 
         $updated = 0;
         foreach ($enrollmentData as $enrollment) {
@@ -201,25 +222,27 @@ class SyncEnrollmentData extends Command
                 continue;
             }
 
-            // Remove LLG- prefix to get contact ID
             $contactId = str_replace('LLG-', '', $llgId);
 
-            if (isset($droppedMap[$contactId])) {
-                $droppedDate = $droppedMap[$contactId];
+            // Use DROPPED_DATE first, fall back to status stamp
+            $droppedDate = $droppedMap[$contactId] ?? $statusMap[$contactId] ?? null;
 
-                // Update if Cancel_Date is empty or if dropped date is later
-                if (!$currentCancelDate || (strtotime($droppedDate) > strtotime($currentCancelDate))) {
-                    $updateSql = "
-                        UPDATE TblEnrollment
-                        SET Cancel_Date = '{$this->esc($droppedDate)}'
-                        WHERE LLG_ID = '{$this->esc($llgId)}'
-                    ";
-                    $sqlConnector->querySqlServer($updateSql);
-                    $updated++;
+            if ($droppedDate === null) {
+                continue;
+            }
 
-                    if ($updated % 100 === 0) {
-                        $this->info("[INFO] Updated {$updated} Cancel_Date records...");
-                    }
+            // Update if Cancel_Date is empty or the new date is later
+            if (!$currentCancelDate || (strtotime($droppedDate) > strtotime($currentCancelDate))) {
+                $updateSql = "
+                    UPDATE TblEnrollment
+                    SET Cancel_Date = '{$this->esc($droppedDate)}'
+                    WHERE LLG_ID = '{$this->esc($llgId)}'
+                ";
+                $sqlConnector->querySqlServer($updateSql);
+                $updated++;
+
+                if ($updated % 100 === 0) {
+                    $this->info("[INFO] Updated {$updated} Cancel_Date records...");
                 }
             }
         }
