@@ -64,10 +64,12 @@ class Formatter
     {
         $email = new EmailSenderService();
 
-        $sent = $email->sendMailHtml(
+        $sent = $email->sendMailUsingTblReportsHtml(
+            $connector,
+            ['Lookback Summary'],
+            ['LDR'],
             $subject,
-            $body,
-            ['oduai@libertydebtrelief.com']
+            $body
         );
         
         if ($sent) {
