@@ -172,42 +172,59 @@ class SyncEnrollmentData extends Command
         $enrollmentData = $sqlConnector->querySqlServer($sql);
         $this->info("[INFO] Processing " . count($enrollmentData) . " enrollment records for Cancel_Date");
 
-        // Primary source: CONTACTS.DROPPED_DATE
-        $snowflakeSql = "
-            SELECT ID, LEFT(DROPPED_DATE, 10) AS DROPPED_DATE
-            FROM CONTACTS
-            WHERE _FIVETRAN_DELETED = FALSE
-              AND DROPPED_DATE IS NOT NULL
-        ";
-        $droppedDates = $snowflake->query($snowflakeSql)['data'] ?? [];
-
-        $droppedMap = [];
-        foreach ($droppedDates as $row) {
-            $id = $row['ID'] ?? null;
-            $date = $row['DROPPED_DATE'] ?? null;
-            if ($id && $date) {
-                $droppedMap[(string) $id] = $date;
-            }
+        // Query BOTH Snowflake sources — contacts with Category=LDR may exist in PLAW Snowflake and vice versa
+        $otherSource = strtolower($this->source) === 'ldr' ? 'plaw' : 'ldr';
+        $snowflakeSources = [$snowflake];
+        try {
+            $snowflakeSources[] = DBConnector::fromEnvironment($otherSource);
+        } catch (\Throwable $e) {
+            $this->warn("[WARN] Could not connect to $otherSource Snowflake: " . $e->getMessage());
         }
 
-        // Fallback source: CONTACTS_STATUS with "Dropped / Cancelled" lead status
-        // Covers contacts where DROPPED_DATE was never set in CONTACTS
-        $statusSql = "
-            SELECT cs.CONTACT_ID, LEFT(cs.STAMP, 10) AS CANCEL_DATE
-            FROM CONTACTS_STATUS cs
-            JOIN CONTACTS_LEAD_STATUS cls ON cs.STATUS_ID = cls.ID
-            WHERE UPPER(cls.TITLE) LIKE '%CANCELLED%'
-              AND cs._FIVETRAN_DELETED = FALSE
-            QUALIFY ROW_NUMBER() OVER (PARTITION BY cs.CONTACT_ID ORDER BY cs.STAMP DESC) = 1
-        ";
-        $statusDates = $snowflake->query($statusSql)['data'] ?? [];
+        $droppedMap = [];
+        $statusMap  = [];
 
-        $statusMap = [];
-        foreach ($statusDates as $row) {
-            $id = $row['CONTACT_ID'] ?? null;
-            $date = $row['CANCEL_DATE'] ?? null;
-            if ($id && $date) {
-                $statusMap[(string) $id] = $date;
+        foreach ($snowflakeSources as $sf) {
+            // Primary: CONTACTS.DROPPED_DATE
+            try {
+                $rows = $sf->query("
+                    SELECT ID, LEFT(DROPPED_DATE, 10) AS DROPPED_DATE
+                    FROM CONTACTS
+                    WHERE _FIVETRAN_DELETED = FALSE
+                      AND DROPPED_DATE IS NOT NULL
+                ")['data'] ?? [];
+
+                foreach ($rows as $row) {
+                    $id   = (string) ($row['ID'] ?? '');
+                    $date = $this->normalizeSnowflakeDate($row['DROPPED_DATE'] ?? null);
+                    if ($id !== '' && $date !== null && !isset($droppedMap[$id])) {
+                        $droppedMap[$id] = $date;
+                    }
+                }
+            } catch (\Throwable $e) {
+                $this->warn("[WARN] CONTACTS query failed: " . $e->getMessage());
+            }
+
+            // Fallback: CONTACTS_STATUS with any cancelled status title
+            try {
+                $rows = $sf->query("
+                    SELECT cs.CONTACT_ID, LEFT(cs.STAMP, 10) AS CANCEL_DATE
+                    FROM CONTACTS_STATUS cs
+                    JOIN CONTACTS_LEAD_STATUS cls ON cs.STATUS_ID = cls.ID
+                    WHERE UPPER(cls.TITLE) LIKE '%CANCELLED%'
+                      AND cs._FIVETRAN_DELETED = FALSE
+                    QUALIFY ROW_NUMBER() OVER (PARTITION BY cs.CONTACT_ID ORDER BY cs.STAMP DESC) = 1
+                ")['data'] ?? [];
+
+                foreach ($rows as $row) {
+                    $id   = (string) ($row['CONTACT_ID'] ?? '');
+                    $date = $this->normalizeSnowflakeDate($row['CANCEL_DATE'] ?? null);
+                    if ($id !== '' && $date !== null && !isset($statusMap[$id])) {
+                        $statusMap[$id] = $date;
+                    }
+                }
+            } catch (\Throwable $e) {
+                $this->warn("[WARN] CONTACTS_STATUS query failed: " . $e->getMessage());
             }
         }
 
@@ -248,6 +265,28 @@ class SyncEnrollmentData extends Command
         }
 
         $this->info("[INFO] Updated {$updated} Cancel_Date records");
+    }
+
+    /**
+     * Normalize a Snowflake date value — handles ISO strings and Excel serial numbers.
+     * PLAW Snowflake stores DROPPED_DATE as Excel serial integers (e.g. 20540 = 2026-03-26).
+     */
+    private function normalizeSnowflakeDate(mixed $value): ?string
+    {
+        if ($value === null || $value === '') {
+            return null;
+        }
+
+        // Excel serial number: integer-like value with no dashes
+        if (is_numeric($value) && !str_contains((string) $value, '-')) {
+            // Excel epoch is 1899-12-30
+            $timestamp = mktime(0, 0, 0, 12, 30, 1899) + ((int) $value * 86400);
+            return date('Y-m-d', $timestamp);
+        }
+
+        // ISO string or datetime — take first 10 chars
+        $date = substr((string) $value, 0, 10);
+        return strtotime($date) !== false ? $date : null;
     }
 
     private function updatePayments(DBConnector $snowflake, DBConnector $sqlConnector): void
