@@ -21,31 +21,18 @@ use Cmd\Reports\Console\Commands\SyncEnrollmentData;
 use Cmd\Reports\Console\Commands\SyncVerifiedDebts;
 use Cmd\Reports\Console\Commands\GenerateCompanyStatsReport\GenerateCompanyStatsReport;
 use Cmd\Reports\Console\Commands\GenerateLegalReport\GenerateLegalReport;
-use Cmd\Reports\Console\Commands\GenerateDPPPastDueReport\GenerateDPPPastDueReport;
-use Cmd\Reports\Console\Commands\GenerateNSFReport\GenerateNSFReport;
-use Cmd\Reports\Console\Commands\GeneratePauseHoldReport\GeneratePauseHoldReport;
-use Cmd\Reports\Console\Commands\GenerateGraduationReport\GenerateGraduationReport;
-use Cmd\Reports\Console\Commands\GenerateSuppressionReport\GenerateSuppressionReport;
 use Cmd\Reports\Console\Commands\GenerateWelcomeLetterReport\GenerateWelcomeLetterReport;
 use Cmd\Reports\Console\Commands\GenerateWelcomePacketReport\GenerateWelcomePacketReport;
 use Cmd\Reports\Console\Commands\GenerateDroppedReport\GenerateDroppedReport;
 use Cmd\Reports\Console\Commands\GenerateScrubListReport\GenerateScrubListReport;
-use Cmd\Reports\Console\Commands\GenerateScrubListReportPLAW\GenerateScrubListReportPLAW;
-use Cmd\Reports\Console\Commands\GenerateScrubListReportLDR\GenerateScrubListReportLDR;
-use Cmd\Reports\Console\Commands\GenerateSettlementReports\GenerateSettlementReports;
 use Cmd\Reports\Console\Commands\GenerateLookbackSummaryReport\GenerateLookbackSummaryReport;
 use Cmd\Reports\Console\Commands\GenerateReportSummary\GenerateReportSummary;
 use Cmd\Reports\Console\Commands\GenerateSyncSummary\GenerateSyncSummary;
-use Cmd\Reports\Console\Commands\GenerateRetentionCommissionReport\GenerateRetentionCommissionReport;
-use Cmd\Reports\Console\Commands\GenerateCancelRequestsAgentReport\GenerateCancelRequestsAgentReport;
-use Cmd\Reports\Console\Commands\GenerateRetentionBonusCommission\GenerateRetentionBonusCommission;
 use Cmd\Reports\Console\Commands\SyncContactsData;
 use Cmd\Reports\Console\Commands\SyncCollectionCompanies;
 use Cmd\Reports\Console\Commands\SyncLastDepositDate;
 use Cmd\Reports\Console\Commands\SyncVeritasTransactions;
-use Cmd\Reports\Console\Commands\ProcessAgentTrainingCompletions;
 use Cmd\Reports\Console\Commands\SyncPhoneNumbers;
-use Cmd\Reports\Console\Commands\SyncCalls;
 use Cmd\Reports\Console\Commands\RefreshForthApiTokens;
 use Cmd\Reports\Console\Commands\SyncNegotiatorPayrollData;
 use Cmd\Reports\Console\Commands\UpdateLendingUSAStatuses;
@@ -65,7 +52,6 @@ use Cmd\Reports\Pmod\Enums\PmodActionType;
 use Cmd\Reports\Pmod\Services\ForthPayPmodExecutionGateway;
 use Cmd\Reports\Pmod\Services\PmodDispatcher;
 use Cmd\Reports\Pmod\Services\PmodEmailNotificationService;
-use Cmd\Reports\Console\Commands\SyncAgentCommissionTierEnrollments;
 
 
 
@@ -122,35 +108,21 @@ class ReportsServiceProvider extends ServiceProvider
                 SyncVerifiedDebts::class,
                 GenerateCompanyStatsReport::class,
                 GenerateLegalReport::class,
-                GenerateDPPPastDueReport::class,
-                GenerateNSFReport::class,
-                GeneratePauseHoldReport::class,
-                GenerateGraduationReport::class,
-                GenerateSuppressionReport::class,
                 GenerateWelcomeLetterReport::class,
                 GenerateWelcomePacketReport::class,
                 GenerateDroppedReport::class,
                 GenerateScrubListReport::class,
-                GenerateScrubListReportPLAW::class,
-                GenerateScrubListReportLDR::class,
-                GenerateSettlementReports::class,
                 GenerateLookbackSummaryReport::class,
                 GenerateReportSummary::class,
                 GenerateSyncSummary::class,
-                GenerateRetentionCommissionReport::class,
-                GenerateCancelRequestsAgentReport::class,
-                GenerateRetentionBonusCommission::class,
                 SyncContactsData::class,
                 SyncCollectionCompanies::class,
                 SyncLastDepositDate::class,
                 SyncVeritasTransactions::class,
-                ProcessAgentTrainingCompletions::class,
                 SyncPhoneNumbers::class,
-                SyncCalls::class,
                 SyncNegotiatorPayrollData::class,
                 RefreshForthApiTokens::class,
                 UpdateLendingUSAStatuses::class,
-                SyncAgentCommissionTierEnrollments::class,
             ]);
         }
 
