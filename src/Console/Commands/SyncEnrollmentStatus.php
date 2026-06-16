@@ -328,7 +328,7 @@ SQL;
             $nsfDate = $row['nsf_date'] ?? '';
 
             $compareStatus = $currentStatus;
-            if ($this->equalsIgnoreCase($newStatus, 'Dropped / Cancelled') && $cancelDate === '') {
+            if ($this->containsCancelled($newStatus) && $cancelDate === '') {
                 $compareStatus = '';
             } elseif ($this->containsNsf($newStatus) && $nsfDate === '') {
                 $compareStatus = '';
@@ -342,7 +342,7 @@ SQL;
             $sql = '';
 
             if ($compareStatus !== $newStatus) {
-                if ($this->equalsIgnoreCase($newStatus, 'Dropped / Cancelled')) {
+                if ($this->containsCancelled($newStatus)) {
                     $cancelValue = $stamp === '' ? 'NULL' : "'" . $stampEsc . "'";
                     $sql = "UPDATE TblEnrollment SET Enrollment_Status = '{$statusEsc}', Cancel_Date = {$cancelValue}, NSF_Date = NULL WHERE LLG_ID = '{$llgEsc}'";
                 } elseif ($this->containsNsf($newStatus)) {
@@ -389,6 +389,11 @@ SQL;
     protected function equalsIgnoreCase(string $left, string $right): bool
     {
         return strcasecmp($left, $right) === 0;
+    }
+
+    protected function containsCancelled(string $value): bool
+    {
+        return stripos($value, 'Cancelled') !== false;
     }
 
     protected function containsNsf(string $value): bool

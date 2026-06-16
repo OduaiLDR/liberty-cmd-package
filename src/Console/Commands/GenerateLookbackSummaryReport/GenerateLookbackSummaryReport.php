@@ -69,13 +69,20 @@ class GenerateLookbackSummaryReport extends Command
                 SUM(e2.Sold_Debt) * 0.08 AS Pending_Lookback,
                 SUM(e3.Sold_Debt) * 0.08 AS Completed_Lookback
             FROM TblEnrollment AS e1
-            LEFT JOIN TblDebtTrancheSales AS d ON e1.Tranche = d.Tranche
+            LEFT JOIN TblDebtTrancheSales AS d ON CAST(e1.Tranche AS INT) = CAST(d.Tranche AS INT)
             LEFT JOIN TblEnrollment AS e2 ON e1.LLG_ID = e2.LLG_ID AND e2.Lookback_Date IS NULL
             LEFT JOIN TblEnrollment AS e3 ON e1.LLG_ID = e3.LLG_ID AND e3.Lookback_Date IS NOT NULL
             WHERE e1.Debt_Sold_To = 'NGF'
               AND e1.Cancel_Date IS NOT NULL
-              AND e1.Cancel_Date >= DATEADD(day, 3, d.Payment_Date)
-              AND e1.Cancel_Date <= DATEADD(day, 57, d.Payment_Date)
+              AND (
+                  (CAST(e1.Tranche AS INT) <= 46
+                    AND e1.Cancel_Date >= DATEADD(day, 3, d.Payment_Date)
+                    AND e1.Cancel_Date <= DATEADD(day, 57, d.Payment_Date))
+                  OR
+                  (CAST(e1.Tranche AS INT) >= 47
+                    AND e1.Cancel_Date >= d.Payment_Date
+                    AND e1.Cancel_Date <= DATEADD(day, 59, d.Payment_Date))
+              )
             GROUP BY d.Tranche, d.Payment_Date
             ORDER BY d.Tranche DESC
         ";

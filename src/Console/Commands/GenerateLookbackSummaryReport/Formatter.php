@@ -30,6 +30,12 @@ class Formatter
         $table .= '</tr>';
 
         foreach ($rows as $row) {
+            $tranche = (int) ($row['Tranche'] ?? 0);
+            if ($tranche < 47 && $tranche > 0) {
+                $row['Total_Lookback'] = $row['Completed_Lookback'] ?? 0;
+                $row['Pending_Lookback'] = 0;
+            }
+
             $table .= '<tr>';
             $table .= '<td style="border: 1px solid #000; padding: 4px; text-align: center;">' . htmlspecialchars((string) ($row['Tranche'] ?? '')) . '</td>';
 
