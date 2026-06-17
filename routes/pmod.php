@@ -6,7 +6,7 @@ use Cmd\Reports\Pmod\Http\Controllers\PmodCsAgentRequestController;
 use Cmd\Reports\Pmod\Http\Controllers\PmodPortalWebhookController;
 use Illuminate\Support\Facades\Route;
 
-Route::middleware('web')->group(function (): void {
+Route::middleware('api')->group(function (): void {
     Route::post('/webhooks/pmod-approval', PmodPortalWebhookController::class)
         ->name('webhooks.pmod-approval');
 });
