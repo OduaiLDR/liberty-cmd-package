@@ -218,9 +218,6 @@
                         @if(!empty($settings->Tiebreaker))
                             <tr><th class="table-secondary">Tiebreaker</th><td>{{ $settings->Tiebreaker }}</td></tr>
                         @endif
-                        @if(!empty($settings->Notes))
-                            <tr><th class="table-secondary">Notes</th><td>{{ $settings->Notes }}</td></tr>
-                        @endif
                     </tbody>
                 </table>
             </div>
