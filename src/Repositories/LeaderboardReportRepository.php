@@ -156,6 +156,7 @@ class LeaderboardReportRepository extends SqlSrvRepository
                 . 'FROM TblEnrollment '
                 . 'WHERE Submitted_Date >= ? AND Submitted_Date <= ? '
                 . 'AND (Cancel_Date IS NULL OR Cancel_Date > ?) AND (NSF_Date IS NULL OR NSF_Date > ?) '
+                . "AND Agent IS NOT NULL AND Agent <> '' "
                 . 'GROUP BY Agent ORDER BY COUNT(*) DESC, SUM(Debt_Amount) DESC',
                 [$from, $to, $cutoff, $cutoff]
             ),
@@ -164,6 +165,7 @@ class LeaderboardReportRepository extends SqlSrvRepository
                 . 'FROM TblEnrollment '
                 . 'WHERE Submitted_Date >= ? AND Submitted_Date <= ? '
                 . 'AND (Cancel_Date IS NULL OR Cancel_Date > ?) AND (NSF_Date IS NULL OR NSF_Date > ?) '
+                . "AND Agent IS NOT NULL AND Agent <> '' "
                 . 'GROUP BY Agent ORDER BY SUM(Debt_Amount) DESC, COUNT(*) DESC',
                 [$from, $to, $cutoff, $cutoff]
             ),
@@ -175,6 +177,7 @@ class LeaderboardReportRepository extends SqlSrvRepository
                 . 'WHERE Submitted_Date >= ? AND Submitted_Date <= ? '
                 . 'AND (Cancel_Date IS NULL OR Cancel_Date > EOMONTH(Submitted_Date)) '
                 . 'AND (NSF_Date IS NULL OR NSF_Date > EOMONTH(Submitted_Date)) '
+                . "AND Agent IS NOT NULL AND Agent <> '' "
                 . 'GROUP BY Agent '
                 . 'HAVING SUM(CASE WHEN COALESCE(Payment_Date_2, Payment_Date_1) <= EOMONTH(Submitted_Date) THEN 1 ELSE 0 END) > 0 '
                 . 'ORDER BY amount DESC, debt DESC',
@@ -190,6 +193,7 @@ class LeaderboardReportRepository extends SqlSrvRepository
                 . 'FROM ('
                 . 'SELECT Agent, COUNT(*) AS contacts FROM TblContacts '
                 . 'WHERE COALESCE(Assigned_Date, Created_Date) >= ? AND COALESCE(Assigned_Date, Created_Date) < ? '
+                . "AND Agent IS NOT NULL AND Agent <> '' "
                 . 'GROUP BY Agent HAVING COUNT(*) >= ?'
                 . ') c '
                 . 'LEFT JOIN ('
@@ -209,6 +213,7 @@ class LeaderboardReportRepository extends SqlSrvRepository
                 . 'COUNT(*) AS deals, SUM(Debt_Amount) AS debt '
                 . 'FROM TblEnrollment '
                 . 'WHERE Submitted_Date >= ? AND Submitted_Date <= ? '
+                . "AND Agent IS NOT NULL AND Agent <> '' "
                 . 'GROUP BY Agent HAVING COUNT(*) >= ? '
                 . 'ORDER BY amount ASC, COUNT(*) DESC',
                 [$from, $to, $half]
@@ -217,6 +222,7 @@ class LeaderboardReportRepository extends SqlSrvRepository
                 'SELECT TOP (4) Agent AS agent, COUNT(*) AS amount, COUNT(*) AS deals, SUM(Debt_Amount) AS debt '
                 . 'FROM TblEnrollment '
                 . "WHERE Cancel_Date IS NULL AND NSF_Date IS NULL AND Category = 'LDR' "
+                . "AND Agent IS NOT NULL AND Agent <> '' "
                 . 'GROUP BY Agent ORDER BY COUNT(*) DESC, SUM(Debt_Amount) DESC',
                 []
             ),
@@ -226,6 +232,7 @@ class LeaderboardReportRepository extends SqlSrvRepository
                 . 'FROM TblEnrollment '
                 . 'WHERE COALESCE(Payment_Date_2, Payment_Date_1) >= ? AND Submitted_Date <= ? '
                 . 'AND Cancel_Date IS NULL AND NSF_Date IS NULL '
+                . "AND Agent IS NOT NULL AND Agent <> '' "
                 . 'ORDER BY Debt_Amount DESC',
                 [$w['report']->copy()->startOfMonth()->subMonths(4)->format('Y-m-d'), $to]
             ),
@@ -366,6 +373,7 @@ class LeaderboardReportRepository extends SqlSrvRepository
             'SELECT TOP (4) e.Employee_Name AS agent, l.Amount AS amount, l.Tiebreaker_1 AS tb1, l.Tiebreaker_2 AS tb2, l.Leaderboard_Date AS record_date '
             . 'FROM TblLeaderboard AS l JOIN TblEmployees AS e ON l.Agent_ID = e.PK '
             . 'WHERE l.Category = ? AND l.Period = ? '
+            . "AND e.Employee_Name IS NOT NULL AND e.Employee_Name <> '' "
             . "ORDER BY l.Amount {$dir}, l.Tiebreaker_1 DESC, l.Tiebreaker_2 DESC",
             [$category, $period]
         );
@@ -447,6 +455,7 @@ FROM (
     FROM TblLeaderboard l
     JOIN TblEmployees e ON l.Agent_ID = e.PK
     WHERE l.Category NOT LIKE '% - Company-Wide'
+      AND e.Employee_Name IS NOT NULL AND e.Employee_Name <> ''
 ) ranked
 WHERE place <= 4
 GROUP BY agent
@@ -502,7 +511,7 @@ SQL;
         $fmt = fn($d) => $d ? Carbon::parse($d)->format('m/d/Y') : '';
 
         return sprintf(
-            'LLG-ID: %s | Client: %s | Welcome Call: %s | Payment: %s | Payments: %s',
+            'LLG-ID: %s | Client: %s | Submitted: %s | Payment: %s | Payments: %s',
             $row->llg_id ?? '',
             $row->client ?? '',
             $fmt($row->submitted_date ?? null),
