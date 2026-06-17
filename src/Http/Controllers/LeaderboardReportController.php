@@ -50,6 +50,15 @@ class LeaderboardReportController extends Controller
             'currentCompany' => $this->repository->currentCompany($category, $period),
             'recordHolders' => $this->repository->recordHolders($category, $period),
             'companyRecord' => $this->repository->companyRecord($category, $period),
+        ]);
+    }
+
+    /**
+     * Standalone Total Records page (all-time standings, category/period-independent).
+     */
+    public function totalRecords(): View
+    {
+        return view('reports::reports.leaderboard_total_records', [
             'totalRecords' => $this->repository->totalRecords(),
         ]);
     }

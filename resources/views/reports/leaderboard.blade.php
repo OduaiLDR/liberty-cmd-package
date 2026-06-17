@@ -36,32 +36,27 @@
             return $pos <= 4 ? $pos : null;
         };
 
+        // Current Leaders keeps Contacts; Record Holders does not (no stored source).
         $optCols = ($layout['show_contacts'] ? 1 : 0) + ($layout['show_deals'] ? 1 : 0) + ($layout['show_debt'] ? 1 : 0);
         $currentCols = 3 + $optCols + 1;
-        $recordCols = 3 + $optCols + 1;
+        $recordCols = 3 + ($layout['show_deals'] ? 1 : 0) + ($layout['show_debt'] ? 1 : 0) + 1;
 
-        $bonusParts = [];
-        if ($settings) {
-            foreach ([1 => '1st', 2 => '2nd', 3 => '3rd', 4 => '4th'] as $n => $lbl) {
-                $b = (float) ($settings->{"Bonus_$n"} ?? 0);
-                if ($b > 0) {
-                    $bonusParts[] = $lbl . ' - $' . number_format($b, 0);
-                }
-            }
-        }
-        $bonusText = implode(', ', $bonusParts);
+        // Record-Holder cell: stored tiebreaker value, or "N/A" when null/blank (Jacob).
+        $recordCell = fn($v) => ($v === null || $v === '') ? 'N/A' : $fmtInt($v);
+        $recordCurrency = fn($v) => ($v === null || $v === '') ? 'N/A' : $fmtCurrency($v);
 
         $anyBelow = false;
     @endphp
 
     <style>
-        .lb-section { font-weight: 700; border-bottom: 2px solid #e9ecef; padding-bottom: .4rem; }
-        .lb-company td { background: #eef2ff; font-weight: 600; }
+        .lb-section { font-weight: 700; border-bottom: 2px solid var(--bs-border-color); padding-bottom: .4rem; }
+        .lb-head th { background: #1f2a36 !important; color: #fff !important; border-color: #2c3e50 !important; }
+        .lb-company td { background: var(--bs-tertiary-bg); font-weight: 600; }
         .lb-pace { box-shadow: inset 3px 0 0 #f1c40f; }
         .badge-soft { background: #fff7e0; color: #8a6d0b; border: 1px solid #f3e2a8; }
         .card { border-radius: .85rem; }
         .card > .card-header:first-child { border-radius: .85rem .85rem 0 0; }
-        .table-responsive { border: 1px solid #e9ecef; border-radius: .65rem; overflow: hidden; }
+        .table-responsive { border: 1px solid var(--bs-border-color); border-radius: .65rem; overflow: hidden; }
         .table-responsive > .table { margin-bottom: 0; }
     </style>
 
@@ -115,7 +110,7 @@
             </h6>
             <div class="table-responsive mb-4">
                 <table class="table table-striped table-hover align-middle">
-                    <thead class="table-dark">
+                    <thead class="lb-head">
                         <tr>
                             <th>Current Rank</th>
                             <th>Agent</th>
@@ -139,7 +134,7 @@
                             @endphp
                             <tr @class(['lb-pace' => $pr !== null])>
                                 <td class="fw-semibold text-nowrap">{{ $placeLabel($i + 1) }} Place</td>
-                                <td>{{ $row->agent }}</td>
+                                <td class="text-nowrap">{{ $row->agent }}</td>
                                 <td class="text-end fw-bold">{{ $fmtAmount($row->amount ?? null, $layout['amount_format']) }}</td>
                                 @if($layout['show_contacts'])<td class="text-end">{{ $fmtInt($row->contacts ?? null) }}{{ (!$ratioCategory && $below) ? ' *' : '' }}</td>@endif
                                 @if($layout['show_deals'])<td class="text-end">{{ $fmtInt($row->deals ?? null) }}{{ ($ratioCategory && $below) ? ' *' : '' }}</td>@endif
@@ -176,12 +171,11 @@
             </h6>
             <div class="table-responsive mb-4">
                 <table class="table table-striped table-hover align-middle">
-                    <thead class="table-dark">
+                    <thead class="lb-head">
                         <tr>
                             <th>Leaderboard Rank</th>
                             <th>Agent</th>
                             <th class="text-end">{{ $layout['amount_label'] }}</th>
-                            @if($layout['show_contacts'])<th class="text-end">Contacts</th>@endif
                             @if($layout['show_deals'])<th class="text-end">{{ $layout['deals_label'] }}</th>@endif
                             @if($layout['show_debt'])<th class="text-end">Debt</th>@endif
                             <th>Leaderboard Date</th>
@@ -191,11 +185,10 @@
                         @forelse($recordHolders as $i => $row)
                             <tr>
                                 <td class="fw-semibold text-nowrap">{{ $placeLabel($i + 1) }} Place</td>
-                                <td>{{ $row->agent }}</td>
+                                <td class="text-nowrap">{{ $row->agent }}</td>
                                 <td class="text-end fw-bold">{{ $fmtAmount($row->amount ?? null, $layout['amount_format']) }}</td>
-                                @if($layout['show_contacts'])<td class="text-end">{{ $fmtInt($row->contacts ?? null) }}</td>@endif
-                                @if($layout['show_deals'])<td class="text-end">{{ $fmtInt($row->deals ?? null) }}</td>@endif
-                                @if($layout['show_debt'])<td class="text-end">{{ $fmtCurrency($row->debt ?? null) }}</td>@endif
+                                @if($layout['show_deals'])<td class="text-end">{{ $recordCell($row->deals ?? null) }}</td>@endif
+                                @if($layout['show_debt'])<td class="text-end">{{ $recordCurrency($row->debt ?? null) }}</td>@endif
                                 <td>{{ $fmtDate($row->record_date ?? null) }}</td>
                             </tr>
                         @empty
@@ -205,9 +198,8 @@
                             <td>Company-Wide</td>
                             <td></td>
                             <td class="text-end fw-bold">{{ $companyRecord ? $fmtAmount($companyRecord->amount ?? null, $layout['amount_format']) : '' }}</td>
-                            @if($layout['show_contacts'])<td></td>@endif
-                            @if($layout['show_deals'])<td class="text-end">{{ $companyRecord ? $fmtInt($companyRecord->deals ?? null) : '' }}</td>@endif
-                            @if($layout['show_debt'])<td class="text-end">{{ $companyRecord ? $fmtCurrency($companyRecord->debt ?? null) : '' }}</td>@endif
+                            @if($layout['show_deals'])<td class="text-end">{{ $companyRecord ? $recordCell($companyRecord->deals ?? null) : '' }}</td>@endif
+                            @if($layout['show_debt'])<td class="text-end">{{ $companyRecord ? $recordCurrency($companyRecord->debt ?? null) : '' }}</td>@endif
                             <td>{{ $companyRecord ? $fmtDate($companyRecord->record_date ?? null) : '' }}</td>
                         </tr>
                     </tbody>
@@ -229,9 +221,6 @@
                         @if(!empty($settings->Notes))
                             <tr><th class="table-secondary">Notes</th><td>{{ $settings->Notes }}</td></tr>
                         @endif
-                        @if($bonusText !== '')
-                            <tr><th class="table-secondary">Record Breaking Bonus</th><td><span class="badge bg-success">{{ $bonusText }}</span></td></tr>
-                        @endif
                     </tbody>
                 </table>
             </div>
@@ -241,39 +230,9 @@
                 Total Records
                 <span class="small text-muted fw-normal ms-1">All-time standings</span>
             </h6>
-            <div class="table-responsive">
-                <table class="table table-striped table-hover align-middle">
-                    <thead class="table-dark">
-                        <tr>
-                            <th style="width:48px;">#</th>
-                            <th>Agent</th>
-                            <th class="text-end" style="width:90px;">Records</th>
-                            <th>Breakdown</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        @forelse($totalRecords as $i => $row)
-                            @php
-                                $parts = [];
-                                foreach (['1st' => $row->first_count ?? 0, '2nd' => $row->second_count ?? 0, '3rd' => $row->third_count ?? 0, '4th' => $row->fourth_count ?? 0] as $lbl => $c) {
-                                    if ((int) $c > 0) {
-                                        $parts[] = (int) $c . 'x ' . $lbl;
-                                    }
-                                }
-                                $breakdown = implode(', ', $parts);
-                            @endphp
-                            <tr>
-                                <td class="fw-semibold">{{ $i + 1 }}</td>
-                                <td>{{ $row->agent }}</td>
-                                <td class="text-end fw-semibold">{{ $row->records }}</td>
-                                <td class="text-muted">{{ $breakdown }}</td>
-                            </tr>
-                        @empty
-                            <tr><td colspan="4" class="text-center text-muted py-3">No records.</td></tr>
-                        @endforelse
-                    </tbody>
-                </table>
-            </div>
+            <a href="{{ route('cmd.reports.leaderboard_total_records') }}" class="btn btn-outline-primary btn-sm">
+                <i class="fas fa-list-ol me-1"></i> View Total Records summary
+            </a>
         </div>
     </div>
 

@@ -372,8 +372,8 @@ class LeaderboardReportRepository extends SqlSrvRepository
 
         $records = collect($rows);
         foreach ($records as $row) {
+            // Records are a stored snapshot from TblLeaderboard — never recomputed live.
             $this->mapRecordRow($category, $row);
-            $row->contacts = $this->contactsForRecord($category, $row->agent ?? null, $row->record_date, $period);
         }
 
         return $records;
@@ -495,30 +495,6 @@ SQL;
         }
 
         return (int) ($this->connection()->selectOne($sql, $bindings)->c ?? 0);
-    }
-
-   
-    private function contactsForRecord(string $category, ?string $agent, mixed $recordDate, string $period): int
-    {
-        if ($category === 'Active Clients') {
-            return $this->contactsFor($agent, Carbon::create(2017, 1, 1), Carbon::today());
-        }
-
-        if (!$recordDate) {
-            return 0;
-        }
-
-        $start = Carbon::parse($recordDate);
-        $end = match ($period) {
-            'Daily' => $start->copy(),
-            'Weekly' => $start->copy()->addDays(6),
-            'Quarterly' => $start->copy()->startOfMonth()->addMonths(3)->subDay(),
-            'Yearly' => $start->copy()->endOfYear(),
-            'Monthly' => $start->copy()->endOfMonth(),
-            default => $start->copy()->endOfMonth(),
-        };
-
-        return $this->contactsFor($agent, $start, $end);
     }
 
     private function individualDebtNote(object $row): string
