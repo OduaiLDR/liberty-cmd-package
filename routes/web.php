@@ -137,6 +137,8 @@ $registerCmdReportRoutes = function (bool $withNames = true): void {
         ->name($name('cmd.reports.sales_team_leader_commission_report'));
     Route::get('/leaderboard-report', [LeaderboardReportController::class, 'index'])
         ->name($name('cmd.reports.leaderboard_report'));
+    Route::get('/leaderboard-report/total-records', [LeaderboardReportController::class, 'totalRecords'])
+        ->name($name('cmd.reports.leaderboard_total_records'));
     Route::get('/invoice-report', [InvoiceReportController::class, 'index'])
         ->name($name('cmd.reports.invoice_report'));
     Route::get('/training-report', [\Cmd\Reports\Http\Controllers\TrainingReportController::class, 'index'])
