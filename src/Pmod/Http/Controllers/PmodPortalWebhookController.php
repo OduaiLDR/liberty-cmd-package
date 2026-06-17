@@ -43,12 +43,12 @@ final class PmodPortalWebhookController extends Controller
         ];
 
         ForwardPmodToCmdRunnerJob::dispatch(
-            payload: $forwardPayload,
-            idempotencyKey: $idempotencyKey,
-            baseUrl: (string) config('services.cmd_runner.base_url', ''),
-            token: (string) config('services.cmd_runner.internal_token', ''),
-            path: (string) config('services.cmd_runner.pmod_path', '/api/payment-adjustments/webhook'),
-            timeout: (int) config('services.cmd_runner.timeout', 30),
+            $forwardPayload,
+            $idempotencyKey,
+            (string) config('services.cmd_runner.base_url', ''),
+            (string) config('services.cmd_runner.internal_token', ''),
+            (string) config('services.cmd_runner.pmod_path', '/api/payment-adjustments/webhook'),
+            (int) config('services.cmd_runner.timeout', 30),
         );
 
         $this->logger()->info('PMOD webhook accepted and forwarding to CMD Runner', [
