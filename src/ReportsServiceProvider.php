@@ -67,7 +67,7 @@ use Cmd\Reports\Pmod\Services\ForthPayPmodExecutionGateway;
 use Cmd\Reports\Pmod\Services\PmodDispatcher;
 use Cmd\Reports\Pmod\Services\PmodEmailNotificationService;
 use Cmd\Reports\Console\Commands\SyncAgentCommissionTierEnrollments;
-
+use Cmd\Reports\Console\Commands\GenerateEmployeesReport\GenerateEmployeesReport;
 
 
 class ReportsServiceProvider extends ServiceProvider
@@ -163,6 +163,7 @@ class ReportsServiceProvider extends ServiceProvider
                 RefreshForthApiTokens::class,
                 UpdateLendingUSAStatuses::class,
                 SyncAgentCommissionTierEnrollments::class,
+                GenerateEmployeesReport::class,
             ]);
         }
 
