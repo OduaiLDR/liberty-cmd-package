@@ -13,7 +13,7 @@ final class PmodCompanyResolver
     {
         if ($explicitCompany !== null && $explicitCompany !== '') {
             $normalized = strtoupper(trim($explicitCompany));
-            
+
             $company = PmodCompany::tryFrom($normalized);
             if ($company instanceof PmodCompany) {
                 return $company;
@@ -25,6 +25,10 @@ final class PmodCompanyResolver
 
             if (str_contains($normalized, 'LDR') || str_contains($normalized, 'LLG') || str_contains($normalized, 'LIBERTY')) {
                 return PmodCompany::LDR;
+            }
+
+            if ($normalized === 'LT' || str_contains($normalized, 'LENDING')) {
+                return PmodCompany::LT;
             }
         }
 
@@ -47,9 +51,13 @@ final class PmodCompanyResolver
                 if (str_contains($normalized, 'LDR') || str_contains($normalized, 'LLG')) {
                     return PmodCompany::LDR;
                 }
+
+                if ($normalized === 'LT' || str_contains($normalized, 'LENDING')) {
+                    return PmodCompany::LT;
+                }
             }
         }
 
-        throw new InvalidArgumentException('Unable to resolve PMOD company from tenant context. Provide explicit tenant_id (ldr, plaw).');
+        throw new InvalidArgumentException('Unable to resolve PMOD company from tenant context. Provide explicit tenant_id (ldr, plaw, lt).');
     }
 }

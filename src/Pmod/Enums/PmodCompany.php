@@ -8,4 +8,5 @@ enum PmodCompany: string
 {
     case LDR = 'LDR';
     case PLAW = 'PLAW';
+    case LT = 'LT';
 }
