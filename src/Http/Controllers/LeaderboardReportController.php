@@ -5,104 +5,70 @@ namespace Cmd\Reports\Http\Controllers;
 use Carbon\Carbon;
 use Cmd\Reports\Http\Requests\LeaderboardReportRequest;
 use Cmd\Reports\Repositories\LeaderboardReportRepository;
-use Cmd\Reports\Support\CsvFormatting;
+use Cmd\Reports\Support\LeaderboardExport;
 use Illuminate\Contracts\View\View;
-use Illuminate\Http\Request;
 use Illuminate\Routing\Controller;
-use Illuminate\Support\Collection;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 
 class LeaderboardReportController extends Controller
 {
-    use CsvFormatting;
-
     public function __construct(protected LeaderboardReportRepository $repository)
     {
     }
 
     public function index(LeaderboardReportRequest $request): View|StreamedResponse
     {
-        $perPage = $this->normalizePerPage($request->input('per_page', 25));
-        $filters = $this->extractFilters($request);
-
-        if ($request->input('export') === 'csv') {
-            $rows = $this->repository->all($filters);
-            return $this->exportCsv($rows);
+        $category = (string) $request->input('category', 'Deals Enrolled');
+        if (! in_array($category, LeaderboardReportRepository::CATEGORIES, true)) {
+            $category = 'Deals Enrolled';
         }
 
-        $allRows = $this->repository->all($filters);
-        $totals = [
-            'contacts' => $allRows->sum('contacts'),
-            'deals' => $allRows->sum('deals'),
-            'debt' => $allRows->sum('debt'),
-        ];
+        $periods = $this->repository->periodsFor($category);
+        $period = $request->input('period');
+        if (! $period || ! $periods->contains($period)) {
+            $period = $periods->first() ?? 'Monthly';
+        }
 
-        $reports = $this->repository->paginate($perPage, $filters);
-        $windowMeta = $this->repository->windowMeta($filters);
-        $recordHolders = $this->repository->topAllTime(4);
-        $companyTotals = $this->repository->companyTotals($filters);
+        if ($request->input('export') === 'csv') {
+            return $this->exportXlsx($category, $period);
+        }
+
+        $window = $this->repository->resolveWindow($period);
 
         return view('reports::reports.leaderboard', [
-            'reports' => $reports,
-            'columns' => $this->repository->columns(),
-            'filters' => $filters,
-            'perPage' => $perPage,
-            'totals' => $totals,
-            'periodLabel' => ucfirst($filters['period'] ?? 'Monthly'),
-            'categoryLabel' => $filters['category'] ?? 'Cancellation Ratio',
-            'windowMeta' => $windowMeta,
-            'recordHolders' => $recordHolders,
-            'companyTotals' => $companyTotals,
+            'category' => $category,
+            'period' => $period,
+            'periods' => $periods,
+            'categories' => LeaderboardReportRepository::CATEGORIES,
+            'layout' => $this->repository->layout($category),
+            'settings' => $this->repository->settings($category, $period),
+            'window' => $window,
+            'title' => $this->repository->titleLabel($category, $period),
+            'header' => $this->repository->currentHeader($category, $period, $window),
+            'currentLeaders' => $this->repository->currentLeaders($category, $period),
+            'currentCompany' => $this->repository->currentCompany($category, $period),
+            'recordHolders' => $this->repository->recordHolders($category, $period),
+            'companyRecord' => $this->repository->companyRecord($category, $period),
+            'totalRecords' => $this->repository->totalRecords(),
         ]);
     }
 
-    protected function normalizePerPage(int|string|null $perPage): int
-    {
-        $perPage = (int) ($perPage ?? 25);
-        return $perPage > 0 && $perPage <= 1000 ? $perPage : 25;
-    }
-
     /**
-     * @return array<string, mixed>
+     * Full report as a styled .xlsx (all four sections, like the Excel sheet).
      */
-    protected function extractFilters(Request $request): array
+    protected function exportXlsx(string $category, string $period): StreamedResponse
     {
-        return [
-            'agent' => $this->trimOrNull($request->input('agent')),
-            'period' => $this->trimOrNull($request->input('period')),
-            'category' => $this->trimOrNull($request->input('category')),
-            'month' => $this->trimOrNull($request->input('month')),
-            'year' => $this->trimOrNull($request->input('year')),
-        ];
-    }
+        $spreadsheet = LeaderboardExport::spreadsheet($this->repository, $category, $period);
+        $writer = new Xlsx($spreadsheet);
 
-    protected function trimOrNull(mixed $value): ?string
-    {
-        if ($value === null) {
-            return null;
-        }
-        $trimmed = trim((string) $value);
-        return $trimmed === '' ? null : $trimmed;
-    }
+        $filename = 'leaderboard_' . strtolower(str_replace(' ', '_', $category)) . '_'
+            . strtolower($period) . '_' . Carbon::now()->format('Ymd_His') . '.xlsx';
 
-    protected function exportCsv(Collection $rows): StreamedResponse
-    {
-        $filename = 'leaderboard_' . Carbon::now()->format('Ymd_His') . '.csv';
-
-        return response()->streamDownload(function () use ($rows) {
-            $out = fopen('php://output', 'w');
-            fputcsv($out, ['Rank', 'Agent', 'Contacts', 'Deals', 'Debt']);
-            foreach ($rows as $row) {
-                fputcsv($out, [
-                    $row->rank,
-                    $row->agent,
-                    $row->contacts,
-                    $row->deals,
-                    $this->formatCsvCurrency($row->debt),
-                ]);
-            }
+        return response()->streamDownload(function () use ($writer) {
+            $writer->save('php://output');
         }, $filename, [
-            'Content-Type' => 'text/csv',
+            'Content-Type' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
         ]);
     }
 }

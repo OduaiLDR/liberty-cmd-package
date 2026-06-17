@@ -14,12 +14,9 @@ class LeaderboardReportRequest extends FormRequest
     public function rules(): array
     {
         return [
-            'per_page' => ['nullable', 'integer', 'min:1', 'max:1000'],
-            'period' => ['nullable', 'string', 'max:50'],
-            'category' => ['nullable', 'string', 'max:100'],
-            'month' => ['nullable', 'integer', 'between:1,12'],
-            'year' => ['nullable', 'integer', 'min:2000', 'max:2100'],
-            'agent' => ['nullable', 'string', 'max:255'],
+            'category' => ['nullable', 'string', 'in:Deals Enrolled,Debt Enrolled,Same Month Pay,Conversion Ratio,Cancellation Ratio,NSF Ratio,Active Clients,Individual Debt'],
+            'period' => ['nullable', 'string', 'in:Daily,Weekly,Monthly,Quarterly,Yearly'],
+            'export' => ['nullable', 'in:csv'],
         ];
     }
 }
