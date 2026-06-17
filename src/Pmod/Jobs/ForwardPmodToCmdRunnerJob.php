@@ -32,8 +32,7 @@ final class ForwardPmodToCmdRunnerJob implements ShouldQueue
         public readonly string $token,
         public readonly string $path = '/api/payment-adjustments/webhook',
         public readonly int $timeout = 30,
-    ) {
-    }
+    ) {}
 
     public function handle(): void
     {
@@ -61,7 +60,14 @@ final class ForwardPmodToCmdRunnerJob implements ShouldQueue
                 ]);
 
                 return $delay;
-            }, function (Throwable $exception, $response) {
+            }, function (Throwable $exception) {
+                // In Laravel's Http retry "when" callback, the second argument
+                // is the PendingRequest (not the Response). Pull the response
+                // off the exception instead.
+                $response = $exception instanceof \Illuminate\Http\Client\RequestException
+                    ? $exception->response
+                    : null;
+
                 if ($response?->status() === 429) {
                     return true;
                 }
