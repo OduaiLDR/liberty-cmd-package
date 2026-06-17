@@ -44,9 +44,13 @@ use Cmd\Reports\Console\Commands\SyncContactsData;
 use Cmd\Reports\Console\Commands\SyncCollectionCompanies;
 use Cmd\Reports\Console\Commands\SyncLastDepositDate;
 use Cmd\Reports\Console\Commands\SyncVeritasTransactions;
+<<<<<<< HEAD
 use Cmd\Reports\Console\Commands\ProcessAgentTrainingCompletions;
 use Cmd\Reports\Console\Commands\SyncPhoneNumbers;
 use Cmd\Reports\Console\Commands\SyncCalls;
+=======
+use Cmd\Reports\Console\Commands\SyncPhoneNumbers;
+>>>>>>> 472583b06a3151b378cc730f570e5c88653f23f2
 use Cmd\Reports\Console\Commands\RefreshForthApiTokens;
 use Cmd\Reports\Console\Commands\SyncNegotiatorPayrollData;
 use Cmd\Reports\Console\Commands\UpdateLendingUSAStatuses;
@@ -77,6 +81,16 @@ class ReportsServiceProvider extends ServiceProvider
         $this->loadRoutesFrom(__DIR__ . '/../routes/web.php');
         $this->loadRoutesFrom(__DIR__ . '/../routes/pmod.php');
         $this->loadViewsFrom(__DIR__ . '/../resources/views', 'reports');
+
+        // PMOD migrations ship with the package but are NOT auto-loaded.
+        // Consumers must explicitly opt in by publishing them:
+        //     php artisan vendor:publish --tag=pmod-migrations
+        // This gives sensitive deployments full control over when/how schema
+        // changes are applied (and lets tenancy-aware apps publish into a
+        // tenant migrations directory of their choice).
+        $this->publishes([
+            __DIR__ . '/../database/migrations' => database_path('migrations'),
+        ], 'pmod-migrations');
 
         // Try new dbConfig first, fallback to legacy configs
         $dbConfigPath = __DIR__ . '/../config/dbConfig.php';
@@ -146,9 +160,13 @@ class ReportsServiceProvider extends ServiceProvider
                 SyncCollectionCompanies::class,
                 SyncLastDepositDate::class,
                 SyncVeritasTransactions::class,
+<<<<<<< HEAD
                 ProcessAgentTrainingCompletions::class,
                 SyncPhoneNumbers::class,
                 SyncCalls::class,
+=======
+                SyncPhoneNumbers::class,
+>>>>>>> 472583b06a3151b378cc730f570e5c88653f23f2
                 SyncNegotiatorPayrollData::class,
                 RefreshForthApiTokens::class,
                 UpdateLendingUSAStatuses::class,
