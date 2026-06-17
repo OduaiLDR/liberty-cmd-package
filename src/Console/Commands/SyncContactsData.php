@@ -158,9 +158,10 @@ class SyncContactsData extends Command
         $isIncremental = $lastSyncAt !== null;
 
         if ($isIncremental) {
-            // Subtract 10 minutes as a safety buffer against clock skew / in-flight writes
-            // that were being saved during the previous run's window.
-            $startDate = date('Y-m-d H:i:s', strtotime($lastSyncAt) - 600);
+            // Subtract 24 hours as a safety buffer against clock skew / in-flight writes
+            // and any latent timezone-conversion edge cases in the Snowflake date filter.
+            // insertChunk() is an idempotent DELETE+INSERT, so re-pulling a day of overlap is safe.
+            $startDate = date('Y-m-d H:i:s', strtotime($lastSyncAt) - 86400);
             $this->info("[INFO] Incremental mode: fetching contacts modified since {$startDate}.");
         } else {
             $startDate = '2021-07-01';
@@ -320,7 +321,7 @@ class SyncContactsData extends Command
                 FROM CONTACTS_USERFIELDS
                 WHERE CUSTOM_ID = {$this->agentCustomId}
             ) AS uf_agent ON c.ID = uf_agent.CONTACT_ID
-            WHERE COALESCE(c.MODIFIED, c.CREATED) >= DATEADD(hour, 7, '{$this->esc($startDate)}'::TIMESTAMP_NTZ)
+            WHERE COALESCE(CONVERT_TIMEZONE('UTC', c.MODIFIED), CONVERT_TIMEZONE('UTC', c.CREATED)) >= '{$this->esc($startDate)}'::TIMESTAMP_NTZ
               AND c.FIRSTNAME IS NOT NULL AND c.FIRSTNAME <> ''
               AND ISCOAPP = 0
               AND c.ID > {$lastId}
@@ -381,7 +382,11 @@ class SyncContactsData extends Command
                 FROM CONTACTS_USERFIELDS
                 WHERE CUSTOM_ID = {$this->debtAmountCustomId}
             ) AS uf_debt ON c.ID = uf_debt.CONTACT_ID
-            WHERE COALESCE(c.MODIFIED, a.STAMP, c.CREATED) >= DATEADD(hour, 7, '{$this->esc($startDate)}'::TIMESTAMP_NTZ)
+            WHERE COALESCE(
+                      CONVERT_TIMEZONE('UTC', c.MODIFIED),
+                      CONVERT_TIMEZONE('America/Chicago', 'UTC', a.STAMP),
+                      CONVERT_TIMEZONE('UTC', c.CREATED)
+                  ) >= '{$this->esc($startDate)}'::TIMESTAMP_NTZ
               AND c.FIRSTNAME IS NOT NULL AND c.FIRSTNAME <> ''
               AND ISCOAPP = 0
               AND cls.TITLE <> 'Duplicate Lead'
