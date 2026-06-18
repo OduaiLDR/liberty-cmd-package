@@ -23,6 +23,7 @@ use Cmd\Reports\Console\Commands\GenerateCompanyStatsReport\GenerateCompanyStats
 use Cmd\Reports\Console\Commands\GenerateLegalReport\GenerateLegalReport;
 use Cmd\Reports\Console\Commands\GenerateAgentSummaryReport\GenerateAgentSummaryReport;
 use Cmd\Reports\Console\Commands\GenerateDPPPastDueReport\GenerateDPPPastDueReport;
+use Cmd\Reports\Pmod\Console\Commands\DumpForthStagesStatuses;
 use Cmd\Reports\Console\Commands\GenerateNSFReport\GenerateNSFReport;
 use Cmd\Reports\Console\Commands\GeneratePauseHoldReport\GeneratePauseHoldReport;
 use Cmd\Reports\Console\Commands\GenerateGraduationReport\GenerateGraduationReport;
@@ -136,6 +137,7 @@ class ReportsServiceProvider extends ServiceProvider
                 GenerateLegalReport::class,
                 GenerateAgentSummaryReport::class,
                 GenerateDPPPastDueReport::class,
+                DumpForthStagesStatuses::class,
                 GenerateNSFReport::class,
                 GeneratePauseHoldReport::class,
                 GenerateGraduationReport::class,
