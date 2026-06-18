@@ -38,7 +38,9 @@ final class GenerateResumePayments extends Command
 {
     protected $signature = 'Generate:resume-payments
         {--dry-run : Skip all CRM writes; only log what would happen}
-        {--company=* : Limit run to LDR and/or PLAW (default: both)}';
+        {--company=* : Limit run to LDR and/or PLAW (default: both)}
+        {--contact-id=* : Only process these Forth contact IDs (controlled live test)}
+        {--limit= : Process at most N contacts per company (after NSF-state filtering)}';
 
     protected $description = 'Process NSF contacts for LDR and Progress Law: update statuses, resume drafts, and execute system cancels per the ResumePayments VBA workflow.';
 
@@ -93,10 +95,16 @@ final class GenerateResumePayments extends Command
                 $states = $this->computeNsfStates($snowflake, $rows);
                 $this->applyRecentDraftAdjustment($snowflake, $states);
 
+                $states = $this->applyRunFilters($states);
+                if ($this->hasRunFilters()) {
+                    $this->info(sprintf('[INFO] [%s] After --contact-id/--limit filter: %d', $company, count($states)));
+                }
+
                 $statusChanges = $this->processContacts($gateway, $snowflake, $sqlConnector, $company, $states, $dryRun);
+                $this->info(sprintf('[INFO] [%s] Phase 4 status changes: %d', $company, count($statusChanges)));
                 $this->processSystemCancels($gateway, $snowflake, $sqlConnector, $company, $states, $statusChanges, $dryRun);
 
-                $this->sendRecap($sqlConnector, $company, $statusChanges);
+                $this->sendRecap($company, $statusChanges, $dryRun);
             } catch (\Throwable $e) {
                 $this->error("[{$company}] ResumePayments failed: " . $e->getMessage());
                 Log::error('GenerateResumePayments: company failed', [
@@ -120,6 +128,48 @@ final class GenerateResumePayments extends Command
         )));
 
         return $opt !== [] ? $opt : ['LDR', 'PLAW'];
+    }
+
+    private function hasRunFilters(): bool
+    {
+        return $this->runContactIds() !== [] || $this->option('limit') !== null;
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function runContactIds(): array
+    {
+        return array_values(array_filter(array_map(
+            static fn(mixed $v): string => trim((string) $v),
+            (array) $this->option('contact-id'),
+        )));
+    }
+
+    /**
+     * Apply --contact-id / --limit to the computed states so a first live run can
+     * be scoped to one or a few contacts. Both phases (4 and 5) see the same set.
+     *
+     * @param list<array<string, mixed>> $states
+     * @return list<array<string, mixed>>
+     */
+    private function applyRunFilters(array $states): array
+    {
+        $only = $this->runContactIds();
+        if ($only !== []) {
+            $set = array_flip($only);
+            $states = array_values(array_filter(
+                $states,
+                static fn(array $s): bool => isset($set[(string) ($s['CONTACT_ID'] ?? '')]),
+            ));
+        }
+
+        $limit = $this->option('limit');
+        if ($limit !== null && (int) $limit > 0) {
+            $states = array_slice($states, 0, (int) $limit);
+        }
+
+        return $states;
     }
 
     /**
@@ -873,13 +923,23 @@ final class GenerateResumePayments extends Command
     }
 
     /**
-     * Phase 6 — Build status-changes Excel and send the recap email.
+     * Phase 6 — Build the "Status Changes" Excel and send the recap email.
+     * Recipients + two-section body live in {@see Formatter}. In dry-run the
+     * workbook is built (to prove it works) but no email is sent.
      *
      * @param list<array{llg_id:string,name:string,status:string}> $statusChanges
      */
-    private function sendRecap(DBConnector $sqlConnector, string $company, array $statusChanges): void
+    private function sendRecap(string $company, array $statusChanges, bool $dryRun): void
     {
-        // TODO Phase 6: Formatter::buildWorkbook + EmailSenderService.
+        try {
+            (new Formatter())->sendRecap($statusChanges, $company, $dryRun, $this);
+        } catch (\Throwable $e) {
+            $this->error("[{$company}] recap email failed: " . $e->getMessage());
+            Log::error('GenerateResumePayments: sendRecap failed', [
+                'company' => $company,
+                'exception' => $e,
+            ]);
+        }
     }
 
     private function initializeSqlServerConnector(): DBConnector

@@ -518,6 +518,15 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway
             throw new \RuntimeException('Failed to resume payments: HTTP ' . $response->status());
         }
 
+        // Log the success status + a body snippet so the first live test gives a
+        // clear yes/no on whether this endpoint actually reschedules the draft.
+        Log::info('PMOD: resume-payments succeeded', [
+            'contact_id' => $contactId,
+            'tenant_id' => $tenantId,
+            'status' => $response->status(),
+            'response' => mb_substr($response->body(), 0, 300),
+        ]);
+
         return $response->json('response', []);
     }
 
