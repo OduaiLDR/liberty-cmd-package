@@ -482,6 +482,84 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway
         return $paymentData;
     }
 
+    /**
+     * Update a contact via Forth CRM. Accepts integer `stage` and `status` IDs
+     * (per Forth release notes 2023-07), plus any other contact fields the
+     * Update Contact endpoint supports.
+     *
+     * @param array<string, mixed> $payload
+     * @return array<string, mixed>
+     */
+    public function updateContact(PmodWorkItem $workItem, array $payload): array
+    {
+        Log::info('PMOD: Updating contact', [
+            'contact_id' => $workItem->contactId,
+            'tenant_id' => $workItem->tenantId,
+            'payload' => $payload,
+            'idempotency_key' => $workItem->idempotencyKey,
+            'dry_run' => $workItem->dryRun,
+        ]);
+
+        if ($workItem->dryRun) {
+            Log::info('PMOD: DRY RUN - Would update contact', [
+                'contact_id' => $workItem->contactId,
+                'payload' => $payload,
+            ]);
+            return [
+                'contact_id' => $workItem->contactId,
+                'status' => 'dry_run_updated',
+                'payload' => $payload,
+            ];
+        }
+
+        $response = $this->crmClient($workItem->tenantId)
+            ->put("/contacts/{$workItem->contactId}", $payload);
+
+        if (!$response->successful()) {
+            Log::error('PMOD: Failed to update contact', [
+                'contact_id' => $workItem->contactId,
+                'tenant_id' => $workItem->tenantId,
+                'status' => $response->status(),
+                'response' => $response->body(),
+            ]);
+
+            throw new \RuntimeException('Failed to update contact');
+        }
+
+        $data = $response->json('response', []);
+
+        Log::info('PMOD: Contact updated', ['contact_id' => $workItem->contactId]);
+
+        return $data;
+    }
+
+    /**
+     * List all contact stages and their statuses for a tenant. Returns the raw
+     * Forth response so callers can extract the integer IDs needed by
+     * updateContact()'s `stage` / `status` fields.
+     *
+     * @return list<array<string, mixed>>
+     */
+    public function listStagesAndStatuses(string $tenantId): array
+    {
+        Log::info('PMOD: Listing stages and statuses', ['tenant_id' => $tenantId]);
+
+        $response = $this->crmClient($tenantId)
+            ->get('/contacts/stages-statuses');
+
+        if (!$response->successful()) {
+            Log::error('PMOD: Failed to list stages and statuses', [
+                'tenant_id' => $tenantId,
+                'status' => $response->status(),
+                'response' => $response->body(),
+            ]);
+
+            throw new \RuntimeException('Failed to list stages and statuses');
+        }
+
+        return $response->json('response', []);
+    }
+
     public function createRefund(PmodWorkItem $workItem, array $payload): array
     {
         Log::info('PMOD: Creating refund', [
