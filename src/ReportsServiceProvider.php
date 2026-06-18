@@ -68,6 +68,7 @@ use Cmd\Reports\Pmod\Services\PmodDispatcher;
 use Cmd\Reports\Pmod\Services\PmodEmailNotificationService;
 use Cmd\Reports\Console\Commands\SyncAgentCommissionTierEnrollments;
 use Cmd\Reports\Console\Commands\GenerateEmployeesReport\GenerateEmployeesReport;
+use Cmd\Reports\Console\Commands\SyncLeaderboardRecords\SyncLeaderboardRecords;
 
 
 class ReportsServiceProvider extends ServiceProvider
@@ -164,6 +165,7 @@ class ReportsServiceProvider extends ServiceProvider
                 UpdateLendingUSAStatuses::class,
                 SyncAgentCommissionTierEnrollments::class,
                 GenerateEmployeesReport::class,
+                SyncLeaderboardRecords::class,
             ]);
         }
 
