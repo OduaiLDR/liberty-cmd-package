@@ -540,24 +540,58 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway
      *
      * @return list<array<string, mixed>>
      */
-    public function listStagesAndStatuses(string $tenantId): array
+    /**
+     * Contact "stages" are Forth's top-level categories (Underwriting, Client,
+     * NSF, Cancel, Graduated, Lead, Admin). Each has an integer `id` that a
+     * status links back to via its `cat_id`.
+     *
+     * @return list<array<string, mixed>>
+     */
+    public function listContactStages(string $tenantId): array
     {
-        Log::info('PMOD: Listing stages and statuses', ['tenant_id' => $tenantId]);
+        Log::info('PMOD: Listing contact stages', ['tenant_id' => $tenantId]);
 
         $response = $this->crmClient($tenantId)
-            ->get('/contacts/stages-statuses');
+            ->get('/contact-stages');
 
         if (!$response->successful()) {
-            Log::error('PMOD: Failed to list stages and statuses', [
+            Log::error('PMOD: Failed to list contact stages', [
                 'tenant_id' => $tenantId,
                 'status' => $response->status(),
                 'response' => $response->body(),
             ]);
 
-            throw new \RuntimeException('Failed to list stages and statuses');
+            throw new \RuntimeException('Failed to list contact stages');
         }
 
-        return $response->json('response', []);
+        return $response->json('response.results', []);
+    }
+
+    /**
+     * Contact "statuses" are the account-specific lead statuses (e.g.
+     * "LDR Enrolled (NSF-1)", "System Cancel (NSF-3)"). Each carries an integer
+     * `id` (what Update Contact wants) and a `cat_id` pointing at its stage.
+     *
+     * @return list<array<string, mixed>>
+     */
+    public function listContactStatuses(string $tenantId): array
+    {
+        Log::info('PMOD: Listing contact statuses', ['tenant_id' => $tenantId]);
+
+        $response = $this->crmClient($tenantId)
+            ->get('/contact-statuses');
+
+        if (!$response->successful()) {
+            Log::error('PMOD: Failed to list contact statuses', [
+                'tenant_id' => $tenantId,
+                'status' => $response->status(),
+                'response' => $response->body(),
+            ]);
+
+            throw new \RuntimeException('Failed to list contact statuses');
+        }
+
+        return $response->json('response.results', []);
     }
 
     public function createRefund(PmodWorkItem $workItem, array $payload): array

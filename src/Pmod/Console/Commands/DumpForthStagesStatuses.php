@@ -33,64 +33,58 @@ final class DumpForthStagesStatuses extends Command
             $this->info("[INFO] Fetching stages/statuses for {$tenant}...");
 
             try {
-                $data = $gateway->listStagesAndStatuses($tenant);
+                $stages   = $gateway->listContactStages($tenant);
+                $statuses = $gateway->listContactStatuses($tenant);
             } catch (\Throwable $e) {
                 $this->error("[{$tenant}] Failed: " . $e->getMessage());
                 continue;
             }
 
-            $path = storage_path("app/forth-stages-statuses-{$tenant}.json");
-            file_put_contents($path, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
-            $this->info("[INFO] [{$tenant}] Raw response saved to {$path}");
+            $stagesPath   = storage_path("app/forth-stages-{$tenant}.json");
+            $statusesPath = storage_path("app/forth-statuses-{$tenant}.json");
+            file_put_contents($stagesPath,   json_encode($stages,   JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+            file_put_contents($statusesPath, json_encode($statuses, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+            $this->info("[INFO] [{$tenant}] Saved {$stagesPath} + {$statusesPath}");
 
-            $this->renderTable($tenant, $data);
+            $this->renderTable($tenant, $stages, $statuses);
         }
 
         return self::SUCCESS;
     }
 
     /**
-     * Render a flat table of stage_id, stage_title, status_id, status_title.
-     * Shape is guessed from typical Forth payload (`[{ id, title, statuses: [{id, title}] }]`);
-     * if the real shape differs, the raw JSON file still has everything.
+     * Render the flat status list joined to its stage via cat_id.
      *
-     * @param list<array<string, mixed>> $data
+     * Stage objects:  { id, title, ... }                 (from /contact-stages)
+     * Status objects: { id, title, cat_id, file_type, ... } (from /contact-statuses)
+     *
+     * @param list<array<string, mixed>> $stages
+     * @param list<array<string, mixed>> $statuses
      */
-    private function renderTable(string $tenant, array $data): void
+    private function renderTable(string $tenant, array $stages, array $statuses): void
     {
+        $stageTitles = [];
+        foreach ($stages as $stage) {
+            if (isset($stage['id'])) {
+                $stageTitles[(string) $stage['id']] = (string) ($stage['title'] ?? '');
+            }
+        }
+
         $rows = [];
-
-        foreach ($data as $stage) {
-            $stageId = $stage['id'] ?? $stage['stage_id'] ?? null;
-            $stageTitle = $stage['title'] ?? $stage['name'] ?? $stage['stage_title'] ?? null;
-            $statuses = $stage['statuses'] ?? $stage['contact_statuses'] ?? [];
-
-            if (!is_array($statuses) || $statuses === []) {
-                $rows[] = [$stageId, $stageTitle, '', ''];
-                continue;
-            }
-
-            foreach ($statuses as $status) {
-                if (!is_array($status)) {
-                    continue;
-                }
-                $rows[] = [
-                    $stageId,
-                    $stageTitle,
-                    $status['id'] ?? $status['status_id'] ?? null,
-                    $status['title'] ?? $status['name'] ?? $status['status_title'] ?? null,
-                ];
-            }
+        foreach ($statuses as $status) {
+            $catId = (string) ($status['cat_id'] ?? '');
+            $rows[] = [
+                $status['id'] ?? '',
+                $stageTitles[$catId] ?? $catId,
+                $status['title'] ?? '',
+            ];
         }
 
         if ($rows === []) {
-            $this->warn("[{$tenant}] No rows extracted from response (shape may differ — see JSON file).");
+            $this->warn("[{$tenant}] No statuses returned (see JSON files).");
             return;
         }
 
-        $this->table(
-            ['Stage ID', 'Stage Title', 'Status ID', 'Status Title'],
-            $rows,
-        );
+        $this->table(['Status ID', 'Stage', 'Status Title'], $rows);
     }
 }
