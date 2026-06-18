@@ -138,6 +138,7 @@ class ReportsServiceProvider extends ServiceProvider
                 GenerateLegalReport::class,
                 GenerateAgentSummaryReport::class,
                 GenerateDPPPastDueReport::class,
+                GenerateResumePayments::class,
                 DumpForthStagesStatuses::class,
                 GenerateNSFReport::class,
                 GeneratePauseHoldReport::class,
