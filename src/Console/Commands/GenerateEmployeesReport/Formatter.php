@@ -48,8 +48,15 @@ class Formatter
         ];
     }
 
-    public function sendReport(DBConnector $connector, string $path, string $filename, string $label, ?Command $console = null): bool
-    {
+    public function sendReport(
+        DBConnector $connector,
+        string $path,
+        string $filename,
+        string $label,
+        int $missingLocations,
+        int $missingCompanies,
+        ?Command $console = null
+    ): bool {
         if (!is_file($path)) {
             Log::warning('GenerateEmployeesReport: report file missing.', ['path' => $path]);
             if ($console) {
@@ -68,7 +75,9 @@ class Formatter
 
         $email   = new EmailSenderService();
         $subject = 'Employees Report - ' . $label;
-        $body    = 'Attached is the Employees Report for ' . $label . '.';
+        $body    = 'Attached is the Employees Report for ' . $label . '.'
+            . "\n\nMissing Locations: " . $missingLocations
+            . "\nMissing Companies: " . $missingCompanies;
 
         // Empty companies array skips the Company clause when looking up TblReports.
         $sent = $email->sendMailUsingTblReports(

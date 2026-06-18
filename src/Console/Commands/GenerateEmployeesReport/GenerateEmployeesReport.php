@@ -17,9 +17,13 @@ use Illuminate\Support\Facades\Log;
  */
 class GenerateEmployeesReport extends Command
 {
-    protected $signature = 'Generate:employees-report';
+    protected $signature = 'Generate:employees-report
+        {--force : Send even when no Location/Company values are missing}';
 
     protected $description = 'Generate the Employees Report (active TblEmployees rows) and email it.';
+
+    /** Marker file path: prevents double-sending on a single calendar day. */
+    private const SENT_MARKER_PATH = 'employees_report_last_sent.txt';
 
     public function handle(): int
     {
@@ -35,6 +39,8 @@ class GenerateEmployeesReport extends Command
 
         $label = date('m/d/Y');
 
+        $force = (bool) $this->option('force');
+
         try {
             $rows = $this->fetchEmployees($connector);
             $this->info('[INFO] Active employees: ' . count($rows));
@@ -45,14 +51,43 @@ class GenerateEmployeesReport extends Command
                 return Command::SUCCESS;
             }
 
+            [$missingLocations, $missingCompanies] = $this->countMissing($rows);
+            $this->info("[INFO] Missing Locations: {$missingLocations}, Missing Companies: {$missingCompanies}");
+
+            // Send-decision: --force always sends; otherwise send only when there is missing data.
+            if (!$force && ($missingLocations + $missingCompanies) === 0) {
+                $this->info('[INFO] No missing data and --force not set. Skipping email.');
+                Log::info('GenerateEmployeesReport: skipped (no missing data, --force not set).');
+                return Command::SUCCESS;
+            }
+
+            // De-dup guard: skip if already sent today (per marker file).
+            if ($this->wasSentToday()) {
+                $this->info('[INFO] Already sent today (per marker). Skipping.');
+                Log::info('GenerateEmployeesReport: skipped (already sent today).');
+                return Command::SUCCESS;
+            }
+
             $formatter = new Formatter();
             $result    = $formatter->buildWorkbook($rows, $label);
             $this->info("[INFO] Employees report written to {$result['path']}");
 
-            $formatter->sendReport($connector, $result['path'], $result['filename'], $label, $this);
+            $sent = $formatter->sendReport(
+                $connector,
+                $result['path'],
+                $result['filename'],
+                $label,
+                $missingLocations,
+                $missingCompanies,
+                $this
+            );
 
             if (is_file($result['path'])) {
                 @unlink($result['path']);
+            }
+
+            if ($sent) {
+                $this->markSentToday();
             }
         } catch (\Throwable $e) {
             $this->error('Employees Report failed: ' . $e->getMessage());
@@ -61,6 +96,50 @@ class GenerateEmployeesReport extends Command
         }
 
         return Command::SUCCESS;
+    }
+
+    /**
+     * Count rows whose Location / Company is null or trimmed-empty.
+     *
+     * @param  array<int, array<string, mixed>>  $rows
+     * @return array{0:int, 1:int}  [missingLocations, missingCompanies]
+     */
+    private function countMissing(array $rows): array
+    {
+        $missingLocations = 0;
+        $missingCompanies = 0;
+
+        foreach ($rows as $row) {
+            if ($this->isBlank($row['Location'] ?? null)) {
+                $missingLocations++;
+            }
+            if ($this->isBlank($row['Company'] ?? null)) {
+                $missingCompanies++;
+            }
+        }
+
+        return [$missingLocations, $missingCompanies];
+    }
+
+    private function isBlank($value): bool
+    {
+        return $value === null || trim((string) $value) === '';
+    }
+
+    private function wasSentToday(): bool
+    {
+        $path = storage_path('app/' . self::SENT_MARKER_PATH);
+        if (!is_file($path)) {
+            return false;
+        }
+        $contents = trim((string) @file_get_contents($path));
+        return $contents === date('Y-m-d');
+    }
+
+    private function markSentToday(): void
+    {
+        $path = storage_path('app/' . self::SENT_MARKER_PATH);
+        @file_put_contents($path, date('Y-m-d'));
     }
 
     /**
