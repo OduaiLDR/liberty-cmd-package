@@ -520,8 +520,10 @@ class SyncLeaderboardRecords extends Command
             ? Carbon::parse($fromOpt)->startOfDay()
             : Carbon::today()->subMonthsNoOverflow(4)->startOfMonth();
 
+        // endOfDay so a period whose end lands on the --to date isn't skipped: month/quarter/year
+        // ends are 23:59:59, and a start-of-day --to would compare as "after" and drop that period.
         $to = $toOpt
-            ? Carbon::parse($toOpt)->startOfDay()
+            ? Carbon::parse($toOpt)->endOfDay()
             : Carbon::today()->subMonthNoOverflow()->endOfMonth();
 
         return [$from, $to];
