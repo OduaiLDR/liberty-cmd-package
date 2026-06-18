@@ -58,7 +58,17 @@
         .card > .card-header:first-child { border-radius: .85rem .85rem 0 0; }
         .table-responsive { border: 1px solid var(--bs-border-color); border-radius: .65rem; overflow: hidden; }
         .table-responsive > .table { margin-bottom: 0; }
+        #lb-loading { position: fixed; inset: 0; z-index: 1080; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,.35); }
+        #lb-loading.show { display: flex; }
+        #lb-loading .lb-spinner { background: var(--bs-body-bg); color: var(--bs-body-color); padding: 1.1rem 1.4rem; border-radius: .75rem; box-shadow: 0 .5rem 1.5rem rgba(0,0,0,.3); display: flex; align-items: center; gap: .75rem; }
     </style>
+
+    <div id="lb-loading" aria-live="polite" aria-busy="true">
+        <div class="lb-spinner">
+            <div class="spinner-border text-primary" role="status"></div>
+            <span class="fw-semibold">Loading…</span>
+        </div>
+    </div>
 
     <div class="card">
         <div class="card-header d-flex align-items-center py-0">
@@ -241,5 +251,19 @@
             form.submit();
             exportInput.value = '';
         }
+
+        // Loading overlay while the report reloads after a Category/Period change. The selects submit
+        // via inline onchange (form.submit() skips the 'submit' event), so hook 'change' directly.
+        // Export is a file download (no reload) — intentionally not hooked, or the overlay would stick.
+        (function () {
+            const form = document.getElementById('leaderboard-form');
+            const overlay = document.getElementById('lb-loading');
+            if (!form || !overlay) return;
+            form.querySelectorAll('select').forEach(function (el) {
+                el.addEventListener('change', function () { overlay.classList.add('show'); });
+            });
+            // Clear it if the page is restored from the back/forward cache.
+            window.addEventListener('pageshow', function () { overlay.classList.remove('show'); });
+        })();
     </script>
 @endsection
