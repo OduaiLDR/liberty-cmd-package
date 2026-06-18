@@ -23,6 +23,7 @@ use Cmd\Reports\Console\Commands\GenerateCompanyStatsReport\GenerateCompanyStats
 use Cmd\Reports\Console\Commands\GenerateLegalReport\GenerateLegalReport;
 use Cmd\Reports\Console\Commands\GenerateAgentSummaryReport\GenerateAgentSummaryReport;
 use Cmd\Reports\Console\Commands\GenerateDPPPastDueReport\GenerateDPPPastDueReport;
+use Cmd\Reports\Console\Commands\GenerateResumePayments\GenerateResumePayments;
 use Cmd\Reports\Pmod\Console\Commands\DumpForthStagesStatuses;
 use Cmd\Reports\Console\Commands\GenerateNSFReport\GenerateNSFReport;
 use Cmd\Reports\Console\Commands\GeneratePauseHoldReport\GeneratePauseHoldReport;
@@ -190,6 +191,12 @@ class ReportsServiceProvider extends ServiceProvider
         // own service provider after calling parent::register().
         $this->app->singleton(PmodExecutionGateway::class, ForthPayPmodExecutionGateway::class);
         $this->app->singleton(PmodEmailNotificationService::class);
+
+        // Singleton so Generate:resume-payments reuses one Panther/Chromium
+        // browser session across all contacts in a run.
+        $this->app->singleton(\Cmd\Reports\Pmod\Services\DppSeleniumService::class, static function (): \Cmd\Reports\Pmod\Services\DppSeleniumService {
+            return \Cmd\Reports\Pmod\Services\DppSeleniumService::fromConfig();
+        });
 
         $this->app->singleton(PmodDispatcher::class, function ($app) {
             $gateway = $app->make(PmodExecutionGateway::class);
