@@ -198,6 +198,13 @@ class ReportsServiceProvider extends ServiceProvider
             return \Cmd\Reports\Pmod\Services\DppSeleniumService::fromConfig();
         });
 
+        // DebtPayPro "post" data-API client for Phase 4 status/note writes
+        // (replicates the VBA UpdateCRMData* subs). Constructor needs config, so
+        // bind it explicitly rather than relying on autowiring.
+        $this->app->singleton(\Cmd\Reports\Pmod\Services\DppDataClient::class, static function (): \Cmd\Reports\Pmod\Services\DppDataClient {
+            return \Cmd\Reports\Pmod\Services\DppDataClient::fromConfig();
+        });
+
         $this->app->singleton(PmodDispatcher::class, function ($app) {
             $gateway = $app->make(PmodExecutionGateway::class);
             $liveDraftUpdates = (bool) config('services.pmod.live_draft_updates', false);

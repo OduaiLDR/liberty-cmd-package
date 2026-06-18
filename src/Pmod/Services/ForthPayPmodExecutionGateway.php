@@ -483,6 +483,45 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway
     }
 
     /**
+     * Resume payments for a single contact without constructing a full
+     * PmodWorkItem. Used by Generate:resume-payments Phase 4, which processes a
+     * Snowflake-derived list of contacts rather than PMOD work items.
+     *
+     * Throws on any non-2xx so the caller can fall back to the VBA's
+     * "(Unable to Resume)" reporting path.
+     *
+     * @return array<string, mixed>
+     */
+    public function resumePaymentsForContact(string $tenantId, string $contactId, bool $dryRun = false): array
+    {
+        Log::info('PMOD: Resuming payments (contact)', [
+            'contact_id' => $contactId,
+            'tenant_id' => $tenantId,
+            'dry_run' => $dryRun,
+        ]);
+
+        if ($dryRun) {
+            return ['contact_id' => $contactId, 'status' => 'dry_run_resumed'];
+        }
+
+        $response = $this->crmClient($tenantId)
+            ->post("/contacts/{$contactId}/resume-payments");
+
+        if (!$response->successful()) {
+            Log::warning('PMOD: resume-payments not successful', [
+                'contact_id' => $contactId,
+                'tenant_id' => $tenantId,
+                'status' => $response->status(),
+                'response' => $response->body(),
+            ]);
+
+            throw new \RuntimeException('Failed to resume payments: HTTP ' . $response->status());
+        }
+
+        return $response->json('response', []);
+    }
+
+    /**
      * Update a contact via Forth CRM. Accepts integer `stage` and `status` IDs
      * (per Forth release notes 2023-07), plus any other contact fields the
      * Update Contact endpoint supports.

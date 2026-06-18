@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Cmd\Reports\Console\Commands\GenerateResumePayments;
 
+use Cmd\Reports\Pmod\Services\DppDataClient;
 use Cmd\Reports\Pmod\Services\ForthPayPmodExecutionGateway;
 use Cmd\Reports\Services\DBConnector;
 use Illuminate\Console\Command;
@@ -46,6 +47,9 @@ final class GenerateResumePayments extends Command
     private const SYSTEM_CANCEL_AGE_DAYS = 105;
     private const CANCEL_COOLDOWN_DAYS = 4;
 
+    /** DPP "post" data-API client for client_status / notebody writes (Phase 4). */
+    private DppDataClient $dppClient;
+
     /** Statuses whose presence in CurrentStatus causes the contact to be SKIPPED entirely. */
     private const SKIP_STATUS_SUBSTRINGS = [
         'Dropped / Cancelled',
@@ -59,8 +63,10 @@ final class GenerateResumePayments extends Command
         'Dropped',
     ];
 
-    public function handle(ForthPayPmodExecutionGateway $gateway): int
+    public function handle(ForthPayPmodExecutionGateway $gateway, DppDataClient $dppClient): int
     {
+        $this->dppClient = $dppClient;
+
         $dryRun = (bool) $this->option('dry-run');
         $companies = $this->resolveCompanies();
 
@@ -109,7 +115,7 @@ final class GenerateResumePayments extends Command
     private function resolveCompanies(): array
     {
         $opt = array_values(array_filter(array_map(
-            static fn (mixed $v): string => strtoupper(trim((string) $v)),
+            static fn(mixed $v): string => strtoupper(trim((string) $v)),
             (array) $this->option('company'),
         )));
 
@@ -179,8 +185,8 @@ final class GenerateResumePayments extends Command
             return [];
         }
 
-        $contactIds = array_map(static fn (array $r): string => (string) ($r['CONTACT_ID'] ?? ''), $candidates);
-        $contactIds = array_values(array_filter($contactIds, static fn (string $v): bool => $v !== ''));
+        $contactIds = array_map(static fn(array $r): string => (string) ($r['CONTACT_ID'] ?? ''), $candidates);
+        $contactIds = array_values(array_filter($contactIds, static fn(string $v): bool => $v !== ''));
         if ($contactIds === []) {
             return [];
         }
@@ -402,8 +408,345 @@ final class GenerateResumePayments extends Command
         array $states,
         bool $dryRun
     ): array {
-        // TODO Phase 4: per-R-code status decision matrix + gateway calls + TblResumePayments insert.
-        return [];
+        $statusChanges = [];
+        if ($states === []) {
+            return $statusChanges;
+        }
+
+        $tenant = strtolower($company); // 'ldr' | 'plaw' — selects DPP key + Forth token
+
+        $contactIds = [];
+        foreach ($states as $state) {
+            $cid = (string) ($state['CONTACT_ID'] ?? '');
+            if ($cid !== '') {
+                $contactIds[] = $cid;
+            }
+        }
+
+        $currentStatuses = $this->fetchCurrentStatuses($snowflake, $contactIds);
+        $enrollmentPlans = $this->fetchEnrollmentPlans($snowflake, $contactIds);
+
+        $today = date('Y-m-d');
+        $monthStart = date('Y-m-01');
+
+        foreach ($states as $state) {
+            $cid = (string) ($state['CONTACT_ID'] ?? '');
+            if ($cid === '') {
+                continue;
+            }
+
+            $name = trim((string) ($state['FULLNAME'] ?? ''));
+            $rcode = (string) ($state['current_rcode'] ?? '');
+            $age = (int) ($state['age_days'] ?? 0);
+            $nsfCount = (int) ($state['nsf_count'] ?? 0);
+            $returnDate = (string) ($state['RETURNED_DATE'] ?? '');
+
+            $currentStatus = (string) ($currentStatuses[$cid] ?? '');
+
+            // Skip contacts already in a terminal/excluded status (VBA's big InStr guard).
+            if ($this->shouldSkipStatus($currentStatus)) {
+                continue;
+            }
+
+            $plan = $this->detectPlan((string) ($enrollmentPlans[$cid] ?? ''));
+            if ($plan === null) {
+                // VBA hits `Stop` here; we log and skip the contact instead of halting.
+                Log::warning('ResumePayments: unmatched/empty enrollment plan, skipping contact', [
+                    'company' => $company,
+                    'contact_id' => $cid,
+                    'plan_title' => $enrollmentPlans[$cid] ?? null,
+                ]);
+                continue;
+            }
+
+            // --- NSF cleared / Current (VBA Case H = "") ---
+            if ($rcode === '') {
+                $target = "{$plan} Enrolled";
+                $alreadyEnrolled = strcasecmp(trim($currentStatus), $target) === 0;
+                if ($alreadyEnrolled || stripos($currentStatus, 'Funded') !== false) {
+                    continue;
+                }
+
+                $this->dppClient->setClientStatus($tenant, $cid, $target, $dryRun);
+                $statusChanges[] = $this->row($cid, $name, "{$plan} Enrolled (NSF Cleared)");
+
+                if ($this->tryResume($gateway, $tenant, $cid, $dryRun)) {
+                    $this->dppClient->addNote($tenant, $cid, 'Payments Resumed. New draft scheduled.', $dryRun);
+                }
+
+                $this->insertResumePayments($sqlConnector, $cid, $today, $returnDate, 0, $monthStart, $dryRun);
+                continue;
+            }
+
+            $group = $this->rcodeGroup($rcode);
+            if ($group === null) {
+                continue; // R-code outside the processed set (shouldn't reach here)
+            }
+            [$reasonLabel, $isNsf] = $group;
+
+            if ($isNsf) {
+                // --- NSF ladder (R01/R09): resume + status + TblResumePayments ---
+                $status = $this->nsfEnrolledStatus($plan, $age);
+                if (stripos($currentStatus, $status) !== false) {
+                    continue; // already at this status
+                }
+
+                if ($this->tryResume($gateway, $tenant, $cid, $dryRun)) {
+                    $this->dppClient->addNote($tenant, $cid, 'Payments Resumed. New draft scheduled.', $dryRun);
+                    $statusChanges[] = $this->row($cid, $name, $status);
+                } else {
+                    $statusChanges[] = $this->row($cid, $name, "{$status} (Unable to Resume)");
+                }
+
+                $this->insertResumePayments($sqlConnector, $cid, $today, $returnDate, $nsfCount, $monthStart, $dryRun);
+                $this->dppClient->setClientStatus($tenant, $cid, $status, $dryRun);
+                continue;
+            }
+
+            // --- Reason ladders (Account Closed / Invalid Bank / Payment Stopped /
+            //     Unauthorized): status update only, no resume, no insert ---
+            $status = $this->reasonLadderStatus($reasonLabel, $age);
+            if (stripos($currentStatus, $status) !== false) {
+                continue;
+            }
+
+            $this->dppClient->setClientStatus($tenant, $cid, $status, $dryRun);
+            $statusChanges[] = $this->row($cid, $name, $status);
+        }
+
+        return $statusChanges;
+    }
+
+    /**
+     * @return array{llg_id:string,name:string,status:string}
+     */
+    private function row(string $contactId, string $name, string $status): array
+    {
+        return ['llg_id' => "LLG-{$contactId}", 'name' => $name, 'status' => $status];
+    }
+
+    /**
+     * Latest lead-status title per contact (VBA: CONTACTS_STATUS join
+     * CONTACTS_LEAD_STATUS, newest STAMP). Batched for all candidates.
+     *
+     * @param list<string> $contactIds
+     * @return array<string, string> contactId => status title
+     */
+    private function fetchCurrentStatuses(DBConnector $snowflake, array $contactIds): array
+    {
+        if ($contactIds === []) {
+            return [];
+        }
+
+        $cidList = implode(',', array_map('intval', $contactIds));
+
+        $sql = "
+            SELECT CONTACT_ID, TITLE
+            FROM (
+                SELECT
+                    s.CONTACT_ID AS CONTACT_ID,
+                    cls.TITLE AS TITLE,
+                    ROW_NUMBER() OVER (PARTITION BY s.CONTACT_ID ORDER BY s.STAMP DESC) AS RN
+                FROM CONTACTS_STATUS s
+                LEFT JOIN CONTACTS_LEAD_STATUS cls ON s.STATUS_ID = cls.ID
+                WHERE s.CONTACT_ID IN ({$cidList})
+            )
+            WHERE RN = 1
+        ";
+
+        $result = $snowflake->query($sql);
+
+        $map = [];
+        foreach ($result['data'] ?? [] as $row) {
+            $cid = (string) ($row['CONTACT_ID'] ?? '');
+            if ($cid !== '') {
+                $map[$cid] = (string) ($row['TITLE'] ?? '');
+            }
+        }
+
+        return $map;
+    }
+
+    /**
+     * Enrollment plan title per contact (VBA: ENROLLMENT_PLAN join
+     * ENROLLMENT_DEFAULTS2). First row wins, matching GetDatabaseValue.
+     *
+     * @param list<string> $contactIds
+     * @return array<string, string> contactId => plan title
+     */
+    private function fetchEnrollmentPlans(DBConnector $snowflake, array $contactIds): array
+    {
+        if ($contactIds === []) {
+            return [];
+        }
+
+        $cidList = implode(',', array_map('intval', $contactIds));
+
+        $sql = "
+            SELECT p.CONTACT_ID AS CONTACT_ID, e.TITLE AS TITLE
+            FROM ENROLLMENT_PLAN p
+            LEFT JOIN ENROLLMENT_DEFAULTS2 e ON p.PLAN_ID = e.ID
+            WHERE p.CONTACT_ID IN ({$cidList})
+        ";
+
+        $result = $snowflake->query($sql);
+
+        $map = [];
+        foreach ($result['data'] ?? [] as $row) {
+            $cid = (string) ($row['CONTACT_ID'] ?? '');
+            if ($cid !== '' && !isset($map[$cid])) {
+                $map[$cid] = (string) ($row['TITLE'] ?? '');
+            }
+        }
+
+        return $map;
+    }
+
+    /**
+     * VBA plan-detection ladder (identical effect in both LDR and PLAW macros):
+     * LDR / "LT L" prefix -> LDR; contains "Progress" -> ProLaw; PLAW prefix ->
+     * PLAW; anything else -> null (VBA `Stop`, we skip the contact).
+     */
+    private function detectPlan(string $enrollmentPlan): ?string
+    {
+        $plan = trim($enrollmentPlan);
+        if ($plan === '' || strcasecmp($plan, 'Untitled') === 0) {
+            return null;
+        }
+
+        $upper = strtoupper($plan);
+
+        if (substr($upper, 0, 3) === 'LDR') {
+            return 'LDR';
+        }
+        if (substr($upper, 0, 4) === 'LT L') {
+            return 'LDR';
+        }
+        if (stripos($plan, 'Progress') !== false) {
+            return 'ProLaw';
+        }
+        if (substr($upper, 0, 4) === 'PLAW') {
+            return 'PLAW';
+        }
+
+        return null;
+    }
+
+    private function shouldSkipStatus(string $currentStatus): bool
+    {
+        if ($currentStatus === '') {
+            return false; // VBA proceeds when no status is present
+        }
+
+        foreach (self::SKIP_STATUS_SUBSTRINGS as $needle) {
+            if (stripos($currentStatus, $needle) !== false) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * NSF "Enrolled" ladder for R01/R09 (VBA age buckets 18/34/45/63/93).
+     */
+    private function nsfEnrolledStatus(string $plan, int $age): string
+    {
+        return match (true) {
+            $age <= 18 => "{$plan} Enrolled (NSF-1)",
+            $age <= 34 => "{$plan} Enrolled (NSF-1) 15 day",
+            $age <= 45 => "{$plan} Enrolled (NSF-2) 30 day",
+            $age <= 63 => "{$plan} Enrolled (NSF-2) 45 day",
+            $age <= 93 => "{$plan} Enrolled (NSF-3) 60 day",
+            default => "{$plan} Enrolled (NSF-3) 90 day",
+        };
+    }
+
+    /**
+     * Reason-specific ladder for Account Closed / Invalid Bank / Payment Stopped /
+     * Unauthorized (VBA age buckets 29/44/59/89). Titles are NOT plan-prefixed.
+     */
+    private function reasonLadderStatus(string $reasonLabel, int $age): string
+    {
+        $suffix = match (true) {
+            $age <= 29 => '1',
+            $age <= 44 => '30',
+            $age <= 59 => '45',
+            $age <= 89 => '60',
+            default => '90',
+        };
+
+        return "NSF {$reasonLabel} - {$suffix}";
+    }
+
+    /**
+     * Map an R-code to its Phase-4 reason group. Note R08 is Payment Stopped here
+     * (in Phase 5 it regroups under NSF — preserved separately in processSystemCancels).
+     *
+     * @return array{0:string,1:bool}|null [reasonLabel, isNsf]
+     */
+    private function rcodeGroup(string $rcode): ?array
+    {
+        return match ($rcode) {
+            'R01', 'R09' => ['nsf', true],
+            'R02', 'R15' => ['Account Closed', false],
+            'R03', 'R04', 'R16', 'R20' => ['Invalid Bank', false],
+            'R07', 'R08' => ['Payment Stopped', false],
+            'R10', 'R11' => ['Unauthorized', false],
+            default => null,
+        };
+    }
+
+    private function tryResume(
+        ForthPayPmodExecutionGateway $gateway,
+        string $tenant,
+        string $contactId,
+        bool $dryRun
+    ): bool {
+        try {
+            $gateway->resumePaymentsForContact($tenant, $contactId, $dryRun);
+
+            return true;
+        } catch (\Throwable $e) {
+            // Matches the VBA's "(Unable to Resume)" path when #resumebtn isn't actionable.
+            Log::warning('ResumePayments: resume-payments failed (Unable to Resume)', [
+                'tenant' => $tenant,
+                'contact_id' => $contactId,
+                'error' => $e->getMessage(),
+            ]);
+
+            return false;
+        }
+    }
+
+    private function insertResumePayments(
+        DBConnector $sqlConnector,
+        string $contactId,
+        string $today,
+        string $returnDate,
+        int $nsfs,
+        string $monthStart,
+        bool $dryRun
+    ): void {
+        if ($dryRun) {
+            Log::info('ResumePayments: DRY RUN - would INSERT TblResumePayments', [
+                'llg_id' => "LLG-{$contactId}",
+                'return_date' => $returnDate,
+                'nsfs' => $nsfs,
+            ]);
+
+            return;
+        }
+
+        $insert = 'INSERT INTO TblResumePayments (LLG_ID, Process_Date, Return_Date, NSFs, Process_Month) VALUES (?, ?, ?, ?, ?)';
+
+        $sqlConnector->querySqlServer($insert, [
+            "LLG-{$contactId}",
+            $today,
+            $returnDate !== '' ? $returnDate : null,
+            $nsfs,
+            $monthStart,
+        ]);
     }
 
     /**
