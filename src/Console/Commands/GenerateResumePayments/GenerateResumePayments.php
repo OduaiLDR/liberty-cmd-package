@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Cmd\Reports\Console\Commands\GenerateResumePayments;
 
 use Cmd\Reports\Pmod\Services\DppDataClient;
+use Cmd\Reports\Pmod\Services\DppSeleniumService;
 use Cmd\Reports\Pmod\Services\ForthPayPmodExecutionGateway;
 use Cmd\Reports\Services\DBConnector;
 use Illuminate\Console\Command;
@@ -52,6 +53,9 @@ final class GenerateResumePayments extends Command
     /** DPP "post" data-API client for client_status / notebody writes (Phase 4). */
     private DppDataClient $dppClient;
 
+    /** Headless-browser client for the #resumebtn (Phase 4) and #cancelbtn (Phase 5) flows. */
+    private DppSeleniumService $dppSelenium;
+
     /** Statuses whose presence in CurrentStatus causes the contact to be SKIPPED entirely. */
     private const SKIP_STATUS_SUBSTRINGS = [
         'Dropped / Cancelled',
@@ -65,9 +69,10 @@ final class GenerateResumePayments extends Command
         'Dropped',
     ];
 
-    public function handle(ForthPayPmodExecutionGateway $gateway, DppDataClient $dppClient): int
+    public function handle(ForthPayPmodExecutionGateway $gateway, DppDataClient $dppClient, DppSeleniumService $dppSelenium): int
     {
         $this->dppClient = $dppClient;
+        $this->dppSelenium = $dppSelenium;
 
         $dryRun = (bool) $this->option('dry-run');
         $companies = $this->resolveCompanies();
@@ -520,7 +525,7 @@ final class GenerateResumePayments extends Command
                 $this->dppClient->setClientStatus($tenant, $cid, $target, $dryRun);
                 $statusChanges[] = $this->row($cid, $name, "{$plan} Enrolled (NSF Cleared)");
 
-                if ($this->tryResume($gateway, $tenant, $cid, $dryRun)) {
+                if ($this->tryResume($tenant, $cid, $dryRun)) {
                     $this->dppClient->addNote($tenant, $cid, 'Payments Resumed. New draft scheduled.', $dryRun);
                 }
 
@@ -541,7 +546,7 @@ final class GenerateResumePayments extends Command
                     continue; // already at this status
                 }
 
-                if ($this->tryResume($gateway, $tenant, $cid, $dryRun)) {
+                if ($this->tryResume($tenant, $cid, $dryRun)) {
                     $this->dppClient->addNote($tenant, $cid, 'Payments Resumed. New draft scheduled.', $dryRun);
                     $statusChanges[] = $this->row($cid, $name, $status);
                 } else {
@@ -747,19 +752,26 @@ final class GenerateResumePayments extends Command
         };
     }
 
-    private function tryResume(
-        ForthPayPmodExecutionGateway $gateway,
-        string $tenant,
-        string $contactId,
-        bool $dryRun
-    ): bool {
+    private function tryResume(string $tenant, string $contactId, bool $dryRun): bool
+    {
         try {
-            $gateway->resumePaymentsForContact($tenant, $contactId, $dryRun);
+            $result = $this->dppSelenium->resumePayments($tenant, $contactId, $dryRun);
+            $ok = ($result['status'] ?? '') === 'success';
 
-            return true;
+            if (!$ok) {
+                // Button absent / not actionable → VBA's "(Unable to Resume)".
+                Log::warning('ResumePayments: not resumed (Unable to Resume)', [
+                    'tenant' => $tenant,
+                    'contact_id' => $contactId,
+                    'message' => $result['message'] ?? '',
+                ]);
+            }
+
+            return $ok;
         } catch (\Throwable $e) {
-            // Matches the VBA's "(Unable to Resume)" path when #resumebtn isn't actionable.
-            Log::warning('ResumePayments: resume-payments failed (Unable to Resume)', [
+            // Browser/login failure (incl. Panther not installed yet) → treat as
+            // "Unable to Resume" so the status write still proceeds.
+            Log::warning('ResumePayments: resume failed (Unable to Resume)', [
                 'tenant' => $tenant,
                 'contact_id' => $contactId,
                 'error' => $e->getMessage(),

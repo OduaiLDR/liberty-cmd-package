@@ -134,8 +134,107 @@ final class DppSeleniumService
     }
 
     /**
+     * Resume payments for a single contact by clicking #resumebtn on the tools
+     * page — the action the VBA's `If ResumePayments = "Resume Payments"` block
+     * performed (Forth has no REST equivalent; the API endpoint 404s).
+     *
+     * Returns success only when the button was present, read "Resume Payments",
+     * and the confirm alert was accepted. A non-actionable button (already
+     * resumed, paused, etc.) returns status=failed so the caller logs the VBA's
+     * "(Unable to Resume)".
+     *
+     * @return array{status: 'success'|'failed', message: string}
+     */
+    public function resumePayments(string $tenant, string $contactId, bool $dryRun = false): array
+    {
+        $tenant = strtoupper(trim($tenant));
+        $contactId = trim($contactId);
+
+        Log::info('DPP: resumePayments requested', [
+            'tenant' => $tenant,
+            'contact_id' => $contactId,
+            'dry_run' => $dryRun,
+        ]);
+
+        if ($dryRun) {
+            return ['status' => 'success', 'message' => 'dry-run: would click #resumebtn'];
+        }
+
+        $this->ensureLogin($tenant);
+        $client = $this->client();
+
+        $url = self::DPP_BASE_URL . '/index.php?module=tools&page=view&cid=' . rawurlencode($contactId);
+
+        try {
+            $client->request('GET', $url);
+            $client->waitFor('#resumebtn', 15);
+        } catch (\Throwable $e) {
+            // No resume button on the page → not in a resumable state.
+            return ['status' => 'failed', 'message' => '#resumebtn not present'];
+        }
+
+        try {
+            $button = $client->findElement(\Facebook\WebDriver\WebDriverBy::cssSelector('#resumebtn'));
+            $text = trim($button->getText());
+
+            if ($text !== 'Resume Payments') {
+                return ['status' => 'failed', 'message' => "resume button not actionable (text: '{$text}')"];
+            }
+
+            $button->click();
+            // Clicking triggers a JS confirm() — accept it, like VBA's SwitchToAlert.Accept.
+            $client->getWebDriver()->switchTo()->alert()->accept();
+
+            Log::info('DPP: payments resumed', ['tenant' => $tenant, 'contact_id' => $contactId]);
+
+            return ['status' => 'success', 'message' => 'payments resumed'];
+        } catch (\Throwable $e) {
+            throw new DppSeleniumException(
+                'resumePayments failed: ' . $e->getMessage(),
+                tenant: $tenant,
+                contactId: $contactId,
+                stage: 'resume',
+                previous: $e,
+            );
+        }
+    }
+
+    /**
+     * Lazily create and reuse one headless Chromium session for the whole run.
+     * Returns a Symfony Panther Client; referenced via FQN so this file still
+     * loads when symfony/panther isn't installed (only calling it requires it).
+     */
+    private function client(): \Symfony\Component\Panther\Client
+    {
+        if ($this->client === null) {
+            // Panther picks up the Chromium binary from this env var.
+            if ($this->chromeBinary !== '') {
+                putenv('PANTHER_CHROME_BINARY=' . $this->chromeBinary);
+                $_SERVER['PANTHER_CHROME_BINARY'] = $this->chromeBinary;
+            }
+
+            $this->client = \Symfony\Component\Panther\Client::createChromeClient(
+                $this->chromeDriverBinary !== '' ? $this->chromeDriverBinary : null,
+                [
+                    '--headless=new',
+                    '--no-sandbox',
+                    '--disable-gpu',
+                    '--disable-dev-shm-usage',
+                    '--window-size=1920,1080',
+                ],
+            );
+        }
+
+        return $this->client;
+    }
+
+    /**
      * Make sure we have a live, authenticated browser session for the tenant.
-     * No-op if we've already logged in this run.
+     * No-op if we've already logged in this run. Mirrors CRMLoginLDR/PLAW:
+     * fill #Username / #Password / #Acct (= tenant name) and submit.
+     *
+     * NOTE: the login URL is the DPP root; if the form isn't found there we'll
+     * see it in the failure and adjust to the exact CRMURLLogin path.
      */
     private function ensureLogin(string $tenant): void
     {
@@ -144,21 +243,49 @@ final class DppSeleniumService
         }
 
         $this->assertCredentials($tenant);
+        $creds = $this->tenantCredentials[$tenant];
 
-        // TODO recordings needed:
-        //   - Selector for username field on https://login.debtpaypro.com
-        //   - Selector for password field
-        //   - Selector for submit button
-        //   - Post-login redirect URL / element that proves auth worked
-        //   - Tenant-switch mechanism (if SystemAdmin sees LDR and PLAW from the
-        //     same login, we may need to switch tenants per call; if separate
-        //     logins, we re-login per tenant.)
-        throw new DppSeleniumException(
-            'ensureLogin() is not yet wired — DPP login form must be recorded first.',
-            tenant: $tenant,
-            stage: 'login',
-        );
+        $client = $this->client();
+
+        try {
+            $client->request('GET', self::DPP_BASE_URL . '/');
+            $client->waitFor('#Username', 20);
+
+            $username = $client->findElement(\Facebook\WebDriver\WebDriverBy::cssSelector('#Username'));
+            $username->clear();
+            $username->sendKeys((string) $creds['username']);
+
+            $password = $client->findElement(\Facebook\WebDriver\WebDriverBy::cssSelector('#Password'));
+            $password->clear();
+            $password->sendKeys((string) $creds['password']);
+
+            // #Acct = the DPP account name, which is the tenant ("LDR" / "PLAW").
+            $account = $client->findElement(\Facebook\WebDriver\WebDriverBy::cssSelector('#Acct'));
+            $account->clear();
+            $account->sendKeys($tenant);
+
+            $client->findElement(\Facebook\WebDriver\WebDriverBy::name('Submit'))->click();
+
+            // Wait for the login form to go away (post-login redirect), like the
+            // VBA's wait after Submit — we don't assert a specific landing element.
+            $client->wait(20)->until(
+                \Facebook\WebDriver\WebDriverExpectedCondition::invisibilityOfElementLocated(
+                    \Facebook\WebDriver\WebDriverBy::cssSelector('#Username')
+                )
+            );
+        } catch (\Throwable $e) {
+            throw new DppSeleniumException(
+                'DPP login failed: ' . $e->getMessage(),
+                tenant: $tenant,
+                stage: 'login',
+                previous: $e,
+            );
+        }
+
+        $this->loggedIn[$tenant] = true;
+        Log::info('DPP: logged in', ['tenant' => $tenant]);
     }
+
 
     private function assertCredentials(string $tenant): void
     {
