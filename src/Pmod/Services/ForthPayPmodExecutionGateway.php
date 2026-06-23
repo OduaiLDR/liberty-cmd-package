@@ -482,6 +482,166 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway
         return $paymentData;
     }
 
+    /**
+     * Resume payments for a single contact without constructing a full
+     * PmodWorkItem. Used by Generate:resume-payments Phase 4, which processes a
+     * Snowflake-derived list of contacts rather than PMOD work items.
+     *
+     * Throws on any non-2xx so the caller can fall back to the VBA's
+     * "(Unable to Resume)" reporting path.
+     *
+     * @return array<string, mixed>
+     */
+    public function resumePaymentsForContact(string $tenantId, string $contactId, bool $dryRun = false): array
+    {
+        Log::info('PMOD: Resuming payments (contact)', [
+            'contact_id' => $contactId,
+            'tenant_id' => $tenantId,
+            'dry_run' => $dryRun,
+        ]);
+
+        if ($dryRun) {
+            return ['contact_id' => $contactId, 'status' => 'dry_run_resumed'];
+        }
+
+        $response = $this->crmClient($tenantId)
+            ->post("/contacts/{$contactId}/resume-payments");
+
+        if (!$response->successful()) {
+            Log::warning('PMOD: resume-payments not successful', [
+                'contact_id' => $contactId,
+                'tenant_id' => $tenantId,
+                'status' => $response->status(),
+                'response' => $response->body(),
+            ]);
+
+            throw new \RuntimeException('Failed to resume payments: HTTP ' . $response->status());
+        }
+
+        // Log the success status + a body snippet so the first live test gives a
+        // clear yes/no on whether this endpoint actually reschedules the draft.
+        Log::info('PMOD: resume-payments succeeded', [
+            'contact_id' => $contactId,
+            'tenant_id' => $tenantId,
+            'status' => $response->status(),
+            'response' => mb_substr($response->body(), 0, 300),
+        ]);
+
+        return $response->json('response', []);
+    }
+
+    /**
+     * Update a contact via Forth CRM. Accepts integer `stage` and `status` IDs
+     * (per Forth release notes 2023-07), plus any other contact fields the
+     * Update Contact endpoint supports.
+     *
+     * @param array<string, mixed> $payload
+     * @return array<string, mixed>
+     */
+    public function updateContact(PmodWorkItem $workItem, array $payload): array
+    {
+        Log::info('PMOD: Updating contact', [
+            'contact_id' => $workItem->contactId,
+            'tenant_id' => $workItem->tenantId,
+            'payload' => $payload,
+            'idempotency_key' => $workItem->idempotencyKey,
+            'dry_run' => $workItem->dryRun,
+        ]);
+
+        if ($workItem->dryRun) {
+            Log::info('PMOD: DRY RUN - Would update contact', [
+                'contact_id' => $workItem->contactId,
+                'payload' => $payload,
+            ]);
+            return [
+                'contact_id' => $workItem->contactId,
+                'status' => 'dry_run_updated',
+                'payload' => $payload,
+            ];
+        }
+
+        $response = $this->crmClient($workItem->tenantId)
+            ->put("/contacts/{$workItem->contactId}", $payload);
+
+        if (!$response->successful()) {
+            Log::error('PMOD: Failed to update contact', [
+                'contact_id' => $workItem->contactId,
+                'tenant_id' => $workItem->tenantId,
+                'status' => $response->status(),
+                'response' => $response->body(),
+            ]);
+
+            throw new \RuntimeException('Failed to update contact');
+        }
+
+        $data = $response->json('response', []);
+
+        Log::info('PMOD: Contact updated', ['contact_id' => $workItem->contactId]);
+
+        return $data;
+    }
+
+    /**
+     * List all contact stages and their statuses for a tenant. Returns the raw
+     * Forth response so callers can extract the integer IDs needed by
+     * updateContact()'s `stage` / `status` fields.
+     *
+     * @return list<array<string, mixed>>
+     */
+    /**
+     * Contact "stages" are Forth's top-level categories (Underwriting, Client,
+     * NSF, Cancel, Graduated, Lead, Admin). Each has an integer `id` that a
+     * status links back to via its `cat_id`.
+     *
+     * @return list<array<string, mixed>>
+     */
+    public function listContactStages(string $tenantId): array
+    {
+        Log::info('PMOD: Listing contact stages', ['tenant_id' => $tenantId]);
+
+        $response = $this->crmClient($tenantId)
+            ->get('/contact-stages');
+
+        if (!$response->successful()) {
+            Log::error('PMOD: Failed to list contact stages', [
+                'tenant_id' => $tenantId,
+                'status' => $response->status(),
+                'response' => $response->body(),
+            ]);
+
+            throw new \RuntimeException('Failed to list contact stages');
+        }
+
+        return $response->json('response.results', []);
+    }
+
+    /**
+     * Contact "statuses" are the account-specific lead statuses (e.g.
+     * "LDR Enrolled (NSF-1)", "System Cancel (NSF-3)"). Each carries an integer
+     * `id` (what Update Contact wants) and a `cat_id` pointing at its stage.
+     *
+     * @return list<array<string, mixed>>
+     */
+    public function listContactStatuses(string $tenantId): array
+    {
+        Log::info('PMOD: Listing contact statuses', ['tenant_id' => $tenantId]);
+
+        $response = $this->crmClient($tenantId)
+            ->get('/contact-statuses');
+
+        if (!$response->successful()) {
+            Log::error('PMOD: Failed to list contact statuses', [
+                'tenant_id' => $tenantId,
+                'status' => $response->status(),
+                'response' => $response->body(),
+            ]);
+
+            throw new \RuntimeException('Failed to list contact statuses');
+        }
+
+        return $response->json('response.results', []);
+    }
+
     public function createRefund(PmodWorkItem $workItem, array $payload): array
     {
         Log::info('PMOD: Creating refund', [

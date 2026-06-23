@@ -32,7 +32,7 @@ final class PmodWorkItemFactory
         if ($settlementId !== '') {
             $settlementIds[] = $settlementId;
         }
-        $settlementIds = array_values(array_unique(array_filter($settlementIds, static fn (string $value): bool => $value !== '')));
+        $settlementIds = array_values(array_unique(array_filter($settlementIds, static fn(string $value): bool => $value !== '')));
 
         $originalDates = self::normalizeStringList($normalizedPayload['original_dates'] ?? []);
         if ($originalDates === []) {
@@ -76,11 +76,19 @@ final class PmodWorkItemFactory
         $extendedAmount = self::nullableString($normalizedPayload['extended_amount'] ?? null);
         $paymentAmount = $amount ?? $extendedAmount ?? self::nullableString($normalizedPayload['increase_amount'] ?? null);
 
+        // Resolve company first, then normalize tenantId to the lowercase
+        // company slug. This makes the gateway tenant-lookup work even when
+        // the upstream consumer passes a UUID (e.g. stancl/tenancy tenant id)
+        // because the gateway maps slugs ('ldr', 'plaw', 'lt') to API keys.
+        // Original tenant identifier is preserved in normalizedPayload/rawPayload.
+        $company = PmodCompanyResolver::fromTenantContext($normalizedPayload['company'] ?? $normalizedPayload['tenant_id'] ?? $tenantId ?? null);
+        $normalizedTenantId = strtolower($company->value);
+
         return new PmodWorkItem(
             requestId: (string) Str::uuid(),
-            tenantId: $tenantId,
+            tenantId: $normalizedTenantId,
             source: $source,
-            company: PmodCompanyResolver::fromTenantContext($normalizedPayload['company'] ?? $normalizedPayload['tenant_id'] ?? $tenantId ?? null),
+            company: $company,
             actionType: $actionType,
             requestedBy: trim((string) ($normalizedPayload['requested_by'] ?? '')),
             contactId: $contactId,

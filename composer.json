@@ -8,6 +8,7 @@
     "guzzlehttp/guzzle": "^7.10",
     "phpoffice/phpspreadsheet": "^1.29",
     "phpseclib/phpseclib": "^3.0",
+    "symfony/panther": "^2.1",
     "ext-sqlsrv": "*",
     "ext-pdo_sqlsrv": "*"
   },

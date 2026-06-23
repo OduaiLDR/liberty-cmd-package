@@ -4,6 +4,7 @@ namespace Cmd\Reports\Console\Commands;
 
 use Cmd\Reports\Services\DBConnector;
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 
 class RefreshForthApiTokens extends Command
@@ -90,6 +91,12 @@ class RefreshForthApiTokens extends Command
                     $updated = $this->updateApiKey($connector, $config['pk'], $config['category'], $newToken);
 
                     if ($updated) {
+                        // Rotating the token invalidates the previous one on Forth's
+                        // side, so bust the gateway's 1h token cache immediately —
+                        // otherwise the next gateway call serves the now-dead token
+                        // and gets 401 until the cache expires.
+                        Cache::forget('pmod_api_key_' . strtoupper($config['category']));
+
                         $this->info("[$companyName] Successfully updated TblAPIKeys.");
                         Log::info('RefreshForthApiTokens: token updated.', [
                             'company' => $companyName,

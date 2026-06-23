@@ -24,6 +24,8 @@ use Cmd\Reports\Console\Commands\GenerateLegalReport\GenerateLegalReport;
 use Cmd\Reports\Console\Commands\GenerateWelcomeLetterReport\GenerateWelcomeLetterReport;
 use Cmd\Reports\Console\Commands\GenerateWelcomePacketReport\GenerateWelcomePacketReport;
 use Cmd\Reports\Console\Commands\GenerateDroppedReport\GenerateDroppedReport;
+use Cmd\Reports\Console\Commands\GenerateResumePayments\GenerateResumePayments;
+use Cmd\Reports\Pmod\Console\Commands\DumpForthStagesStatuses;
 use Cmd\Reports\Console\Commands\GenerateScrubListReport\GenerateScrubListReport;
 use Cmd\Reports\Console\Commands\GenerateLookbackSummaryReport\GenerateLookbackSummaryReport;
 use Cmd\Reports\Console\Commands\GenerateReportSummary\GenerateReportSummary;
@@ -121,6 +123,8 @@ class ReportsServiceProvider extends ServiceProvider
                 GenerateWelcomeLetterReport::class,
                 GenerateWelcomePacketReport::class,
                 GenerateDroppedReport::class,
+                GenerateResumePayments::class,
+                DumpForthStagesStatuses::class,
                 GenerateScrubListReport::class,
                 GenerateLookbackSummaryReport::class,
                 GenerateReportSummary::class,
@@ -155,6 +159,19 @@ class ReportsServiceProvider extends ServiceProvider
         // own service provider after calling parent::register().
         $this->app->singleton(PmodExecutionGateway::class, ForthPayPmodExecutionGateway::class);
         $this->app->singleton(PmodEmailNotificationService::class);
+
+        // Singleton so Generate:resume-payments reuses one Panther/Chromium
+        // browser session across all contacts in a run.
+        $this->app->singleton(\Cmd\Reports\Pmod\Services\DppSeleniumService::class, static function (): \Cmd\Reports\Pmod\Services\DppSeleniumService {
+            return \Cmd\Reports\Pmod\Services\DppSeleniumService::fromConfig();
+        });
+
+        // DebtPayPro "post" data-API client for Phase 4 status/note writes
+        // (replicates the VBA UpdateCRMData* subs). Constructor needs config, so
+        // bind it explicitly rather than relying on autowiring.
+        $this->app->singleton(\Cmd\Reports\Pmod\Services\DppDataClient::class, static function (): \Cmd\Reports\Pmod\Services\DppDataClient {
+            return \Cmd\Reports\Pmod\Services\DppDataClient::fromConfig();
+        });
 
         $this->app->singleton(PmodDispatcher::class, function ($app) {
             $gateway = $app->make(PmodExecutionGateway::class);
