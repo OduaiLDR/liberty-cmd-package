@@ -8,6 +8,7 @@ use Cmd\Reports\Pmod\Services\DppDataClient;
 use Cmd\Reports\Pmod\Services\DppSeleniumService;
 use Cmd\Reports\Pmod\Services\ForthPayPmodExecutionGateway;
 use Cmd\Reports\Services\DBConnector;
+use Cmd\Reports\Services\EmailSenderService;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
 
@@ -41,7 +42,8 @@ final class GenerateResumePayments extends Command
         {--dry-run : Skip all CRM writes; only log what would happen}
         {--company=* : Limit run to LDR and/or PLAW (default: both)}
         {--contact-id=* : Only process these Forth contact IDs (controlled live test)}
-        {--limit= : Process at most N contacts per company (after NSF-state filtering)}';
+        {--limit= : Process at most N contacts per company (after NSF-state filtering)}
+        {--execute-cancels : Actually run the Day-4+ System Cancel (browser drop/refund). Off by default — Phase 5 only reports cancel-ready contacts unless this is passed.}';
 
     protected $description = 'Process NSF contacts for LDR and Progress Law: update statuses, resume drafts, and execute system cancels per the ResumePayments VBA workflow.';
 
@@ -843,6 +845,10 @@ final class GenerateResumePayments extends Command
         bool $dryRun
     ): void {
         $today = date('Y-m-d');
+        $executeCancels = (bool) $this->option('execute-cancels');
+        $processDate = $this->nextBusinessDay();
+        $tenant = strtolower($company);
+        $systemAccount = $this->systemAccountFor($company);
 
         foreach ($states as $state) {
             $isCurrent = (bool) ($state['is_current'] ?? false);
@@ -878,15 +884,243 @@ final class GenerateResumePayments extends Command
                 continue;
             }
 
-            // Day >= 4: ready to cancel. Until DppSeleniumService selectors are
-            // wired, we surface a "Ready" placeholder so the email reader knows
-            // the contact is queued for cancel; no Panther call yet.
-            $statusChanges[] = [
-                'llg_id' => $llgId,
-                'name' => $name,
-                'status' => "System Cancel Ready - Day {$day}",
-            ];
+            // Day >= 4: ready to cancel.
+            $rcode = (string) ($state['current_rcode'] ?? '');
+            $cancelInfo = $this->systemCancelInfo($rcode);
+
+            // Without --execute-cancels (the default, and how the daily cron runs
+            // until cancel is verified), or for an R-code we don't map, just report
+            // the contact as ready and execute nothing.
+            if (!$executeCancels || $cancelInfo === null) {
+                $statusChanges[] = [
+                    'llg_id' => $llgId,
+                    'name' => $name,
+                    'status' => "System Cancel Ready - Day {$day}",
+                ];
+                continue;
+            }
+
+            // Give up after 3 failed attempts so we don't hammer a stuck contact.
+            if ($dayInfo['attempts'] >= 3) {
+                $statusChanges[] = [
+                    'llg_id' => $llgId,
+                    'name' => $name,
+                    'status' => "System Cancel Failed (3 attempts) - Day {$day}",
+                ];
+                continue;
+            }
+
+            $this->executeSystemCancel(
+                $snowflake,
+                $sqlConnector,
+                $tenant,
+                $contactId,
+                $llgId,
+                $name,
+                $cancelInfo,
+                $systemAccount,
+                $processDate,
+                $today,
+                $dryRun,
+                $statusChanges,
+            );
         }
+    }
+
+    /**
+     * Day-4+ System Cancel for one contact: compute balances, add the cancel note,
+     * drive the browser cancel (DppSeleniumService), then on the result set the
+     * final status, email setforth for a negative balance, and stamp
+     * TblEnrollmentCancellations. Mirrors the VBA's cancel block.
+     *
+     * @param array{0:string,1:string,2:string} $cancelInfo [statusTitle, reasonEn, reasonEs]
+     * @param list<array{llg_id:string,name:string,status:string}> $statusChanges
+     */
+    private function executeSystemCancel(
+        DBConnector $snowflake,
+        DBConnector $sqlConnector,
+        string $tenant,
+        string $contactId,
+        string $llgId,
+        string $name,
+        array $cancelInfo,
+        string $systemAccount,
+        string $processDate,
+        string $today,
+        bool $dryRun,
+        array &$statusChanges
+    ): void {
+        [$statusTitle, $reasonEn, $reasonEs] = $cancelInfo;
+        $reason = $this->isEnglish($snowflake, $contactId) ? $reasonEn : $reasonEs;
+
+        $balance = $this->latestPendingBalance($snowflake, $contactId);
+        $epf = $this->sumPendingTransactions($snowflake, $contactId, 'PF');
+        $settlements = $this->sumPendingTransactions($snowflake, $contactId, 'S');
+
+        if ($dryRun) {
+            Log::info('ResumePayments: DRY RUN - would System Cancel', [
+                'contact_id' => $contactId,
+                'status' => $statusTitle,
+                'balance' => $balance,
+                'epf' => $epf,
+                'scheduled_settlements' => $settlements,
+            ]);
+            $statusChanges[] = ['llg_id' => $llgId, 'name' => $name, 'status' => "DRY RUN: {$statusTitle}"];
+            return;
+        }
+
+        // Cancel note (DPP post) before driving the browser, matching the VBA.
+        $this->dppClient->addNote($tenant, $contactId, "System Cancel ({$reason}-3)", false);
+
+        $result = $this->dppSelenium->cancelProgram($tenant, $contactId, [
+            'balance' => $balance,
+            'epf' => $epf,
+            'scheduled_settlements' => $settlements,
+            'process_date' => $processDate,
+            'today' => $today,
+            'system_account' => $systemAccount,
+            'drop_reason' => 'Unable to Resolve NSF',
+            'note' => 'Attempted to resume payments 4 times.',
+        ]);
+
+        $status = (string) ($result['status'] ?? 'failed');
+
+        if ($status === 'manual_audit') {
+            $this->emailCancellationAudit($contactId);
+            $this->stampCancelResult($sqlConnector, $llgId, 'manual_audit: ' . ($result['message'] ?? ''), false);
+            $statusChanges[] = ['llg_id' => $llgId, 'name' => $name, 'status' => 'Manual Cancel Audit Required.'];
+            return;
+        }
+
+        if ($status === 'success') {
+            $this->dppClient->setClientStatus($tenant, $contactId, $statusTitle, false);
+
+            if (($result['balance_branch'] ?? '') === 'negative') {
+                $this->emailReverseFees($contactId, $name);
+            }
+
+            $this->stampCancelResult($sqlConnector, $llgId, 'success', true);
+            $statusChanges[] = ['llg_id' => $llgId, 'name' => $name, 'status' => $statusTitle];
+            return;
+        }
+
+        // not_cancellable / failed → record the attempt, report it.
+        $this->stampCancelResult($sqlConnector, $llgId, $status . ': ' . ($result['message'] ?? ''), false);
+        $statusChanges[] = ['llg_id' => $llgId, 'name' => $name, 'status' => "System Cancel {$status}: " . ($result['message'] ?? '')];
+    }
+
+    /**
+     * Phase-5 R-code grouping (note R08 sits with NSF here, unlike Phase 4).
+     *
+     * @return array{0:string,1:string,2:string}|null [statusTitle, reasonEnglish, reasonSpanish]
+     */
+    private function systemCancelInfo(string $rcode): ?array
+    {
+        return match ($rcode) {
+            'R01', 'R08', 'R09' => ['System Cancel (NSF-3)', 'NSF', 'Fondos Insuficientes'],
+            'R02', 'R15' => ['System Cancel (Account Closed-3)', 'Account Closed', 'Cierre de Cuenta'],
+            'R03', 'R04', 'R16', 'R20' => ['System Cancel (Invalid Bank-3)', 'Invalid Bank', 'Banco Invalido'],
+            'R07' => ['System Cancel (Payment Stopped-3)', 'Payment Stopped', 'Pago Detenido'],
+            'R10', 'R11' => ['System Cancel (Unauthorized-3)', 'Payment Unauthorized', 'Autorización Necesaria'],
+            default => null,
+        };
+    }
+
+    /** Next business day (Mon–Fri), matching the VBA's ProcessDate. */
+    private function nextBusinessDay(): string
+    {
+        $ts = strtotime('+1 day');
+        while ((int) date('N', $ts) > 5) {
+            $ts = strtotime('+1 day', $ts);
+        }
+
+        return date('Y-m-d', $ts);
+    }
+
+    /** DPP system account used for the EPF credit (per the VBA). */
+    private function systemAccountFor(string $company): string
+    {
+        return strtoupper($company) === 'PLAW' ? '35564 - Progress Law' : '35281 - LDR - Main';
+    }
+
+    /**
+     * Language check for the cancel-note reason (VBA: data source NAME contains
+     * "ES" — case-sensitive — then the Spanish user-field).
+     */
+    private function isEnglish(DBConnector $snowflake, string $contactId): bool
+    {
+        $cid = (int) $contactId;
+
+        $sql = "SELECT ds.NAME AS NAME FROM CONTACTS c LEFT JOIN DATA_SOURCES ds ON c.C_SOURCE = ds.ID WHERE c.ID = {$cid}";
+        $sourceName = (string) ($snowflake->query($sql)['data'][0]['NAME'] ?? '');
+        $english = strpos($sourceName, 'ES') === false;
+
+        if ($english) {
+            $sql2 = "SELECT F_STRING AS F_STRING FROM CONTACTS_USERFIELDS WHERE CONTACT_ID = {$cid} AND CUSTOM_ID = 299195";
+            $field = (string) ($snowflake->query($sql2)['data'][0]['F_STRING'] ?? '');
+            $english = $field !== 'Spanish';
+        }
+
+        return $english;
+    }
+
+    /** Latest pending balance (VBA: TOP 1 PENDING FROM CONTACT_BALANCES). */
+    private function latestPendingBalance(DBConnector $snowflake, string $contactId): float
+    {
+        $cid = (int) $contactId;
+        $sql = "SELECT PENDING AS PENDING FROM CONTACT_BALANCES WHERE CONTACT_ID = {$cid} ORDER BY STAMP DESC LIMIT 1";
+
+        return (float) ($snowflake->query($sql)['data'][0]['PENDING'] ?? 0);
+    }
+
+    /** Sum of pending (uncleared, active, not cancelled) PF (EPF) or S (settlement) transactions. */
+    private function sumPendingTransactions(DBConnector $snowflake, string $contactId, string $transType): float
+    {
+        $cid = (int) $contactId;
+        $type = $transType === 'PF' ? 'PF' : 'S';
+        $sql = "
+            SELECT SUM(AMOUNT) AS TOTAL
+            FROM TRANSACTIONS
+            WHERE CONTACT_ID = {$cid}
+              AND TRANS_TYPE = '{$type}'
+              AND CLEARED_DATE IS NULL
+              AND CANCELLED = 0
+              AND ACTIVE = 1
+        ";
+
+        return (float) ($snowflake->query($sql)['data'][0]['TOTAL'] ?? 0);
+    }
+
+    private function stampCancelResult(DBConnector $sqlConnector, string $llgId, string $result, bool $cancelled): void
+    {
+        if ($cancelled) {
+            $update = 'UPDATE TblEnrollmentCancellations SET Cancelled_At = ?, Cancel_Result = ?, Cancel_Attempts = ISNULL(Cancel_Attempts, 0) + 1 WHERE LLG_ID = ?';
+            $sqlConnector->querySqlServer($update, [date('Y-m-d H:i:s'), $result, $llgId]);
+
+            return;
+        }
+
+        $update = 'UPDATE TblEnrollmentCancellations SET Cancel_Result = ?, Cancel_Attempts = ISNULL(Cancel_Attempts, 0) + 1 WHERE LLG_ID = ?';
+        $sqlConnector->querySqlServer($update, [$result, $llgId]);
+    }
+
+    private function emailCancellationAudit(string $contactId): void
+    {
+        (new EmailSenderService())->sendMailHtml(
+            'Cancellation Audit',
+            "Client {$contactId} is pending cancellation but has a balance and pending settlements. Please review and process manually.",
+            ['jennifer@libertydebtrelief.com'],
+        );
+    }
+
+    private function emailReverseFees(string $contactId, string $name): void
+    {
+        (new EmailSenderService())->sendMailHtml(
+            "{$contactId} - {$name}",
+            'Hi, please reverse pending fees to zero balance file is cancelled. Thank you.',
+            ['clients@setforth.com'],
+            ['nancy@libertydebtrelief.com'],
+        );
     }
 
     /**
