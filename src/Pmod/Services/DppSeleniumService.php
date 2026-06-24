@@ -47,8 +47,7 @@ final class DppSeleniumService
         private readonly array $tenantCredentials,
         private readonly string $chromeBinary,
         private readonly string $chromeDriverBinary,
-    ) {
-    }
+    ) {}
 
     public static function fromConfig(): self
     {
@@ -213,7 +212,7 @@ final class DppSeleniumService
      */
     private function captureEpf(mixed $client, float $balance, float $epf, string $processDate, string $systemAccount): float
     {
-        $css = static fn (string $c) => \Facebook\WebDriver\WebDriverBy::cssSelector($c);
+        $css = static fn(string $c) => \Facebook\WebDriver\WebDriverBy::cssSelector($c);
 
         $client->findElement(\Facebook\WebDriver\WebDriverBy::xpath('//a[contains(text(),"Add Payment")]'))->click();
         $client->waitFor('#trans_type', 15);
@@ -271,7 +270,7 @@ final class DppSeleniumService
      */
     private function executeDrop(mixed $client, float $balance, string $processDate, string $today, string $dropReason, string $note): void
     {
-        $css = static fn (string $c) => \Facebook\WebDriver\WebDriverBy::cssSelector($c);
+        $css = static fn(string $c) => \Facebook\WebDriver\WebDriverBy::cssSelector($c);
         $driver = $client->getWebDriver();
 
         $client->findElement($css('#cancelbtn'))->click();
@@ -309,7 +308,7 @@ final class DppSeleniumService
         // as the confirmation, then fall through.
         try {
             $client->wait(60)->until(
-                static fn ($d): bool => \count($d->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('#savebtn'))) === 0
+                static fn($d): bool => \count($d->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('#savebtn'))) === 0
             );
         } catch (\Throwable $e) {
             // proceed regardless
@@ -467,7 +466,7 @@ final class DppSeleniumService
             // brief page-unload flicker when credentials are rejected (a failed
             // login re-renders login.php, so the URL stays on it and this times out).
             $client->wait(20)->until(
-                static fn ($driver): bool => !str_contains((string) $driver->getCurrentURL(), 'login.php')
+                static fn($driver): bool => !str_contains((string) $driver->getCurrentURL(), 'login.php')
             );
         } catch (\Throwable $e) {
             throw new DppSeleniumException(
