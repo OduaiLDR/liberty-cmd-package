@@ -71,7 +71,7 @@ final class PmodPortalWebhookController extends Controller
     private function actionIsSupported(string $action): bool
     {
         $supportedActions = array_values(array_filter(array_map(
-            static fn (mixed $value): string => trim((string) $value),
+            static fn(mixed $value): string => trim((string) $value),
             (array) config('services.pmod.supported_actions', []),
         )));
 
