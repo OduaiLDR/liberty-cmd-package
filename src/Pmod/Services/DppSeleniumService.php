@@ -47,8 +47,7 @@ final class DppSeleniumService
         private readonly array $tenantCredentials,
         private readonly string $chromeBinary,
         private readonly string $chromeDriverBinary,
-    ) {
-    }
+    ) {}
 
     public static function fromConfig(): self
     {
@@ -84,7 +83,7 @@ final class DppSeleniumService
      *   #savebtn                           click → triggers JS alert → accept
      *
      * @param array{
-     *   refund_amount?: float|int|null,
+     *   refund_amount?: float|int|null,`
      *   process_date?: string,
      *   drop_reason?: string,
      *   note?: string,
@@ -97,40 +96,236 @@ final class DppSeleniumService
         $tenant = strtoupper(trim($tenant));
         $contactId = trim($contactId);
 
+        $balance = (float) ($form['balance'] ?? 0);
+        $epf = (float) ($form['epf'] ?? 0);
+        $settlements = (float) ($form['scheduled_settlements'] ?? 0);
+        $processDate = (string) ($form['process_date'] ?? '');
+        $today = (string) ($form['today'] ?? date('Y-m-d'));
+        $systemAccount = (string) ($form['system_account'] ?? '');
+        $dropReason = (string) ($form['drop_reason'] ?? 'Unable to Resolve NSF');
+        $note = (string) ($form['note'] ?? 'Attempted to resume payments 4 times.');
+
         Log::info('DPP: cancelProgram requested', [
             'tenant' => $tenant,
             'contact_id' => $contactId,
             'dry_run' => $dryRun,
-            'has_refund' => !empty($form['refund_amount']),
+            'balance' => $balance,
+            'epf' => $epf,
+            'scheduled_settlements' => $settlements,
         ]);
 
         if ($dryRun) {
+            return ['status' => 'success', 'message' => 'dry-run: would run cancel flow'];
+        }
+
+        $this->ensureLogin($tenant);
+        $client = $this->client();
+        $toolsUrl = self::DPP_BASE_URL . '/index.php?module=tools&page=view&cid=' . rawurlencode($contactId);
+
+        // 1) Confirm the contact is cancellable.
+        try {
+            $client->request('GET', $toolsUrl);
+            $client->waitFor('#cancelbtn', 15);
+            $cancelText = trim($client->findElement(\Facebook\WebDriver\WebDriverBy::cssSelector('#cancelbtn'))->getText());
+        } catch (\Throwable $e) {
+            return ['status' => 'not_cancellable', 'message' => '#cancelbtn not present'];
+        }
+        if ($cancelText !== 'Cancel Program') {
+            return ['status' => 'not_cancellable', 'message' => "cancel button reads '{$cancelText}'"];
+        }
+
+        // 2) EPF capture. If this fails we do NOT proceed to the drop (the VBA
+        //    swallowed the error and cancelled anyway — we refuse, so we never
+        //    cancel a contact whose EPF wasn't captured).
+        if ($balance > 0 && $epf > 0) {
+            try {
+                $balance = $this->captureEpf($client, $balance, $epf, $processDate, $systemAccount);
+            } catch (\Throwable $e) {
+                throw new DppSeleniumException(
+                    'EPF capture failed: ' . $e->getMessage(),
+                    tenant: $tenant,
+                    contactId: $contactId,
+                    stage: 'epf',
+                    previous: $e,
+                );
+            }
+        }
+
+        // 3) Pending settlements.
+        //    SAFETY GATE: the VBA auto-voids partially-paid settlements here via a
+        //    deeply position-dependent DOM-index loop. Running that blind voids real
+        //    settlements, so until it's verified against a live contact that actually
+        //    has pending settlements, ANY contact with scheduled settlements is routed
+        //    to manual review instead of auto-voiding. (Implement voidSettlements()
+        //    and drop this gate once we can record the settlement table on a real cancel.)
+        if ($settlements > 0) {
             return [
-                'status' => 'success',
-                'message' => 'dry-run: would click #cancelbtn and fill form',
+                'status' => 'manual_audit',
+                'message' => $balance >= $settlements
+                    ? 'balance >= scheduled settlements; manual review required'
+                    : 'pending settlements present; auto-void not yet verified — manual review',
             ];
         }
 
-        $this->assertCredentials($tenant);
+        // 4) Re-confirm the cancel button is still present, then drop.
+        try {
+            $client->request('GET', $toolsUrl);
+            $client->waitFor('#cancelbtn', 15);
+            $displayed = $client->findElement(\Facebook\WebDriver\WebDriverBy::cssSelector('#cancelbtn'))->isDisplayed();
+        } catch (\Throwable $e) {
+            $displayed = false;
+        }
+        if (!$displayed) {
+            return ['status' => 'failed', 'message' => '#cancelbtn not displayed after EPF step'];
+        }
 
-        // TODO once symfony/panther is installed + DPP login form has been
-        //      recorded with the real credentials, fill in:
-        //        1. $this->ensureLogin($tenant)
-        //        2. navigate to /index.php?module=tools&page=view&cid={$contactId}
-        //        3. click #cancelbtn, accept alert
-        //        4. fill the form fields (see docblock above)
-        //        5. click #savebtn, accept alert
-        //        6. wait for redirect / confirmation
-        //        7. return ['status' => 'success', ...]
-        //      Catch WebDriver exceptions and rethrow as DppSeleniumException
-        //      with $tenant + $contactId + $stage context so the caller can log
-        //      the failure to TblEnrollmentCancellations.Cancel_Result.
-        throw new DppSeleniumException(
-            'cancelProgram() is not yet wired — Panther selectors must be recorded against the DPP portal first.',
-            tenant: $tenant,
-            contactId: $contactId,
-            stage: 'init',
-        );
+        $branch = $balance > 0 ? 'positive' : ($balance < 0 ? 'negative' : 'zero');
+
+        try {
+            $this->executeDrop($client, $balance, $processDate, $today, $dropReason, $note);
+        } catch (\Throwable $e) {
+            throw new DppSeleniumException(
+                'cancel drop failed: ' . $e->getMessage(),
+                tenant: $tenant,
+                contactId: $contactId,
+                stage: 'drop',
+                previous: $e,
+            );
+        }
+
+        Log::info('DPP: cancelProgram completed', [
+            'tenant' => $tenant,
+            'contact_id' => $contactId,
+            'balance_branch' => $branch,
+        ]);
+
+        return ['status' => 'success', 'message' => 'program cancelled', 'balance_branch' => $branch];
+    }
+
+    /**
+     * EPF capture — schedule an "ACH Credit / Fee" for min(balance, epf) to the
+     * system account. Returns the reduced balance.
+     *
+     * NOTE: the "--System Account--" picker is a jQuery "chosen" widget; the VBA
+     * drove it with a brittle ArrowDown/Tab loop. {@see selectSystemAccount()} uses
+     * the chosen search box instead — VERIFY AGAINST THE LIVE DOM before trusting it.
+     */
+    private function captureEpf(mixed $client, float $balance, float $epf, string $processDate, string $systemAccount): float
+    {
+        $css = static fn(string $c) => \Facebook\WebDriver\WebDriverBy::cssSelector($c);
+
+        $client->findElement(\Facebook\WebDriver\WebDriverBy::xpath('//a[contains(text(),"Add Payment")]'))->click();
+        $client->waitFor('#trans_type', 15);
+
+        $this->select($client, '#trans_type', 'ACH Credit / Fee');
+        $this->select($client, '#sub_type', 'Esign / Wet Signature');
+
+        $processDateEl = $client->findElement($css('#process_date'));
+        $processDateEl->clear();
+        $processDateEl->sendKeys($processDate);
+        $processDateEl->sendKeys(\Facebook\WebDriver\WebDriverKeys::TAB);
+
+        if ($balance >= $epf) {
+            $client->findElement($css('#lbamount'))->sendKeys($this->money($epf));
+            $balance -= $epf;
+        } else {
+            $client->findElement($css('#lbamount'))->sendKeys($this->money($balance));
+            $balance = 0.0;
+        }
+
+        $client->findElement($css('#manmemo'))->sendKeys('EPF');
+
+        $this->selectSystemAccount($client, $systemAccount);
+
+        $this->select($client, '#paction', 'Schedule Transaction');
+        $client->findElement($css('#pmtbtn'))->click();
+        sleep(1);
+
+        return $balance;
+    }
+
+    /**
+     * Select the system account in the jQuery "chosen" dropdown via its search box.
+     * FRAGILE / UNVERIFIED — chosen markup must be confirmed against the live page;
+     * the target value comes from the caller (e.g. "35281 - LDR - Main").
+     */
+    private function selectSystemAccount(mixed $client, string $systemAccount): void
+    {
+        $client->findElement(\Facebook\WebDriver\WebDriverBy::xpath("//span[contains(text(),'--System Account--')]"))->click();
+        usleep(500000);
+
+        $search = $client->findElement(\Facebook\WebDriver\WebDriverBy::cssSelector(
+            '.chosen-container-active .chosen-search input, .chosen-container-active .chosen-search-input'
+        ));
+        $search->sendKeys($systemAccount);
+        usleep(500000);
+
+        $client->findElement(\Facebook\WebDriver\WebDriverBy::xpath(
+            "//li[contains(@class,'active-result') and contains(normalize-space(.),'" . $systemAccount . "')]"
+        ))->click();
+    }
+
+    /**
+     * The #cancelbtn drop flow — three balance branches, all stable element IDs.
+     */
+    private function executeDrop(mixed $client, float $balance, string $processDate, string $today, string $dropReason, string $note): void
+    {
+        $css = static fn(string $c) => \Facebook\WebDriver\WebDriverBy::cssSelector($c);
+        $driver = $client->getWebDriver();
+
+        $client->findElement($css('#cancelbtn'))->click();
+        $driver->switchTo()->alert()->accept();
+        $client->waitFor('#dropped_reason', 15);
+
+        $this->select($client, '#dropped_reason', $dropReason);
+        $client->findElement(\Facebook\WebDriver\WebDriverBy::tagName('textarea'))->sendKeys($note);
+
+        if ($balance > 0) {
+            $client->findElement($css('#dorefund'))->click();
+            $client->findElement($css('#amount'))->sendKeys($this->money($balance));
+            $startDate = $client->findElement($css('#start_date'));
+            $startDate->sendKeys($processDate);
+            $startDate->sendKeys(\Facebook\WebDriver\WebDriverKeys::TAB);
+        }
+
+        $this->select($client, '#complete_delete', 'Complete');
+        $client->findElement($css('#delete_events'))->click();
+
+        // Optional fields — the VBA wrapped these in On Error Resume Next.
+        try {
+            $client->findElement($css('#cancellation_request_date'))->sendKeys($today);
+            $startDate2 = $client->findElement($css('#start_date'));
+            $startDate2->sendKeys($today);
+            $startDate2->sendKeys(\Facebook\WebDriver\WebDriverKeys::ENTER);
+        } catch (\Throwable $e) {
+            // best-effort only
+        }
+
+        $client->findElement($css('#savebtn'))->click();
+        $driver->switchTo()->alert()->accept();
+
+        // VBA waited 60s after save. We wait (up to 60s) for the drop form to clear
+        // as the confirmation, then fall through.
+        try {
+            $client->wait(60)->until(
+                static fn($d): bool => \count($d->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('#savebtn'))) === 0
+            );
+        } catch (\Throwable $e) {
+            // proceed regardless
+        }
+    }
+
+    /** Select an option by visible text. */
+    private function select(mixed $client, string $css, string $visibleText): void
+    {
+        $element = $client->findElement(\Facebook\WebDriver\WebDriverBy::cssSelector($css));
+        (new \Facebook\WebDriver\WebDriverSelect($element))->selectByVisibleText($visibleText);
+    }
+
+    /** Format a money amount the way the form expects (e.g. 123.40). */
+    private function money(float $amount): string
+    {
+        return number_format($amount, 2, '.', '');
     }
 
     /**
@@ -266,12 +461,12 @@ final class DppSeleniumService
 
             $client->findElement(\Facebook\WebDriver\WebDriverBy::name('Submit'))->click();
 
-            // Wait for the login form to go away (post-login redirect), like the
-            // VBA's wait after Submit — we don't assert a specific landing element.
+            // Success = we leave login.php (redirect to the dashboard). Checking the
+            // URL — rather than #Username visibility — avoids a false pass on the
+            // brief page-unload flicker when credentials are rejected (a failed
+            // login re-renders login.php, so the URL stays on it and this times out).
             $client->wait(20)->until(
-                \Facebook\WebDriver\WebDriverExpectedCondition::invisibilityOfElementLocated(
-                    \Facebook\WebDriver\WebDriverBy::cssSelector('#Username')
-                )
+                static fn($driver): bool => !str_contains((string) $driver->getCurrentURL(), 'login.php')
             );
         } catch (\Throwable $e) {
             throw new DppSeleniumException(
