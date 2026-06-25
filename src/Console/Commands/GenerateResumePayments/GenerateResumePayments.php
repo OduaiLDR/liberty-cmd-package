@@ -44,7 +44,8 @@ final class GenerateResumePayments extends Command
         {--contact-id=* : Only process these Forth contact IDs (controlled live test)}
         {--limit= : Process at most N contacts per company (after NSF-state filtering)}
         {--execute-cancels : Actually run the Day-4+ System Cancel (browser drop/refund). Off by default — Phase 5 only reports cancel-ready contacts unless this is passed.}
-        {--max-cancels= : Safety cap — process at most N cancel candidates per company per run (the rest are reported as deferred). 0/unset = no cap.}';
+        {--max-cancels= : Safety cap — process at most N cancel candidates per company per run (the rest are reported as deferred). 0/unset = no cap.}
+        {--probe-cancel= : Diagnostic only — drive the cancel flow for ONE contact id and print which selectors exist, WITHOUT clicking save (commits nothing). Tenant = first --company (default LDR).}';
 
     protected $description = 'Process NSF contacts for LDR and Progress Law: update statuses, resume drafts, and execute system cancels per the ResumePayments VBA workflow.';
 
@@ -76,6 +77,11 @@ final class GenerateResumePayments extends Command
     {
         $this->dppClient = $dppClient;
         $this->dppSelenium = $dppSelenium;
+
+        $probeCancelId = (string) ($this->option('probe-cancel') ?? '');
+        if ($probeCancelId !== '') {
+            return $this->runProbeCancel($probeCancelId);
+        }
 
         $dryRun = (bool) $this->option('dry-run');
         $companies = $this->resolveCompanies();
@@ -121,6 +127,32 @@ final class GenerateResumePayments extends Command
                 ]);
             }
         }
+
+        return Command::SUCCESS;
+    }
+
+    /**
+     * --probe-cancel: run the no-save cancel diagnostic for one contact and print
+     * the report. Commits nothing (DppSeleniumService::probeCancel never clicks
+     * #savebtn). Tenant is the first --company (default LDR).
+     */
+    private function runProbeCancel(string $contactId): int
+    {
+        $company = $this->resolveCompanies()[0] ?? 'LDR';
+        $tenant = strtolower($company);
+
+        $this->info("[INFO] Probe-cancel (NO-SAVE) for contact {$contactId} as {$company} — commits nothing.");
+
+        try {
+            $report = $this->dppSelenium->probeCancel($tenant, $contactId);
+        } catch (\Throwable $e) {
+            $this->error('Probe failed: ' . $e->getMessage());
+            Log::error('GenerateResumePayments: probe-cancel failed', ['contact_id' => $contactId, 'exception' => $e]);
+
+            return Command::FAILURE;
+        }
+
+        $this->line((string) json_encode($report, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
 
         return Command::SUCCESS;
     }
