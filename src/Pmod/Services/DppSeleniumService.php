@@ -203,6 +203,102 @@ final class DppSeleniumService
     }
 
     /**
+     * No-save diagnostic: drive the cancel flow far enough to verify every selector,
+     * then navigate away WITHOUT clicking #savebtn — nothing is ever committed, so
+     * it is safe to run against any contact. Verifies login, #cancelbtn, and the
+     * drop-form fields. The EPF "Add Payment" picker is a separate flow and is NOT
+     * exercised here (that needs a real balance>0 & epf>0 cancel).
+     *
+     * @return array<string, mixed>
+     */
+    public function probeCancel(string $tenant, string $contactId): array
+    {
+        $tenant = strtoupper(trim($tenant));
+        $contactId = trim($contactId);
+
+        Log::info('DPP: probeCancel (no-save) requested', ['tenant' => $tenant, 'contact_id' => $contactId]);
+
+        $this->ensureLogin($tenant);
+        $client = $this->client();
+        $driver = $client->getWebDriver();
+        $toolsUrl = self::DPP_BASE_URL . '/index.php?module=tools&page=view&cid=' . rawurlencode($contactId);
+
+        $report = ['login' => 'ok', 'contact_id' => $contactId, 'committed' => false];
+
+        try {
+            $client->request('GET', $toolsUrl);
+            $client->waitFor('#cancelbtn', 15);
+            $cancelText = trim($client->findElement(\Facebook\WebDriver\WebDriverBy::cssSelector('#cancelbtn'))->getText());
+        } catch (\Throwable $e) {
+            $report['cancelbtn'] = 'not found on tools page';
+            $report['cancellable'] = false;
+
+            return $report;
+        }
+
+        $report['cancelbtn_text'] = $cancelText;
+        $report['cancellable'] = $cancelText === 'Cancel Program';
+
+        if (!$report['cancellable']) {
+            $report['note'] = "login + navigation verified; contact isn't in a 'Cancel Program' state, so the drop-form selectors can't be checked here.";
+
+            return $report;
+        }
+
+        // Open the drop form (click + accept the JS confirm) — still nothing committed.
+        try {
+            $client->findElement(\Facebook\WebDriver\WebDriverBy::cssSelector('#cancelbtn'))->click();
+            $driver->switchTo()->alert()->accept();
+            $client->waitFor('#dropped_reason', 15);
+        } catch (\Throwable $e) {
+            $report['form_opened'] = false;
+            $report['error'] = 'drop form did not open: ' . $e->getMessage();
+
+            return $report;
+        }
+        $report['form_opened'] = true;
+
+        // Verify each drop-form selector EXISTS (no fill, no save).
+        $present = [];
+        foreach (['#dropped_reason', '#dorefund', '#amount', '#start_date', '#complete_delete', '#delete_events', '#cancellation_request_date', '#savebtn'] as $sel) {
+            $present[$sel] = \count($driver->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector($sel))) > 0;
+        }
+        $present['textarea'] = \count($driver->findElements(\Facebook\WebDriver\WebDriverBy::tagName('textarea'))) > 0;
+        $report['fields_present'] = $present;
+
+        // List the option texts so we can confirm our selectByVisibleText targets exist.
+        $report['dropped_reason_options'] = $this->optionTexts($driver, '#dropped_reason');
+        $report['complete_delete_options'] = $this->optionTexts($driver, '#complete_delete');
+
+        // Navigate away → the unsaved form is discarded. NOTHING is committed.
+        $client->request('GET', $toolsUrl);
+        $report['result'] = 'all drop-form selectors verified; #savebtn NOT clicked';
+
+        return $report;
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function optionTexts(mixed $driver, string $css): array
+    {
+        $texts = [];
+        try {
+            $select = $driver->findElement(\Facebook\WebDriver\WebDriverBy::cssSelector($css));
+            foreach ($select->findElements(\Facebook\WebDriver\WebDriverBy::tagName('option')) as $option) {
+                $text = trim($option->getText());
+                if ($text !== '') {
+                    $texts[] = $text;
+                }
+            }
+        } catch (\Throwable $e) {
+            $texts[] = 'ERROR: ' . $e->getMessage();
+        }
+
+        return $texts;
+    }
+
+    /**
      * EPF capture — schedule an "ACH Credit / Fee" for min(balance, epf) to the
      * system account. Returns the reduced balance.
      *
