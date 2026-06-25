@@ -43,7 +43,8 @@ final class GenerateResumePayments extends Command
         {--company=* : Limit run to LDR and/or PLAW (default: both)}
         {--contact-id=* : Only process these Forth contact IDs (controlled live test)}
         {--limit= : Process at most N contacts per company (after NSF-state filtering)}
-        {--execute-cancels : Actually run the Day-4+ System Cancel (browser drop/refund). Off by default — Phase 5 only reports cancel-ready contacts unless this is passed.}';
+        {--execute-cancels : Actually run the Day-4+ System Cancel (browser drop/refund). Off by default — Phase 5 only reports cancel-ready contacts unless this is passed.}
+        {--max-cancels= : Safety cap — process at most N cancel candidates per company per run (the rest are reported as deferred). 0/unset = no cap.}';
 
     protected $description = 'Process NSF contacts for LDR and Progress Law: update statuses, resume drafts, and execute system cancels per the ResumePayments VBA workflow.';
 
@@ -847,10 +848,14 @@ final class GenerateResumePayments extends Command
     ): void {
         $today = date('Y-m-d');
         $executeCancels = (bool) $this->option('execute-cancels');
+        $maxCancels = (int) ($this->option('max-cancels') ?? 0);
         $processDate = $this->nextBusinessDay();
         $tenant = strtolower($company);
         $systemAccount = $this->systemAccountFor($company);
 
+        // Pass 1 — day-count every age>105 contact (insert Day-0 rows, emit Day 0–3
+        // / "Ready" warnings) and collect the ones that will actually be cancelled.
+        $toCancel = [];
         foreach ($states as $state) {
             $isCurrent = (bool) ($state['is_current'] ?? false);
             $ageDays = (int) ($state['age_days'] ?? 0);
@@ -867,41 +872,58 @@ final class GenerateResumePayments extends Command
             $llgId = 'LLG-' . $contactId;
             $name = trim((string) ($state['FULLNAME'] ?? ''));
 
-            $dayInfo = $this->resolveCancelDay($sqlConnector, $llgId, $today, $dryRun);
-            $day = $dayInfo['day'];
+            $day = $this->resolveCancelDay($sqlConnector, $llgId, $today, $dryRun)['day'];
 
             if ($day < self::CANCEL_COOLDOWN_DAYS) {
-                $statusChanges[] = [
-                    'llg_id' => $llgId,
-                    'name' => $name,
-                    'status' => "System Cancel Pending - Day {$day}",
-                ];
+                $statusChanges[] = ['llg_id' => $llgId, 'name' => $name, 'status' => "System Cancel Pending - Day {$day}"];
                 continue;
             }
 
             // Day >= 4: ready to cancel.
-            $rcode = (string) ($state['current_rcode'] ?? '');
-            $cancelInfo = $this->systemCancelInfo($rcode);
+            $cancelInfo = $this->systemCancelInfo((string) ($state['current_rcode'] ?? ''));
 
-            // Without --execute-cancels (the default, and how the daily cron runs
-            // until cancel is verified), or for an R-code we don't map, just report
-            // the contact as ready and execute nothing.
+            // Without --execute-cancels (the default daily cron), or for an R-code we
+            // don't map, just report the contact as ready and execute nothing.
             if (!$executeCancels || $cancelInfo === null) {
-                $statusChanges[] = [
-                    'llg_id' => $llgId,
-                    'name' => $name,
-                    'status' => "System Cancel Ready - Day {$day}",
-                ];
+                $statusChanges[] = ['llg_id' => $llgId, 'name' => $name, 'status' => "System Cancel Ready - Day {$day}"];
                 continue;
             }
 
+            $toCancel[] = ['contact_id' => $contactId, 'llg_id' => $llgId, 'name' => $name, 'day' => $day, 'info' => $cancelInfo];
+        }
+
+        if ($toCancel === []) {
+            return;
+        }
+
+        // Batch-fetch the Snowflake data for all to-cancel contacts in one shot each
+        // (instead of ~5 round-trips per contact).
+        $contactIds = array_column($toCancel, 'contact_id');
+        $balances = $this->fetchBalances($snowflake, $contactIds);
+        $epfs = $this->fetchPendingSums($snowflake, $contactIds, 'PF');
+        $settlements = $this->fetchPendingSums($snowflake, $contactIds, 'S');
+        $englishFlags = $this->fetchEnglishFlags($snowflake, $contactIds);
+
+        // Pass 2 — execute, honoring the --max-cancels safety cap.
+        $processed = 0;
+        foreach ($toCancel as $item) {
+            if ($maxCancels > 0 && $processed >= $maxCancels) {
+                $statusChanges[] = ['llg_id' => $item['llg_id'], 'name' => $item['name'], 'status' => "System Cancel Deferred (cap) - Day {$item['day']}"];
+                continue;
+            }
+            $processed++;
+
+            $cid = $item['contact_id'];
             $this->executeSystemCancel(
-                $snowflake,
                 $tenant,
-                $contactId,
-                $llgId,
-                $name,
-                $cancelInfo,
+                $cid,
+                $item['llg_id'],
+                $item['name'],
+                $item['info'],
+                $balances[$cid] ?? 0.0,
+                $epfs[$cid] ?? 0.0,
+                $settlements[$cid] ?? 0.0,
+                $englishFlags[$cid] ?? true,
                 $systemAccount,
                 $processDate,
                 $today,
@@ -912,22 +934,25 @@ final class GenerateResumePayments extends Command
     }
 
     /**
-     * Day-4+ System Cancel for one contact: compute balances, add the cancel note,
-     * drive the browser cancel (DppSeleniumService), then on the result set the
-     * final status and email setforth for a negative balance. Mirrors the VBA's
-     * cancel block. Re-cancel is prevented by cancelProgram()'s #cancelbtn check,
-     * so no DB cancel-state tracking is needed.
+     * Day-4+ System Cancel for one contact (balances/language pre-fetched in batch
+     * by the caller): add the cancel note, drive the browser cancel
+     * (DppSeleniumService), then on the result set the final status and email
+     * setforth for a negative balance. Mirrors the VBA's cancel block. Re-cancel is
+     * prevented by cancelProgram()'s #cancelbtn check, so no DB tracking is needed.
      *
      * @param array{0:string,1:string,2:string} $cancelInfo [statusTitle, reasonEn, reasonEs]
      * @param list<array{llg_id:string,name:string,status:string}> $statusChanges
      */
     private function executeSystemCancel(
-        DBConnector $snowflake,
         string $tenant,
         string $contactId,
         string $llgId,
         string $name,
         array $cancelInfo,
+        float $balance,
+        float $epf,
+        float $settlements,
+        bool $english,
         string $systemAccount,
         string $processDate,
         string $today,
@@ -935,11 +960,7 @@ final class GenerateResumePayments extends Command
         array &$statusChanges
     ): void {
         [$statusTitle, $reasonEn, $reasonEs] = $cancelInfo;
-        $reason = $this->isEnglish($snowflake, $contactId) ? $reasonEn : $reasonEs;
-
-        $balance = $this->latestPendingBalance($snowflake, $contactId);
-        $epf = $this->sumPendingTransactions($snowflake, $contactId, 'PF');
-        $settlements = $this->sumPendingTransactions($snowflake, $contactId, 'S');
+        $reason = $english ? $reasonEn : $reasonEs;
 
         if ($dryRun) {
             Log::info('ResumePayments: DRY RUN - would System Cancel', [
@@ -1045,51 +1066,110 @@ final class GenerateResumePayments extends Command
     }
 
     /**
-     * Language check for the cancel-note reason (VBA: data source NAME contains
-     * "ES" — case-sensitive — then the Spanish user-field).
+     * Latest pending balance per contact (VBA: TOP 1 PENDING FROM CONTACT_BALANCES,
+     * newest STAMP). Batched for all to-cancel contacts in one query.
+     *
+     * @param list<string> $contactIds
+     * @return array<string, float> contactId => balance
      */
-    private function isEnglish(DBConnector $snowflake, string $contactId): bool
+    private function fetchBalances(DBConnector $snowflake, array $contactIds): array
     {
-        $cid = (int) $contactId;
+        if ($contactIds === []) {
+            return [];
+        }
+        $cidList = implode(',', array_map('intval', $contactIds));
+        $sql = "
+            SELECT CONTACT_ID, PENDING
+            FROM (
+                SELECT CONTACT_ID, PENDING,
+                       ROW_NUMBER() OVER (PARTITION BY CONTACT_ID ORDER BY STAMP DESC) AS RN
+                FROM CONTACT_BALANCES
+                WHERE CONTACT_ID IN ({$cidList})
+            )
+            WHERE RN = 1
+        ";
 
-        $sql = "SELECT ds.NAME AS NAME FROM CONTACTS c LEFT JOIN DATA_SOURCES ds ON c.C_SOURCE = ds.ID WHERE c.ID = {$cid}";
-        $sourceName = (string) ($snowflake->query($sql)['data'][0]['NAME'] ?? '');
-        $english = strpos($sourceName, 'ES') === false;
-
-        if ($english) {
-            $sql2 = "SELECT F_STRING AS F_STRING FROM CONTACTS_USERFIELDS WHERE CONTACT_ID = {$cid} AND CUSTOM_ID = 299195";
-            $field = (string) ($snowflake->query($sql2)['data'][0]['F_STRING'] ?? '');
-            $english = $field !== 'Spanish';
+        $map = [];
+        foreach ($snowflake->query($sql)['data'] ?? [] as $row) {
+            $cid = (string) ($row['CONTACT_ID'] ?? '');
+            if ($cid !== '') {
+                $map[$cid] = (float) ($row['PENDING'] ?? 0);
+            }
         }
 
-        return $english;
+        return $map;
     }
 
-    /** Latest pending balance (VBA: TOP 1 PENDING FROM CONTACT_BALANCES). */
-    private function latestPendingBalance(DBConnector $snowflake, string $contactId): float
+    /**
+     * Sum of pending (uncleared, active, not cancelled) PF (EPF) or S (settlement)
+     * transactions per contact. Batched.
+     *
+     * @param list<string> $contactIds
+     * @return array<string, float> contactId => total
+     */
+    private function fetchPendingSums(DBConnector $snowflake, array $contactIds, string $transType): array
     {
-        $cid = (int) $contactId;
-        $sql = "SELECT PENDING AS PENDING FROM CONTACT_BALANCES WHERE CONTACT_ID = {$cid} ORDER BY STAMP DESC LIMIT 1";
-
-        return (float) ($snowflake->query($sql)['data'][0]['PENDING'] ?? 0);
-    }
-
-    /** Sum of pending (uncleared, active, not cancelled) PF (EPF) or S (settlement) transactions. */
-    private function sumPendingTransactions(DBConnector $snowflake, string $contactId, string $transType): float
-    {
-        $cid = (int) $contactId;
+        if ($contactIds === []) {
+            return [];
+        }
+        $cidList = implode(',', array_map('intval', $contactIds));
         $type = $transType === 'PF' ? 'PF' : 'S';
         $sql = "
-            SELECT SUM(AMOUNT) AS TOTAL
+            SELECT CONTACT_ID, SUM(AMOUNT) AS TOTAL
             FROM TRANSACTIONS
-            WHERE CONTACT_ID = {$cid}
+            WHERE CONTACT_ID IN ({$cidList})
               AND TRANS_TYPE = '{$type}'
               AND CLEARED_DATE IS NULL
               AND CANCELLED = 0
               AND ACTIVE = 1
+            GROUP BY CONTACT_ID
         ";
 
-        return (float) ($snowflake->query($sql)['data'][0]['TOTAL'] ?? 0);
+        $map = [];
+        foreach ($snowflake->query($sql)['data'] ?? [] as $row) {
+            $cid = (string) ($row['CONTACT_ID'] ?? '');
+            if ($cid !== '') {
+                $map[$cid] = (float) ($row['TOTAL'] ?? 0);
+            }
+        }
+
+        return $map;
+    }
+
+    /**
+     * Language flag per contact for the cancel-note reason (VBA: data source NAME
+     * contains "ES" — case-sensitive — OR the Spanish user-field → Spanish). Batched
+     * into two queries regardless of contact count.
+     *
+     * @param list<string> $contactIds
+     * @return array<string, bool> contactId => isEnglish
+     */
+    private function fetchEnglishFlags(DBConnector $snowflake, array $contactIds): array
+    {
+        if ($contactIds === []) {
+            return [];
+        }
+        $cidList = implode(',', array_map('intval', $contactIds));
+
+        $english = [];
+        $sql1 = "SELECT c.ID AS ID, ds.NAME AS NAME FROM CONTACTS c LEFT JOIN DATA_SOURCES ds ON c.C_SOURCE = ds.ID WHERE c.ID IN ({$cidList})";
+        foreach ($snowflake->query($sql1)['data'] ?? [] as $row) {
+            $cid = (string) ($row['ID'] ?? '');
+            if ($cid !== '') {
+                $english[$cid] = strpos((string) ($row['NAME'] ?? ''), 'ES') === false;
+            }
+        }
+
+        // Only the Spanish user-field can flip an otherwise-English contact to Spanish.
+        $sql2 = "SELECT CONTACT_ID AS CONTACT_ID, F_STRING AS F_STRING FROM CONTACTS_USERFIELDS WHERE CONTACT_ID IN ({$cidList}) AND CUSTOM_ID = 299195";
+        foreach ($snowflake->query($sql2)['data'] ?? [] as $row) {
+            $cid = (string) ($row['CONTACT_ID'] ?? '');
+            if ($cid !== '' && ($english[$cid] ?? true) && (string) ($row['F_STRING'] ?? '') === 'Spanish') {
+                $english[$cid] = false;
+            }
+        }
+
+        return $english;
     }
 
     private function emailCancellationAudit(string $contactId): void
