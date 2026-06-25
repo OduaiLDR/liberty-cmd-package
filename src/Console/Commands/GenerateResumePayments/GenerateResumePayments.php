@@ -822,15 +822,16 @@ final class GenerateResumePayments extends Command
      *    that date for the numbers of days. It will be on the report as Day 0,
      *    Day 1, Day 2 etc."
      *
+     * Uses only the existing columns (LLG_ID, Cancellation_Date) — no schema change.
+     * Re-cancel is prevented by cancelProgram()'s #cancelbtn check, not a DB flag.
+     *
      * Behavior:
      *   - Skip contacts where is_current=true or age_days <= 105.
      *   - Look up the latest TblEnrollmentCancellations row for LLG-{contactId}.
      *       - No row → INSERT (Cancellation_Date = today), emit "System Cancel Pending - Day 0".
-     *       - Row exists, Cancelled_At populated → contact already cancelled, skip silently.
      *       - Row exists, Day 0..3 → emit "System Cancel Pending - Day N".
-     *       - Row exists, Day >= 4 → emit "System Cancel Ready - Day N" placeholder.
-     *         (Actual Panther-driven cancel execution lands once DppSeleniumService
-     *         selectors are recorded — see DppSeleniumService::cancelProgram.)
+     *       - Row exists, Day >= 4 → with --execute-cancels, run the browser cancel
+     *         (see executeSystemCancel); otherwise emit "System Cancel Ready - Day N".
      *
      * @param list<array<string, mixed>> $states
      * @param list<array{llg_id:string,name:string,status:string}> $statusChanges
@@ -867,12 +868,6 @@ final class GenerateResumePayments extends Command
             $name = trim((string) ($state['FULLNAME'] ?? ''));
 
             $dayInfo = $this->resolveCancelDay($sqlConnector, $llgId, $today, $dryRun);
-
-            if ($dayInfo['cancelled_at'] !== null) {
-                // Already cancelled in a prior run — nothing to do, no email row.
-                continue;
-            }
-
             $day = $dayInfo['day'];
 
             if ($day < self::CANCEL_COOLDOWN_DAYS) {
@@ -900,19 +895,8 @@ final class GenerateResumePayments extends Command
                 continue;
             }
 
-            // Give up after 3 failed attempts so we don't hammer a stuck contact.
-            if ($dayInfo['attempts'] >= 3) {
-                $statusChanges[] = [
-                    'llg_id' => $llgId,
-                    'name' => $name,
-                    'status' => "System Cancel Failed (3 attempts) - Day {$day}",
-                ];
-                continue;
-            }
-
             $this->executeSystemCancel(
                 $snowflake,
-                $sqlConnector,
                 $tenant,
                 $contactId,
                 $llgId,
@@ -930,15 +914,15 @@ final class GenerateResumePayments extends Command
     /**
      * Day-4+ System Cancel for one contact: compute balances, add the cancel note,
      * drive the browser cancel (DppSeleniumService), then on the result set the
-     * final status, email setforth for a negative balance, and stamp
-     * TblEnrollmentCancellations. Mirrors the VBA's cancel block.
+     * final status and email setforth for a negative balance. Mirrors the VBA's
+     * cancel block. Re-cancel is prevented by cancelProgram()'s #cancelbtn check,
+     * so no DB cancel-state tracking is needed.
      *
      * @param array{0:string,1:string,2:string} $cancelInfo [statusTitle, reasonEn, reasonEs]
      * @param list<array{llg_id:string,name:string,status:string}> $statusChanges
      */
     private function executeSystemCancel(
         DBConnector $snowflake,
-        DBConnector $sqlConnector,
         string $tenant,
         string $contactId,
         string $llgId,
@@ -972,22 +956,31 @@ final class GenerateResumePayments extends Command
         // Cancel note (DPP post) before driving the browser, matching the VBA.
         $this->dppClient->addNote($tenant, $contactId, "System Cancel ({$reason}-3)", false);
 
-        $result = $this->dppSelenium->cancelProgram($tenant, $contactId, [
-            'balance' => $balance,
-            'epf' => $epf,
-            'scheduled_settlements' => $settlements,
-            'process_date' => $processDate,
-            'today' => $today,
-            'system_account' => $systemAccount,
-            'drop_reason' => 'Unable to Resolve NSF',
-            'note' => 'Attempted to resume payments 4 times.',
-        ]);
+        try {
+            $result = $this->dppSelenium->cancelProgram($tenant, $contactId, [
+                'balance' => $balance,
+                'epf' => $epf,
+                'scheduled_settlements' => $settlements,
+                'process_date' => $processDate,
+                'today' => $today,
+                'system_account' => $systemAccount,
+                'drop_reason' => 'Unable to Resolve NSF',
+                'note' => 'Attempted to resume payments 4 times.',
+            ]);
+        } catch (\Throwable $e) {
+            // One stuck contact must not abort the rest of the company's Phase 5 loop.
+            Log::warning('ResumePayments: cancelProgram threw', [
+                'contact_id' => $contactId,
+                'error' => $e->getMessage(),
+            ]);
+            $statusChanges[] = ['llg_id' => $llgId, 'name' => $name, 'status' => 'System Cancel failed: ' . $e->getMessage()];
+            return;
+        }
 
         $status = (string) ($result['status'] ?? 'failed');
 
         if ($status === 'manual_audit') {
             $this->emailCancellationAudit($contactId);
-            $this->stampCancelResult($sqlConnector, $llgId, 'manual_audit: ' . ($result['message'] ?? ''), false);
             $statusChanges[] = ['llg_id' => $llgId, 'name' => $name, 'status' => 'Manual Cancel Audit Required.'];
             return;
         }
@@ -999,14 +992,22 @@ final class GenerateResumePayments extends Command
                 $this->emailReverseFees($contactId, $name);
             }
 
-            $this->stampCancelResult($sqlConnector, $llgId, 'success', true);
             $statusChanges[] = ['llg_id' => $llgId, 'name' => $name, 'status' => $statusTitle];
             return;
         }
 
-        // not_cancellable / failed → record the attempt, report it.
-        $this->stampCancelResult($sqlConnector, $llgId, $status . ': ' . ($result['message'] ?? ''), false);
-        $statusChanges[] = ['llg_id' => $llgId, 'name' => $name, 'status' => "System Cancel {$status}: " . ($result['message'] ?? '')];
+        if ($status === 'not_cancellable') {
+            // #cancelbtn isn't "Cancel Program" (already cancelled / not droppable):
+            // like the VBA, do nothing and add no recap row.
+            Log::info('ResumePayments: contact not cancellable, skipping', [
+                'contact_id' => $contactId,
+                'message' => $result['message'] ?? '',
+            ]);
+            return;
+        }
+
+        // Any other failure → report it; it retries on the next run (like the VBA).
+        $statusChanges[] = ['llg_id' => $llgId, 'name' => $name, 'status' => 'System Cancel failed: ' . ($result['message'] ?? '')];
     }
 
     /**
@@ -1091,19 +1092,6 @@ final class GenerateResumePayments extends Command
         return (float) ($snowflake->query($sql)['data'][0]['TOTAL'] ?? 0);
     }
 
-    private function stampCancelResult(DBConnector $sqlConnector, string $llgId, string $result, bool $cancelled): void
-    {
-        if ($cancelled) {
-            $update = 'UPDATE TblEnrollmentCancellations SET Cancelled_At = ?, Cancel_Result = ?, Cancel_Attempts = ISNULL(Cancel_Attempts, 0) + 1 WHERE LLG_ID = ?';
-            $sqlConnector->querySqlServer($update, [date('Y-m-d H:i:s'), $result, $llgId]);
-
-            return;
-        }
-
-        $update = 'UPDATE TblEnrollmentCancellations SET Cancel_Result = ?, Cancel_Attempts = ISNULL(Cancel_Attempts, 0) + 1 WHERE LLG_ID = ?';
-        $sqlConnector->querySqlServer($update, [$result, $llgId]);
-    }
-
     private function emailCancellationAudit(string $contactId): void
     {
         (new EmailSenderService())->sendMailHtml(
@@ -1124,13 +1112,15 @@ final class GenerateResumePayments extends Command
     }
 
     /**
-     * Look up (or insert) the cancel-cooldown anchor row for an LLG_ID.
+     * Look up (or insert) the cancel-cooldown anchor row for an LLG_ID, using only
+     * the existing columns (LLG_ID, Cancellation_Date) — no schema change needed.
+     * Re-cancel is prevented by cancelProgram()'s #cancelbtn check, not a DB flag.
      *
-     * @return array{day:int, cancelled_at:?string, attempts:int}
+     * @return array{day:int}
      */
     private function resolveCancelDay(DBConnector $sqlConnector, string $llgId, string $today, bool $dryRun): array
     {
-        $select = "SELECT TOP 1 Cancellation_Date, Cancelled_At, Cancel_Attempts
+        $select = "SELECT TOP 1 Cancellation_Date
                    FROM TblEnrollmentCancellations
                    WHERE LLG_ID = ?
                    ORDER BY Cancellation_Date DESC";
@@ -1138,10 +1128,7 @@ final class GenerateResumePayments extends Command
         $result = $sqlConnector->querySqlServer($select, [$llgId]);
 
         if (!empty($result['data'])) {
-            $row = $result['data'][0];
-            $cancellationDate = (string) ($row['Cancellation_Date'] ?? '');
-            $cancelledAt = $row['Cancelled_At'] ?? null;
-            $attempts = (int) ($row['Cancel_Attempts'] ?? 0);
+            $cancellationDate = (string) ($result['data'][0]['Cancellation_Date'] ?? '');
 
             $day = 0;
             if ($cancellationDate !== '') {
@@ -1149,11 +1136,7 @@ final class GenerateResumePayments extends Command
                 $day = max(0, $day);
             }
 
-            return [
-                'day' => $day,
-                'cancelled_at' => $cancelledAt !== '' ? $cancelledAt : null,
-                'attempts' => $attempts,
-            ];
+            return ['day' => $day];
         }
 
         if (!$dryRun) {
@@ -1161,11 +1144,7 @@ final class GenerateResumePayments extends Command
             $sqlConnector->querySqlServer($insert, [$llgId, $today]);
         }
 
-        return [
-            'day' => 0,
-            'cancelled_at' => null,
-            'attempts' => 0,
-        ];
+        return ['day' => 0];
     }
 
     /**
