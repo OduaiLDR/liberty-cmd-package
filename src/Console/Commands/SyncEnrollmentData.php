@@ -62,6 +62,10 @@ class SyncEnrollmentData extends Command
             return Command::FAILURE;
         }
 
+        // Step 0: Insert new enrollments from Snowflake that don't yet exist in TblEnrollment
+        $this->info('[STEP 0] Importing new enrollments from Snowflake...');
+        $this->importNewEnrollments($snowflake, $sqlConnector);
+
         // Step 1: Update missing Drop_Name and State
         $this->info('[STEP 1] Updating missing Drop_Name and State...');
         $this->updateDropNameAndState($sqlConnector);
@@ -98,7 +102,7 @@ class SyncEnrollmentData extends Command
               {$dateFilter}
         ";
 
-        $result = $sqlConnector->querySqlServer($sql)['data'] ?? [];
+        $result = $sqlConnector->querySqlServer($sql);
         $this->info("[INFO] Found " . count($result) . " records with missing Drop_Name or State");
 
         $updated = 0;
@@ -118,12 +122,12 @@ class SyncEnrollmentData extends Command
             // Get Drop_Name if missing
             if ($dropName === '') {
                 $campaignSql = "SELECT Campaign FROM TblContacts WHERE LLG_ID = '{$this->esc($llgId)}'";
-                $campaignResult = $sqlConnector->querySqlServer($campaignSql)['data'] ?? [];
+                $campaignResult = $sqlConnector->querySqlServer($campaignSql);
                 $campaign = $campaignResult[0]['Campaign'] ?? '';
 
                 if ($campaign === '') {
                     $leadSql = "SELECT Drop_Name FROM TblLeads WHERE LLG_ID = '{$this->esc($llgId)}'";
-                    $leadResult = $sqlConnector->querySqlServer($leadSql)['data'] ?? [];
+                    $leadResult = $sqlConnector->querySqlServer($leadSql);
                     $campaign = $leadResult[0]['Drop_Name'] ?? '';
                 }
 
@@ -136,12 +140,12 @@ class SyncEnrollmentData extends Command
             // Get State if missing
             if ($state === '') {
                 $stateSql = "SELECT State FROM TblContacts WHERE LLG_ID = '{$this->esc($llgId)}'";
-                $stateResult = $sqlConnector->querySqlServer($stateSql)['data'] ?? [];
+                $stateResult = $sqlConnector->querySqlServer($stateSql);
                 $stateValue = $stateResult[0]['State'] ?? '';
 
                 if ($stateValue === '') {
                     $leadStateSql = "SELECT State FROM TblLeads WHERE LLG_ID = '{$this->esc($llgId)}'";
-                    $leadStateResult = $sqlConnector->querySqlServer($leadStateSql)['data'] ?? [];
+                    $leadStateResult = $sqlConnector->querySqlServer($leadStateSql);
                     $stateValue = $leadStateResult[0]['State'] ?? '';
                 }
 
@@ -169,66 +173,28 @@ class SyncEnrollmentData extends Command
     {
         // Get all enrollment records with LLG_ID and current Cancel_Date
         $sql = "SELECT LLG_ID, Cancel_Date FROM TblEnrollment WHERE Category = '{$this->esc($this->source)}'";
-        $enrollmentData = $sqlConnector->querySqlServer($sql)['data'] ?? [];
+        $enrollmentData = $sqlConnector->querySqlServer($sql);
         $this->info("[INFO] Processing " . count($enrollmentData) . " enrollment records for Cancel_Date");
 
-        // Query BOTH Snowflake sources — contacts with Category=LDR may exist in PLAW Snowflake and vice versa
-        $otherSource = strtolower($this->source) === 'ldr' ? 'plaw' : 'ldr';
-        $snowflakeSources = [$snowflake];
-        try {
-            $snowflakeSources[] = DBConnector::fromEnvironment($otherSource);
-        } catch (\Throwable $e) {
-            $this->warn("[WARN] Could not connect to $otherSource Snowflake: " . $e->getMessage());
-        }
+        // Get DROPPED_DATE from Snowflake
+        $snowflakeSql = "
+            SELECT ID, DROPPED_DATE
+            FROM CONTACTS
+            WHERE _FIVETRAN_DELETED = FALSE
+              AND DROPPED_DATE IS NOT NULL
+        ";
+        $snowflakeResult = $snowflake->query($snowflakeSql);
+        $droppedDates = $snowflakeResult['data'] ?? [];
 
+        // Create lookup map
         $droppedMap = [];
-        $statusMap  = [];
-
-        foreach ($snowflakeSources as $sf) {
-            // Primary: CONTACTS.DROPPED_DATE
-            try {
-                $rows = $sf->query("
-                    SELECT ID, LEFT(DROPPED_DATE, 10) AS DROPPED_DATE
-                    FROM CONTACTS
-                    WHERE _FIVETRAN_DELETED = FALSE
-                      AND DROPPED_DATE IS NOT NULL
-                ")['data'] ?? [];
-
-                foreach ($rows as $row) {
-                    $id   = (string) ($row['ID'] ?? '');
-                    $date = $this->normalizeSnowflakeDate($row['DROPPED_DATE'] ?? null);
-                    if ($id !== '' && $date !== null && !isset($droppedMap[$id])) {
-                        $droppedMap[$id] = $date;
-                    }
-                }
-            } catch (\Throwable $e) {
-                $this->warn("[WARN] CONTACTS query failed: " . $e->getMessage());
-            }
-
-            // Fallback: CONTACTS_STATUS with any cancelled status title
-            try {
-                $rows = $sf->query("
-                    SELECT cs.CONTACT_ID, LEFT(cs.STAMP, 10) AS CANCEL_DATE
-                    FROM CONTACTS_STATUS cs
-                    JOIN CONTACTS_LEAD_STATUS cls ON cs.STATUS_ID = cls.ID
-                    WHERE UPPER(cls.TITLE) LIKE '%CANCELLED%'
-                      AND cs._FIVETRAN_DELETED = FALSE
-                    QUALIFY ROW_NUMBER() OVER (PARTITION BY cs.CONTACT_ID ORDER BY cs.STAMP DESC) = 1
-                ")['data'] ?? [];
-
-                foreach ($rows as $row) {
-                    $id   = (string) ($row['CONTACT_ID'] ?? '');
-                    $date = $this->normalizeSnowflakeDate($row['CANCEL_DATE'] ?? null);
-                    if ($id !== '' && $date !== null && !isset($statusMap[$id])) {
-                        $statusMap[$id] = $date;
-                    }
-                }
-            } catch (\Throwable $e) {
-                $this->warn("[WARN] CONTACTS_STATUS query failed: " . $e->getMessage());
+        foreach ($droppedDates as $row) {
+            $id = $row['ID'] ?? null;
+            $droppedDate = $row['DROPPED_DATE'] ?? null;
+            if ($id && $droppedDate) {
+                $droppedMap[$id] = $droppedDate;
             }
         }
-
-        $this->info("[INFO] Found " . count($droppedMap) . " DROPPED_DATE entries, " . count($statusMap) . " status-based cancel dates");
 
         $updated = 0;
         foreach ($enrollmentData as $enrollment) {
@@ -239,54 +205,30 @@ class SyncEnrollmentData extends Command
                 continue;
             }
 
+            // Remove LLG- prefix to get contact ID
             $contactId = str_replace('LLG-', '', $llgId);
 
-            // Use DROPPED_DATE first, fall back to status stamp
-            $droppedDate = $droppedMap[$contactId] ?? $statusMap[$contactId] ?? null;
+            if (isset($droppedMap[$contactId])) {
+                $droppedDate = $droppedMap[$contactId];
 
-            if ($droppedDate === null) {
-                continue;
-            }
+                // Update if Cancel_Date is empty or if dropped date is later
+                if (!$currentCancelDate || (strtotime($droppedDate) > strtotime($currentCancelDate))) {
+                    $updateSql = "
+                        UPDATE TblEnrollment
+                        SET Cancel_Date = '{$this->esc($droppedDate)}'
+                        WHERE LLG_ID = '{$this->esc($llgId)}'
+                    ";
+                    $sqlConnector->querySqlServer($updateSql);
+                    $updated++;
 
-            // Update if Cancel_Date is empty or the new date is later
-            if (!$currentCancelDate || (strtotime($droppedDate) > strtotime($currentCancelDate))) {
-                $updateSql = "
-                    UPDATE TblEnrollment
-                    SET Cancel_Date = '{$this->esc($droppedDate)}'
-                    WHERE LLG_ID = '{$this->esc($llgId)}'
-                ";
-                $sqlConnector->querySqlServer($updateSql);
-                $updated++;
-
-                if ($updated % 100 === 0) {
-                    $this->info("[INFO] Updated {$updated} Cancel_Date records...");
+                    if ($updated % 100 === 0) {
+                        $this->info("[INFO] Updated {$updated} Cancel_Date records...");
+                    }
                 }
             }
         }
 
         $this->info("[INFO] Updated {$updated} Cancel_Date records");
-    }
-
-    /**
-     * Normalize a Snowflake date value — handles ISO strings and Excel serial numbers.
-     * PLAW Snowflake stores DROPPED_DATE as Excel serial integers (e.g. 20540 = 2026-03-26).
-     */
-    private function normalizeSnowflakeDate(mixed $value): ?string
-    {
-        if ($value === null || $value === '') {
-            return null;
-        }
-
-        // Excel serial number: integer-like value with no dashes
-        if (is_numeric($value) && !str_contains((string) $value, '-')) {
-            // Excel epoch is 1899-12-30
-            $timestamp = mktime(0, 0, 0, 12, 30, 1899) + ((int) $value * 86400);
-            return date('Y-m-d', $timestamp);
-        }
-
-        // ISO string or datetime — take first 10 chars
-        $date = substr((string) $value, 0, 10);
-        return strtotime($date) !== false ? $date : null;
     }
 
     private function updatePayments(DBConnector $snowflake, DBConnector $sqlConnector): void
@@ -431,6 +373,114 @@ class SyncEnrollmentData extends Command
                 'error' => $e->getMessage()
             ]);
         }
+    }
+
+    private function importNewEnrollments(DBConnector $snowflake, DBConnector $sqlConnector): void
+    {
+        // Pull enrolled contacts from Snowflake — last 90 days only to avoid importing
+        // historical contacts that were never part of TblEnrollment
+        $sfResult = $snowflake->query("
+            SELECT
+                c.ID,
+                CONCAT(c.FIRSTNAME, ' ', c.LASTNAME) AS FULL_NAME,
+                c.STATE,
+                TO_CHAR(c.ENROLLED_DATE, 'YYYY-MM-DD') AS ENROLLED_DATE
+            FROM CONTACTS c
+            WHERE c.ENROLLED_DATE IS NOT NULL
+              AND c.ENROLLED_DATE >= DATEADD('day', -90, CURRENT_DATE())
+              AND c._FIVETRAN_DELETED = FALSE
+              AND c.FIRSTNAME IS NOT NULL
+              AND c.FIRSTNAME <> ''
+        ");
+        $sfContacts = $sfResult['data'] ?? [];
+        $this->info("[INFO] Snowflake {$this->source}: " . count($sfContacts) . " enrolled contacts");
+
+        // Load existing LLG_IDs for this source into a lookup set
+        $existingResult = $sqlConnector->querySqlServer(
+            "SELECT LLG_ID FROM TblEnrollment WHERE Category = '{$this->esc($this->source)}'"
+        );
+        $existingIds = array_flip(array_column($existingResult['data'] ?? [], 'LLG_ID'));
+        $this->info("[INFO] TblEnrollment {$this->source}: " . count($existingIds) . " existing rows");
+
+        // Find contacts not yet in TblEnrollment
+        $missing = [];
+        foreach ($sfContacts as $contact) {
+            $id = $contact['ID'] ?? '';
+            if ($id === '') {
+                continue;
+            }
+            $llgId = 'LLG-' . $id;
+            if (!isset($existingIds[$llgId])) {
+                $missing[$llgId] = $contact;
+            }
+        }
+
+        $this->info("[INFO] New contacts to insert: " . count($missing));
+        if (empty($missing)) {
+            return;
+        }
+
+        // Fetch Agent and Drop_Name from TblContacts in batches of 500
+        $contactsMap = [];
+        foreach (array_chunk(array_keys($missing), 500) as $batch) {
+            $ids = implode(',', array_map(fn($id) => "'" . $this->esc($id) . "'", $batch));
+            $tblResult = $sqlConnector->querySqlServer(
+                "SELECT LLG_ID, Agent, Campaign AS Drop_Name FROM TblContacts WHERE LLG_ID IN ({$ids})"
+            );
+            foreach ($tblResult['data'] ?? [] as $row) {
+                $contactsMap[$row['LLG_ID']] = $row;
+            }
+        }
+
+        // Insert each missing row
+        $inserted = 0;
+        $skipped  = 0;
+        foreach ($missing as $llgId => $sf) {
+            $enrolledDate = trim($sf['ENROLLED_DATE'] ?? '');
+            if ($enrolledDate === '') {
+                $skipped++;
+                continue;
+            }
+
+            $tbl      = $contactsMap[$llgId] ?? [];
+            $client   = $this->esc(trim($sf['FULL_NAME'] ?? ''));
+            $state    = $this->esc(trim($sf['STATE'] ?? ''));
+            $agent    = $this->esc(trim($tbl['Agent'] ?? ''));
+            $dropName = $this->esc(trim($tbl['Drop_Name'] ?? ''));
+
+            try {
+                $sqlConnector->querySqlServer("
+                    INSERT INTO TblEnrollment (LLG_ID, Category, Client, State, Agent, Drop_Name, Welcome_Call_Date)
+                    VALUES (
+                        '{$llgId}',
+                        '{$this->esc($this->source)}',
+                        '{$client}',
+                        '{$state}',
+                        '{$agent}',
+                        '{$dropName}',
+                        '{$this->esc($enrolledDate)}'
+                    )
+                ");
+                $inserted++;
+                if ($inserted % 50 === 0) {
+                    $this->info("[INFO] Inserted {$inserted} records...");
+                }
+            } catch (\Throwable $e) {
+                $msg = $e->getMessage();
+                if (stripos($msg, 'duplicate') !== false || stripos($msg, 'UNIQUE') !== false || stripos($msg, 'PRIMARY KEY') !== false) {
+                    $skipped++;
+                    continue;
+                }
+                $this->warn("[WARN] Failed to insert {$llgId}: {$msg}");
+                Log::warning('SyncEnrollmentData: INSERT failed', [
+                    'source' => $this->source,
+                    'llgId'  => $llgId,
+                    'error'  => $msg,
+                ]);
+            }
+        }
+
+        $this->info("[INFO] Inserted {$inserted} new enrollment rows, skipped {$skipped}");
     }
 
     protected function esc(string $value): string
