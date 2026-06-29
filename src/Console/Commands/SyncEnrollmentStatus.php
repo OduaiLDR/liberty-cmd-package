@@ -162,7 +162,7 @@ SELECT
     Cancel_Date,
     NSF_Date
 FROM TblEnrollment
-WHERE Welcome_Call_Date >= '2022-07-01'
+WHERE Category IN ('LDR', 'CCS')
 SQL;
 
         $result = $connector->querySqlServer($sql);

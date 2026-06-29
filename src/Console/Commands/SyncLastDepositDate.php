@@ -13,6 +13,7 @@ class SyncLastDepositDate extends Command
     protected $description = 'Sync Last_Deposit_Date in TblEnrollment from Snowflake TRANSACTIONS (most recent cleared deposit for non-enrolled contacts)';
 
     private string $source;
+    private string $category; // 'LDR' for LDR source, 'CCS' for PLAW source
 
     public function handle(): int
     {
@@ -42,8 +43,10 @@ class SyncLastDepositDate extends Command
 
     private function syncForSource(string $source): int
     {
-        $this->source = $source;
-        $this->info("[INFO] Sync Last Deposit Date: starting for {$this->source}.");
+        $this->source   = $source;
+        // PLAW contacts are stored as Category='CCS' in TblEnrollment — never 'PLAW'
+        $this->category = ($source === 'PLAW') ? 'CCS' : 'LDR';
+        $this->info("[INFO] Sync Last Deposit Date: starting for {$this->source} (Category={$this->category}).");
 
         try {
             $snowflake = $this->initializeSnowflakeConnector();
@@ -61,18 +64,28 @@ class SyncLastDepositDate extends Command
             return Command::FAILURE;
         }
 
-        // Step 1: Fetch last deposit dates from Snowflake
-        $this->info('[STEP 1] Fetching last deposit dates from Snowflake...');
-        $depositData = $this->fetchLastDepositDates($snowflake);
-        $this->info('[INFO] Fetched ' . count($depositData) . ' last deposit records');
+        // Step 1: Get contact IDs that need updating from Azure SQL
+        $this->info('[STEP 1] Fetching contact IDs missing Last_Deposit_Date from Azure SQL...');
+        $contactIds = $this->fetchContactIdsNeedingUpdate($sqlConnector);
+        $this->info('[INFO] Found ' . count($contactIds) . ' contacts needing Last_Deposit_Date update');
 
-        if (empty($depositData)) {
-            $this->warn('[WARN] No deposit data found. Exiting.');
+        if (empty($contactIds)) {
+            $this->info('[INFO] No contacts need updating. Exiting.');
             return Command::SUCCESS;
         }
 
-        // Step 2: Update TblEnrollment
-        $this->info('[STEP 2] Updating TblEnrollment...');
+        // Step 2: Fetch last deposit dates from Snowflake for only those contacts
+        $this->info('[STEP 2] Fetching last deposit dates from Snowflake...');
+        $depositData = $this->fetchLastDepositDates($snowflake, $contactIds);
+        $this->info('[INFO] Fetched ' . count($depositData) . ' last deposit records from Snowflake');
+
+        if (empty($depositData)) {
+            $this->warn('[WARN] No deposit data found in Snowflake. Exiting.');
+            return Command::SUCCESS;
+        }
+
+        // Step 3: Batch update TblEnrollment (500 rows per query)
+        $this->info('[STEP 3] Updating TblEnrollment in batches...');
         $updated = $this->updateLastDepositDates($sqlConnector, $depositData);
         $this->info("[INFO] Updated {$updated} records");
 
@@ -80,66 +93,112 @@ class SyncLastDepositDate extends Command
         return Command::SUCCESS;
     }
 
-    private function fetchLastDepositDates(DBConnector $snowflake): array
+    private function fetchContactIdsNeedingUpdate(DBConnector $connector): array
     {
         $sql = "
-            SELECT CONTACT_ID, CLEARED_DATE
-            FROM (
-                SELECT
-                    t.CONTACT_ID,
-                    t.CLEARED_DATE,
-                    ROW_NUMBER() OVER(PARTITION BY t.CONTACT_ID ORDER BY t.CLEARED_DATE DESC) AS N
-                FROM TRANSACTIONS AS t
-                LEFT JOIN CONTACTS AS c ON t.CONTACT_ID = c.ID
-                WHERE t.TRANS_TYPE = 'D'
-                  AND t.CLEARED_DATE IS NOT NULL
-                  AND t.RETURNED_DATE IS NULL
-                  AND c.ENROLLED = 0
-            )
-            WHERE N = 1
+            SELECT LTRIM(RTRIM(REPLACE(LLG_ID, 'LLG-', ''))) AS CONTACT_ID
+            FROM TblEnrollment
+            WHERE Category = '{$this->category}'
+              AND Last_Deposit_Date IS NULL
+              AND First_Payment_Cleared_Date IS NOT NULL
+              AND COALESCE(Payments, 0) > 0
         ";
 
-        $result = $snowflake->query($sql);
-        return $result['data'] ?? [];
+        $result = $connector->querySqlServer($sql);
+        $rows   = $result['data'] ?? (array_is_list($result) ? $result : []);
+
+        $ids = [];
+        foreach ($rows as $row) {
+            $cid = $row['CONTACT_ID'] ?? null;
+            if ($cid !== null && $cid !== '') {
+                $ids[] = (string) $cid;
+            }
+        }
+        return $ids;
+    }
+
+    private function fetchLastDepositDates(DBConnector $snowflake, array $contactIds): array
+    {
+        $all    = [];
+        $chunks = array_chunk($contactIds, 500);
+        $total  = count($chunks);
+
+        foreach ($chunks as $i => $chunk) {
+            $inList = implode(',', array_map(fn($id) => "'" . str_replace("'", "''", $id) . "'", $chunk));
+            $sql    = "
+                SELECT CONTACT_ID, TO_VARCHAR(MAX(CLEARED_DATE), 'YYYY-MM-DD') AS CLEARED_DATE
+                FROM TRANSACTIONS
+                WHERE CONTACT_ID IN ({$inList})
+                  AND TRANS_TYPE = 'D'
+                  AND CLEARED_DATE IS NOT NULL
+                  AND RETURNED_DATE IS NULL
+                GROUP BY CONTACT_ID
+            ";
+
+            try {
+                $result = $snowflake->query($sql);
+                $rows   = $result['data'] ?? (is_array($result) && array_is_list($result) ? $result : []);
+                foreach ($rows as $row) {
+                    $cid = $row['CONTACT_ID'] ?? null;
+                    if ($cid !== null) {
+                        $all[$cid] = $row;
+                    }
+                }
+                if (($i + 1) % 10 === 0) {
+                    $this->info("[INFO] Snowflake: processed chunk " . ($i + 1) . "/{$total}");
+                }
+            } catch (\Throwable $e) {
+                $this->warn("[WARN] Snowflake chunk " . ($i + 1) . " failed: " . $e->getMessage());
+                Log::warning('SyncLastDepositDate: Snowflake chunk failed', ['error' => $e->getMessage()]);
+            }
+        }
+
+        return array_values($all);
     }
 
     private function updateLastDepositDates(DBConnector $connector, array $depositData): int
     {
-        $updated = 0;
-
+        // Build map: contactId => formattedDate (skip any with unparseable dates)
+        $map = [];
         foreach ($depositData as $row) {
             $contactId = $row['CONTACT_ID'] ?? null;
-            $clearedDate = $row['CLEARED_DATE'] ?? null;
-
-            if (!$contactId || !$clearedDate) {
-                continue;
+            $date      = $this->formatDate($row['CLEARED_DATE'] ?? null);
+            if ($contactId && $date) {
+                $map[(string) $contactId] = $date;
             }
+        }
 
-            $formattedDate = $this->formatDate($clearedDate);
-            if (!$formattedDate) {
-                continue;
+        if (empty($map)) {
+            return 0;
+        }
+
+        $updated = 0;
+        $batches = array_chunk($map, 500, true);
+
+        foreach ($batches as $batch) {
+            $caseWhen = '';
+            $inList   = [];
+
+            foreach ($batch as $contactId => $date) {
+                $escaped   = $this->escSql($contactId);
+                $caseWhen .= "WHEN 'LLG-{$escaped}' THEN '{$date}' ";
+                $inList[]  = "'LLG-{$escaped}'";
             }
 
             $sql = "
                 UPDATE TblEnrollment
-                SET Last_Deposit_Date = '{$formattedDate}'
-                WHERE LLG_ID = 'LLG-{$this->escSql($contactId)}'
+                SET Last_Deposit_Date = CASE LLG_ID {$caseWhen} END
+                WHERE LLG_ID IN (" . implode(',', $inList) . ")
+                  AND Category = '{$this->category}'
             ";
 
             try {
                 $connector->querySqlServer($sql);
-                $updated++;
-
-                if ($updated % 100 === 0) {
-                    $this->info("[INFO] Updated {$updated} records...");
-                }
+                $updated += count($batch);
+                $this->info("[INFO] Updated {$updated} records so far...");
             } catch (\Throwable $e) {
-                $this->warn("[WARN] Failed to update Contact_ID {$contactId}: " . $e->getMessage());
-                Log::warning('SyncLastDepositDate: Update failed', [
-                    'contact_id' => $contactId,
-                    'cleared_date' => $clearedDate,
-                    'error' => $e->getMessage()
-                ]);
+                $this->warn("[WARN] Batch update failed: " . $e->getMessage());
+                Log::warning('SyncLastDepositDate: Batch update failed', ['error' => $e->getMessage()]);
             }
         }
 

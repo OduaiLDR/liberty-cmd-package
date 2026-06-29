@@ -101,7 +101,8 @@ class SyncEnrollmentData extends Command
               {$dateFilter}
         ";
 
-        $result = $sqlConnector->querySqlServer($sql);
+        $rawResult = $sqlConnector->querySqlServer($sql);
+        $result = $rawResult['data'] ?? (array_is_list($rawResult) ? $rawResult : []);
         $this->info("[INFO] Found " . count($result) . " records with missing Drop_Name or State");
 
         $updated = 0;
