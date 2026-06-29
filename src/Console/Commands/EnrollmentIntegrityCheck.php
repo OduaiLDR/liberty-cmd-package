@@ -165,17 +165,22 @@ class EnrollmentIntegrityCheck extends Command
     {
         $startedAt = now();
         $skipEmail = (bool) $this->option('no-email');
-        $alerts    = [];   // only steps that are STILL broken after retry
+        $alerts    = [];
+        $steps     = $this->steps();
+        $total     = count($steps);
 
-        $this->info('[IntegrityCheck] Starting at ' . $startedAt->toDateTimeString());
-        Log::info('EnrollmentIntegrityCheck: starting');
+        $this->log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+        $this->log("ENROLLMENT INTEGRITY CHECK — {$startedAt->format('Y-m-d H:i:s')}");
+        $this->log("Checks to run: {$total}");
+        $this->log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
         try {
+            $this->log('Connecting to SQL Server...');
             $sql = DBConnector::fromEnvironment('ldr');
             $sql->initializeSqlServer();
+            $this->log('Connected.');
         } catch (\Throwable $e) {
-            $this->error('SQL Server connection failed: ' . $e->getMessage());
-            Log::error('EnrollmentIntegrityCheck: SQL Server connect failed', ['error' => $e->getMessage()]);
+            $this->log('ERROR: SQL Server connection failed — ' . $e->getMessage(), 'error');
             $this->sendAlert(
                 [['label' => 'SQL Server Connection', 'command' => 'n/a', 'reason' => $e->getMessage(), 'count' => 0, 'ids' => []]],
                 $startedAt,
@@ -184,45 +189,60 @@ class EnrollmentIntegrityCheck extends Command
             return Command::FAILURE;
         }
 
-        foreach ($this->steps() as $step) {
+        foreach ($steps as $i => $step) {
             $label    = $step['label'];
             $command  = $step['command'];
             $checkSql = $step['check'];
             $reason   = $step['reason'];
+            $num      = $i + 1;
 
-            $this->line("  checking: {$label}");
+            $this->log("─────────────────────────────────────────────────────────");
+            $this->log("[{$num}/{$total}] {$label}");
+            $this->log("  command : {$command}");
+            $this->log("  checking: {$reason}");
 
             // ── Initial check ─────────────────────────────────────────────
+            $t0  = microtime(true);
             $ids = $this->runCheck($sql, $checkSql);
+            $ms  = round((microtime(true) - $t0) * 1000);
 
             if (empty($ids)) {
-                $this->info("    ✓ OK");
+                $this->log("  result  : ✓ CLEAN  ({$ms}ms)");
                 continue;
             }
 
-            // ── Something is off — retry ONLY this automation ─────────────
-            $this->warn("    ✗ {$label}: " . count($ids) . " issue(s) — retrying {$command}...");
-            Log::warning("EnrollmentIntegrityCheck: check failed, retrying [{$command}]", [
-                'count' => count($ids),
-                'ids'   => array_slice($ids, 0, 10),
+            // ── Something is off — log what we found ─────────────────────
+            $found = count($ids);
+            $this->log("  result  : ✗ {$found} issue(s) found ({$ms}ms)", 'warn');
+            $this->log("  sample  : " . implode(', ', array_slice($ids, 0, 5)) . ($found > 5 ? ' …' : ''));
+            $this->log("  action  : re-running [{$command}]...", 'warn');
+
+            Log::warning("EnrollmentIntegrityCheck: check failed [{$label}]", [
+                'count'  => $found,
+                'sample' => array_slice($ids, 0, 10),
             ]);
 
+            // ── Retry ONLY this automation ────────────────────────────────
+            $t1 = microtime(true);
             $this->runAutomation($command);
+            $retryMs = round((microtime(true) - $t1) * 1000);
+            $this->log("  retried : completed in {$retryMs}ms — re-checking...");
 
-            // ── Re-check after retry ──────────────────────────────────────
+            // ── Re-check ──────────────────────────────────────────────────
             $retryIds = $this->runCheck($sql, $checkSql);
 
             if (empty($retryIds)) {
-                $this->info("    ✓ Resolved after retry");
-                Log::info("EnrollmentIntegrityCheck: [{$command}] resolved after retry");
+                $this->log("  result  : ✓ RESOLVED after retry", 'info');
+                Log::info("EnrollmentIntegrityCheck: [{$label}] resolved after retry");
                 continue;
             }
 
-            // ── Still broken — flag it ────────────────────────────────────
-            $this->error("    ✗ STILL {$count = count($retryIds)} issue(s) after retry — flagging");
-            Log::error("EnrollmentIntegrityCheck: [{$command}] still failing after retry", [
-                'count' => $count,
-                'ids'   => array_slice($retryIds, 0, 20),
+            // ── Still broken — flag for alert ─────────────────────────────
+            $count = count($retryIds);
+            $this->log("  result  : ✗ STILL {$count} issue(s) after retry — FLAGGED", 'error');
+            Log::error("EnrollmentIntegrityCheck: [{$label}] still failing after retry", [
+                'count'  => $count,
+                'sample' => array_slice($retryIds, 0, 20),
                 'reason' => $reason,
             ]);
 
@@ -235,18 +255,42 @@ class EnrollmentIntegrityCheck extends Command
             ];
         }
 
-        $elapsed = now()->diffInSeconds($startedAt);
+        $elapsed = round(now()->diffInSeconds($startedAt));
+        $this->log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
         if (empty($alerts)) {
-            $this->info("\n[IntegrityCheck] All checks passed in {$elapsed}s — no email needed.");
+            $this->log("ALL {$total} CHECKS PASSED — elapsed: {$elapsed}s — no email sent.");
+            $this->log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
             Log::info('EnrollmentIntegrityCheck: all clear', ['elapsed_s' => $elapsed]);
             return Command::SUCCESS;
         }
 
-        $this->error("\n[IntegrityCheck] " . count($alerts) . " unresolved issue(s) after {$elapsed}s — sending alert...");
+        $flagged = count($alerts);
+        $this->log("{$flagged} UNRESOLVED ISSUE(S) after {$elapsed}s — sending alert email...", 'error');
+        $this->log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
         $this->sendAlert($alerts, $startedAt, $skipEmail);
 
         return Command::FAILURE;
+    }
+
+    private function log(string $message, string $level = 'line'): void
+    {
+        $ts      = now()->format('H:i:s');
+        $full    = "[{$ts}] {$message}";
+        $logPath = storage_path('logs/enrollment-integrity.log');
+
+        // Write to dedicated log file
+        @file_put_contents($logPath, $full . PHP_EOL, FILE_APPEND | LOCK_EX);
+
+        // Write to console with colour
+        match ($level) {
+            'error' => $this->error($full),
+            'warn'  => $this->warn($full),
+            'info'  => $this->info($full),
+            default => $this->line($full),
+        };
+
+        Log::channel('single')->{$level === 'warn' ? 'warning' : ($level === 'line' ? 'info' : $level)}($message);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
