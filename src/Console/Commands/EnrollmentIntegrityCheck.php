@@ -9,25 +9,26 @@ use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Log;
 
 /**
- * Enrollment Integrity Check
+ * Enrollment Integrity Check — watchdog, not a runner.
  *
- * Runs all 10 enrollment automation commands in sequence, cross-checks TblEnrollment
- * for suspicious nulls or gaps after each one, retries once if issues are found,
- * then sends an HTML report email via Microsoft Graph.
+ * Runs AFTER all automations have already executed on their schedule.
+ * Checks TblEnrollment for data gaps. If a check fails it re-runs ONLY
+ * that specific automation once. If the issue persists after the retry
+ * it is flagged and an alert email is sent via Microsoft Graph.
+ *
+ * Email is only sent when at least one check is still failing after retry.
  *
  * Artisan: enrollment:integrity-check
  */
 class EnrollmentIntegrityCheck extends Command
 {
     protected $signature = 'enrollment:integrity-check
-                            {--skip-automations : Skip running automations — only run checks and email}
-                            {--no-email         : Run checks but do not send email}';
+                            {--no-email : Run checks and retries but suppress the alert email}';
 
-    protected $description = 'Run all enrollment sync automations, cross-check data integrity, retry failures, email report via Graph API';
+    protected $description = 'Watchdog: checks enrollment data integrity after automations run, retries specific failing automation, emails alert if unresolved';
 
     private const REPORT_TO = 'oduai@libertydebtrelief.com';
 
-    /** Each entry: label, command, check SQL (returns suspicious LLG_IDs), reason */
     private function steps(): array
     {
         return [
@@ -41,7 +42,7 @@ class EnrollmentIntegrityCheck extends Command
                       AND Welcome_Call_Date IS NULL
                       AND Import_Time >= CAST(GETDATE() AS DATE)
                 ",
-                'reason'  => 'Rows inserted today missing Welcome_Call_Date — import may have failed',
+                'reason'  => 'Rows inserted today are missing Welcome_Call_Date',
             ],
             [
                 'label'   => 'Sync Enrollment Data (Drop_Name / State)',
@@ -53,7 +54,7 @@ class EnrollmentIntegrityCheck extends Command
                       AND (Drop_Name IS NULL OR Drop_Name = '')
                       AND Welcome_Call_Date >= DATEADD(day, -90, GETDATE())
                 ",
-                'reason'  => 'Active enrollments (last 90 days) still missing Drop_Name after sync',
+                'reason'  => 'Active enrollments (last 90 days) missing Drop_Name',
             ],
             [
                 'label'   => 'Sync Enrollment Status',
@@ -65,7 +66,7 @@ class EnrollmentIntegrityCheck extends Command
                       AND Enrollment_Status IS NULL
                       AND Welcome_Call_Date >= DATEADD(day, -90, GETDATE())
                 ",
-                'reason'  => 'Active enrollments (last 90 days) still missing Enrollment_Status',
+                'reason'  => 'Active enrollments (last 90 days) missing Enrollment_Status',
             ],
             [
                 'label'   => 'Sync Time In Program (Payment_Frequency)',
@@ -79,7 +80,7 @@ class EnrollmentIntegrityCheck extends Command
                       AND Welcome_Call_Date BETWEEN DATEADD(day, -90, GETDATE())
                                                AND DATEADD(day,  -7, GETDATE())
                 ",
-                'reason'  => 'Active enrollments (7-90 days) still missing Payment_Frequency',
+                'reason'  => 'Active enrollments (7–90 days old) missing Payment_Frequency',
             ],
             [
                 'label'   => 'Sync Enrollment Plans',
@@ -92,7 +93,7 @@ class EnrollmentIntegrityCheck extends Command
                       AND COALESCE(Enrollment_Status, '') NOT IN ('Cancelled', 'Dropped', 'Cancel')
                       AND Welcome_Call_Date >= DATEADD(day, -90, GETDATE())
                 ",
-                'reason'  => 'Active enrollments (last 90 days) still missing Enrollment_Plan',
+                'reason'  => 'Active enrollments (last 90 days) missing Enrollment_Plan',
             ],
             [
                 'label'   => 'Sync Debt Accounts (count + amount)',
@@ -105,7 +106,7 @@ class EnrollmentIntegrityCheck extends Command
                       AND COALESCE(Enrollment_Status, '') NOT IN ('Cancelled', 'Dropped', 'Cancel')
                       AND Welcome_Call_Date >= DATEADD(day, -90, GETDATE())
                 ",
-                'reason'  => 'Active enrollments (last 90 days) still missing debt data',
+                'reason'  => 'Active enrollments (last 90 days) missing debt count or dollar amount',
             ],
             [
                 'label'   => 'Sync First Payment Date',
@@ -118,7 +119,7 @@ class EnrollmentIntegrityCheck extends Command
                       AND COALESCE(Enrollment_Status, '') NOT IN ('Cancelled', 'Dropped', 'Cancel')
                       AND Welcome_Call_Date <= DATEADD(day, -30, GETDATE())
                 ",
-                'reason'  => 'Active enrollments 30+ days old still missing First_Payment_Date',
+                'reason'  => 'Active enrollments 30+ days old missing First_Payment_Date',
             ],
             [
                 'label'   => 'Sync First Payment Cleared Date',
@@ -130,7 +131,7 @@ class EnrollmentIntegrityCheck extends Command
                       AND First_Payment_Cleared_Date IS NULL
                       AND COALESCE(Payments, 0) > 0
                 ",
-                'reason'  => 'Enrollments with cleared payments but still missing First_Payment_Cleared_Date',
+                'reason'  => 'Enrollments with cleared payments but missing First_Payment_Cleared_Date',
             ],
             [
                 'label'   => 'Sync Last Deposit Date',
@@ -142,7 +143,7 @@ class EnrollmentIntegrityCheck extends Command
                       AND Last_Deposit_Date IS NULL
                       AND COALESCE(Payments, 0) > 0
                 ",
-                'reason'  => 'Enrollments with payments but still missing Last_Deposit_Date',
+                'reason'  => 'Enrollments with payments but missing Last_Deposit_Date',
             ],
             [
                 'label'   => 'Sync Submitted Date',
@@ -155,120 +156,97 @@ class EnrollmentIntegrityCheck extends Command
                       AND Welcome_Call_Date BETWEEN DATEADD(day, -90, GETDATE())
                                                AND DATEADD(day,  -7, GETDATE())
                 ",
-                'reason'  => 'Enrollments (7-90 days) still missing Submitted_Date',
+                'reason'  => 'Enrollments (7–90 days old) missing Submitted_Date',
             ],
         ];
     }
 
     public function handle(): int
     {
-        $startedAt   = now();
-        $skipAuto    = (bool) $this->option('skip-automations');
-        $skipEmail   = (bool) $this->option('no-email');
-        $overallOk   = true;
-        $results     = [];
+        $startedAt = now();
+        $skipEmail = (bool) $this->option('no-email');
+        $alerts    = [];   // only steps that are STILL broken after retry
 
-        $this->info('[EnrollmentIntegrityCheck] Starting at ' . $startedAt->toDateTimeString());
-        Log::info('EnrollmentIntegrityCheck: starting', ['skip_automations' => $skipAuto]);
+        $this->info('[IntegrityCheck] Starting at ' . $startedAt->toDateTimeString());
+        Log::info('EnrollmentIntegrityCheck: starting');
 
         try {
             $sql = DBConnector::fromEnvironment('ldr');
             $sql->initializeSqlServer();
         } catch (\Throwable $e) {
-            $this->error('Cannot connect to SQL Server: ' . $e->getMessage());
+            $this->error('SQL Server connection failed: ' . $e->getMessage());
             Log::error('EnrollmentIntegrityCheck: SQL Server connect failed', ['error' => $e->getMessage()]);
-            $this->maybeSendEmail(false, [], $startedAt, 'SQL Server connection failed: ' . $e->getMessage(), $skipEmail);
+            $this->sendAlert(
+                [['label' => 'SQL Server Connection', 'command' => 'n/a', 'reason' => $e->getMessage(), 'count' => 0, 'ids' => []]],
+                $startedAt,
+                $skipEmail
+            );
             return Command::FAILURE;
         }
 
         foreach ($this->steps() as $step) {
-            $label   = $step['label'];
-            $command = $step['command'];
+            $label    = $step['label'];
+            $command  = $step['command'];
             $checkSql = $step['check'];
-            $reason  = $step['reason'];
+            $reason   = $step['reason'];
 
-            $this->info("\n" . str_repeat('-', 60));
-            $this->info("▶  {$label}");
+            $this->line("  checking: {$label}");
 
-            $result = [
-                'label'         => $label,
-                'command'       => $command,
-                'reason'        => $reason,
-                'status'        => 'OK',          // OK | FIXED | ALERT | SKIPPED | ERROR
-                'pre_count'     => 0,
-                'post_count'    => 0,
-                'sample_ids'    => [],
-                'automation_ok' => true,
-                'error'         => null,
+            // ── Initial check ─────────────────────────────────────────────
+            $ids = $this->runCheck($sql, $checkSql);
+
+            if (empty($ids)) {
+                $this->info("    ✓ OK");
+                continue;
+            }
+
+            // ── Something is off — retry ONLY this automation ─────────────
+            $this->warn("    ✗ {$label}: " . count($ids) . " issue(s) — retrying {$command}...");
+            Log::warning("EnrollmentIntegrityCheck: check failed, retrying [{$command}]", [
+                'count' => count($ids),
+                'ids'   => array_slice($ids, 0, 10),
+            ]);
+
+            $this->runAutomation($command);
+
+            // ── Re-check after retry ──────────────────────────────────────
+            $retryIds = $this->runCheck($sql, $checkSql);
+
+            if (empty($retryIds)) {
+                $this->info("    ✓ Resolved after retry");
+                Log::info("EnrollmentIntegrityCheck: [{$command}] resolved after retry");
+                continue;
+            }
+
+            // ── Still broken — flag it ────────────────────────────────────
+            $this->error("    ✗ STILL {$count = count($retryIds)} issue(s) after retry — flagging");
+            Log::error("EnrollmentIntegrityCheck: [{$command}] still failing after retry", [
+                'count' => $count,
+                'ids'   => array_slice($retryIds, 0, 20),
+                'reason' => $reason,
+            ]);
+
+            $alerts[] = [
+                'label'   => $label,
+                'command' => $command,
+                'reason'  => $reason,
+                'count'   => $count,
+                'ids'     => array_slice($retryIds, 0, 20),
             ];
-
-            // ── Run pre-check (before automation) ────────────────────────
-            $preIds = $this->runCheck($sql, $checkSql);
-            $result['pre_count'] = count($preIds);
-
-            if ($result['pre_count'] > 0) {
-                $this->warn("   Pre-check: {$result['pre_count']} suspicious row(s) found");
-            } else {
-                $this->info("   Pre-check: clean");
-            }
-
-            // ── Run automation ────────────────────────────────────────────
-            if (!$skipAuto) {
-                $exitCode = $this->runAutomation($command);
-                $result['automation_ok'] = ($exitCode === 0);
-
-                if (!$result['automation_ok']) {
-                    $this->warn("   Automation exited with code {$exitCode}");
-                }
-            }
-
-            // ── Post-check ────────────────────────────────────────────────
-            $postIds = $this->runCheck($sql, $checkSql);
-            $result['post_count'] = count($postIds);
-            $result['sample_ids'] = array_slice($postIds, 0, 20);
-
-            if ($result['post_count'] === 0) {
-                $result['status'] = ($result['pre_count'] > 0) ? 'FIXED' : 'OK';
-                $this->info("   Post-check: ✓ clean");
-            } else {
-                // Issues remain — retry automation once
-                $this->warn("   Post-check: {$result['post_count']} issue(s) — retrying automation...");
-
-                if (!$skipAuto) {
-                    $retryCode = $this->runAutomation($command);
-                    $result['automation_ok'] = ($retryCode === 0);
-                }
-
-                $retryIds = $this->runCheck($sql, $checkSql);
-                $result['post_count']  = count($retryIds);
-                $result['sample_ids']  = array_slice($retryIds, 0, 20);
-
-                if ($result['post_count'] === 0) {
-                    $result['status'] = 'FIXED';
-                    $this->info("   Retry: ✓ resolved after retry");
-                } else {
-                    $result['status'] = 'ALERT';
-                    $overallOk = false;
-                    $this->error("   Retry: ✗ still {$result['post_count']} issue(s) after retry");
-                    Log::warning("EnrollmentIntegrityCheck: persistent issue in [{$label}]", [
-                        'count'      => $result['post_count'],
-                        'sample_ids' => $result['sample_ids'],
-                        'reason'     => $reason,
-                    ]);
-                }
-            }
-
-            $results[] = $result;
         }
 
         $elapsed = now()->diffInSeconds($startedAt);
-        $this->info("\n" . str_repeat('=', 60));
-        $this->info('[EnrollmentIntegrityCheck] Completed in ' . $elapsed . 's — overall: ' . ($overallOk ? 'OK ✓' : 'ISSUES FOUND ✗'));
-        Log::info('EnrollmentIntegrityCheck: completed', ['overall_ok' => $overallOk, 'elapsed_s' => $elapsed]);
 
-        $this->maybeSendEmail($overallOk, $results, $startedAt, null, $skipEmail);
+        if (empty($alerts)) {
+            $this->info("\n[IntegrityCheck] All checks passed in {$elapsed}s — no email needed.");
+            Log::info('EnrollmentIntegrityCheck: all clear', ['elapsed_s' => $elapsed]);
+            return Command::SUCCESS;
+        }
 
-        return $overallOk ? Command::SUCCESS : Command::FAILURE;
+        $this->error("\n[IntegrityCheck] " . count($alerts) . " unresolved issue(s) after {$elapsed}s — sending alert...");
+        $this->sendAlert($alerts, $startedAt, $skipEmail);
+
+        return Command::FAILURE;
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -282,120 +260,90 @@ class EnrollmentIntegrityCheck extends Command
                 : [];
             return array_values(array_filter(array_column($rows, 'LLG_ID')));
         } catch (\Throwable $e) {
-            Log::error('EnrollmentIntegrityCheck: check query failed', ['error' => $e->getMessage()]);
+            Log::error('EnrollmentIntegrityCheck: check query threw exception', ['error' => $e->getMessage()]);
             return [];
         }
     }
 
-    private function runAutomation(string $command): int
+    private function runAutomation(string $command): void
     {
         try {
-            return Artisan::call($command);
+            Artisan::call($command);
         } catch (\Throwable $e) {
-            Log::error("EnrollmentIntegrityCheck: automation [{$command}] threw exception", [
+            Log::error("EnrollmentIntegrityCheck: retry of [{$command}] threw exception", [
                 'error' => $e->getMessage(),
             ]);
-            return 1;
         }
     }
 
-    private function maybeSendEmail(
-        bool $overallOk,
-        array $results,
-        \Illuminate\Support\Carbon $startedAt,
-        ?string $fatalError,
-        bool $skipEmail
-    ): void {
+    private function sendAlert(array $alerts, \Illuminate\Support\Carbon $startedAt, bool $skipEmail): void
+    {
         if ($skipEmail) {
-            $this->info('[EnrollmentIntegrityCheck] Email skipped (--no-email)');
+            $this->info('[IntegrityCheck] Email suppressed (--no-email)');
             return;
         }
 
-        $subject = $fatalError
-            ? '[ENROLLMENT INTEGRITY] ✗ FATAL ERROR — ' . now()->format('Y-m-d H:i')
-            : '[ENROLLMENT INTEGRITY] ' . ($overallOk ? '✓ All Clear' : '✗ Issues Found') . ' — ' . now()->format('Y-m-d H:i');
-
-        $body = $this->buildHtmlEmail($overallOk, $results, $startedAt, $fatalError);
+        $subject = '[ENROLLMENT ALERT] ' . count($alerts) . ' automation(s) failed integrity check — ' . now()->format('Y-m-d H:i');
+        $body    = $this->buildHtml($alerts, $startedAt);
 
         try {
-            $mailer  = new EmailSenderService();
-            $sent    = $mailer->sendMailHtml($subject, $body, [self::REPORT_TO]);
-            $outcome = $sent ? 'sent' : 'failed';
-            $this->info("[EnrollmentIntegrityCheck] Email {$outcome} → " . self::REPORT_TO);
-            Log::info("EnrollmentIntegrityCheck: email {$outcome}", ['to' => self::REPORT_TO]);
+            $sent = (new EmailSenderService())->sendMailHtml($subject, $body, [self::REPORT_TO]);
+            $this->info('[IntegrityCheck] Alert email ' . ($sent ? 'sent' : 'FAILED to send') . ' → ' . self::REPORT_TO);
+            Log::info('EnrollmentIntegrityCheck: alert email ' . ($sent ? 'sent' : 'failed'), ['to' => self::REPORT_TO]);
         } catch (\Throwable $e) {
-            $this->error('Failed to send email: ' . $e->getMessage());
-            Log::error('EnrollmentIntegrityCheck: email send failed', ['error' => $e->getMessage()]);
+            $this->error('Could not send alert email: ' . $e->getMessage());
+            Log::error('EnrollmentIntegrityCheck: sendMailHtml threw', ['error' => $e->getMessage()]);
         }
     }
 
-    private function buildHtmlEmail(
-        bool $overallOk,
-        array $results,
-        \Illuminate\Support\Carbon $startedAt,
-        ?string $fatalError
-    ): string {
-        $elapsed  = now()->diffInSeconds($startedAt);
+    private function buildHtml(array $alerts, \Illuminate\Support\Carbon $startedAt): string
+    {
         $ranAt    = $startedAt->format('F j, Y \a\t g:i A');
-        $duration = $elapsed >= 60
-            ? round($elapsed / 60, 1) . ' min'
-            : $elapsed . 's';
-
-        $banner = $fatalError
-            ? '<div style="background:#dc3545;color:#fff;padding:12px 16px;border-radius:4px;font-size:15px;font-weight:bold;">✗ FATAL — Could not run checks: ' . htmlspecialchars($fatalError) . '</div>'
-            : ($overallOk
-                ? '<div style="background:#198754;color:#fff;padding:12px 16px;border-radius:4px;font-size:15px;font-weight:bold;">✓ All enrollment data checks passed</div>'
-                : '<div style="background:#dc3545;color:#fff;padding:12px 16px;border-radius:4px;font-size:15px;font-weight:bold;">✗ One or more enrollment integrity checks still have issues after retry</div>');
+        $elapsed  = now()->diffInSeconds($startedAt);
+        $duration = $elapsed >= 60 ? round($elapsed / 60, 1) . ' min' : $elapsed . 's';
 
         $rows = '';
-        foreach ($results as $r) {
-            [$bg, $icon] = match ($r['status']) {
-                'OK'     => ['#d1e7dd', '✓'],
-                'FIXED'  => ['#fff3cd', '⚡'],
-                'ALERT'  => ['#f8d7da', '✗'],
-                'ERROR'  => ['#f8d7da', '⚠'],
-                default  => ['#e2e3e5', '—'],
-            };
-            $sampleHtml = empty($r['sample_ids'])
+        foreach ($alerts as $a) {
+            $sampleHtml = empty($a['ids'])
                 ? '<em>none</em>'
-                : '<code style="font-size:11px;">' . implode(', ', array_map('htmlspecialchars', $r['sample_ids'])) . (count($r['sample_ids']) < $r['post_count'] ? ', …' : '') . '</code>';
+                : '<code style="font-size:11px;">' . implode(', ', array_map('htmlspecialchars', $a['ids']))
+                  . ($a['count'] > count($a['ids']) ? ' … (' . $a['count'] . ' total)' : '') . '</code>';
 
             $rows .= "
-                <tr style=\"background:{$bg};\">
-                    <td style=\"padding:8px 12px;border:1px solid #dee2e6;white-space:nowrap;\">{$icon} {$r['label']}</td>
-                    <td style=\"padding:8px 12px;border:1px solid #dee2e6;white-space:nowrap;\"><code>{$r['command']}</code></td>
-                    <td style=\"padding:8px 12px;border:1px solid #dee2e6;text-align:center;\">{$r['post_count']}</td>
-                    <td style=\"padding:8px 12px;border:1px solid #dee2e6;font-size:12px;\">{$r['reason']}</td>
-                    <td style=\"padding:8px 12px;border:1px solid #dee2e6;font-size:11px;word-break:break-all;\">{$sampleHtml}</td>
+                <tr>
+                    <td style=\"padding:9px 12px;border:1px solid #dee2e6;font-weight:600;white-space:nowrap;\">{$a['label']}</td>
+                    <td style=\"padding:9px 12px;border:1px solid #dee2e6;\"><code>{$a['command']}</code></td>
+                    <td style=\"padding:9px 12px;border:1px solid #dee2e6;text-align:center;font-weight:bold;color:#dc3545;\">{$a['count']}</td>
+                    <td style=\"padding:9px 12px;border:1px solid #dee2e6;font-size:12px;\">{$a['reason']}</td>
+                    <td style=\"padding:9px 12px;border:1px solid #dee2e6;font-size:11px;word-break:break-all;\">{$sampleHtml}</td>
                 </tr>";
         }
 
-        $tableHtml = empty($results) ? '<p><em>No steps were run.</em></p>' : "
-            <table style=\"border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:13px;margin-top:16px;\">
-                <thead>
-                    <tr style=\"background:#343a40;color:#fff;\">
-                        <th style=\"padding:10px 12px;border:1px solid #dee2e6;text-align:left;\">Automation</th>
-                        <th style=\"padding:10px 12px;border:1px solid #dee2e6;text-align:left;\">Command</th>
-                        <th style=\"padding:10px 12px;border:1px solid #dee2e6;text-align:center;\">Issues</th>
-                        <th style=\"padding:10px 12px;border:1px solid #dee2e6;text-align:left;\">What It Checks</th>
-                        <th style=\"padding:10px 12px;border:1px solid #dee2e6;text-align:left;\">Sample LLG_IDs</th>
-                    </tr>
-                </thead>
-                <tbody>{$rows}</tbody>
-            </table>";
-
-        return "
-<!DOCTYPE html>
+        return "<!DOCTYPE html>
 <html>
 <body style=\"font-family:Arial,sans-serif;font-size:14px;color:#212529;max-width:960px;margin:0 auto;padding:20px;\">
-    <h2 style=\"margin-top:0;\">Enrollment Integrity Report</h2>
-    <p style=\"color:#6c757d;margin-top:-8px;\">Run: {$ranAt} &nbsp;|&nbsp; Duration: {$duration}</p>
-    {$banner}
-    {$tableHtml}
+    <h2 style=\"margin-top:0;color:#dc3545;\">&#x26A0; Enrollment Integrity Alert</h2>
+    <p style=\"color:#6c757d;margin-top:-8px;\">Checked: {$ranAt} &nbsp;|&nbsp; Duration: {$duration}</p>
+    <div style=\"background:#f8d7da;color:#842029;padding:12px 16px;border-radius:4px;font-size:14px;border:1px solid #f5c2c7;\">
+        <strong>" . count($alerts) . " automation(s) still have data issues after an automatic retry.</strong>
+        The automations below were re-run once and the problem persists — manual review may be needed.
+    </div>
+    <table style=\"border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:13px;margin-top:20px;\">
+        <thead>
+            <tr style=\"background:#343a40;color:#fff;\">
+                <th style=\"padding:10px 12px;border:1px solid #dee2e6;text-align:left;\">Automation</th>
+                <th style=\"padding:10px 12px;border:1px solid #dee2e6;text-align:left;\">Command</th>
+                <th style=\"padding:10px 12px;border:1px solid #dee2e6;text-align:center;\">Issues</th>
+                <th style=\"padding:10px 12px;border:1px solid #dee2e6;text-align:left;\">What's Wrong</th>
+                <th style=\"padding:10px 12px;border:1px solid #dee2e6;text-align:left;\">Affected LLG_IDs (up to 20)</th>
+            </tr>
+        </thead>
+        <tbody style=\"background:#fff8f8;\">{$rows}</tbody>
+    </table>
     <hr style=\"margin-top:32px;\">
     <p style=\"font-size:11px;color:#adb5bd;\">
-        Generated by <strong>enrollment:integrity-check</strong> — cmd-runner<br>
-        Showing up to 20 sample IDs per check. Counts may be higher (TOP 50 sampled from SQL Server).
+        Generated by <strong>enrollment:integrity-check</strong> — runs after all scheduled automations complete.<br>
+        Each flagged automation was retried once automatically before this alert was sent.
     </p>
 </body>
 </html>";
