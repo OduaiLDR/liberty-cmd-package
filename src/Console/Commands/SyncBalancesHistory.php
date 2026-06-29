@@ -28,6 +28,7 @@ class SyncBalancesHistory extends Command
             $normalizedConnection = strtolower($connection);
             $source = $sourceByConnection[$normalizedConnection] ?? strtoupper($connection);
             $legacySource = strtoupper($connection);
+            $logSource    = $this->buildLogSource($legacySource);
             $deleteSources = array_values(array_unique([$source, $legacySource]));
             $totalFetched = 0;
             $connector = null;
@@ -203,7 +204,7 @@ WITH month_end_stamps AS (
 )
 SELECT
     CONTACT_ID,
-    "CURRENT" AS BALANCE,
+    BALANCE,
     TO_CHAR(STAMP, 'YYYY-MM-DD') AS STAMP
 FROM CONTACT_BALANCES
 WHERE DATE(STAMP) IN (SELECT stamp FROM month_end_stamps)

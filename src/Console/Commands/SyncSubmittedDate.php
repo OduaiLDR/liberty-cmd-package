@@ -194,7 +194,7 @@ SQL;
         try {
             $result = $connector->query($baseSql);
         } catch (\Throwable $e) {
-            $this->warn("[$connector->getConnectionName()] Snowflake query failed: {$e->getMessage()}");
+            $this->warn("[Snowflake] Submitted date query failed: {$e->getMessage()}");
             Log::warning('SyncSubmittedDate: Snowflake query failed.', [
                 'error' => $e->getMessage(),
             ]);
