@@ -10,7 +10,7 @@ class SyncDebtAccounts extends Command
 {
     protected $signature = 'enrollment:update-debts';
 
-    protected $description = 'Update TblEnrollment.Enrolled_Debt_Accounts from Snowflake DEBTS counts';
+    protected $description = 'Update TblEnrollment.Enrolled_Debt_Accounts (count) and Debt_Amount (sum) from Snowflake DEBTS';
 
     public function handle(): int
     {
@@ -136,11 +136,12 @@ class SyncDebtAccounts extends Command
 
     protected function fetchMissingEnrollmentIds(DBConnector $connector): array
     {
+        // Fetch rows that are missing either the count OR the dollar amount
         $sql = <<<SQL
 SELECT LLG_ID
 FROM TblEnrollment
 WHERE Category IN ('LDR', 'CCS')
-  AND Enrolled_Debt_Accounts IS NULL
+  AND (Enrolled_Debt_Accounts IS NULL OR Debt_Amount IS NULL)
 SQL;
 
         $result = $connector->querySqlServer($sql);
@@ -198,10 +199,14 @@ SQL;
             $inList = implode(', ', $contactIds);
 
             $sql = <<<SQL
-SELECT CONTACT_ID, COUNT(*) AS CNT
+SELECT
+    CONTACT_ID,
+    COUNT(*)                    AS CNT,
+    SUM(ORIGINAL_DEBT_AMOUNT)   AS TOTAL_DEBT
 FROM DEBTS
 WHERE CONTACT_ID IN ({$inList})
-  AND ENROLLED = 1
+  AND ENROLLED          = 1
+  AND _FIVETRAN_DELETED = FALSE
 GROUP BY CONTACT_ID
 SQL;
 
@@ -224,14 +229,17 @@ SQL;
                     continue;
                 }
 
-                $cid = null;
-                $cnt = null;
+                $cid   = null;
+                $cnt   = null;
+                $total = null;
 
                 foreach ($row as $key => $value) {
                     if (strcasecmp($key, 'CONTACT_ID') === 0) {
                         $cid = (string) $value;
                     } elseif (strcasecmp($key, 'CNT') === 0) {
                         $cnt = (int) $value;
+                    } elseif (strcasecmp($key, 'TOTAL_DEBT') === 0) {
+                        $total = is_numeric($value) ? (float) $value : null;
                     }
                 }
 
@@ -240,7 +248,7 @@ SQL;
                 }
 
                 $llgId = $this->truncateString('LLG-' . $cid, 100);
-                $counts[$llgId] = $cnt ?? 0;
+                $counts[$llgId] = ['count' => $cnt ?? 0, 'debt' => $total];
             }
         }
 
@@ -260,26 +268,32 @@ SQL;
         $batches = array_chunk($counts, $batchSize, true);
 
         foreach ($batches as $chunk) {
-            $cases = [];
+            $countCases = [];
+            $debtCases  = [];
             $ids = [];
 
-            foreach ($chunk as $llgId => $count) {
-                $llgEsc = $this->truncateString($this->escapeSqlString($llgId), 100);
-                $countValue = is_numeric($count) ? (int) $count : 0;
-                $cases[] = "WHEN '{$llgEsc}' THEN {$countValue}";
-                $ids[] = "'{$llgEsc}'";
+            foreach ($chunk as $llgId => $data) {
+                $llgEsc     = $this->truncateString($this->escapeSqlString($llgId), 100);
+                $countValue = (int) ($data['count'] ?? 0);
+                $debtValue  = $data['debt'] ?? null;
+
+                $countCases[] = "WHEN '{$llgEsc}' THEN {$countValue}";
+                $debtCases[]  = "WHEN '{$llgEsc}' THEN " . ($debtValue !== null ? $debtValue : 'NULL');
+                $ids[]        = "'{$llgEsc}'";
             }
 
-            if (empty($cases) || empty($ids)) {
+            if (empty($countCases) || empty($ids)) {
                 continue;
             }
 
-            $caseSql = implode(' ', $cases);
-            $idList = implode(', ', $ids);
+            $countSql = implode(' ', $countCases);
+            $debtSql  = implode(' ', $debtCases);
+            $idList   = implode(', ', $ids);
 
             $sql = <<<SQL
 UPDATE TblEnrollment
-SET Enrolled_Debt_Accounts = CASE LLG_ID {$caseSql} END
+SET Enrolled_Debt_Accounts = CASE LLG_ID {$countSql} END,
+    Debt_Amount            = CASE LLG_ID {$debtSql}  END
 WHERE LLG_ID IN ({$idList});
 SQL;
 
