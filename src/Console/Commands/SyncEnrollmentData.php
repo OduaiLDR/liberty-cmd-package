@@ -13,6 +13,7 @@ class SyncEnrollmentData extends Command
     protected $description = 'Sync enrollment data: updates Drop_Name, State, Cancel_Date, and Payments from Snowflake (no inserts — use enrollment:import-missing for new rows)';
 
     private string $source;
+    private string $category;
 
     public function handle(): int
     {
@@ -43,7 +44,9 @@ class SyncEnrollmentData extends Command
     private function syncForSource(string $source): int
     {
         $this->source = $source;
-        $this->info("[INFO] Sync Enrollment Data: starting for {$this->source}.");
+        // PLAW Snowflake contacts are stored as Category='CCS' in TblEnrollment (never 'PLAW')
+        $this->category = ($source === 'PLAW') ? 'CCS' : 'LDR';
+        $this->info("[INFO] Sync Enrollment Data: starting for {$this->source} (Category={$this->category}).");
 
         try {
             $snowflake = DBConnector::fromEnvironment(strtolower($this->source));
@@ -93,7 +96,7 @@ class SyncEnrollmentData extends Command
         $sql = "
             SELECT PK, Drop_Name, LLG_ID, State, Agent, Client
             FROM TblEnrollment
-            WHERE Category = '{$this->esc($this->source)}'
+            WHERE Category = '{$this->esc($this->category)}'
               AND (Drop_Name IS NULL OR Drop_Name = '' OR State IS NULL OR State = '')
               {$dateFilter}
         ";
@@ -168,7 +171,7 @@ class SyncEnrollmentData extends Command
     private function updateCancelDate(DBConnector $snowflake, DBConnector $sqlConnector): void
     {
         // Get all enrollment records with LLG_ID and current Cancel_Date
-        $sql = "SELECT LLG_ID, Cancel_Date FROM TblEnrollment WHERE Category = '{$this->esc($this->source)}'";
+        $sql = "SELECT LLG_ID, Cancel_Date FROM TblEnrollment WHERE Category = '{$this->esc($this->category)}'";
         $enrollmentData = $sqlConnector->querySqlServer($sql);
         $this->info("[INFO] Processing " . count($enrollmentData) . " enrollment records for Cancel_Date");
 
@@ -278,7 +281,7 @@ class SyncEnrollmentData extends Command
         $this->info("[INFO] Total unique contacts with payments: " . count($paymentsMap));
 
         // Get current payments and payment frequency from TblEnrollment for this category
-        $sql = "SELECT LLG_ID, Payments, Payment_Frequency FROM TblEnrollment WHERE Category = '{$this->esc($this->source)}'";
+        $sql = "SELECT LLG_ID, Payments, Payment_Frequency FROM TblEnrollment WHERE Category = '{$this->esc($this->category)}'";
         $enrollmentResult = $sqlConnector->querySqlServer($sql);
         $enrollmentData = $enrollmentResult['data'] ?? [];
 
@@ -356,7 +359,7 @@ class SyncEnrollmentData extends Command
             FROM TblContacts
             INNER JOIN TblEnrollment ON TblEnrollment.LLG_ID = TblContacts.LLG_ID
             WHERE COALESCE(TblContacts.Campaign, '') = ''
-              AND TblEnrollment.Category = '{$this->esc($this->source)}'
+              AND TblEnrollment.Category = '{$this->esc($this->category)}'
         ";
 
         try {
