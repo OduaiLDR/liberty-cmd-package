@@ -116,10 +116,12 @@ class EnrollmentIntegrityCheck extends Command
                     FROM TblEnrollment
                     WHERE Category IN ('LDR', 'CCS')
                       AND First_Payment_Date IS NULL
-                      AND COALESCE(Enrollment_Status, '') NOT IN ('Cancelled', 'Dropped', 'Cancel')
+                      AND COALESCE(Payments, 0) > 0
+                      AND COALESCE(Enrollment_Status, '') NOT LIKE '%Cancelled%'
+                      AND COALESCE(Enrollment_Status, '') NOT LIKE '%Dropped%'
                       AND Welcome_Call_Date <= DATEADD(day, -30, GETDATE())
                 ",
-                'reason'  => 'Active enrollments 30+ days old missing First_Payment_Date',
+                'reason'  => 'Active enrollments 30+ days old with payments but missing First_Payment_Date',
             ],
             [
                 'label'   => 'Sync First Payment Cleared Date',
@@ -130,8 +132,10 @@ class EnrollmentIntegrityCheck extends Command
                     WHERE Category IN ('LDR', 'CCS')
                       AND First_Payment_Cleared_Date IS NULL
                       AND COALESCE(Payments, 0) > 0
+                      AND First_Payment_Date IS NOT NULL
+                      AND First_Payment_Date <= GETDATE()
                 ",
-                'reason'  => 'Enrollments with cleared payments but missing First_Payment_Cleared_Date',
+                'reason'  => 'Enrollments where First_Payment_Date has passed but First_Payment_Cleared_Date is still null',
             ],
             [
                 'label'   => 'Sync Last Deposit Date',
@@ -141,9 +145,10 @@ class EnrollmentIntegrityCheck extends Command
                     FROM TblEnrollment
                     WHERE Category IN ('LDR', 'CCS')
                       AND Last_Deposit_Date IS NULL
+                      AND First_Payment_Cleared_Date IS NOT NULL
                       AND COALESCE(Payments, 0) > 0
                 ",
-                'reason'  => 'Enrollments with payments but missing Last_Deposit_Date',
+                'reason'  => 'Enrollments with cleared payments but missing Last_Deposit_Date',
             ],
             [
                 'label'   => 'Sync Submitted Date',
