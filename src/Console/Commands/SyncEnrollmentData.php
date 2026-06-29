@@ -10,9 +10,10 @@ class SyncEnrollmentData extends Command
 {
     protected $signature = 'Sync:enrollment-data';
 
-    protected $description = 'Sync enrollment data: updates Drop_Name, State, Cancel_Date, and Payments from Snowflake and SQL Server sources';
+    protected $description = 'Sync enrollment data: updates Drop_Name, State, Cancel_Date, and Payments from Snowflake (no inserts — use enrollment:import-missing for new rows)';
 
     private string $source;
+    private string $category;
 
     public function handle(): int
     {
@@ -43,7 +44,9 @@ class SyncEnrollmentData extends Command
     private function syncForSource(string $source): int
     {
         $this->source = $source;
-        $this->info("[INFO] Sync Enrollment Data: starting for {$this->source}.");
+        // PLAW Snowflake contacts are stored as Category='CCS' in TblEnrollment (never 'PLAW')
+        $this->category = ($source === 'PLAW') ? 'CCS' : 'LDR';
+        $this->info("[INFO] Sync Enrollment Data: starting for {$this->source} (Category={$this->category}).");
 
         try {
             $snowflake = DBConnector::fromEnvironment(strtolower($this->source));
@@ -61,10 +64,6 @@ class SyncEnrollmentData extends Command
             Log::error('SyncEnrollmentData: SQL Server init failed', ['exception' => $e, 'source' => $this->source]);
             return Command::FAILURE;
         }
-
-        // Step 0: Insert new enrollments from Snowflake that don't yet exist in TblEnrollment
-        $this->info('[STEP 0] Importing new enrollments from Snowflake...');
-        $this->importNewEnrollments($snowflake, $sqlConnector);
 
         // Step 1: Update missing Drop_Name and State
         $this->info('[STEP 1] Updating missing Drop_Name and State...');
@@ -97,7 +96,7 @@ class SyncEnrollmentData extends Command
         $sql = "
             SELECT PK, Drop_Name, LLG_ID, State, Agent, Client
             FROM TblEnrollment
-            WHERE Category = '{$this->esc($this->source)}'
+            WHERE Category = '{$this->esc($this->category)}'
               AND (Drop_Name IS NULL OR Drop_Name = '' OR State IS NULL OR State = '')
               {$dateFilter}
         ";
@@ -172,7 +171,7 @@ class SyncEnrollmentData extends Command
     private function updateCancelDate(DBConnector $snowflake, DBConnector $sqlConnector): void
     {
         // Get all enrollment records with LLG_ID and current Cancel_Date
-        $sql = "SELECT LLG_ID, Cancel_Date FROM TblEnrollment WHERE Category = '{$this->esc($this->source)}'";
+        $sql = "SELECT LLG_ID, Cancel_Date FROM TblEnrollment WHERE Category = '{$this->esc($this->category)}'";
         $enrollmentData = $sqlConnector->querySqlServer($sql);
         $this->info("[INFO] Processing " . count($enrollmentData) . " enrollment records for Cancel_Date");
 
@@ -282,7 +281,7 @@ class SyncEnrollmentData extends Command
         $this->info("[INFO] Total unique contacts with payments: " . count($paymentsMap));
 
         // Get current payments and payment frequency from TblEnrollment for this category
-        $sql = "SELECT LLG_ID, Payments, Payment_Frequency FROM TblEnrollment WHERE Category = '{$this->esc($this->source)}'";
+        $sql = "SELECT LLG_ID, Payments, Payment_Frequency FROM TblEnrollment WHERE Category = '{$this->esc($this->category)}'";
         $enrollmentResult = $sqlConnector->querySqlServer($sql);
         $enrollmentData = $enrollmentResult['data'] ?? [];
 
@@ -360,7 +359,7 @@ class SyncEnrollmentData extends Command
             FROM TblContacts
             INNER JOIN TblEnrollment ON TblEnrollment.LLG_ID = TblContacts.LLG_ID
             WHERE COALESCE(TblContacts.Campaign, '') = ''
-              AND TblEnrollment.Category = '{$this->esc($this->source)}'
+              AND TblEnrollment.Category = '{$this->esc($this->category)}'
         ";
 
         try {
@@ -373,114 +372,6 @@ class SyncEnrollmentData extends Command
                 'error' => $e->getMessage()
             ]);
         }
-    }
-
-    private function importNewEnrollments(DBConnector $snowflake, DBConnector $sqlConnector): void
-    {
-        // Pull enrolled contacts from Snowflake — last 90 days only to avoid importing
-        // historical contacts that were never part of TblEnrollment
-        $sfResult = $snowflake->query("
-            SELECT
-                c.ID,
-                CONCAT(c.FIRSTNAME, ' ', c.LASTNAME) AS FULL_NAME,
-                c.STATE,
-                TO_CHAR(c.ENROLLED_DATE, 'YYYY-MM-DD') AS ENROLLED_DATE
-            FROM CONTACTS c
-            WHERE c.ENROLLED_DATE IS NOT NULL
-              AND c.ENROLLED_DATE >= DATEADD('day', -90, CURRENT_DATE())
-              AND c._FIVETRAN_DELETED = FALSE
-              AND c.FIRSTNAME IS NOT NULL
-              AND c.FIRSTNAME <> ''
-        ");
-        $sfContacts = $sfResult['data'] ?? [];
-        $this->info("[INFO] Snowflake {$this->source}: " . count($sfContacts) . " enrolled contacts");
-
-        // Load existing LLG_IDs for this source into a lookup set
-        $existingResult = $sqlConnector->querySqlServer(
-            "SELECT LLG_ID FROM TblEnrollment WHERE Category = '{$this->esc($this->source)}'"
-        );
-        $existingIds = array_flip(array_column($existingResult['data'] ?? [], 'LLG_ID'));
-        $this->info("[INFO] TblEnrollment {$this->source}: " . count($existingIds) . " existing rows");
-
-        // Find contacts not yet in TblEnrollment
-        $missing = [];
-        foreach ($sfContacts as $contact) {
-            $id = $contact['ID'] ?? '';
-            if ($id === '') {
-                continue;
-            }
-            $llgId = 'LLG-' . $id;
-            if (!isset($existingIds[$llgId])) {
-                $missing[$llgId] = $contact;
-            }
-        }
-
-        $this->info("[INFO] New contacts to insert: " . count($missing));
-        if (empty($missing)) {
-            return;
-        }
-
-        // Fetch Agent and Drop_Name from TblContacts in batches of 500
-        $contactsMap = [];
-        foreach (array_chunk(array_keys($missing), 500) as $batch) {
-            $ids = implode(',', array_map(fn($id) => "'" . $this->esc($id) . "'", $batch));
-            $tblResult = $sqlConnector->querySqlServer(
-                "SELECT LLG_ID, Agent, Campaign AS Drop_Name FROM TblContacts WHERE LLG_ID IN ({$ids})"
-            );
-            foreach ($tblResult['data'] ?? [] as $row) {
-                $contactsMap[$row['LLG_ID']] = $row;
-            }
-        }
-
-        // Insert each missing row
-        $inserted = 0;
-        $skipped  = 0;
-        foreach ($missing as $llgId => $sf) {
-            $enrolledDate = trim($sf['ENROLLED_DATE'] ?? '');
-            if ($enrolledDate === '') {
-                $skipped++;
-                continue;
-            }
-
-            $tbl      = $contactsMap[$llgId] ?? [];
-            $client   = $this->esc(trim($sf['FULL_NAME'] ?? ''));
-            $state    = $this->esc(trim($sf['STATE'] ?? ''));
-            $agent    = $this->esc(trim($tbl['Agent'] ?? ''));
-            $dropName = $this->esc(trim($tbl['Drop_Name'] ?? ''));
-
-            try {
-                $sqlConnector->querySqlServer("
-                    INSERT INTO TblEnrollment (LLG_ID, Category, Client, State, Agent, Drop_Name, Welcome_Call_Date)
-                    VALUES (
-                        '{$llgId}',
-                        '{$this->esc($this->source)}',
-                        '{$client}',
-                        '{$state}',
-                        '{$agent}',
-                        '{$dropName}',
-                        '{$this->esc($enrolledDate)}'
-                    )
-                ");
-                $inserted++;
-                if ($inserted % 50 === 0) {
-                    $this->info("[INFO] Inserted {$inserted} records...");
-                }
-            } catch (\Throwable $e) {
-                $msg = $e->getMessage();
-                if (stripos($msg, 'duplicate') !== false || stripos($msg, 'UNIQUE') !== false || stripos($msg, 'PRIMARY KEY') !== false) {
-                    $skipped++;
-                    continue;
-                }
-                $this->warn("[WARN] Failed to insert {$llgId}: {$msg}");
-                Log::warning('SyncEnrollmentData: INSERT failed', [
-                    'source' => $this->source,
-                    'llgId'  => $llgId,
-                    'error'  => $msg,
-                ]);
-            }
-        }
-
-        $this->info("[INFO] Inserted {$inserted} new enrollment rows, skipped {$skipped}");
     }
 
     protected function esc(string $value): string

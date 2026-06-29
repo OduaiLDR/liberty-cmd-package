@@ -18,6 +18,8 @@ use Cmd\Reports\Console\Commands\SyncSettlementData;
 use Cmd\Reports\Console\Commands\SyncSettledDebtsData;
 use Cmd\Reports\Console\Commands\SyncEnrollmentStatus;
 use Cmd\Reports\Console\Commands\SyncEnrollmentData;
+use Cmd\Reports\Console\Commands\ImportMissingEnrollments;
+use Cmd\Reports\Console\Commands\EnrollmentIntegrityCheck;
 use Cmd\Reports\Console\Commands\SyncVerifiedDebts;
 use Cmd\Reports\Console\Commands\GenerateCompanyStatsReport\GenerateCompanyStatsReport;
 use Cmd\Reports\Console\Commands\GenerateLegalReport\GenerateLegalReport;
@@ -133,6 +135,8 @@ class ReportsServiceProvider extends ServiceProvider
                 SyncSettledDebtsData::class,
                 SyncEnrollmentStatus::class,
                 SyncEnrollmentData::class,
+                ImportMissingEnrollments::class,
+                EnrollmentIntegrityCheck::class,
                 SyncVerifiedDebts::class,
                 GenerateCompanyStatsReport::class,
                 GenerateLegalReport::class,

@@ -8,7 +8,7 @@ use Illuminate\Support\Facades\Log;
 
 class SyncTimeInProgram extends Command
 {
-    protected $signature = 'sync:time-in-program';
+    protected $signature = 'sync:time-in-program {--full-refresh : Remove date filter and sync all enrolled contacts, not just last 7 days}';
 
     protected $description = 'Sync Program_Length and Payment_Frequency in TblEnrollment from Snowflake enrollment plan data (last 7 days)';
 
@@ -119,6 +119,10 @@ class SyncTimeInProgram extends Command
 
     protected function fetchTimeInProgramFromSnowflake(DBConnector $connector): array
     {
+        $dateFilter = $this->option('full-refresh')
+            ? ''
+            : 'AND c.ENROLLED_DATE >= DATEADD(day, -7, CURRENT_DATE)';
+
         $sql = <<<SQL
 SELECT c.ID AS CONTACT_ID,
        p.TIME_IN_PROGRAM,
@@ -129,7 +133,7 @@ LEFT JOIN ENROLLMENT_DEFAULTS2 AS ed ON p.PLAN_ID = ed.ID
 WHERE c.CREATED >= '2021-07-01'
   AND c.DEL = FALSE
   AND c.ISCOAPP = 0
-  AND c.ENROLLED_DATE >= DATEADD(day, -7, CURRENT_DATE)
+  {$dateFilter}
 SQL;
 
         try {
