@@ -255,11 +255,41 @@ class EnrollmentIntegrityCheck extends Command
             ];
         }
 
+        // ── Duplicate LLG_ID check (no retry — needs manual fix) ─────────────
+        $this->log('─────────────────────────────────────────────────────────');
+        $this->log('[DUP] Checking for duplicate LLG_IDs in TblEnrollment...');
+
+        $dupIds = $this->runCheck($sql, "
+            SELECT TOP 50 LLG_ID
+            FROM TblEnrollment
+            WHERE Category IN ('LDR', 'CCS')
+            GROUP BY LLG_ID
+            HAVING COUNT(*) > 1
+        ");
+
+        if (empty($dupIds)) {
+            $this->log('[DUP] ✓ No duplicates found');
+        } else {
+            $dupCount = count($dupIds);
+            $this->log("[DUP] ✗ {$dupCount} LLG_ID(s) have duplicate rows — FLAGGED (manual fix required)", 'error');
+            Log::error('EnrollmentIntegrityCheck: duplicate LLG_IDs detected', [
+                'count'  => $dupCount,
+                'sample' => array_slice($dupIds, 0, 20),
+            ]);
+            $alerts[] = [
+                'label'   => 'Duplicate LLG_IDs',
+                'command' => 'manual',
+                'reason'  => 'Same LLG_ID appears more than once in TblEnrollment — no automation can fix this, manual DELETE required',
+                'count'   => $dupCount,
+                'ids'     => array_slice($dupIds, 0, 20),
+            ];
+        }
+
         $elapsed = round(now()->diffInSeconds($startedAt));
         $this->log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
         if (empty($alerts)) {
-            $this->log("ALL {$total} CHECKS PASSED — elapsed: {$elapsed}s — no email sent.");
+            $this->log("ALL {$total} CHECKS PASSED + NO DUPLICATES — elapsed: {$elapsed}s — no email sent.");
             $this->log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
             Log::info('EnrollmentIntegrityCheck: all clear', ['elapsed_s' => $elapsed]);
             return Command::SUCCESS;
@@ -348,15 +378,21 @@ class EnrollmentIntegrityCheck extends Command
 
         $rows = '';
         foreach ($alerts as $a) {
+            $isManual   = ($a['command'] === 'manual');
+            $cmdDisplay = $isManual
+                ? '<span style="color:#842029;font-weight:bold;">⚠ MANUAL FIX</span>'
+                : '<code>' . htmlspecialchars($a['command']) . '</code>';
+            $rowBg      = $isManual ? '#fff3cd' : '#fff8f8';
+
             $sampleHtml = empty($a['ids'])
                 ? '<em>none</em>'
                 : '<code style="font-size:11px;">' . implode(', ', array_map('htmlspecialchars', $a['ids']))
                   . ($a['count'] > count($a['ids']) ? ' … (' . $a['count'] . ' total)' : '') . '</code>';
 
             $rows .= "
-                <tr>
+                <tr style=\"background:{$rowBg};\">
                     <td style=\"padding:9px 12px;border:1px solid #dee2e6;font-weight:600;white-space:nowrap;\">{$a['label']}</td>
-                    <td style=\"padding:9px 12px;border:1px solid #dee2e6;\"><code>{$a['command']}</code></td>
+                    <td style=\"padding:9px 12px;border:1px solid #dee2e6;\">{$cmdDisplay}</td>
                     <td style=\"padding:9px 12px;border:1px solid #dee2e6;text-align:center;font-weight:bold;color:#dc3545;\">{$a['count']}</td>
                     <td style=\"padding:9px 12px;border:1px solid #dee2e6;font-size:12px;\">{$a['reason']}</td>
                     <td style=\"padding:9px 12px;border:1px solid #dee2e6;font-size:11px;word-break:break-all;\">{$sampleHtml}</td>
