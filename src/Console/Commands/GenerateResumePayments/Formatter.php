@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Cmd\Reports\Console\Commands\GenerateResumePayments;
 
+use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\EmailSenderService;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
@@ -22,28 +23,18 @@ use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
  */
 class Formatter
 {
-    /** VBA SendTo. */
-    private const RECIPIENTS_TO = [
-        'candice@libertydebtrelief.com',
-        'anthony@libertydebtrelief.com',
-        'adrian@libertydebtrelief.com',
-        'rama@libertydebtrelief.com',
-        'scarlett@libertydebtrelief.com',
-        'bill@libertydebtrelief.com',
-        'freddie@libertydebtrelief.com',
-    ];
-
-    /** VBA SendCC. */
-    private const RECIPIENTS_CC = [
-        'sam@libertydebtrelief.com',
-        'omar@libertydebtrelief.com',
-        'jacob@libertydebtrelief.com',
-    ];
+    /**
+     * TblReports lookup keys (Report_Name) for the recap recipients. Mirrors how
+     * GenerateEmployeesReport pulls its distribution list from dbo.TblReports
+     * instead of hardcoding. Recipients (Send_To/Send_CC/Send_BCC) are managed in
+     * the table, not in code.
+     */
+    private const REPORT_NAMES = ['ResumePayments', 'Client NSF Status Updates'];
 
     /**
      * @param list<array{llg_id:string,name:string,status:string}> $statusChanges
      */
-    public function sendRecap(array $statusChanges, string $company, bool $dryRun = false, ?Command $console = null): bool
+    public function sendRecap(DBConnector $connector, array $statusChanges, string $company, bool $dryRun = false, ?Command $console = null): bool
     {
         // VBA: LDR macro subject says "LDR"; PLAW macro subject says "ProLaw".
         $subjectSuffix = strtoupper($company) === 'PLAW' ? 'ProLaw' : 'LDR';
@@ -74,8 +65,20 @@ class Formatter
             return true;
         }
 
+        // Recipients come from dbo.TblReports (Send_To/Send_CC/Send_BCC keyed by
+        // Report_Name + Company), same as the other package reports. One row per
+        // company (LDR / PLAW). If a company row is missing the service falls back
+        // to the report's company-less rows, so a single shared row also works.
         $email = new EmailSenderService();
-        $sent = $email->sendMailHtml($subject, $body, self::RECIPIENTS_TO, self::RECIPIENTS_CC, [], $attachments);
+        $sent = $email->sendMailUsingTblReportsHtml(
+            $connector,
+            self::REPORT_NAMES,
+            [strtoupper($company)],
+            $subject,
+            $body,
+            $attachments,
+            true
+        );
 
         if (is_file($built['path'])) {
             @unlink($built['path']);
