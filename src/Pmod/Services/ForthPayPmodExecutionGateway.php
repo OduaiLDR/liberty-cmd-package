@@ -531,6 +531,50 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway
     }
 
     /**
+     * Diagnostic for the Forth CRM resume-payments endpoint discovered 2026-06-30:
+     *   POST /servicing/enrollment/{id}/resume-payments
+     * (the older /contacts/{id}/resume-payments path used above 404s). We don't yet
+     * know whether {id} is the contact id or a separate enrollment id, so this probe:
+     *   1. GETs the contact's transactions (read-only) — confirms the contact
+     *      resolves and surfaces any enrollment id the response carries.
+     *   2. POSTs resume-payments using the contact id as {id} and reports the raw
+     *      status + body (never throws) so one test-file run tells us whether the
+     *      endpoint accepts the contact id directly.
+     * Run ONLY against a test file — a 2xx here performs a REAL resume.
+     *
+     * @return array<string, mixed>
+     */
+    public function probeResumePayments(string $tenantId, string $contactId): array
+    {
+        $out = ['tenant' => $tenantId, 'contact_id' => $contactId];
+
+        // 1. Read-only: list the contact's transactions (also a candidate to
+        //    replace our Snowflake balance queries, and may reveal an enrollment id).
+        $txResp = $this->crmClient($tenantId)
+            ->get('/servicing/transactions/get-contact-transactions', ['id' => $contactId]);
+        $out['get_contact_transactions'] = [
+            'path'   => "/servicing/transactions/get-contact-transactions?id={$contactId}",
+            'status' => $txResp->status(),
+            'ok'     => $txResp->successful(),
+            'body'   => mb_substr($txResp->body(), 0, 1500),
+        ];
+
+        // 2. Resume on the new path, contact id as {id}. Reports, never throws.
+        $resumeResp = $this->crmClient($tenantId)
+            ->post("/servicing/enrollment/{$contactId}/resume-payments");
+        $out['resume_payments'] = [
+            'path'   => "/servicing/enrollment/{$contactId}/resume-payments",
+            'status' => $resumeResp->status(),
+            'ok'     => $resumeResp->successful(),
+            'body'   => mb_substr($resumeResp->body(), 0, 1500),
+        ];
+
+        Log::info('PMOD: probeResumePayments', $out);
+
+        return $out;
+    }
+
+    /**
      * Update a contact via Forth CRM. Accepts integer `stage` and `status` IDs
      * (per Forth release notes 2023-07), plus any other contact fields the
      * Update Contact endpoint supports.

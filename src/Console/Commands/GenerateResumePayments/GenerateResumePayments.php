@@ -45,7 +45,8 @@ final class GenerateResumePayments extends Command
         {--limit= : Process at most N contacts per company (after NSF-state filtering)}
         {--execute-cancels : Actually run the Day-4+ System Cancel (browser drop/refund). Off by default — Phase 5 only reports cancel-ready contacts unless this is passed.}
         {--max-cancels= : Safety cap — process at most N cancel candidates per company per run (the rest are reported as deferred). 0/unset = no cap.}
-        {--probe-cancel= : Diagnostic only — drive the cancel flow for ONE contact id and print which selectors exist, WITHOUT clicking save (commits nothing). Tenant = first --company (default LDR).}';
+        {--probe-cancel= : Diagnostic only — drive the cancel flow for ONE contact id and print which selectors exist, WITHOUT clicking save (commits nothing). Tenant = first --company (default LDR).}
+        {--probe-resume= : Diagnostic only — call the Forth CRM resume-payments API for ONE contact id and print the raw status/body (read-only transaction list + a resume attempt). Run on TEST files only — a 2xx performs a real resume. Tenant = first --company (default LDR).}';
 
     protected $description = 'Process NSF contacts for LDR and Progress Law: update statuses, resume drafts, and execute system cancels per the ResumePayments VBA workflow.';
 
@@ -81,6 +82,11 @@ final class GenerateResumePayments extends Command
         $probeCancelId = (string) ($this->option('probe-cancel') ?? '');
         if ($probeCancelId !== '') {
             return $this->runProbeCancel($probeCancelId);
+        }
+
+        $probeResumeId = (string) ($this->option('probe-resume') ?? '');
+        if ($probeResumeId !== '') {
+            return $this->runProbeResume($gateway, $probeResumeId);
         }
 
         $dryRun = (bool) $this->option('dry-run');
@@ -148,6 +154,35 @@ final class GenerateResumePayments extends Command
         } catch (\Throwable $e) {
             $this->error('Probe failed: ' . $e->getMessage());
             Log::error('GenerateResumePayments: probe-cancel failed', ['contact_id' => $contactId, 'exception' => $e]);
+
+            return Command::FAILURE;
+        }
+
+        $this->line((string) json_encode($report, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+
+        return Command::SUCCESS;
+    }
+
+    /**
+     * --probe-resume: call the Forth CRM resume-payments API (path discovered
+     * 2026-06-30: POST /servicing/enrollment/{id}/resume-payments) for one contact
+     * and print the raw result, plus a read-only dump of the contact's
+     * transactions. Confirms whether the endpoint accepts the contact id directly
+     * (vs a separate enrollment id) before we wire it into Phase 4. Run ONLY on a
+     * test file — a 2xx resume is a real action. Tenant is the first --company.
+     */
+    private function runProbeResume(ForthPayPmodExecutionGateway $gateway, string $contactId): int
+    {
+        $company = $this->resolveCompanies()[0] ?? 'LDR';
+        $tenant = strtolower($company);
+
+        $this->info("[INFO] Probe-resume for contact {$contactId} as {$company} — TEST FILES ONLY (a 2xx performs a real resume).");
+
+        try {
+            $report = $gateway->probeResumePayments($tenant, $contactId);
+        } catch (\Throwable $e) {
+            $this->error('Probe failed: ' . $e->getMessage());
+            Log::error('GenerateResumePayments: probe-resume failed', ['contact_id' => $contactId, 'exception' => $e]);
 
             return Command::FAILURE;
         }
