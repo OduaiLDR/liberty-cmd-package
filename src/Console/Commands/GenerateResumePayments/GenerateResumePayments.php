@@ -47,7 +47,8 @@ final class GenerateResumePayments extends Command
         {--max-cancels= : Safety cap — process at most N cancel candidates per company per run (the rest are reported as deferred). 0/unset = no cap.}
         {--probe-cancel= : Diagnostic only — drive the cancel flow for ONE contact id and print which selectors exist, WITHOUT clicking save (commits nothing). Tenant = first --company (default LDR).}
         {--probe-resume= : Diagnostic only — probe the Forth resume-payments API for ONE contact id. READ-ONLY by default (token health + contact resolve + transactions paths; safe on any contact). Tenant = first --company (default LDR).}
-        {--probe-resume-execute : With --probe-resume, also FIRE the resume POST (an action — TEST FILES ONLY). Without it the resume probe is read-only.}';
+        {--probe-resume-execute : With --probe-resume, also FIRE the resume POST (an action — TEST FILES ONLY). Without it the resume probe is read-only.}
+        {--no-recap : Skip the Phase 6 recap email (status writes + resumes still happen). Use for controlled live tests so the team is not emailed a partial run.}';
 
     protected $description = 'Process NSF contacts for LDR and Progress Law: update statuses, resume drafts, and execute system cancels per the ResumePayments VBA workflow.';
 
@@ -56,10 +57,13 @@ final class GenerateResumePayments extends Command
     private const SYSTEM_CANCEL_AGE_DAYS = 105;
     private const CANCEL_COOLDOWN_DAYS = 4;
 
+    /** Forth CRM/Pay API gateway — Phase 4 resume (POST /contacts/{id}/resume) + Phase 5 reads. */
+    private ForthPayPmodExecutionGateway $gateway;
+
     /** DPP "post" data-API client for client_status / notebody writes (Phase 4). */
     private DppDataClient $dppClient;
 
-    /** Headless-browser client for the #resumebtn (Phase 4) and #cancelbtn (Phase 5) flows. */
+    /** Headless-browser client for the #cancelbtn (Phase 5) flow. (Phase 4 resume is now the API.) */
     private DppSeleniumService $dppSelenium;
 
     /** Statuses whose presence in CurrentStatus causes the contact to be SKIPPED entirely. */
@@ -77,6 +81,7 @@ final class GenerateResumePayments extends Command
 
     public function handle(ForthPayPmodExecutionGateway $gateway, DppDataClient $dppClient, DppSeleniumService $dppSelenium): int
     {
+        $this->gateway = $gateway;
         $this->dppClient = $dppClient;
         $this->dppSelenium = $dppSelenium;
 
@@ -125,7 +130,11 @@ final class GenerateResumePayments extends Command
                 $this->info(sprintf('[INFO] [%s] Phase 4 status changes: %d', $company, count($statusChanges)));
                 $this->processSystemCancels($gateway, $snowflake, $sqlConnector, $company, $states, $statusChanges, $dryRun);
 
-                $this->sendRecap($company, $statusChanges, $dryRun);
+                if ($this->option('no-recap')) {
+                    $this->info(sprintf('[INFO] [%s] --no-recap: skipping recap email (%d status changes).', $company, count($statusChanges)));
+                } else {
+                    $this->sendRecap($company, $statusChanges, $dryRun);
+                }
             } catch (\Throwable $e) {
                 $this->error("[{$company}] ResumePayments failed: " . $e->getMessage());
                 Log::error('GenerateResumePayments: company failed', [
@@ -828,25 +837,40 @@ final class GenerateResumePayments extends Command
         };
     }
 
+    /**
+     * Resume a contact via the Forth CRM API (POST /contacts/{id}/resume), replacing
+     * the headless-browser #resumebtn click. Returns true only when the contact was
+     * actually paused and is now resumed (HTTP 200, response.paused === false) — the
+     * caller then writes the "Payments Resumed" note. Every other outcome returns
+     * false → the VBA's "(Unable to Resume)" branch, status write still proceeds:
+     *   - 409 "Client is not paused": already active, nothing to resume (faithful to
+     *     the browser, whose Resume button is only actionable when paused). Logged
+     *     distinctly so we can see how often it occurs and revisit reporting with
+     *     Jacob if needed.
+     *   - any other non-2xx / transport error: a real failure.
+     */
     private function tryResume(string $tenant, string $contactId, bool $dryRun): bool
     {
         try {
-            $result = $this->dppSelenium->resumePayments($tenant, $contactId, $dryRun);
-            $ok = ($result['status'] ?? '') === 'success';
+            $result = $this->gateway->resumeContact($tenant, $contactId, $dryRun);
+            $outcome = $result['result'] ?? '';
 
-            if (!$ok) {
-                // Button absent / not actionable → VBA's "(Unable to Resume)".
-                Log::warning('ResumePayments: not resumed (Unable to Resume)', [
-                    'tenant' => $tenant,
-                    'contact_id' => $contactId,
-                    'message' => $result['message'] ?? '',
-                ]);
+            if ($outcome === 'resumed' || $outcome === 'dry_run') {
+                return true;
             }
 
-            return $ok;
+            // 'not_paused' (409) — already active; nothing to resume.
+            Log::warning('ResumePayments: not resumed (Unable to Resume)', [
+                'tenant' => $tenant,
+                'contact_id' => $contactId,
+                'result' => $outcome,
+                'message' => $result['message'] ?? '',
+            ]);
+
+            return false;
         } catch (\Throwable $e) {
-            // Browser/login failure (incl. Panther not installed yet) → treat as
-            // "Unable to Resume" so the status write still proceeds.
+            // Real non-2xx (e.g. 400) or transport failure → treat as "Unable to
+            // Resume" so the status write still proceeds.
             Log::warning('ResumePayments: resume failed (Unable to Resume)', [
                 'tenant' => $tenant,
                 'contact_id' => $contactId,
