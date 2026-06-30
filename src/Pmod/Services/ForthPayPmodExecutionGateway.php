@@ -593,24 +593,74 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway
         );
 
         // --- ACTION (test files only) ---
+        // Real path confirmed from the live doc page (2026-06-30):
+        //   POST /contacts/{id}/resume  ({id} = contact id; 200 => {"response":{"paused":false}})
         if ($execute) {
             $record(
-                'resume (inferred servicing/enrollment path)',
+                'resume (real /contacts/{id}/resume)',
                 'POST',
-                "/servicing/enrollment/{$contactId}/resume-payments",
-                $this->crmClient($tenantId)->post("/servicing/enrollment/{$contactId}/resume-payments")
-            );
-            $record(
-                'resume (old /contacts path)',
-                'POST',
-                "/contacts/{$contactId}/resume-payments",
-                $this->crmClient($tenantId)->post("/contacts/{$contactId}/resume-payments")
+                "/contacts/{$contactId}/resume",
+                $this->crmClient($tenantId)->post("/contacts/{$contactId}/resume")
             );
         }
 
         Log::info('PMOD: probeResumePayments', $out);
 
         return $out;
+    }
+
+    /**
+     * Resume a paused contact via the real Forth CRM endpoint (confirmed from the
+     * doc page 2026-06-30): POST /contacts/{id}/resume, where {id} is the contact
+     * id. Success is HTTP 200 with response.paused === false. This replaces the
+     * headless-browser #resumebtn click for Phase 4's high-volume daily resume.
+     *
+     * Throws on any non-2xx so the caller can fall back to the VBA's
+     * "(Unable to Resume)" reporting path — same contract as the browser resume.
+     * (The endpoint can return 409 Conflict; until we've seen one in practice we
+     * treat it as a failure so it surfaces in the recap rather than being silently
+     * swallowed.)
+     *
+     * @return array{paused: bool|null, status: int, body: string}
+     */
+    public function resumeContact(string $tenantId, string $contactId, bool $dryRun = false): array
+    {
+        Log::info('PMOD: resume contact', [
+            'contact_id' => $contactId,
+            'tenant_id'  => $tenantId,
+            'dry_run'    => $dryRun,
+        ]);
+
+        if ($dryRun) {
+            return ['paused' => null, 'status' => 0, 'body' => 'dry_run'];
+        }
+
+        $response = $this->crmClient($tenantId)->post("/contacts/{$contactId}/resume");
+
+        if (!$response->successful()) {
+            Log::warning('PMOD: resume contact not successful', [
+                'contact_id' => $contactId,
+                'tenant_id'  => $tenantId,
+                'status'     => $response->status(),
+                'response'   => mb_substr($response->body(), 0, 300),
+            ]);
+
+            throw new \RuntimeException('Failed to resume contact: HTTP ' . $response->status());
+        }
+
+        $paused = $response->json('response.paused');
+
+        Log::info('PMOD: contact resumed', [
+            'contact_id' => $contactId,
+            'tenant_id'  => $tenantId,
+            'paused'     => $paused,
+        ]);
+
+        return [
+            'paused' => is_bool($paused) ? $paused : null,
+            'status' => $response->status(),
+            'body'   => mb_substr($response->body(), 0, 300),
+        ];
     }
 
     /**
