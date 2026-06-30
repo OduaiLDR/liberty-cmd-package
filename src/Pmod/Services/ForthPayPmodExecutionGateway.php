@@ -595,7 +595,17 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway
         // --- ACTION (test files only) ---
         // Real path confirmed from the live doc page (2026-06-30):
         //   POST /contacts/{id}/resume  ({id} = contact id; 200 => {"response":{"paused":false}})
+        // NOTE: /resume checks the real "payments paused" flag, NOT the CRM lead
+        // status ("Paused / Hold") or a gateway hold. To confirm the 200 path we
+        // pause first (paused=true) then resume (paused=false) — net state returns
+        // to active. Safe on a test file.
         if ($execute) {
+            $record(
+                'pause (real /contacts/{id}/pause)',
+                'POST',
+                "/contacts/{$contactId}/pause",
+                $this->crmClient($tenantId)->post("/contacts/{$contactId}/pause")
+            );
             $record(
                 'resume (real /contacts/{id}/resume)',
                 'POST',
