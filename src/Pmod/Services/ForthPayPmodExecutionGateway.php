@@ -615,13 +615,15 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway
      * id. Success is HTTP 200 with response.paused === false. This replaces the
      * headless-browser #resumebtn click for Phase 4's high-volume daily resume.
      *
-     * Throws on any non-2xx so the caller can fall back to the VBA's
-     * "(Unable to Resume)" reporting path — same contract as the browser resume.
-     * (The endpoint can return 409 Conflict; until we've seen one in practice we
-     * treat it as a failure so it surfaces in the recap rather than being silently
-     * swallowed.)
+     * Returns a structured outcome rather than throwing on business conflicts:
+     *   - 'resumed'   : HTTP 200, response.paused === false (was paused, now active).
+     *   - 'not_paused': HTTP 409 "Client is not paused" (already active — no-op,
+     *                   confirmed live 2026-06-30). Not an error.
+     *   - 'dry_run'   : no call made.
+     * Only a genuine failure (other non-2xx / transport error) throws, so the caller
+     * can report "(Unable to Resume)" while still writing the status.
      *
-     * @return array{paused: bool|null, status: int, body: string}
+     * @return array{result: string, paused: bool|null, status: int, message: string}
      */
     public function resumeContact(string $tenantId, string $contactId, bool $dryRun = false): array
     {
@@ -632,35 +634,49 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway
         ]);
 
         if ($dryRun) {
-            return ['paused' => null, 'status' => 0, 'body' => 'dry_run'];
+            return ['result' => 'dry_run', 'paused' => null, 'status' => 0, 'message' => 'dry_run'];
         }
 
         $response = $this->crmClient($tenantId)->post("/contacts/{$contactId}/resume");
+        $status = $response->status();
+        $message = (string) ($response->json('status.message') ?? '');
 
-        if (!$response->successful()) {
-            Log::warning('PMOD: resume contact not successful', [
+        if ($response->successful()) {
+            $paused = $response->json('response.paused');
+
+            Log::info('PMOD: contact resumed', [
                 'contact_id' => $contactId,
                 'tenant_id'  => $tenantId,
-                'status'     => $response->status(),
-                'response'   => mb_substr($response->body(), 0, 300),
+                'paused'     => $paused,
             ]);
 
-            throw new \RuntimeException('Failed to resume contact: HTTP ' . $response->status());
+            return [
+                'result'  => 'resumed',
+                'paused'  => is_bool($paused) ? $paused : null,
+                'status'  => $status,
+                'message' => $message,
+            ];
         }
 
-        $paused = $response->json('response.paused');
+        // 409 "Client is not paused" — already active; nothing to resume.
+        if ($status === 409) {
+            Log::info('PMOD: resume contact - already not paused', [
+                'contact_id' => $contactId,
+                'tenant_id'  => $tenantId,
+                'message'    => $message,
+            ]);
 
-        Log::info('PMOD: contact resumed', [
+            return ['result' => 'not_paused', 'paused' => false, 'status' => 409, 'message' => $message];
+        }
+
+        Log::warning('PMOD: resume contact failed', [
             'contact_id' => $contactId,
             'tenant_id'  => $tenantId,
-            'paused'     => $paused,
+            'status'     => $status,
+            'response'   => mb_substr($response->body(), 0, 300),
         ]);
 
-        return [
-            'paused' => is_bool($paused) ? $paused : null,
-            'status' => $response->status(),
-            'body'   => mb_substr($response->body(), 0, 300),
-        ];
+        throw new \RuntimeException("Failed to resume contact {$contactId}: HTTP {$status} {$message}");
     }
 
     /**
