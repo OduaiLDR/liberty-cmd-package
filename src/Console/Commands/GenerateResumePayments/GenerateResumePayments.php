@@ -133,7 +133,7 @@ final class GenerateResumePayments extends Command
                 if ($this->option('no-recap')) {
                     $this->info(sprintf('[INFO] [%s] --no-recap: skipping recap email (%d status changes).', $company, count($statusChanges)));
                 } else {
-                    $this->sendRecap($company, $statusChanges, $dryRun);
+                    $this->sendRecap($sqlConnector, $company, $statusChanges, $dryRun);
                 }
             } catch (\Throwable $e) {
                 $this->error("[{$company}] ResumePayments failed: " . $e->getMessage());
@@ -1331,10 +1331,10 @@ final class GenerateResumePayments extends Command
      *
      * @param list<array{llg_id:string,name:string,status:string}> $statusChanges
      */
-    private function sendRecap(string $company, array $statusChanges, bool $dryRun): void
+    private function sendRecap(DBConnector $connector, string $company, array $statusChanges, bool $dryRun): void
     {
         try {
-            (new Formatter())->sendRecap($statusChanges, $company, $dryRun, $this);
+            (new Formatter())->sendRecap($connector, $statusChanges, $company, $dryRun, $this);
         } catch (\Throwable $e) {
             $this->error("[{$company}] recap email failed: " . $e->getMessage());
             Log::error('GenerateResumePayments: sendRecap failed', [
