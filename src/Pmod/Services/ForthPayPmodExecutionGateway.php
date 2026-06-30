@@ -531,43 +531,82 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway
     }
 
     /**
-     * Diagnostic for the Forth CRM resume-payments endpoint discovered 2026-06-30:
-     *   POST /servicing/enrollment/{id}/resume-payments
-     * (the older /contacts/{id}/resume-payments path used above 404s). We don't yet
-     * know whether {id} is the contact id or a separate enrollment id, so this probe:
-     *   1. GETs the contact's transactions (read-only) — confirms the contact
-     *      resolves and surfaces any enrollment id the response carries.
-     *   2. POSTs resume-payments using the contact id as {id} and reports the raw
-     *      status + body (never throws) so one test-file run tells us whether the
-     *      endpoint accepts the contact id directly.
-     * Run ONLY against a test file — a 2xx here performs a REAL resume.
+     * Diagnostic for the Forth resume-payments API. READ-ONLY by default (safe on
+     * ANY contact, including real ones): checks token health, whether the contact
+     * resolves, and which transactions path is real — surfacing any enrollment id
+     * distinct from the contact id. Only when $execute is true does it fire the
+     * resume POST itself (an ACTION — TEST FILES ONLY).
+     *
+     * Disambiguates the AI-inferred paths (developer.setforth.com, 2026-06-30) from
+     * the real ones, and rules out token/contact-state confounds before we trust
+     * any 404. Never throws — every call's raw status + body is reported.
      *
      * @return array<string, mixed>
      */
-    public function probeResumePayments(string $tenantId, string $contactId): array
+    public function probeResumePayments(string $tenantId, string $contactId, bool $execute = false): array
     {
-        $out = ['tenant' => $tenantId, 'contact_id' => $contactId];
+        $out = ['tenant' => $tenantId, 'contact_id' => $contactId, 'execute' => $execute, 'checks' => []];
 
-        // 1. Read-only: list the contact's transactions (also a candidate to
-        //    replace our Snowflake balance queries, and may reveal an enrollment id).
-        $txResp = $this->crmClient($tenantId)
-            ->get('/servicing/transactions/get-contact-transactions', ['id' => $contactId]);
-        $out['get_contact_transactions'] = [
-            'path'   => "/servicing/transactions/get-contact-transactions?id={$contactId}",
-            'status' => $txResp->status(),
-            'ok'     => $txResp->successful(),
-            'body'   => mb_substr($txResp->body(), 0, 1500),
-        ];
+        $record = function (string $label, string $method, string $path, $resp) use (&$out): void {
+            $out['checks'][] = [
+                'label'  => $label,
+                'call'   => $method . ' ' . $path,
+                'status' => $resp->status(),
+                'ok'     => $resp->successful(),
+                'body'   => mb_substr($resp->body(), 0, 500),
+            ];
+        };
 
-        // 2. Resume on the new path, contact id as {id}. Reports, never throws.
-        $resumeResp = $this->crmClient($tenantId)
-            ->post("/servicing/enrollment/{$contactId}/resume-payments");
-        $out['resume_payments'] = [
-            'path'   => "/servicing/enrollment/{$contactId}/resume-payments",
-            'status' => $resumeResp->status(),
-            'ok'     => $resumeResp->successful(),
-            'body'   => mb_substr($resumeResp->body(), 0, 1500),
-        ];
+        // --- READ-ONLY (safe on real contacts) ---
+
+        // Token health: /contact-stages is a known-good CRM endpoint. A 404 here
+        // means the token is stale (refresh:forth-api-tokens), not a bad path.
+        $record(
+            'token_health (contact-stages)',
+            'GET',
+            '/contact-stages',
+            $this->crmClient($tenantId)->get('/contact-stages')
+        );
+
+        // Does the contact resolve under this token? Body may reveal an enrollment id.
+        $record(
+            'contact resolves',
+            'GET',
+            "/contacts/{$contactId}",
+            $this->crmClient($tenantId)->get("/contacts/{$contactId}")
+        );
+
+        // Real CRM transactions path (the gateway already uses /contacts/{id}/...).
+        $record(
+            'transactions (real /contacts path)',
+            'GET',
+            "/contacts/{$contactId}/transactions",
+            $this->crmClient($tenantId)->get("/contacts/{$contactId}/transactions")
+        );
+
+        // AI-inferred transactions path — confirms whether the servicing/ prefix is real.
+        $record(
+            'transactions (inferred servicing path)',
+            'GET',
+            "/servicing/transactions/get-contact-transactions?id={$contactId}",
+            $this->crmClient($tenantId)->get('/servicing/transactions/get-contact-transactions', ['id' => $contactId])
+        );
+
+        // --- ACTION (test files only) ---
+        if ($execute) {
+            $record(
+                'resume (inferred servicing/enrollment path)',
+                'POST',
+                "/servicing/enrollment/{$contactId}/resume-payments",
+                $this->crmClient($tenantId)->post("/servicing/enrollment/{$contactId}/resume-payments")
+            );
+            $record(
+                'resume (old /contacts path)',
+                'POST',
+                "/contacts/{$contactId}/resume-payments",
+                $this->crmClient($tenantId)->post("/contacts/{$contactId}/resume-payments")
+            );
+        }
 
         Log::info('PMOD: probeResumePayments', $out);
 

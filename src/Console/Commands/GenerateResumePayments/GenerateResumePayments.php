@@ -46,7 +46,8 @@ final class GenerateResumePayments extends Command
         {--execute-cancels : Actually run the Day-4+ System Cancel (browser drop/refund). Off by default — Phase 5 only reports cancel-ready contacts unless this is passed.}
         {--max-cancels= : Safety cap — process at most N cancel candidates per company per run (the rest are reported as deferred). 0/unset = no cap.}
         {--probe-cancel= : Diagnostic only — drive the cancel flow for ONE contact id and print which selectors exist, WITHOUT clicking save (commits nothing). Tenant = first --company (default LDR).}
-        {--probe-resume= : Diagnostic only — call the Forth CRM resume-payments API for ONE contact id and print the raw status/body (read-only transaction list + a resume attempt). Run on TEST files only — a 2xx performs a real resume. Tenant = first --company (default LDR).}';
+        {--probe-resume= : Diagnostic only — probe the Forth resume-payments API for ONE contact id. READ-ONLY by default (token health + contact resolve + transactions paths; safe on any contact). Tenant = first --company (default LDR).}
+        {--probe-resume-execute : With --probe-resume, also FIRE the resume POST (an action — TEST FILES ONLY). Without it the resume probe is read-only.}';
 
     protected $description = 'Process NSF contacts for LDR and Progress Law: update statuses, resume drafts, and execute system cancels per the ResumePayments VBA workflow.';
 
@@ -175,11 +176,16 @@ final class GenerateResumePayments extends Command
     {
         $company = $this->resolveCompanies()[0] ?? 'LDR';
         $tenant = strtolower($company);
+        $execute = (bool) $this->option('probe-resume-execute');
 
-        $this->info("[INFO] Probe-resume for contact {$contactId} as {$company} — TEST FILES ONLY (a 2xx performs a real resume).");
+        if ($execute) {
+            $this->info("[INFO] Probe-resume for contact {$contactId} as {$company} — EXECUTE mode (will fire a REAL resume). TEST FILES ONLY.");
+        } else {
+            $this->info("[INFO] Probe-resume for contact {$contactId} as {$company} — READ-ONLY (no writes; safe on any contact).");
+        }
 
         try {
-            $report = $gateway->probeResumePayments($tenant, $contactId);
+            $report = $gateway->probeResumePayments($tenant, $contactId, $execute);
         } catch (\Throwable $e) {
             $this->error('Probe failed: ' . $e->getMessage());
             Log::error('GenerateResumePayments: probe-resume failed', ['contact_id' => $contactId, 'exception' => $e]);
