@@ -270,6 +270,36 @@ final class DppSeleniumService
         $report['dropped_reason_options'] = $this->optionTexts($driver, '#dropped_reason');
         $report['complete_delete_options'] = $this->optionTexts($driver, '#complete_delete');
 
+        // --- Refund-amount diagnostics (2026-07-01) ---
+        // The form caps the refund at its own "Available Refund Amount" (= Current
+        // Balance − Uncollected Disbursement Fees − anything cleared today), which is
+        // LESS than the raw Snowflake balance we currently type into #amount → the
+        // refund fails. Capture the on-page money labels + whether #amount pre-fills,
+        // so the real cancel can refund the form's authoritative figure.
+        $report['money_fields'] = [];
+        foreach (['Available Refund Amount', 'Current Balance', 'Uncollected Disbursement Fees'] as $label) {
+            try {
+                $el = $driver->findElement(\Facebook\WebDriver\WebDriverBy::xpath("//*[contains(text(),'{$label}')]"));
+                $parent = $el->findElement(\Facebook\WebDriver\WebDriverBy::xpath('..'));
+                $report['money_fields'][$label] = [
+                    'text'        => trim($el->getText()),
+                    'parent_text' => trim((string) preg_replace('/\s+/', ' ', $parent->getText())),
+                ];
+            } catch (\Throwable $e) {
+                $report['money_fields'][$label] = ['error' => $e->getMessage()];
+            }
+        }
+
+        // Does the form auto-fill #amount when refund is enabled? (still no-save)
+        try {
+            $report['amount_value_before_dorefund'] = $driver->findElement(\Facebook\WebDriver\WebDriverBy::cssSelector('#amount'))->getAttribute('value');
+            $driver->findElement(\Facebook\WebDriver\WebDriverBy::cssSelector('#dorefund'))->click();
+            usleep(400000);
+            $report['amount_value_after_dorefund'] = $driver->findElement(\Facebook\WebDriver\WebDriverBy::cssSelector('#amount'))->getAttribute('value');
+        } catch (\Throwable $e) {
+            $report['amount_prefill_error'] = $e->getMessage();
+        }
+
         // Navigate away → the unsaved form is discarded. NOTHING is committed.
         $client->request('GET', $toolsUrl);
         $report['result'] = 'all drop-form selectors verified; #savebtn NOT clicked';
