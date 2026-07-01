@@ -300,6 +300,23 @@ final class DppSeleniumService
             $report['amount_prefill_error'] = $e->getMessage();
         }
 
+        // DRY-FILL: run the exact refund logic the real cancel uses — read the
+        // Available Refund Amount, type it into #amount, read it back — then bail
+        // WITHOUT saving. Shows precisely what the real cancel will refund.
+        try {
+            $available = $this->readAvailableRefund($client);
+            $report['available_refund_read'] = $available;
+            if ($available !== null && $available > 0) {
+                $amountEl = $driver->findElement(\Facebook\WebDriver\WebDriverBy::cssSelector('#amount'));
+                $amountEl->clear();
+                $amountEl->sendKeys($this->money($available));
+                usleep(200000);
+                $report['amount_dry_filled'] = $driver->findElement(\Facebook\WebDriver\WebDriverBy::cssSelector('#amount'))->getAttribute('value');
+            }
+        } catch (\Throwable $e) {
+            $report['dry_fill_error'] = $e->getMessage();
+        }
+
         // Navigate away → the unsaved form is discarded. NOTHING is committed.
         $client->request('GET', $toolsUrl);
         $report['result'] = 'all drop-form selectors verified; #savebtn NOT clicked';
