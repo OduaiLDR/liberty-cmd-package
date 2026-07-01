@@ -36,7 +36,7 @@ class BonusFormatter
             $headers = [
                 'ID', 'Client', 'Retention Agent', 'Retention Date', 'Immediate Results',
                 'Enrolled Debt', 'Reconsideration Date', 'Retained Date', 'Dropped Date',
-                'First Payment Cleared', 'Cutoff', 'Payments', 'Agent', 'Commission Rate',
+                'First Payment Date', 'Cutoff', 'Payments', 'Agent', 'Commission Rate',
                 'Violations', 'Retention Commission', 'Agent Deduction',
             ];
 
@@ -57,7 +57,7 @@ class BonusFormatter
                 $agent     = $row['AGENT']              ?? '';
                 $client    = $row['CLIENT']             ?? '';
                 $comm      = $row['RETENTION_COMMISSION'] ?? 0;
-                $deduction = $row['AGENT_DEDUCTION']    ?? 0;
+                $deduction = $row['AGENT_DEDUCTION']    ?? '';
 
                 $sheet->setCellValue("A$r", $id);
                 $sheet->setCellValue("B$r", $client);
@@ -75,7 +75,7 @@ class BonusFormatter
                 $sheet->setCellValue("N$r", $row['COMMISSION_RATE']                 ?? '');
                 $sheet->setCellValue("O$r", $row['VIOLATIONS']                      ?? '');
                 $sheet->setCellValue("P$r", $comm);
-                $sheet->setCellValue("Q$r", $deduction);
+                $sheet->setCellValue("Q$r", $deduction === '' ? '' : (float) $deduction);
                 $r++;
             }
 
@@ -98,7 +98,8 @@ class BonusFormatter
             $sheet->freezePane('A2');
             $sheet->setSelectedCells('A1');
 
-            // ── Summary sheet ─────────────────────────────────────────────────
+            /* Summary sheet retained for future use. Disabled to match VBA bonus report output.
+            // -- Summary sheet --------------------------------------------------
             $summary = $sp->createSheet();
             $summary->setTitle('Agent Summary');
             $summary->setShowGridlines(false);
@@ -136,6 +137,7 @@ class BonusFormatter
             $summary->getStyle("A1:C{$lastSr}")->getFont()->setName('Calibri')->setSize(9);
             $summary->freezePane('A2');
             $summary->setSelectedCells('A1');
+            */
 
             // Set active sheet back to data tab
             $sp->setActiveSheetIndex(0);

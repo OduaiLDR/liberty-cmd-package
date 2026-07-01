@@ -44,11 +44,10 @@ class GenerateRetentionCommissionReport extends Command
             'custom_results'        => 742105,
             'recon_status_id'       => 377650,
             'cancel_request_custom' => 742098,
-            'has_t4'                => true,
+            'has_t4'                => false,
             'agents' => [
-                'Alice Kennedy', 'Gracia Rivera', 'John Pozuelos', 'Jose Melgar',
-                'Ken Smith', 'Marco Gonzalez', 'Mike Wexford', 'Rick Mills',
-                'Javier Deras', 'Andrea Mendoza',
+                'Mike Wexford', 'Ivy Morgan', 'Laura Brown', 'Ken Smith',
+                'Jose Chocano', 'John Pozuelos', 'Kevin Nixon', 'Alice Kennedy',
             ],
         ],
         'plaw' => [
@@ -228,7 +227,7 @@ class GenerateRetentionCommissionReport extends Command
             $this->info("[INFO] [$display] Rows after processing: " . count($rows));
 
             // ── STEP 6: fetch agent locations from SQL Server
-            $locationMap = $this->fetchLocationMap($sql, $cfg['agents']);
+            $locationMap = [];
 
             // ── STEP 7: build workbook with both sheets
             $file = $this->buildWorkbook($rows, $cfg, $display, $startDate, $endDate, $locationMap);
@@ -263,37 +262,34 @@ class GenerateRetentionCommissionReport extends Command
         $cc = (int) $cfg['cancel_request_custom'];
 
         $sql = "
-            WITH PivotedFields AS (
-                SELECT
-                    CONTACT_ID,
-                    MAX(CASE WHEN CUSTOM_ID = $ca THEN F_STRING END) AS RETENTION_AGENT,
-                    MAX(CASE WHEN CUSTOM_ID = $cd THEN F_DATE   END) AS RETENTION_DATE,
-                    MAX(CASE WHEN CUSTOM_ID = $cr THEN F_STRING END) AS IMMEDIATE_RESULTS,
-                    MAX(CASE WHEN CUSTOM_ID = $cc THEN TO_DATE(F_DATETIME) END) AS CANCEL_REQUEST_DATE
-                FROM CONTACTS_USERFIELDS
-                WHERE CUSTOM_ID IN ($ca, $cd, $cr, $cc)
-                GROUP BY CONTACT_ID
-            )
             SELECT
                 c.ID,
                 CONCAT(c.FIRSTNAME,' ',c.LASTNAME)                     AS CLIENT,
-                p.RETENTION_AGENT,
-                LEFT(p.RETENTION_DATE, 10)                             AS RETENTION_DATE,
-                p.IMMEDIATE_RESULTS,
+                cu1.F_STRING                                           AS RETENTION_AGENT,
+                LEFT(cu2.F_DATE, 10)                                   AS RETENTION_DATE,
+                cu3.F_STRING                                           AS IMMEDIATE_RESULTS,
                 d.ENROLLED_DEBT,
                 LEFT(c.DROPPED_DATE, 10)                               AS DROPPED_DATE,
-                TO_VARCHAR(p.CANCEL_REQUEST_DATE, 'YYYY-MM-DD')        AS CANCEL_REQUEST_DATE
-            FROM PivotedFields p
-            JOIN CONTACTS c ON c.ID = p.CONTACT_ID
+                TO_VARCHAR(TO_DATE(cu4.F_DATETIME), 'YYYY-MM-DD')      AS CANCEL_REQUEST_DATE
+            FROM CONTACTS c
+            LEFT JOIN CONTACTS_USERFIELDS cu1 ON c.ID = cu1.CONTACT_ID
+            LEFT JOIN (
+                SELECT CONTACT_ID, F_DATE
+                FROM CONTACTS_USERFIELDS
+                WHERE CUSTOM_ID = $cd
+            ) cu2 ON c.ID = cu2.CONTACT_ID
+            LEFT JOIN CONTACTS_USERFIELDS cu3 ON c.ID = cu3.CONTACT_ID
+            LEFT JOIN CONTACTS_USERFIELDS cu4 ON c.ID = cu4.CONTACT_ID
             LEFT JOIN (
                 SELECT CONTACT_ID, SUM(ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT
                 FROM DEBTS
                 WHERE ENROLLED=1 AND _FIVETRAN_DELETED=FALSE
                 GROUP BY CONTACT_ID
             ) d ON c.ID = d.CONTACT_ID
-            WHERE p.RETENTION_AGENT IS NOT NULL
-              AND p.IMMEDIATE_RESULTS IS NOT NULL
-            ORDER BY p.RETENTION_AGENT ASC
+            WHERE cu1.CUSTOM_ID = $ca
+              AND cu3.CUSTOM_ID = $cr
+              AND cu4.CUSTOM_ID = $cc
+            ORDER BY cu1.F_STRING ASC
         ";
 
         return $sf->query($sql)['data'] ?? [];
@@ -446,11 +442,11 @@ class GenerateRetentionCommissionReport extends Command
             $sheet2->setTitle('Commission Summary');
             $sheet2->setShowGridlines(false);
 
-            $sumHeaders = ['Retention Agent', 'Assigned', 'Retained', '% Retained', 'Tier', 'Commission', 'Location'];
+            $sumHeaders = ['Retention Agent', 'Assigned', 'Retained', '% Retained', 'Tier', 'Commission'];
             foreach ($sumHeaders as $i => $h) {
                 $sheet2->setCellValue(chr(65 + $i) . '1', $h);
             }
-            $this->headerStyle($sheet2, 'A1:G1');
+            $this->headerStyle($sheet2, 'A1:F1');
 
             $agents      = $cfg['agents'];
             $summaryRows = $this->buildSummary($rows, $agents, $startDate, $endDate, $locationMap);
@@ -463,7 +459,6 @@ class GenerateRetentionCommissionReport extends Command
                 $sheet2->setCellValue("D$r2", $sum['pct_retained']);
                 $sheet2->setCellValue("E$r2", $sum['tier']);
                 $sheet2->setCellValue("F$r2", $sum['commission']);
-                $sheet2->setCellValue("G$r2", $sum['location'] ?? '');
                 $r2++;
             }
 
@@ -471,12 +466,12 @@ class GenerateRetentionCommissionReport extends Command
             $sheet2->getStyle("D2:D{$last2}")->getNumberFormat()->setFormatCode('0%');
             $sheet2->getStyle("F2:F{$last2}")->getNumberFormat()->setFormatCode('$#,##0');
             if ($last2 > 1) {
-                $sheet2->getStyle("A1:G{$last2}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
+                $sheet2->getStyle("A1:F{$last2}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
             }
-            foreach (range('A', 'G') as $c) {
+            foreach (range('A', 'F') as $c) {
                 $sheet2->getColumnDimension($c)->setAutoSize(true);
             }
-            $sheet2->getStyle("A1:G{$last2}")->getFont()->setName('Calibri')->setSize(9);
+            $sheet2->getStyle("A1:F{$last2}")->getFont()->setName('Calibri')->setSize(9);
             $sheet2->freezePane('A2');
             $sheet2->setSelectedCells('A1');
 
@@ -505,7 +500,7 @@ class GenerateRetentionCommissionReport extends Command
      * @param  array<int,array<string,mixed>> $rows
      * @param  string[] $agents
      * @param  array<string,string> $locationMap
-     * @return array<string,array{assigned:int,retained:int,pct_retained:float,tier:int,commission:float,location:string}>
+     * @return array<string,array{assigned:int,retained:int,pct_retained:float,tier:int,commission:float}>
      */
     private function buildSummary(array $rows, array $agents, string $startDate, string $endDate, array $locationMap = []): array
     {
@@ -542,8 +537,7 @@ class GenerateRetentionCommissionReport extends Command
                 $pct < 0.20 => 0,
                 $pct < 0.35 => 1,
                 $pct < 0.50 => 2,
-                $pct < 0.65 => 3,
-                default     => 4,
+                default     => 3,
             };
 
             // Sum commission using the agent's tier column for rows where payment landed in period
@@ -565,7 +559,6 @@ class GenerateRetentionCommissionReport extends Command
                 'pct_retained'=> $pct,
                 'tier'        => $tier,
                 'commission'  => $commission,
-                'location'    => $locationMap[strtoupper($agentName)] ?? '',
             ];
         }
 
@@ -576,8 +569,8 @@ class GenerateRetentionCommissionReport extends Command
 
     private function sendReport(array $file, string $display): void
     {
-        $subject = "Retention Commission Report - $display";
-        $body    = "See attached Retention Commission Report - $display.";
+        $subject = "Retention Commission Report - $display - All";
+        $body    = "See attached Retention Commission Report - $display - All";
         $att     = [
             'name'         => $file['filename'],
             'contentType'  => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',

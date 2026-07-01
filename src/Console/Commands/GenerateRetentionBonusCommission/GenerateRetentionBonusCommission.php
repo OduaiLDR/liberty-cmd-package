@@ -32,6 +32,7 @@ class GenerateRetentionBonusCommission extends Command
             'custom_date'       => 742101,
             'custom_results'    => 742105,
             'recon_status_id'   => 377650,
+            'base_months_back'  => 4,
         ],
         'plaw' => [
             'display'           => 'Progress Law',
@@ -39,6 +40,7 @@ class GenerateRetentionBonusCommission extends Command
             'custom_date'       => 742102,
             'custom_results'    => 742106,
             'recon_status_id'   => 377687,
+            'base_months_back'  => 4,
         ],
     ];
 
@@ -62,9 +64,10 @@ class GenerateRetentionBonusCommission extends Command
         $display = $cfg['display'];
         $this->info("[INFO] GenerateRetentionBonusCommission – $display");
 
-        $startDate = date('Y-m-01', strtotime('first day of last month'));
-        $endDate   = date('Y-m-t', strtotime($startDate));
-        $this->info("[INFO] Period: $startDate → $endDate");
+        $reportStartDate = date('Y-m-01', strtotime('first day of last month'));
+        $endDate         = date('Y-m-t', strtotime($reportStartDate));
+        $baseStartDate   = date('Y-m-01', strtotime('-' . (int) $cfg['base_months_back'] . ' months'));
+        $this->info("[INFO] Base period: $baseStartDate → $endDate; report cutoff period: $reportStartDate → $endDate");
 
         try {
             $sf  = DBConnector::fromEnvironment($source);
@@ -75,8 +78,8 @@ class GenerateRetentionBonusCommission extends Command
         }
 
         try {
-            // STEP 1 – base data (only Retained contacts within date range)
-            $rows = $this->fetchBase($sf, $cfg, $startDate, $endDate);
+            // STEP 1 - base data mirrors the VBA raw userfield joins.
+            $rows = $this->fetchBase($sf, $cfg, $baseStartDate, $endDate);
             $this->info("[INFO] [$display] Base rows: " . count($rows));
 
             $ids = array_filter(array_map(fn($r) => (int) $this->rowValue($r, 'ID', 0), $rows));
@@ -148,7 +151,7 @@ class GenerateRetentionBonusCommission extends Command
             unset($row);
 
             // VBA filter conditions
-            $rows = array_values(array_filter($rows, function($row) use ($endDate) {
+            $rows = array_values(array_filter($rows, function($row) use ($reportStartDate, $endDate) {
                 $retenDate = $this->dateValue($this->rowValue($row, 'RETENTION_DATE'));
                 $dropped   = $this->dateValue($this->rowValue($row, 'DROPPED_DATE'));
                 $cutoff    = $this->dateValue($row['CUTOFF'] ?? null);
@@ -158,8 +161,8 @@ class GenerateRetentionBonusCommission extends Command
                 if ($retenDate && $cutoff && $retenDate > $cutoff) return false;
                 // If dropped and dropped <= cutoff → remove
                 if ($dropped && $cutoff && $dropped <= $cutoff) return false;
-                // If cutoff > endDate → remove
-                if ($cutoff && $cutoff > $endDate) return false;
+                // Expected workbook is for clients whose cutoff lands in the report month.
+                if ($cutoff && ($cutoff < $reportStartDate || $cutoff > $endDate)) return false;
                 // If payments < 3 → remove
                 if ((int) $this->rowValue($row, 'PAYMENTS', 0) < 3) return false;
 
@@ -178,7 +181,7 @@ class GenerateRetentionBonusCommission extends Command
                     $row['COMMISSION_RATE']    = 0.38;
                     $row['VIOLATIONS']         = 0;
                     $row['RETENTION_COMMISSION'] = round($debt * 0.38 / 100 / 2, 2);
-                    $row['AGENT_DEDUCTION']    = null;
+                    $row['AGENT_DEDUCTION']    = '';
                 } else {
                     // Check violations
                     $safe = str_replace("'", "''", $id);
@@ -204,7 +207,7 @@ class GenerateRetentionBonusCommission extends Command
             $locationMap = $this->fetchLocationMap($sql, $agentNames);
 
             $formatter = new BonusFormatter();
-            $file = $formatter->buildWorkbook($rows, $display, $startDate, $endDate, $locationMap);
+            $file = $formatter->buildWorkbook($rows, $display, $reportStartDate, $endDate, $locationMap);
 
             if ($file) {
                 $this->info("[INFO] [$display] Workbook: {$file['filename']}");
@@ -227,37 +230,33 @@ class GenerateRetentionBonusCommission extends Command
         $cd = (int)$cfg['custom_date'];
         $cr = (int)$cfg['custom_results'];
         $nextDay = date('Y-m-d', strtotime('+1 day', strtotime($end)));
-
         $sql = "
-            WITH PivotedFields AS (
-                SELECT 
-                    CONTACT_ID,
-                    MAX(CASE WHEN CUSTOM_ID = $ca THEN F_STRING END) AS RETENTION_AGENT,
-                    MAX(CASE WHEN CUSTOM_ID = $cd THEN F_DATE END) AS RETENTION_DATE,
-                    MAX(CASE WHEN CUSTOM_ID = $cr THEN F_STRING END) AS IMMEDIATE_RESULTS
-                FROM CONTACTS_USERFIELDS
-                WHERE CUSTOM_ID IN ($ca, $cd, $cr)
-                GROUP BY CONTACT_ID
-            )
             SELECT
                 c.ID,
                 CONCAT(c.FIRSTNAME,' ',c.LASTNAME)  AS CLIENT,
-                p.RETENTION_AGENT,
-                LEFT(p.RETENTION_DATE, 10) AS RETENTION_DATE,
-                p.IMMEDIATE_RESULTS,
+                cu1.F_STRING AS RETENTION_AGENT,
+                LEFT(cu2.F_DATE, 10) AS RETENTION_DATE,
+                cu3.F_STRING AS IMMEDIATE_RESULTS,
                 d.ENROLLED_DEBT,
                 LEFT(c.DROPPED_DATE, 10) AS DROPPED_DATE
-            FROM PivotedFields p
-            JOIN CONTACTS c ON c.ID = p.CONTACT_ID
+            FROM CONTACTS c
+            LEFT JOIN CONTACTS_USERFIELDS cu1 ON c.ID = cu1.CONTACT_ID
+            LEFT JOIN (
+                SELECT CONTACT_ID, F_DATE
+                FROM CONTACTS_USERFIELDS
+                WHERE CUSTOM_ID = $cd
+            ) cu2 ON c.ID = cu2.CONTACT_ID
+            LEFT JOIN CONTACTS_USERFIELDS cu3 ON c.ID = cu3.CONTACT_ID
             LEFT JOIN (
                 SELECT CONTACT_ID, SUM(ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT
                 FROM DEBTS WHERE ENROLLED=1 AND _FIVETRAN_DELETED=FALSE GROUP BY CONTACT_ID
             ) d ON c.ID=d.CONTACT_ID
-            WHERE p.RETENTION_DATE >= '$start'
-              AND p.RETENTION_DATE < '$nextDay'
-              AND TRIM(p.IMMEDIATE_RESULTS) = 'Retained'
-              AND p.RETENTION_AGENT IS NOT NULL
-            ORDER BY p.RETENTION_AGENT ASC
+            WHERE cu1.CUSTOM_ID = $ca
+              AND cu3.CUSTOM_ID = $cr
+              AND cu3.F_STRING = 'Retained'
+              AND cu2.F_DATE >= '$start'
+              AND cu2.F_DATE < '$nextDay'
+            ORDER BY cu1.F_STRING ASC
         ";
         $res = $sf->query($sql);
         return $res['data'] ?? [];
