@@ -79,6 +79,33 @@ class SyncLastDepositDate extends Command
         $depositData = $this->fetchLastDepositDates($snowflake, $contactIds);
         $this->info('[INFO] Fetched ' . count($depositData) . ' last deposit records from Snowflake');
 
+        // Cross-source fallback: some LDR contacts have deposits in PLAW Snowflake and vice versa
+        $foundIds  = array_column($depositData, 'CONTACT_ID');
+        $missedIds = array_values(array_diff($contactIds, $foundIds));
+        if (!empty($missedIds)) {
+            $otherSource = ($source === 'LDR') ? 'plaw' : 'ldr';
+            try {
+                $otherSnowflake = DBConnector::fromEnvironment($otherSource);
+                $crossData = $this->fetchLastDepositDates($otherSnowflake, $missedIds);
+                if (!empty($crossData)) {
+                    $this->info('[INFO] Cross-source fallback (' . strtoupper($otherSource) . '): found ' . count($crossData) . ' additional deposit records.');
+                    Log::info('SyncLastDepositDate: cross-source deposits found.', [
+                        'source' => $source,
+                        'fallback_source' => $otherSource,
+                        'count' => count($crossData),
+                    ]);
+                    $depositData = array_merge($depositData, $crossData);
+                }
+            } catch (\Throwable $e) {
+                $this->warn('[WARN] Cross-source fallback failed: ' . $e->getMessage());
+                Log::warning('SyncLastDepositDate: cross-source fallback failed', [
+                    'source' => $source,
+                    'fallback_source' => $otherSource,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
         if (empty($depositData)) {
             $this->warn('[WARN] No deposit data found in Snowflake. Exiting.');
             return Command::SUCCESS;
