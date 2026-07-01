@@ -743,9 +743,14 @@ final class GenerateResumePayments extends Command
     }
 
     /**
-     * VBA plan-detection ladder (identical effect in both LDR and PLAW macros):
-     * LDR / "LT L" prefix -> LDR; contains "Progress" -> ProLaw; PLAW prefix ->
-     * PLAW; anything else -> null (VBA `Stop`, we skip the contact).
+     * Plan-detection ladder → status-title prefix. LDR / "LT L" prefix -> LDR;
+     * "PLAW" prefix OR contains "Progress" -> ProLaw; anything else -> null (skip).
+     *
+     * NOTE: the prefix returned must match a REAL status family in that company's
+     * Forth account. The PLAW account defines its enrolled/NSF statuses ONLY as
+     * "ProLaw …" — there is no "PLAW Enrolled" status in either account (confirmed
+     * via forth:dump-stages-statuses 2026-06-30). So a "PLAW…" plan title maps to
+     * "ProLaw", same as a "Progress" title; returning "PLAW" would write an orphan.
      */
     private function detectPlan(string $enrollmentPlan): ?string
     {
@@ -766,7 +771,7 @@ final class GenerateResumePayments extends Command
             return 'ProLaw';
         }
         if (substr($upper, 0, 4) === 'PLAW') {
-            return 'PLAW';
+            return 'ProLaw';
         }
 
         return null;
