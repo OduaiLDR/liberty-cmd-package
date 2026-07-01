@@ -406,9 +406,31 @@ final class DppSeleniumService
         $this->select($client, '#dropped_reason', $dropReason);
         $client->findElement(\Facebook\WebDriver\WebDriverBy::tagName('textarea'))->sendKeys($note);
 
-        if ($balance > 0) {
+        // Refund the form's own "Available Refund Amount" — NOT the raw Snowflake
+        // balance, which overshoots by uncollected disbursement fees + anything
+        // cleared today and gets rejected (found on the first real cancel, Denise
+        // Riley 2026-07-01: balance 508.22 vs available 483.22). The form is the
+        // live source of truth and reflects same-day clearings, so we don't rely on
+        // the (end-of-day) CONTACT_BALANCES figure for the refund amount.
+        $availableRefund = $this->readAvailableRefund($client);
+
+        if ($availableRefund === null && $balance > 0) {
+            // Client looks owed a refund but we couldn't read the form figure — do
+            // NOT guess (a wrong amount is rejected) and do NOT drop without it.
+            // Abort so the caller flags it for manual review; the contact stays
+            // cancellable (#cancelbtn unchanged) and is retried next run.
+            // Plain exception — cancelProgram()'s catch wraps it into a
+            // DppSeleniumException with tenant/contactId/stage=drop context.
+            throw new \RuntimeException(
+                "Could not read 'Available Refund Amount' from the drop form; aborting drop for manual review (Snowflake balance ~" . $this->money($balance) . ').'
+            );
+        }
+
+        if ($availableRefund !== null && $availableRefund > 0) {
             $client->findElement($css('#dorefund'))->click();
-            $client->findElement($css('#amount'))->sendKeys($this->money($balance));
+            $amountEl = $client->findElement($css('#amount'));
+            $amountEl->clear();
+            $amountEl->sendKeys($this->money($availableRefund));
             $startDate = $client->findElement($css('#start_date'));
             $startDate->sendKeys($processDate);
             $startDate->sendKeys(\Facebook\WebDriver\WebDriverKeys::TAB);
@@ -452,6 +474,35 @@ final class DppSeleniumService
     private function money(float $amount): string
     {
         return number_format($amount, 2, '.', '');
+    }
+
+    /**
+     * Read the drop form's live "Available Refund Amount" — Current Balance minus
+     * uncollected disbursement fees and anything cleared today. This is the max the
+     * form will refund; typing more is rejected. Scrapes the label's parent text
+     * (verified layout: "Available Refund Amount: $483.22") and parses the dollar
+     * value. Returns null if the label/number can't be found or parsed.
+     */
+    private function readAvailableRefund(mixed $client): ?float
+    {
+        try {
+            $driver = $client->getWebDriver();
+            $el = $driver->findElement(\Facebook\WebDriver\WebDriverBy::xpath(
+                "//*[contains(text(),'Available Refund Amount')]"
+            ));
+            $parent = $el->findElement(\Facebook\WebDriver\WebDriverBy::xpath('..'));
+            $text = (string) $parent->getText(); // "Available Refund Amount: $483.22"
+
+            if (preg_match('/Available Refund Amount:?\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)/i', $text, $m) === 1) {
+                return (float) str_replace(',', '', $m[1]);
+            }
+
+            Log::warning('DPP: Available Refund Amount found but not parseable', ['text' => $text]);
+        } catch (\Throwable $e) {
+            Log::warning('DPP: could not read Available Refund Amount', ['error' => $e->getMessage()]);
+        }
+
+        return null;
     }
 
     /**
