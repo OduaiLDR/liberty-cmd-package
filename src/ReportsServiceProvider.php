@@ -73,6 +73,8 @@ use Cmd\Reports\Pmod\Services\PmodEmailNotificationService;
 use Cmd\Reports\Console\Commands\SyncAgentCommissionTierEnrollments;
 use Cmd\Reports\Console\Commands\GenerateEmployeesReport\GenerateEmployeesReport;
 use Cmd\Reports\Console\Commands\SyncLeaderboardRecords\SyncLeaderboardRecords;
+use Cmd\Reports\Console\Commands\GenerateConsumerAffairsFundedReport\GenerateConsumerAffairsFundedReport;
+use Cmd\Reports\Console\Commands\GenerateConsumerAffairsSettlementReport\GenerateConsumerAffairsSettlementReport;
 
 
 class ReportsServiceProvider extends ServiceProvider
@@ -174,6 +176,8 @@ class ReportsServiceProvider extends ServiceProvider
                 SyncAgentCommissionTierEnrollments::class,
                 GenerateEmployeesReport::class,
                 SyncLeaderboardRecords::class,
+                GenerateConsumerAffairsFundedReport::class,
+                GenerateConsumerAffairsSettlementReport::class,
             ]);
         }
 
