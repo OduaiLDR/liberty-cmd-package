@@ -285,7 +285,9 @@ SQL;
                 $debtValue  = $data['debt'] ?? null;
 
                 $countCases[] = "WHEN '{$llgEsc}' THEN {$countValue}";
-                $debtCases[]  = "WHEN '{$llgEsc}' THEN " . ($debtValue !== null ? $debtValue : 'NULL');
+                // Only write Debt_Amount when Snowflake returns a positive value;
+                // zero means no enrolled debt amount recorded — leave existing value intact
+                $debtCases[]  = "WHEN '{$llgEsc}' THEN " . ($debtValue !== null && $debtValue > 0 ? $debtValue : 'NULL');
                 $ids[]        = "'{$llgEsc}'";
             }
 
