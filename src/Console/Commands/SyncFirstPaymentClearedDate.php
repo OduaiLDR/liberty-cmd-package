@@ -94,6 +94,14 @@ class SyncFirstPaymentClearedDate extends Command
                 $updated = $this->updateFirstClearedPayments($connector, $payments);
 
                 $this->info("[$source] Updated {$updated} first cleared payment rows.");
+
+                // Re-sync Program_Payment for contacts already cleared but missing it
+                // (amount was NULL in Snowflake at time of original sync)
+                $this->info("[$source] Backfilling missing Program_Payment for cleared contacts...");
+                $ppFixed = $this->backfillMissingProgramPayment($connector);
+                if ($ppFixed > 0) {
+                    $this->info("[$source] Backfilled Program_Payment for {$ppFixed} cleared contacts.");
+                }
                 $this->insertLogRow(
                     $connector,
                     $source,
@@ -527,6 +535,9 @@ SQL;
             if ($caseDebtSql !== '') {
                 $setClauses[] = "Debt_Amount = CASE WHEN (Debt_Amount IS NULL OR Debt_Amount = 0) THEN CASE LLG_ID {$caseDebtSql} ELSE Debt_Amount END ELSE Debt_Amount END";
             }
+            // Guard: if First_Payment_Date somehow ended up after First_Payment_Cleared_Date, correct it
+            // by pulling it back to match the cleared date (impossible for payment date to be after cleared date)
+            $setClauses[] = "First_Payment_Date = CASE WHEN First_Payment_Date > First_Payment_Cleared_Date THEN First_Payment_Cleared_Date ELSE First_Payment_Date END";
             $setSql = implode(",\n    ", $setClauses);
 
             $sql = <<<SQL
@@ -574,6 +585,86 @@ SQL;
         }
 
         return $totalUpdated;
+    }
+
+    protected function backfillMissingProgramPayment(DBConnector $connector): int
+    {
+        // Fetch cleared contacts that are missing Program_Payment
+        $sql = <<<SQL
+SELECT LLG_ID
+FROM dbo.TblEnrollment
+WHERE First_Payment_Status = 'Cleared'
+  AND Program_Payment IS NULL
+  AND First_Payment_Cleared_Date IS NOT NULL
+  AND LLG_ID LIKE 'LLG-%'
+  AND TRY_CONVERT(BIGINT, REPLACE(LLG_ID, 'LLG-', '')) IS NOT NULL
+SQL;
+
+        $result = $connector->querySqlServer($sql);
+        $rows = $result['data'] ?? (is_array($result) && array_is_list($result) ? $result : []);
+
+        $llgIds = [];
+        foreach ($rows as $row) {
+            foreach ($row as $k => $v) {
+                if (strcasecmp($k, 'LLG_ID') === 0 && $v !== null && $v !== '') {
+                    $llgIds[] = (string) $v;
+                    break;
+                }
+            }
+        }
+
+        if (empty($llgIds)) {
+            return 0;
+        }
+
+        // Re-fetch from Snowflake to get the amount
+        $payments = $this->fetchFirstClearedFromSnowflake($connector, $llgIds);
+        if (empty($payments)) {
+            return 0;
+        }
+
+        $totalFixed = 0;
+        $batchSize = 500;
+
+        foreach (array_chunk($payments, $batchSize, true) as $chunk) {
+            $casesAmount = [];
+            $ids = [];
+
+            foreach ($chunk as $llgId => $data) {
+                $amountVal = $data['amount'] ?? null;
+                if ($amountVal === null || $amountVal === '' || !is_numeric($amountVal)) {
+                    continue;
+                }
+                $llgEsc = $this->truncateString($this->escapeSqlString($llgId), 100);
+                $casesAmount[] = "WHEN '{$llgEsc}' THEN {$amountVal}";
+                $ids[] = "'{$llgEsc}'";
+            }
+
+            if (empty($casesAmount)) {
+                continue;
+            }
+
+            $caseAmountSql = implode(' ', $casesAmount);
+            $idList = implode(', ', $ids);
+
+            $updateSql = <<<SQL
+UPDATE dbo.TblEnrollment
+SET Program_Payment = CASE LLG_ID {$caseAmountSql} END
+WHERE LLG_ID IN ({$idList})
+  AND Program_Payment IS NULL
+  AND First_Payment_Status = 'Cleared'
+SQL;
+
+            $updateResult = $connector->querySqlServer($updateSql);
+            foreach (['rowCount', 'affected_rows', 'row_count'] as $key) {
+                if (isset($updateResult[$key]) && is_numeric($updateResult[$key])) {
+                    $totalFixed += (int) $updateResult[$key];
+                    break;
+                }
+            }
+        }
+
+        return $totalFixed;
     }
 
     protected function backfillClearedStatus(DBConnector $connector): int
