@@ -676,8 +676,7 @@ SQL;
             $updateSql = <<<SQL
 UPDATE TblEnrollment
 SET First_Payment_Cleared_Date = NULL,
-    First_Payment_Date         = NULL,
-    First_Payment_Status       = NULL,
+    First_Payment_Status       = 'Returned',
     Program_Payment            = NULL
 WHERE LLG_ID IN ({$idList})
 SQL;
