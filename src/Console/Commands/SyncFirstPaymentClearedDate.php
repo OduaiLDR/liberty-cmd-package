@@ -33,6 +33,13 @@ class SyncFirstPaymentClearedDate extends Command
                 $connector->initializeSqlServer();
                 $this->ensureLogTable($connector);
 
+                // Backfill status for contacts that already have a cleared date but NULL status
+                // (data populated outside the sync, or from before status tracking was added)
+                $backfilled = $this->backfillClearedStatus($connector);
+                if ($backfilled > 0) {
+                    $this->info("[$source] Backfilled First_Payment_Status='Cleared' for {$backfilled} contacts.");
+                }
+
                 $this->info("[$source] Checking for previously synced payments that were returned...");
                 $reverted = $this->revertReturnedFirstPayments($connector, $source);
                 if ($reverted > 0) {
@@ -567,6 +574,28 @@ SQL;
         }
 
         return $totalUpdated;
+    }
+
+    protected function backfillClearedStatus(DBConnector $connector): int
+    {
+        $sql = <<<SQL
+UPDATE dbo.TblEnrollment
+SET First_Payment_Status = 'Cleared'
+WHERE First_Payment_Cleared_Date IS NOT NULL
+  AND First_Payment_Status IS NULL
+  AND Cancel_Date IS NULL
+  AND LLG_ID LIKE 'LLG-%'
+SQL;
+
+        $result = $connector->querySqlServer($sql);
+        if (is_array($result)) {
+            foreach (['rowCount', 'affected_rows', 'row_count'] as $key) {
+                if (isset($result[$key]) && is_numeric($result[$key])) {
+                    return (int) $result[$key];
+                }
+            }
+        }
+        return 0;
     }
 
     protected function revertReturnedFirstPayments(DBConnector $connector, string $source): int
