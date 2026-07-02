@@ -134,7 +134,28 @@ final class DppSeleniumService
             return ['status' => 'not_cancellable', 'message' => "cancel button reads '{$cancelText}'"];
         }
 
-        // 2) EPF capture. If this fails we do NOT proceed to the drop (the VBA
+        // 2) Pending settlements — SAFETY GATE, checked BEFORE the EPF capture (moved
+        //    2026-07-02): every positive-balance + EPF client in the backlog also has
+        //    settlements, so capturing EPF first would schedule a fee and THEN bail to
+        //    manual without dropping — a half-done state. Checking settlements first
+        //    means those clients route to manual with NO browser action, and the
+        //    fragile EPF picker never runs on them.
+        //    (The VBA auto-voids partially-paid settlements here via a deeply
+        //    position-dependent DOM-index loop. Running that blind voids real
+        //    settlements, so until it's verified against a live contact that actually
+        //    has pending settlements, ANY contact with scheduled settlements is routed
+        //    to manual review instead of auto-voiding. Implement voidSettlements() and
+        //    drop this gate once we can record the settlement table on a real cancel.)
+        if ($settlements > 0) {
+            return [
+                'status' => 'manual_audit',
+                'message' => $balance >= $settlements
+                    ? 'balance >= scheduled settlements; manual review required'
+                    : 'pending settlements present; auto-void not yet verified — manual review',
+            ];
+        }
+
+        // 3) EPF capture. If this fails we do NOT proceed to the drop (the VBA
         //    swallowed the error and cancelled anyway — we refuse, so we never
         //    cancel a contact whose EPF wasn't captured).
         if ($balance > 0 && $epf > 0) {
@@ -149,22 +170,6 @@ final class DppSeleniumService
                     previous: $e,
                 );
             }
-        }
-
-        // 3) Pending settlements.
-        //    SAFETY GATE: the VBA auto-voids partially-paid settlements here via a
-        //    deeply position-dependent DOM-index loop. Running that blind voids real
-        //    settlements, so until it's verified against a live contact that actually
-        //    has pending settlements, ANY contact with scheduled settlements is routed
-        //    to manual review instead of auto-voiding. (Implement voidSettlements()
-        //    and drop this gate once we can record the settlement table on a real cancel.)
-        if ($settlements > 0) {
-            return [
-                'status' => 'manual_audit',
-                'message' => $balance >= $settlements
-                    ? 'balance >= scheduled settlements; manual review required'
-                    : 'pending settlements present; auto-void not yet verified — manual review',
-            ];
         }
 
         // 4) Re-confirm the cancel button is still present, then drop.
