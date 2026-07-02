@@ -508,7 +508,7 @@ class GenerateRetentionCommissionReport extends Command
 
             $sp->setActiveSheetIndex(0);
 
-            $filename = "Retention Commission ({$display}) - All.xlsx";
+            $filename = "Retention Commission ({$display}).xlsx";
             $path     = storage_path("app/{$filename}");
             (new Xlsx($sp))->save($path);
 
@@ -634,8 +634,8 @@ class GenerateRetentionCommissionReport extends Command
 
     private function sendReport(array $file, string $display): void
     {
-        $subject = "Retention Commission Report - $display - All";
-        $body    = "See attached Retention Commission Report - $display - All";
+        $subject = "Retention Commission Report - $display";
+        $body    = "See attached Retention Commission Report - $display";
         $att     = [
             'name'         => $file['filename'],
             'contentType'  => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
