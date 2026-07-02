@@ -262,6 +262,11 @@ class GenerateRetentionCommissionReport extends Command
         $cr = (int) $cfg['custom_results'];
         $cc = (int) $cfg['cancel_request_custom'];
 
+        // Detail report uses the union of LDR + PL configured retention agents.
+        // - Prevents the Snowflake source from leaking unconfigured agents
+        //   (e.g. "WENDY KAZEM" observed in earlier generated files).
+        // - Allows LDR detail to legitimately include PL agents like
+        //   "ALEXANDER MALONE" because Jacob's LDR sample file does the same.
         $allowedAgents = array_unique(array_merge(
             self::SOURCE_CONFIG['ldr']['agents'] ?? [],
             self::SOURCE_CONFIG['plaw']['agents'] ?? []
@@ -272,33 +277,35 @@ class GenerateRetentionCommissionReport extends Command
         ));
 
         $sql = "
-            SELECT *
-            FROM (
-                SELECT
-                    c.ID,
-                    CONCAT(c.FIRSTNAME,' ',c.LASTNAME)                       AS CLIENT,
-                    MAX(CASE WHEN cu.CUSTOM_ID = $ca THEN cu.F_STRING END)   AS RETENTION_AGENT,
-                    MAX(CASE WHEN cu.CUSTOM_ID = $cd THEN LEFT(cu.F_DATE,10) END) AS RETENTION_DATE,
-                    MAX(CASE WHEN cu.CUSTOM_ID = $cr THEN cu.F_STRING END)   AS IMMEDIATE_RESULTS,
-                    d.ENROLLED_DEBT,
-                    LEFT(c.DROPPED_DATE, 10)                                 AS DROPPED_DATE,
-                    MAX(CASE WHEN cu.CUSTOM_ID = $cc
-                             THEN TO_VARCHAR(TO_DATE(cu.F_DATETIME), 'YYYY-MM-DD') END) AS CANCEL_REQUEST_DATE
-                FROM CONTACTS c
-                LEFT JOIN CONTACTS_USERFIELDS cu
-                       ON cu.CONTACT_ID = c.ID
-                      AND cu.CUSTOM_ID IN ($ca, $cd, $cr, $cc)
-                LEFT JOIN (
-                    SELECT CONTACT_ID, SUM(ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT
-                    FROM DEBTS
-                    WHERE ENROLLED=1 AND _FIVETRAN_DELETED=FALSE
-                    GROUP BY CONTACT_ID
-                ) d ON c.ID = d.CONTACT_ID
-                GROUP BY c.ID, c.FIRSTNAME, c.LASTNAME, c.DROPPED_DATE, d.ENROLLED_DEBT
-            ) base
-            WHERE RETENTION_AGENT IS NOT NULL
-              AND UPPER(RETENTION_AGENT) IN ($agentListUpper)
-            ORDER BY RETENTION_AGENT ASC
+            SELECT
+                c.ID,
+                CONCAT(c.FIRSTNAME,' ',c.LASTNAME)                     AS CLIENT,
+                cu1.F_STRING                                           AS RETENTION_AGENT,
+                LEFT(cu2.F_DATE, 10)                                   AS RETENTION_DATE,
+                cu3.F_STRING                                           AS IMMEDIATE_RESULTS,
+                d.ENROLLED_DEBT,
+                LEFT(c.DROPPED_DATE, 10)                               AS DROPPED_DATE,
+                TO_VARCHAR(TO_DATE(cu4.F_DATETIME), 'YYYY-MM-DD')      AS CANCEL_REQUEST_DATE
+            FROM CONTACTS c
+            LEFT JOIN CONTACTS_USERFIELDS cu1
+                   ON cu1.CONTACT_ID = c.ID AND cu1.CUSTOM_ID = $ca
+            LEFT JOIN (
+                SELECT CONTACT_ID, F_DATE
+                FROM CONTACTS_USERFIELDS
+                WHERE CUSTOM_ID = $cd
+            ) cu2 ON c.ID = cu2.CONTACT_ID
+            LEFT JOIN CONTACTS_USERFIELDS cu3
+                   ON cu3.CONTACT_ID = c.ID AND cu3.CUSTOM_ID = $cr
+            LEFT JOIN CONTACTS_USERFIELDS cu4
+                   ON cu4.CONTACT_ID = c.ID AND cu4.CUSTOM_ID = $cc
+            LEFT JOIN (
+                SELECT CONTACT_ID, SUM(ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT
+                FROM DEBTS
+                WHERE ENROLLED=1 AND _FIVETRAN_DELETED=FALSE
+                GROUP BY CONTACT_ID
+            ) d ON c.ID = d.CONTACT_ID
+            WHERE UPPER(cu1.F_STRING) IN ($agentListUpper)
+            ORDER BY cu1.F_STRING ASC
         ";
 
         return $sf->query($sql)['data'] ?? [];
@@ -503,15 +510,17 @@ class GenerateRetentionCommissionReport extends Command
     /**
      * Replicates the Commission Summary sheet formulas in PHP.
      *
-     * Assigned  = rows where cancel_request_date falls in period
-     * Retained  = rows where retention_date falls in period
-     * Tier      = 0 if pct<20%, 1 if <35%, 2 if <50%, 3 otherwise
-     * Commission= sum of T{tier} for rows where retention_payment_date falls in period
+     * Assigned   = rows where cancel_request_date falls in period
+     * Retained   = rows where retention_date falls in period
+     * Tier       = 0 if pct<20%, 1 if <35%, 2 if <50%,
+     *              3 if <80% (when has_t4) or default (when no T4),
+     *              4 if has_t4 and pct >= 80%
+     * Commission = sum of T{tier} for rows where retention_payment_date falls in period
      *
      * @param  array<int,array<string,mixed>> $rows
      * @param  string[] $agents
-     * @param  array<string,string> $locationMap
-     * @return array<string,array{assigned:int,retained:int,pct_retained:float,tier:int,commission:float}>
+     * @param  array<string,array{location:string,company:string}> $locationMap
+     * @return array<string,array{assigned:int,retained:int,pct_retained:float,tier:int,commission:float,location:string,company:string}>
      */
     private function buildSummary(array $rows, array $agents, string $startDate, string $endDate, array $locationMap = [], bool $hasT4 = false): array
     {
