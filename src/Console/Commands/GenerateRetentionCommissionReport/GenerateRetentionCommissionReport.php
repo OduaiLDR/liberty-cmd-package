@@ -45,10 +45,17 @@ class GenerateRetentionCommissionReport extends Command
             'recon_status_id'       => 377650,
             'cancel_request_custom' => 742098,
             'has_t4'                => true,
+            // Summary agents (drives Commission Summary sheet rows and Location/Company lookup).
             'agents' => [
                 'Alice Kennedy', 'Andrea Mendoza', 'Gracia Rivera', 'Javier Deras',
                 'John Pozuelos', 'Jose Melgar', 'Ken Smith', 'Marco Gonzalez',
                 'Mike Wexford', 'Rick Mills',
+            ],
+            // Agents explicitly excluded from the Retention Commission Report sheet.
+            // Blacklist approach (vs. whitelist) so we don't drop valid agents we
+            // don't know about. Add here only if a name should never appear.
+            'excluded_agents' => [
+                'WENDY KAZEM',
             ],
         ],
         'plaw' => [
@@ -63,6 +70,9 @@ class GenerateRetentionCommissionReport extends Command
                 'Alexander Malone', 'Andrea Galvez', 'Edgar Gonzalez', 'Maria Lezana',
                 'Melody Martinez', 'Nick Jones', 'Theo Clayton', 'Tony Walker',
                 'Vicente Gonzalez', 'Alfred Brown',
+            ],
+            'excluded_agents' => [
+                // None confirmed yet. Add only known-bad names here.
             ],
         ],
     ];
@@ -262,19 +272,19 @@ class GenerateRetentionCommissionReport extends Command
         $cr = (int) $cfg['custom_results'];
         $cc = (int) $cfg['cancel_request_custom'];
 
-        // Detail report uses the union of LDR + PL configured retention agents.
-        // - Prevents the Snowflake source from leaking unconfigured agents
-        //   (e.g. "WENDY KAZEM" observed in earlier generated files).
-        // - Allows LDR detail to legitimately include PL agents like
-        //   "ALEXANDER MALONE" because Jacob's LDR sample file does the same.
-        $allowedAgents = array_unique(array_merge(
-            self::SOURCE_CONFIG['ldr']['agents'] ?? [],
-            self::SOURCE_CONFIG['plaw']['agents'] ?? []
-        ));
-        $agentListUpper = implode(',', array_map(
-            fn ($a) => "'" . str_replace("'", "''", strtoupper((string) $a)) . "'",
-            $allowedAgents
-        ));
+        // Detail report uses a blacklist (excluded_agents) rather than a whitelist,
+        // so unknown-but-valid agents (legacy LDR names, additional PL names) still
+        // appear in the report. Add known-bad names (e.g. "WENDY KAZEM") to
+        // excluded_agents in the source config.
+        $excludedAgents = $cfg['excluded_agents'] ?? [];
+        $excludeSql = '';
+        if (!empty($excludedAgents)) {
+            $excludedListUpper = implode(',', array_map(
+                fn ($a) => "'" . str_replace("'", "''", strtoupper((string) $a)) . "'",
+                $excludedAgents
+            ));
+            $excludeSql = "AND UPPER(cu1.F_STRING) NOT IN ($excludedListUpper)";
+        }
 
         $sql = "
             SELECT
@@ -304,7 +314,10 @@ class GenerateRetentionCommissionReport extends Command
                 WHERE ENROLLED=1 AND _FIVETRAN_DELETED=FALSE
                 GROUP BY CONTACT_ID
             ) d ON c.ID = d.CONTACT_ID
-            WHERE UPPER(cu1.F_STRING) IN ($agentListUpper)
+            WHERE cu1.CONTACT_ID IS NOT NULL
+              AND cu3.CONTACT_ID IS NOT NULL
+              AND cu4.CONTACT_ID IS NOT NULL
+              $excludeSql
             ORDER BY cu1.F_STRING ASC
         ";
 
