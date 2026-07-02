@@ -136,8 +136,10 @@ class SyncDebtAccounts extends Command
 
     protected function fetchMissingEnrollmentIds(DBConnector $connector): array
     {
-        // Fetch rows missing the count, missing the amount, or where debt is not yet locked
-        // (debt locks once first payment is attempted: status = 'Cleared' or 'Returned')
+        // Fetch rows missing the count, missing the amount, or where debt is not yet locked.
+        // Debt_Amount locks once First_Payment_Cleared_Date is set (payment cleared = attempted).
+        // We use the cleared date as the lock signal rather than status strings,
+        // because status can have non-standard values ('Returned / NSF', 'Unauth Return', etc.)
         $sql = <<<SQL
 SELECT LLG_ID
 FROM TblEnrollment
@@ -145,7 +147,7 @@ WHERE Category IN ('LDR', 'CCS')
   AND (
     Enrolled_Debt_Accounts IS NULL
     OR Debt_Amount IS NULL
-    OR COALESCE(First_Payment_Status, '') NOT IN ('Cleared', 'Returned')
+    OR First_Payment_Cleared_Date IS NULL
   )
 SQL;
 
@@ -283,7 +285,9 @@ SQL;
                 $debtValue  = $data['debt'] ?? null;
 
                 $countCases[] = "WHEN '{$llgEsc}' THEN {$countValue}";
-                $debtCases[]  = "WHEN '{$llgEsc}' THEN " . ($debtValue !== null ? $debtValue : 'NULL');
+                // Only write Debt_Amount when Snowflake returns a positive value;
+                // zero means no enrolled debt amount recorded — leave existing value intact
+                $debtCases[]  = "WHEN '{$llgEsc}' THEN " . ($debtValue !== null && $debtValue > 0 ? $debtValue : 'NULL');
                 $ids[]        = "'{$llgEsc}'";
             }
 
@@ -299,7 +303,7 @@ SQL;
 UPDATE TblEnrollment
 SET Enrolled_Debt_Accounts = CASE LLG_ID {$countSql} END,
     Debt_Amount            = CASE
-        WHEN COALESCE(First_Payment_Status, '') NOT IN ('Cleared', 'Returned')
+        WHEN First_Payment_Cleared_Date IS NULL
         THEN CASE LLG_ID {$debtSql} END
         ELSE Debt_Amount
     END
