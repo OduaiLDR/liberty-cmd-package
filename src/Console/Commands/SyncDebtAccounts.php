@@ -136,10 +136,9 @@ class SyncDebtAccounts extends Command
 
     protected function fetchMissingEnrollmentIds(DBConnector $connector): array
     {
-        // Fetch rows missing the count, missing the amount, or where debt is not yet locked.
-        // Debt_Amount locks once First_Payment_Cleared_Date is set (payment cleared = attempted).
-        // We use the cleared date as the lock signal rather than status strings,
-        // because status can have non-standard values ('Returned / NSF', 'Unauth Return', etc.)
+        // Debt_Amount locks once the first payment is attempted (cleared OR returned/NSF).
+        // "Attempted" = FPCD is set (cleared) OR status is not NULL/Pending (returned/NSF).
+        // Pending and NULL status = payment not yet tried = still updatable.
         $sql = <<<SQL
 SELECT LLG_ID
 FROM TblEnrollment
@@ -148,7 +147,10 @@ WHERE Category IN ('LDR', 'CCS')
     Enrolled_Debt_Accounts IS NULL
     OR Debt_Amount IS NULL
     OR ISNULL(Debt_Amount, 0) = 0
-    OR First_Payment_Cleared_Date IS NULL
+    OR (
+      First_Payment_Cleared_Date IS NULL
+      AND (First_Payment_Status IS NULL OR First_Payment_Status = 'Pending')
+    )
   )
 SQL;
 
@@ -304,7 +306,11 @@ SQL;
 UPDATE TblEnrollment
 SET Enrolled_Debt_Accounts = CASE LLG_ID {$countSql} END,
     Debt_Amount            = CASE
-        WHEN First_Payment_Cleared_Date IS NULL OR ISNULL(Debt_Amount, 0) = 0
+        WHEN ISNULL(Debt_Amount, 0) = 0
+          OR (
+            First_Payment_Cleared_Date IS NULL
+            AND (First_Payment_Status IS NULL OR First_Payment_Status = 'Pending')
+          )
         THEN CASE LLG_ID {$debtSql} END
         ELSE Debt_Amount
     END
