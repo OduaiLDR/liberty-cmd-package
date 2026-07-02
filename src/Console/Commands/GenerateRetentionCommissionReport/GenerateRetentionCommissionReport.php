@@ -44,10 +44,11 @@ class GenerateRetentionCommissionReport extends Command
             'custom_results'        => 742105,
             'recon_status_id'       => 377650,
             'cancel_request_custom' => 742098,
-            'has_t4'                => false,
+            'has_t4'                => true,
             'agents' => [
-                'Mike Wexford', 'Ivy Morgan', 'Laura Brown', 'Ken Smith',
-                'Jose Chocano', 'John Pozuelos', 'Kevin Nixon', 'Alice Kennedy',
+                'Alice Kennedy', 'Andrea Mendoza', 'Gracia Rivera', 'Javier Deras',
+                'John Pozuelos', 'Jose Melgar', 'Ken Smith', 'Marco Gonzalez',
+                'Mike Wexford', 'Rick Mills',
             ],
         ],
         'plaw' => [
@@ -226,8 +227,8 @@ class GenerateRetentionCommissionReport extends Command
 
             $this->info("[INFO] [$display] Rows after processing: " . count($rows));
 
-            // ── STEP 6: fetch agent locations from SQL Server
-            $locationMap = [];
+            // ── STEP 6: fetch agent location/company from SQL Server
+            $locationMap = $this->fetchLocationMap($sql, $cfg['agents']);
 
             // ── STEP 7: build workbook with both sheets
             $file = $this->buildWorkbook($rows, $cfg, $display, $startDate, $endDate, $locationMap);
@@ -442,11 +443,11 @@ class GenerateRetentionCommissionReport extends Command
             $sheet2->setTitle('Commission Summary');
             $sheet2->setShowGridlines(false);
 
-            $sumHeaders = ['Retention Agent', 'Assigned', 'Retained', '% Retained', 'Tier', 'Commission'];
+            $sumHeaders = ['Retention Agent', 'Assigned', 'Retained', '% Retained', 'Tier', 'Commission', 'Location', 'Company'];
             foreach ($sumHeaders as $i => $h) {
                 $sheet2->setCellValue(chr(65 + $i) . '1', $h);
             }
-            $this->headerStyle($sheet2, 'A1:F1');
+            $this->headerStyle($sheet2, 'A1:H1');
 
             $agents      = $cfg['agents'];
             $summaryRows = $this->buildSummary($rows, $agents, $startDate, $endDate, $locationMap);
@@ -459,6 +460,8 @@ class GenerateRetentionCommissionReport extends Command
                 $sheet2->setCellValue("D$r2", $sum['pct_retained']);
                 $sheet2->setCellValue("E$r2", $sum['tier']);
                 $sheet2->setCellValue("F$r2", $sum['commission']);
+                $sheet2->setCellValue("G$r2", $sum['location']);
+                $sheet2->setCellValue("H$r2", $sum['company']);
                 $r2++;
             }
 
@@ -466,12 +469,12 @@ class GenerateRetentionCommissionReport extends Command
             $sheet2->getStyle("D2:D{$last2}")->getNumberFormat()->setFormatCode('0%');
             $sheet2->getStyle("F2:F{$last2}")->getNumberFormat()->setFormatCode('$#,##0');
             if ($last2 > 1) {
-                $sheet2->getStyle("A1:F{$last2}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
+                $sheet2->getStyle("A1:H{$last2}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
             }
-            foreach (range('A', 'F') as $c) {
+            foreach (range('A', 'H') as $c) {
                 $sheet2->getColumnDimension($c)->setAutoSize(true);
             }
-            $sheet2->getStyle("A1:F{$last2}")->getFont()->setName('Calibri')->setSize(9);
+            $sheet2->getStyle("A1:H{$last2}")->getFont()->setName('Calibri')->setSize(9);
             $sheet2->freezePane('A2');
             $sheet2->setSelectedCells('A1');
 
@@ -559,8 +562,22 @@ class GenerateRetentionCommissionReport extends Command
                 'pct_retained'=> $pct,
                 'tier'        => $tier,
                 'commission'  => $commission,
+                'location'    => $locationMap[$agentUpper]['location'] ?? '',
+                'company'     => $locationMap[$agentUpper]['company'] ?? '',
             ];
         }
+
+        uksort($summary, function (string $a, string $b) use ($summary): int {
+            return [
+                $summary[$a]['location'],
+                $summary[$a]['company'],
+                $a,
+            ] <=> [
+                $summary[$b]['location'],
+                $summary[$b]['company'],
+                $b,
+            ];
+        });
 
         return $summary;
     }
@@ -678,12 +695,15 @@ class GenerateRetentionCommissionReport extends Command
         }
         $list = implode(',', array_map(fn ($a) => "'" . str_replace("'", "''", $a) . "'", $agents));
         $res  = $sql->querySqlServer(
-            "SELECT Employee_Name, Location FROM TblEmployees WHERE Employee_Name IN ($list)"
+            "SELECT Employee_Name, Location, Company FROM TblEmployees WHERE Employee_Name IN ($list)"
         );
         $map = [];
         foreach ($res['data'] ?? [] as $row) {
             $name = strtoupper((string) ($row['Employee_Name'] ?? $row['employee_name'] ?? ''));
-            $map[$name] = (string) ($row['Location'] ?? $row['location'] ?? '');
+            $map[$name] = [
+                'location' => (string) ($row['Location'] ?? $row['location'] ?? ''),
+                'company' => (string) ($row['Company'] ?? $row['company'] ?? ''),
+            ];
         }
         return $map;
     }

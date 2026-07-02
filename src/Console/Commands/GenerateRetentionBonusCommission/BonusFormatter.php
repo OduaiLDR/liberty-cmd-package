@@ -23,9 +23,9 @@ class BonusFormatter
 
     /**
      * @param array<int,array<string,mixed>> $rows
-     * @param array<string,string> $locationMap  UPPER(agent_name) => location
+     * @param array<string,array{location:string,company:string}> $employeeMap  UPPER(agent_name) => employee data
      */
-    public function buildWorkbook(array $rows, string $source, string $start, string $end, array $locationMap = []): ?array
+    public function buildWorkbook(array $rows, string $source, string $start, string $end, array $employeeMap = []): ?array
     {
         try {
             $sp    = new Spreadsheet();
@@ -98,7 +98,6 @@ class BonusFormatter
             $sheet->freezePane('A2');
             $sheet->setSelectedCells('A1');
 
-            /* Summary sheet retained for future use. Disabled to match VBA bonus report output.
             // -- Summary sheet --------------------------------------------------
             $summary = $sp->createSheet();
             $summary->setTitle('Agent Summary');
@@ -107,37 +106,53 @@ class BonusFormatter
             $summary->setCellValue('A1', 'Retention Agent');
             $summary->setCellValue('B1', 'Total Commission');
             $summary->setCellValue('C1', 'Location');
-            $this->applyHeaderStyle($summary, 'A1:C1');
+            $summary->setCellValue('D1', 'Company');
+            $this->applyHeaderStyle($summary, 'A1:D1');
 
             // Aggregate commission per retention agent
             $agentTotals = [];
             foreach ($rows as $row) {
                 $agentName = (string) ($row['RETENTION_AGENT'] ?? '');
                 $comm      = (float)  ($row['RETENTION_COMMISSION'] ?? 0);
-                $agentTotals[$agentName] = ($agentTotals[$agentName] ?? 0.0) + $comm;
+                $key = strtoupper($agentName);
+                $agentTotals[$agentName] = [
+                    'commission' => ($agentTotals[$agentName]['commission'] ?? 0.0) + $comm,
+                    'location' => $employeeMap[$key]['location'] ?? '',
+                    'company' => $employeeMap[$key]['company'] ?? '',
+                ];
             }
-            arsort($agentTotals);
+            uasort($agentTotals, fn ($a, $b) => [$a['location'], $a['company']] <=> [$b['location'], $b['company']]);
+            $agentNames = array_keys($agentTotals);
+            usort($agentNames, fn ($a, $b) => [
+                $agentTotals[$a]['location'],
+                $agentTotals[$a]['company'],
+                $a,
+            ] <=> [
+                $agentTotals[$b]['location'],
+                $agentTotals[$b]['company'],
+                $b,
+            ]);
 
             $sr = 2;
-            foreach ($agentTotals as $agentName => $total) {
+            foreach ($agentNames as $agentName) {
                 $summary->setCellValue("A{$sr}", $agentName);
-                $summary->setCellValue("B{$sr}", round($total, 2, PHP_ROUND_HALF_EVEN));
-                $summary->setCellValue("C{$sr}", $locationMap[strtoupper($agentName)] ?? '');
+                $summary->setCellValue("B{$sr}", round($agentTotals[$agentName]['commission'], 2, PHP_ROUND_HALF_EVEN));
+                $summary->setCellValue("C{$sr}", $agentTotals[$agentName]['location']);
+                $summary->setCellValue("D{$sr}", $agentTotals[$agentName]['company']);
                 $sr++;
             }
 
             $lastSr = max($sr - 1, 1);
             $summary->getStyle("B2:B{$lastSr}")->getNumberFormat()->setFormatCode(self::MONEY2_FMT);
             if ($lastSr > 1) {
-                $summary->getStyle("A1:C{$lastSr}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
+                $summary->getStyle("A1:D{$lastSr}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
             }
-            foreach (['A', 'B', 'C'] as $c) {
+            foreach (['A', 'B', 'C', 'D'] as $c) {
                 $summary->getColumnDimension($c)->setAutoSize(true);
             }
-            $summary->getStyle("A1:C{$lastSr}")->getFont()->setName('Calibri')->setSize(9);
+            $summary->getStyle("A1:D{$lastSr}")->getFont()->setName('Calibri')->setSize(9);
             $summary->freezePane('A2');
             $summary->setSelectedCells('A1');
-            */
 
             // Set active sheet back to data tab
             $sp->setActiveSheetIndex(0);
