@@ -40,6 +40,12 @@ class SyncFirstPaymentClearedDate extends Command
                     $this->info("[$source] Backfilled First_Payment_Status='Cleared' for {$backfilled} contacts.");
                 }
 
+                // Correct any existing contacts where FPD ended up after FPCD (impossible ordering)
+                $corrected = $this->correctFpdAfterFpcd($connector);
+                if ($corrected > 0) {
+                    $this->info("[$source] Corrected First_Payment_Date on {$corrected} contacts where FPD > FPCD.");
+                }
+
                 $this->info("[$source] Checking for previously synced payments that were returned...");
                 $reverted = $this->revertReturnedFirstPayments($connector, $source);
                 if ($reverted > 0) {
@@ -665,6 +671,27 @@ SQL;
         }
 
         return $totalFixed;
+    }
+
+    protected function correctFpdAfterFpcd(DBConnector $connector): int
+    {
+        $sql = <<<SQL
+UPDATE dbo.TblEnrollment
+SET First_Payment_Date = First_Payment_Cleared_Date
+WHERE First_Payment_Date > First_Payment_Cleared_Date
+  AND First_Payment_Cleared_Date IS NOT NULL
+  AND LLG_ID LIKE 'LLG-%'
+SQL;
+
+        $result = $connector->querySqlServer($sql);
+        if (is_array($result)) {
+            foreach (['rowCount', 'affected_rows', 'row_count'] as $key) {
+                if (isset($result[$key]) && is_numeric($result[$key])) {
+                    return (int) $result[$key];
+                }
+            }
+        }
+        return 0;
     }
 
     protected function backfillClearedStatus(DBConnector $connector): int
