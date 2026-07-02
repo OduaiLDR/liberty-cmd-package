@@ -535,15 +535,13 @@ SQL;
                 "Program_Payment = CASE LLG_ID {$caseAmountSql} END",
             ];
             if ($caseProcessDateSql !== '') {
-                $setClauses[] = "First_Payment_Date = CASE LLG_ID {$caseProcessDateSql} ELSE First_Payment_Date END";
+                // Clamp FPD to FPCD in the same expression to prevent FPD > FPCD in one pass
+                $setClauses[] = "First_Payment_Date = CASE WHEN (CASE LLG_ID {$caseProcessDateSql} ELSE First_Payment_Date END) > First_Payment_Cleared_Date THEN First_Payment_Cleared_Date ELSE (CASE LLG_ID {$caseProcessDateSql} ELSE First_Payment_Date END) END";
             }
             // Update Debt_Amount from Snowflake DEBTS only when currently NULL or 0 (locked after first payment)
             if ($caseDebtSql !== '') {
                 $setClauses[] = "Debt_Amount = CASE WHEN (Debt_Amount IS NULL OR Debt_Amount = 0) THEN CASE LLG_ID {$caseDebtSql} ELSE Debt_Amount END ELSE Debt_Amount END";
             }
-            // Guard: if First_Payment_Date somehow ended up after First_Payment_Cleared_Date, correct it
-            // by pulling it back to match the cleared date (impossible for payment date to be after cleared date)
-            $setClauses[] = "First_Payment_Date = CASE WHEN First_Payment_Date > First_Payment_Cleared_Date THEN First_Payment_Cleared_Date ELSE First_Payment_Date END";
             $setSql = implode(",\n    ", $setClauses);
 
             $sql = <<<SQL
