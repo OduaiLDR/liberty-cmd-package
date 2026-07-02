@@ -128,7 +128,6 @@ class SyncLastDepositDate extends Command
             WHERE Category = '{$this->category}'
               AND Last_Deposit_Date IS NULL
               AND First_Payment_Cleared_Date IS NOT NULL
-              AND COALESCE(Payments, 0) > 0
         ";
 
         $result = $connector->querySqlServer($sql);
