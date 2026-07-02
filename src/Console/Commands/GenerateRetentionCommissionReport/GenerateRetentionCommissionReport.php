@@ -266,8 +266,8 @@ class GenerateRetentionCommissionReport extends Command
             self::SOURCE_CONFIG['ldr']['agents'] ?? [],
             self::SOURCE_CONFIG['plaw']['agents'] ?? []
         ));
-        $agentList = implode(',', array_map(
-            fn ($a) => "'" . str_replace("'", "''", (string) $a) . "'",
+        $agentListUpper = implode(',', array_map(
+            fn ($a) => "'" . str_replace("'", "''", strtoupper((string) $a)) . "'",
             $allowedAgents
         ));
 
@@ -296,7 +296,8 @@ class GenerateRetentionCommissionReport extends Command
                 ) d ON c.ID = d.CONTACT_ID
                 GROUP BY c.ID, c.FIRSTNAME, c.LASTNAME, c.DROPPED_DATE, d.ENROLLED_DEBT
             ) base
-            WHERE RETENTION_AGENT IN ($agentList)
+            WHERE RETENTION_AGENT IS NOT NULL
+              AND UPPER(RETENTION_AGENT) IN ($agentListUpper)
             ORDER BY RETENTION_AGENT ASC
         ";
 
