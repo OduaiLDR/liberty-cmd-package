@@ -303,7 +303,7 @@ SQL;
 UPDATE TblEnrollment
 SET Enrolled_Debt_Accounts = CASE LLG_ID {$countSql} END,
     Debt_Amount            = CASE
-        WHEN First_Payment_Cleared_Date IS NULL
+        WHEN First_Payment_Cleared_Date IS NULL OR ISNULL(Debt_Amount, 0) = 0
         THEN CASE LLG_ID {$debtSql} END
         ELSE Debt_Amount
     END
