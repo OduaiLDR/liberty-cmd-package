@@ -147,6 +147,7 @@ WHERE Category IN ('LDR', 'CCS')
   AND (
     Enrolled_Debt_Accounts IS NULL
     OR Debt_Amount IS NULL
+    OR ISNULL(Debt_Amount, 0) = 0
     OR First_Payment_Cleared_Date IS NULL
   )
 SQL;
