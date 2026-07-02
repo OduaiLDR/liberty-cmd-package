@@ -65,7 +65,7 @@ class GenerateRetentionCommissionReport extends Command
             'custom_results'        => 742106,
             'recon_status_id'       => 377687,
             'cancel_request_custom' => 742100,
-            'has_t4'                => false,
+            'has_t4'                => true,
             'agents' => [
                 'Alexander Malone', 'Andrea Galvez', 'Edgar Gonzalez', 'Maria Lezana',
                 'Melody Martinez', 'Nick Jones', 'Theo Clayton', 'Tony Walker',
@@ -123,6 +123,19 @@ class GenerateRetentionCommissionReport extends Command
         try {
             // ── STEP 1: base rows (no date filter — VBA doesn't filter by date on initial query)
             $rows = $this->fetchBase($sf, $cfg);
+
+            // Normalize known misspellings from the source so they line up with the
+            // configured agent list (e.g. "ANDREA MENDOZE" -> "ANDREA MENDOZA").
+            // Forth will be corrected going forward; this keeps historical data
+            // attributable to the same agent.
+            foreach ($rows as &$row) {
+                $agent = strtoupper((string) $this->col($row, 'RETENTION_AGENT', ''));
+                if ($agent === 'ANDREA MENDOZE') {
+                    $row['RETENTION_AGENT'] = 'ANDREA MENDOZA';
+                }
+            }
+            unset($row);
+
             $this->info("[INFO] [$display] Base rows: " . count($rows));
 
             if (empty($rows)) {
