@@ -44,10 +44,11 @@ class GenerateRetentionCommissionReport extends Command
             'custom_results'        => 742105,
             'recon_status_id'       => 377650,
             'cancel_request_custom' => 742098,
-            'has_t4'                => false,
+            'has_t4'                => true,
             'agents' => [
-                'Mike Wexford', 'Ivy Morgan', 'Laura Brown', 'Ken Smith',
-                'Jose Chocano', 'John Pozuelos', 'Kevin Nixon', 'Alice Kennedy',
+                'Alice Kennedy', 'Andrea Mendoza', 'Gracia Rivera', 'Javier Deras',
+                'John Pozuelos', 'Jose Melgar', 'Ken Smith', 'Marco Gonzalez',
+                'Mike Wexford', 'Rick Mills',
             ],
         ],
         'plaw' => [
@@ -59,7 +60,7 @@ class GenerateRetentionCommissionReport extends Command
             'cancel_request_custom' => 742100,
             'has_t4'                => false,
             'agents' => [
-                'Alexander Malone', 'Andrea Galves', 'Edgar Gonzalez', 'Maria Lezana',
+                'Alexander Malone', 'Andrea Galvez', 'Edgar Gonzalez', 'Maria Lezana',
                 'Melody Martinez', 'Nick Jones', 'Theo Clayton', 'Tony Walker',
                 'Vicente Gonzalez', 'Alfred Brown',
             ],
@@ -226,8 +227,8 @@ class GenerateRetentionCommissionReport extends Command
 
             $this->info("[INFO] [$display] Rows after processing: " . count($rows));
 
-            // ── STEP 6: fetch agent locations from SQL Server
-            $locationMap = [];
+            // ── STEP 6: fetch agent location/company from SQL Server
+            $locationMap = $this->fetchLocationMap($sql, $cfg['agents']);
 
             // ── STEP 7: build workbook with both sheets
             $file = $this->buildWorkbook($rows, $cfg, $display, $startDate, $endDate, $locationMap);
@@ -261,35 +262,39 @@ class GenerateRetentionCommissionReport extends Command
         $cr = (int) $cfg['custom_results'];
         $cc = (int) $cfg['cancel_request_custom'];
 
+        $allowedAgents = array_unique(array_merge(
+            self::SOURCE_CONFIG['ldr']['agents'] ?? [],
+            self::SOURCE_CONFIG['plaw']['agents'] ?? []
+        ));
+        $agentList = implode(',', array_map(
+            fn ($a) => "'" . str_replace("'", "''", (string) $a) . "'",
+            $allowedAgents
+        ));
+
         $sql = "
             SELECT
                 c.ID,
-                CONCAT(c.FIRSTNAME,' ',c.LASTNAME)                     AS CLIENT,
-                cu1.F_STRING                                           AS RETENTION_AGENT,
-                LEFT(cu2.F_DATE, 10)                                   AS RETENTION_DATE,
-                cu3.F_STRING                                           AS IMMEDIATE_RESULTS,
+                CONCAT(c.FIRSTNAME,' ',c.LASTNAME)                       AS CLIENT,
+                MAX(CASE WHEN cu.CUSTOM_ID = $ca THEN cu.F_STRING END)   AS RETENTION_AGENT,
+                MAX(CASE WHEN cu.CUSTOM_ID = $cd THEN LEFT(cu.F_DATE,10) END) AS RETENTION_DATE,
+                MAX(CASE WHEN cu.CUSTOM_ID = $cr THEN cu.F_STRING END)   AS IMMEDIATE_RESULTS,
                 d.ENROLLED_DEBT,
-                LEFT(c.DROPPED_DATE, 10)                               AS DROPPED_DATE,
-                TO_VARCHAR(TO_DATE(cu4.F_DATETIME), 'YYYY-MM-DD')      AS CANCEL_REQUEST_DATE
+                LEFT(c.DROPPED_DATE, 10)                                 AS DROPPED_DATE,
+                MAX(CASE WHEN cu.CUSTOM_ID = $cc
+                         THEN TO_VARCHAR(TO_DATE(cu.F_DATETIME), 'YYYY-MM-DD') END) AS CANCEL_REQUEST_DATE
             FROM CONTACTS c
-            LEFT JOIN CONTACTS_USERFIELDS cu1 ON c.ID = cu1.CONTACT_ID
-            LEFT JOIN (
-                SELECT CONTACT_ID, F_DATE
-                FROM CONTACTS_USERFIELDS
-                WHERE CUSTOM_ID = $cd
-            ) cu2 ON c.ID = cu2.CONTACT_ID
-            LEFT JOIN CONTACTS_USERFIELDS cu3 ON c.ID = cu3.CONTACT_ID
-            LEFT JOIN CONTACTS_USERFIELDS cu4 ON c.ID = cu4.CONTACT_ID
+            LEFT JOIN CONTACTS_USERFIELDS cu
+                   ON cu.CONTACT_ID = c.ID
+                  AND cu.CUSTOM_ID IN ($ca, $cd, $cr, $cc)
             LEFT JOIN (
                 SELECT CONTACT_ID, SUM(ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT
                 FROM DEBTS
                 WHERE ENROLLED=1 AND _FIVETRAN_DELETED=FALSE
                 GROUP BY CONTACT_ID
             ) d ON c.ID = d.CONTACT_ID
-            WHERE cu1.CUSTOM_ID = $ca
-              AND cu3.CUSTOM_ID = $cr
-              AND cu4.CUSTOM_ID = $cc
-            ORDER BY cu1.F_STRING ASC
+            WHERE MAX(CASE WHEN cu.CUSTOM_ID = $ca THEN cu.F_STRING END) IN ($agentList)
+            GROUP BY c.ID, c.FIRSTNAME, c.LASTNAME, c.DROPPED_DATE, d.ENROLLED_DEBT
+            ORDER BY RETENTION_AGENT ASC
         ";
 
         return $sf->query($sql)['data'] ?? [];
@@ -442,14 +447,14 @@ class GenerateRetentionCommissionReport extends Command
             $sheet2->setTitle('Commission Summary');
             $sheet2->setShowGridlines(false);
 
-            $sumHeaders = ['Retention Agent', 'Assigned', 'Retained', '% Retained', 'Tier', 'Commission'];
+            $sumHeaders = ['Retention Agent', 'Assigned', 'Retained', '% Retained', 'Tier', 'Commission', 'Location', 'Company'];
             foreach ($sumHeaders as $i => $h) {
                 $sheet2->setCellValue(chr(65 + $i) . '1', $h);
             }
-            $this->headerStyle($sheet2, 'A1:F1');
+            $this->headerStyle($sheet2, 'A1:H1');
 
             $agents      = $cfg['agents'];
-            $summaryRows = $this->buildSummary($rows, $agents, $startDate, $endDate, $locationMap);
+            $summaryRows = $this->buildSummary($rows, $agents, $startDate, $endDate, $locationMap, $hasT4);
 
             $r2 = 2;
             foreach ($summaryRows as $agentName => $sum) {
@@ -459,6 +464,8 @@ class GenerateRetentionCommissionReport extends Command
                 $sheet2->setCellValue("D$r2", $sum['pct_retained']);
                 $sheet2->setCellValue("E$r2", $sum['tier']);
                 $sheet2->setCellValue("F$r2", $sum['commission']);
+                $sheet2->setCellValue("G$r2", $sum['location']);
+                $sheet2->setCellValue("H$r2", $sum['company']);
                 $r2++;
             }
 
@@ -466,12 +473,12 @@ class GenerateRetentionCommissionReport extends Command
             $sheet2->getStyle("D2:D{$last2}")->getNumberFormat()->setFormatCode('0%');
             $sheet2->getStyle("F2:F{$last2}")->getNumberFormat()->setFormatCode('$#,##0');
             if ($last2 > 1) {
-                $sheet2->getStyle("A1:F{$last2}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
+                $sheet2->getStyle("A1:H{$last2}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
             }
-            foreach (range('A', 'F') as $c) {
+            foreach (range('A', 'H') as $c) {
                 $sheet2->getColumnDimension($c)->setAutoSize(true);
             }
-            $sheet2->getStyle("A1:F{$last2}")->getFont()->setName('Calibri')->setSize(9);
+            $sheet2->getStyle("A1:H{$last2}")->getFont()->setName('Calibri')->setSize(9);
             $sheet2->freezePane('A2');
             $sheet2->setSelectedCells('A1');
 
@@ -502,7 +509,7 @@ class GenerateRetentionCommissionReport extends Command
      * @param  array<string,string> $locationMap
      * @return array<string,array{assigned:int,retained:int,pct_retained:float,tier:int,commission:float}>
      */
-    private function buildSummary(array $rows, array $agents, string $startDate, string $endDate, array $locationMap = []): array
+    private function buildSummary(array $rows, array $agents, string $startDate, string $endDate, array $locationMap = [], bool $hasT4 = false): array
     {
         $summary = [];
 
@@ -533,12 +540,7 @@ class GenerateRetentionCommissionReport extends Command
             }
 
             $pct  = ($assigned > 0) ? ($retained / $assigned) : 0.0;
-            $tier = match (true) {
-                $pct < 0.20 => 0,
-                $pct < 0.35 => 1,
-                $pct < 0.50 => 2,
-                default     => 3,
-            };
+            $tier = $this->resolveTier($pct, $hasT4);
 
             // Sum commission using the agent's tier column for rows where payment landed in period
             $tierCol = $tier > 0 ? "T$tier" : null;
@@ -559,10 +561,47 @@ class GenerateRetentionCommissionReport extends Command
                 'pct_retained'=> $pct,
                 'tier'        => $tier,
                 'commission'  => $commission,
+                'location'    => $locationMap[$agentUpper]['location'] ?? '',
+                'company'     => $locationMap[$agentUpper]['company'] ?? '',
             ];
         }
 
+        uksort($summary, function (string $a, string $b) use ($summary): int {
+            return [
+                $summary[$a]['location'],
+                $summary[$a]['company'],
+                $a,
+            ] <=> [
+                $summary[$b]['location'],
+                $summary[$b]['company'],
+                $b,
+            ];
+        });
+
         return $summary;
+    }
+
+    /**
+     * Map retention % to commission tier.
+     * T4 is only honored when source has T4 enabled.
+     */
+    private function resolveTier(float $pct, bool $hasT4): int
+    {
+        if ($hasT4) {
+            return match (true) {
+                $pct < 0.20 => 0,
+                $pct < 0.35 => 1,
+                $pct < 0.50 => 2,
+                $pct < 0.80 => 3,
+                default     => 4,
+            };
+        }
+        return match (true) {
+            $pct < 0.20 => 0,
+            $pct < 0.35 => 1,
+            $pct < 0.50 => 2,
+            default     => 3,
+        };
     }
 
     // ─── Email ────────────────────────────────────────────────────────────────
@@ -678,12 +717,15 @@ class GenerateRetentionCommissionReport extends Command
         }
         $list = implode(',', array_map(fn ($a) => "'" . str_replace("'", "''", $a) . "'", $agents));
         $res  = $sql->querySqlServer(
-            "SELECT Employee_Name, Location FROM TblEmployees WHERE Employee_Name IN ($list)"
+            "SELECT Employee_Name, Location, Company FROM TblEmployees WHERE Employee_Name IN ($list)"
         );
         $map = [];
         foreach ($res['data'] ?? [] as $row) {
             $name = strtoupper((string) ($row['Employee_Name'] ?? $row['employee_name'] ?? ''));
-            $map[$name] = (string) ($row['Location'] ?? $row['location'] ?? '');
+            $map[$name] = [
+                'location' => (string) ($row['Location'] ?? $row['location'] ?? ''),
+                'company' => (string) ($row['Company'] ?? $row['company'] ?? ''),
+            ];
         }
         return $map;
     }

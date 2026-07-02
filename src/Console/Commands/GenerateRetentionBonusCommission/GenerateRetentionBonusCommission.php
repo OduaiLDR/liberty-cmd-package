@@ -204,10 +204,10 @@ class GenerateRetentionBonusCommission extends Command
             $agentNames  = array_values(array_unique(array_filter(
                 array_map(fn ($r) => (string) ($r['RETENTION_AGENT'] ?? ''), $rows)
             )));
-            $locationMap = $this->fetchLocationMap($sql, $agentNames);
+            $employeeMap = $this->fetchEmployeeMap($sql, $agentNames);
 
             $formatter = new BonusFormatter();
-            $file = $formatter->buildWorkbook($rows, $display, $reportStartDate, $endDate, $locationMap);
+            $file = $formatter->buildWorkbook($rows, $display, $reportStartDate, $endDate, $employeeMap);
 
             if ($file) {
                 $this->info("[INFO] [$display] Workbook: {$file['filename']}");
@@ -358,19 +358,22 @@ class GenerateRetentionBonusCommission extends Command
         }
     }
 
-    private function fetchLocationMap(DBConnector $sql, array $agents): array
+    private function fetchEmployeeMap(DBConnector $sql, array $agents): array
     {
         if (empty($agents)) {
             return [];
         }
         $list = implode(',', array_map(fn ($a) => "'" . str_replace("'", "''", $a) . "'", $agents));
         $res  = $sql->querySqlServer(
-            "SELECT Employee_Name, Location FROM TblEmployees WHERE Employee_Name IN ($list)"
+            "SELECT Employee_Name, Location, Company FROM TblEmployees WHERE Employee_Name IN ($list)"
         );
         $map = [];
         foreach ($res['data'] ?? [] as $row) {
             $name       = strtoupper((string) ($row['Employee_Name'] ?? $row['employee_name'] ?? ''));
-            $map[$name] = (string) ($row['Location'] ?? $row['location'] ?? '');
+            $map[$name] = [
+                'location' => (string) ($row['Location'] ?? $row['location'] ?? ''),
+                'company' => (string) ($row['Company'] ?? $row['company'] ?? ''),
+            ];
         }
         return $map;
     }
