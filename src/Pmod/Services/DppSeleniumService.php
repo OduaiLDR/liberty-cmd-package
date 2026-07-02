@@ -155,6 +155,26 @@ final class DppSeleniumService
             ];
         }
 
+        // NARROW EPF GATE (2026-07-02): the EPF-capture path below is unverified (the
+        // "chosen" system-account picker + whether the form's Available Refund Amount
+        // reflects the just-scheduled EPF). No backlog client reaches it — every
+        // positive+EPF client has settlements and is gated above — but if one ever does,
+        // route it to manual review instead of running the unproven capture unsupervised.
+        // REMOVE this block (after validating one such cancel) to re-enable auto capture.
+        if ($balance > 0 && $epf > 0) {
+            Log::warning('DPP: EPF_UNVERIFIED — positive+EPF+no-settlement reached the capture path; routing to manual', [
+                'tenant' => $tenant,
+                'contact_id' => $contactId,
+                'balance' => $balance,
+                'epf' => $epf,
+            ]);
+
+            return [
+                'status' => 'manual_audit',
+                'message' => 'EPF_UNVERIFIED: positive balance + EPF, no settlement — capture path not yet validated; needs a supervised cancel',
+            ];
+        }
+
         // 3) EPF capture. If this fails we do NOT proceed to the drop (the VBA
         //    swallowed the error and cancelled anyway — we refuse, so we never
         //    cancel a contact whose EPF wasn't captured).

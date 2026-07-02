@@ -1120,8 +1120,13 @@ final class GenerateResumePayments extends Command
         $status = (string) ($result['status'] ?? 'failed');
 
         if ($status === 'manual_audit') {
-            $this->emailCancellationAudit($contactId);
-            $statusChanges[] = ['llg_id' => $llgId, 'name' => $name, 'status' => 'Manual Cancel Audit Required.'];
+            $reason = (string) ($result['message'] ?? 'manual review required');
+            Log::warning('ResumePayments: cancel routed to MANUAL review', [
+                'contact_id' => $contactId,
+                'reason' => $reason,
+            ]);
+            $this->emailCancellationAudit($contactId, $reason);
+            $statusChanges[] = ['llg_id' => $llgId, 'name' => $name, 'status' => 'Manual Cancel Audit Required — ' . $reason];
             return;
         }
 
@@ -1291,11 +1296,13 @@ final class GenerateResumePayments extends Command
         return $english;
     }
 
-    private function emailCancellationAudit(string $contactId): void
+    private function emailCancellationAudit(string $contactId, string $reason = ''): void
     {
+        $detail = $reason !== '' ? " Reason: {$reason}." : ' (balance + pending settlements).';
+
         (new EmailSenderService())->sendMailHtml(
             'Cancellation Audit',
-            "Client {$contactId} is pending cancellation but has a balance and pending settlements. Please review and process manually.",
+            "Client {$contactId} is pending cancellation but requires manual review.{$detail} Please review and process manually.",
             ['jennifer@libertydebtrelief.com'],
         );
     }
