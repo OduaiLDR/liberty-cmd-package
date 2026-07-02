@@ -272,28 +272,31 @@ class GenerateRetentionCommissionReport extends Command
         ));
 
         $sql = "
-            SELECT
-                c.ID,
-                CONCAT(c.FIRSTNAME,' ',c.LASTNAME)                       AS CLIENT,
-                MAX(CASE WHEN cu.CUSTOM_ID = $ca THEN cu.F_STRING END)   AS RETENTION_AGENT,
-                MAX(CASE WHEN cu.CUSTOM_ID = $cd THEN LEFT(cu.F_DATE,10) END) AS RETENTION_DATE,
-                MAX(CASE WHEN cu.CUSTOM_ID = $cr THEN cu.F_STRING END)   AS IMMEDIATE_RESULTS,
-                d.ENROLLED_DEBT,
-                LEFT(c.DROPPED_DATE, 10)                                 AS DROPPED_DATE,
-                MAX(CASE WHEN cu.CUSTOM_ID = $cc
-                         THEN TO_VARCHAR(TO_DATE(cu.F_DATETIME), 'YYYY-MM-DD') END) AS CANCEL_REQUEST_DATE
-            FROM CONTACTS c
-            LEFT JOIN CONTACTS_USERFIELDS cu
-                   ON cu.CONTACT_ID = c.ID
-                  AND cu.CUSTOM_ID IN ($ca, $cd, $cr, $cc)
-            LEFT JOIN (
-                SELECT CONTACT_ID, SUM(ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT
-                FROM DEBTS
-                WHERE ENROLLED=1 AND _FIVETRAN_DELETED=FALSE
-                GROUP BY CONTACT_ID
-            ) d ON c.ID = d.CONTACT_ID
-            WHERE MAX(CASE WHEN cu.CUSTOM_ID = $ca THEN cu.F_STRING END) IN ($agentList)
-            GROUP BY c.ID, c.FIRSTNAME, c.LASTNAME, c.DROPPED_DATE, d.ENROLLED_DEBT
+            SELECT *
+            FROM (
+                SELECT
+                    c.ID,
+                    CONCAT(c.FIRSTNAME,' ',c.LASTNAME)                       AS CLIENT,
+                    MAX(CASE WHEN cu.CUSTOM_ID = $ca THEN cu.F_STRING END)   AS RETENTION_AGENT,
+                    MAX(CASE WHEN cu.CUSTOM_ID = $cd THEN LEFT(cu.F_DATE,10) END) AS RETENTION_DATE,
+                    MAX(CASE WHEN cu.CUSTOM_ID = $cr THEN cu.F_STRING END)   AS IMMEDIATE_RESULTS,
+                    d.ENROLLED_DEBT,
+                    LEFT(c.DROPPED_DATE, 10)                                 AS DROPPED_DATE,
+                    MAX(CASE WHEN cu.CUSTOM_ID = $cc
+                             THEN TO_VARCHAR(TO_DATE(cu.F_DATETIME), 'YYYY-MM-DD') END) AS CANCEL_REQUEST_DATE
+                FROM CONTACTS c
+                LEFT JOIN CONTACTS_USERFIELDS cu
+                       ON cu.CONTACT_ID = c.ID
+                      AND cu.CUSTOM_ID IN ($ca, $cd, $cr, $cc)
+                LEFT JOIN (
+                    SELECT CONTACT_ID, SUM(ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT
+                    FROM DEBTS
+                    WHERE ENROLLED=1 AND _FIVETRAN_DELETED=FALSE
+                    GROUP BY CONTACT_ID
+                ) d ON c.ID = d.CONTACT_ID
+                GROUP BY c.ID, c.FIRSTNAME, c.LASTNAME, c.DROPPED_DATE, d.ENROLLED_DEBT
+            ) base
+            WHERE RETENTION_AGENT IN ($agentList)
             ORDER BY RETENTION_AGENT ASC
         ";
 
