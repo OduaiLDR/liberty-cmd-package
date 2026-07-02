@@ -948,7 +948,13 @@ final class GenerateResumePayments extends Command
         array &$statusChanges,
         bool $dryRun
     ): void {
-        $today = date('Y-m-d');
+        // Cancel-cooldown runs on business (Pacific) days per Jacob 2026-07-02: the
+        // command runs 7 days/week but cancels only EXECUTE Mon–Fri, and the day count
+        // skips weekends. Use the business timezone — the automation fires 7pm PT, which
+        // in server-UTC is the next calendar day, so date() alone would break both.
+        $businessNow = new \DateTimeImmutable('now', new \DateTimeZone('America/Los_Angeles'));
+        $today = $businessNow->format('Y-m-d');
+        $isWeekday = (int) $businessNow->format('N') <= 5; // 1=Mon .. 5=Fri
         $executeCancels = (bool) $this->option('execute-cancels');
         $maxCancels = (int) ($this->option('max-cancels') ?? 0);
         $processDate = $this->nextBusinessDay();
@@ -984,9 +990,10 @@ final class GenerateResumePayments extends Command
             // Day >= 4: ready to cancel.
             $cancelInfo = $this->systemCancelInfo((string) ($state['current_rcode'] ?? ''));
 
-            // Without --execute-cancels (the default daily cron), or for an R-code we
-            // don't map, just report the contact as ready and execute nothing.
-            if (!$executeCancels || $cancelInfo === null) {
+            // Execute the drop only when the flag is on, it's a weekday (cancels run
+            // Mon–Fri only per Jacob), and the R-code maps to a cancel status.
+            // Otherwise just report the contact as ready — weekend or reporting-only run.
+            if (!$executeCancels || !$isWeekday || $cancelInfo === null) {
                 $statusChanges[] = ['llg_id' => $llgId, 'name' => $name, 'status' => "System Cancel Ready - Day {$day}"];
                 continue;
             }
@@ -1065,14 +1072,24 @@ final class GenerateResumePayments extends Command
         $reason = $english ? $reasonEn : $reasonEs;
 
         if ($dryRun) {
-            Log::info('ResumePayments: DRY RUN - would System Cancel', [
+            // Preview the LIVE outcome (mirrors cancelProgram's only remaining gate:
+            // settlements → manual review, since the settlement-void isn't implemented;
+            // EPF auto-cancels). Shows which contacts auto-cancel vs go to manual.
+            $gate = $settlements > 0 ? 'settlement' : null;
+            $outcome = $gate === null
+                ? "would System Cancel → {$statusTitle}"
+                : "would route to MANUAL REVIEW ({$gate}) — not dropped";
+
+            Log::info('ResumePayments: DRY RUN - system cancel preview', [
                 'contact_id' => $contactId,
+                'outcome' => $gate === null ? 'auto_cancel' : 'manual_review',
+                'gate' => $gate,
                 'status' => $statusTitle,
                 'balance' => $balance,
                 'epf' => $epf,
                 'scheduled_settlements' => $settlements,
             ]);
-            $statusChanges[] = ['llg_id' => $llgId, 'name' => $name, 'status' => "DRY RUN: {$statusTitle}"];
+            $statusChanges[] = ['llg_id' => $llgId, 'name' => $name, 'status' => "DRY RUN: {$outcome}"];
             return;
         }
 
@@ -1314,8 +1331,9 @@ final class GenerateResumePayments extends Command
 
             $day = 0;
             if ($cancellationDate !== '') {
-                $day = (int) floor((strtotime($today) - strtotime($cancellationDate)) / 86400);
-                $day = max(0, $day);
+                // Business-day count (Mon–Fri only) per Jacob 2026-07-02 — weekends
+                // don't advance the cooldown clock.
+                $day = $this->businessDaysBetween($cancellationDate, $today);
             }
 
             return ['day' => $day];
@@ -1327,6 +1345,37 @@ final class GenerateResumePayments extends Command
         }
 
         return ['day' => 0];
+    }
+
+    /**
+     * Count business days (Mon–Fri) strictly AFTER $startDate up to and including
+     * $endDate — the cancel-cooldown clock, which skips weekends (Jacob 2026-07-02):
+     * reset Thu = Day 0 → Fri 1 → (Sat/Sun no change) → Mon 2 → Tue 3 → Wed = Day 4
+     * (cancel). Inputs are Y-m-d (a trailing time component is ignored).
+     */
+    private function businessDaysBetween(string $startDate, string $endDate): int
+    {
+        try {
+            $start = new \DateTimeImmutable(substr(trim($startDate), 0, 10));
+            $end = new \DateTimeImmutable(substr(trim($endDate), 0, 10));
+        } catch (\Throwable $e) {
+            return 0;
+        }
+
+        if ($end <= $start) {
+            return 0;
+        }
+
+        $count = 0;
+        $cursor = $start->modify('+1 day');
+        while ($cursor <= $end) {
+            if ((int) $cursor->format('N') <= 5) { // 1=Mon .. 5=Fri
+                $count++;
+            }
+            $cursor = $cursor->modify('+1 day');
+        }
+
+        return $count;
     }
 
     /**

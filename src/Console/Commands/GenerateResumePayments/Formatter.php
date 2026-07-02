@@ -103,28 +103,43 @@ class Formatter
     public function buildHtmlBody(array $statusChanges): string
     {
         $statusRows = [];
-        $cancelRows = [];
+        $pending = [];     // day => [lines] — "System Cancel Pending - Day N" (0..3)
+        $finalRows = [];   // completed cancels + other cancel outcomes
 
         foreach ($statusChanges as $change) {
+            $status = (string) ($change['status'] ?? '');
             $line = sprintf(
                 '%s | %s | %s',
                 (string) ($change['llg_id'] ?? ''),
                 (string) ($change['name'] ?? ''),
-                (string) ($change['status'] ?? ''),
+                $status,
             );
             $line = htmlspecialchars($line, ENT_QUOTES, 'UTF-8');
 
-            if (stripos((string) ($change['status'] ?? ''), 'System Cancel') !== false) {
-                $cancelRows[] = $line;
+            if (preg_match('/System Cancel Pending - Day (\d+)/i', $status, $m) === 1) {
+                $pending[(int) $m[1]][] = $line;       // pending → grouped by day for sorting
+            } elseif (stripos($status, 'System Cancel') !== false) {
+                $finalRows[] = $line;                  // actual cancels (+ deferred/failed)
             } else {
-                $statusRows[] = $line;
+                $statusRows[] = $line;                 // regular NSF status updates
             }
         }
 
-        $body = 'The following clients were in NSF status and have been processed: <br><br>';
-        $body .= implode('<br>', $statusRows);
-        $body .= '<br><br>System Cancellations<br>';
-        $body .= implode('<br>', $cancelRows);
+        // Pending sorted by day 0 → 3 (managers' intervention window).
+        ksort($pending);
+        $pendingLines = [];
+        foreach ($pending as $lines) {
+            foreach ($lines as $l) {
+                $pendingLines[] = $l;
+            }
+        }
+
+        $body  = 'The following clients were in NSF status and have been processed: <br><br>';
+        $body .= $statusRows === [] ? '(none)' : implode('<br>', $statusRows);
+        $body .= '<br><br><b>System Cancellations - Pending</b> (Day 0&ndash;3 &mdash; managers can still intervene)<br>';
+        $body .= $pendingLines === [] ? '(none)' : implode('<br>', $pendingLines);
+        $body .= '<br><br><b>System Cancellations</b> (final)<br>';
+        $body .= $finalRows === [] ? '(none)' : implode('<br>', $finalRows);
 
         return $body;
     }
