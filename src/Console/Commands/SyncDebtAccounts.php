@@ -136,12 +136,17 @@ class SyncDebtAccounts extends Command
 
     protected function fetchMissingEnrollmentIds(DBConnector $connector): array
     {
-        // Fetch rows that are missing either the count OR the dollar amount
+        // Fetch rows missing the count, missing the amount, or where debt is not yet locked
+        // (debt locks once first payment is attempted: status = 'Cleared' or 'Returned')
         $sql = <<<SQL
 SELECT LLG_ID
 FROM TblEnrollment
 WHERE Category IN ('LDR', 'CCS')
-  AND (Enrolled_Debt_Accounts IS NULL OR Debt_Amount IS NULL)
+  AND (
+    Enrolled_Debt_Accounts IS NULL
+    OR Debt_Amount IS NULL
+    OR COALESCE(First_Payment_Status, '') NOT IN ('Cleared', 'Returned')
+  )
 SQL;
 
         $result = $connector->querySqlServer($sql);
@@ -293,7 +298,11 @@ SQL;
             $sql = <<<SQL
 UPDATE TblEnrollment
 SET Enrolled_Debt_Accounts = CASE LLG_ID {$countSql} END,
-    Debt_Amount            = CASE LLG_ID {$debtSql}  END
+    Debt_Amount            = CASE
+        WHEN COALESCE(First_Payment_Status, '') NOT IN ('Cleared', 'Returned')
+        THEN CASE LLG_ID {$debtSql} END
+        ELSE Debt_Amount
+    END
 WHERE LLG_ID IN ({$idList});
 SQL;
 

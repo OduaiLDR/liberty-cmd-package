@@ -55,6 +55,32 @@ class SyncEnrollmentPlans extends Command
 
                 $plans = $this->fetchPlansFromSnowflake($connector, $missingContacts, $connection);
 
+                // Cross-source fallback: some LDR contacts have plans in PLAW Snowflake and vice versa
+                $stillMissing = array_diff($missingContacts, array_keys($plans));
+                if (!empty($stillMissing)) {
+                    $otherConnection = ($connection === 'ldr') ? 'plaw' : 'ldr';
+                    try {
+                        $otherConnector = DBConnector::fromEnvironment($otherConnection);
+                        $crossPlans = $this->fetchPlansFromSnowflake($otherConnector, $stillMissing, $otherConnection);
+                        if (!empty($crossPlans)) {
+                            $this->info("[$source] Cross-source fallback (" . strtoupper($otherConnection) . "): found " . count($crossPlans) . " additional plans.");
+                            Log::info('SyncEnrollmentPlans: cross-source plans found.', [
+                                'source' => $source,
+                                'fallback_connection' => $otherConnection,
+                                'count' => count($crossPlans),
+                            ]);
+                            $plans = array_merge($plans, $crossPlans);
+                        }
+                    } catch (\Throwable $e) {
+                        $this->warn("[$source] Cross-source fallback failed: " . $e->getMessage());
+                        Log::warning('SyncEnrollmentPlans: cross-source fallback failed.', [
+                            'source' => $source,
+                            'fallback_connection' => $otherConnection,
+                            'exception' => $e->getMessage(),
+                        ]);
+                    }
+                }
+
                 // Log contacts that couldn't be matched in Snowflake
                 $unmatchedIds = array_diff($missingContacts, array_keys($plans));
                 if (!empty($unmatchedIds)) {

@@ -69,6 +69,15 @@ class SyncFirstPaymentDate extends Command
                 $remainingIds = array_diff($missingClearedIds, array_keys($clearedPayments));
                 $this->info("[$source] " . count($remainingIds) . " IDs still without cleared date.");
 
+                // Exclude contacts with any returned/NSF payment — their First_Payment_Date must be locked
+                if (!empty($remainingIds)) {
+                    $nsfIds = $this->fetchContactsWithReturnedPayments($connector, array_values($remainingIds));
+                    if (!empty($nsfIds)) {
+                        $this->info("[$source] Excluding " . count($nsfIds) . " contacts with returned/NSF payments from date update.");
+                        $remainingIds = array_values(array_diff($remainingIds, $nsfIds));
+                    }
+                }
+
                 $scheduledPayments = [];
                 if (!empty($remainingIds)) {
                     $this->info("[$source] Checking Snowflake for scheduled payments (process_date <= current_date - 5)...");
@@ -107,6 +116,13 @@ class SyncFirstPaymentDate extends Command
 
                 $cancelledRollForward = [];
                 if (!empty($cancelledOverdueIds)) {
+                    // Exclude cancelled contacts whose first payment was returned — their date must stay locked
+                    $cancelledNsfIds = $this->fetchContactsWithReturnedPayments($connector, $cancelledOverdueIds);
+                    if (!empty($cancelledNsfIds)) {
+                        $this->info("[$source] Excluding " . count($cancelledNsfIds) . " cancelled contacts with returned payments from roll-forward.");
+                        $cancelledOverdueIds = array_values(array_diff($cancelledOverdueIds, $cancelledNsfIds));
+                    }
+
                     $this->info("[$source] Checking Snowflake for future payments for cancelled overdue contacts...");
                     $cancelledRollForward = $this->fetchFuturePaymentsForCancelled($connector, $cancelledOverdueIds);
                     $this->info("[$source] Found " . count($cancelledRollForward) . " future payments for cancelled contacts.");
@@ -262,6 +278,7 @@ FROM (
       AND t.TRANS_TYPE = 'D'
       AND t.CLEARED_DATE IS NOT NULL
       AND t.RETURNED_DATE IS NULL
+      AND (t.RETURN_CODE IS NULL OR t.RETURN_CODE = '')
 )
 WHERE N = 1
 SQL;
@@ -791,8 +808,55 @@ SQL;
         return $totalUpdated;
     }
 
+    /**
+     * Returns LLG IDs that have any returned/NSF D payment in Snowflake.
+     * These contacts' First_Payment_Date must not be updated — it is permanently locked.
+     */
+    protected function fetchContactsWithReturnedPayments(DBConnector $connector, array $llgIds): array
+    {
+        if (empty($llgIds)) {
+            return [];
+        }
+
+        $contactToLlg = $this->buildContactToLlgMap($llgIds);
+        $contactIds = array_keys($contactToLlg);
+
+        if (empty($contactIds)) {
+            return [];
+        }
+
+        $returned = [];
+        $chunkSize = 500;
+
+        foreach (array_chunk($contactIds, $chunkSize) as $chunk) {
+            $values = implode(', ', array_map(function ($id) {
+                return "('" . $this->escapeSqlString($id) . "')";
+            }, $chunk));
+
+            $sql = <<<SQL
+SELECT DISTINCT CONTACT_ID
+FROM TRANSACTIONS t
+WHERE t.CONTACT_ID IN (SELECT TO_NUMBER(column1) FROM VALUES {$values})
+  AND t.TRANS_TYPE = 'D'
+  AND (t.RETURNED_DATE IS NOT NULL OR (t.RETURN_CODE IS NOT NULL AND t.RETURN_CODE != ''))
+SQL;
+
+            $result = $connector->query($sql);
+            $rows = $this->extractRows($result);
+
+            foreach ($rows as $row) {
+                $cid = $this->getRowValue($row, 'CONTACT_ID');
+                if ($cid && isset($contactToLlg[$cid])) {
+                    $returned[] = $contactToLlg[$cid];
+                }
+            }
+        }
+
+        return $returned;
+    }
+
     // Helper methods
-    
+
     protected function buildContactToLlgMap(array $llgIds): array
     {
         $map = [];
