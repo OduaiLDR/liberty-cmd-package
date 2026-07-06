@@ -645,6 +645,35 @@ class SyncContactsData extends Command
             return 0;
         }
 
+        // Deduplicate by LLG_ID within this chunk: keep the row with the most recent
+        // assigned_date and prefer rows with a non-empty agent. Snowflake can return the
+        // same contact multiple times (e.g. from multiple mailer campaigns) and inserting
+        // all copies produces duplicate rows that break agent lookups.
+        $deduped = [];
+        foreach ($data as $row) {
+            $llgId = $row['llg_id'] ?? '';
+            if ($llgId === '') {
+                $deduped[] = $row;
+                continue;
+            }
+            if (!isset($deduped[$llgId])) {
+                $deduped[$llgId] = $row;
+                continue;
+            }
+            $existing = $deduped[$llgId];
+            $existingAgent    = $existing['agent'] ?? '';
+            $rowAgent         = $row['agent'] ?? '';
+            $existingAssigned = $existing['assigned_date'] ?? '';
+            $rowAssigned      = $row['assigned_date'] ?? '';
+            // Prefer non-empty agent; break ties by latest assigned_date
+            $rowBetter = ($existingAgent === '' && $rowAgent !== '')
+                || ($existingAgent === $rowAgent && $rowAssigned > $existingAssigned);
+            if ($rowBetter) {
+                $deduped[$llgId] = $row;
+            }
+        }
+        $data = \array_values($deduped);
+
         // TblContacts (LT) has 24 columns — no TP_ID. TblContactsLDR/PLAW have 25.
         $fields = 'Created_Date, Assigned_Date, LLG_ID, External_ID, Campaign, Data_Source, '
             . 'Created_By, Agent, Client, Phone, Email, Address_1, Address_2, City, State, '
