@@ -873,13 +873,42 @@ class SyncContactsData extends Command
             }
         }
 
-        $enrollmentSteps = [
+        // Agent update: use MIN(Agent) per LLG_ID to handle duplicate TblContacts rows
+        // deterministically, and only write when TblContacts has a non-empty agent.
+        // Only fills blank TblEnrollment.Agent — never overwrites an existing value.
+        $agentSteps = [
+            // Primary: from TblContacts (LT source)
             "UPDATE TblEnrollment
-             SET TblEnrollment.Agent = TblContacts.Agent
-             FROM TblEnrollment, TblContacts
-             WHERE TblEnrollment.LLG_ID = TblContacts.LLG_ID"
-            => '[INFO] Updated TblEnrollment.Agent',
+             SET TblEnrollment.Agent = c.Agent
+             FROM TblEnrollment
+             JOIN (
+                 SELECT LLG_ID, MIN(Agent) AS Agent
+                 FROM TblContacts
+                 WHERE Agent IS NOT NULL AND Agent <> ''
+                 GROUP BY LLG_ID
+             ) c ON TblEnrollment.LLG_ID = c.LLG_ID
+             WHERE (TblEnrollment.Agent IS NULL OR TblEnrollment.Agent = '')"
+            => '[INFO] Updated TblEnrollment.Agent from TblContacts',
 
+            // Fallback: from TblContactsLDR for contacts missing from TblContacts
+            "UPDATE TblEnrollment
+             SET TblEnrollment.Agent = l.Agent
+             FROM TblEnrollment
+             JOIN TblContactsLDR l ON TblEnrollment.LLG_ID = l.LLG_ID
+             WHERE (TblEnrollment.Agent IS NULL OR TblEnrollment.Agent = '')
+               AND l.Agent IS NOT NULL AND l.Agent <> ''"
+            => '[INFO] Updated TblEnrollment.Agent from TblContactsLDR (fallback)',
+
+            // Fallback: from TblContactsPLAW for contacts missing from TblContacts
+            "UPDATE TblEnrollment
+             SET TblEnrollment.Agent = p.Agent
+             FROM TblEnrollment
+             JOIN TblContactsPLAW p ON TblEnrollment.LLG_ID = p.LLG_ID
+             WHERE (TblEnrollment.Agent IS NULL OR TblEnrollment.Agent = '')
+               AND p.Agent IS NOT NULL AND p.Agent <> ''"
+            => '[INFO] Updated TblEnrollment.Agent from TblContactsPLAW (fallback)',
+
+            // Drop_Name: only update when source has a value; never blank it out
             "UPDATE TblEnrollment
              SET TblEnrollment.Drop_Name = TblContacts.Campaign
              FROM TblEnrollment, TblContacts
@@ -888,7 +917,7 @@ class SyncContactsData extends Command
             => '[INFO] Updated TblEnrollment.Drop_Name',
         ];
 
-        foreach ($enrollmentSteps as $sql => $label) {
+        foreach ($agentSteps as $sql => $label) {
             try {
                 $connector->querySqlServer($sql);
                 $this->info($label);
