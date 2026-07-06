@@ -29,13 +29,13 @@ class Formatter
         $spreadsheet = new Spreadsheet();
 
         $dataSheet = $spreadsheet->getActiveSheet();
-        $dataSheet->setTitle('Data');
+        $dataSheet->setTitle('NSF Data');
         $dataSheet->setShowGridlines(false);
         $this->buildDataSheet($dataSheet, $dataRows);
 
         $spreadsheet->createSheet();
         $commSheet = $spreadsheet->getSheet(1);
-        $commSheet->setTitle('Commission');
+        $commSheet->setTitle('Agent Summary');
         $commSheet->setShowGridlines(false);
         $this->buildCommissionSheet($commSheet, $commissionRows);
 
@@ -94,26 +94,26 @@ class Formatter
 
     private function buildCommissionSheet(Worksheet $s, array $rows): void
     {
-        // Main table headers (A1:I1)
-        $headers = ['NGO', 'Assignments', 'Actions', 'Ratio', 'Actions Tier', 'Cleared Tier', 'Rate', 'Clears', 'Commission'];
+        // Main table headers A1:K1
+        $headers = ['NGO', 'Assignments', 'Actions', 'Ratio', 'Actions Tier', 'Cleared Tier', 'Rate', 'Clears', 'Commission', 'Location', 'Company'];
         foreach ($headers as $i => $h) {
             $s->setCellValueByColumnAndRow($i + 1, 1, $h);
         }
-        $this->styleHeader($s, 'A1:I1');
+        $this->styleHeader($s, 'A1:K1');
 
-        // Data rows
         $r = 2;
         foreach ($rows as $row) {
             $s->setCellValue("A$r", $row['agent']);
             $s->setCellValue("B$r", $row['assignments']);
             $s->setCellValue("C$r", $row['actions']);
             $s->setCellValue("D$r", round($row['ratio'], 4));
-            // Tier columns are informational (computed in PHP)
-            $s->setCellValue("E$r", '');
-            $s->setCellValue("F$r", '');
+            $s->setCellValue("E$r", $row['actions_tier'] > 0 ? $row['actions_tier'] : '');
+            $s->setCellValue("F$r", $row['cleared_tier'] > 0 ? $row['cleared_tier'] : '');
             $s->setCellValue("G$r", $row['rate']);
             $s->setCellValue("H$r", $row['clears']);
             $s->setCellValue("I$r", $row['commission']);
+            $s->setCellValue("J$r", $row['location'] ?? '');
+            $s->setCellValue("K$r", $row['company']  ?? '');
             $r++;
         }
 
@@ -121,14 +121,14 @@ class Formatter
         $s->getStyle("D2:D{$last}")->getNumberFormat()->setFormatCode(self::PCT_FORMAT);
         $s->getStyle("G2:G{$last}")->getNumberFormat()->setFormatCode(self::MONEY_FORMAT);
         $s->getStyle("I2:I{$last}")->getNumberFormat()->setFormatCode(self::MONEY_FORMAT);
-        $this->applyBorders($s, "A1:I{$last}");
-        $this->applyFont($s, "A1:I{$last}");
-        $s->getStyle("A1:I1")->getAlignment()->setHorizontal(Alignment::HORIZONTAL_CENTER);
+        $this->applyBorders($s, "A1:K{$last}");
+        $this->applyFont($s, "A1:K{$last}");
+        $s->getStyle("A1:K1")->getAlignment()->setHorizontal(Alignment::HORIZONTAL_CENTER);
 
-        // Commission tier reference table (columns K–N, mirroring VBA N1:Q5)
+        // Commission tier reference table (columns M–P)
         $this->buildTierTable($s);
 
-        $this->autoWidths($s, 14);
+        $this->autoWidths($s, 16);
         $s->setSelectedCells('A1');
     }
 
@@ -143,23 +143,22 @@ class Formatter
      */
     private function buildTierTable(Worksheet $s): void
     {
-        $s->setCellValue('K1', 'Commission Tiers');
-        $s->mergeCells('K1:N1');
-        $s->getStyle('K1')->getAlignment()->setHorizontal(Alignment::HORIZONTAL_CENTER);
-        $s->getStyle('K1')->getFont()->setBold(true);
+        // Placed at M1:P5 (columns M–P) to leave room for Location (J) and Company (K)
+        $s->setCellValue('M1', 'Commission Tiers');
+        $s->mergeCells('M1:P1');
+        $s->getStyle('M1')->getAlignment()->setHorizontal(Alignment::HORIZONTAL_CENTER);
+        $s->getStyle('M1')->getFont()->setBold(true);
 
-        // Header row: blank label cell + 3 ratio columns
-        $s->setCellValue('K2', '');
-        $s->getStyle('K2')->getFill()->setFillType(Fill::FILL_SOLID)->getStartColor()->setARGB(self::TIER_FILL);
+        $s->setCellValue('M2', '');
+        $s->getStyle('M2')->getFill()->setFillType(Fill::FILL_SOLID)->getStartColor()->setARGB(self::TIER_FILL);
         $ratios = [0.2, 0.4, 0.6];
         foreach ($ratios as $i => $v) {
-            $col = chr(76 + $i); // L, M, N
+            $col = chr(78 + $i); // N, O, P
             $s->setCellValue("{$col}2", $v);
             $s->getStyle("{$col}2")->getFill()->setFillType(Fill::FILL_SOLID)->getStartColor()->setARGB(self::TIER_FILL);
             $s->getStyle("{$col}2")->getNumberFormat()->setFormatCode(self::PCT_FORMAT);
         }
 
-        // Data rows
         $thresholds = [1, 51, 101];
         $rates = [
             [1.50, 1.75, 2.00],
@@ -168,16 +167,16 @@ class Formatter
         ];
         foreach ($thresholds as $ri => $threshold) {
             $excelRow = $ri + 3;
-            $s->setCellValue("K{$excelRow}", $threshold);
+            $s->setCellValue("M{$excelRow}", $threshold);
             foreach ($rates[$ri] as $ci => $rate) {
-                $col = chr(76 + $ci); // L, M, N
+                $col = chr(78 + $ci); // N, O, P
                 $s->setCellValue("{$col}{$excelRow}", $rate);
                 $s->getStyle("{$col}{$excelRow}")->getNumberFormat()->setFormatCode(self::MONEY_FORMAT);
             }
         }
 
-        $this->applyBorders($s, 'K1:N5');
-        $this->applyFont($s, 'K1:N5');
+        $this->applyBorders($s, 'M1:P5');
+        $this->applyFont($s, 'M1:P5');
     }
 
     // ─────────────────────────────────────────────────────────────────────────

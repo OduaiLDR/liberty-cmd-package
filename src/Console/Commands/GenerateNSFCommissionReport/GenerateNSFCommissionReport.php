@@ -106,7 +106,8 @@ class GenerateNSFCommissionReport extends Command
             $commissionRows = $this->buildCommissionRows(
                 $dataRows,
                 $cfg['agents'],
-                $sql
+                $sql,
+                $display
             );
 
             $formatter = new Formatter();
@@ -188,7 +189,7 @@ class GenerateNSFCommissionReport extends Command
      *   Rate        = tier lookup (or flat $4 for special agents)
      *   Commission  = Rate * Valid
      */
-    private function buildCommissionRows(array $dataRows, array $agents, DBConnector $sqlConn): array
+    private function buildCommissionRows(array $dataRows, array $agents, DBConnector $sqlConn, string $company = ''): array
     {
         $rateTable = [
             1 => [1 => 1.50, 2 => 1.75, 3 => 2.00],
@@ -239,25 +240,29 @@ class GenerateNSFCommissionReport extends Command
 
             $ratio = ($assignments > 0) ? ($actions / $assignments) : 0;
 
+            $actionsTier = $this->matchTier($ratio, [0.2, 0.4, 0.6]);
+            $clearedTier = $this->matchTier($clears, [1, 51, 101]);
+
             if (in_array($agent, self::FLAT_RATE_AGENTS, true)) {
                 $rate = 4.00;
             } else {
-                $actionsTier = $this->matchTier($ratio, [0.2, 0.4, 0.6]);
-                $clearedTier = $this->matchTier($clears, [1, 51, 101]);
                 $rate = ($actionsTier > 0 && $clearedTier > 0)
                     ? ($rateTable[$clearedTier][$actionsTier] ?? 0)
                     : 0;
             }
 
             $rows[] = [
-                'agent'       => $agent,
-                'assignments' => $assignments,
-                'actions'     => $actions,
-                'ratio'       => $ratio,
-                'rate'        => $rate,
-                'clears'      => $clears,
+                'agent'        => $agent,
+                'assignments'  => $assignments,
+                'actions'      => $actions,
+                'ratio'        => $ratio,
+                'actions_tier' => $actionsTier,
+                'cleared_tier' => $clearedTier,
+                'rate'         => $rate,
+                'clears'       => $clears,
                 'commission'  => $rate * $clears,
                 'location'    => $locationMap[$agent] ?? '',
+                'company'     => $company,
             ];
         }
 
