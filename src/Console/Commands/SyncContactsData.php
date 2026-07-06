@@ -650,6 +650,35 @@ class SyncContactsData extends Command
             return 0;
         }
 
+        // Deduplicate by LLG_ID within this chunk: keep the row with the most recent
+        // assigned_date and prefer rows with a non-empty agent. Snowflake can return the
+        // same contact multiple times (e.g. from multiple mailer campaigns) and inserting
+        // all copies produces duplicate rows that break agent lookups.
+        $deduped = [];
+        foreach ($data as $row) {
+            $llgId = $row['llg_id'] ?? '';
+            if ($llgId === '') {
+                $deduped[] = $row;
+                continue;
+            }
+            if (!isset($deduped[$llgId])) {
+                $deduped[$llgId] = $row;
+                continue;
+            }
+            $existing = $deduped[$llgId];
+            $existingAgent    = $existing['agent'] ?? '';
+            $rowAgent         = $row['agent'] ?? '';
+            $existingAssigned = $existing['assigned_date'] ?? '';
+            $rowAssigned      = $row['assigned_date'] ?? '';
+            // Prefer non-empty agent; break ties by latest assigned_date
+            $rowBetter = ($existingAgent === '' && $rowAgent !== '')
+                || ($existingAgent === $rowAgent && $rowAssigned > $existingAssigned);
+            if ($rowBetter) {
+                $deduped[$llgId] = $row;
+            }
+        }
+        $data = \array_values($deduped);
+
         // TblContacts (LT) has 24 columns — no TP_ID. TblContactsLDR/PLAW have 25.
         $fields = 'Created_Date, Assigned_Date, LLG_ID, External_ID, Campaign, Data_Source, '
             . 'Created_By, Agent, Client, Phone, Email, Address_1, Address_2, City, State, '
@@ -878,13 +907,42 @@ class SyncContactsData extends Command
             }
         }
 
-        $enrollmentSteps = [
+        // Agent update: use MIN(Agent) per LLG_ID to handle duplicate TblContacts rows
+        // deterministically, and only write when TblContacts has a non-empty agent.
+        // Only fills blank TblEnrollment.Agent — never overwrites an existing value.
+        $agentSteps = [
+            // Primary: from TblContacts (LT source)
             "UPDATE TblEnrollment
-             SET TblEnrollment.Agent = TblContacts.Agent
-             FROM TblEnrollment, TblContacts
-             WHERE TblEnrollment.LLG_ID = TblContacts.LLG_ID"
-            => '[INFO] Updated TblEnrollment.Agent',
+             SET TblEnrollment.Agent = c.Agent
+             FROM TblEnrollment
+             JOIN (
+                 SELECT LLG_ID, MIN(Agent) AS Agent
+                 FROM TblContacts
+                 WHERE Agent IS NOT NULL AND Agent <> ''
+                 GROUP BY LLG_ID
+             ) c ON TblEnrollment.LLG_ID = c.LLG_ID
+             WHERE (TblEnrollment.Agent IS NULL OR TblEnrollment.Agent = '')"
+            => '[INFO] Updated TblEnrollment.Agent from TblContacts',
 
+            // Fallback: from TblContactsLDR for contacts missing from TblContacts
+            "UPDATE TblEnrollment
+             SET TblEnrollment.Agent = l.Agent
+             FROM TblEnrollment
+             JOIN TblContactsLDR l ON TblEnrollment.LLG_ID = l.LLG_ID
+             WHERE (TblEnrollment.Agent IS NULL OR TblEnrollment.Agent = '')
+               AND l.Agent IS NOT NULL AND l.Agent <> ''"
+            => '[INFO] Updated TblEnrollment.Agent from TblContactsLDR (fallback)',
+
+            // Fallback: from TblContactsPLAW for contacts missing from TblContacts
+            "UPDATE TblEnrollment
+             SET TblEnrollment.Agent = p.Agent
+             FROM TblEnrollment
+             JOIN TblContactsPLAW p ON TblEnrollment.LLG_ID = p.LLG_ID
+             WHERE (TblEnrollment.Agent IS NULL OR TblEnrollment.Agent = '')
+               AND p.Agent IS NOT NULL AND p.Agent <> ''"
+            => '[INFO] Updated TblEnrollment.Agent from TblContactsPLAW (fallback)',
+
+            // Drop_Name: only update when source has a value; never blank it out
             "UPDATE TblEnrollment
              SET TblEnrollment.Drop_Name = TblContacts.Campaign
              FROM TblEnrollment, TblContacts
@@ -893,7 +951,7 @@ class SyncContactsData extends Command
             => '[INFO] Updated TblEnrollment.Drop_Name',
         ];
 
-        foreach ($enrollmentSteps as $sql => $label) {
+        foreach ($agentSteps as $sql => $label) {
             try {
                 $connector->querySqlServer($sql);
                 $this->info($label);
