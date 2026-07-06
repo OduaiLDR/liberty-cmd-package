@@ -96,49 +96,90 @@ class Formatter
     }
 
     /**
-     * Two-section HTML body, matching the VBA's `Body` string.
+     * Categorize the status changes into the recap's display groups and sort
+     * each group by client name (Jacob 2026-07-06): regular NSF status updates,
+     * then System Cancel "Pending" bucketed by Day (0 → 3), then the final
+     * cancels. Shared by the email body and the Excel attachment so both present
+     * in the same order.
+     *
+     * @param list<array{llg_id:string,name:string,status:string}> $statusChanges
+     * @return array{status:list<array{llg_id:string,name:string,status:string}>, pending:array<int,list<array{llg_id:string,name:string,status:string}>>, final:list<array{llg_id:string,name:string,status:string}>}
+     */
+    private function groupChanges(array $statusChanges): array
+    {
+        $status = [];
+        $pending = [];   // day (0..3) => rows — "System Cancel Pending - Day N"
+        $final = [];     // completed cancels + other cancel outcomes
+
+        foreach ($statusChanges as $change) {
+            $s = (string) ($change['status'] ?? '');
+            if (preg_match('/System Cancel Pending - Day (\d+)/i', $s, $m) === 1) {
+                $pending[(int) $m[1]][] = $change;
+            } elseif (stripos($s, 'System Cancel') !== false) {
+                $final[] = $change;
+            } else {
+                $status[] = $change;
+            }
+        }
+
+        $byName = static fn(array $a, array $b): int => strcasecmp(
+            (string) ($a['name'] ?? ''),
+            (string) ($b['name'] ?? ''),
+        );
+
+        usort($status, $byName);
+        usort($final, $byName);
+        ksort($pending);                 // Day 0 → 3
+        foreach ($pending as &$rows) {
+            usort($rows, $byName);       // each day sorted by client
+        }
+        unset($rows);
+
+        return ['status' => $status, 'pending' => $pending, 'final' => $final];
+    }
+
+    /**
+     * HTML body grouped for the managers (Jacob 2026-07-06): the NSF status-update
+     * list, then System Cancellations — Pending split into Day 0 / 1 / 2 / 3
+     * sub-groups, then the final "cancelled" group. Every group is sorted by
+     * client name. Full detail also ships as the attached "Status Changes" Excel.
      *
      * @param list<array{llg_id:string,name:string,status:string}> $statusChanges
      */
     public function buildHtmlBody(array $statusChanges): string
     {
-        $statusRows = [];
-        $pending = [];     // day => [lines] — "System Cancel Pending - Day N" (0..3)
-        $finalRows = [];   // completed cancels + other cancel outcomes
+        $groups = $this->groupChanges($statusChanges);
 
-        foreach ($statusChanges as $change) {
-            $status = (string) ($change['status'] ?? '');
+        $fmt = static function (array $c): string {
             $line = sprintf(
                 '%s | %s | %s',
-                (string) ($change['llg_id'] ?? ''),
-                (string) ($change['name'] ?? ''),
-                $status,
+                (string) ($c['llg_id'] ?? ''),
+                (string) ($c['name'] ?? ''),
+                (string) ($c['status'] ?? ''),
             );
-            $line = htmlspecialchars($line, ENT_QUOTES, 'UTF-8');
 
-            if (preg_match('/System Cancel Pending - Day (\d+)/i', $status, $m) === 1) {
-                $pending[(int) $m[1]][] = $line;       // pending → grouped by day for sorting
-            } elseif (stripos($status, 'System Cancel') !== false) {
-                $finalRows[] = $line;                  // actual cancels (+ deferred/failed)
-            } else {
-                $statusRows[] = $line;                 // regular NSF status updates
-            }
-        }
+            return htmlspecialchars($line, ENT_QUOTES, 'UTF-8');
+        };
 
-        // Pending sorted by day 0 → 3 (managers' intervention window).
-        ksort($pending);
-        $pendingLines = [];
-        foreach ($pending as $lines) {
-            foreach ($lines as $l) {
-                $pendingLines[] = $l;
-            }
-        }
+        $statusRows = array_map($fmt, $groups['status']);
 
         $body  = 'The following clients were in NSF status and have been processed: <br><br>';
         $body .= $statusRows === [] ? '(none)' : implode('<br>', $statusRows);
+
         $body .= '<br><br><b>System Cancellations - Pending</b> (Day 0&ndash;3 &mdash; managers can still intervene)<br>';
-        $body .= $pendingLines === [] ? '(none)' : implode('<br>', $pendingLines);
-        $body .= '<br><br><b>System Cancellations</b> (final)<br>';
+        if ($groups['pending'] === []) {
+            $body .= '(none)';
+        } else {
+            $blocks = [];
+            foreach ($groups['pending'] as $day => $rows) {
+                $lines = array_map($fmt, $rows);
+                $blocks[] = '<u>Day ' . (int) $day . '</u><br>' . implode('<br>', $lines);
+            }
+            $body .= implode('<br><br>', $blocks);
+        }
+
+        $finalRows = array_map($fmt, $groups['final']);
+        $body .= '<br><br><b>System Cancellations</b> (final &mdash; cancelled)<br>';
         $body .= $finalRows === [] ? '(none)' : implode('<br>', $finalRows);
 
         return $body;
@@ -158,8 +199,21 @@ class Formatter
         $sheet->fromArray(['LLG ID', 'Name', 'Status'], null, 'A1');
         $this->styleHeader($sheet, 'A1:C1');
 
+        // Same grouping/sort as the email body (Jacob 2026-07-06): NSF updates,
+        // then Pending Day 0 → 3, then final cancels — each group by client name.
+        $groups = $this->groupChanges($statusChanges);
+        $ordered = $groups['status'];
+        foreach ($groups['pending'] as $rows) {
+            foreach ($rows as $row) {
+                $ordered[] = $row;
+            }
+        }
+        foreach ($groups['final'] as $row) {
+            $ordered[] = $row;
+        }
+
         $rowIndex = 2;
-        foreach ($statusChanges as $change) {
+        foreach ($ordered as $change) {
             $sheet->setCellValue("A{$rowIndex}", (string) ($change['llg_id'] ?? ''));
             $sheet->setCellValue("B{$rowIndex}", (string) ($change['name'] ?? ''));
             $sheet->setCellValue("C{$rowIndex}", (string) ($change['status'] ?? ''));
