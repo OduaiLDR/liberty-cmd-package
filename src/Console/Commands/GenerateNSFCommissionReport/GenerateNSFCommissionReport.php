@@ -106,8 +106,7 @@ class GenerateNSFCommissionReport extends Command
             $commissionRows = $this->buildCommissionRows(
                 $dataRows,
                 $cfg['agents'],
-                $sql,
-                $display
+                $sql
             );
 
             $formatter = new Formatter();
@@ -189,7 +188,7 @@ class GenerateNSFCommissionReport extends Command
      *   Rate        = tier lookup (or flat $4 for special agents)
      *   Commission  = Rate * Valid
      */
-    private function buildCommissionRows(array $dataRows, array $agents, DBConnector $sqlConn, string $company = ''): array
+    private function buildCommissionRows(array $dataRows, array $agents, DBConnector $sqlConn): array
     {
         $rateTable = [
             1 => [1 => 1.50, 2 => 1.75, 3 => 2.00],
@@ -213,11 +212,14 @@ class GenerateNSFCommissionReport extends Command
                 $agents
             ));
             $empRes = $sqlConn->querySqlServer(
-                "SELECT Employee_Name, Location FROM TblEmployees WHERE Employee_Name IN ($inList)"
+                "SELECT Employee_Name, Location, Company FROM TblEmployees WHERE Employee_Name IN ($inList)"
             );
             foreach ($empRes['data'] ?? [] as $emp) {
                 $name = (string) ($emp['Employee_Name'] ?? $emp['employee_name'] ?? '');
-                $locationMap[$name] = (string) ($emp['Location'] ?? $emp['location'] ?? '');
+                $locationMap[$name] = [
+                    'location' => (string) ($emp['Location'] ?? $emp['location'] ?? ''),
+                    'company'  => (string) ($emp['Company']  ?? $emp['company']  ?? ''),
+                ];
             }
         }
 
@@ -260,9 +262,9 @@ class GenerateNSFCommissionReport extends Command
                 'cleared_tier' => $clearedTier,
                 'rate'         => $rate,
                 'clears'       => $clears,
-                'commission'  => $rate * $clears,
-                'location'    => $locationMap[$agent] ?? '',
-                'company'     => $company,
+                'commission' => $rate * $clears,
+                'location'   => $locationMap[$agent]['location'] ?? '',
+                'company'    => $locationMap[$agent]['company']  ?? '',
             ];
         }
 
