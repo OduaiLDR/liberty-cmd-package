@@ -538,9 +538,8 @@ class GenerateRetentionCommissionReport extends Command
      *
      * Assigned   = rows where cancel_request_date falls in period
      * Retained   = rows where retention_date falls in period
-     * Tier       = 0 if pct<20%, 1 if <35%, 2 if <50%,
-     *              3 if <80% (when has_t4) or default (when no T4),
-     *              4 if has_t4 and pct >= 80%
+     * Tier       = 4 if has_t4 AND pct >= 70% AND retained >= 50
+     *              0 if pct<20%, 1 if <35%, 2 if <50%, 3 otherwise
      * Commission = sum of T{tier} for rows where retention_payment_date falls in period
      *
      * @param  array<int,array<string,mixed>> $rows
@@ -579,7 +578,7 @@ class GenerateRetentionCommissionReport extends Command
             }
 
             $pct  = ($assigned > 0) ? ($retained / $assigned) : 0.0;
-            $tier = $this->resolveTier($pct, $hasT4);
+            $tier = $this->resolveTier($pct, $retained, $hasT4);
 
             // Sum commission using the agent's tier column for rows where payment landed in period
             $tierCol = $tier > 0 ? "T$tier" : null;
@@ -622,18 +621,20 @@ class GenerateRetentionCommissionReport extends Command
 
     /**
      * Map retention % to commission tier.
-     * T4 is only honored when source has T4 enabled.
+     *
+     * Replicates the VBA formula:
+     *   =IF(AND(D2>=.7,C2>=50),4,IF(D2<0.2,0,IF(D2<0.35,1,IF(D2<0.5,2,3))))
+     *
+     * - Tier 4:  pct >= 70%  AND  retained count >= 50
+     * - Else:    <20%  -> 0
+     *            <35%  -> 1
+     *            <50%  -> 2
+     *            else  -> 3
      */
-    private function resolveTier(float $pct, bool $hasT4): int
+    private function resolveTier(float $pct, int $retained, bool $hasT4): int
     {
-        if ($hasT4) {
-            return match (true) {
-                $pct < 0.20 => 0,
-                $pct < 0.35 => 1,
-                $pct < 0.50 => 2,
-                $pct < 0.80 => 3,
-                default     => 4,
-            };
+        if ($hasT4 && $pct >= 0.70 && $retained >= 50) {
+            return 4;
         }
         return match (true) {
             $pct < 0.20 => 0,
