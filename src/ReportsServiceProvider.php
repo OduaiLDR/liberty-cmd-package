@@ -75,7 +75,7 @@ use Cmd\Reports\Console\Commands\GenerateEmployeesReport\GenerateEmployeesReport
 use Cmd\Reports\Console\Commands\SyncLeaderboardRecords\SyncLeaderboardRecords;
 use Cmd\Reports\Console\Commands\GenerateConsumerAffairsFundedReport\GenerateConsumerAffairsFundedReport;
 use Cmd\Reports\Console\Commands\GenerateConsumerAffairsSettlementReport\GenerateConsumerAffairsSettlementReport;
-
+use Cmd\Reports\Console\Commands\SyncEmployeeSfUids;
 
 class ReportsServiceProvider extends ServiceProvider
 {
@@ -178,6 +178,7 @@ class ReportsServiceProvider extends ServiceProvider
                 SyncLeaderboardRecords::class,
                 GenerateConsumerAffairsFundedReport::class,
                 GenerateConsumerAffairsSettlementReport::class,
+                SyncEmployeeSfUids::class,
             ]);
         }
 
