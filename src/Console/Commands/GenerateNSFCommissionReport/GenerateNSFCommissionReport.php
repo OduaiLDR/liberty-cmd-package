@@ -113,7 +113,7 @@ class GenerateNSFCommissionReport extends Command
             $file = $formatter->buildWorkbook($dataRows, $commissionRows, $display, $startDate, $endDate);
             $this->info("[INFO] [$display] Workbook: {$file['filename']}");
 
-            $this->sendReport($sql, $file, $display, $startDate, $endDate);
+            $this->sendReport($sql, $file, $display, $startDate, $endDate, $commissionRows);
 
             if (file_exists($file['path'])) {
                 @unlink($file['path']);
@@ -167,9 +167,10 @@ class GenerateNSFCommissionReport extends Command
                 WHERE TRANS_TYPE = 'D'
                   AND CLEARED_DATE IS NOT NULL
                   AND RETURNED_DATE IS NULL
-            ) T ON c.ID = T.CONTACT_ID AND T.RN = 1
+            ) T ON c.ID = T.CONTACT_ID
             WHERE CU2.NSF_RETURNED_DATE >= '$startDate'
               AND CU2.NSF_RETURNED_DATE <= '$endDate'
+              AND T.RN = 1
             ORDER BY CU1.AGENT, CU2.NSF_RETURNED_DATE
         ";
 
@@ -243,7 +244,7 @@ class GenerateNSFCommissionReport extends Command
             $ratio = ($assignments > 0) ? ($actions / $assignments) : 0;
 
             $actionsTier = $this->matchTier($ratio, [0.2, 0.4, 0.6]);
-            $clearedTier = $this->matchTier($clears, [1, 51, 101]);
+            $clearedTier = $this->matchTier($actions, [1, 51, 101]);
 
             if (in_array($agent, self::FLAT_RATE_AGENTS, true)) {
                 $rate = 4.00;
@@ -311,7 +312,7 @@ class GenerateNSFCommissionReport extends Command
         return $tier;
     }
 
-    private function sendReport(DBConnector $sql, array $file, string $display, string $start, string $end): void
+    private function sendReport(DBConnector $sql, array $file, string $display, string $start, string $end, array $commissionRows): void
     {
         if (!file_exists($file['path'])) {
             $this->warn("[WARN] [$display] File missing — not sent.");
@@ -319,8 +320,26 @@ class GenerateNSFCommissionReport extends Command
         }
 
         $subject = "NSF Commission Report - $display";
-        $period  = date('F Y', strtotime($start));
-        $body    = "Please see the attached NSF Commission Report for $display — $period.";
+
+        // Build HTML table body matching VBA
+        $body  = '<table border="1">';
+        $body .= '<tr><th>Agent</th><th>Assignments</th><th>Actions</th><th>Ratio</th><th>Commission Rate</th><th>Commission</th><th>Location</th></tr>';
+        foreach ($commissionRows as $row) {
+            if ($row['agent'] === '') continue;
+            $ratio      = $row['assignments'] > 0 ? number_format($row['ratio'] * 100, 2) . '%' : '#DIV/0!';
+            $rate       = '$' . number_format($row['rate'], 2);
+            $commission = '$' . number_format($row['commission'], 2);
+            $body .= '<tr align="right">';
+            $body .= '<td>' . htmlspecialchars($row['agent'])    . '</td>';
+            $body .= '<td>' . $row['assignments']                . '</td>';
+            $body .= '<td>' . $row['actions']                    . '</td>';
+            $body .= '<td>' . $ratio                             . '</td>';
+            $body .= '<td>' . $rate                              . '</td>';
+            $body .= '<td>' . $commission                        . '</td>';
+            $body .= '<td>' . htmlspecialchars($row['location']) . '</td>';
+            $body .= '</tr>';
+        }
+        $body .= '</table>';
 
         $attachment = [
             'name'         => $file['filename'],
@@ -328,21 +347,29 @@ class GenerateNSFCommissionReport extends Command
             'contentBytes' => base64_encode((string) file_get_contents($file['path'])),
         ];
 
-        $email = new \Cmd\Reports\Services\EmailSenderService();
-        $sent  = $email->sendMailUsingTblReports(
-            $sql,
-            ['NSFCommissionReport', 'NSF Commission Report'],
-            [strtoupper($display === 'Progress Law' ? 'PLAW' : 'LDR')],
-            $subject,
-            $body,
-            [$attachment],
-            true
-        );
+        $email  = new \Cmd\Reports\Services\EmailSenderService();
+        $testTo = trim((string) env('NSF_REPORT_TEST_TO', ''));
+
+        if ($testTo !== '') {
+            // Guard: override all recipients — send only to test address
+            $this->info("[INFO] [$display] NSF_REPORT_TEST_TO set — sending only to $testTo");
+            $sent = $email->sendMailHtml($subject, $body, [$testTo], [], [], [$attachment]);
+        } else {
+            $sent = $email->sendMailUsingTblReportsHtml(
+                $sql,
+                ['NSFCommissionReport', 'NSF Commission Report'],
+                [strtoupper($display === 'Progress Law' ? 'PLAW' : 'LDR')],
+                $subject,
+                $body,
+                [$attachment],
+                true
+            );
+        }
 
         if ($sent) {
             $this->info("[INFO] [$display] NSF Commission Report sent.");
         } else {
-            $this->warn("[WARN] [$display] sendMailUsingTblReports returned false — report not sent.");
+            $this->warn("[WARN] [$display] Email not sent.");
             Log::warning("GenerateNSFCommissionReport[$display]: email not sent.");
         }
     }
