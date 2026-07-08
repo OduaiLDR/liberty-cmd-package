@@ -183,9 +183,11 @@ class ImportMissingEnrollments extends Command
                 $sqlConnector->querySqlServer("
                     INSERT INTO TblEnrollment
                         (LLG_ID, Category, State, Agent, Client, Debt_Amount, Welcome_Call_Date, Payment_Date_1, Cancel_Date)
-                    VALUES
-                        ('{$llgId}', '{$category}', '{$state}', '{$agent}', '{$client}',
-                         {$debtSql}, '{$this->esc($enrolledDate)}', {$pay1Sql}, {$cxlSql})
+                    SELECT '{$llgId}', '{$category}', '{$state}', '{$agent}', '{$client}',
+                           {$debtSql}, '{$this->esc($enrolledDate)}', {$pay1Sql}, {$cxlSql}
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM TblEnrollment WHERE LLG_ID = '{$llgId}'
+                    )
                 ");
                 $inserted++;
                 $existingIds[$llgId] = true; // prevent duplicate from PLAW pass

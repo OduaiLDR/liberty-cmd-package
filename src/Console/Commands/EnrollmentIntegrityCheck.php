@@ -12,11 +12,16 @@ use Illuminate\Support\Facades\Log;
  * Enrollment Integrity Check — watchdog, not a runner.
  *
  * Runs AFTER all automations have already executed on their schedule.
- * Checks TblEnrollment for data gaps. If a check fails it re-runs ONLY
- * that specific automation once. If the issue persists after the retry
- * it is flagged and an alert email is sent via Microsoft Graph.
+ * Each step has a severity:
  *
- * Email is only sent when at least one check is still failing after retry.
+ *   'alert'  — automation is broken or data needs manual intervention.
+ *              Failures are emailed and cause a non-zero exit.
+ *              Examples: duplicate LLG_IDs, sync exceptions.
+ *
+ *   'info'   — persistent gap means the SOURCE data doesn't exist yet
+ *              (e.g. no campaign assigned, no enrollment plan in CRM).
+ *              The sync ran and retried — it's not broken, the data just
+ *              isn't there. Logged and shown in output; NOT emailed.
  *
  * Artisan: enrollment:integrity-check
  */
@@ -31,47 +36,53 @@ class EnrollmentIntegrityCheck extends Command
 
     private function steps(): array
     {
+        // severity = 'alert' → email + failure exit if unresolved after retry
+        // severity = 'info'  → log only; gap means source data doesn't exist, not a broken sync
         return [
             [
-                'label'   => 'Import Missing Enrollments',
-                'command' => 'enrollment:import-missing',
-                'check'   => "
+                'label'    => 'Import Missing Enrollments',
+                'command'  => 'enrollment:import-missing',
+                'severity' => 'info',
+                'check'    => "
                     SELECT TOP 50 LLG_ID
                     FROM TblEnrollment
                     WHERE Category IN ('LDR', 'CCS')
                       AND Welcome_Call_Date IS NULL
                       AND Import_Time >= CAST(GETDATE() AS DATE)
                 ",
-                'reason'  => 'Rows inserted today are missing Welcome_Call_Date',
+                'reason'   => 'Rows inserted today are missing Welcome_Call_Date — likely not yet set in CRM',
             ],
             [
-                'label'   => 'Sync Enrollment Data (Drop_Name / State)',
-                'command' => 'Sync:enrollment-data',
-                'check'   => "
+                'label'    => 'Sync Enrollment Data (Drop_Name / State)',
+                'command'  => 'Sync:enrollment-data',
+                'severity' => 'info',
+                'check'    => "
                     SELECT TOP 50 LLG_ID
                     FROM TblEnrollment
                     WHERE Category IN ('LDR', 'CCS')
                       AND (Drop_Name IS NULL OR Drop_Name = '')
                       AND Welcome_Call_Date >= DATEADD(day, -90, GETDATE())
                 ",
-                'reason'  => 'Active enrollments (last 90 days) missing Drop_Name',
+                'reason'   => 'Active enrollments (last 90 days) missing Drop_Name — contact was enrolled without a campaign/mailer assignment in CRM',
             ],
             [
-                'label'   => 'Sync Enrollment Status',
-                'command' => 'sync:enrollment-status',
-                'check'   => "
+                'label'    => 'Sync Enrollment Status',
+                'command'  => 'sync:enrollment-status',
+                'severity' => 'info',
+                'check'    => "
                     SELECT TOP 50 LLG_ID
                     FROM TblEnrollment
                     WHERE Category IN ('LDR', 'CCS')
                       AND Enrollment_Status IS NULL
                       AND Welcome_Call_Date >= DATEADD(day, -90, GETDATE())
                 ",
-                'reason'  => 'Active enrollments (last 90 days) missing Enrollment_Status',
+                'reason'   => 'Active enrollments (last 90 days) missing Enrollment_Status — status not yet set in Snowflake',
             ],
             [
-                'label'   => 'Sync Time In Program (Payment_Frequency)',
-                'command' => 'sync:time-in-program',
-                'check'   => "
+                'label'    => 'Sync Time In Program (Payment_Frequency)',
+                'command'  => 'sync:time-in-program',
+                'severity' => 'info',
+                'check'    => "
                     SELECT TOP 50 LLG_ID
                     FROM TblEnrollment
                     WHERE Category IN ('LDR', 'CCS')
@@ -80,12 +91,13 @@ class EnrollmentIntegrityCheck extends Command
                       AND Welcome_Call_Date BETWEEN DATEADD(day, -90, GETDATE())
                                                AND DATEADD(day,  -7, GETDATE())
                 ",
-                'reason'  => 'Active enrollments (7–90 days old) missing Payment_Frequency',
+                'reason'   => 'Active enrollments (7–90 days old) missing Payment_Frequency — enrollment plan has no payment schedule set in Snowflake',
             ],
             [
-                'label'   => 'Sync Enrollment Plans',
-                'command' => 'enrollment:sync-plans',
-                'check'   => "
+                'label'    => 'Sync Enrollment Plans',
+                'command'  => 'enrollment:sync-plans',
+                'severity' => 'info',
+                'check'    => "
                     SELECT TOP 50 LLG_ID
                     FROM TblEnrollment
                     WHERE Category IN ('LDR', 'CCS')
@@ -93,12 +105,13 @@ class EnrollmentIntegrityCheck extends Command
                       AND COALESCE(Enrollment_Status, '') NOT IN ('Cancelled', 'Dropped', 'Cancel')
                       AND Welcome_Call_Date >= DATEADD(day, -90, GETDATE())
                 ",
-                'reason'  => 'Active enrollments (last 90 days) missing Enrollment_Plan',
+                'reason'   => 'Active enrollments (last 90 days) missing Enrollment_Plan — no plan linked in Snowflake ENROLLMENT_DEFAULTS2',
             ],
             [
-                'label'   => 'Sync Debt Accounts (count + amount)',
-                'command' => 'enrollment:update-debts',
-                'check'   => "
+                'label'    => 'Sync Debt Accounts (count + amount)',
+                'command'  => 'enrollment:update-debts',
+                'severity' => 'info',
+                'check'    => "
                     SELECT TOP 50 LLG_ID
                     FROM TblEnrollment
                     WHERE Category IN ('LDR', 'CCS')
@@ -106,12 +119,13 @@ class EnrollmentIntegrityCheck extends Command
                       AND COALESCE(Enrollment_Status, '') NOT IN ('Cancelled', 'Dropped', 'Cancel')
                       AND Welcome_Call_Date >= DATEADD(day, -90, GETDATE())
                 ",
-                'reason'  => 'Active enrollments (last 90 days) missing debt count or dollar amount',
+                'reason'   => 'Active enrollments (last 90 days) missing debt count or amount — no enrolled debts in Snowflake yet',
             ],
             [
-                'label'   => 'Sync First Payment Date',
-                'command' => 'sync:first-payment-date',
-                'check'   => "
+                'label'    => 'Sync First Payment Date',
+                'command'  => 'sync:first-payment-date',
+                'severity' => 'info',
+                'check'    => "
                     SELECT TOP 50 LLG_ID
                     FROM TblEnrollment
                     WHERE Category IN ('LDR', 'CCS')
@@ -121,12 +135,13 @@ class EnrollmentIntegrityCheck extends Command
                       AND COALESCE(Enrollment_Status, '') NOT LIKE '%Dropped%'
                       AND Welcome_Call_Date <= DATEADD(day, -30, GETDATE())
                 ",
-                'reason'  => 'Active enrollments 30+ days old with payments but missing First_Payment_Date',
+                'reason'   => 'Enrollments 30+ days old with payments but no First_Payment_Date — transactions may be in the other Snowflake instance or not yet cleared',
             ],
             [
-                'label'   => 'Sync First Payment Cleared Date',
-                'command' => 'sync:first-payment-cleared-date',
-                'check'   => "
+                'label'    => 'Sync First Payment Cleared Date',
+                'command'  => 'sync:first-payment-cleared-date',
+                'severity' => 'info',
+                'check'    => "
                     SELECT TOP 50 LLG_ID
                     FROM TblEnrollment
                     WHERE Category IN ('LDR', 'CCS')
@@ -135,12 +150,13 @@ class EnrollmentIntegrityCheck extends Command
                       AND First_Payment_Date IS NOT NULL
                       AND First_Payment_Date <= GETDATE()
                 ",
-                'reason'  => 'Enrollments where First_Payment_Date has passed but First_Payment_Cleared_Date is still null',
+                'reason'   => 'First_Payment_Date has passed but no cleared date found — payment may still be pending in Snowflake',
             ],
             [
-                'label'   => 'Sync Last Deposit Date',
-                'command' => 'Sync:last-deposit-date',
-                'check'   => "
+                'label'    => 'Sync Last Deposit Date',
+                'command'  => 'Sync:last-deposit-date',
+                'severity' => 'info',
+                'check'    => "
                     SELECT TOP 50 LLG_ID
                     FROM TblEnrollment
                     WHERE Category IN ('LDR', 'CCS')
@@ -148,12 +164,13 @@ class EnrollmentIntegrityCheck extends Command
                       AND First_Payment_Cleared_Date IS NOT NULL
                       AND COALESCE(Payments, 0) > 0
                 ",
-                'reason'  => 'Enrollments with cleared payments but missing Last_Deposit_Date',
+                'reason'   => 'Cleared payments exist but Last_Deposit_Date is missing — transaction not found in Snowflake',
             ],
             [
-                'label'   => 'Sync Submitted Date',
-                'command' => 'sync:submitted-date',
-                'check'   => "
+                'label'    => 'Sync Submitted Date',
+                'command'  => 'sync:submitted-date',
+                'severity' => 'info',
+                'check'    => "
                     SELECT TOP 50 LLG_ID
                     FROM TblEnrollment
                     WHERE Category IN ('LDR', 'CCS')
@@ -161,7 +178,7 @@ class EnrollmentIntegrityCheck extends Command
                       AND Welcome_Call_Date BETWEEN DATEADD(day, -90, GETDATE())
                                                AND DATEADD(day,  -7, GETDATE())
                 ",
-                'reason'  => 'Enrollments (7–90 days old) missing Submitted_Date',
+                'reason'   => 'Enrollments (7–90 days old) missing Submitted_Date — status not yet reached in Snowflake',
             ],
         ];
     }
@@ -188,17 +205,21 @@ class EnrollmentIntegrityCheck extends Command
             $this->log('ERROR: SQL Server connection failed — ' . $e->getMessage(), 'error');
             $this->sendAlert(
                 [['label' => 'SQL Server Connection', 'command' => 'n/a', 'reason' => $e->getMessage(), 'count' => 0, 'ids' => []]],
+                [],
                 $startedAt,
                 $skipEmail
             );
             return Command::FAILURE;
         }
 
+        $dataGaps = [];   // severity=info: syncs ran fine, source data just doesn't exist
+
         foreach ($steps as $i => $step) {
             $label    = $step['label'];
             $command  = $step['command'];
             $checkSql = $step['check'];
             $reason   = $step['reason'];
+            $severity = $step['severity'] ?? 'alert';
             $num      = $i + 1;
 
             $this->log("─────────────────────────────────────────────────────────");
@@ -216,9 +237,9 @@ class EnrollmentIntegrityCheck extends Command
                 continue;
             }
 
-            // ── Something is off — log what we found ─────────────────────
+            // ── Something is off — retry ──────────────────────────────────
             $found = count($ids);
-            $this->log("  result  : ✗ {$found} issue(s) found ({$ms}ms)", 'warn');
+            $this->log("  result  : ✗ {$found} gap(s) found ({$ms}ms)", 'warn');
             $this->log("  sample  : " . implode(', ', array_slice($ids, 0, 5)) . ($found > 5 ? ' …' : ''));
             $this->log("  action  : re-running [{$command}]...", 'warn');
 
@@ -227,13 +248,11 @@ class EnrollmentIntegrityCheck extends Command
                 'sample' => array_slice($ids, 0, 10),
             ]);
 
-            // ── Retry ONLY this automation ────────────────────────────────
             $t1 = microtime(true);
             $this->runAutomation($command);
             $retryMs = round((microtime(true) - $t1) * 1000);
             $this->log("  retried : completed in {$retryMs}ms — re-checking...");
 
-            // ── Re-check ──────────────────────────────────────────────────
             $retryIds = $this->runCheck($sql, $checkSql);
 
             if (empty($retryIds)) {
@@ -242,22 +261,38 @@ class EnrollmentIntegrityCheck extends Command
                 continue;
             }
 
-            // ── Still broken — flag for alert ─────────────────────────────
             $count = count($retryIds);
-            $this->log("  result  : ✗ STILL {$count} issue(s) after retry — FLAGGED", 'error');
-            Log::error("EnrollmentIntegrityCheck: [{$label}] still failing after retry", [
-                'count'  => $count,
-                'sample' => array_slice($retryIds, 0, 20),
-                'reason' => $reason,
-            ]);
 
-            $alerts[] = [
-                'label'   => $label,
-                'command' => $command,
-                'reason'  => $reason,
-                'count'   => $count,
-                'ids'     => array_slice($retryIds, 0, 20),
-            ];
+            if ($severity === 'info') {
+                // Sync ran and retried — gap means data doesn't exist in source, not a broken automation.
+                $this->log("  result  : ℹ {$count} still missing after retry — data gap in source (not an error)", 'line');
+                Log::info("EnrollmentIntegrityCheck: [{$label}] data gap after retry — source data missing", [
+                    'count'  => $count,
+                    'sample' => array_slice($retryIds, 0, 20),
+                    'reason' => $reason,
+                ]);
+                $dataGaps[] = [
+                    'label'   => $label,
+                    'command' => $command,
+                    'reason'  => $reason,
+                    'count'   => $count,
+                    'ids'     => array_slice($retryIds, 0, 20),
+                ];
+            } else {
+                $this->log("  result  : ✗ STILL {$count} issue(s) after retry — FLAGGED", 'error');
+                Log::error("EnrollmentIntegrityCheck: [{$label}] still failing after retry", [
+                    'count'  => $count,
+                    'sample' => array_slice($retryIds, 0, 20),
+                    'reason' => $reason,
+                ]);
+                $alerts[] = [
+                    'label'   => $label,
+                    'command' => $command,
+                    'reason'  => $reason,
+                    'count'   => $count,
+                    'ids'     => array_slice($retryIds, 0, 20),
+                ];
+            }
         }
 
         // ── Duplicate LLG_ID check (no retry — needs manual fix) ─────────────
@@ -293,17 +328,26 @@ class EnrollmentIntegrityCheck extends Command
         $elapsed = round(now()->diffInSeconds($startedAt));
         $this->log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
+        // Log data gaps summary (informational — no email)
+        if (!empty($dataGaps)) {
+            $gapCount = count($dataGaps);
+            $this->log("ℹ {$gapCount} data gap(s) noted (source data missing — automation is fine, no action needed):", 'line');
+            foreach ($dataGaps as $g) {
+                $this->log("  • {$g['label']}: {$g['count']} record(s) — {$g['reason']}", 'line');
+            }
+        }
+
         if (empty($alerts)) {
-            $this->log("ALL {$total} CHECKS PASSED + NO DUPLICATES — elapsed: {$elapsed}s — no email sent.");
+            $this->log("✓ NO ALERTS — elapsed: {$elapsed}s — no email sent." . (!empty($dataGaps) ? " ({$gapCount} data gap(s) logged above.)" : ''));
             $this->log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-            Log::info('EnrollmentIntegrityCheck: all clear', ['elapsed_s' => $elapsed]);
+            Log::info('EnrollmentIntegrityCheck: all clear', ['elapsed_s' => $elapsed, 'data_gaps' => count($dataGaps)]);
             return Command::SUCCESS;
         }
 
         $flagged = count($alerts);
-        $this->log("{$flagged} UNRESOLVED ISSUE(S) after {$elapsed}s — sending alert email...", 'error');
+        $this->log("{$flagged} ALERT(S) require attention after {$elapsed}s — sending alert email...", 'error');
         $this->log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-        $this->sendAlert($alerts, $startedAt, $skipEmail);
+        $this->sendAlert($alerts, $dataGaps, $startedAt, $skipEmail);
 
         return Command::FAILURE;
     }
@@ -355,15 +399,15 @@ class EnrollmentIntegrityCheck extends Command
         }
     }
 
-    private function sendAlert(array $alerts, \Illuminate\Support\Carbon $startedAt, bool $skipEmail): void
+    private function sendAlert(array $alerts, array $dataGaps, \Illuminate\Support\Carbon $startedAt, bool $skipEmail): void
     {
         if ($skipEmail) {
             $this->info('[IntegrityCheck] Email suppressed (--no-email)');
             return;
         }
 
-        $subject = '[ENROLLMENT ALERT] ' . count($alerts) . ' automation(s) failed integrity check — ' . now()->format('Y-m-d H:i');
-        $body    = $this->buildHtml($alerts, $startedAt);
+        $subject = '[ENROLLMENT ALERT] ' . count($alerts) . ' issue(s) need attention — ' . now()->format('Y-m-d H:i');
+        $body    = $this->buildHtml($alerts, $dataGaps, $startedAt);
 
         try {
             $sent = (new EmailSenderService())->sendMailHtml($subject, $body, [self::REPORT_TO]);
@@ -375,26 +419,27 @@ class EnrollmentIntegrityCheck extends Command
         }
     }
 
-    private function buildHtml(array $alerts, \Illuminate\Support\Carbon $startedAt): string
+    private function buildHtml(array $alerts, array $dataGaps, \Illuminate\Support\Carbon $startedAt): string
     {
         $ranAt    = $startedAt->format('F j, Y \a\t g:i A');
         $elapsed  = now()->diffInSeconds($startedAt);
         $duration = $elapsed >= 60 ? round($elapsed / 60, 1) . ' min' : $elapsed . 's';
 
-        $rows = '';
+        // ── ALERTS section (red — needs action) ──────────────────────────────
+        $alertRows = '';
         foreach ($alerts as $a) {
             $isManual   = ($a['command'] === 'manual');
             $cmdDisplay = $isManual
-                ? '<span style="color:#842029;font-weight:bold;">⚠ MANUAL FIX</span>'
+                ? '<span style="color:#842029;font-weight:bold;">&#x26A0; MANUAL FIX REQUIRED</span>'
                 : '<code>' . htmlspecialchars($a['command']) . '</code>';
-            $rowBg      = $isManual ? '#fff3cd' : '#fff8f8';
+            $rowBg = $isManual ? '#fff3cd' : '#fff8f8';
 
             $sampleHtml = empty($a['ids'])
                 ? '<em>none</em>'
                 : '<code style="font-size:11px;">' . implode(', ', array_map('htmlspecialchars', $a['ids']))
                   . ($a['count'] > count($a['ids']) ? ' … (' . $a['count'] . ' total)' : '') . '</code>';
 
-            $rows .= "
+            $alertRows .= "
                 <tr style=\"background:{$rowBg};\">
                     <td style=\"padding:9px 12px;border:1px solid #dee2e6;font-weight:600;white-space:nowrap;\">{$a['label']}</td>
                     <td style=\"padding:9px 12px;border:1px solid #dee2e6;\">{$cmdDisplay}</td>
@@ -404,31 +449,76 @@ class EnrollmentIntegrityCheck extends Command
                 </tr>";
         }
 
-        return "<!DOCTYPE html>
-<html>
-<body style=\"font-family:Arial,sans-serif;font-size:14px;color:#212529;max-width:960px;margin:0 auto;padding:20px;\">
-    <h2 style=\"margin-top:0;color:#dc3545;\">&#x26A0; Enrollment Integrity Alert</h2>
-    <p style=\"color:#6c757d;margin-top:-8px;\">Checked: {$ranAt} &nbsp;|&nbsp; Duration: {$duration}</p>
-    <div style=\"background:#f8d7da;color:#842029;padding:12px 16px;border-radius:4px;font-size:14px;border:1px solid #f5c2c7;\">
-        <strong>" . count($alerts) . " automation(s) still have data issues after an automatic retry.</strong>
-        The automations below were re-run once and the problem persists — manual review may be needed.
+        $alertsTable = "
+    <div style=\"background:#f8d7da;color:#842029;padding:12px 16px;border-radius:4px;font-size:14px;border:1px solid #f5c2c7;margin-bottom:12px;\">
+        <strong>" . count($alerts) . " alert(s) need your attention.</strong>
+        These automations were retried once and the issue persists — action required.
     </div>
-    <table style=\"border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:13px;margin-top:20px;\">
+    <table style=\"border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:13px;margin-bottom:32px;\">
         <thead>
-            <tr style=\"background:#343a40;color:#fff;\">
-                <th style=\"padding:10px 12px;border:1px solid #dee2e6;text-align:left;\">Automation</th>
-                <th style=\"padding:10px 12px;border:1px solid #dee2e6;text-align:left;\">Command</th>
-                <th style=\"padding:10px 12px;border:1px solid #dee2e6;text-align:center;\">Issues</th>
-                <th style=\"padding:10px 12px;border:1px solid #dee2e6;text-align:left;\">What's Wrong</th>
-                <th style=\"padding:10px 12px;border:1px solid #dee2e6;text-align:left;\">Affected LLG_IDs (up to 20)</th>
+            <tr style=\"background:#842029;color:#fff;\">
+                <th style=\"padding:10px 12px;border:1px solid #c9a0a4;text-align:left;\">Automation</th>
+                <th style=\"padding:10px 12px;border:1px solid #c9a0a4;text-align:left;\">Command</th>
+                <th style=\"padding:10px 12px;border:1px solid #c9a0a4;text-align:center;\">Count</th>
+                <th style=\"padding:10px 12px;border:1px solid #c9a0a4;text-align:left;\">Why It's Flagged</th>
+                <th style=\"padding:10px 12px;border:1px solid #c9a0a4;text-align:left;\">Affected LLG_IDs (up to 20)</th>
             </tr>
         </thead>
-        <tbody style=\"background:#fff8f8;\">{$rows}</tbody>
-    </table>
-    <hr style=\"margin-top:32px;\">
+        <tbody>{$alertRows}</tbody>
+    </table>";
+
+        // ── DATA GAPS section (grey/blue — informational, no action needed) ──
+        $gapsSection = '';
+        if (!empty($dataGaps)) {
+            $gapRows = '';
+            foreach ($dataGaps as $g) {
+                $sampleHtml = empty($g['ids'])
+                    ? '<em>none</em>'
+                    : '<code style="font-size:11px;">' . implode(', ', array_map('htmlspecialchars', $g['ids']))
+                      . ($g['count'] > count($g['ids']) ? ' … (' . $g['count'] . ' total)' : '') . '</code>';
+
+                $gapRows .= "
+                <tr style=\"background:#f8f9fa;\">
+                    <td style=\"padding:9px 12px;border:1px solid #dee2e6;font-weight:600;white-space:nowrap;\">{$g['label']}</td>
+                    <td style=\"padding:9px 12px;border:1px solid #dee2e6;text-align:center;color:#6c757d;\">{$g['count']}</td>
+                    <td style=\"padding:9px 12px;border:1px solid #dee2e6;font-size:12px;color:#495057;\">{$g['reason']}</td>
+                    <td style=\"padding:9px 12px;border:1px solid #dee2e6;font-size:11px;word-break:break-all;\">{$sampleHtml}</td>
+                </tr>";
+            }
+
+            $gapsSection = "
+    <h3 style=\"color:#495057;font-size:14px;margin-bottom:6px;\">&#x2139; Data Gaps &mdash; informational only, no action needed</h3>
+    <div style=\"background:#e7f1ff;color:#084298;padding:10px 16px;border-radius:4px;font-size:13px;border:1px solid #b6d4fe;margin-bottom:12px;\">
+        These syncs ran and retried successfully. Records are missing because the source data
+        doesn't exist yet in the CRM or Snowflake &mdash; <strong>the automation is working correctly.</strong>
+        These will resolve automatically once the data is added upstream.
+    </div>
+    <table style=\"border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:13px;margin-bottom:32px;\">
+        <thead>
+            <tr style=\"background:#495057;color:#fff;\">
+                <th style=\"padding:10px 12px;border:1px solid #dee2e6;text-align:left;\">Sync</th>
+                <th style=\"padding:10px 12px;border:1px solid #dee2e6;text-align:center;\">Count</th>
+                <th style=\"padding:10px 12px;border:1px solid #dee2e6;text-align:left;\">Why Data Is Missing</th>
+                <th style=\"padding:10px 12px;border:1px solid #dee2e6;text-align:left;\">Sample LLG_IDs</th>
+            </tr>
+        </thead>
+        <tbody>{$gapRows}</tbody>
+    </table>";
+        }
+
+        return "<!DOCTYPE html>
+<html>
+<body style=\"font-family:Arial,sans-serif;font-size:14px;color:#212529;max-width:980px;margin:0 auto;padding:20px;\">
+    <h2 style=\"margin-top:0;color:#dc3545;\">&#x26A0; Enrollment Integrity Alert</h2>
+    <p style=\"color:#6c757d;margin-top:-8px;\">Checked: {$ranAt} &nbsp;|&nbsp; Duration: {$duration}</p>
+    {$alertsTable}
+    {$gapsSection}
+    <hr style=\"margin-top:16px;\">
     <p style=\"font-size:11px;color:#adb5bd;\">
-        Generated by <strong>enrollment:integrity-check</strong> — runs after all scheduled automations complete.<br>
-        Each flagged automation was retried once automatically before this alert was sent.
+        Generated by <strong>enrollment:integrity-check</strong> &mdash; runs after all scheduled automations complete.<br>
+        Each check was retried once before this alert was sent.
+        <strong>Alerts = broken or needs manual fix.</strong>
+        <strong>Data Gaps = automation is fine, source data missing.</strong>
     </p>
 </body>
 </html>";

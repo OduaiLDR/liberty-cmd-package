@@ -45,6 +45,7 @@ use Cmd\Reports\Console\Commands\GenerateRetentionCommissionReport\GenerateReten
 use Cmd\Reports\Console\Commands\GenerateRetentionManagerCommission\GenerateRetentionManagerCommission;
 use Cmd\Reports\Console\Commands\GenerateCancelRequestsAgentReport\GenerateCancelRequestsAgentReport;
 use Cmd\Reports\Console\Commands\GenerateRetentionBonusCommission\GenerateRetentionBonusCommission;
+use Cmd\Reports\Console\Commands\GenerateNSFCommissionReport\GenerateNSFCommissionReport;
 use Cmd\Reports\Console\Commands\SyncContactsData;
 use Cmd\Reports\Console\Commands\SyncCollectionCompanies;
 use Cmd\Reports\Console\Commands\SyncLastDepositDate;
@@ -165,6 +166,7 @@ class ReportsServiceProvider extends ServiceProvider
                 GenerateRetentionManagerCommission::class,
                 GenerateCancelRequestsAgentReport::class,
                 GenerateRetentionBonusCommission::class,
+                GenerateNSFCommissionReport::class,
                 SyncContactsData::class,
                 SyncCollectionCompanies::class,
                 SyncLastDepositDate::class,
