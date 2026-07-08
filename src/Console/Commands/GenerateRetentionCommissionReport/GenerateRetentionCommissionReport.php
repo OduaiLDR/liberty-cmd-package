@@ -32,7 +32,9 @@ use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 class GenerateRetentionCommissionReport extends Command
 {
     protected $signature = 'reports:retention-commission
-                            {source=both : ldr | plaw | both}';
+                            {source=both : ldr | plaw | both}
+                            {period? : Period start date YYYY-MM-01; defaults to first day of last month}
+                            {--no-email : Build/save snapshot but do not send email}';
 
     protected $description = 'Generate Retention Commission Report (sends to oduai only for testing).';
 
@@ -88,6 +90,8 @@ class GenerateRetentionCommissionReport extends Command
 
     public function handle(): int
     {
+        ini_set('memory_limit', '1024M');
+
         $arg     = strtolower((string) $this->argument('source'));
         $sources = ($arg === 'both') ? ['ldr', 'plaw'] : [$arg];
 
@@ -108,7 +112,8 @@ class GenerateRetentionCommissionReport extends Command
         $display = $cfg['display'];
         $this->info("[INFO] GenerateRetentionCommissionReport – $display");
 
-        $startDate = date('Y-m-01', strtotime('first day of last month'));
+        $periodArg = (string) ($this->argument('period') ?? '');
+        $startDate = $periodArg !== '' ? date('Y-m-01', strtotime($periodArg)) : date('Y-m-01', strtotime('first day of last month'));
         $endDate   = date('Y-m-t', strtotime($startDate));
         $this->info("[INFO] Period: $startDate → $endDate");
 
@@ -258,7 +263,15 @@ class GenerateRetentionCommissionReport extends Command
 
             if ($file) {
                 $this->info("[INFO] [$display] Workbook built: {$file['filename']}");
-                $this->sendReport($file, $display);
+                $snapshotPath = $this->saveSnapshotCopy($file, $display, $startDate);
+                $this->info("[INFO] [$display] Snapshot saved: {$snapshotPath}");
+                $this->cleanupOldSnapshots($startDate);
+
+                if ($this->option('no-email')) {
+                    $this->info("[INFO] [$display] --no-email set; skipping email send.");
+                } else {
+                    $this->sendReport($file, $display);
+                }
                 if (file_exists($file['path'])) {
                     @unlink($file['path']);
                 }
@@ -673,6 +686,72 @@ class GenerateRetentionCommissionReport extends Command
         }
 
         $this->info("[INFO] [$display] Email sent.");
+    }
+
+    // ─── Snapshot retention ───────────────────────────────────────────────────
+
+    private const SNAPSHOT_RETENTION_MONTHS = 6;
+
+    private function saveSnapshotCopy(array $file, string $display, string $startDate): string
+    {
+        if (!isset($file['path'], $file['filename']) || !is_file((string) $file['path'])) {
+            throw new \RuntimeException('Cannot save retention commission snapshot because workbook file is missing.');
+        }
+
+        $month = date('Y-m', strtotime($startDate));
+        $period = date('m-Y', strtotime($startDate));
+        $source = strtoupper($display) === 'PROGRESS LAW' ? 'Progress Law' : 'LDR';
+        $dir = storage_path("app/commission-snapshots/{$month}/retention");
+        if (!is_dir($dir)) {
+            mkdir($dir, 0775, true);
+        }
+
+        $dest = $dir . DIRECTORY_SEPARATOR . "Retention Commission Report - {$source} - {$period}.xlsx";
+        copy((string) $file['path'], $dest); // overwrite same month/source if rerun
+
+        return $dest;
+    }
+
+    private function cleanupOldSnapshots(string $currentStartDate): void
+    {
+        $root = storage_path('app/commission-snapshots');
+        if (!is_dir($root)) {
+            return;
+        }
+
+        $cutoff = (new \DateTimeImmutable(date('Y-m-01', strtotime($currentStartDate))))
+            ->modify('-' . (self::SNAPSHOT_RETENTION_MONTHS - 1) . ' months')
+            ->format('Y-m');
+
+        foreach (scandir($root) ?: [] as $entry) {
+            if ($entry === '.' || $entry === '..' || !preg_match('/^\d{4}-\d{2}$/', $entry)) {
+                continue;
+            }
+            if ($entry < $cutoff) {
+                $path = $root . DIRECTORY_SEPARATOR . $entry;
+                $this->deleteDirectory($path);
+                $this->info("[INFO] Deleted old commission snapshot folder: {$path}");
+            }
+        }
+    }
+
+    private function deleteDirectory(string $path): void
+    {
+        if (!is_dir($path)) {
+            return;
+        }
+        foreach (scandir($path) ?: [] as $item) {
+            if ($item === '.' || $item === '..') {
+                continue;
+            }
+            $child = $path . DIRECTORY_SEPARATOR . $item;
+            if (is_dir($child)) {
+                $this->deleteDirectory($child);
+            } else {
+                @unlink($child);
+            }
+        }
+        @rmdir($path);
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────────────

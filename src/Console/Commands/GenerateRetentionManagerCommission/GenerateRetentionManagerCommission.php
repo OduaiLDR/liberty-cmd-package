@@ -34,12 +34,16 @@ class GenerateRetentionManagerCommission extends Command
                             {--snapshot= : Directory with ldr_rows.json and plaw_rows.json from reports:retention-commission --save-snapshot}
                             {--retention-ldr= : Path to generated LDR Retention Commission Report xlsx}
                             {--retention-plaw= : Path to generated PLAW Retention Commission Report xlsx}
+                            {--nsf-ldr= : Path to generated LDR NSF Commission Report xlsx}
+                            {--nsf-plaw= : Path to generated Progress Law NSF Commission Report xlsx}
+                            {--require-snapshots : Fail if monthly retention/NSF snapshot files are missing instead of falling back to live Snowflake}
+                            {--no-email : Generate files but do not email manager reports}
                             {--all-data-xlsx= : Test mode path to existing manager All Data / Rama tab workbook}
-                            {--all-data-sheet= : Optional sheet name for --all-data-xlsx; defaults to first sheet}
-                            {--email : Email generated reports using RETENTION_MANAGER_* env recipients}
-                            {--email-dry-run : Show email routing but do not send}';
+                            {--all-data-sheet= : Optional sheet name for --all-data-xlsx; defaults to first sheet}';
 
     protected $description = 'Generate Rama - Retention & NSF Manager, Nick - Retention Team Leader, and/or Anthony - NSF Team Leader workbooks.';
+
+    private bool $hadFailures = false;
 
     private const SOURCE_CONFIG = [
         'ldr' => [
@@ -152,7 +156,7 @@ class GenerateRetentionManagerCommission extends Command
                     'exception' => $e->getMessage(),
                     'trace' => $e->getTraceAsString(),
                 ]);
-                if (in_array($report, ['rama', 'nick', 'both'], true)) {
+                if (in_array($report, ['rama', 'nick', 'both', 'all'], true)) {
                     return Command::FAILURE;
                 }
             }
@@ -168,7 +172,7 @@ class GenerateRetentionManagerCommission extends Command
             $this->generateAnthonyReport('Anthony - NSF Team Leader', $startDate, $endDate);
         }
 
-        return Command::SUCCESS;
+        return $this->hadFailures ? Command::FAILURE : Command::SUCCESS;
     }
 
     /** @return array<int,array<string,mixed>> */
@@ -190,6 +194,17 @@ class GenerateRetentionManagerCommission extends Command
 
         $ldrReport = (string) ($this->option('retention-ldr') ?? '');
         $plawReport = (string) ($this->option('retention-plaw') ?? '');
+
+        if ($ldrReport === '' && $plawReport === '') {
+            [$autoLdr, $autoPlaw] = $this->defaultRetentionSnapshotPaths($startDate);
+            if (is_file($autoLdr) && is_file($autoPlaw)) {
+                $ldrReport = $autoLdr;
+                $plawReport = $autoPlaw;
+                $this->info('[INFO] Using monthly retention commission snapshot files.');
+            } elseif ($this->option('require-snapshots')) {
+                throw new \RuntimeException("Required retention snapshot files are missing: {$autoLdr} | {$autoPlaw}");
+            }
+        }
 
         if ($ldrReport !== '' || $plawReport !== '') {
             if ($ldrReport === '' || $plawReport === '') {
@@ -219,6 +234,19 @@ class GenerateRetentionManagerCommission extends Command
         $this->applyTrancheAssignments($all);
 
         return $all;
+    }
+
+    /** @return array{0:string,1:string} */
+    private function defaultRetentionSnapshotPaths(string $startDate): array
+    {
+        $month = date('Y-m', strtotime($startDate));
+        $period = date('m-Y', strtotime($startDate));
+        $dir = storage_path("app/commission-snapshots/{$month}/retention");
+
+        return [
+            $dir . DIRECTORY_SEPARATOR . "Retention Commission Report - LDR - {$period}.xlsx",
+            $dir . DIRECTORY_SEPARATOR . "Retention Commission Report - Progress Law - {$period}.xlsx",
+        ];
     }
 
     /** @return array<int,array<string,mixed>> */
@@ -490,8 +518,9 @@ class GenerateRetentionManagerCommission extends Command
             $file = $this->buildWorkbook($key, $reportName, $rows, $startDate, $endDate);
             $this->info("[INFO] {$reportName}: {$file['filename']}");
             $this->info("[INFO] Saved: {$file['path']}");
-            $this->maybeEmailManagerReport($key, $reportName, $file, $startDate, $endDate);
+            $this->sendManagerReportEmail($key, $file);
         } catch (\Throwable $e) {
+            $this->hadFailures = true;
             $this->error("{$reportName} failed: " . $e->getMessage());
             Log::error('GenerateRetentionManagerCommission report failed', [
                 'report' => $reportName,
@@ -501,16 +530,155 @@ class GenerateRetentionManagerCommission extends Command
         }
     }
 
+    private function sendManagerReportEmail(string $key, array $file): void
+    {
+        if ($this->option('no-email')) {
+            $this->info("[INFO] [{$key}] --no-email set; skipping manager report email.");
+            return;
+        }
+
+        $cfg = match ($key) {
+            'rama' => ['report' => 'Retention & NSF Manager', 'company' => 'Rama'],
+            'nick' => ['report' => 'Retention Team Leader', 'company' => 'Nick'],
+            'anthony' => ['report' => 'NSF Team Leader', 'company' => 'Anthony'],
+            default => throw new \InvalidArgumentException("Unknown manager report email key: {$key}"),
+        };
+
+        if (!isset($file['path'], $file['filename']) || !is_file((string) $file['path'])) {
+            throw new \RuntimeException("Cannot email {$cfg['report']} because workbook file is missing.");
+        }
+
+        $sql = $this->initSqlServer('ldr');
+        $recipients = $this->fetchManagerReportRecipients($sql, $cfg['report'], $cfg['company']);
+        if (empty($recipients['to'])) {
+            $this->hadFailures = true;
+            $this->warn("[WARN] {$cfg['report']} email not sent: no Send_To recipients found in TblReports for company {$cfg['company']}.");
+            return;
+        }
+
+        $attachment = [
+            'name' => (string) $file['filename'],
+            'contentType' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'contentBytes' => base64_encode((string) file_get_contents((string) $file['path'])),
+        ];
+
+        $subject = (string) $cfg['report'];
+        $body = "See attached {$cfg['report']} report.";
+        $sent = (new EmailSenderService())->sendMail(
+            $subject,
+            $body,
+            $recipients['to'],
+            $recipients['cc'],
+            $recipients['bcc'],
+            [$attachment]
+        );
+
+        if ($sent) {
+            $this->info("[INFO] {$cfg['report']} email sent. TO=" . implode(';', $recipients['to']) . " CC=" . implode(';', $recipients['cc']));
+        } else {
+            $this->hadFailures = true;
+            $this->warn("[WARN] {$cfg['report']} email failed to send.");
+        }
+    }
+
+    /** @return array{to:array<int,string>,cc:array<int,string>,bcc:array<int,string>} */
+    private function fetchManagerReportRecipients(DBConnector $sql, string $reportName, string $company): array
+    {
+        $cols = $this->detectTblReportsRecipientColumns($sql);
+        foreach (['report', 'company', 'to', 'cc', 'bcc'] as $required) {
+            if (($cols[$required] ?? null) === null) {
+                throw new \RuntimeException("TblReports missing required recipient column mapping: {$required}");
+            }
+        }
+
+        $reportCol = $cols['report'];
+        $companyCol = $cols['company'];
+        $toCol = $cols['to'];
+        $ccCol = $cols['cc'];
+        $bccCol = $cols['bcc'];
+        $reportEsc = str_replace("'", "''", $reportName);
+        $companyEsc = str_replace("'", "''", $company);
+
+        $res = $sql->querySqlServer("
+            SELECT {$toCol} AS SendToValue, {$ccCol} AS SendCcValue, {$bccCol} AS SendBccValue
+            FROM dbo.TblReports
+            WHERE LTRIM(RTRIM({$reportCol})) = '{$reportEsc}'
+              AND LTRIM(RTRIM({$companyCol})) = '{$companyEsc}'
+        ");
+
+        $to = [];
+        $cc = [];
+        $bcc = [];
+        foreach ($res['data'] ?? [] as $row) {
+            $to = array_merge($to, $this->parseEmailList((string) ($row['SendToValue'] ?? '')));
+            $cc = array_merge($cc, $this->parseEmailList((string) ($row['SendCcValue'] ?? '')));
+            $bcc = array_merge($bcc, $this->parseEmailList((string) ($row['SendBccValue'] ?? '')));
+        }
+
+        return [
+            'to' => array_values(array_unique($to)),
+            'cc' => array_values(array_unique($cc)),
+            'bcc' => array_values(array_unique($bcc)),
+        ];
+    }
+
+    /** @return array{report:?string,company:?string,to:?string,cc:?string,bcc:?string} */
+    private function detectTblReportsRecipientColumns(DBConnector $sql): array
+    {
+        $res = $sql->querySqlServer("
+            SELECT COLUMN_NAME
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = 'dbo'
+              AND TABLE_NAME = 'TblReports'
+        ");
+        $names = [];
+        foreach ($res['data'] ?? [] as $row) {
+            foreach ($row as $value) {
+                if (is_string($value) && $value !== '') {
+                    $names[$value] = true;
+                    break;
+                }
+            }
+        }
+
+        $pick = static function (array $candidates) use ($names): ?string {
+            foreach ($candidates as $candidate) {
+                if (isset($names[$candidate])) {
+                    return $candidate;
+                }
+            }
+            return null;
+        };
+
+        return [
+            'report' => $pick(['Report_Name', 'ReportName']),
+            'company' => $pick(['Company', 'Company_Name', 'CompanyName']),
+            'to' => $pick(['Send_To', 'SendTo']),
+            'cc' => $pick(['Send_CC', 'SendCC']),
+            'bcc' => $pick(['Send_BCC', 'SendBCC']),
+        ];
+    }
+
+    /** @return array<int,string> */
+    private function parseEmailList(string $value): array
+    {
+        $parts = preg_split('/[;,\s]+/', $value) ?: [];
+        return array_values(array_filter(array_map('trim', $parts), function (string $email): bool {
+            return $email !== '' && filter_var($email, FILTER_VALIDATE_EMAIL) !== false;
+        }));
+    }
+
     private function generateAnthonyReport(string $reportName, string $startDate, string $endDate): void
     {
         try {
-            $nsfRows = $this->fetchNsfRows($startDate, $endDate);
+            $nsfRows = $this->buildNsfRowsForAnthony($startDate, $endDate);
             $this->info("[INFO] NSF rows: " . count($nsfRows));
             $file = $this->buildAnthonyWorkbook($reportName, $nsfRows);
             $this->info("[INFO] {$reportName}: {$file['filename']}");
             $this->info("[INFO] Saved: {$file['path']}");
-            $this->maybeEmailManagerReport('anthony', $reportName, $file, $startDate, $endDate);
+            $this->sendManagerReportEmail('anthony', $file);
         } catch (\Throwable $e) {
+            $this->hadFailures = true;
             $this->error("{$reportName} failed: " . $e->getMessage());
             Log::error('GenerateRetentionManagerCommission anthony failed', [
                 'report' => $reportName,
@@ -542,6 +710,109 @@ class GenerateRetentionManagerCommission extends Command
             'recoup'   => 742146,
         ],
     ];
+
+    /** @return array<int,array<string,mixed>> */
+    private function buildNsfRowsForAnthony(string $startDate, string $endDate): array
+    {
+        $ldrPath = (string) ($this->option('nsf-ldr') ?? '');
+        $plawPath = (string) ($this->option('nsf-plaw') ?? '');
+
+        if ($ldrPath === '' && $plawPath === '') {
+            [$autoLdr, $autoPlaw] = $this->defaultNsfSnapshotPaths($startDate);
+            if (is_file($autoLdr) && is_file($autoPlaw)) {
+                $ldrPath = $autoLdr;
+                $plawPath = $autoPlaw;
+                $this->info('[INFO] Using monthly NSF commission snapshot files.');
+            } elseif ($this->option('require-snapshots')) {
+                throw new \RuntimeException("Required NSF snapshot files are missing: {$autoLdr} | {$autoPlaw}");
+            }
+        }
+
+        if ($ldrPath !== '' || $plawPath !== '') {
+            if ($ldrPath === '' || $plawPath === '') {
+                throw new \InvalidArgumentException('Use both --nsf-ldr=path and --nsf-plaw=path, or neither.');
+            }
+            $this->info('[INFO] Loading generated NSF commission XLSX files for Anthony');
+            return array_merge(
+                $this->loadNsfCommissionRowsFromXlsx($ldrPath),
+                $this->loadNsfCommissionRowsFromXlsx($plawPath)
+            );
+        }
+
+        return $this->fetchNsfRows($startDate, $endDate);
+    }
+
+    /** @return array{0:string,1:string} */
+    private function defaultNsfSnapshotPaths(string $startDate): array
+    {
+        $month = date('Y-m', strtotime($startDate));
+        $period = date('m-Y', strtotime($startDate));
+        $dir = storage_path("app/commission-snapshots/{$month}/nsf");
+
+        return [
+            $dir . DIRECTORY_SEPARATOR . "NSF Commission Report - LDR - {$period}.xlsx",
+            $dir . DIRECTORY_SEPARATOR . "NSF Commission Report - Progress Law - {$period}.xlsx",
+        ];
+    }
+
+    /** @return array<int,array<string,mixed>> */
+    private function loadNsfCommissionRowsFromXlsx(string $path): array
+    {
+        if (!is_file($path)) {
+            throw new \RuntimeException("NSF commission report not found: {$path}");
+        }
+
+        $reader = IOFactory::createReaderForFile($path);
+        $reader->setReadDataOnly(true);
+        $spreadsheet = $reader->load($path);
+        $sheet = $spreadsheet->getSheetByName('NSF Data') ?? $spreadsheet->getActiveSheet();
+        $highestRow = $sheet->getHighestDataRow();
+        $highestCol = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::columnIndexFromString($sheet->getHighestDataColumn());
+
+        $headerMap = [];
+        for ($c = 1; $c <= $highestCol; $c++) {
+            $cell = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($c) . '1';
+            $header = strtoupper(trim((string) $sheet->getCell($cell)->getValue()));
+            $key = match ($header) {
+                'ID' => 'ID',
+                'AGENT' => 'AGENT',
+                'NSF RETURNED DATE' => 'NSF_RETURNED_DATE',
+                'NSF ACTION' => 'NSF_ACTION',
+                'NSF RECOUP DATE' => 'NSF_RECOUP_DATE',
+                'CLEARED DATE' => 'CLEARED_DATE',
+                'VALID COMMISSION' => 'VALID_COMMISSION',
+                default => '',
+            };
+            if ($key !== '') {
+                $headerMap[$c] = $key;
+            }
+        }
+
+        $dateKeys = ['NSF_RETURNED_DATE' => true, 'NSF_RECOUP_DATE' => true, 'CLEARED_DATE' => true];
+        $rows = [];
+        for ($r = 2; $r <= $highestRow; $r++) {
+            $row = [];
+            foreach ($headerMap as $c => $key) {
+                $cell = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($c) . (string) $r;
+                $value = $sheet->getCell($cell)->getValue();
+                if (isset($dateKeys[$key])) {
+                    $value = $this->excelOrStringToDate($value);
+                }
+                $row[$key] = $value;
+            }
+            if (trim((string) ($row['ID'] ?? '')) === '' && trim((string) ($row['AGENT'] ?? '')) === '') {
+                continue;
+            }
+            $rows[] = $row;
+        }
+
+        $title = $sheet->getTitle();
+        $spreadsheet->disconnectWorksheets();
+        unset($spreadsheet);
+        $this->info("[INFO] NSF commission rows loaded from '{$title}' ({$path}): " . count($rows));
+
+        return $rows;
+    }
 
     /** @return array<int,array<string,mixed>> */
     private function fetchNsfRows(string $startDate, string $endDate): array

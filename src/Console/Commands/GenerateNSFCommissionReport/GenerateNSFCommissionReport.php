@@ -9,7 +9,9 @@ use Illuminate\Support\Facades\Log;
 class GenerateNSFCommissionReport extends Command
 {
     protected $signature = 'reports:generate-nsf-commission-report
-                            {source=both : ldr | plaw | both}';
+                            {source=both : ldr | plaw | both}
+                            {period? : Period start date YYYY-MM-01; defaults to first day of last month}
+                            {--no-email : Build/save snapshot but do not send email}';
 
     protected $description = 'Generate NSF Commission Report for LDR and/or Progress Law. Runs for the previous calendar month.';
 
@@ -52,6 +54,9 @@ class GenerateNSFCommissionReport extends Command
     // Rate = $4.00 regardless of tier
     private const FLAT_RATE_AGENTS = ['Anthony Clark', 'Lucas Wright'];
 
+    // Keep monthly NSF/commission snapshots for current month + previous 5 months.
+    private const SNAPSHOT_RETENTION_MONTHS = 6;
+
     public function handle(): int
     {
         $arg     = strtolower((string) $this->argument('source'));
@@ -74,7 +79,8 @@ class GenerateNSFCommissionReport extends Command
         $display = $cfg['display'];
         $this->info("[INFO] GenerateNSFCommissionReport — $display");
 
-        $startDate = date('Y-m-01', strtotime('first day of last month'));
+        $periodArg = (string) ($this->argument('period') ?? '');
+        $startDate = $periodArg !== '' ? date('Y-m-01', strtotime($periodArg)) : date('Y-m-01', strtotime('first day of last month'));
         $endDate   = date('Y-m-t', strtotime($startDate));
         $this->info("[INFO] Period: $startDate → $endDate");
 
@@ -113,7 +119,15 @@ class GenerateNSFCommissionReport extends Command
             $file = $formatter->buildWorkbook($dataRows, $commissionRows, $display, $startDate, $endDate);
             $this->info("[INFO] [$display] Workbook: {$file['filename']}");
 
-            $this->sendReport($sql, $file, $display, $startDate, $endDate, $commissionRows);
+            $snapshotPath = $this->saveSnapshotCopy($file, $startDate);
+            $this->info("[INFO] [$display] Snapshot saved: {$snapshotPath}");
+            $this->cleanupOldSnapshots($startDate);
+
+            if ($this->option('no-email')) {
+                $this->info("[INFO] [$display] --no-email set; skipping email send.");
+            } else {
+                $this->sendReport($sql, $file, $display, $startDate, $endDate, $commissionRows);
+            }
 
             if (file_exists($file['path'])) {
                 @unlink($file['path']);
@@ -372,6 +386,69 @@ class GenerateNSFCommissionReport extends Command
             $this->warn("[WARN] [$display] Email not sent.");
             Log::warning("GenerateNSFCommissionReport[$display]: email not sent.");
         }
+    }
+
+    private function saveSnapshotCopy(array $file, string $startDate): string
+    {
+        if (!isset($file['path'], $file['filename']) || !is_file((string) $file['path'])) {
+            throw new \RuntimeException('Cannot save NSF commission snapshot because workbook file is missing.');
+        }
+
+        $month = date('Y-m', strtotime($startDate));
+        $dir = storage_path("app/commission-snapshots/{$month}/nsf");
+        if (!is_dir($dir)) {
+            mkdir($dir, 0775, true);
+        }
+
+        $dest = $dir . DIRECTORY_SEPARATOR . (string) $file['filename'];
+        copy((string) $file['path'], $dest); // overwrite same month/source if rerun
+
+        return $dest;
+    }
+
+    private function cleanupOldSnapshots(string $currentStartDate): void
+    {
+        $root = storage_path('app/commission-snapshots');
+        if (!is_dir($root)) {
+            return;
+        }
+
+        $cutoff = (new \DateTimeImmutable(date('Y-m-01', strtotime($currentStartDate))))
+            ->modify('-' . (self::SNAPSHOT_RETENTION_MONTHS - 1) . ' months')
+            ->format('Y-m');
+
+        foreach (scandir($root) ?: [] as $entry) {
+            if ($entry === '.' || $entry === '..' || !preg_match('/^\d{4}-\d{2}$/', $entry)) {
+                continue;
+            }
+
+            if ($entry < $cutoff) {
+                $path = $root . DIRECTORY_SEPARATOR . $entry;
+                $this->deleteDirectory($path);
+                $this->info("[INFO] Deleted old commission snapshot folder: {$path}");
+            }
+        }
+    }
+
+    private function deleteDirectory(string $path): void
+    {
+        if (!is_dir($path)) {
+            return;
+        }
+
+        $items = scandir($path) ?: [];
+        foreach ($items as $item) {
+            if ($item === '.' || $item === '..') {
+                continue;
+            }
+            $child = $path . DIRECTORY_SEPARATOR . $item;
+            if (is_dir($child)) {
+                $this->deleteDirectory($child);
+            } else {
+                @unlink($child);
+            }
+        }
+        @rmdir($path);
     }
 
     private function initSqlServer(string $source): DBConnector
