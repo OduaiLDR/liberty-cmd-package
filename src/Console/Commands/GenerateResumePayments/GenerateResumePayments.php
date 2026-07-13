@@ -962,8 +962,12 @@ final class GenerateResumePayments extends Command
         $systemAccount = $this->systemAccountFor($company);
 
         // Pass 1 — day-count every age>105 contact (insert Day-0 rows, emit Day 0–3
-        // / "Ready" warnings) and collect the ones that will actually be cancelled.
+        // warnings) and collect the ones that will actually be cancelled. Contacts
+        // past Day 3 that are NOT cancelled today (weekend / reporting-only run) are
+        // COUNTED, not listed — Jacob 2026-07-10 wants 0/1/2/3 then only the clients
+        // dropped that day, no running "Day N" list.
         $toCancel = [];
+        $readyWaiting = 0;
         foreach ($states as $state) {
             $isCurrent = (bool) ($state['is_current'] ?? false);
             $ageDays = (int) ($state['age_days'] ?? 0);
@@ -988,57 +992,77 @@ final class GenerateResumePayments extends Command
             }
 
             // Day >= 4: ready to cancel.
-            $cancelInfo = $this->systemCancelInfo((string) ($state['current_rcode'] ?? ''));
+            $rcode = (string) ($state['current_rcode'] ?? '');
+            $cancelInfo = $this->systemCancelInfo($rcode);
 
-            // Execute the drop only when the flag is on, it's a weekday (cancels run
-            // Mon–Fri only per Jacob), and the R-code maps to a cancel status.
-            // Otherwise just report the contact as ready — weekend or reporting-only run.
-            if (!$executeCancels || !$isWeekday || $cancelInfo === null) {
-                $statusChanges[] = ['llg_id' => $llgId, 'name' => $name, 'status' => "System Cancel Ready - Day {$day}"];
+            if ($cancelInfo === null) {
+                // Day 4+ but the return code doesn't map to a cancel type — it can't be
+                // auto-cancelled and would otherwise sit forever showing a climbing
+                // "Ready - Day N". Surface it for a human instead (Jacob 2026-07-10).
+                $statusChanges[] = ['llg_id' => $llgId, 'name' => $name, 'status' => 'Manual Cancel Audit Required — unmapped return code (' . ($rcode !== '' ? $rcode : 'none') . '); needs manual cancel'];
+                continue;
+            }
+
+            // Execute the drop only when the flag is on and it's a weekday (cancels run
+            // Mon–Fri only per Jacob). On a weekend / reporting-only run the contact is
+            // ready but not dropped today — count it (summarized below), don't list it.
+            if (!$executeCancels || !$isWeekday) {
+                $readyWaiting++;
                 continue;
             }
 
             $toCancel[] = ['contact_id' => $contactId, 'llg_id' => $llgId, 'name' => $name, 'day' => $day, 'info' => $cancelInfo];
         }
 
-        if ($toCancel === []) {
-            return;
+        // Pass 2 — execute, honoring the --max-cancels safety cap. Deferred contacts
+        // (past the cap) are counted, not listed (Jacob 2026-07-10).
+        $deferred = 0;
+        if ($toCancel !== []) {
+            // Batch-fetch the Snowflake data for all to-cancel contacts in one shot
+            // each (instead of ~5 round-trips per contact).
+            $contactIds = array_column($toCancel, 'contact_id');
+            $balances = $this->fetchBalances($snowflake, $contactIds);
+            $epfs = $this->fetchPendingSums($snowflake, $contactIds, 'PF');
+            $settlements = $this->fetchPendingSums($snowflake, $contactIds, 'S');
+            $englishFlags = $this->fetchEnglishFlags($snowflake, $contactIds);
+
+            $processed = 0;
+            foreach ($toCancel as $item) {
+                if ($maxCancels > 0 && $processed >= $maxCancels) {
+                    $deferred++;   // past today's cap — summarized below, not listed
+                    continue;
+                }
+                $processed++;
+
+                $cid = $item['contact_id'];
+                $this->executeSystemCancel(
+                    $tenant,
+                    $cid,
+                    $item['llg_id'],
+                    $item['name'],
+                    $item['info'],
+                    $balances[$cid] ?? 0.0,
+                    $epfs[$cid] ?? 0.0,
+                    $settlements[$cid] ?? 0.0,
+                    $englishFlags[$cid] ?? true,
+                    $systemAccount,
+                    $processDate,
+                    $today,
+                    $dryRun,
+                    $statusChanges,
+                );
+            }
         }
 
-        // Batch-fetch the Snowflake data for all to-cancel contacts in one shot each
-        // (instead of ~5 round-trips per contact).
-        $contactIds = array_column($toCancel, 'contact_id');
-        $balances = $this->fetchBalances($snowflake, $contactIds);
-        $epfs = $this->fetchPendingSums($snowflake, $contactIds, 'PF');
-        $settlements = $this->fetchPendingSums($snowflake, $contactIds, 'S');
-        $englishFlags = $this->fetchEnglishFlags($snowflake, $contactIds);
-
-        // Pass 2 — execute, honoring the --max-cancels safety cap.
-        $processed = 0;
-        foreach ($toCancel as $item) {
-            if ($maxCancels > 0 && $processed >= $maxCancels) {
-                $statusChanges[] = ['llg_id' => $item['llg_id'], 'name' => $item['name'], 'status' => "System Cancel Deferred (cap) - Day {$item['day']}"];
-                continue;
-            }
-            $processed++;
-
-            $cid = $item['contact_id'];
-            $this->executeSystemCancel(
-                $tenant,
-                $cid,
-                $item['llg_id'],
-                $item['name'],
-                $item['info'],
-                $balances[$cid] ?? 0.0,
-                $epfs[$cid] ?? 0.0,
-                $settlements[$cid] ?? 0.0,
-                $englishFlags[$cid] ?? true,
-                $systemAccount,
-                $processDate,
-                $today,
-                $dryRun,
-                $statusChanges,
-            );
+        // One summary line for contacts past the warning window that did NOT cancel
+        // today — deferred by the daily cap, or a weekend / reporting-only run. Jacob
+        // 2026-07-10: show a count, never a running "Day N" list.
+        $waiting = $deferred + $readyWaiting;
+        if ($waiting > 0) {
+            $why = $deferred > 0
+                ? "deferred past today's cap of {$maxCancels}"
+                : 'cancels run Mon-Fri';
+            $statusChanges[] = ['llg_id' => '', 'name' => '', 'status' => "System Cancel - {$waiting} more client(s) ready to cancel ({$why})"];
         }
     }
 
