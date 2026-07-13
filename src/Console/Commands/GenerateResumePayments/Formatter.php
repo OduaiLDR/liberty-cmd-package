@@ -103,20 +103,25 @@ class Formatter
      * in the same order.
      *
      * @param list<array{llg_id:string,name:string,status:string}> $statusChanges
-     * @return array{status:list<array{llg_id:string,name:string,status:string}>, pending:array<int,list<array{llg_id:string,name:string,status:string}>>, final:list<array{llg_id:string,name:string,status:string}>}
+     * @return array{status:list<array{llg_id:string,name:string,status:string}>, pending:array<int,list<array{llg_id:string,name:string,status:string}>>, final:list<array{llg_id:string,name:string,status:string}>, notes:list<array{llg_id:string,name:string,status:string}>}
      */
     private function groupChanges(array $statusChanges): array
     {
         $status = [];
         $pending = [];   // day (0..3) => rows — "System Cancel Pending - Day N"
-        $final = [];     // completed cancels + other cancel outcomes
+        $final = [];     // clients ACTUALLY cancelled today ("System Cancel (…)")
+        $notes = [];     // ID-less summary lines (e.g. "N more ready, deferred past cap")
 
         foreach ($statusChanges as $change) {
             $s = (string) ($change['status'] ?? '');
-            if (preg_match('/System Cancel Pending - Day (\d+)/i', $s, $m) === 1) {
+            $hasId = trim((string) ($change['llg_id'] ?? '')) !== '';
+
+            if (!$hasId && stripos($s, 'System Cancel') !== false) {
+                $notes[] = $change;                    // summary/footer line, no client
+            } elseif (preg_match('/System Cancel Pending - Day (\d+)/i', $s, $m) === 1) {
                 $pending[(int) $m[1]][] = $change;
             } elseif (stripos($s, 'System Cancel') !== false) {
-                $final[] = $change;
+                $final[] = $change;                    // an actual same-day cancel
             } else {
                 $status[] = $change;
             }
@@ -135,7 +140,7 @@ class Formatter
         }
         unset($rows);
 
-        return ['status' => $status, 'pending' => $pending, 'final' => $final];
+        return ['status' => $status, 'pending' => $pending, 'final' => $final, 'notes' => $notes];
     }
 
     /**
@@ -150,13 +155,14 @@ class Formatter
     {
         $groups = $this->groupChanges($statusChanges);
 
+        // ID-less summary rows render as just their status text (no "| |" prefix).
         $fmt = static function (array $c): string {
-            $line = sprintf(
-                '%s | %s | %s',
-                (string) ($c['llg_id'] ?? ''),
-                (string) ($c['name'] ?? ''),
-                (string) ($c['status'] ?? ''),
-            );
+            $id = (string) ($c['llg_id'] ?? '');
+            $name = (string) ($c['name'] ?? '');
+            $status = (string) ($c['status'] ?? '');
+            $line = ($id === '' && $name === '')
+                ? $status
+                : sprintf('%s | %s | %s', $id, $name, $status);
 
             return htmlspecialchars($line, ENT_QUOTES, 'UTF-8');
         };
@@ -178,9 +184,17 @@ class Formatter
             $body .= implode('<br><br>', $blocks);
         }
 
+        // Only clients cancelled on THIS run (Jacob 2026-07-10: no running list of
+        // deferred cancels). Any ready-but-deferred contacts appear as a single
+        // count line below, not as named rows with a climbing "Day N".
         $finalRows = array_map($fmt, $groups['final']);
-        $body .= '<br><br><b>System Cancellations</b> (final &mdash; cancelled)<br>';
+        $body .= '<br><br><b>System Cancellations</b> (cancelled today)<br>';
         $body .= $finalRows === [] ? '(none)' : implode('<br>', $finalRows);
+
+        if ($groups['notes'] !== []) {
+            $noteLines = array_map($fmt, $groups['notes']);
+            $body .= '<br><br>' . implode('<br>', $noteLines);
+        }
 
         return $body;
     }
@@ -209,6 +223,9 @@ class Formatter
             }
         }
         foreach ($groups['final'] as $row) {
+            $ordered[] = $row;
+        }
+        foreach ($groups['notes'] as $row) {
             $ordered[] = $row;
         }
 
