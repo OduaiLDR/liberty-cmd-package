@@ -227,16 +227,42 @@ final class DppSeleniumService
         // so the caller never sets the "System Cancel" status, which is what fires the
         // client's Termination Notice. (Root cause of the repeat-cancel + duplicate-notice
         // bug found 2026-07-14: DROPPED stayed 0 while we reported success and re-emailed.)
+        $postDropText = '';
         try {
             $client->request('GET', $toolsUrl);
-            $client->waitFor('#cancelbtn', 15);
+            $client->waitFor('#cancelbtn', 20);
+            // Wait for the button's LABEL to actually render — a slow page can present the
+            // element with an empty text for a moment, which must NOT be read as a changed
+            // (dropped) label. Best-effort; if it stays empty we treat it as not-dropped.
+            try {
+                $client->wait(10)->until(
+                    static fn($d): bool =>
+                    trim($d->findElement(\Facebook\WebDriver\WebDriverBy::cssSelector('#cancelbtn'))->getText()) !== ''
+                );
+            } catch (\Throwable $e) {
+                // label stayed empty
+            }
             $postDropText = trim($client->findElement(\Facebook\WebDriver\WebDriverBy::cssSelector('#cancelbtn'))->getText());
         } catch (\Throwable $e) {
-            $postDropText = ''; // #cancelbtn gone → contact is dropped
+            $postDropText = ''; // couldn't read the button — inconclusive (handled as not-dropped)
         }
 
-        if ($postDropText === 'Cancel Program') {
-            Log::warning('DPP: drop did NOT land — #cancelbtn still reads "Cancel Program" after save', [
+        // Diagnostic: capture the post-drop label so real runs tell us exactly what a
+        // landed drop reads (vs the "Cancel Program" of a failure).
+        Log::info('DPP: post-drop #cancelbtn read', [
+            'contact_id' => $contactId,
+            'text' => $postDropText,
+            'balance_branch' => $branch,
+        ]);
+
+        // Success requires a POSITIVE signal: #cancelbtn present with a new, NON-EMPTY
+        // label (no longer "Cancel Program"). Still "Cancel Program", empty, or unreadable
+        // all mean the drop did NOT land — return failed so we never set the status (which
+        // fires the client's Termination Notice). The bias is deliberate: a false "failed"
+        // only routes to a manual cancel; a false "success" was the repeat-cancel bug. An
+        // empty read is what caused a one-off false success on a held client in validation.
+        if ($postDropText === '' || $postDropText === 'Cancel Program') {
+            Log::warning('DPP: drop did NOT land — #cancelbtn reads "' . $postDropText . '" after save', [
                 'tenant' => $tenant,
                 'contact_id' => $contactId,
                 'balance_branch' => $branch,
