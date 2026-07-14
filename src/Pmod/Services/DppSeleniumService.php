@@ -207,7 +207,7 @@ final class DppSeleniumService
         $branch = $balance > 0 ? 'positive' : ($balance < 0 ? 'negative' : 'zero');
 
         try {
-            $this->executeDrop($client, $balance, $processDate, $today, $dropReason, $note);
+            $formCleared = $this->executeDrop($client, $balance, $processDate, $today, $dropReason, $note);
         } catch (\Throwable $e) {
             throw new DppSeleniumException(
                 'cancel drop failed: ' . $e->getMessage(),
@@ -219,52 +219,39 @@ final class DppSeleniumService
         }
 
         // VERIFY the drop actually landed. executeDrop can run to completion without a
-        // Selenium error yet leave the client un-dropped — the form is rejected
-        // server-side (refund validation, or a "Returned Payments Hold" blocking the
-        // drop) and the "wait for #savebtn to clear" simply times out and proceeds.
-        // Re-load the tools page and re-read #cancelbtn: after a real drop it no longer
-        // reads "Cancel Program". If it still does, the drop did NOT take — return failed
-        // so the caller never sets the "System Cancel" status, which is what fires the
-        // client's Termination Notice. (Root cause of the repeat-cancel + duplicate-notice
-        // bug found 2026-07-14: DROPPED stayed 0 while we reported success and re-emailed.)
-        $postDropText = '';
+        // Selenium error yet leave the client un-dropped (Returned Payments Hold / refund).
+        // Two signals, biased so a false "failed" only routes to a manual cancel:
+        //   1) PRIMARY — the save form CLEARED (#savebtn gone) = the server accepted the drop;
+        //   2) GUARD — after a reload #cancelbtn is no longer "Cancel Program". A dropped
+        //      contact loses #cancelbtn entirely (probe-cancel 2026-07-14: "not found"), so
+        //      absence is fine; only a definitive "Cancel Program" here can DOWNGRADE to
+        //      failed. It can NEVER false-fail a real drop (whose button is gone).
+        $stillCancellable = false;
         try {
             $client->request('GET', $toolsUrl);
-            $client->waitFor('#cancelbtn', 20);
-            // Wait for the button's LABEL to actually render — a slow page can present the
-            // element with an empty text for a moment, which must NOT be read as a changed
-            // (dropped) label. Best-effort; if it stays empty we treat it as not-dropped.
-            try {
-                $client->wait(10)->until(
-                    static fn($d): bool =>
-                    trim($d->findElement(\Facebook\WebDriver\WebDriverBy::cssSelector('#cancelbtn'))->getText()) !== ''
-                );
-            } catch (\Throwable $e) {
-                // label stayed empty
-            }
-            $postDropText = trim($client->findElement(\Facebook\WebDriver\WebDriverBy::cssSelector('#cancelbtn'))->getText());
+            $client->waitFor('#cancelbtn', 10);
+            $stillCancellable = trim($client->findElement(\Facebook\WebDriver\WebDriverBy::cssSelector('#cancelbtn'))->getText()) === 'Cancel Program';
         } catch (\Throwable $e) {
-            $postDropText = ''; // couldn't read the button — inconclusive (handled as not-dropped)
+            // #cancelbtn absent/unreadable — consistent with a dropped contact; leave false.
         }
 
-        // Diagnostic: capture the post-drop label so real runs tell us exactly what a
-        // landed drop reads (vs the "Cancel Program" of a failure).
-        Log::info('DPP: post-drop #cancelbtn read', [
+        Log::info('DPP: drop verification', [
             'contact_id' => $contactId,
-            'text' => $postDropText,
+            'form_cleared' => $formCleared,
+            'still_cancellable' => $stillCancellable,
             'balance_branch' => $branch,
         ]);
 
-        // Success requires a POSITIVE signal: #cancelbtn present with a new, NON-EMPTY
-        // label (no longer "Cancel Program"). Still "Cancel Program", empty, or unreadable
-        // all mean the drop did NOT land — return failed so we never set the status (which
-        // fires the client's Termination Notice). The bias is deliberate: a false "failed"
-        // only routes to a manual cancel; a false "success" was the repeat-cancel bug. An
-        // empty read is what caused a one-off false success on a held client in validation.
-        if ($postDropText === '' || $postDropText === 'Cancel Program') {
-            Log::warning('DPP: drop did NOT land — #cancelbtn reads "' . $postDropText . '" after save', [
+        // Not dropped if the form never cleared, or the contact is still cancellable —
+        // return failed so the caller never sets the "System Cancel" status (which fires
+        // the client's Termination Notice on a drop that never happened). Root cause of
+        // the repeat-cancel + duplicate-notice bug found 2026-07-14.
+        if (!$formCleared || $stillCancellable) {
+            Log::warning('DPP: drop did NOT land', [
                 'tenant' => $tenant,
                 'contact_id' => $contactId,
+                'form_cleared' => $formCleared,
+                'still_cancellable' => $stillCancellable,
                 'balance_branch' => $branch,
             ]);
 
@@ -493,7 +480,7 @@ final class DppSeleniumService
     /**
      * The #cancelbtn drop flow — three balance branches, all stable element IDs.
      */
-    private function executeDrop(mixed $client, float $balance, string $processDate, string $today, string $dropReason, string $note): void
+    private function executeDrop(mixed $client, float $balance, string $processDate, string $today, string $dropReason, string $note): bool
     {
         $css = static fn(string $c) => \Facebook\WebDriver\WebDriverBy::cssSelector($c);
         $driver = $client->getWebDriver();
@@ -551,14 +538,20 @@ final class DppSeleniumService
         $client->findElement($css('#savebtn'))->click();
         $driver->switchTo()->alert()->accept();
 
-        // VBA waited 60s after save. We wait (up to 60s) for the drop form to clear
-        // as the confirmation, then fall through.
+        // A successful drop CLEARS the form (#savebtn disappears); a drop the server
+        // rejects (Returned Payments Hold / refund) leaves the form open. Return whether
+        // it cleared — this is the reliable success signal. Re-reading #cancelbtn after a
+        // reload is racy: a dropped contact loses #cancelbtn entirely (verified via
+        // probe-cancel 2026-07-14: "not found on tools page"), so "absent" can't be told
+        // apart from "slow to load".
         try {
             $client->wait(60)->until(
                 static fn($d): bool => \count($d->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('#savebtn'))) === 0
             );
+
+            return true;
         } catch (\Throwable $e) {
-            // proceed regardless
+            return false; // form still open after 60s → the server did not accept the drop
         }
     }
 
