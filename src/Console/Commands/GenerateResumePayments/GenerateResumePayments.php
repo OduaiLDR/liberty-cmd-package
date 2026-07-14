@@ -57,6 +57,13 @@ final class GenerateResumePayments extends Command
     private const SYSTEM_CANCEL_AGE_DAYS = 105;
     private const CANCEL_COOLDOWN_DAYS = 4;
 
+    /**
+     * dbo.TblReports Report_Name for the per-run "needs a manual cancel" digest
+     * (clients a Returned Payments Hold / refund blocks from auto-dropping). Recipient
+     * is configured in the table like the recap — currently Rama (Jacob 2026-07-14).
+     */
+    private const MANUAL_CANCEL_REPORT = 'System Cancel Manual Review';
+
     /** Forth CRM/Pay API gateway — Phase 4 resume (POST /contacts/{id}/resume) + Phase 5 reads. */
     private ForthPayPmodExecutionGateway $gateway;
 
@@ -1017,6 +1024,7 @@ final class GenerateResumePayments extends Command
         // Pass 2 — execute, honoring the --max-cancels safety cap. Deferred contacts
         // (past the cap) are counted, not listed (Jacob 2026-07-10).
         $deferred = 0;
+        $manualCancels = []; // held/refund clients that need a manual cancel → one digest to Rama below
         if ($toCancel !== []) {
             // Batch-fetch the Snowflake data for all to-cancel contacts in one shot
             // each (instead of ~5 round-trips per contact).
@@ -1050,6 +1058,7 @@ final class GenerateResumePayments extends Command
                     $today,
                     $dryRun,
                     $statusChanges,
+                    $manualCancels,
                 );
             }
         }
@@ -1063,6 +1072,13 @@ final class GenerateResumePayments extends Command
                 ? "deferred past today's cap of {$maxCancels}"
                 : 'cancels run Mon-Fri';
             $statusChanges[] = ['llg_id' => '', 'name' => '', 'status' => "System Cancel - {$waiting} more client(s) ready to cancel ({$why})"];
+        }
+
+        // One digest email to Rama (recipient configured in dbo.TblReports) listing the
+        // clients a Returned Payments Hold / refund blocked from auto-dropping — sent
+        // once per run, never per contact, and skipped in dry-run (Jacob 2026-07-14).
+        if (!$dryRun && $manualCancels !== []) {
+            $this->sendManualCancelEmail($sqlConnector, $company, $manualCancels);
         }
     }
 
@@ -1090,7 +1106,8 @@ final class GenerateResumePayments extends Command
         string $processDate,
         string $today,
         bool $dryRun,
-        array &$statusChanges
+        array &$statusChanges,
+        array &$manualCancels
     ): void {
         [$statusTitle, $reasonEn, $reasonEs] = $cancelInfo;
         $reason = $english ? $reasonEn : $reasonEs;
@@ -1175,8 +1192,20 @@ final class GenerateResumePayments extends Command
             return;
         }
 
+        $msg = (string) ($result['message'] ?? '');
+
+        // A drop that ran but didn't land = the client can't be auto-cancelled
+        // (Returned Payments Hold / refund rejection). Jacob 2026-07-14: collect these
+        // for a single manual-cancel digest to Rama (sent once per run below), and DON'T
+        // set the status — so no Termination Notice fires on a client we didn't drop.
+        if (stripos($msg, 'drop did not take effect') !== false) {
+            $manualCancels[] = ['contact_id' => $contactId, 'name' => $name, 'reason' => $msg];
+            $statusChanges[] = ['llg_id' => $llgId, 'name' => $name, 'status' => 'Manual Cancel Required (emailed to Rama) — ' . $msg];
+            return;
+        }
+
         // Any other failure → report it; it retries on the next run (like the VBA).
-        $statusChanges[] = ['llg_id' => $llgId, 'name' => $name, 'status' => 'System Cancel failed: ' . ($result['message'] ?? '')];
+        $statusChanges[] = ['llg_id' => $llgId, 'name' => $name, 'status' => 'System Cancel failed: ' . $msg];
     }
 
     /**
@@ -1329,6 +1358,55 @@ final class GenerateResumePayments extends Command
             "Client {$contactId} is pending cancellation but requires manual review.{$detail} Please review and process manually.",
             ['jennifer@libertydebtrelief.com'],
         );
+    }
+
+    /**
+     * Per-run digest of clients that couldn't be auto-cancelled because a Returned
+     * Payments Hold / refund blocked the drop, so a person must cancel them manually.
+     * The recipient lives in dbo.TblReports (Report_Name = self::MANUAL_CANCEL_REPORT),
+     * same pattern as the recap — env extras are NOT merged, so it goes to just the
+     * configured recipient (Jacob 2026-07-14: Rama only). One email per company per run.
+     *
+     * @param list<array{contact_id:string,name:string,reason:string}> $manualCancels
+     */
+    private function sendManualCancelEmail(DBConnector $connector, string $company, array $manualCancels): void
+    {
+        $lines = [];
+        foreach ($manualCancels as $mc) {
+            $lines[] = htmlspecialchars(
+                sprintf(
+                    'LLG-%s | %s | %s',
+                    (string) ($mc['contact_id'] ?? ''),
+                    (string) ($mc['name'] ?? ''),
+                    (string) ($mc['reason'] ?? ''),
+                ),
+                ENT_QUOTES,
+                'UTF-8',
+            );
+        }
+
+        $label = strtoupper($company) === 'PLAW' ? 'ProLaw' : 'LDR';
+        $subject = "System Cancel - Manual Cancel Required - {$label}";
+        $body = 'The following ' . $label . ' client(s) could not be auto-cancelled '
+            . '(Returned Payments Hold / refund) and need a manual cancel:<br><br>'
+            . implode('<br>', $lines);
+
+        $sent = (new EmailSenderService())->sendMailUsingTblReportsHtml(
+            $connector,
+            [self::MANUAL_CANCEL_REPORT],
+            [strtoupper($company)],
+            $subject,
+            $body,
+            [],
+            false, // Rama only — do not merge REPORT_EXTRA_RECIPIENTS
+        );
+
+        if (!$sent) {
+            Log::warning('ResumePayments: manual-cancel digest not sent (no TblReports recipient for ' . self::MANUAL_CANCEL_REPORT . '?)', [
+                'company' => $company,
+                'count' => count($manualCancels),
+            ]);
+        }
     }
 
     private function emailReverseFees(string $contactId, string $name): void
