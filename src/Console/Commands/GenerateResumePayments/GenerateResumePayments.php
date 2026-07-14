@@ -17,7 +17,7 @@ use Illuminate\Support\Facades\Log;
  *
  * Workflow (per company):
  *   Phase 1  — Pull NSF candidates from Snowflake (returned drafts since 2022-09-01,
- *              enrolled + not graduated, R-codes R01/R02/R03/R04/R07/R08/R09/R10/R11/R15/R16/R20).
+ *              enrolled + not graduated, R-codes R01/R02/R03/R04/R07/R08/R09/R10/R11/R13/R15/R16/R17/R20/R24/R29).
  *   Phase 2  — Per contact: walk draft history to find latest R-code, count NSFs by
  *              distinct calendar month, compute age (days) from earliest NSF.
  *   Phase 3  — Recent-successful-draft adjustment (subtract count of cleared drafts in last 3 days).
@@ -52,7 +52,7 @@ final class GenerateResumePayments extends Command
 
     protected $description = 'Process NSF contacts for LDR and Progress Law: update statuses, resume drafts, and execute system cancels per the ResumePayments VBA workflow.';
 
-    private const PROCESSED_R_CODES = ['R01', 'R02', 'R03', 'R04', 'R07', 'R08', 'R09', 'R10', 'R11', 'R15', 'R16', 'R20'];
+    private const PROCESSED_R_CODES = ['R01', 'R02', 'R03', 'R04', 'R07', 'R08', 'R09', 'R10', 'R11', 'R13', 'R15', 'R16', 'R17', 'R20', 'R24', 'R29'];
 
     private const SYSTEM_CANCEL_AGE_DAYS = 105;
     private const CANCEL_COOLDOWN_DAYS = 4;
@@ -835,9 +835,9 @@ final class GenerateResumePayments extends Command
         return match ($rcode) {
             'R01', 'R09' => ['nsf', true],
             'R02', 'R15' => ['Account Closed', false],
-            'R03', 'R04', 'R16', 'R20' => ['Invalid Bank', false],
+            'R03', 'R04', 'R13', 'R16', 'R20' => ['Invalid Bank', false],
             'R07', 'R08' => ['Payment Stopped', false],
-            'R10', 'R11' => ['Unauthorized', false],
+            'R10', 'R11', 'R17', 'R24', 'R29' => ['Unauthorized', false],
             default => null,
         };
     }
@@ -1189,9 +1189,9 @@ final class GenerateResumePayments extends Command
         return match ($rcode) {
             'R01', 'R08', 'R09' => ['System Cancel (NSF-3)', 'NSF', 'Fondos Insuficientes'],
             'R02', 'R15' => ['System Cancel (Account Closed-3)', 'Account Closed', 'Cierre de Cuenta'],
-            'R03', 'R04', 'R16', 'R20' => ['System Cancel (Invalid Bank-3)', 'Invalid Bank', 'Banco Invalido'],
+            'R03', 'R04', 'R13', 'R16', 'R20' => ['System Cancel (Invalid Bank-3)', 'Invalid Bank', 'Banco Invalido'],
             'R07' => ['System Cancel (Payment Stopped-3)', 'Payment Stopped', 'Pago Detenido'],
-            'R10', 'R11' => ['System Cancel (Unauthorized-3)', 'Payment Unauthorized', 'Autorización Necesaria'],
+            'R10', 'R11', 'R17', 'R24', 'R29' => ['System Cancel (Unauthorized-3)', 'Payment Unauthorized', 'Autorización Necesaria'],
             default => null,
         };
     }
