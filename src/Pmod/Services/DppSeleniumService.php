@@ -218,6 +218,37 @@ final class DppSeleniumService
             );
         }
 
+        // VERIFY the drop actually landed. executeDrop can run to completion without a
+        // Selenium error yet leave the client un-dropped — the form is rejected
+        // server-side (refund validation, or a "Returned Payments Hold" blocking the
+        // drop) and the "wait for #savebtn to clear" simply times out and proceeds.
+        // Re-load the tools page and re-read #cancelbtn: after a real drop it no longer
+        // reads "Cancel Program". If it still does, the drop did NOT take — return failed
+        // so the caller never sets the "System Cancel" status, which is what fires the
+        // client's Termination Notice. (Root cause of the repeat-cancel + duplicate-notice
+        // bug found 2026-07-14: DROPPED stayed 0 while we reported success and re-emailed.)
+        try {
+            $client->request('GET', $toolsUrl);
+            $client->waitFor('#cancelbtn', 15);
+            $postDropText = trim($client->findElement(\Facebook\WebDriver\WebDriverBy::cssSelector('#cancelbtn'))->getText());
+        } catch (\Throwable $e) {
+            $postDropText = ''; // #cancelbtn gone → contact is dropped
+        }
+
+        if ($postDropText === 'Cancel Program') {
+            Log::warning('DPP: drop did NOT land — #cancelbtn still reads "Cancel Program" after save', [
+                'tenant' => $tenant,
+                'contact_id' => $contactId,
+                'balance_branch' => $branch,
+            ]);
+
+            return [
+                'status' => 'failed',
+                'message' => 'drop did not take effect (still cancellable after save) — likely refund rejection or a Returned Payments Hold',
+                'balance_branch' => $branch,
+            ];
+        }
+
         Log::info('DPP: cancelProgram completed', [
             'tenant' => $tenant,
             'contact_id' => $contactId,
