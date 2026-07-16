@@ -4,6 +4,7 @@ namespace Cmd\Reports\Console\Commands;
 
 use Cmd\Reports\Services\DBConnector;
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Process;
 
@@ -130,6 +131,33 @@ class SyncContactsData extends Command
             $this->targetTable        = 'TblContactsLDR';
         }
 
+        // Prevent two syncs of the SAME source from running concurrently. Overlapping
+        // runs race each other's DELETE+INSERT and silently create duplicate rows
+        // (this is how TblContacts accumulated its historical duplicate backlog).
+        // The lock is DB-backed (CACHE_STORE=database), so it serializes across the
+        // orchestrator's subprocess and any manual/scheduled run on this host. It
+        // auto-expires after 2h so a crashed run can never wedge future syncs.
+        $lock = Cache::lock("sync-contacts-data:{$this->source}", 7200);
+        if (! $lock->get()) {
+            $this->warn("[WARN] Another {$this->source} sync is already running; skipping this run to avoid duplicate rows.");
+            Log::warning('SyncContactsData: overlapping run skipped', ['source' => $this->source]);
+            return Command::SUCCESS;
+        }
+
+        try {
+            return $this->runSourceSync();
+        } finally {
+            $lock->release();
+        }
+    }
+
+    /**
+     * Runs the fetch → process → upsert loop for the already-selected source.
+     * Split out from syncForSource() so the overlap lock there can wrap the whole
+     * run in try/finally without re-indenting this body.
+     */
+    private function runSourceSync(): int
+    {
         $this->info("[DEBUG] Initializing Snowflake connector...");
         try {
             $snowflake = $this->initializeSnowflakeConnector();
