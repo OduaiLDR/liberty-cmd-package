@@ -48,7 +48,8 @@ final class GenerateResumePayments extends Command
         {--probe-cancel= : Diagnostic only — drive the cancel flow for ONE contact id and print which selectors exist, WITHOUT clicking save (commits nothing). Tenant = first --company (default LDR).}
         {--probe-resume= : Diagnostic only — probe the Forth resume-payments API for ONE contact id. READ-ONLY by default (token health + contact resolve + transactions paths; safe on any contact). Tenant = first --company (default LDR).}
         {--probe-resume-execute : With --probe-resume, also FIRE the resume POST (an action — TEST FILES ONLY). Without it the resume probe is read-only.}
-        {--no-recap : Skip the Phase 6 recap email (status writes + resumes still happen). Use for controlled live tests so the team is not emailed a partial run.}';
+        {--no-recap : Skip the Phase 6 recap email (status writes + resumes still happen). Use for controlled live tests so the team is not emailed a partial run.}
+        {--cancels-only : Skip Phase 4 (NSF status updates + resume) and run ONLY the Day-4+ System Cancels. Use with --execute-cancels to work extra cancel batches through the backlog WITHOUT re-writing statuses or re-firing status-change triggers (Jacob 2026-07-20).}';
 
     protected $description = 'Process NSF contacts for LDR and Progress Law: update statuses, resume drafts, and execute system cancels per the ResumePayments VBA workflow.';
 
@@ -58,11 +59,17 @@ final class GenerateResumePayments extends Command
     private const CANCEL_COOLDOWN_DAYS = 4;
 
     /**
-     * dbo.TblReports Report_Name for the per-run "needs a manual cancel" digest
-     * (clients a Returned Payments Hold / refund blocks from auto-dropping). Recipient
-     * is configured in the table like the recap — currently Rama (Jacob 2026-07-14).
+     * Recap stage keys (Jacob 2026-07-20): every processed client lands in exactly
+     * one stage. The recap email shows a per-stage COUNT + total debt, and the
+     * attached workbook has one sheet per stage (LLG ID / Name / Debt / Days since
+     * NSF). NSF-1/2/3 are derived from nsf_count via nsfStage(). These keys MUST
+     * stay in sync with Formatter::STAGES.
      */
-    private const MANUAL_CANCEL_REPORT = 'System Cancel Manual Review';
+    private const STAGE_RESOLVED = 'Resolved';
+    private const STAGE_CANCEL_GRACE = 'Cancels - Grace Period';
+    private const STAGE_CANCEL_HOLD = 'Cancels - Release Hold Requested';
+    private const STAGE_CANCEL_BACKLOG = 'Cancels - Backlog';
+    private const STAGE_CANCEL_COMPLETE = 'Cancels - Complete';
 
     /** Forth CRM/Pay API gateway — Phase 4 resume (POST /contacts/{id}/resume) + Phase 5 reads. */
     private ForthPayPmodExecutionGateway $gateway;
@@ -133,8 +140,20 @@ final class GenerateResumePayments extends Command
                     $this->info(sprintf('[INFO] [%s] After --contact-id/--limit filter: %d', $company, count($states)));
                 }
 
-                $statusChanges = $this->processContacts($gateway, $snowflake, $sqlConnector, $company, $states, $dryRun);
-                $this->info(sprintf('[INFO] [%s] Phase 4 status changes: %d', $company, count($statusChanges)));
+                // Enrich each state with the enrolled debt (TblEnrollment.Debt_Amount)
+                // for the recap's Debt column (Jacob 2026-07-20).
+                $this->applyDebtAmounts($sqlConnector, $states);
+
+                if ($this->option('cancels-only')) {
+                    // Jacob 2026-07-20: extra backlog batches — run only the Day-4+ cancels,
+                    // skip Phase 4 so we don't re-write statuses or re-fire status-change
+                    // triggers. (Phase 1–3 candidate load still runs — cancels need the states.)
+                    $statusChanges = [];
+                    $this->info(sprintf('[INFO] [%s] --cancels-only: skipping Phase 4 status updates.', $company));
+                } else {
+                    $statusChanges = $this->processContacts($gateway, $snowflake, $sqlConnector, $company, $states, $dryRun);
+                    $this->info(sprintf('[INFO] [%s] Phase 4 status changes: %d', $company, count($statusChanges)));
+                }
                 $this->processSystemCancels($gateway, $snowflake, $sqlConnector, $company, $states, $statusChanges, $dryRun);
 
                 if ($this->option('no-recap')) {
@@ -541,11 +560,65 @@ final class GenerateResumePayments extends Command
     }
 
     /**
-     * Phase 4 — For each contact, decide and execute the CRM action via the gateway.
-     * Returns the list of (LLG_ID, name, status) status changes to include in the email.
+     * Attach the enrolled debt (dbo.TblEnrollment.Debt_Amount, keyed by LLG_ID) to
+     * each state as `debt_amount` for the recap's Debt column (Jacob 2026-07-20).
+     * TblEnrollment is the same SQL Server source the other reports read debt from,
+     * and our rows are already LLG-{contactId} — so this is one keyed batch lookup,
+     * chunked to stay under SQL Server's 2100-parameter cap. A missing row (or any
+     * query error) leaves debt_amount at 0.0; debt is display-only and must never
+     * fail the run.
      *
      * @param list<array<string, mixed>> $states
-     * @return list<array{llg_id:string,name:string,status:string}>
+     */
+    private function applyDebtAmounts(DBConnector $sqlConnector, array &$states): void
+    {
+        if ($states === []) {
+            return;
+        }
+
+        $llgIds = [];
+        foreach ($states as $state) {
+            $cid = (string) ($state['CONTACT_ID'] ?? '');
+            if ($cid !== '') {
+                $llgIds[] = 'LLG-' . $cid;
+            }
+        }
+        if ($llgIds === []) {
+            return;
+        }
+
+        $debtByLlg = [];
+        foreach (array_chunk(array_values(array_unique($llgIds)), 1000) as $chunk) {
+            $placeholders = implode(',', array_fill(0, count($chunk), '?'));
+            $sql = "SELECT LLG_ID, Debt_Amount FROM TblEnrollment WHERE LLG_ID IN ({$placeholders})";
+            try {
+                $result = $sqlConnector->querySqlServer($sql, $chunk);
+                foreach ($result['data'] ?? [] as $row) {
+                    $llg = (string) ($row['LLG_ID'] ?? '');
+                    if ($llg !== '') {
+                        $debtByLlg[$llg] = (float) ($row['Debt_Amount'] ?? 0);
+                    }
+                }
+            } catch (\Throwable $e) {
+                Log::warning('ResumePayments: debt lookup chunk failed; those clients show 0 debt', [
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        foreach ($states as &$state) {
+            $cid = (string) ($state['CONTACT_ID'] ?? '');
+            $state['debt_amount'] = $cid !== '' ? ($debtByLlg['LLG-' . $cid] ?? 0.0) : 0.0;
+        }
+        unset($state);
+    }
+
+    /**
+     * Phase 4 — For each contact, decide and execute the CRM action via the gateway.
+     * Returns the list of recap rows (llg_id, name, stage, days, debt) for the email.
+     *
+     * @param list<array<string, mixed>> $states
+     * @return list<array{llg_id:string,name:string,stage:string,days:int,debt:float}>
      */
     private function processContacts(
         ForthPayPmodExecutionGateway $gateway,
@@ -587,6 +660,7 @@ final class GenerateResumePayments extends Command
             $age = (int) ($state['age_days'] ?? 0);
             $nsfCount = (int) ($state['nsf_count'] ?? 0);
             $returnDate = (string) ($state['RETURNED_DATE'] ?? '');
+            $debt = (float) ($state['debt_amount'] ?? 0.0);
 
             $currentStatus = (string) ($currentStatuses[$cid] ?? '');
 
@@ -615,7 +689,7 @@ final class GenerateResumePayments extends Command
                 }
 
                 $this->dppClient->setClientStatus($tenant, $cid, $target, $dryRun);
-                $statusChanges[] = $this->row($cid, $name, "{$plan} Enrolled (NSF Cleared)");
+                $statusChanges[] = $this->row($cid, $name, self::STAGE_RESOLVED, $age, $debt);
 
                 if ($this->tryResume($tenant, $cid, $dryRun)) {
                     $this->dppClient->addNote($tenant, $cid, 'Payments Resumed. New draft scheduled.', $dryRun);
@@ -640,10 +714,10 @@ final class GenerateResumePayments extends Command
 
                 if ($this->tryResume($tenant, $cid, $dryRun)) {
                     $this->dppClient->addNote($tenant, $cid, 'Payments Resumed. New draft scheduled.', $dryRun);
-                    $statusChanges[] = $this->row($cid, $name, $status);
-                } else {
-                    $statusChanges[] = $this->row($cid, $name, "{$status} (Unable to Resume)");
                 }
+                // Resumed or not, the recap stage is the same NSF bucket (Jacob 2026-07-20
+                // folds the resume outcome into NSF-1/2/3); the status write below records it.
+                $statusChanges[] = $this->row($cid, $name, $this->nsfStage($nsfCount), $age, $debt);
 
                 $this->insertResumePayments($sqlConnector, $cid, $today, $returnDate, $nsfCount, $monthStart, $dryRun);
                 $this->dppClient->setClientStatus($tenant, $cid, $status, $dryRun);
@@ -658,18 +732,34 @@ final class GenerateResumePayments extends Command
             }
 
             $this->dppClient->setClientStatus($tenant, $cid, $status, $dryRun);
-            $statusChanges[] = $this->row($cid, $name, $status);
+            $statusChanges[] = $this->row($cid, $name, $this->nsfStage($nsfCount), $age, $debt);
         }
 
         return $statusChanges;
     }
 
     /**
-     * @return array{llg_id:string,name:string,status:string}
+     * Build one recap row in the shape the {@see Formatter} consumes: LLG id, client
+     * name, the recap STAGE (a STAGE_* constant or nsfStage()), days-since-NSF (age),
+     * and enrolled debt. One client = one stage.
+     *
+     * @return array{llg_id:string,name:string,stage:string,days:int,debt:float}
      */
-    private function row(string $contactId, string $name, string $status): array
+    private function row(string $contactId, string $name, string $stage, int $days, float $debt): array
     {
-        return ['llg_id' => "LLG-{$contactId}", 'name' => $name, 'status' => $status];
+        return [
+            'llg_id' => "LLG-{$contactId}",
+            'name' => $name,
+            'stage' => $stage,
+            'days' => $days,
+            'debt' => $debt,
+        ];
+    }
+
+    /** nsf_count → NSF-1/2/3 recap stage (Jacob folds 15/30/45/60/90 into 1/2/3). */
+    private function nsfStage(int $nsfCount): string
+    {
+        return 'NSF-' . max(1, min(3, $nsfCount));
     }
 
     /**
@@ -944,7 +1034,7 @@ final class GenerateResumePayments extends Command
      *         (see executeSystemCancel); otherwise emit "System Cancel Ready - Day N".
      *
      * @param list<array<string, mixed>> $states
-     * @param list<array{llg_id:string,name:string,status:string}> $statusChanges
+     * @param list<array{llg_id:string,name:string,stage:string,days:int,debt:float}> $statusChanges
      */
     private function processSystemCancels(
         ForthPayPmodExecutionGateway $gateway, // reserved for Day 4+ EPF capture + settlement void
@@ -974,7 +1064,6 @@ final class GenerateResumePayments extends Command
         // COUNTED, not listed — Jacob 2026-07-10 wants 0/1/2/3 then only the clients
         // dropped that day, no running "Day N" list.
         $toCancel = [];
-        $readyWaiting = 0;
         foreach ($states as $state) {
             $isCurrent = (bool) ($state['is_current'] ?? false);
             $ageDays = (int) ($state['age_days'] ?? 0);
@@ -990,11 +1079,13 @@ final class GenerateResumePayments extends Command
 
             $llgId = 'LLG-' . $contactId;
             $name = trim((string) ($state['FULLNAME'] ?? ''));
+            $debt = (float) ($state['debt_amount'] ?? 0.0);
 
             $day = $this->resolveCancelDay($sqlConnector, $llgId, $today, $dryRun)['day'];
 
             if ($day < self::CANCEL_COOLDOWN_DAYS) {
-                $statusChanges[] = ['llg_id' => $llgId, 'name' => $name, 'status' => "System Cancel Pending - Day {$day}"];
+                // Day 0–3 cool-down — managers can still intervene (Grace Period sheet).
+                $statusChanges[] = $this->row($contactId, $name, self::STAGE_CANCEL_GRACE, $ageDays, $debt);
                 continue;
             }
 
@@ -1004,27 +1095,24 @@ final class GenerateResumePayments extends Command
 
             if ($cancelInfo === null) {
                 // Day 4+ but the return code doesn't map to a cancel type — it can't be
-                // auto-cancelled and would otherwise sit forever showing a climbing
-                // "Ready - Day N". Surface it for a human instead (Jacob 2026-07-10).
-                $statusChanges[] = ['llg_id' => $llgId, 'name' => $name, 'status' => 'Manual Cancel Audit Required — unmapped return code (' . ($rcode !== '' ? $rcode : 'none') . '); needs manual cancel'];
+                // auto-cancelled, so a person must handle it (Release Hold / manual sheet).
+                $statusChanges[] = $this->row($contactId, $name, self::STAGE_CANCEL_HOLD, $ageDays, $debt);
                 continue;
             }
 
             // Execute the drop only when the flag is on and it's a weekday (cancels run
             // Mon–Fri only per Jacob). On a weekend / reporting-only run the contact is
-            // ready but not dropped today — count it (summarized below), don't list it.
+            // ready but not dropped today — it goes to the Backlog sheet.
             if (!$executeCancels || !$isWeekday) {
-                $readyWaiting++;
+                $statusChanges[] = $this->row($contactId, $name, self::STAGE_CANCEL_BACKLOG, $ageDays, $debt);
                 continue;
             }
 
-            $toCancel[] = ['contact_id' => $contactId, 'llg_id' => $llgId, 'name' => $name, 'day' => $day, 'info' => $cancelInfo];
+            $toCancel[] = ['contact_id' => $contactId, 'llg_id' => $llgId, 'name' => $name, 'day' => $day, 'info' => $cancelInfo, 'days' => $ageDays, 'debt' => $debt];
         }
 
         // Pass 2 — execute, honoring the --max-cancels safety cap. Deferred contacts
         // (past the cap) are counted, not listed (Jacob 2026-07-10).
-        $deferred = 0;
-        $manualCancels = []; // held/refund clients that need a manual cancel → one digest to Rama below
         if ($toCancel !== []) {
             // Batch-fetch the Snowflake data for all to-cancel contacts in one shot
             // each (instead of ~5 round-trips per contact).
@@ -1037,7 +1125,9 @@ final class GenerateResumePayments extends Command
             $processed = 0;
             foreach ($toCancel as $item) {
                 if ($maxCancels > 0 && $processed >= $maxCancels) {
-                    $deferred++;   // past today's cap — summarized below, not listed
+                    // Past today's safety cap — goes to the Backlog sheet, cancelled a
+                    // later run (Jacob 2026-07-20: detail on the sheet, count in the email).
+                    $statusChanges[] = $this->row($item['contact_id'], $item['name'], self::STAGE_CANCEL_BACKLOG, $item['days'], $item['debt']);
                     continue;
                 }
                 $processed++;
@@ -1056,30 +1146,18 @@ final class GenerateResumePayments extends Command
                     $systemAccount,
                     $processDate,
                     $today,
+                    $item['days'],
+                    $item['debt'],
                     $dryRun,
                     $statusChanges,
-                    $manualCancels,
                 );
             }
         }
 
-        // One summary line for contacts past the warning window that did NOT cancel
-        // today — deferred by the daily cap, or a weekend / reporting-only run. Jacob
-        // 2026-07-10: show a count, never a running "Day N" list.
-        $waiting = $deferred + $readyWaiting;
-        if ($waiting > 0) {
-            $why = $deferred > 0
-                ? "deferred past today's cap of {$maxCancels}"
-                : 'cancels run Mon-Fri';
-            $statusChanges[] = ['llg_id' => '', 'name' => '', 'status' => "System Cancel - {$waiting} more client(s) ready to cancel ({$why})"];
-        }
-
-        // One digest email to Rama (recipient configured in dbo.TblReports) listing the
-        // clients a Returned Payments Hold / refund blocked from auto-dropping — sent
-        // once per run, never per contact, and skipped in dry-run (Jacob 2026-07-14).
-        if (!$dryRun && $manualCancels !== []) {
-            $this->sendManualCancelEmail($sqlConnector, $company, $manualCancels);
-        }
+        // No summary "N more ready" line and no separate Rama digest anymore (Jacob
+        // 2026-07-20): every ready-but-not-dropped client is an individual row on the
+        // Backlog sheet, and held/manual clients are on the Release Hold Requested
+        // sheet. The email shows per-stage counts; the workbook carries the detail.
     }
 
     /**
@@ -1090,7 +1168,7 @@ final class GenerateResumePayments extends Command
      * prevented by cancelProgram()'s #cancelbtn check, so no DB tracking is needed.
      *
      * @param array{0:string,1:string,2:string} $cancelInfo [statusTitle, reasonEn, reasonEs]
-     * @param list<array{llg_id:string,name:string,status:string}> $statusChanges
+     * @param list<array{llg_id:string,name:string,stage:string,days:int,debt:float}> $statusChanges
      */
     private function executeSystemCancel(
         string $tenant,
@@ -1105,9 +1183,10 @@ final class GenerateResumePayments extends Command
         string $systemAccount,
         string $processDate,
         string $today,
+        int $days,
+        float $debt,
         bool $dryRun,
-        array &$statusChanges,
-        array &$manualCancels
+        array &$statusChanges
     ): void {
         [$statusTitle, $reasonEn, $reasonEs] = $cancelInfo;
         $reason = $english ? $reasonEn : $reasonEs;
@@ -1117,9 +1196,6 @@ final class GenerateResumePayments extends Command
             // settlements → manual review, since the settlement-void isn't implemented;
             // EPF auto-cancels). Shows which contacts auto-cancel vs go to manual.
             $gate = $settlements > 0 ? 'settlement' : null;
-            $outcome = $gate === null
-                ? "would System Cancel → {$statusTitle}"
-                : "would route to MANUAL REVIEW ({$gate}) — not dropped";
 
             Log::info('ResumePayments: DRY RUN - system cancel preview', [
                 'contact_id' => $contactId,
@@ -1130,7 +1206,9 @@ final class GenerateResumePayments extends Command
                 'epf' => $epf,
                 'scheduled_settlements' => $settlements,
             ]);
-            $statusChanges[] = ['llg_id' => $llgId, 'name' => $name, 'status' => "DRY RUN: {$outcome}"];
+            // Preview lands in the stage it WOULD end in: a clean drop → Complete,
+            // a settlement gate → Release Hold Requested (manual).
+            $statusChanges[] = $this->row($contactId, $name, $gate === null ? self::STAGE_CANCEL_COMPLETE : self::STAGE_CANCEL_HOLD, $days, $debt);
             return;
         }
 
@@ -1154,7 +1232,8 @@ final class GenerateResumePayments extends Command
                 'contact_id' => $contactId,
                 'error' => $e->getMessage(),
             ]);
-            $statusChanges[] = ['llg_id' => $llgId, 'name' => $name, 'status' => 'System Cancel failed: ' . $e->getMessage()];
+            // Transient/unknown failure — retries next run; lands on the Backlog sheet.
+            $statusChanges[] = $this->row($contactId, $name, self::STAGE_CANCEL_BACKLOG, $days, $debt);
             return;
         }
 
@@ -1167,7 +1246,7 @@ final class GenerateResumePayments extends Command
                 'reason' => $reason,
             ]);
             $this->emailCancellationAudit($contactId, $reason);
-            $statusChanges[] = ['llg_id' => $llgId, 'name' => $name, 'status' => 'Manual Cancel Audit Required — ' . $reason];
+            $statusChanges[] = $this->row($contactId, $name, self::STAGE_CANCEL_HOLD, $days, $debt);
             return;
         }
 
@@ -1178,7 +1257,7 @@ final class GenerateResumePayments extends Command
                 $this->emailReverseFees($contactId, $name);
             }
 
-            $statusChanges[] = ['llg_id' => $llgId, 'name' => $name, 'status' => $statusTitle];
+            $statusChanges[] = $this->row($contactId, $name, self::STAGE_CANCEL_COMPLETE, $days, $debt);
             return;
         }
 
@@ -1199,13 +1278,15 @@ final class GenerateResumePayments extends Command
         // for a single manual-cancel digest to Rama (sent once per run below), and DON'T
         // set the status — so no Termination Notice fires on a client we didn't drop.
         if (stripos($msg, 'drop did not take effect') !== false) {
-            $manualCancels[] = ['contact_id' => $contactId, 'name' => $name, 'reason' => $msg];
-            $statusChanges[] = ['llg_id' => $llgId, 'name' => $name, 'status' => 'Manual Cancel Required (emailed to Rama) — ' . $msg];
+            // Returned Payments Hold / refund blocked the drop — a person must release &
+            // cancel it. Lands on the Release Hold Requested sheet (Jacob 2026-07-20: no
+            // separate Rama email; held clients live on that sheet).
+            $statusChanges[] = $this->row($contactId, $name, self::STAGE_CANCEL_HOLD, $days, $debt);
             return;
         }
 
-        // Any other failure → report it; it retries on the next run (like the VBA).
-        $statusChanges[] = ['llg_id' => $llgId, 'name' => $name, 'status' => 'System Cancel failed: ' . $msg];
+        // Any other failure → retries on the next run (like the VBA); Backlog sheet.
+        $statusChanges[] = $this->row($contactId, $name, self::STAGE_CANCEL_BACKLOG, $days, $debt);
     }
 
     /**
@@ -1360,55 +1441,6 @@ final class GenerateResumePayments extends Command
         );
     }
 
-    /**
-     * Per-run digest of clients that couldn't be auto-cancelled because a Returned
-     * Payments Hold / refund blocked the drop, so a person must cancel them manually.
-     * The recipient lives in dbo.TblReports (Report_Name = self::MANUAL_CANCEL_REPORT),
-     * same pattern as the recap — env extras are NOT merged, so it goes to just the
-     * configured recipient (Jacob 2026-07-14: Rama only). One email per company per run.
-     *
-     * @param list<array{contact_id:string,name:string,reason:string}> $manualCancels
-     */
-    private function sendManualCancelEmail(DBConnector $connector, string $company, array $manualCancels): void
-    {
-        $lines = [];
-        foreach ($manualCancels as $mc) {
-            $lines[] = htmlspecialchars(
-                sprintf(
-                    'LLG-%s | %s | %s',
-                    (string) ($mc['contact_id'] ?? ''),
-                    (string) ($mc['name'] ?? ''),
-                    (string) ($mc['reason'] ?? ''),
-                ),
-                ENT_QUOTES,
-                'UTF-8',
-            );
-        }
-
-        $label = strtoupper($company) === 'PLAW' ? 'ProLaw' : 'LDR';
-        $subject = "System Cancel - Manual Cancel Required - {$label}";
-        $body = 'The following ' . $label . ' client(s) could not be auto-cancelled '
-            . '(Returned Payments Hold / refund) and need a manual cancel:<br><br>'
-            . implode('<br>', $lines);
-
-        $sent = (new EmailSenderService())->sendMailUsingTblReportsHtml(
-            $connector,
-            [self::MANUAL_CANCEL_REPORT],
-            [strtoupper($company)],
-            $subject,
-            $body,
-            [],
-            false, // Rama only — do not merge REPORT_EXTRA_RECIPIENTS
-        );
-
-        if (!$sent) {
-            Log::warning('ResumePayments: manual-cancel digest not sent (no TblReports recipient for ' . self::MANUAL_CANCEL_REPORT . '?)', [
-                'company' => $company,
-                'count' => count($manualCancels),
-            ]);
-        }
-    }
-
     private function emailReverseFees(string $contactId, string $name): void
     {
         (new EmailSenderService())->sendMailHtml(
@@ -1492,7 +1524,7 @@ final class GenerateResumePayments extends Command
      * Recipients + two-section body live in {@see Formatter}. In dry-run the
      * workbook is built (to prove it works) but no email is sent.
      *
-     * @param list<array{llg_id:string,name:string,status:string}> $statusChanges
+     * @param list<array{llg_id:string,name:string,stage:string,days:int,debt:float}> $statusChanges
      */
     private function sendRecap(DBConnector $connector, string $company, array $statusChanges, bool $dryRun): void
     {
