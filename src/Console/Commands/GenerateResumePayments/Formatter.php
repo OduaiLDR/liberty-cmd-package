@@ -8,6 +8,7 @@ use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\EmailSenderService;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
+use PhpOffice\PhpSpreadsheet\Cell\DataType;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Style\Alignment;
 use PhpOffice\PhpSpreadsheet\Style\Border;
@@ -16,32 +17,51 @@ use PhpOffice\PhpSpreadsheet\Worksheet\Worksheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 
 /**
- * Phase 6 — builds the "Status Changes" workbook and sends the recap email,
- * mirroring the VBA's final block: a 3-column sheet (LLG ID / Name / Status) and
- * an HTML body split into a status-updates section and a "System Cancellations"
- * section, mailed to a fixed distribution list.
+ * Phase 6 — recap for a ResumePayments run (Jacob 2026-07-20 format):
+ *   - Email BODY: a per-stage summary — one line per stage with the client count
+ *     and total debt. No client lists in the body.
+ *   - Attachment: one worksheet per stage, columns LLG ID / Name / Debt / Days
+ *     since NSF, sorted by days (desc) then name (asc).
+ * One recap per company (LDR / ProLaw). Recipients live in dbo.TblReports.
  */
 class Formatter
 {
     /**
-     * TblReports lookup keys (Report_Name) for the recap recipients. Mirrors how
-     * GenerateEmployeesReport pulls its distribution list from dbo.TblReports
-     * instead of hardcoding. Recipients (Send_To/Send_CC/Send_BCC) are managed in
-     * the table, not in code.
+     * TblReports lookup keys (Report_Name) for the recap recipients. Recipients
+     * (Send_To/Send_CC/Send_BCC) are managed in the table, not in code.
      */
     private const REPORT_NAMES = ['ResumePayments', 'Client NSF Status Updates'];
 
     /**
-     * @param list<array{llg_id:string,name:string,status:string}> $statusChanges
+     * The recap stages, in display order. `key` matches the `stage` set on each row
+     * by GenerateResumePayments (its STAGE_* constants + nsfStage()). `label` is the
+     * email/summary text; `sheet` is the Excel tab name (kept <= 31 chars with no
+     * Excel-forbidden characters). Keep in sync with the command's STAGE_* keys.
+     */
+    private const STAGES = [
+        ['key' => 'Resolved', 'label' => 'Resolved', 'sheet' => 'Resolved'],
+        ['key' => 'NSF-1', 'label' => 'NSF-1', 'sheet' => 'NSF-1'],
+        ['key' => 'NSF-2', 'label' => 'NSF-2', 'sheet' => 'NSF-2'],
+        ['key' => 'NSF-3', 'label' => 'NSF-3', 'sheet' => 'NSF-3'],
+        ['key' => 'Cancels - Grace Period', 'label' => 'Cancels - Grace Period', 'sheet' => 'Cancel - Grace Period'],
+        ['key' => 'Cancels - Release Hold Requested', 'label' => 'Cancels - Release Hold Requested', 'sheet' => 'Cancel - Hold Requested'],
+        ['key' => 'Cancels - Backlog', 'label' => 'Cancels - Backlog', 'sheet' => 'Cancel - Backlog'],
+        ['key' => 'Cancels - Complete', 'label' => 'Cancels - Complete', 'sheet' => 'Cancel - Complete'],
+    ];
+
+    /**
+     * @param list<array{llg_id:string,name:string,stage:string,days:int,debt:float}> $statusChanges
      */
     public function sendRecap(DBConnector $connector, array $statusChanges, string $company, bool $dryRun = false, ?Command $console = null): bool
     {
         // VBA: LDR macro subject says "LDR"; PLAW macro subject says "ProLaw".
         $subjectSuffix = strtoupper($company) === 'PLAW' ? 'ProLaw' : 'LDR';
         $subject = 'Client NSF Status Updates - ' . $subjectSuffix;
-        $body = $this->buildHtmlBody($statusChanges);
 
-        $built = $this->buildWorkbook($statusChanges, $company);
+        $grouped = $this->groupByStage($statusChanges);
+        $body = $this->buildSummaryBody($grouped, $subjectSuffix);
+
+        $built = $this->buildWorkbook($grouped, $company);
         $attachments = [[
             'name' => $built['filename'],
             'contentType' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -66,9 +86,7 @@ class Formatter
         }
 
         // Recipients come from dbo.TblReports (Send_To/Send_CC/Send_BCC keyed by
-        // Report_Name + Company), same as the other package reports. One row per
-        // company (LDR / PLAW). If a company row is missing the service falls back
-        // to the report's company-less rows, so a single shared row also works.
+        // Report_Name + Company), same as the other package reports.
         $email = new EmailSenderService();
         $sent = $email->sendMailUsingTblReportsHtml(
             $connector,
@@ -96,159 +114,144 @@ class Formatter
     }
 
     /**
-     * Categorize the status changes into the recap's display groups and sort
-     * each group by client name (Jacob 2026-07-06): regular NSF status updates,
-     * then System Cancel "Pending" bucketed by Day (0 → 3), then the final
-     * cancels. Shared by the email body and the Excel attachment so both present
-     * in the same order.
+     * Bucket the rows by stage (in STAGES order) and sort each bucket by
+     * days-since-NSF descending, then client name ascending (Jacob 2026-07-20).
+     * Every stage gets a bucket (possibly empty) so the layout is stable. Rows with
+     * an unrecognized stage are dropped (they should not occur).
      *
-     * @param list<array{llg_id:string,name:string,status:string}> $statusChanges
-     * @return array{status:list<array{llg_id:string,name:string,status:string}>, pending:array<int,list<array{llg_id:string,name:string,status:string}>>, final:list<array{llg_id:string,name:string,status:string}>, notes:list<array{llg_id:string,name:string,status:string}>}
+     * @param list<array{llg_id:string,name:string,stage:string,days:int,debt:float}> $statusChanges
+     * @return array<string, list<array{llg_id:string,name:string,stage:string,days:int,debt:float}>>
      */
-    private function groupChanges(array $statusChanges): array
+    private function groupByStage(array $statusChanges): array
     {
-        $status = [];
-        $pending = [];   // day (0..3) => rows — "System Cancel Pending - Day N"
-        $final = [];     // clients ACTUALLY cancelled today ("System Cancel (…)")
-        $notes = [];     // ID-less summary lines (e.g. "N more ready, deferred past cap")
+        $buckets = [];
+        foreach (self::STAGES as $stage) {
+            $buckets[$stage['key']] = [];
+        }
 
         foreach ($statusChanges as $change) {
-            $s = (string) ($change['status'] ?? '');
-            $hasId = trim((string) ($change['llg_id'] ?? '')) !== '';
-
-            if (!$hasId && stripos($s, 'System Cancel') !== false) {
-                $notes[] = $change;                    // summary/footer line, no client
-            } elseif (preg_match('/System Cancel Pending - Day (\d+)/i', $s, $m) === 1) {
-                $pending[(int) $m[1]][] = $change;
-            } elseif (stripos($s, 'System Cancel') !== false) {
-                $final[] = $change;                    // an actual same-day cancel
-            } else {
-                $status[] = $change;
+            $stage = (string) ($change['stage'] ?? '');
+            if ($stage !== '' && isset($buckets[$stage])) {
+                $buckets[$stage][] = $change;
             }
         }
 
-        $byName = static fn(array $a, array $b): int => strcasecmp(
-            (string) ($a['name'] ?? ''),
-            (string) ($b['name'] ?? ''),
-        );
+        $sorter = static function (array $a, array $b): int {
+            $byDays = ((int) ($b['days'] ?? 0)) <=> ((int) ($a['days'] ?? 0)); // days desc
+            if ($byDays !== 0) {
+                return $byDays;
+            }
 
-        usort($status, $byName);
-        usort($final, $byName);
-        ksort($pending);                 // Day 0 → 3
-        foreach ($pending as &$rows) {
-            usort($rows, $byName);       // each day sorted by client
+            return strcasecmp((string) ($a['name'] ?? ''), (string) ($b['name'] ?? '')); // name asc
+        };
+
+        foreach ($buckets as &$rows) {
+            usort($rows, $sorter);
         }
         unset($rows);
 
-        return ['status' => $status, 'pending' => $pending, 'final' => $final, 'notes' => $notes];
+        return $buckets;
     }
 
     /**
-     * HTML body grouped for the managers (Jacob 2026-07-06): the NSF status-update
-     * list, then System Cancellations — Pending split into Day 0 / 1 / 2 / 3
-     * sub-groups, then the final "cancelled" group. Every group is sorted by
-     * client name. Full detail also ships as the attached "Status Changes" Excel.
+     * Summary email body — one line per stage with the client count and total debt,
+     * a grand total, and a pointer to the attached per-client detail (Jacob 2026-07-20:
+     * "give a summary and totals only ... put detail in attachment").
      *
-     * @param list<array{llg_id:string,name:string,status:string}> $statusChanges
+     * @param array<string, list<array{llg_id:string,name:string,stage:string,days:int,debt:float}>> $grouped
      */
-    public function buildHtmlBody(array $statusChanges): string
+    private function buildSummaryBody(array $grouped, string $label): string
     {
-        $groups = $this->groupChanges($statusChanges);
+        $rows = '';
+        $totalClients = 0;
+        $totalDebt = 0.0;
 
-        // ID-less summary rows render as just their status text (no "| |" prefix).
-        $fmt = static function (array $c): string {
-            $id = (string) ($c['llg_id'] ?? '');
-            $name = (string) ($c['name'] ?? '');
-            $status = (string) ($c['status'] ?? '');
-            $line = ($id === '' && $name === '')
-                ? $status
-                : sprintf('%s | %s | %s', $id, $name, $status);
-
-            return htmlspecialchars($line, ENT_QUOTES, 'UTF-8');
-        };
-
-        $statusRows = array_map($fmt, $groups['status']);
-
-        $body  = 'The following clients were in NSF status and have been processed: <br><br>';
-        $body .= $statusRows === [] ? '(none)' : implode('<br>', $statusRows);
-
-        $body .= '<br><br><b>System Cancellations - Pending</b> (Day 0&ndash;3 &mdash; managers can still intervene)<br>';
-        if ($groups['pending'] === []) {
-            $body .= '(none)';
-        } else {
-            $blocks = [];
-            foreach ($groups['pending'] as $day => $rows) {
-                $lines = array_map($fmt, $rows);
-                $blocks[] = '<u>Day ' . (int) $day . '</u><br>' . implode('<br>', $lines);
+        foreach (self::STAGES as $stage) {
+            $bucket = $grouped[$stage['key']] ?? [];
+            $count = count($bucket);
+            $debt = 0.0;
+            foreach ($bucket as $r) {
+                $debt += (float) ($r['debt'] ?? 0);
             }
-            $body .= implode('<br><br>', $blocks);
+            $totalClients += $count;
+            $totalDebt += $debt;
+
+            $rows .= '<tr>'
+                . '<td style="padding:4px 16px 4px 0;">' . htmlspecialchars($stage['label'], ENT_QUOTES, 'UTF-8') . '</td>'
+                . '<td style="padding:4px 16px 4px 0; text-align:right;">' . $count . '</td>'
+                . '<td style="padding:4px 0; text-align:right;">$' . number_format($debt, 2) . '</td>'
+                . '</tr>';
         }
 
-        // Only clients cancelled on THIS run (Jacob 2026-07-10: no running list of
-        // deferred cancels). Any ready-but-deferred contacts appear as a single
-        // count line below, not as named rows with a climbing "Day N".
-        $finalRows = array_map($fmt, $groups['final']);
-        $body .= '<br><br><b>System Cancellations</b> (cancelled today)<br>';
-        $body .= $finalRows === [] ? '(none)' : implode('<br>', $finalRows);
-
-        if ($groups['notes'] !== []) {
-            $noteLines = array_map($fmt, $groups['notes']);
-            $body .= '<br><br>' . implode('<br>', $noteLines);
-        }
+        $body  = 'ResumePayments summary &mdash; ' . htmlspecialchars($label, ENT_QUOTES, 'UTF-8')
+            . ' &mdash; ' . date('m/d/Y') . '<br><br>';
+        $body .= '<table style="border-collapse:collapse; font-family:Calibri,Arial,sans-serif; font-size:13px;">';
+        $body .= '<tr>'
+            . '<th style="text-align:left; padding:4px 16px 4px 0; border-bottom:1px solid #ccc;">Stage</th>'
+            . '<th style="text-align:right; padding:4px 16px 4px 0; border-bottom:1px solid #ccc;">Clients</th>'
+            . '<th style="text-align:right; padding:4px 0; border-bottom:1px solid #ccc;">Debt</th>'
+            . '</tr>';
+        $body .= $rows;
+        $body .= '<tr>'
+            . '<td style="padding:6px 16px 4px 0; border-top:1px solid #ccc;"><b>Total</b></td>'
+            . '<td style="padding:6px 16px 4px 0; text-align:right; border-top:1px solid #ccc;"><b>' . $totalClients . '</b></td>'
+            . '<td style="padding:6px 0 4px 0; text-align:right; border-top:1px solid #ccc;"><b>$' . number_format($totalDebt, 2) . '</b></td>'
+            . '</tr>';
+        $body .= '</table>';
+        $body .= '<br>Per-client detail (LLG ID, name, debt, days since NSF) is in the attached workbook &mdash; one sheet per stage.';
 
         return $body;
     }
 
     /**
-     * @param list<array{llg_id:string,name:string,status:string}> $statusChanges
+     * One worksheet per stage: LLG ID / Name / Debt / Days since NSF, sorted by days
+     * (desc) then name. Empty stages still get a header-only sheet so the layout is
+     * stable run-to-run.
+     *
+     * @param array<string, list<array{llg_id:string,name:string,stage:string,days:int,debt:float}>> $grouped
      * @return array{filename:string, path:string}
      */
-    public function buildWorkbook(array $statusChanges, string $company): array
+    public function buildWorkbook(array $grouped, string $company): array
     {
         $spreadsheet = new Spreadsheet();
-        $sheet = $spreadsheet->getActiveSheet();
-        $sheet->setTitle('Status Changes');
-        $sheet->setShowGridlines(false);
 
-        $sheet->fromArray(['LLG ID', 'Name', 'Status'], null, 'A1');
-        $this->styleHeader($sheet, 'A1:C1');
+        $first = true;
+        foreach (self::STAGES as $stage) {
+            $sheet = $first ? $spreadsheet->getActiveSheet() : $spreadsheet->createSheet();
+            $first = false;
 
-        // Same grouping/sort as the email body (Jacob 2026-07-06): NSF updates,
-        // then Pending Day 0 → 3, then final cancels — each group by client name.
-        $groups = $this->groupChanges($statusChanges);
-        $ordered = $groups['status'];
-        foreach ($groups['pending'] as $rows) {
-            foreach ($rows as $row) {
-                $ordered[] = $row;
+            $sheet->setTitle($stage['sheet']);
+            $sheet->setShowGridlines(false);
+
+            $sheet->fromArray(['LLG ID', 'Name', 'Debt', 'Days since NSF'], null, 'A1');
+            $this->styleHeader($sheet, 'A1:D1');
+
+            $rowIndex = 2;
+            foreach ($grouped[$stage['key']] ?? [] as $change) {
+                $sheet->setCellValue("A{$rowIndex}", (string) ($change['llg_id'] ?? ''));
+                $sheet->setCellValue("B{$rowIndex}", (string) ($change['name'] ?? ''));
+                $sheet->setCellValueExplicit("C{$rowIndex}", (float) ($change['debt'] ?? 0), DataType::TYPE_NUMERIC);
+                $sheet->setCellValueExplicit("D{$rowIndex}", (int) ($change['days'] ?? 0), DataType::TYPE_NUMERIC);
+                $rowIndex++;
             }
-        }
-        foreach ($groups['final'] as $row) {
-            $ordered[] = $row;
-        }
-        foreach ($groups['notes'] as $row) {
-            $ordered[] = $row;
+
+            $lastRow = max(2, $rowIndex - 1);
+
+            $this->applyBorders($sheet, "A1:D{$lastRow}");
+            $sheet->getStyle("A1:D{$lastRow}")->getFont()->setName('Calibri')->setSize(9);
+            $sheet->getStyle("A1:D{$lastRow}")->getAlignment()->setVertical(Alignment::VERTICAL_TOP);
+            $sheet->getStyle("C2:C{$lastRow}")->getNumberFormat()->setFormatCode('#,##0.00');
+            $sheet->getColumnDimension('A')->setWidth(18);
+            $sheet->getColumnDimension('B')->setWidth(26);
+            $sheet->getColumnDimension('C')->setWidth(14);
+            $sheet->getColumnDimension('D')->setWidth(14);
+            $sheet->freezePane('A2');
+            $sheet->setSelectedCells('A1');
         }
 
-        $rowIndex = 2;
-        foreach ($ordered as $change) {
-            $sheet->setCellValue("A{$rowIndex}", (string) ($change['llg_id'] ?? ''));
-            $sheet->setCellValue("B{$rowIndex}", (string) ($change['name'] ?? ''));
-            $sheet->setCellValue("C{$rowIndex}", (string) ($change['status'] ?? ''));
-            $rowIndex++;
-        }
+        $spreadsheet->setActiveSheetIndex(0);
 
-        $lastRow = max(2, $rowIndex - 1);
-
-        $this->applyBorders($sheet, "A1:C{$lastRow}");
-        $sheet->getStyle("A1:C{$lastRow}")->getFont()->setName('Calibri')->setSize(9);
-        $sheet->getStyle("A1:C{$lastRow}")->getAlignment()->setVertical(Alignment::VERTICAL_TOP);
-        $sheet->getColumnDimension('A')->setWidth(20);
-        $sheet->getColumnDimension('B')->setWidth(20);
-        $sheet->getColumnDimension('C')->setWidth(40);
-        $sheet->freezePane('A2');
-        $sheet->setSelectedCells('A1');
-
-        $filename = 'Status Changes - ' . $company . ' - ' . date('m-d-Y') . '.xlsx';
+        $filename = 'ResumePayments - ' . $company . ' - ' . date('m-d-Y') . '.xlsx';
         $path = storage_path('app/' . $filename);
 
         $writer = new Xlsx($spreadsheet);
