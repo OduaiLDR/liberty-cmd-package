@@ -59,6 +59,15 @@ final class GenerateResumePayments extends Command
     private const CANCEL_COOLDOWN_DAYS = 4;
 
     /**
+     * Candidates per Phase-2/3 batch. Bounds the in-memory transaction buffer:
+     * computeNsfStates loads every draft for the contacts it's handed, so running it
+     * over all ~6.7k candidates at once buffered their entire draft history and was
+     * the OOM risk behind the server outage (Bryan 2026-07). Chunking caps peak
+     * memory at roughly one batch's worth.
+     */
+    private const CANDIDATE_CHUNK_SIZE = 500;
+
+    /**
      * Recap stage keys (Jacob 2026-07-20): every processed client lands in exactly
      * one stage. The recap email shows a per-stage COUNT + total debt, and the
      * attached workbook has one sheet per stage (LLG ID / Name / Debt / Days since
@@ -132,10 +141,12 @@ final class GenerateResumePayments extends Command
                 $rows = $this->fetchNsfCandidates($snowflake);
                 $this->info(sprintf('[INFO] [%s] NSF candidates: %d', $company, count($rows)));
 
-                $states = $this->computeNsfStates($snowflake, $rows);
-                $this->applyRecentDraftAdjustment($snowflake, $states);
-
-                $states = $this->applyRunFilters($states);
+                // Scope candidates BEFORE the heavy per-contact transaction load so
+                // --contact-id/--limit actually cut work + memory. Then compute NSF
+                // state in bounded chunks so we never buffer every candidate's full
+                // draft history at once (Bryan 2026-07: the OOM behind the outage).
+                $rows = $this->applyCandidateFilters($rows);
+                $states = $this->computeNsfStatesChunked($snowflake, $rows);
                 if ($this->hasRunFilters()) {
                     $this->info(sprintf('[INFO] [%s] After --contact-id/--limit filter: %d', $company, count($states)));
                 }
@@ -161,6 +172,8 @@ final class GenerateResumePayments extends Command
                 } else {
                     $this->sendRecap($sqlConnector, $company, $statusChanges, $dryRun);
                 }
+
+                $this->info(sprintf('[INFO] [%s] Peak memory: %.1f MB', $company, memory_get_peak_usage(true) / 1048576));
             } catch (\Throwable $e) {
                 $this->error("[{$company}] ResumePayments failed: " . $e->getMessage());
                 Log::error('GenerateResumePayments: company failed', [
@@ -263,29 +276,32 @@ final class GenerateResumePayments extends Command
     }
 
     /**
-     * Apply --contact-id / --limit to the computed states so a first live run can
-     * be scoped to one or a few contacts. Both phases (4 and 5) see the same set.
+     * Apply --contact-id / --limit to the CANDIDATE rows up front — before Phase 2/3
+     * load each contact's draft history — so a scoped run (one/few contacts, or the
+     * first N) does proportionally less DB work and holds proportionally less memory.
+     * computeNsfStates is 1:1 candidate→state, so filtering here is equivalent to the
+     * old post-compute slice but far cheaper.
      *
-     * @param list<array<string, mixed>> $states
+     * @param list<array<string, mixed>> $candidates
      * @return list<array<string, mixed>>
      */
-    private function applyRunFilters(array $states): array
+    private function applyCandidateFilters(array $candidates): array
     {
         $only = $this->runContactIds();
         if ($only !== []) {
             $set = array_flip($only);
-            $states = array_values(array_filter(
-                $states,
-                static fn(array $s): bool => isset($set[(string) ($s['CONTACT_ID'] ?? '')]),
+            $candidates = array_values(array_filter(
+                $candidates,
+                static fn(array $c): bool => isset($set[(string) ($c['CONTACT_ID'] ?? '')]),
             ));
         }
 
         $limit = $this->option('limit');
         if ($limit !== null && (int) $limit > 0) {
-            $states = array_slice($states, 0, (int) $limit);
+            $candidates = array_slice($candidates, 0, (int) $limit);
         }
 
-        return $states;
+        return $candidates;
     }
 
     /**
@@ -325,6 +341,36 @@ final class GenerateResumePayments extends Command
 
         $result = $snowflake->query($sql);
         return $result['data'] ?? [];
+    }
+
+    /**
+     * Chunked driver for Phase 2 + 3: compute NSF state for the candidates in bounded
+     * batches (CANDIDATE_CHUNK_SIZE) so we never hold every candidate's full draft
+     * history in memory at once. Each chunk loads only its own transactions; those raw
+     * rows are freed between chunks, leaving just the small per-contact state. Behavior
+     * is identical to running Phase 2/3 over the whole set — the per-contact logic has
+     * no cross-contact dependency.
+     *
+     * @param list<array<string, mixed>> $candidates
+     * @return list<array<string, mixed>>
+     */
+    private function computeNsfStatesChunked(DBConnector $snowflake, array $candidates): array
+    {
+        if ($candidates === []) {
+            return [];
+        }
+
+        $states = [];
+        foreach (array_chunk($candidates, self::CANDIDATE_CHUNK_SIZE) as $chunk) {
+            $chunkStates = $this->computeNsfStates($snowflake, $chunk);
+            $this->applyRecentDraftAdjustment($snowflake, $chunkStates);
+            foreach ($chunkStates as $state) {
+                $states[] = $state;
+            }
+            unset($chunkStates);
+        }
+
+        return $states;
     }
 
     /**
