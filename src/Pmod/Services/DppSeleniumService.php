@@ -520,11 +520,17 @@ final class DppSeleniumService
             $amountEl->clear();
             $amountEl->sendKeys($this->money($availableRefund));
             $startDate = $client->findElement($css('#start_date'));
-            // Clear via JS, not ->clear(): #start_date is a datepicker input whose
-            // ->clear() throws "invalid element state" (seen 2026-07-21). JS value=''
-            // works regardless and still guards against the form auto-populating the
-            // field (which would otherwise make the sendKeys below APPEND → garbled date).
-            $driver->executeScript('arguments[0].value = "";', [$startDate]);
+            // DIAG (2026-07-21): #start_date came out empty after a JS-clear+sendKeys.
+            // Capture its nature + any auto-filled value BEFORE we set it (readonly?
+            // input mask? pick-only datepicker?) so we can set it the right way.
+            Log::info('DPP: drop diag - #start_date pre-set', [
+                'value' => $startDate->getAttribute('value'),
+                'readonly' => $startDate->getAttribute('readonly'),
+                'disabled' => $startDate->getAttribute('disabled'),
+                'type' => $startDate->getAttribute('type'),
+                'tag' => $startDate->getTagName(),
+            ]);
+            // Plain sendKeys (the pattern that DOES work for #cancellation_request_date).
             $startDate->sendKeys($processDate);
             $startDate->sendKeys(\Facebook\WebDriver\WebDriverKeys::TAB);
         }
