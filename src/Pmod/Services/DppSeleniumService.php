@@ -535,8 +535,26 @@ final class DppSeleniumService
             // best-effort only
         }
 
+        // TEMP DIAGNOSTIC (2026-07-21): capture the final field values right before
+        // save — chiefly to see whether #start_date got garbled by the double write
+        // ($processDate in the refund block, then $today in the optional block, no
+        // clear between) on refund (= positive-balance / held) clients.
+        Log::info('DPP: drop diag - field values right before save', [
+            'start_date' => $this->diagValue($client, '#start_date'),
+            'amount' => $this->diagValue($client, '#amount'),
+            'cancellation_request_date' => $this->diagValue($client, '#cancellation_request_date'),
+            'process_date' => $processDate,
+            'today' => $today,
+        ]);
+
         $client->findElement($css('#savebtn'))->click();
         $driver->switchTo()->alert()->accept();
+
+        // TEMP DIAGNOSTIC (2026-07-21): after accepting the first (save) alert, capture
+        // WHY a held/refund drop doesn't land — a lingering SECOND alert (dismissed, not
+        // accepted → never completes the drop), the URL, #savebtn presence, and any
+        // on-page validation text. Read-only + dismiss-only → commits nothing.
+        $this->logDropDiagnostics($client, $driver);
 
         // A successful drop CLEARS the form (#savebtn disappears); a drop the server
         // rejects (Returned Payments Hold / refund) leaves the form open. Return whether
@@ -552,6 +570,62 @@ final class DppSeleniumService
             return true;
         } catch (\Throwable $e) {
             return false; // form still open after 60s → the server did not accept the drop
+        }
+    }
+
+    /**
+     * TEMP DIAGNOSTIC (2026-07-21) — post-save capture for the held-client drop bug.
+     * Detects a lingering SECOND alert (dismissed, never accepted → nothing committed),
+     * then logs the URL / #savebtn presence / date+amount field values / any visible
+     * validation text. All read-only + dismiss-only. Remove once the fix lands.
+     */
+    private function logDropDiagnostics(mixed $client, mixed $driver): void
+    {
+        try {
+            $client->wait(3)->until(\Facebook\WebDriver\WebDriverExpectedCondition::alertIsPresent());
+            $alert = $driver->switchTo()->alert();
+            $text = (string) $alert->getText();
+            $alert->dismiss(); // "no" → does NOT complete the drop (safe)
+            Log::warning('DPP: drop diag - SECOND alert after save (dismissed, not accepted)', ['text' => $text]);
+        } catch (\Throwable $e) {
+            Log::info('DPP: drop diag - no second alert after save');
+        }
+
+        try {
+            Log::info('DPP: drop diag - post-save state', [
+                'url' => $driver->getCurrentURL(),
+                'savebtn_present' => \count($driver->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('#savebtn'))),
+                'start_date' => $this->diagValue($client, '#start_date'),
+                'amount' => $this->diagValue($client, '#amount'),
+            ]);
+        } catch (\Throwable $e) {
+            Log::warning('DPP: drop diag - post-save state read failed', ['error' => $e->getMessage()]);
+        }
+
+        try {
+            $body = (string) $driver->findElement(\Facebook\WebDriver\WebDriverBy::tagName('body'))->getText();
+            foreach (['invalid', 'required', 'valid date', 'must be', 'error', 'cannot'] as $needle) {
+                $pos = stripos($body, $needle);
+                if ($pos !== false) {
+                    Log::warning('DPP: drop diag - possible validation text', [
+                        'needle' => $needle,
+                        'snippet' => trim(substr($body, max(0, $pos - 60), 160)),
+                    ]);
+                    break;
+                }
+            }
+        } catch (\Throwable $e) {
+            // ignore
+        }
+    }
+
+    /** TEMP DIAGNOSTIC helper — read an element's value attribute; null on failure. */
+    private function diagValue(mixed $client, string $css): ?string
+    {
+        try {
+            return $client->findElement(\Facebook\WebDriver\WebDriverBy::cssSelector($css))->getAttribute('value');
+        } catch (\Throwable $e) {
+            return null;
         }
     }
 
