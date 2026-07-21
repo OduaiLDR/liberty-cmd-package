@@ -44,9 +44,15 @@ class Formatter
         ['key' => 'NSF-2', 'label' => 'NSF-2', 'sheet' => 'NSF-2'],
         ['key' => 'NSF-3', 'label' => 'NSF-3', 'sheet' => 'NSF-3'],
         ['key' => 'Cancels - Grace Period', 'label' => 'Cancels - Grace Period', 'sheet' => 'Cancel - Grace Period'],
-        ['key' => 'Cancels - Release Hold Requested', 'label' => 'Cancels - Release Hold Requested', 'sheet' => 'Cancel - Hold Requested'],
-        ['key' => 'Cancels - Backlog', 'label' => 'Cancels - Backlog', 'sheet' => 'Cancel - Backlog'],
-        ['key' => 'Cancels - Complete', 'label' => 'Cancels - Complete', 'sheet' => 'Cancel - Complete'],
+        // Internal key stays 'Cancels - Release Hold Requested' to match the command's
+        // STAGE_CANCEL_HOLD (no matched-pair change), but the DISPLAY label is "Manual
+        // Review" — the bucket actually holds settlement/EPF manual cases, not held
+        // clients (held clients auto-cancel now). Jacob 2026-07-21.
+        ['key' => 'Cancels - Release Hold Requested', 'label' => 'Cancels - Manual Review', 'sheet' => 'Cancel - Manual Review'],
+        // Display labels renamed per Jacob 2026-07-21 (Backlog->Queued, Complete->Completed);
+        // internal keys unchanged so the command↔Formatter match holds (no matched-pair risk).
+        ['key' => 'Cancels - Backlog', 'label' => 'Cancels - Queued', 'sheet' => 'Cancel - Queued'],
+        ['key' => 'Cancels - Complete', 'label' => 'Cancels - Completed', 'sheet' => 'Cancel - Completed'],
     ];
 
     /**

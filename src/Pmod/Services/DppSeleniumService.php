@@ -394,6 +394,124 @@ final class DppSeleniumService
     }
 
     /**
+     * READ-ONLY probe for the settlement-void screen (2026-07-21). Dumps how a contact's
+     * settlements are laid out — any "settlement" tab links, the settlements table rows
+     * (#tablelist per the VBA: id / creditor / amount / status cells), all <select> ids
+     * (to locate #sett_void_reasons) and its options if present. Clicks NOTHING that
+     * could void — no edit / #voidbtn / confirm. Used to confirm the real selectors +
+     * settlement-id semantics BEFORE the destructive voidSettlements() is written.
+     *
+     * @return array<string, mixed>
+     */
+    public function probeVoidSettlements(string $tenant, string $contactId): array
+    {
+        $tenant = strtoupper(trim($tenant));
+        $contactId = trim($contactId);
+
+        Log::info('DPP: probeVoidSettlements (read-only) requested', ['tenant' => $tenant, 'contact_id' => $contactId]);
+
+        $this->ensureLogin($tenant);
+        $client = $this->client();
+        $driver = $client->getWebDriver();
+        $viewUrl = self::DPP_BASE_URL . '/index.php?module=contacts&page=view2&cid=' . rawurlencode($contactId);
+
+        $report = ['login' => 'ok', 'contact_id' => $contactId, 'committed' => false];
+
+        try {
+            $client->request('GET', $viewUrl);
+            usleep(1500000); // let the contact page settle
+            $report['url'] = $driver->getCurrentURL();
+        } catch (\Throwable $e) {
+            $report['error'] = 'could not load contact page: ' . $e->getMessage();
+
+            return $report;
+        }
+
+        // Links whose text/href mentions "settlement" — to find the real settlements tab.
+        $report['settlement_links'] = [];
+        try {
+            foreach ($driver->findElements(\Facebook\WebDriver\WebDriverBy::tagName('a')) as $a) {
+                $txt = trim((string) $a->getText());
+                $href = (string) ($a->getAttribute('href') ?? '');
+                if (stripos($txt, 'settlement') !== false || stripos($href, 'settlement') !== false) {
+                    $report['settlement_links'][] = ['text' => $txt, 'href' => $href, 'id' => (string) ($a->getAttribute('id') ?? '')];
+                }
+            }
+        } catch (\Throwable $e) {
+            $report['settlement_links_error'] = $e->getMessage();
+        }
+
+        // All <select> ids (to spot #sett_void_reasons) + its options if already present.
+        $report['select_ids'] = [];
+        try {
+            foreach ($driver->findElements(\Facebook\WebDriver\WebDriverBy::tagName('select')) as $s) {
+                $id = (string) ($s->getAttribute('id') ?? '');
+                if ($id !== '') {
+                    $report['select_ids'][] = $id;
+                }
+            }
+        } catch (\Throwable $e) {
+            // ignore
+        }
+        $report['sett_void_reasons_options'] = \count($driver->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('#sett_void_reasons'))) > 0
+            ? $this->optionTexts($driver, '#sett_void_reasons')
+            : 'not present here (the reason dropdown likely only appears inside the void dialog)';
+
+        // The settlements table (#tablelist per the VBA). Try here; if absent, follow the
+        // first settlement link (GET only — no destructive click) and try again there.
+        $report['tablelist_here'] = \count($driver->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('#tablelist'))) > 0;
+        $firstHref = (string) ($report['settlement_links'][0]['href'] ?? '');
+        if (!$report['tablelist_here'] && $firstHref !== '') {
+            try {
+                $client->request('GET', $firstHref);
+                usleep(1500000);
+                $report['followed_link'] = $firstHref;
+                $report['url_after_link'] = $driver->getCurrentURL();
+            } catch (\Throwable $e) {
+                $report['follow_link_error'] = $e->getMessage();
+            }
+        }
+        $report['tablelist_rows'] = \count($driver->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('#tablelist'))) > 0
+            ? $this->dumpTableRows($driver, '#tablelist')
+            : 'no #tablelist found on the contact page or the first settlement link';
+
+        // Back to the contact page — nothing clicked into edit/void/confirm, nothing committed.
+        $client->request('GET', $viewUrl);
+        $report['result'] = 'read-only DOM dump; no edit / #voidbtn / confirm clicked — nothing committed';
+
+        return $report;
+    }
+
+    /**
+     * Dump the first ~25 rows of a table as arrays of cell text — read-only, for probes.
+     *
+     * @return list<list<string>>|string
+     */
+    private function dumpTableRows(mixed $driver, string $css): array|string
+    {
+        try {
+            $table = $driver->findElement(\Facebook\WebDriver\WebDriverBy::cssSelector($css));
+            $rows = [];
+            foreach ($table->findElements(\Facebook\WebDriver\WebDriverBy::tagName('tr')) as $i => $tr) {
+                if ($i > 25) {
+                    break;
+                }
+                $cells = [];
+                foreach ($tr->findElements(\Facebook\WebDriver\WebDriverBy::tagName('td')) as $td) {
+                    $cells[] = trim((string) preg_replace('/\s+/', ' ', $td->getText()));
+                }
+                if ($cells !== []) {
+                    $rows[] = $cells;
+                }
+            }
+
+            return $rows;
+        } catch (\Throwable $e) {
+            return 'dump failed: ' . $e->getMessage();
+        }
+    }
+
+    /**
      * @return list<string>
      */
     private function optionTexts(mixed $driver, string $css): array
