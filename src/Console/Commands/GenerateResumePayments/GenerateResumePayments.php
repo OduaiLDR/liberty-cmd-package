@@ -48,6 +48,7 @@ final class GenerateResumePayments extends Command
         {--probe-cancel= : Diagnostic only — drive the cancel flow for ONE contact id and print which selectors exist, WITHOUT clicking save (commits nothing). Tenant = first --company (default LDR).}
         {--probe-resume= : Diagnostic only — probe the Forth resume-payments API for ONE contact id. READ-ONLY by default (token health + contact resolve + transactions paths; safe on any contact). Tenant = first --company (default LDR).}
         {--probe-resume-execute : With --probe-resume, also FIRE the resume POST (an action — TEST FILES ONLY). Without it the resume probe is read-only.}
+        {--probe-void-settlements= : Diagnostic only — READ-ONLY dump of a single contact settlement-void screen (selectors, void-reason options, settlement rows) plus the pending settlement offers we would target for auto-void. Commits nothing. Tenant = first --company.}
         {--no-recap : Skip the Phase 6 recap email (status writes + resumes still happen). Use for controlled live tests so the team is not emailed a partial run.}
         {--cancels-only : Skip Phase 4 (NSF status updates + resume) and run ONLY the Day-4+ System Cancels. Use with --execute-cancels to work extra cancel batches through the backlog WITHOUT re-writing statuses or re-firing status-change triggers (Jacob 2026-07-20).}';
 
@@ -116,6 +117,11 @@ final class GenerateResumePayments extends Command
         $probeResumeId = (string) ($this->option('probe-resume') ?? '');
         if ($probeResumeId !== '') {
             return $this->runProbeResume($gateway, $probeResumeId);
+        }
+
+        $probeVoidId = (string) ($this->option('probe-void-settlements') ?? '');
+        if ($probeVoidId !== '') {
+            return $this->runProbeVoidSettlements($probeVoidId);
         }
 
         $dryRun = (bool) $this->option('dry-run');
@@ -242,6 +248,50 @@ final class GenerateResumePayments extends Command
         }
 
         $this->line((string) json_encode($report, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+
+        return Command::SUCCESS;
+    }
+
+    /**
+     * --probe-void-settlements: READ-ONLY diagnostic for the settlement auto-void we are
+     * about to build. Prints (a) the pending settlement OFFERS Snowflake thinks this
+     * contact has (the ids we'd void, with pending/cleared row counts + a fully-unpaid
+     * flag), and (b) a live DOM dump of the DPP settlement-void screen (selectors, the
+     * void-reason options, the settlement table rows). Commits NOTHING — no settlement is
+     * voided. Confirms the real selectors + id semantics before we write the destructive
+     * voidSettlements(). Tenant = first --company (default LDR).
+     */
+    private function runProbeVoidSettlements(string $contactId): int
+    {
+        $company = $this->resolveCompanies()[0] ?? 'LDR';
+        $tenant = strtolower($company);
+
+        $this->info("[INFO] Probe-void-settlements (READ-ONLY) for contact {$contactId} as {$company} — commits nothing.");
+
+        // Snowflake side: which settlement offers we THINK are pending for this contact.
+        $offers = [];
+        try {
+            $snowflake = DBConnector::fromEnvironment($tenant);
+            $offers = $this->fetchPendingSettlementOffers($snowflake, [$contactId]);
+        } catch (\Throwable $e) {
+            $this->error('Snowflake offer fetch failed: ' . $e->getMessage());
+            Log::warning('GenerateResumePayments: probe-void offer fetch failed', ['contact_id' => $contactId, 'error' => $e->getMessage()]);
+        }
+
+        // Browser side: read-only dump of the live settlement-void screen.
+        try {
+            $ui = $this->dppSelenium->probeVoidSettlements($tenant, $contactId);
+        } catch (\Throwable $e) {
+            $this->error('Probe failed: ' . $e->getMessage());
+            Log::error('GenerateResumePayments: probe-void-settlements failed', ['contact_id' => $contactId, 'exception' => $e]);
+
+            return Command::FAILURE;
+        }
+
+        $this->line((string) json_encode([
+            'snowflake_pending_offers' => $offers[$contactId] ?? [],
+            'live_ui' => $ui,
+        ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
 
         return Command::SUCCESS;
     }
@@ -1435,6 +1485,55 @@ final class GenerateResumePayments extends Command
             if ($cid !== '') {
                 $map[$cid] = (float) ($row['TOTAL'] ?? 0);
             }
+        }
+
+        return $map;
+    }
+
+    /**
+     * Pending SETTLEMENT OFFERS per contact — the offer IDs the auto-void would target
+     * (currently used only by the read-only --probe-void-settlements). A 'S' (settlement)
+     * transaction links to its SETTLEMENT_OFFERS.ID via LINKED_TO (VBA chain). An offer is
+     * "pending" if it has any uncleared/active/non-cancelled 'S' row; we also count cleared
+     * rows so the future void can EXCLUDE partially-paid offers (fully_unpaid = no cleared
+     * rows). Read-only; mirrors fetchPendingSums('S') but keeps the per-offer ids.
+     *
+     * @param list<string> $contactIds
+     * @return array<string, list<array{offer_id:string,pending_rows:int,cleared_rows:int,fully_unpaid:bool}>>
+     */
+    private function fetchPendingSettlementOffers(DBConnector $snowflake, array $contactIds): array
+    {
+        if ($contactIds === []) {
+            return [];
+        }
+        $cidList = implode(',', array_map('intval', $contactIds));
+        $sql = "
+            SELECT
+                CONTACT_ID,
+                LINKED_TO AS OFFER_ID,
+                SUM(CASE WHEN CLEARED_DATE IS NULL AND CANCELLED = 0 AND ACTIVE = 1 THEN 1 ELSE 0 END) AS PENDING_ROWS,
+                SUM(CASE WHEN CLEARED_DATE IS NOT NULL THEN 1 ELSE 0 END) AS CLEARED_ROWS
+            FROM TRANSACTIONS
+            WHERE CONTACT_ID IN ({$cidList})
+              AND TRANS_TYPE = 'S'
+              AND LINKED_TO IS NOT NULL
+            GROUP BY CONTACT_ID, LINKED_TO
+            HAVING SUM(CASE WHEN CLEARED_DATE IS NULL AND CANCELLED = 0 AND ACTIVE = 1 THEN 1 ELSE 0 END) > 0
+        ";
+
+        $map = [];
+        foreach ($snowflake->query($sql)['data'] ?? [] as $row) {
+            $cid = (string) ($row['CONTACT_ID'] ?? '');
+            if ($cid === '') {
+                continue;
+            }
+            $cleared = (int) ($row['CLEARED_ROWS'] ?? 0);
+            $map[$cid][] = [
+                'offer_id' => (string) ($row['OFFER_ID'] ?? ''),
+                'pending_rows' => (int) ($row['PENDING_ROWS'] ?? 0),
+                'cleared_rows' => $cleared,
+                'fully_unpaid' => $cleared === 0,
+            ];
         }
 
         return $map;
