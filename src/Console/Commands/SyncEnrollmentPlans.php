@@ -29,6 +29,8 @@ class SyncEnrollmentPlans extends Command
                 'source' => $source,
             ]);
 
+            unset($connector);
+
             try {
                 $connector = DBConnector::fromEnvironment($connection);
                 $connector->initializeSqlServer();
@@ -38,7 +40,7 @@ class SyncEnrollmentPlans extends Command
                 $missingContacts = $this->fetchMissingContactIds($connector, $connection);
 
                 if (empty($missingContacts)) {
-                    $this->warn("[$source] No contacts missing Enrollment_Plan.");
+                    $this->warn("[$source] No contacts missing Enrollment_Plan in last 90 days.");
                     $this->insertLogRow(
                         $connector,
                         $source,
@@ -181,13 +183,11 @@ class SyncEnrollmentPlans extends Command
 
     protected function fetchMissingContactIds(DBConnector $connector, string $connection = 'ldr'): array
     {
-        $category = (strtolower($connection) === 'plaw') ? 'CCS' : 'LDR';
-
         $sql = <<<SQL
 SELECT LTRIM(RTRIM(REPLACE(LLG_ID, 'LLG-', ''))) AS CONTACT_ID
 FROM TblEnrollment
 WHERE Enrollment_Plan IS NULL
-  AND Category = '{$category}'
+  AND Welcome_Call_Date >= DATEADD(day, -90, GETDATE())
 SQL;
 
         $result = $connector->querySqlServer($sql);
