@@ -52,11 +52,14 @@ class Formatter
     /**
      * @param list<array{llg_id:string,name:string,stage:string,days:int,debt:float}> $statusChanges
      */
-    public function sendRecap(DBConnector $connector, array $statusChanges, string $company, bool $dryRun = false, ?Command $console = null): bool
+    public function sendRecap(DBConnector $connector, array $statusChanges, string $company, bool $dryRun = false, ?Command $console = null, bool $cancelsOnly = false): bool
     {
         // VBA: LDR macro subject says "LDR"; PLAW macro subject says "ProLaw".
         $subjectSuffix = strtoupper($company) === 'PLAW' ? 'ProLaw' : 'LDR';
-        $subject = 'Client NSF Status Updates - ' . $subjectSuffix;
+        // A --cancels-only run skips the NSF status step (the day's first/full run
+        // already did it), so its report is a pure cancels report: NSF stages omitted,
+        // its own subject. The main full run keeps Jacob's NSF format unchanged.
+        $subject = ($cancelsOnly ? 'System Cancels - ' : 'Client NSF Status Updates - ') . $subjectSuffix;
 
         $grouped = $this->groupByStage($statusChanges);
         $totalRows = 0;
@@ -72,8 +75,8 @@ class Formatter
             $attachments = [];
             $builtPath = null;
         } else {
-            $body = $this->buildSummaryBody($grouped, $subjectSuffix);
-            $built = $this->buildWorkbook($grouped, $company);
+            $body = $this->buildSummaryBody($grouped, $subjectSuffix, $cancelsOnly);
+            $built = $this->buildWorkbook($grouped, $company, $cancelsOnly);
             $builtPath = $built['path'];
             $attachments = [[
                 'name' => $built['filename'],
@@ -181,19 +184,40 @@ class Formatter
     }
 
     /**
+     * The stages to DISPLAY. A --cancels-only run skips the NSF status step, so its
+     * report shows only the four Cancels stages (the NSF/Resolved rows would just be
+     * zeros); a full run shows all eight. Grouping still buckets all eight — this only
+     * controls what the summary + workbook render.
+     *
+     * @return list<array{key:string,label:string,sheet:string}>
+     */
+    private function displayStages(bool $cancelsOnly): array
+    {
+        if (!$cancelsOnly) {
+            return self::STAGES;
+        }
+
+        return array_values(array_filter(
+            self::STAGES,
+            static fn(array $s): bool => str_starts_with($s['key'], 'Cancels'),
+        ));
+    }
+
+    /**
      * Summary email body — one line per stage with the client count and total debt,
      * a grand total, and a pointer to the attached per-client detail (Jacob 2026-07-20:
-     * "give a summary and totals only ... put detail in attachment").
+     * "give a summary and totals only ... put detail in attachment"). A cancels-only
+     * run renders only the Cancels stages (see displayStages).
      *
      * @param array<string, list<array{llg_id:string,name:string,stage:string,days:int,debt:float}>> $grouped
      */
-    private function buildSummaryBody(array $grouped, string $label): string
+    private function buildSummaryBody(array $grouped, string $label, bool $cancelsOnly = false): string
     {
         $rows = '';
         $totalClients = 0;
         $totalDebt = 0.0;
 
-        foreach (self::STAGES as $stage) {
+        foreach ($this->displayStages($cancelsOnly) as $stage) {
             $bucket = $grouped[$stage['key']] ?? [];
             $count = count($bucket);
             $debt = 0.0;
@@ -210,7 +234,8 @@ class Formatter
                 . '</tr>';
         }
 
-        $body  = 'ResumePayments summary &mdash; ' . htmlspecialchars($label, ENT_QUOTES, 'UTF-8')
+        $heading = $cancelsOnly ? 'System Cancels summary' : 'ResumePayments summary';
+        $body  = $heading . ' &mdash; ' . htmlspecialchars($label, ENT_QUOTES, 'UTF-8')
             . ' &mdash; ' . date('m/d/Y') . '<br><br>';
         $body .= '<table style="border-collapse:collapse; font-family:Calibri,Arial,sans-serif; font-size:13px;">';
         $body .= '<tr>'
@@ -238,12 +263,12 @@ class Formatter
      * @param array<string, list<array{llg_id:string,name:string,stage:string,days:int,debt:float}>> $grouped
      * @return array{filename:string, path:string}
      */
-    public function buildWorkbook(array $grouped, string $company): array
+    public function buildWorkbook(array $grouped, string $company, bool $cancelsOnly = false): array
     {
         $spreadsheet = new Spreadsheet();
 
         $first = true;
-        foreach (self::STAGES as $stage) {
+        foreach ($this->displayStages($cancelsOnly) as $stage) {
             $sheet = $first ? $spreadsheet->getActiveSheet() : $spreadsheet->createSheet();
             $first = false;
 
