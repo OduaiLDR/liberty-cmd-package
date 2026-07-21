@@ -527,7 +527,6 @@ final class DppSeleniumService
             // value (mirrors #cancellation_request_date, which stores YYYYMMDD).
             $driver->executeScript("arguments[0].removeAttribute('readonly');", [$startDate]);
             $startDate->sendKeys($processDate);
-            Log::info('DPP: drop diag - #start_date after set', ['value' => $startDate->getAttribute('value')]);
             $startDate->sendKeys(\Facebook\WebDriver\WebDriverKeys::TAB);
         }
 
@@ -554,27 +553,6 @@ final class DppSeleniumService
             // best-effort only
         }
 
-        // TEMP DIAGNOSTIC (2026-07-21): capture the final field values right before
-        // save — chiefly to confirm #start_date is now a single clean date (= process
-        // date), not the old garbled double-write, on refund (held) clients.
-        Log::info('DPP: drop diag - field values right before save', [
-            'start_date' => $this->diagValue($client, '#start_date'),
-            'amount' => $this->diagValue($client, '#amount'),
-            'cancellation_request_date' => $this->diagValue($client, '#cancellation_request_date'),
-            'process_date' => $processDate,
-            'today' => $today,
-        ]);
-
-        // SAFE-TEST GATE (2026-07-21): with DPP_DROP_DRYRUN=1 we run the full sequence
-        // THROUGH the (now footer-safe) #delete_events click and the diag log above,
-        // then stop BEFORE clicking #savebtn — no confirm() is raised and the unsaved
-        // form is discarded, so NOTHING is committed. Confirms the interception is gone
-        // + the date is clean on a real held client without a real drop. Defaults OFF.
-        if (getenv('DPP_DROP_DRYRUN') === '1') {
-            Log::info('DPP: DRYRUN - stopping before #savebtn (nothing committed)', ['start_date' => $this->diagValue($client, '#start_date')]);
-            return false;
-        }
-
         $this->safeClick($client, '#savebtn');
 
         // Accept the mandatory cancel-enrollment confirm, then drain up to 2 bounded,
@@ -595,10 +573,6 @@ final class DppSeleniumService
                 break; // no further alert → done
             }
         }
-
-        // Read-only post-save capture (URL / #savebtn presence / field values / any
-        // validation text). Alerts were already drained above.
-        $this->logDropDiagnostics($client, $driver);
 
         // A successful drop CLEARS the form (#savebtn disappears); a drop the server
         // rejects (Returned Payments Hold / refund) leaves the form open. Return whether
@@ -634,52 +608,6 @@ final class DppSeleniumService
         $driver->executeScript('arguments[0].scrollIntoView({block: "center", inline: "center"});', [$el]);
         usleep(150000); // let the sticky layout settle after the scroll
         $el->click();
-    }
-
-    /**
-     * TEMP DIAGNOSTIC (2026-07-21) — read-only post-save capture for the held-client
-     * drop bug: logs the URL / #savebtn presence / date+amount field values / any
-     * visible validation text. Alerts are drained by executeDrop's accept-loop BEFORE
-     * this runs, so this method never touches alerts. Remove once the fix is proven.
-     */
-    private function logDropDiagnostics(mixed $client, mixed $driver): void
-    {
-        try {
-            Log::info('DPP: drop diag - post-save state', [
-                'url' => $driver->getCurrentURL(),
-                'savebtn_present' => \count($driver->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('#savebtn'))),
-                'start_date' => $this->diagValue($client, '#start_date'),
-                'amount' => $this->diagValue($client, '#amount'),
-            ]);
-        } catch (\Throwable $e) {
-            Log::warning('DPP: drop diag - post-save state read failed', ['error' => $e->getMessage()]);
-        }
-
-        try {
-            $body = (string) $driver->findElement(\Facebook\WebDriver\WebDriverBy::tagName('body'))->getText();
-            foreach (['invalid', 'required', 'valid date', 'must be', 'error', 'cannot'] as $needle) {
-                $pos = stripos($body, $needle);
-                if ($pos !== false) {
-                    Log::warning('DPP: drop diag - possible validation text', [
-                        'needle' => $needle,
-                        'snippet' => trim(substr($body, max(0, $pos - 60), 160)),
-                    ]);
-                    break;
-                }
-            }
-        } catch (\Throwable $e) {
-            // ignore
-        }
-    }
-
-    /** TEMP DIAGNOSTIC helper — read an element's value attribute; null on failure. */
-    private function diagValue(mixed $client, string $css): ?string
-    {
-        try {
-            return $client->findElement(\Facebook\WebDriver\WebDriverBy::cssSelector($css))->getAttribute('value');
-        } catch (\Throwable $e) {
-            return null;
-        }
     }
 
     /** Select an option by visible text. */

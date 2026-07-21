@@ -59,27 +59,42 @@ class Formatter
         $subject = 'Client NSF Status Updates - ' . $subjectSuffix;
 
         $grouped = $this->groupByStage($statusChanges);
-        $body = $this->buildSummaryBody($grouped, $subjectSuffix);
+        $totalRows = 0;
+        foreach ($grouped as $bucket) {
+            $totalRows += count($bucket);
+        }
 
-        $built = $this->buildWorkbook($grouped, $company);
-        $attachments = [[
-            'name' => $built['filename'],
-            'contentType' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            'contentBytes' => base64_encode((string) file_get_contents($built['path'])),
-        ]];
+        // Zero-activity run (nothing processed + no cancels): send a plain "nothing to
+        // report" line instead of an all-zeros grid, and skip the empty attachment — so
+        // a quiet day never lands in the team's inbox looking like a broken report.
+        if ($totalRows === 0) {
+            $body = $this->buildEmptyBody($subjectSuffix);
+            $attachments = [];
+            $builtPath = null;
+        } else {
+            $body = $this->buildSummaryBody($grouped, $subjectSuffix);
+            $built = $this->buildWorkbook($grouped, $company);
+            $builtPath = $built['path'];
+            $attachments = [[
+                'name' => $built['filename'],
+                'contentType' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                'contentBytes' => base64_encode((string) file_get_contents($built['path'])),
+            ]];
+        }
 
         if ($dryRun) {
             Log::info('ResumePayments: DRY RUN - would send recap email', [
                 'company' => $company,
                 'subject' => $subject,
                 'status_change_count' => count($statusChanges),
-                'workbook' => $built['path'],
+                'workbook' => $builtPath,
             ]);
-            if (is_file($built['path'])) {
-                @unlink($built['path']);
+            if ($builtPath !== null && is_file($builtPath)) {
+                @unlink($builtPath);
             }
             if ($console) {
-                $console->info("[INFO] [{$company}] DRY RUN - recap email not sent ({$built['filename']} built).");
+                $note = $builtPath !== null ? basename($builtPath) . ' built' : 'no activity — plain note, no attachment';
+                $console->info("[INFO] [{$company}] DRY RUN - recap email not sent ({$note}).");
             }
 
             return true;
@@ -98,8 +113,8 @@ class Formatter
             true
         );
 
-        if (is_file($built['path'])) {
-            @unlink($built['path']);
+        if ($builtPath !== null && is_file($builtPath)) {
+            @unlink($builtPath);
         }
 
         if ($console) {
@@ -111,6 +126,18 @@ class Formatter
         }
 
         return $sent;
+    }
+
+    /**
+     * Body for a zero-activity run — a plain confirmation line instead of an all-zeros
+     * table, so a quiet day reads as "job ran, nothing to do" rather than a broken
+     * report. No attachment accompanies this body.
+     */
+    private function buildEmptyBody(string $label): string
+    {
+        return 'ResumePayments summary &mdash; ' . htmlspecialchars($label, ENT_QUOTES, 'UTF-8')
+            . ' &mdash; ' . date('m/d/Y') . '<br><br>'
+            . 'No NSF status changes or system cancels to report today.';
     }
 
     /**
