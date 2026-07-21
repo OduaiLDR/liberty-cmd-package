@@ -64,15 +64,6 @@ class Formatter
             $totalRows += count($bucket);
         }
 
-        // TEMP DEBUG (2026-07-21): diagnose the 07/20 all-zeros email (log showed 870
-        // Phase-4 changes but the email rendered zeros). Capture the raw stage values.
-        Log::warning('RECAP DEBUG', [
-            'status_change_count' => count($statusChanges),
-            'grouped_total' => $totalRows,
-            'distinct_stages' => array_values(array_unique(array_map(static fn($r) => (string) ($r['stage'] ?? '(MISSING)'), $statusChanges))),
-            'sample_row' => empty($statusChanges) ? null : $statusChanges[array_key_first($statusChanges)],
-        ]);
-
         // Zero-activity run (nothing processed + no cancels): send a plain "nothing to
         // report" line instead of an all-zeros grid, and skip the empty attachment — so
         // a quiet day never lands in the team's inbox looking like a broken report.
