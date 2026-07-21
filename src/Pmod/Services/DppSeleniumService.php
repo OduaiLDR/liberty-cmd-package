@@ -512,33 +512,45 @@ final class DppSeleniumService
             );
         }
 
+        $didRefund = false;
         if ($availableRefund !== null && $availableRefund > 0) {
+            $didRefund = true;
             $client->findElement($css('#dorefund'))->click();
             $amountEl = $client->findElement($css('#amount'));
             $amountEl->clear();
             $amountEl->sendKeys($this->money($availableRefund));
             $startDate = $client->findElement($css('#start_date'));
+            $startDate->clear(); // guard against the form auto-populating #start_date
             $startDate->sendKeys($processDate);
             $startDate->sendKeys(\Facebook\WebDriver\WebDriverKeys::TAB);
         }
 
         $this->select($client, '#complete_delete', 'Complete');
-        $client->findElement($css('#delete_events'))->click();
+        // Footer-safe click: on a refund the form has expanded and this checkbox slides
+        // under DPP's sticky "System Status" footer → "element click intercepted" (the
+        // live held-client failure, 2026-07-21). safeClick centers it first.
+        $this->safeClick($client, '#delete_events');
 
         // Optional fields — the VBA wrapped these in On Error Resume Next.
         try {
             $client->findElement($css('#cancellation_request_date'))->sendKeys($today);
-            $startDate2 = $client->findElement($css('#start_date'));
-            $startDate2->sendKeys($today);
-            $startDate2->sendKeys(\Facebook\WebDriver\WebDriverKeys::ENTER);
+            // Only the NON-refund path fills #start_date here (to $today). On a refund
+            // the branch above already set it to $processDate, and sendKeys APPENDS
+            // (never replaces) → re-writing garbles the date and the save is rejected.
+            // Guarding by !$didRefund keeps the negative-balance path byte-for-byte
+            // identical while fixing held/refund clients (verified 2026-07-21).
+            if (!$didRefund) {
+                $startDate2 = $client->findElement($css('#start_date'));
+                $startDate2->sendKeys($today);
+                $startDate2->sendKeys(\Facebook\WebDriver\WebDriverKeys::ENTER);
+            }
         } catch (\Throwable $e) {
             // best-effort only
         }
 
         // TEMP DIAGNOSTIC (2026-07-21): capture the final field values right before
-        // save — chiefly to see whether #start_date got garbled by the double write
-        // ($processDate in the refund block, then $today in the optional block, no
-        // clear between) on refund (= positive-balance / held) clients.
+        // save — chiefly to confirm #start_date is now a single clean date (= process
+        // date), not the old garbled double-write, on refund (held) clients.
         Log::info('DPP: drop diag - field values right before save', [
             'start_date' => $this->diagValue($client, '#start_date'),
             'amount' => $this->diagValue($client, '#amount'),
@@ -547,13 +559,39 @@ final class DppSeleniumService
             'today' => $today,
         ]);
 
-        $client->findElement($css('#savebtn'))->click();
-        $driver->switchTo()->alert()->accept();
+        // SAFE-TEST GATE (2026-07-21): with DPP_DROP_DRYRUN=1 we run the full sequence
+        // THROUGH the (now footer-safe) #delete_events click and the diag log above,
+        // then stop BEFORE clicking #savebtn — no confirm() is raised and the unsaved
+        // form is discarded, so NOTHING is committed. Confirms the interception is gone
+        // + the date is clean on a real held client without a real drop. Defaults OFF.
+        if (getenv('DPP_DROP_DRYRUN') === '1') {
+            Log::info('DPP: DRYRUN - stopping before #savebtn (nothing committed)', ['start_date' => $this->diagValue($client, '#start_date')]);
+            return false;
+        }
 
-        // TEMP DIAGNOSTIC (2026-07-21): after accepting the first (save) alert, capture
-        // WHY a held/refund drop doesn't land — a lingering SECOND alert (dismissed, not
-        // accepted → never completes the drop), the URL, #savebtn presence, and any
-        // on-page validation text. Read-only + dismiss-only → commits nothing.
+        $this->safeClick($client, '#savebtn');
+
+        // Accept the mandatory cancel-enrollment confirm, then drain up to 2 bounded,
+        // LOGGED follow-up confirms (the refund path can raise a second refund confirm
+        // that a single accept() would miss, leaving the form open — the historical
+        // "drop did not take effect"). Always accept, never dismiss ("No" aborts the
+        // drop). If a stray alert doesn't complete the drop, the 60s #savebtn-gone
+        // check below still fails safe to "failed" → manual review, never a phantom
+        // success (2026-07-21, workflow-verified).
+        $driver->switchTo()->alert()->accept();
+        for ($i = 0; $i < 2; $i++) {
+            try {
+                $client->wait(4)->until(\Facebook\WebDriver\WebDriverExpectedCondition::alertIsPresent());
+                $alert = $driver->switchTo()->alert();
+                Log::info('DPP: drop - follow-up confirm accepted', ['text' => (string) $alert->getText()]);
+                $alert->accept();
+            } catch (\Throwable $e) {
+                break; // no further alert → done
+            }
+        }
+
+        // Read-only post-save capture (URL / #savebtn presence / field values / any
+        // validation text). Alerts were already drained above.
         $this->logDropDiagnostics($client, $driver);
 
         // A successful drop CLEARS the form (#savebtn disappears); a drop the server
@@ -574,23 +612,32 @@ final class DppSeleniumService
     }
 
     /**
-     * TEMP DIAGNOSTIC (2026-07-21) — post-save capture for the held-client drop bug.
-     * Detects a lingering SECOND alert (dismissed, never accepted → nothing committed),
-     * then logs the URL / #savebtn presence / date+amount field values / any visible
-     * validation text. All read-only + dismiss-only. Remove once the fix lands.
+     * Click an element robustly on a page with a fixed/sticky footer (DPP's "System
+     * Status" bar). WebDriver only auto-scrolls an element to the viewport EDGE, where
+     * the footer paints over it → "element click intercepted" (seen 2026-07-21 on
+     * #delete_events once the refund branch expanded the form). scrollIntoView with
+     * block:center puts the target mid-viewport, clear of the footer; then a SINGLE
+     * NATIVE click — native (not JS) so confirm() dialogs still surface to WebDriver
+     * and checkboxes toggle exactly once (no JS fallback → no double-toggle, no
+     * auto-dismissed confirm).
+     */
+    private function safeClick(mixed $client, string $css): void
+    {
+        $driver = $client->getWebDriver();
+        $el = $client->findElement(\Facebook\WebDriver\WebDriverBy::cssSelector($css));
+        $driver->executeScript('arguments[0].scrollIntoView({block: "center", inline: "center"});', [$el]);
+        usleep(150000); // let the sticky layout settle after the scroll
+        $el->click();
+    }
+
+    /**
+     * TEMP DIAGNOSTIC (2026-07-21) — read-only post-save capture for the held-client
+     * drop bug: logs the URL / #savebtn presence / date+amount field values / any
+     * visible validation text. Alerts are drained by executeDrop's accept-loop BEFORE
+     * this runs, so this method never touches alerts. Remove once the fix is proven.
      */
     private function logDropDiagnostics(mixed $client, mixed $driver): void
     {
-        try {
-            $client->wait(3)->until(\Facebook\WebDriver\WebDriverExpectedCondition::alertIsPresent());
-            $alert = $driver->switchTo()->alert();
-            $text = (string) $alert->getText();
-            $alert->dismiss(); // "no" → does NOT complete the drop (safe)
-            Log::warning('DPP: drop diag - SECOND alert after save (dismissed, not accepted)', ['text' => $text]);
-        } catch (\Throwable $e) {
-            Log::info('DPP: drop diag - no second alert after save');
-        }
-
         try {
             Log::info('DPP: drop diag - post-save state', [
                 'url' => $driver->getCurrentURL(),
