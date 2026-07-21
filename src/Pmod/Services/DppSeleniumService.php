@@ -520,18 +520,14 @@ final class DppSeleniumService
             $amountEl->clear();
             $amountEl->sendKeys($this->money($availableRefund));
             $startDate = $client->findElement($css('#start_date'));
-            // DIAG (2026-07-21): #start_date came out empty after a JS-clear+sendKeys.
-            // Capture its nature + any auto-filled value BEFORE we set it (readonly?
-            // input mask? pick-only datepicker?) so we can set it the right way.
-            Log::info('DPP: drop diag - #start_date pre-set', [
-                'value' => $startDate->getAttribute('value'),
-                'readonly' => $startDate->getAttribute('readonly'),
-                'disabled' => $startDate->getAttribute('disabled'),
-                'type' => $startDate->getAttribute('type'),
-                'tag' => $startDate->getTagName(),
-            ]);
-            // Plain sendKeys (the pattern that DOES work for #cancellation_request_date).
+            // #start_date is a READONLY pick-only datepicker (confirmed 2026-07-21:
+            // readonly=true, empty by default) → sendKeys silently no-ops and it stays
+            // blank, leaving the refund with no process date. Strip the readonly
+            // attribute so we can type; the field's own input mask then formats the
+            // value (mirrors #cancellation_request_date, which stores YYYYMMDD).
+            $driver->executeScript("arguments[0].removeAttribute('readonly');", [$startDate]);
             $startDate->sendKeys($processDate);
+            Log::info('DPP: drop diag - #start_date after set', ['value' => $startDate->getAttribute('value')]);
             $startDate->sendKeys(\Facebook\WebDriver\WebDriverKeys::TAB);
         }
 
