@@ -1575,7 +1575,10 @@ final class GenerateResumePayments extends Command
     private function sendRecap(DBConnector $connector, string $company, array $statusChanges, bool $dryRun): void
     {
         try {
-            (new Formatter())->sendRecap($connector, $statusChanges, $company, $dryRun, $this);
+            // --cancels-only runs skip the NSF step, so their report is a pure cancels
+            // report (NSF stages hidden, "System Cancels" subject). The full run keeps
+            // the standard NSF format.
+            (new Formatter())->sendRecap($connector, $statusChanges, $company, $dryRun, $this, (bool) $this->option('cancels-only'));
         } catch (\Throwable $e) {
             $this->error("[{$company}] recap email failed: " . $e->getMessage());
             Log::error('GenerateResumePayments: sendRecap failed', [
