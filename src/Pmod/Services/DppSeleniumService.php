@@ -520,7 +520,11 @@ final class DppSeleniumService
             $amountEl->clear();
             $amountEl->sendKeys($this->money($availableRefund));
             $startDate = $client->findElement($css('#start_date'));
-            $startDate->clear(); // guard against the form auto-populating #start_date
+            // Clear via JS, not ->clear(): #start_date is a datepicker input whose
+            // ->clear() throws "invalid element state" (seen 2026-07-21). JS value=''
+            // works regardless and still guards against the form auto-populating the
+            // field (which would otherwise make the sendKeys below APPEND → garbled date).
+            $driver->executeScript('arguments[0].value = "";', [$startDate]);
             $startDate->sendKeys($processDate);
             $startDate->sendKeys(\Facebook\WebDriver\WebDriverKeys::TAB);
         }
