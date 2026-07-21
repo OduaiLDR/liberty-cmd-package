@@ -4,6 +4,7 @@ namespace Cmd\Reports\Console\Commands;
 
 use Cmd\Reports\Services\DBConnector;
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 
 class ImportMissingEnrollments extends Command
@@ -16,6 +17,27 @@ class ImportMissingEnrollments extends Command
     {
         $this->info('[INFO] ImportMissingEnrollments: starting.');
 
+        // Prevent overlapping runs (e.g. a scheduled run still in flight when another
+        // is triggered) from both passing the NOT EXISTS check for the same contact
+        // and inserting duplicate rows. TblEnrollment has no unique constraint on
+        // LLG_ID we can add, so this is the only guard against that race.
+        $lock = Cache::lock('enrollment-import-missing-lock', 600);
+
+        if (! $lock->get()) {
+            $this->warn('[WARN] ImportMissingEnrollments: another instance is already running. Skipping this run.');
+            Log::warning('ImportMissingEnrollments: skipped, lock held by another instance.');
+            return Command::SUCCESS;
+        }
+
+        try {
+            return $this->runImport();
+        } finally {
+            $lock->release();
+        }
+    }
+
+    private function runImport(): int
+    {
         try {
             $sqlConnector = DBConnector::fromEnvironment('ldr');
             $sqlConnector->initializeSqlServer();
@@ -179,16 +201,28 @@ class ImportMissingEnrollments extends Command
             $pay1Sql  = $paymentDate1 !== '' ? "'{$this->esc($paymentDate1)}'" : 'NULL';
             $cxlSql   = $cancelDate   !== '' ? "'{$this->esc($cancelDate)}'"   : 'NULL';
 
+            $pdo = $sqlConnector->getSqlServerConnection();
+
             try {
+                // TblEnrollment has no unique constraint on LLG_ID, so the NOT EXISTS
+                // check below is only race-free if it runs inside a transaction that
+                // holds a lock on the row (or the key range, if the row doesn't exist
+                // yet) until commit. WITH (UPDLOCK, HOLDLOCK) forces exactly that,
+                // so two overlapping runs checking the same LLG_ID serialize instead
+                // of both seeing "not there yet" and both inserting.
+                $pdo->beginTransaction();
+
                 $sqlConnector->querySqlServer("
                     INSERT INTO TblEnrollment
                         (LLG_ID, Category, State, Agent, Client, Debt_Amount, Welcome_Call_Date, Payment_Date_1, Cancel_Date)
                     SELECT '{$llgId}', '{$category}', '{$state}', '{$agent}', '{$client}',
                            {$debtSql}, '{$this->esc($enrolledDate)}', {$pay1Sql}, {$cxlSql}
                     WHERE NOT EXISTS (
-                        SELECT 1 FROM TblEnrollment WHERE LLG_ID = '{$llgId}'
+                        SELECT 1 FROM TblEnrollment WITH (UPDLOCK, HOLDLOCK) WHERE LLG_ID = '{$llgId}'
                     )
                 ");
+
+                $pdo->commit();
                 $inserted++;
                 $existingIds[$llgId] = true; // prevent duplicate from PLAW pass
 
@@ -196,6 +230,10 @@ class ImportMissingEnrollments extends Command
                     $this->info("[INFO] {$source}: {$inserted} inserted so far...");
                 }
             } catch (\Throwable $e) {
+                if ($pdo->inTransaction()) {
+                    $pdo->rollBack();
+                }
+
                 $msg = $e->getMessage();
                 if (
                     stripos($msg, 'duplicate')   !== false ||
