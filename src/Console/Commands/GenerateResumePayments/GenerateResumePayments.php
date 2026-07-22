@@ -1322,11 +1322,15 @@ final class GenerateResumePayments extends Command
         $reason = $english ? $reasonEn : $reasonEs;
 
         if ($dryRun) {
-            // Preview the LIVE outcome (mirrors cancelProgram's gates): settlements route
-            // to manual UNLESS the auto-void will handle them — the caller already resolved
-            // that into $settlementOffers (switch on + within --max-voids + void-eligible),
-            // so a non-empty list here means this contact WOULD auto-void then drop.
-            $gate = ($settlements > 0 && $settlementOffers === []) ? 'settlement' : null;
+            // Preview the LIVE outcome (mirrors BOTH of cancelProgram's manual gates):
+            //  - settlements route to manual UNLESS the auto-void will handle them — the caller
+            //    already resolved that into $settlementOffers (switch on + within --max-voids +
+            //    void-eligible), so a non-empty list here means this contact WOULD auto-void.
+            //  - a positive-balance + EPF client (with no settlement, so not caught above) hits
+            //    the EPF_UNVERIFIED gate → manual. Mirror it so the preview matches the live run.
+            $gate = ($settlements > 0 && $settlementOffers === [])
+                ? 'settlement'
+                : (($balance > 0 && $epf > 0) ? 'epf' : null);
 
             Log::info('ResumePayments: DRY RUN - system cancel preview', [
                 'contact_id' => $contactId,
@@ -1360,6 +1364,20 @@ final class GenerateResumePayments extends Command
                 'note' => 'Attempted to resume payments 4 times.',
             ]);
         } catch (\Throwable $e) {
+            // A PARTIAL settlement void (≥1 offer already voided, then a later one failed) is
+            // IRREVERSIBLE and leaves the client un-dropped + un-refunded — it must NOT be
+            // buried in the Backlog like a transient error. Alert loudly and route to the
+            // manual (Release Hold) sheet so a person reconciles and finishes the cancel.
+            if ($e instanceof \Cmd\Reports\Pmod\Services\DppSeleniumException && $e->stage === 'settlement_void_partial') {
+                Log::error('ResumePayments: PARTIAL settlement void — manual reconcile required', [
+                    'contact_id' => $contactId,
+                    'error' => $e->getMessage(),
+                ]);
+                $this->emailCancellationAudit($contactId, 'URGENT — PARTIAL settlement void; client NOT dropped/refunded, reconcile manually: ' . $e->getMessage());
+                $statusChanges[] = $this->row($contactId, $name, self::STAGE_CANCEL_HOLD, $days, $debt);
+                return;
+            }
+
             // One stuck contact must not abort the rest of the company's Phase 5 loop.
             Log::warning('ResumePayments: cancelProgram threw', [
                 'contact_id' => $contactId,

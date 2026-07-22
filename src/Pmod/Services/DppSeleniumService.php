@@ -139,9 +139,11 @@ final class DppSeleniumService
         //    creditor call). So when the DPP_ALLOW_SETTLEMENT_VOID switch is on, the
         //    caller passed the offer ids, and the client will NOT hit the EPF gate after
         //    voiding, we void all offers HERE (before EPF/drop, since voiding navigates
-        //    away and step 4 re-confirms #cancelbtn) and continue to the drop. Any void
+        //    away and step 4 re-confirms #cancelbtn) and continue to the drop. A clean void
         //    failure throws → the caller routes the whole contact to manual and the drop
-        //    never runs on a half-voided client (voidSettlements is all-or-nothing).
+        //    never runs. NOTE: voids commit irreversibly per offer, so a multi-offer void is
+        //    NOT atomic — a mid-sequence failure throws a typed settlement_void_partial error
+        //    that the caller turns into a LOUD reconcile-this alert (not a silent backlog).
         //    Switch OFF → route to manual exactly as before (today's safe default).
         $offers = (array) ($form['settlement_offers'] ?? []);
         $voidedOfferIds = [];
@@ -884,9 +886,13 @@ final class DppSeleniumService
      *   settlements&page=dispatch&sid={offer_id} → #editbtn (accept the JS "OK" confirm)
      *   → #voidbtn (the void icon) → select "CLIENT CANCELLING" in #sett_void_reasons →
      *   the modal "Ok".
-     * ALL-OR-NOTHING: any step throws, so the caller returns manual/failed and the drop
-     * never runs on a half-voided client. Heavy logging so the first supervised void is
-     * fully traceable.
+     * STOPS ON FIRST FAILURE — but a void commits IRREVERSIBLY the instant its modal "Ok"
+     * lands, so this is NOT atomic across multiple offers: if a later offer fails, earlier
+     * ones are already voided. A clean (nothing-voided-yet) failure rethrows so the caller
+     * routes to manual and the drop never runs; a PARTIAL failure rethrows a typed
+     * settlement_void_partial DppSeleniumException carrying the already-voided ids so the
+     * caller alerts a human to reconcile. Each void is VERIFIED (the modal must close) before
+     * it is recorded, so a non-committing "Ok" can never be reported as a successful void.
      *
      * @param list<array{offer_id:string}> $offers
      * @return list<string> voided offer ids
@@ -895,60 +901,157 @@ final class DppSeleniumService
     {
         $driver = $client->getWebDriver();
         $voided = [];
+        $expected = 0;
 
         foreach ($offers as $offer) {
             $offerId = (string) ($offer['offer_id'] ?? '');
             if ($offerId === '') {
                 continue;
             }
+            $expected++;
 
-            Log::info('DPP: void settlement - start', ['contact_id' => $contactId, 'offer_id' => $offerId]);
-
-            // Open the settlement by its offer id (confirmed: sid == SETTLEMENT_OFFERS.ID).
-            $client->request('GET', self::DPP_BASE_URL . '/index.php?module=settlements&page=dispatch&sid=' . rawurlencode($offerId));
-
-            // "edit this settlement" → its JS confirm → the edit form.
-            $client->waitFor('#editbtn', 20);
-            $this->safeClick($client, '#editbtn');
             try {
-                $driver->switchTo()->alert()->accept();
+                $this->voidOneSettlement($client, $driver, $contactId, $offerId);
             } catch (\Throwable $e) {
-                // no confirm on #editbtn
+                if ($voided !== []) {
+                    // At least one void already committed — this contact can no longer be made
+                    // whole by bailing. Surface which offers are gone LOUDLY and rethrow a typed
+                    // error so the caller alerts a human + routes to manual (not silent backlog).
+                    Log::error('DPP: PARTIAL SETTLEMENT VOID — reconcile manually', [
+                        'tenant' => $tenant,
+                        'contact_id' => $contactId,
+                        'voided_offer_ids' => $voided,
+                        'failed_offer_id' => $offerId,
+                        'error' => $e->getMessage(),
+                    ]);
+
+                    throw new DppSeleniumException(
+                        'PARTIAL settlement void: already voided [' . implode(',', $voided) . '] then failed on ' . $offerId . ' — ' . $e->getMessage(),
+                        tenant: $tenant,
+                        contactId: $contactId,
+                        stage: 'settlement_void_partial',
+                        previous: $e,
+                    );
+                }
+
+                // Nothing voided yet — a clean failure. Rethrow so the caller routes the whole
+                // contact to manual/backlog and the drop never runs.
+                throw $e;
             }
 
-            // The void icon → the "Are you sure you want to void this offer?" modal.
-            $client->waitFor('#voidbtn', 20);
-            $this->safeClick($client, '#voidbtn');
-            usleep(2000000); // modal + its reason options load async
-
-            // Required "Settlement Voided Reason" — CLIENT CANCELLING (confirmed 2026-07-22).
-            // Throws if the select/option isn't there → all-or-nothing.
-            $this->select($client, '#sett_void_reasons', 'CLIENT CANCELLING');
-
-            // Confirm with the modal "Ok" — NEVER the page's "Save Offer" (#savebtn).
-            $this->clickByText($driver, 'Ok');
-            usleep(3000000); // let the void commit
-
-            Log::info('DPP: void settlement - Ok clicked', ['contact_id' => $contactId, 'offer_id' => $offerId]);
             $voided[] = $offerId;
+        }
+
+        // The gate only calls us when it believes there are offers to void; if we voided NONE
+        // (e.g. every id was blank), do NOT let the caller drop a client whose live settlements
+        // are untouched — fail so it routes to manual instead.
+        if ($expected > 0 && $voided === []) {
+            throw new \RuntimeException("voidSettlements: {$expected} offer(s) expected but none voided for contact {$contactId}");
         }
 
         return $voided;
     }
 
     /**
-     * Click the first DISPLAYED button/anchor/span whose exact text matches (case-
-     * insensitive) — used to hit a modal's "Ok" without touching a same-page "Save"
-     * button. Throws if not found (the caller treats that as a failed void).
+     * Void ONE settlement offer and VERIFY it committed before returning. Drives the confirmed
+     * UI: dispatch&sid → #editbtn (accept the JS confirm) → #voidbtn → select "CLIENT
+     * CANCELLING" in #sett_void_reasons → the modal's own "Ok" (scoped to the modal, never the
+     * page's "Save Offer"). Throws on any missing selector, an unpopulated reason dropdown, or
+     * a void that did not commit — the caller treats a throw as a failed void.
      */
-    private function clickByText(mixed $driver, string $text): void
+    private function voidOneSettlement(mixed $client, mixed $driver, string $contactId, string $offerId): void
     {
-        foreach ($driver->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('button, a, span[role=button], input[type=button], input[type=submit]')) as $el) {
+        Log::info('DPP: void settlement - start', ['contact_id' => $contactId, 'offer_id' => $offerId]);
+
+        // Open the settlement by its offer id (confirmed: sid == SETTLEMENT_OFFERS.ID). An
+        // already-voided offer no longer renders #editbtn/#voidbtn, so the waitFor times out
+        // and throws — a safe no-op (we never re-void).
+        $client->request('GET', self::DPP_BASE_URL . '/index.php?module=settlements&page=dispatch&sid=' . rawurlencode($offerId));
+
+        // "edit this settlement" → its JS confirm → the edit form.
+        $client->waitFor('#editbtn', 20);
+        $this->safeClick($client, '#editbtn');
+        $this->acceptAlertIfPresent($driver);
+
+        // The void icon → the "Are you sure you want to void this offer?" modal. #voidbtn may
+        // raise its own native confirm, so accept one if it appears.
+        $client->waitFor('#voidbtn', 20);
+        $this->safeClick($client, '#voidbtn');
+        $this->acceptAlertIfPresent($driver);
+
+        // Wait for the required "Settlement Voided Reason" to actually POPULATE (its options
+        // load async; a fixed sleep was flaky), then select CLIENT CANCELLING (confirmed
+        // 2026-07-22). A throw here means the dialog never rendered → failed void.
+        $this->waitForOption($driver, '#sett_void_reasons', 'CLIENT CANCELLING', 12);
+        $this->select($client, '#sett_void_reasons', 'CLIENT CANCELLING');
+
+        // Confirm with the modal's OWN "Ok" — scoped to the dialog that hosts the reason
+        // select, so a stray page "Ok" / "Save Offer" can never be clicked instead.
+        $this->clickModalOk($driver);
+
+        // VERIFY the void committed: a successful void closes the dialog (the reason select is
+        // gone / the page navigates); a validation error, CSRF/session rejection, or a mis-click
+        // leaves it open. If it is still open, the void did NOT land — throw so the caller never
+        // records a phantom void and never drops/refunds this client.
+        $this->assertVoidDialogClosed($driver, $offerId);
+
+        Log::info('DPP: void settlement - committed', ['contact_id' => $contactId, 'offer_id' => $offerId]);
+    }
+
+    /** Accept a native JS alert/confirm if one is open right now; no-op otherwise. */
+    private function acceptAlertIfPresent(mixed $driver): void
+    {
+        try {
+            $driver->switchTo()->alert()->accept();
+        } catch (\Throwable $e) {
+            // no alert open
+        }
+    }
+
+    /**
+     * Poll up to $timeoutSec for a <select> to contain an option with the given visible text
+     * (DPP loads the void-reason options asynchronously). Throws if it never appears.
+     */
+    private function waitForOption(mixed $driver, string $css, string $optionText, int $timeoutSec): void
+    {
+        $deadline = time() + max(1, $timeoutSec);
+        do {
+            foreach ($this->optionTexts($driver, $css) as $txt) {
+                if (strcasecmp(trim((string) $txt), $optionText) === 0) {
+                    return;
+                }
+            }
+            usleep(300000);
+        } while (time() < $deadline);
+
+        throw new \RuntimeException("option '{$optionText}' not present in {$css} within {$timeoutSec}s");
+    }
+
+    /**
+     * Click the void dialog's OWN "Ok", scoped to the dialog element that hosts
+     * #sett_void_reasons — so a page-level "Ok" / "Save Offer" outside the dialog can never be
+     * clicked by mistake. Matches button/anchor/span text and input[value]. Throws if the
+     * dialog or its Ok button isn't found.
+     */
+    private function clickModalOk(mixed $driver): void
+    {
+        // The dialog = the NEAREST ancestor of the reason select that also contains an "Ok".
+        $modal = $driver->findElement(\Facebook\WebDriver\WebDriverBy::xpath(
+            "//*[@id='sett_void_reasons']/ancestor::*[.//button[normalize-space(.)='Ok'] or .//a[normalize-space(.)='Ok'] or .//span[normalize-space(.)='Ok'] or .//input[@value='Ok']][1]"
+        ));
+
+        foreach ($modal->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('button, a, span[role=button], input[type=button], input[type=submit]')) as $el) {
             try {
                 if (!$el->isDisplayed()) {
                     continue;
                 }
-                if (strcasecmp(trim((string) $el->getText()), $text) === 0) {
+                $label = trim((string) $el->getText());
+                if ($label === '') {
+                    $label = trim((string) ($el->getAttribute('value') ?? ''));
+                }
+                if (strcasecmp($label, 'Ok') === 0) {
+                    $driver->executeScript('arguments[0].scrollIntoView({block:"center"});', [$el]);
+                    usleep(150000);
                     $el->click();
 
                     return;
@@ -958,7 +1061,31 @@ final class DppSeleniumService
             }
         }
 
-        throw new \RuntimeException("void dialog button '{$text}' not found");
+        throw new \RuntimeException('void dialog "Ok" button not found in the reason dialog');
+    }
+
+    /**
+     * Assert the void dialog closed after "Ok" — the signal that the server committed the void.
+     * A validation error / rejection / mis-click leaves #sett_void_reasons still displayed; in
+     * that case throw so the caller never treats the offer as voided.
+     */
+    private function assertVoidDialogClosed(mixed $driver, string $offerId): void
+    {
+        $deadline = time() + 8;
+        do {
+            $open = false;
+            try {
+                $open = $driver->findElement(\Facebook\WebDriver\WebDriverBy::cssSelector('#sett_void_reasons'))->isDisplayed();
+            } catch (\Throwable $e) {
+                $open = false; // gone from the DOM → dialog closed / page navigated
+            }
+            if (!$open) {
+                return;
+            }
+            usleep(300000);
+        } while (time() < $deadline);
+
+        throw new \RuntimeException("void not confirmed for offer {$offerId}: reason dialog still open after Ok");
     }
 
     /** Select an option by visible text. */
