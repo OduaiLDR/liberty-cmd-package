@@ -457,23 +457,19 @@ final class DppSeleniumService
             ? $this->optionTexts($driver, '#sett_void_reasons')
             : 'not present here (the reason dropdown likely only appears inside the void dialog)';
 
-        // The settlements table (#tablelist per the VBA). Try here; if absent, follow the
-        // first settlement link (GET only — no destructive click) and try again there.
-        $report['tablelist_here'] = \count($driver->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('#tablelist'))) > 0;
-        $firstHref = (string) ($report['settlement_links'][0]['href'] ?? '');
-        if (!$report['tablelist_here'] && $firstHref !== '') {
-            try {
-                $client->request('GET', $firstHref);
-                usleep(1500000);
-                $report['followed_link'] = $firstHref;
-                $report['url_after_link'] = $driver->getCurrentURL();
-            } catch (\Throwable $e) {
-                $report['follow_link_error'] = $e->getMessage();
+        // Drill into the FIRST per-settlement dispatch page (module=settlements&page=dispatch
+        // &sid=<offer_id>) to reveal the actual void controls. Read-only — no clicks on
+        // void/edit/confirm, so nothing is committed.
+        $sidHref = '';
+        foreach ($report['settlement_links'] as $lnk) {
+            if (stripos((string) ($lnk['href'] ?? ''), 'sid=') !== false) {
+                $sidHref = (string) $lnk['href'];
+                break;
             }
         }
-        $report['tablelist_rows'] = \count($driver->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('#tablelist'))) > 0
-            ? $this->dumpTableRows($driver, '#tablelist')
-            : 'no #tablelist found on the contact page or the first settlement link';
+        $report['settlement_page'] = $sidHref !== ''
+            ? $this->probeSettlementPage($client, $driver, $sidHref)
+            : 'no per-settlement (sid=) dispatch link found on the contact page';
 
         // Back to the contact page — nothing clicked into edit/void/confirm, nothing committed.
         $client->request('GET', $viewUrl);
@@ -509,6 +505,69 @@ final class DppSeleniumService
         } catch (\Throwable $e) {
             return 'dump failed: ' . $e->getMessage();
         }
+    }
+
+    /**
+     * READ-ONLY dump of a single settlement's dispatch page (module=settlements&page=
+     * dispatch&sid=<offer_id>) — the page where the void happens. Reports the void/edit
+     * controls, all <select> ids, whether #voidbtn / #editbtn / #sett_void_reasons are
+     * present (+ the reason options if statically rendered), and the first table. Clicks
+     * NOTHING that could void. Used to design voidSettlements() against the real UI.
+     *
+     * @return array<string, mixed>
+     */
+    private function probeSettlementPage(mixed $client, mixed $driver, string $href): array
+    {
+        $out = ['href' => $href, 'committed' => false];
+        try {
+            $client->request('GET', $href);
+            usleep(1500000);
+            $out['url'] = $driver->getCurrentURL();
+        } catch (\Throwable $e) {
+            $out['error'] = 'could not load: ' . $e->getMessage();
+
+            return $out;
+        }
+
+        // Anchors/buttons mentioning void or edit (with id/href) — the void trigger.
+        $out['void_edit_controls'] = [];
+        try {
+            foreach ($driver->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('a, button')) as $el) {
+                $t = trim((string) $el->getText());
+                $id = (string) ($el->getAttribute('id') ?? '');
+                $href2 = (string) ($el->getAttribute('href') ?? '');
+                if (stripos($t . ' ' . $id . ' ' . $href2, 'void') !== false || stripos($t . ' ' . $id, 'edit') !== false) {
+                    $out['void_edit_controls'][] = ['tag' => $el->getTagName(), 'text' => $t, 'id' => $id, 'href' => $href2];
+                }
+            }
+        } catch (\Throwable $e) {
+            $out['controls_error'] = $e->getMessage();
+        }
+
+        // Select ids + the void-reason options if the dropdown is already in the DOM.
+        $out['select_ids'] = [];
+        try {
+            foreach ($driver->findElements(\Facebook\WebDriver\WebDriverBy::tagName('select')) as $s) {
+                $id = (string) ($s->getAttribute('id') ?? '');
+                if ($id !== '') {
+                    $out['select_ids'][] = $id;
+                }
+            }
+        } catch (\Throwable $e) {
+            // ignore
+        }
+        $out['voidbtn_present'] = \count($driver->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('#voidbtn'))) > 0;
+        $out['editbtn_present'] = \count($driver->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('#editbtn'))) > 0;
+        $out['sett_void_reasons_options'] = \count($driver->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('#sett_void_reasons'))) > 0
+            ? $this->optionTexts($driver, '#sett_void_reasons')
+            : 'not statically present (likely appears only after #voidbtn opens the dialog)';
+
+        // First table on the page (settlement detail / status).
+        $out['first_table'] = \count($driver->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('table'))) > 0
+            ? $this->dumpTableRows($driver, 'table')
+            : 'no table on the settlement page';
+
+        return $out;
     }
 
     /**
