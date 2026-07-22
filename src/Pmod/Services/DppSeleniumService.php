@@ -518,9 +518,11 @@ final class DppSeleniumService
      */
     private function probeSettlementPage(mixed $client, mixed $driver, string $href): array
     {
-        $out = ['href' => $href, 'committed' => false];
+        // Panther needs an ABSOLUTE url; the settlement links are relative ("/index.php?…").
+        $absUrl = str_starts_with($href, 'http') ? $href : self::DPP_BASE_URL . '/' . ltrim($href, '/');
+        $out = ['href' => $href, 'abs_url' => $absUrl, 'committed' => false];
         try {
-            $client->request('GET', $href);
+            $client->request('GET', $absUrl);
             usleep(1500000);
             $out['url'] = $driver->getCurrentURL();
         } catch (\Throwable $e) {
