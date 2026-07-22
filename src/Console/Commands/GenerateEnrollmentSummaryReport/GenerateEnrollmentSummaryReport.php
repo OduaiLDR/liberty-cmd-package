@@ -17,8 +17,6 @@ class GenerateEnrollmentSummaryReport extends Command
 
     protected $description = 'Generate the Enrollment Summary Report (Total/LDR/Legal breakdown from TblEnrollment) and email it.';
 
-    private const NOTIFY_EMAIL = 'oduai@libertydebtrelief.com';
-
     /** Column key => Enrollment_Plan SQL criteria, mirrors the VBA i-loop (0=Total, 1=LDR, 2=Legal). */
     private const COLUMNS = [
         'Total' => "AND State NOT IN ('WI') ",
@@ -104,7 +102,7 @@ class GenerateEnrollmentSummaryReport extends Command
 
         $sent = true;
         if (!$skipEmail) {
-            $sent = $this->sendReport($workbook, $snapshotDate);
+            $sent = $this->sendReport($connector, $workbook, $snapshotDate);
         } else {
             $this->info('[INFO] Skipping email send (--no-email or --output was used).');
         }
@@ -399,7 +397,7 @@ class GenerateEnrollmentSummaryReport extends Command
         ];
     }
 
-    private function sendReport(?array $workbook, string $reportDate): bool
+    private function sendReport(DBConnector $connector, ?array $workbook, string $reportDate): bool
     {
         $subject = 'Enrollment Summary Report - ' . date('m/d/Y', strtotime($reportDate));
         $body = 'Attached is the Enrollment Summary Report for ' . date('m/d/Y', strtotime($reportDate)) . '.';
@@ -414,12 +412,21 @@ class GenerateEnrollmentSummaryReport extends Command
         }
 
         $email = new EmailSenderService();
-        $sent = $email->sendMail($subject, $body, [self::NOTIFY_EMAIL], [], [], $attachments);
+        $sent = $email->sendMailUsingTblReports(
+            $connector,
+            ['EnrollmentSummary'],
+            ['LDR', 'PLAW'],
+            $subject,
+            $body,
+            $attachments,
+            true
+        );
 
         if ($sent) {
-            $this->info('[INFO] Enrollment Summary Report emailed to ' . self::NOTIFY_EMAIL);
+            $this->info('[INFO] Enrollment Summary Report emailed (TblReports recipients).');
         } else {
-            Log::warning('GenerateEnrollmentSummaryReport: notification email failed.', ['to' => self::NOTIFY_EMAIL]);
+            $this->warn('[WARN] Enrollment Summary Report not sent (no TblReports recipients found or send failed).');
+            Log::warning('GenerateEnrollmentSummaryReport: notification email failed.');
         }
 
         return $sent;
