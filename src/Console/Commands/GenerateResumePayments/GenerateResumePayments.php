@@ -45,6 +45,7 @@ final class GenerateResumePayments extends Command
         {--limit= : Process at most N contacts per company (after NSF-state filtering)}
         {--execute-cancels : Actually run the Day-4+ System Cancel (browser drop/refund). Off by default — Phase 5 only reports cancel-ready contacts unless this is passed.}
         {--max-cancels= : Safety cap — process at most N cancel candidates per company per run (the rest are reported as deferred). 0/unset = no cap.}
+        {--max-voids= : Safety cap for the settlement AUTO-VOID — void the settlements of at most N cancel candidates per company per run. 0/unset = no auto-void (settlement contacts route to manual, todays default). Requires DPP_ALLOW_SETTLEMENT_VOID=1; start at 1 for a supervised void.}
         {--probe-cancel= : Diagnostic only — drive the cancel flow for ONE contact id and print which selectors exist, WITHOUT clicking save (commits nothing). Tenant = first --company (default LDR).}
         {--probe-resume= : Diagnostic only — probe the Forth resume-payments API for ONE contact id. READ-ONLY by default (token health + contact resolve + transactions paths; safe on any contact). Tenant = first --company (default LDR).}
         {--probe-resume-execute : With --probe-resume, also FIRE the resume POST (an action — TEST FILES ONLY). Without it the resume probe is read-only.}
@@ -1217,6 +1218,17 @@ final class GenerateResumePayments extends Command
             $epfs = $this->fetchPendingSums($snowflake, $contactIds, 'PF');
             $settlements = $this->fetchPendingSums($snowflake, $contactIds, 'S');
             $englishFlags = $this->fetchEnglishFlags($snowflake, $contactIds);
+            $settlementOffers = $this->fetchPendingSettlementOffers($snowflake, $contactIds);
+
+            // Settlement AUTO-VOID gating (DARK): fires only when the env switch is on AND
+            // --max-voids>0. --max-voids caps how many CONTACTS have their settlements
+            // voided this run (start at 1 for a supervised void); beyond it, settlement
+            // contacts fall through to cancelProgram's manual gate exactly as today. A
+            // slot is only spent on a contact that will actually void — offers present and
+            // NOT positive-balance+EPF (that hits the EPF gate, which still blocks the drop).
+            $voidSwitch = getenv('DPP_ALLOW_SETTLEMENT_VOID') === '1';
+            $maxVoids = (int) ($this->option('max-voids') ?? 0);
+            $voidsUsed = 0;
 
             $processed = 0;
             foreach ($toCancel as $item) {
@@ -1229,21 +1241,41 @@ final class GenerateResumePayments extends Command
                 $processed++;
 
                 $cid = $item['contact_id'];
+                $balance = $balances[$cid] ?? 0.0;
+                $epf = $epfs[$cid] ?? 0.0;
+                $settlementSum = $settlements[$cid] ?? 0.0;
+
+                // Resolve the offers to void for THIS contact (empty = route to manual as
+                // before). Consumes a --max-voids slot in dry-run too, so the preview
+                // reflects exactly which contacts the live run would auto-void.
+                $offersForContact = [];
+                if (
+                    $voidSwitch && $maxVoids > 0
+                    && $settlementSum > 0
+                    && !($balance > 0 && $epf > 0)
+                    && ($settlementOffers[$cid] ?? []) !== []
+                    && $voidsUsed < $maxVoids
+                ) {
+                    $offersForContact = $settlementOffers[$cid];
+                    $voidsUsed++;
+                }
+
                 $this->executeSystemCancel(
                     $tenant,
                     $cid,
                     $item['llg_id'],
                     $item['name'],
                     $item['info'],
-                    $balances[$cid] ?? 0.0,
-                    $epfs[$cid] ?? 0.0,
-                    $settlements[$cid] ?? 0.0,
+                    $balance,
+                    $epf,
+                    $settlementSum,
                     $englishFlags[$cid] ?? true,
                     $systemAccount,
                     $processDate,
                     $today,
                     $item['days'],
                     $item['debt'],
+                    $offersForContact,
                     $dryRun,
                     $statusChanges,
                 );
@@ -1264,6 +1296,7 @@ final class GenerateResumePayments extends Command
      * prevented by cancelProgram()'s #cancelbtn check, so no DB tracking is needed.
      *
      * @param array{0:string,1:string,2:string} $cancelInfo [statusTitle, reasonEn, reasonEs]
+     * @param list<array{offer_id:string,pending_rows:int,cleared_rows:int,fully_unpaid:bool}> $settlementOffers offers to auto-void (empty = route settlements to manual)
      * @param list<array{llg_id:string,name:string,stage:string,days:int,debt:float}> $statusChanges
      */
     private function executeSystemCancel(
@@ -1281,6 +1314,7 @@ final class GenerateResumePayments extends Command
         string $today,
         int $days,
         float $debt,
+        array $settlementOffers,
         bool $dryRun,
         array &$statusChanges
     ): void {
@@ -1288,15 +1322,17 @@ final class GenerateResumePayments extends Command
         $reason = $english ? $reasonEn : $reasonEs;
 
         if ($dryRun) {
-            // Preview the LIVE outcome (mirrors cancelProgram's only remaining gate:
-            // settlements → manual review, since the settlement-void isn't implemented;
-            // EPF auto-cancels). Shows which contacts auto-cancel vs go to manual.
-            $gate = $settlements > 0 ? 'settlement' : null;
+            // Preview the LIVE outcome (mirrors cancelProgram's gates): settlements route
+            // to manual UNLESS the auto-void will handle them — the caller already resolved
+            // that into $settlementOffers (switch on + within --max-voids + void-eligible),
+            // so a non-empty list here means this contact WOULD auto-void then drop.
+            $gate = ($settlements > 0 && $settlementOffers === []) ? 'settlement' : null;
 
             Log::info('ResumePayments: DRY RUN - system cancel preview', [
                 'contact_id' => $contactId,
                 'outcome' => $gate === null ? 'auto_cancel' : 'manual_review',
                 'gate' => $gate,
+                'would_void_offers' => array_column($settlementOffers, 'offer_id'),
                 'status' => $statusTitle,
                 'balance' => $balance,
                 'epf' => $epf,
@@ -1316,6 +1352,7 @@ final class GenerateResumePayments extends Command
                 'balance' => $balance,
                 'epf' => $epf,
                 'scheduled_settlements' => $settlements,
+                'settlement_offers' => $settlementOffers,
                 'process_date' => $processDate,
                 'today' => $today,
                 'system_account' => $systemAccount,

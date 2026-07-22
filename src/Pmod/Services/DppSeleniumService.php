@@ -134,25 +134,31 @@ final class DppSeleniumService
             return ['status' => 'not_cancellable', 'message' => "cancel button reads '{$cancelText}'"];
         }
 
-        // 2) Pending settlements — SAFETY GATE, checked BEFORE the EPF capture (moved
-        //    2026-07-02): every positive-balance + EPF client in the backlog also has
-        //    settlements, so capturing EPF first would schedule a fee and THEN bail to
-        //    manual without dropping — a half-done state. Checking settlements first
-        //    means those clients route to manual with NO browser action, and the
-        //    fragile EPF picker never runs on them.
-        //    (The VBA auto-voids partially-paid settlements here via a deeply
-        //    position-dependent DOM-index loop. Running that blind voids real
-        //    settlements, so until it's verified against a live contact that actually
-        //    has pending settlements, ANY contact with scheduled settlements is routed
-        //    to manual review instead of auto-voiding. Implement voidSettlements() and
-        //    drop this gate once we can record the settlement table on a real cancel.)
+        // 2) Pending settlements. Jennifer + Jacob 2026-07-21: a cancel VOIDS every
+        //    active settlement (the client is refunded the escrow by the drop below — no
+        //    creditor call). So when the DPP_ALLOW_SETTLEMENT_VOID switch is on, the
+        //    caller passed the offer ids, and the client will NOT hit the EPF gate after
+        //    voiding, we void all offers HERE (before EPF/drop, since voiding navigates
+        //    away and step 4 re-confirms #cancelbtn) and continue to the drop. Any void
+        //    failure throws → the caller routes the whole contact to manual and the drop
+        //    never runs on a half-voided client (voidSettlements is all-or-nothing).
+        //    Switch OFF → route to manual exactly as before (today's safe default).
+        $offers = (array) ($form['settlement_offers'] ?? []);
+        $voidedOfferIds = [];
         if ($settlements > 0) {
-            return [
-                'status' => 'manual_audit',
-                'message' => $balance >= $settlements
-                    ? 'balance >= scheduled settlements; manual review required'
-                    : 'pending settlements present; auto-void not yet verified — manual review',
-            ];
+            $canVoid = getenv('DPP_ALLOW_SETTLEMENT_VOID') === '1'
+                && $offers !== []
+                && !($balance > 0 && $epf > 0); // don't void if the EPF gate would then block the drop
+            if (!$canVoid) {
+                return [
+                    'status' => 'manual_audit',
+                    'message' => $balance >= $settlements
+                        ? 'balance >= scheduled settlements; manual review required'
+                        : 'pending settlements present; manual review',
+                ];
+            }
+            $voidedOfferIds = $this->voidSettlements($client, $tenant, $contactId, $offers);
+            Log::info('DPP: settlements voided, continuing to drop', ['contact_id' => $contactId, 'voided_offer_ids' => $voidedOfferIds]);
         }
 
         // NARROW EPF GATE (2026-07-02): the EPF-capture path below is unverified (the
@@ -867,6 +873,92 @@ final class DppSeleniumService
         $driver->executeScript('arguments[0].scrollIntoView({block: "center", inline: "center"});', [$el]);
         usleep(150000); // let the sticky layout settle after the scroll
         $el->click();
+    }
+
+    /**
+     * Void ALL of a contact's pending settlement offers, then let the caller drop the
+     * client (Jennifer + Jacob 2026-07-21: a cancel voids every active settlement; the
+     * escrow is refunded by the drop, no creditor call). DESTRUCTIVE — fires only from
+     * the settlement gate when DPP_ALLOW_SETTLEMENT_VOID=1. Per offer, drives the exact
+     * UI confirmed via --probe-void-settlements + a live walkthrough (2026-07-22):
+     *   settlements&page=dispatch&sid={offer_id} → #editbtn (accept the JS "OK" confirm)
+     *   → #voidbtn (the void icon) → select "CLIENT CANCELLING" in #sett_void_reasons →
+     *   the modal "Ok".
+     * ALL-OR-NOTHING: any step throws, so the caller returns manual/failed and the drop
+     * never runs on a half-voided client. Heavy logging so the first supervised void is
+     * fully traceable.
+     *
+     * @param list<array{offer_id:string}> $offers
+     * @return list<string> voided offer ids
+     */
+    private function voidSettlements(mixed $client, string $tenant, string $contactId, array $offers): array
+    {
+        $driver = $client->getWebDriver();
+        $voided = [];
+
+        foreach ($offers as $offer) {
+            $offerId = (string) ($offer['offer_id'] ?? '');
+            if ($offerId === '') {
+                continue;
+            }
+
+            Log::info('DPP: void settlement - start', ['contact_id' => $contactId, 'offer_id' => $offerId]);
+
+            // Open the settlement by its offer id (confirmed: sid == SETTLEMENT_OFFERS.ID).
+            $client->request('GET', self::DPP_BASE_URL . '/index.php?module=settlements&page=dispatch&sid=' . rawurlencode($offerId));
+
+            // "edit this settlement" → its JS confirm → the edit form.
+            $client->waitFor('#editbtn', 20);
+            $this->safeClick($client, '#editbtn');
+            try {
+                $driver->switchTo()->alert()->accept();
+            } catch (\Throwable $e) {
+                // no confirm on #editbtn
+            }
+
+            // The void icon → the "Are you sure you want to void this offer?" modal.
+            $client->waitFor('#voidbtn', 20);
+            $this->safeClick($client, '#voidbtn');
+            usleep(2000000); // modal + its reason options load async
+
+            // Required "Settlement Voided Reason" — CLIENT CANCELLING (confirmed 2026-07-22).
+            // Throws if the select/option isn't there → all-or-nothing.
+            $this->select($client, '#sett_void_reasons', 'CLIENT CANCELLING');
+
+            // Confirm with the modal "Ok" — NEVER the page's "Save Offer" (#savebtn).
+            $this->clickByText($driver, 'Ok');
+            usleep(3000000); // let the void commit
+
+            Log::info('DPP: void settlement - Ok clicked', ['contact_id' => $contactId, 'offer_id' => $offerId]);
+            $voided[] = $offerId;
+        }
+
+        return $voided;
+    }
+
+    /**
+     * Click the first DISPLAYED button/anchor/span whose exact text matches (case-
+     * insensitive) — used to hit a modal's "Ok" without touching a same-page "Save"
+     * button. Throws if not found (the caller treats that as a failed void).
+     */
+    private function clickByText(mixed $driver, string $text): void
+    {
+        foreach ($driver->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('button, a, span[role=button], input[type=button], input[type=submit]')) as $el) {
+            try {
+                if (!$el->isDisplayed()) {
+                    continue;
+                }
+                if (strcasecmp(trim((string) $el->getText()), $text) === 0) {
+                    $el->click();
+
+                    return;
+                }
+            } catch (\Throwable $e) {
+                // stale element; keep looking
+            }
+        }
+
+        throw new \RuntimeException("void dialog button '{$text}' not found");
     }
 
     /** Select an option by visible text. */
