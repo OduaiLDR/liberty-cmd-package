@@ -587,12 +587,18 @@ final class DppSeleniumService
 
                 if ($voidBtn) {
                     $this->safeClick($client, '#voidbtn');
-                    usleep(1200000);
+                    try {
+                        $driver->switchTo()->alert()->accept(); // #voidbtn may raise its own JS confirm
+                    } catch (\Throwable $e) {
+                        // no alert on #voidbtn
+                    }
+                    usleep(3500000); // the reason dropdown + confirm load async after #voidbtn
+                    $hasReasons = \count($driver->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('#sett_void_reasons'))) > 0;
                     $out['void_dialog'] = [
-                        'sett_void_reasons_options' => \count($driver->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('#sett_void_reasons'))) > 0
-                            ? $this->optionTexts($driver, '#sett_void_reasons')
-                            : 'still not present after #voidbtn',
-                        'buttons' => $this->dumpDialogButtons($driver),
+                        'url' => $driver->getCurrentURL(),
+                        'sett_void_reasons_present' => $hasReasons,
+                        'sett_void_reasons_options' => $hasReasons ? $this->optionTexts($driver, '#sett_void_reasons') : 'not present',
+                        'displayed_buttons' => $this->dumpDialogButtons($driver),
                     ];
                 }
             } catch (\Throwable $e) {
@@ -621,13 +627,22 @@ final class DppSeleniumService
     {
         $btns = [];
         try {
-            foreach ($driver->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('button, a, span, input[type=button], input[type=submit]')) as $el) {
-                $t = trim((string) $el->getText());
-                if ($t === '' || strlen($t) > 40) {
-                    continue;
-                }
-                if (preg_match('/\b(ok|yes|confirm|void|save|submit|cancel|no|close)\b/i', $t) === 1) {
-                    $btns[] = ['tag' => (string) $el->getTagName(), 'text' => $t, 'id' => (string) ($el->getAttribute('id') ?? '')];
+            foreach ($driver->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('button, a, span[role=button], input[type=button], input[type=submit]')) as $el) {
+                try {
+                    if (!$el->isDisplayed()) {
+                        continue;
+                    }
+                    $t = trim((string) $el->getText());
+                    $id = (string) ($el->getAttribute('id') ?? '');
+                    if ($t === '' && $id === '') {
+                        continue;
+                    }
+                    $btns[] = ['tag' => (string) $el->getTagName(), 'id' => $id, 'text' => strlen($t) > 40 ? substr($t, 0, 40) : $t];
+                    if (\count($btns) >= 30) {
+                        break;
+                    }
+                } catch (\Throwable $e) {
+                    // stale element; skip
                 }
             }
         } catch (\Throwable $e) {
