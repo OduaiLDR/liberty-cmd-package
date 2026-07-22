@@ -25,8 +25,9 @@ use Illuminate\Support\Facades\Log;
  *                 set client_status, click Resume Payments, log to TblResumePayments.
  *              Skip contacts whose status contains Dropped/LUSA-FUNDED/System Cancel/etc.
  *   Phase 5  — System Cancel for contacts with age > 105 days:
- *                 Day 0 → insert TblEnrollmentCancellations and stop (4-day cool-down)
- *                 Day 4+ → assemble Cancel Program from primitives:
+ *                 Day 1 (first eligible day) → insert TblEnrollmentCancellations and stop
+ *                 (5-business-day grace, shown 1-indexed Day 1..Day 5; cancel on Day 6)
+ *                 Day 6+ → assemble Cancel Program from primitives:
  *                     (a) Schedule ACH Credit/Fee for min(Balance, EPF) (paid-to system account)
  *                     (b) Void pending settlements (reason "NSF/SKIP PAYMENT") if Balance < ScheduledSettlements
  *                     (c) Cancel pending drafts + create refund if Balance > 0
@@ -58,7 +59,10 @@ final class GenerateResumePayments extends Command
     private const PROCESSED_R_CODES = ['R01', 'R02', 'R03', 'R04', 'R07', 'R08', 'R09', 'R10', 'R11', 'R13', 'R15', 'R16', 'R17', 'R20', 'R24', 'R29'];
 
     private const SYSTEM_CANCEL_AGE_DAYS = 105;
-    private const CANCEL_COOLDOWN_DAYS = 4;
+    // Grace period before a System Cancel executes (business days). Jacob 2026-07-22: extended
+    // to 5 and shown 1-indexed — Day 1 the first eligible day through Day 5, cancel on Day 6.
+    // Internally $day is 0-indexed (0 = first day), so cancel fires when $day >= 5.
+    private const CANCEL_COOLDOWN_DAYS = 5;
 
     /**
      * Candidates per Phase-2/3 batch. Bounds the in-memory transaction buffer:
@@ -500,6 +504,7 @@ final class GenerateResumePayments extends Command
                 'is_current' => false,
                 'current_rcode' => '',
                 'age_days' => 0,
+                'nsf_anchor_date' => '',
                 'nsf_count' => 0,
                 'last_cleared_date' => null,
             ];
@@ -539,6 +544,11 @@ final class GenerateResumePayments extends Command
                     $state['age_days'] = $processDate !== ''
                         ? (int) floor(($today - strtotime($processDate)) / 86400)
                         : 0;
+                    // Streak anchor = the oldest unresolved NSF's process date (the start of the
+                    // current NSF episode). Used by resolveCancelDay to reset the cooldown when a
+                    // client resolved then re-cancelled. Unlike age_days, it is NOT reduced by the
+                    // resume adjustment below, so it stays the true episode start.
+                    $state['nsf_anchor_date'] = $processDate !== '' ? date('Y-m-d', strtotime($processDate)) : '';
                 }
 
                 if ($rcode !== '' && isset($nsfRcodes[$rcode])) {
@@ -1113,22 +1123,23 @@ final class GenerateResumePayments extends Command
     /**
      * Phase 5 — Cool-down gate + warning emission for age > 105 day contacts.
      *
-     * Day counting (per Jacob 2026-06-18):
-     *   "First it will check the cancels tables and if there is no match it will
-     *    add it then this is day 0. If there is a match it will check today minus
-     *    that date for the numbers of days. It will be on the report as Day 0,
-     *    Day 1, Day 2 etc."
+     * Day counting (per Jacob 2026-06-18, grace extended + renumbered 2026-07-22):
+     *   Check the cancels table; no match → insert today (this is the first day). A match →
+     *   count business days since that date. Shown on the report 1-indexed: Day 1 the first
+     *   eligible day through Day 5, cancel on Day 6. (Internally $day is 0-indexed: 0 = first
+     *   day; cancel fires at $day >= CANCEL_COOLDOWN_DAYS (5), i.e. displayed Day 6.)
      *
      * Uses only the existing columns (LLG_ID, Cancellation_Date) — no schema change.
-     * Re-cancel is prevented by cancelProgram()'s #cancelbtn check, not a DB flag.
+     * Re-cancel is prevented by cancelProgram()'s #cancelbtn check, not a DB flag; a
+     * resolve-then-recancel restarts the count (see resolveCancelDay's stale-anchor reset).
      *
      * Behavior:
      *   - Skip contacts where is_current=true or age_days <= 105.
      *   - Look up the latest TblEnrollmentCancellations row for LLG-{contactId}.
-     *       - No row → INSERT (Cancellation_Date = today), emit "System Cancel Pending - Day 0".
-     *       - Row exists, Day 0..3 → emit "System Cancel Pending - Day N".
-     *       - Row exists, Day >= 4 → with --execute-cancels, run the browser cancel
-     *         (see executeSystemCancel); otherwise emit "System Cancel Ready - Day N".
+     *       - No row (or a stale pre-episode row) → INSERT (Cancellation_Date = today) = Day 1.
+     *       - Row exists, internal day 0..4 (Day 1..5) → Grace Period sheet.
+     *       - Row exists, internal day >= 5 (Day 6) → with --execute-cancels, run the browser
+     *         cancel (see executeSystemCancel); otherwise it lands on the Backlog/Queued sheet.
      *
      * @param list<array<string, mixed>> $states
      * @param list<array{llg_id:string,name:string,stage:string,days:int,debt:float}> $statusChanges
@@ -1155,10 +1166,10 @@ final class GenerateResumePayments extends Command
         $tenant = strtolower($company);
         $systemAccount = $this->systemAccountFor($company);
 
-        // Pass 1 — day-count every age>105 contact (insert Day-0 rows, emit Day 0–3
-        // warnings) and collect the ones that will actually be cancelled. Contacts
-        // past Day 3 that are NOT cancelled today (weekend / reporting-only run) are
-        // COUNTED, not listed — Jacob 2026-07-10 wants 0/1/2/3 then only the clients
+        // Pass 1 — day-count every age>105 contact (insert first-day rows, Grace sheet shows
+        // Day 1..5) and collect the ones that will actually be cancelled. Contacts past the
+        // grace (Day 6+) that are NOT cancelled today (weekend / reporting-only run) are
+        // COUNTED, not listed — Jacob 2026-07-10 wants the grace days then only the clients
         // dropped that day, no running "Day N" list.
         $toCancel = [];
         foreach ($states as $state) {
@@ -1178,20 +1189,23 @@ final class GenerateResumePayments extends Command
             $name = trim((string) ($state['FULLNAME'] ?? ''));
             $debt = (float) ($state['debt_amount'] ?? 0.0);
 
-            $day = $this->resolveCancelDay($sqlConnector, $llgId, $today, $dryRun)['day'];
+            $anchorDate = (string) ($state['nsf_anchor_date'] ?? '');
+            $day = $this->resolveCancelDay($sqlConnector, $llgId, $today, $anchorDate, $dryRun)['day'];
 
             if ($day < self::CANCEL_COOLDOWN_DAYS) {
-                // Day 0–3 cool-down — managers can still intervene (Grace Period sheet).
-                $statusChanges[] = $this->row($contactId, $name, self::STAGE_CANCEL_GRACE, $ageDays, $debt);
+                // Grace period — managers can still intervene (Grace Period sheet). Jacob
+                // 2026-07-22: show the cooldown day 1-indexed (Day 1 the first eligible day
+                // .. Day 5), NOT the NSF age. $day is 0-indexed internally, so display $day+1.
+                $statusChanges[] = $this->row($contactId, $name, self::STAGE_CANCEL_GRACE, $day + 1, $debt);
                 continue;
             }
 
-            // Day >= 4: ready to cancel.
+            // Grace over (internal day >= 5, i.e. Day 6): ready to cancel.
             $rcode = (string) ($state['current_rcode'] ?? '');
             $cancelInfo = $this->systemCancelInfo($rcode);
 
             if ($cancelInfo === null) {
-                // Day 4+ but the return code doesn't map to a cancel type — it can't be
+                // Past grace but the return code doesn't map to a cancel type — it can't be
                 // auto-cancelled, so a person must handle it (Release Hold / manual sheet).
                 $statusChanges[] = $this->row($contactId, $name, self::STAGE_CANCEL_HOLD, $ageDays, $debt);
                 continue;
@@ -1656,9 +1670,16 @@ final class GenerateResumePayments extends Command
      * the existing columns (LLG_ID, Cancellation_Date) — no schema change needed.
      * Re-cancel is prevented by cancelProgram()'s #cancelbtn check, not a DB flag.
      *
+     * Re-cancel RESET (Jacob 2026-07-22): if the stored anchor predates the client's current
+     * NSF episode ($nsfAnchorDate = the oldest unresolved NSF's process date), they resolved
+     * after a prior cooldown and then re-NSF'd — counting from the old date would cancel them
+     * immediately with no fresh grace. In that case we ignore the stale anchor and start over
+     * (insert a fresh row = Day 0). Erring here is safe: a false reset only grants MORE grace,
+     * never a premature cancel.
+     *
      * @return array{day:int}
      */
-    private function resolveCancelDay(DBConnector $sqlConnector, string $llgId, string $today, bool $dryRun): array
+    private function resolveCancelDay(DBConnector $sqlConnector, string $llgId, string $today, string $nsfAnchorDate, bool $dryRun): array
     {
         $select = "SELECT TOP 1 Cancellation_Date
                    FROM TblEnrollmentCancellations
@@ -1670,14 +1691,25 @@ final class GenerateResumePayments extends Command
         if (!empty($result['data'])) {
             $cancellationDate = (string) ($result['data'][0]['Cancellation_Date'] ?? '');
 
-            $day = 0;
-            if ($cancellationDate !== '') {
+            // Stale = the stored cooldown anchor is OLDER than the current NSF episode's start
+            // → a resolve-then-recancel. Y-m-d strings compare lexicographically = chronologically.
+            $stale = $cancellationDate !== '' && $nsfAnchorDate !== ''
+                && substr($cancellationDate, 0, 10) < substr($nsfAnchorDate, 0, 10);
+
+            if ($cancellationDate !== '' && !$stale) {
                 // Business-day count (Mon–Fri only) per Jacob 2026-07-02 — weekends
                 // don't advance the cooldown clock.
-                $day = $this->businessDaysBetween($cancellationDate, $today);
+                return ['day' => $this->businessDaysBetween($cancellationDate, $today)];
             }
 
-            return ['day' => $day];
+            // Stale (or unreadable) anchor → fall through and lay down a fresh Day-0 anchor.
+            if ($stale) {
+                Log::info('ResumePayments: cancel cooldown reset (resolve-then-recancel)', [
+                    'llg_id' => $llgId,
+                    'stale_anchor' => $cancellationDate,
+                    'nsf_anchor_date' => $nsfAnchorDate,
+                ]);
+            }
         }
 
         if (!$dryRun) {
@@ -1690,9 +1722,11 @@ final class GenerateResumePayments extends Command
 
     /**
      * Count business days (Mon–Fri) strictly AFTER $startDate up to and including
-     * $endDate — the cancel-cooldown clock, which skips weekends (Jacob 2026-07-02):
-     * reset Thu = Day 0 → Fri 1 → (Sat/Sun no change) → Mon 2 → Tue 3 → Wed = Day 4
-     * (cancel). Inputs are Y-m-d (a trailing time component is ignored).
+     * $endDate — the cancel-cooldown clock, which skips weekends (Jacob 2026-07-02).
+     * Returns the 0-indexed internal $day; cancel fires at $day >= 5 (displayed Day 6).
+     * e.g. anchor Thu = internal 0 (Day 1) → Fri 1 (Day 2) → (Sat/Sun no change) → Mon 2
+     * (Day 3) → Tue 3 (Day 4) → Wed 4 (Day 5) → Thu 5 = cancel (Day 6). Inputs are Y-m-d
+     * (a trailing time component is ignored).
      */
     private function businessDaysBetween(string $startDate, string $endDate): int
     {

@@ -901,14 +901,18 @@ final class DppSeleniumService
     {
         $driver = $client->getWebDriver();
         $voided = [];
-        $expected = 0;
+
+        // Validate ALL offer ids BEFORE any irreversible void — a blank id is malformed input.
+        // Failing up front means a bad list can never leave a client half-voided, nor silently
+        // return [] and let the caller drop a client whose settlements were never voided.
+        foreach ($offers as $offer) {
+            if ((string) ($offer['offer_id'] ?? '') === '') {
+                throw new \RuntimeException("voidSettlements: blank offer_id for contact {$contactId}");
+            }
+        }
 
         foreach ($offers as $offer) {
             $offerId = (string) ($offer['offer_id'] ?? '');
-            if ($offerId === '') {
-                continue;
-            }
-            $expected++;
 
             try {
                 $this->voidOneSettlement($client, $driver, $contactId, $offerId);
@@ -942,11 +946,11 @@ final class DppSeleniumService
             $voided[] = $offerId;
         }
 
-        // The gate only calls us when it believes there are offers to void; if we voided NONE
-        // (e.g. every id was blank), do NOT let the caller drop a client whose live settlements
-        // are untouched — fail so it routes to manual instead.
-        if ($expected > 0 && $voided === []) {
-            throw new \RuntimeException("voidSettlements: {$expected} offer(s) expected but none voided for contact {$contactId}");
+        // The gate only calls us when offers were passed (and a blank id throws above), so a
+        // clean loop always voids ≥1. Belt-and-suspenders: if we somehow voided NONE, never let
+        // the caller drop a client whose live settlements are untouched.
+        if ($voided === []) {
+            throw new \RuntimeException("voidSettlements: no offers voided for contact {$contactId}");
         }
 
         return $voided;
@@ -989,10 +993,16 @@ final class DppSeleniumService
         // select, so a stray page "Ok" / "Save Offer" can never be clicked instead.
         $this->clickModalOk($driver);
 
+        // The "Ok" may itself raise a native confirm — accept it (mirrors #editbtn/#voidbtn) so
+        // no alert is left open to block the commit OR to be mis-read as success by the verify
+        // below.
+        $this->acceptAlertIfPresent($driver);
+
         // VERIFY the void committed: a successful void closes the dialog (the reason select is
         // gone / the page navigates); a validation error, CSRF/session rejection, or a mis-click
-        // leaves it open. If it is still open, the void did NOT land — throw so the caller never
-        // records a phantom void and never drops/refunds this client.
+        // leaves it open. If it is still open — or the state can't be read — the void did NOT
+        // verifiably land, so we throw and the caller never records a phantom void or drops this
+        // client.
         $this->assertVoidDialogClosed($driver, $offerId);
 
         Log::info('DPP: void settlement - committed', ['contact_id' => $contactId, 'offer_id' => $offerId]);
@@ -1040,7 +1050,10 @@ final class DppSeleniumService
             "//*[@id='sett_void_reasons']/ancestor::*[.//button[normalize-space(.)='Ok'] or .//a[normalize-space(.)='Ok'] or .//span[normalize-space(.)='Ok'] or .//input[@value='Ok']][1]"
         ));
 
-        foreach ($modal->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('button, a, span[role=button], input[type=button], input[type=submit]')) as $el) {
+        // Selector set kept in SYNC with the detection xpath above (button/a/span/input) so any
+        // element that made the xpath match the dialog is also reachable here — an Ok rendered
+        // as a plain <span> or <input value="Ok"> is clicked, not skipped into a spurious failure.
+        foreach ($modal->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('button, a, span, input')) as $el) {
             try {
                 if (!$el->isDisplayed()) {
                     continue;
@@ -1073,13 +1086,16 @@ final class DppSeleniumService
     {
         $deadline = time() + 8;
         do {
-            $open = false;
             try {
-                $open = $driver->findElement(\Facebook\WebDriver\WebDriverBy::cssSelector('#sett_void_reasons'))->isDisplayed();
-            } catch (\Throwable $e) {
-                $open = false; // gone from the DOM → dialog closed / page navigated
+                $displayed = $driver->findElement(\Facebook\WebDriver\WebDriverBy::cssSelector('#sett_void_reasons'))->isDisplayed();
+            } catch (\Facebook\WebDriver\Exception\NoSuchElementException $e) {
+                return; // reason select GONE from the DOM → dialog closed / page navigated → committed
             }
-            if (!$open) {
+            // Present-but-hidden also means the dialog closed. FAIL-CLOSED on everything else:
+            // an open native alert (UnexpectedAlertOpenException), a stale/session/transient
+            // WebDriver error, or a login redirect must NOT be read as success — those throwables
+            // propagate so an unverifiable void is treated as FAILED, never a phantom commit.
+            if (!$displayed) {
                 return;
             }
             usleep(300000);
