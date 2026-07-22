@@ -569,7 +569,72 @@ final class DppSeleniumService
             ? $this->dumpTableRows($driver, 'table')
             : 'no table on the settlement page';
 
+        // Open the void dialog to read the reason options + confirm button — click
+        // #editbtn (accept any JS confirm the VBA accepted), then #voidbtn, dump, and
+        // navigate AWAY without ever clicking a confirm/void. Mirrors probeCancel: opens
+        // the destructive dialog, reads it, commits nothing.
+        if ($out['editbtn_present']) {
+            try {
+                $this->safeClick($client, '#editbtn');
+                try {
+                    $driver->switchTo()->alert()->accept();
+                } catch (\Throwable $e) {
+                    // no alert on #editbtn
+                }
+                usleep(1200000);
+                $voidBtn = \count($driver->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('#voidbtn'))) > 0;
+                $out['after_editbtn'] = ['voidbtn_present' => $voidBtn, 'url' => $driver->getCurrentURL()];
+
+                if ($voidBtn) {
+                    $this->safeClick($client, '#voidbtn');
+                    usleep(1200000);
+                    $out['void_dialog'] = [
+                        'sett_void_reasons_options' => \count($driver->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('#sett_void_reasons'))) > 0
+                            ? $this->optionTexts($driver, '#sett_void_reasons')
+                            : 'still not present after #voidbtn',
+                        'buttons' => $this->dumpDialogButtons($driver),
+                    ];
+                }
+            } catch (\Throwable $e) {
+                $out['void_dialog_error'] = $e->getMessage();
+            }
+
+            // Discard: reload the settlement page — no confirm clicked, nothing voided.
+            try {
+                $client->request('GET', $absUrl);
+            } catch (\Throwable $e) {
+                // ignore
+            }
+        }
+
         return $out;
+    }
+
+    /**
+     * Dump visible action buttons (button/a/span/input with ok/yes/confirm/void/save/
+     * cancel/close text) — read-only, to locate the void dialog's confirm button for the
+     * probe (the VBA used a fragile //body/div[12] index that has drifted).
+     *
+     * @return list<array{tag:string,text:string,id:string}>
+     */
+    private function dumpDialogButtons(mixed $driver): array
+    {
+        $btns = [];
+        try {
+            foreach ($driver->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('button, a, span, input[type=button], input[type=submit]')) as $el) {
+                $t = trim((string) $el->getText());
+                if ($t === '' || strlen($t) > 40) {
+                    continue;
+                }
+                if (preg_match('/\b(ok|yes|confirm|void|save|submit|cancel|no|close)\b/i', $t) === 1) {
+                    $btns[] = ['tag' => (string) $el->getTagName(), 'text' => $t, 'id' => (string) ($el->getAttribute('id') ?? '')];
+                }
+            }
+        } catch (\Throwable $e) {
+            // ignore
+        }
+
+        return $btns;
     }
 
     /**
