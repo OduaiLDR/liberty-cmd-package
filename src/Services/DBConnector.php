@@ -85,7 +85,7 @@ class DBConnector
      * Create connector from environment configuration
      * Picks the right Snowflake env/mode (production vs sandbox) based on config/ENV.
      */
-    public static function fromEnvironment(string $env, string $mode = null): self
+    public static function fromEnvironment(string $env, ?string $mode = null): self
     {
         $config = self::loadConfiguration();
 

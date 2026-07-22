@@ -77,6 +77,9 @@ use Cmd\Reports\Console\Commands\GenerateEmployeesReport\GenerateEmployeesReport
 use Cmd\Reports\Console\Commands\SyncLeaderboardRecords\SyncLeaderboardRecords;
 use Cmd\Reports\Console\Commands\GenerateConsumerAffairsFundedReport\GenerateConsumerAffairsFundedReport;
 use Cmd\Reports\Console\Commands\GenerateConsumerAffairsSettlementReport\GenerateConsumerAffairsSettlementReport;
+use Cmd\Reports\Console\Commands\GenerateLowBalanceReport\GenerateLowBalanceReport;
+use Cmd\Reports\Console\Commands\GenerateUnclearedSettlementPaymentsReport\GenerateUnclearedSettlementPaymentsReport;
+use Cmd\Reports\Console\Commands\GenerateOfferAuthorizationReport\GenerateOfferAuthorizationReport;
 use Cmd\Reports\Console\Commands\SyncEmployeeSfUids;
 
 class ReportsServiceProvider extends ServiceProvider
@@ -182,6 +185,9 @@ class ReportsServiceProvider extends ServiceProvider
                 SyncLeaderboardRecords::class,
                 GenerateConsumerAffairsFundedReport::class,
                 GenerateConsumerAffairsSettlementReport::class,
+                GenerateLowBalanceReport::class,
+                GenerateUnclearedSettlementPaymentsReport::class,
+                GenerateOfferAuthorizationReport::class,
                 SyncEmployeeSfUids::class,
             ]);
         }
@@ -241,3 +247,4 @@ class ReportsServiceProvider extends ServiceProvider
         });
     }
 }
+

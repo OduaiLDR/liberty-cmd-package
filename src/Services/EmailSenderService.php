@@ -144,6 +144,9 @@ class EmailSenderService
 
     /**
      * Send using recipients pulled from TblReports (by report name) plus optional env extras.
+     *
+     * @param  bool  $strictCompany  When true and $companies is non-empty: require a company column,
+     *                               never drop the company filter, never fall back to all companies.
      */
     public function sendMailUsingTblReports(
         \Cmd\Reports\Services\DBConnector $connector,
@@ -152,9 +155,10 @@ class EmailSenderService
         string $subject,
         string $body,
         array $attachments = [],
-        bool $includeEnvExtras = true
+        bool $includeEnvExtras = true,
+        bool $strictCompany = false
     ): bool {
-        $list = $this->fetchRecipientsFromTblReports($connector, $reportNames, $companies);
+        $list = $this->fetchRecipientsFromTblReports($connector, $reportNames, $companies, $strictCompany);
         if ($includeEnvExtras) {
             $extras = $this->parseRecipientList((string) env('REPORT_EXTRA_RECIPIENTS', ''));
             $list = array_merge($list, $extras);
@@ -162,7 +166,7 @@ class EmailSenderService
         $list = array_values(array_unique(array_filter($list)));
 
         if (empty($list)) {
-            Log::warning('EmailSenderService: no recipients found for report.', ['reports' => $reportNames, 'companies' => $companies]);
+            Log::warning('EmailSenderService: no recipients found for report.', ['reports' => $reportNames, 'companies' => $companies, 'strict_company' => $strictCompany]);
             return false;
         }
 
@@ -183,9 +187,10 @@ class EmailSenderService
         string $subject,
         string $body,
         array $attachments = [],
-        bool $includeEnvExtras = true
+        bool $includeEnvExtras = true,
+        bool $strictCompany = false
         ): bool {
-        $list = $this->fetchRecipientsFromTblReports($connector, $reportNames, $companies);
+        $list = $this->fetchRecipientsFromTblReports($connector, $reportNames, $companies, $strictCompany);
         if ($includeEnvExtras) {
             $extras = $this->parseRecipientList((string) env('REPORT_EXTRA_RECIPIENTS', ''));
             $list = array_merge($list, $extras);
@@ -193,7 +198,7 @@ class EmailSenderService
         $list = array_values(array_unique(array_filter($list)));
 
         if (empty($list)) {
-            Log::warning('EmailSenderService: no recipients found for report.', ['reports' => $reportNames, 'companies' => $companies]);
+            Log::warning('EmailSenderService: no recipients found for report.', ['reports' => $reportNames, 'companies' => $companies, 'strict_company' => $strictCompany]);
             return false;
         }
 
@@ -273,9 +278,16 @@ class EmailSenderService
 
     /**
      * Fetch SendTo/SendCC/SendBCC from TblReports for a given report.
+     *
+     * @param  bool  $strictCompany  Fail closed when companies requested but company column missing;
+     *                               do not re-query without company filter.
      */
-    private function fetchRecipientsFromTblReports(\Cmd\Reports\Services\DBConnector $connector, array $reportNames, array $companies): array
-    {
+    private function fetchRecipientsFromTblReports(
+        \Cmd\Reports\Services\DBConnector $connector,
+        array $reportNames,
+        array $companies,
+        bool $strictCompany = false
+    ): array {
         if (empty($reportNames)) {
             return [];
         }
@@ -306,6 +318,15 @@ class EmailSenderService
             return [];
         }
 
+        // Strict dual-portal sends must never drop the company filter.
+        if ($strictCompany && ! empty($companies) && $companyColumn === null) {
+            Log::warning('EmailSenderService: strict company filter requires company column.', [
+                'reports' => $reportNames,
+                'companies' => $companies,
+            ]);
+            return [];
+        }
+
         $sendList = implode(', ', $sendColumns);
         $reportExpr = "LTRIM(RTRIM({$reportColumn}))";
         $companyClause = '';
@@ -323,7 +344,9 @@ class EmailSenderService
         $rows = $result['data'] ?? [];
         $emails = $this->collectRecipients($rows, $sendColumns);
 
-        if (empty($emails) && $companyClause !== '') {
+        // Legacy: if company filter yields nothing, broaden to all companies for that report.
+        // Disabled under $strictCompany so LDR/PLAW isolation cannot leak.
+        if (empty($emails) && $companyClause !== '' && ! $strictCompany) {
             $fallbackSql = "
                 SELECT {$sendList}
                 FROM dbo.TblReports
@@ -343,6 +366,7 @@ class EmailSenderService
                 'company_column' => $companyColumn,
                 'send_columns' => $sendColumns,
                 'row_count' => count($rows),
+                'strict_company' => $strictCompany,
             ]);
         }
 
