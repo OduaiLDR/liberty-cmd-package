@@ -201,9 +201,7 @@ class Formatter
         $sent = $email->sendMailUsingTblReports(
             $connector,
             [
-                'ReconsiderationReport',
                 'Reconsideration Report',
-                'Reconsideration',
             ],
             [$company],
             $subject,
