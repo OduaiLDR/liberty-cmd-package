@@ -605,20 +605,38 @@ final class DppSeleniumService
                 $out['after_editbtn'] = ['voidbtn_present' => $voidBtn, 'url' => $driver->getCurrentURL()];
 
                 if ($voidBtn) {
-                    $this->safeClick($client, '#voidbtn');
+                    // Match voidOneSettlement exactly: JS-click the <a> void icon (a plain click
+                    // didn't open the modal), accept any confirm, then poll up to 15s for the
+                    // reason options to POPULATE — recording WHEN, so a slow modal is told apart
+                    // from one that never opens.
+                    usleep(1200000);
+                    $driver->executeScript("var b = document.getElementById('voidbtn'); if (b) { b.click(); }");
                     try {
-                        $driver->switchTo()->alert()->accept(); // #voidbtn may raise its own JS confirm
+                        $driver->switchTo()->alert()->accept();
                     } catch (\Throwable $e) {
                         // no alert on #voidbtn
                     }
-                    usleep(3500000); // the reason dropdown + confirm load async after #voidbtn
-                    $hasReasons = \count($driver->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('#sett_void_reasons'))) > 0;
+
+                    $appearedAfter = null;
+                    $reasonOpts = [];
+                    $start = time();
+                    while (time() < $start + 15) {
+                        $reasonOpts = \count($driver->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('#sett_void_reasons'))) > 0
+                            ? $this->optionTexts($driver, '#sett_void_reasons')
+                            : [];
+                        foreach ($reasonOpts as $o) {
+                            if (stripos((string) $o, 'CANCELLING') !== false) {
+                                $appearedAfter = time() - $start;
+                                break 2;
+                            }
+                        }
+                        usleep(500000);
+                    }
+
                     $out['void_dialog'] = [
                         'url' => $driver->getCurrentURL(),
-                        'sett_void_reasons_present' => $hasReasons,
-                        'sett_void_reasons_options' => $hasReasons ? $this->optionTexts($driver, '#sett_void_reasons') : 'not present',
-                        // EVERY select in the DOM after #voidbtn — reveals the real reason
-                        // dropdown (id/name + options) when it is NOT #sett_void_reasons.
+                        'reason_options_appeared_after_seconds' => $appearedAfter, // null = never populated
+                        'sett_void_reasons_options' => $reasonOpts,
                         'all_selects' => $this->dumpAllSelects($driver),
                         'displayed_buttons' => $this->dumpDialogButtons($driver),
                     ];
@@ -1032,16 +1050,19 @@ final class DppSeleniumService
         $this->safeClick($client, '#editbtn');
         $this->acceptAlertIfPresent($driver);
 
-        // The void icon → the "Are you sure you want to void this offer?" modal. #voidbtn may
-        // raise its own native confirm, so accept one if it appears.
+        // The void icon opens the "Are you sure you want to void this offer?" modal. It is an
+        // <a> icon on the edit form; a plain WebDriver click did NOT open the dialog (probe
+        // 2026-07-23: #sett_void_reasons stayed empty + hidden), so drive its handler with a JS
+        // click once the edit form has settled. #voidbtn may also raise a native confirm — accept it.
         $client->waitFor('#voidbtn', 20);
-        $this->safeClick($client, '#voidbtn');
+        usleep(1200000); // let the edit form finish wiring its JS handlers
+        $driver->executeScript("var b = document.getElementById('voidbtn'); if (b) { b.click(); }");
         $this->acceptAlertIfPresent($driver);
 
-        // Wait for the required "Settlement Voided Reason" to actually POPULATE (its options
-        // load async; a fixed sleep was flaky), then select CLIENT CANCELLING (confirmed
-        // 2026-07-22). A throw here means the dialog never rendered → failed void.
-        $this->waitForOption($driver, '#sett_void_reasons', 'CLIENT CANCELLING', 12);
+        // Wait for the required "Settlement Voided Reason" to POPULATE (its options load only
+        // once the modal actually opens), then select CLIENT CANCELLING (confirmed 2026-07-22).
+        // A throw here means the dialog never rendered → failed void (fail-safe, no drop).
+        $this->waitForOption($driver, '#sett_void_reasons', 'CLIENT CANCELLING', 15);
         $this->select($client, '#sett_void_reasons', 'CLIENT CANCELLING');
 
         // Confirm with the modal's OWN "Ok" — scoped to the dialog that hosts the reason
