@@ -615,7 +615,6 @@ final class DppSeleniumService
                     $this->acceptAlertIfPresent($driver);
                     usleep(3000000);
 
-                    $diag = (string) $driver->executeScript(
                     $chain = (string) $driver->executeScript(
                         "var s=document.getElementById('sett_void_reasons'); if(!s) return 'no select';" .
                             "var out='win='+window.innerWidth+'x'+window.innerHeight+' | ';" .
