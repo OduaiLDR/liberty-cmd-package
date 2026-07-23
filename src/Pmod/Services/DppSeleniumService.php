@@ -1066,6 +1066,12 @@ final class DppSeleniumService
         } while (time() < $deadline);
 
         $status = $status === null ? '' : trim((string) $status);
+        // Fail-CLOSED: '10' = still active (void failed); '' / 'no-form' = couldn't read the status
+        // (can't confirm). Only a real non-active status (observed 116 = voided, 2026-07-23) counts
+        // as a confirmed void, so an unverifiable result never lets the caller drop the client.
+        if ($status === '' || $status === 'no-form') {
+            throw new \RuntimeException("void not confirmed for offer {$offerId}: offer_status unreadable ('{$status}')");
+        }
         if ($status === '10') {
             throw new \RuntimeException("void not confirmed for offer {$offerId}: still active (offer_status=10)");
         }
