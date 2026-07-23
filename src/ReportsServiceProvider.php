@@ -34,6 +34,7 @@ use Cmd\Reports\Console\Commands\GenerateSuppressionReport\GenerateSuppressionRe
 use Cmd\Reports\Console\Commands\GenerateWelcomeLetterReport\GenerateWelcomeLetterReport;
 use Cmd\Reports\Console\Commands\GenerateWelcomePacketReport\GenerateWelcomePacketReport;
 use Cmd\Reports\Console\Commands\GenerateDroppedReport\GenerateDroppedReport;
+use Cmd\Reports\Console\Commands\GenerateCancellationReport\GenerateCancellationReport;
 use Cmd\Reports\Console\Commands\GenerateScrubListReport\GenerateScrubListReport;
 use Cmd\Reports\Console\Commands\GenerateScrubListReportPLAW\GenerateScrubListReportPLAW;
 use Cmd\Reports\Console\Commands\GenerateScrubListReportLDR\GenerateScrubListReportLDR;
@@ -160,6 +161,7 @@ class ReportsServiceProvider extends ServiceProvider
                 GenerateWelcomeLetterReport::class,
                 GenerateWelcomePacketReport::class,
                 GenerateDroppedReport::class,
+                GenerateCancellationReport::class,
                 GenerateScrubListReport::class,
                 GenerateScrubListReportPLAW::class,
                 GenerateScrubListReportLDR::class,
