@@ -615,22 +615,16 @@ final class DppSeleniumService
                     $this->acceptAlertIfPresent($driver);
                     usleep(3000000);
 
-                    // Skip clicking entirely: find the jQuery click handler bound to #voidbtn (or a
-                    // delegated one on document) and INVOKE it directly. That runs the .dialog()-init
-                    // code regardless of why event dispatch won't reach it.
-                    $handlers = (string) $driver->executeScript(
-                        "var vb=document.getElementById('voidbtn');if(!window.jQuery)return 'no-jquery';var out=[];" .
+                    // Walk EVERY ancestor of #voidbtn for a jQuery click handler (direct or delegated
+                    // by a selector #voidbtn matches) and invoke it directly — the last place the
+                    // dialog-opening handler could be bound.
+                    $ancestorHandlers = (string) $driver->executeScript(
+                        "var vb=document.getElementById('voidbtn');if(!window.jQuery)return 'no-jquery';var out=[];var found='NONE';" .
                             "function inited(){try{return jQuery('#sett_void_dlg').dialog('instance')!=null;}catch(e){return false;}}" .
-                            "var ev=jQuery._data(vb,'events');out.push('directClickHandlers='+(ev&&ev.click?ev.click.length:0));" .
-                            "if(ev&&ev.click){for(var i=0;i<ev.click.length;i++){try{ev.click[i].handler.call(vb,jQuery.Event('click'));}catch(e){out.push('h'+i+'Err:'+e.message);}}out.push('afterDirectInvoke_inited='+inited());}" .
-                            "var dev=jQuery._data(document,'events');if(dev&&dev.click){var sels=[];for(var j=0;j<dev.click.length;j++){if(dev.click[j].selector)sels.push(dev.click[j].selector);}out.push('docDelegatedSelectors='+sels.slice(0,30).join(' ; '));}" .
-                            "return out.join(' | ');"
-                    );
-                    $delegatedTry = (string) $driver->executeScript(
-                        "if(!window.jQuery)return 'no-jquery';function inited(){try{return jQuery('#sett_void_dlg').dialog('instance')!=null;}catch(e){return false;}}" .
-                            "if(inited())return 'already-inited';var vb=document.getElementById('voidbtn');var dev=jQuery._data(document,'events');var done='no-matching-delegate';" .
-                            "if(dev&&dev.click){for(var j=0;j<dev.click.length;j++){var sel=dev.click[j].selector;if(sel){try{if(jQuery(vb).is(sel)){var e=jQuery.Event('click');e.currentTarget=vb;e.target=vb;dev.click[j].handler.call(vb,e);done='invoked['+sel+'] inited='+inited();break;}}catch(err){done='err['+sel+']:'+err.message;}}}}" .
-                            "return done;"
+                            "var node=vb;" .
+                            "for(var lvl=0;lvl<14&&node;lvl++){var ed=jQuery._data(node,'events');if(ed&&ed.click){for(var k=0;k<ed.click.length;k++){var sel=ed.click[k].selector;out.push('lvl'+lvl+' '+node.tagName+'#'+(node.id||'')+' sel='+(sel||'(direct)'));" .
+                            "if((!sel||jQuery(vb).is(sel))&&found==='NONE'){try{ed.click[k].handler.call(vb,jQuery.Event('click',{currentTarget:vb,target:vb}));found='invoked@lvl'+lvl+'['+(sel||'direct')+'] inited='+inited();}catch(e){found='invokeErr:'+e.message;}}}}node=node.parentElement;}" .
+                            "return 'clickHandlersFound='+(out.length?out.join(' ; '):'NONE-in-whole-chain')+' || result='+found;"
                     );
                     $okAfter = (string) $driver->executeScript(
                         "var b=[];var a=document.querySelectorAll('.ui-dialog button, button, a');for(var i=0;i<a.length;i++){var t=((a[i].textContent||'')+'').trim();if(a[i].offsetHeight>0&&(t==='Ok'||t==='Cancel'))b.push(t+':'+(a[i].className||''));}return b.join(' , ')||'none';"
@@ -638,8 +632,7 @@ final class DppSeleniumService
 
                     $out['void_dialog'] = [
                         'url' => $driver->getCurrentURL(),
-                        'handlers' => $handlers,
-                        'delegated_try' => $delegatedTry,
+                        'ancestor_handlers' => $ancestorHandlers,
                         'ok_after' => $okAfter,
                     ];
                 }
