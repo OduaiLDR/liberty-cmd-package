@@ -615,25 +615,23 @@ final class DppSeleniumService
                     $this->acceptAlertIfPresent($driver);
                     usleep(3000000);
 
-                    $chain = (string) $driver->executeScript(
-                        "var s=document.getElementById('sett_void_reasons'); if(!s) return 'no select';" .
-                            "var out='win='+window.innerWidth+'x'+window.innerHeight+' | ';" .
-                            "var c=[];var m=s;" .
-                            "for(var lvl=0;lvl<9&&m;lvl++){var st=getComputedStyle(m);c.push(lvl+':'+m.tagName+'#'+(m.id||'')+'.'+(((m.className||'')+'').trim().split(/\\s+/).join('.'))+' d='+st.display+' vis='+st.visibility+' pos='+st.position+' h='+m.offsetHeight);m=m.parentElement;}" .
-                            "return out+c.join('  ||  ');"
+                    // The confirm dialog is #sett_void_dlg (display:none). Probe whether it's a
+                    // jQuery UI dialog we can open directly, and dump its full markup (Ok/Cancel wiring).
+                    $openTry = (string) $driver->executeScript(
+                        "var s=document.getElementById('sett_void_reasons');var out=[];" .
+                            "try{if(window.jQuery){var d=jQuery('#sett_void_dlg');out.push('hasDialogFn='+(typeof d.dialog));" .
+                            "var inst=null;try{inst=d.dialog('instance');}catch(e2){out.push('instErr:'+e2.message);}out.push('inited='+(inst?'y':'n'));" .
+                            "d.dialog('open');out.push('afterOpen render='+(s&&s.offsetHeight>0));}else{out.push('no-jquery');}}catch(e){out.push('openErr:'+e.message);}" .
+                            "return out.join(' | ');"
                     );
-                    $containerHtml = (string) $driver->executeScript(
-                        "var s=document.getElementById('sett_void_reasons'); if(!s) return 'no select';" .
-                            "var a=s;for(var i=0;i<5&&a.parentElement;i++)a=a.parentElement;return a.outerHTML.substring(0,1600);"
+                    $dlgHtml = (string) $driver->executeScript(
+                        "var d=document.getElementById('sett_void_dlg');return d?d.outerHTML:'none';"
                     );
 
                     $out['void_dialog'] = [
                         'url' => $driver->getCurrentURL(),
-                        'ancestor_chain' => $chain,
-                        'container_html' => $containerHtml,
-                        'reason_options_via_js' => (string) $driver->executeScript(
-                            "var s=document.getElementById('sett_void_reasons');if(!s)return 'none';var a=[];for(var i=0;i<s.options.length;i++){a.push(s.options[i].value+':'+s.options[i].text);}return a.join(' | ');"
-                        ),
+                        'open_try' => $openTry,
+                        'dlg_html' => mb_substr($dlgHtml, 0, 2000),
                     ];
                 }
             } catch (\Throwable $e) {
