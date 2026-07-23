@@ -27,8 +27,7 @@ use Illuminate\Support\Facades\Log;
  * - Progress Law SF ('plaw' env): every contact is automatically "Progress Law".
  * - LDR SF ('ldr' env): PLAW-prefixed enrollment plan titles are "PLAW", everything else is "LDR".
  *
- * TESTING: emails directly to oduai@libertydebtrelief.com for now. Switch to the TblReports lookup
- * (Report_Name = 'CancellationReport', Company = LDR/PLAW — confirmed in TblReports) once verified.
+ * Recipients come from dbo.TblReports (Report_Name = 'CancellationReport', Company = LDR/PLAW).
  */
 class GenerateCancellationReport extends Command
 {
@@ -39,14 +38,15 @@ class GenerateCancellationReport extends Command
 
     protected $description = 'Generate the Cancellation Report staircase workbook ({Category} - All Contacts / {Category} - With Settlements / Cancellation Report) for LDR and Progress Law and email them.';
 
-    private const NOTIFY_EMAIL = 'oduai@libertydebtrelief.com';
-
     private const CATEGORY_ENVS = ['LDR' => 'ldr', 'Progress Law' => 'plaw'];
 
     // Which Cancellation Report company blocks are possible per category's own Snowflake source:
     // the 'ldr' account can contain both LDR- and PLAW-titled enrollment plans (never Progress Law); the
     // 'plaw' account is 100% Progress Law.
     private const CATEGORY_CANCELLATION_COMPANIES = ['LDR' => ['LDR', 'PLAW'], 'Progress Law' => ['Progress Law']];
+
+    // dbo.TblReports stores this report's rows under Company = 'LDR' / 'PLAW' (not "Progress Law").
+    private const CATEGORY_TBLREPORTS_COMPANY = ['LDR' => 'LDR', 'Progress Law' => 'PLAW'];
 
     public function handle(): int
     {
@@ -56,9 +56,17 @@ class GenerateCancellationReport extends Command
         $categoryArg = $this->argument('category') ? $this->normalizeCategoryArg($this->argument('category')) : null;
         $categories = $categoryArg ? [$categoryArg] : ['LDR', 'Progress Law'];
 
+        try {
+            $sqlServerConnector = $this->initializeSqlServerConnector();
+        } catch (\Throwable $e) {
+            $this->error('Failed to initialize SQL Server connector: ' . $e->getMessage());
+            Log::error('GenerateCancellationReport: SQL Server connector init failed', ['exception' => $e]);
+            return Command::FAILURE;
+        }
+
         $hadFailure = false;
         foreach ($categories as $category) {
-            if (!$this->buildAndSend($category)) {
+            if (!$this->buildAndSend($category, $sqlServerConnector)) {
                 $hadFailure = true;
             }
         }
@@ -70,7 +78,7 @@ class GenerateCancellationReport extends Command
      * Builds and sends one company's staircase workbook, sourced entirely from that company's own
      * Snowflake account.
      */
-    private function buildAndSend(string $category): bool
+    private function buildAndSend(string $category, DBConnector $sqlServerConnector): bool
     {
         $this->info("[INFO] Cancellation Report ({$category}): starting.");
 
@@ -108,7 +116,7 @@ class GenerateCancellationReport extends Command
 
         $sent = true;
         if (!$skipEmail) {
-            $sent = $this->sendReport($category, $workbook);
+            $sent = $this->sendReport($category, $workbook, $sqlServerConnector);
         } else {
             $this->info("[{$category}] Skipping email send (--no-email or --output was used).");
         }
@@ -253,7 +261,7 @@ class GenerateCancellationReport extends Command
         return str_starts_with(strtoupper(trim($title)), 'PLAW') ? 'PLAW' : 'LDR';
     }
 
-    private function sendReport(string $category, ?array $workbook): bool
+    private function sendReport(string $category, ?array $workbook, DBConnector $sqlServerConnector): bool
     {
         $subject = "{$category} - Cancellation Report";
         $body = 'Please see the attached Cancellation report.';
@@ -267,17 +275,45 @@ class GenerateCancellationReport extends Command
             ];
         }
 
+        $company = self::CATEGORY_TBLREPORTS_COMPANY[$category];
+
         $email = new EmailSenderService();
-        $sent = $email->sendMail($subject, $body, [self::NOTIFY_EMAIL], [], [], $attachments);
+        $sent = $email->sendMailUsingTblReports(
+            $sqlServerConnector,
+            ['CancellationReport'],
+            [$company],
+            $subject,
+            $body,
+            $attachments,
+            true
+        );
 
         if ($sent) {
-            $this->info("[{$category}] Cancellation Report emailed to " . self::NOTIFY_EMAIL);
+            $this->info("[{$category}] Cancellation Report emailed (TblReports recipients).");
         } else {
-            $this->warn("[{$category}] Cancellation Report email failed to send.");
+            $this->warn("[{$category}] Cancellation Report not sent (no TblReports recipients found or send failed).");
             Log::warning('GenerateCancellationReport: notification email failed.', ['category' => $category]);
         }
 
         return $sent;
+    }
+
+    private function initializeSqlServerConnector(): DBConnector
+    {
+        $candidates = ['ldr', 'plaw', 'production', 'sandbox'];
+        $errors = [];
+
+        foreach ($candidates as $env) {
+            try {
+                $connector = DBConnector::fromEnvironment($env);
+                $connector->initializeSqlServer();
+                return $connector;
+            } catch (\Throwable $e) {
+                $errors[] = "{$env}: {$e->getMessage()}";
+            }
+        }
+
+        throw new \RuntimeException('Unable to initialize SQL Server connector. Tried: ' . implode('; ', $errors));
     }
 
     private function esc(string $value): string
