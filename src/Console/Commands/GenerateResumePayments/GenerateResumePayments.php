@@ -115,21 +115,38 @@ final class GenerateResumePayments extends Command
         $this->dppSelenium = $dppSelenium;
 
         $probeCancelId = (string) ($this->option('probe-cancel') ?? '');
+        $probeResumeId = (string) ($this->option('probe-resume') ?? '');
+        $probeVoidId = (string) ($this->option('probe-void-settlements') ?? '');
+        $dryRun = (bool) $this->option('dry-run');
+
+        // Concurrency guard (2026-07-23): this command drives ONE headless Chromium on the fixed
+        // ChromeDriver port 9515 against ONE DPP login. Two overlapping runs collide ("port 9515
+        // is already in use") and would double-process contacts — that crashed ~26 cancels on
+        // 2026-07-22 when a manual test overlapped the scheduled run. A dry-run uses no browser;
+        // every other invocation (a probe or a live run) takes an exclusive lock and exits cleanly
+        // if another run already holds it. flock auto-releases if a run dies, so no stale locks.
+        // $lockHandle is intentionally held in scope for the whole run — closing it frees the lock.
+        $usesBrowser = $probeCancelId !== '' || $probeResumeId !== '' || $probeVoidId !== '' || ! $dryRun;
+        $lockHandle = false;
+        if ($usesBrowser) {
+            $lockHandle = $this->acquireRunLock();
+            if ($lockHandle === null) {
+                $this->warn('[INFO] Another resume-payments run holds the browser lock — exiting to avoid a collision.');
+                Log::warning('ResumePayments: skipped — another run holds the browser lock');
+                return Command::SUCCESS;
+            }
+        }
+
         if ($probeCancelId !== '') {
             return $this->runProbeCancel($probeCancelId);
         }
-
-        $probeResumeId = (string) ($this->option('probe-resume') ?? '');
         if ($probeResumeId !== '') {
             return $this->runProbeResume($gateway, $probeResumeId);
         }
-
-        $probeVoidId = (string) ($this->option('probe-void-settlements') ?? '');
         if ($probeVoidId !== '') {
             return $this->runProbeVoidSettlements($probeVoidId);
         }
 
-        $dryRun = (bool) $this->option('dry-run');
         $companies = $this->resolveCompanies();
 
         $this->info('[INFO] ResumePayments: starting.');
@@ -304,6 +321,34 @@ final class GenerateResumePayments extends Command
     /**
      * @return list<string>
      */
+    /**
+     * Acquire an exclusive, non-blocking file lock so only ONE browser-driving run executes at a
+     * time (prevents the ChromeDriver port-9515 collision + double-processing). Returns the open
+     * lock handle (KEEP it referenced for the whole run — closing/GC releases the lock), null if
+     * another run already holds it, or false if the lock file can't be opened (proceed anyway — a
+     * lock-infra hiccup must not block the daily run). flock is process-scoped, so a crashed run
+     * releases its lock automatically (no stale-lock recovery needed).
+     *
+     * @return resource|null|false
+     */
+    private function acquireRunLock()
+    {
+        $path = storage_path('app/resume-payments-run.lock');
+        $handle = @fopen($path, 'c');
+        if ($handle === false) {
+            Log::warning('ResumePayments: could not open run-lock file; proceeding WITHOUT a concurrency lock', ['path' => $path]);
+
+            return false;
+        }
+        if (! flock($handle, LOCK_EX | LOCK_NB)) {
+            fclose($handle);
+
+            return null;
+        }
+
+        return $handle;
+    }
+
     private function resolveCompanies(): array
     {
         $opt = array_values(array_filter(array_map(
@@ -1274,25 +1319,43 @@ final class GenerateResumePayments extends Command
                     $voidsUsed++;
                 }
 
-                $this->executeSystemCancel(
-                    $tenant,
-                    $cid,
-                    $item['llg_id'],
-                    $item['name'],
-                    $item['info'],
-                    $balance,
-                    $epf,
-                    $settlementSum,
-                    $englishFlags[$cid] ?? true,
-                    $systemAccount,
-                    $processDate,
-                    $today,
-                    $item['days'],
-                    $item['debt'],
-                    $offersForContact,
-                    $dryRun,
-                    $statusChanges,
-                );
+                try {
+                    $this->executeSystemCancel(
+                        $tenant,
+                        $cid,
+                        $item['llg_id'],
+                        $item['name'],
+                        $item['info'],
+                        $balance,
+                        $epf,
+                        $settlementSum,
+                        $englishFlags[$cid] ?? true,
+                        $systemAccount,
+                        $processDate,
+                        $today,
+                        $item['days'],
+                        $item['debt'],
+                        $offersForContact,
+                        $dryRun,
+                        $statusChanges,
+                    );
+                } catch (\Cmd\Reports\Pmod\Services\DppSeleniumException $e) {
+                    // A DPP SESSION failure (dead login, ChromeDriver port collision, Chromium
+                    // crash) breaks EVERY remaining cancel the same way. STOP attempting the rest
+                    // this run instead of silently piling ~1000 contacts into Backlog (which
+                    // masquerades as a huge queue — exactly the 2026-07-22 confusion). The loud
+                    // error is the signal that the run was broken, not that there's a big backlog.
+                    if ($e->stage === 'session_failure') {
+                        Log::error('ResumePayments: DPP session dead — stopping Phase 5 cancels for this company', [
+                            'company' => $company,
+                            'processed' => $processed,
+                            'error' => $e->getMessage(),
+                        ]);
+                        break;
+                    }
+
+                    throw $e;
+                }
             }
         }
 
@@ -1390,6 +1453,27 @@ final class GenerateResumePayments extends Command
                 $this->emailCancellationAudit($contactId, 'URGENT — PARTIAL settlement void; client NOT dropped/refunded, reconcile manually: ' . $e->getMessage());
                 $statusChanges[] = $this->row($contactId, $name, self::STAGE_CANCEL_HOLD, $days, $debt);
                 return;
+            }
+
+            // DPP SESSION-level failure (dead/expired login, ChromeDriver port collision,
+            // Chromium not reachable): EVERY remaining cancel will fail identically, so record
+            // this one to Backlog and RETHROW a typed session_failure so the Pass-2 loop stops
+            // and alerts loudly, instead of silently backlogging the whole batch. (This is what
+            // masqueraded as "0 cancelled / ~1000 queued" on 2026-07-22.)
+            if (preg_match('/login failed|port \d+ is already in use|session (?:deleted|not created|timed out|id is null)|invalid session id|chrome not reachable|disconnected|unable to connect/i', $e->getMessage())) {
+                Log::error('ResumePayments: DPP SESSION FAILURE during cancel — aborting further attempts', [
+                    'contact_id' => $contactId,
+                    'error' => $e->getMessage(),
+                ]);
+                $statusChanges[] = $this->row($contactId, $name, self::STAGE_CANCEL_BACKLOG, $days, $debt);
+
+                throw new \Cmd\Reports\Pmod\Services\DppSeleniumException(
+                    'DPP session failure during cancels: ' . $e->getMessage(),
+                    tenant: $tenant,
+                    contactId: $contactId,
+                    stage: 'session_failure',
+                    previous: $e,
+                );
             }
 
             // One stuck contact must not abort the rest of the company's Phase 5 loop.
