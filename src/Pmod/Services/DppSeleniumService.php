@@ -605,39 +605,46 @@ final class DppSeleniumService
                 $out['after_editbtn'] = ['voidbtn_present' => $voidBtn, 'url' => $driver->getCurrentURL()];
 
                 if ($voidBtn) {
-                    // Match voidOneSettlement exactly: JS-click the <a> void icon (a plain click
-                    // didn't open the modal), accept any confirm, then poll up to 15s for the
-                    // reason options to POPULATE — recording WHEN, so a slow modal is told apart
-                    // from one that never opens.
+                    // #voidbtn is <a id=voidbtn> with a jQuery-bound handler (no onclick/href), and
+                    // the reason <select> is already populated but display:none inside an unopened
+                    // modal. Try jQuery trigger (DPP uses jQuery) and the inner icon, then report
+                    // whether the reason select becomes VISIBLE (offsetParent!==null) — getText-based
+                    // polling can't see hidden options, so visibility is the real signal.
                     usleep(1200000);
-                    $driver->executeScript("var b = document.getElementById('voidbtn'); if (b) { b.click(); }");
-                    try {
-                        $driver->switchTo()->alert()->accept();
-                    } catch (\Throwable $e) {
-                        // no alert on #voidbtn
+                    $openLog = (string) $driver->executeScript(
+                        "var out=[]; out.push('jq='+(window.jQuery?'y':'n'));" .
+                            "if(window.jQuery){try{jQuery('#voidbtn').trigger('click');out.push('jqTrig');}catch(e){out.push('jqErr:'+e.message);}}" .
+                            "return out.join(' ');"
+                    );
+                    $this->acceptAlertIfPresent($driver);
+                    usleep(1500000);
+                    $shownAfterJq = (string) $driver->executeScript(
+                        "var s=document.getElementById('sett_void_reasons');return s?('display='+getComputedStyle(s).display+' visible='+(s.offsetParent!==null)):'gone';"
+                    );
+
+                    // If still hidden, try clicking the inner <i> icon (handler may be bound there).
+                    $shownAfterIcon = 'not tried';
+                    if (strpos($shownAfterJq, 'visible=1') === false) {
+                        $driver->executeScript("var i=document.querySelector('#voidbtn i, #voidbtn');if(i){i.click();}if(window.jQuery){jQuery('#voidbtn i').trigger('click');}");
+                        $this->acceptAlertIfPresent($driver);
+                        usleep(1500000);
+                        $shownAfterIcon = (string) $driver->executeScript(
+                            "var s=document.getElementById('sett_void_reasons');return s?('display='+getComputedStyle(s).display+' visible='+(s.offsetParent!==null)):'gone';"
+                        );
                     }
 
-                    $appearedAfter = null;
-                    $reasonOpts = [];
-                    $start = time();
-                    while (time() < $start + 15) {
-                        $reasonOpts = \count($driver->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('#sett_void_reasons'))) > 0
-                            ? $this->optionTexts($driver, '#sett_void_reasons')
-                            : [];
-                        foreach ($reasonOpts as $o) {
-                            if (stripos((string) $o, 'CANCELLING') !== false) {
-                                $appearedAfter = time() - $start;
-                                break 2;
-                            }
-                        }
-                        usleep(500000);
-                    }
+                    // Read options by value:text via JS (getText is empty on a hidden select).
+                    $optsJs = (string) $driver->executeScript(
+                        "var s=document.getElementById('sett_void_reasons'); if(!s)return 'none';" .
+                            "var a=[];for(var i=0;i<s.options.length;i++){a.push(s.options[i].value+':'+s.options[i].text);}return a.join(' | ');"
+                    );
 
                     $out['void_dialog'] = [
                         'url' => $driver->getCurrentURL(),
-                        'reason_options_appeared_after_seconds' => $appearedAfter, // null = never populated
-                        'sett_void_reasons_options' => $reasonOpts,
-                        'all_selects' => $this->dumpAllSelects($driver),
+                        'open_attempt' => $openLog,
+                        'reason_visible_after_jquery' => $shownAfterJq,
+                        'reason_visible_after_icon' => $shownAfterIcon,
+                        'reason_options_via_js' => $optsJs,
                         'displayed_buttons' => $this->dumpDialogButtons($driver),
                     ];
                 }
@@ -690,47 +697,6 @@ final class DppSeleniumService
         }
 
         return $btns;
-    }
-
-    /**
-     * Dump EVERY <select> in the DOM (id, name, displayed, first ~12 option texts) — read-only,
-     * for the void probe. Reveals the real void-reason dropdown when it isn't #sett_void_reasons.
-     *
-     * @return list<array{id:string,name:string,displayed:bool,options:list<string>}>
-     */
-    private function dumpAllSelects(mixed $driver): array
-    {
-        $out = [];
-        try {
-            foreach ($driver->findElements(\Facebook\WebDriver\WebDriverBy::tagName('select')) as $s) {
-                $opts = [];
-                foreach ($s->findElements(\Facebook\WebDriver\WebDriverBy::tagName('option')) as $o) {
-                    $t = trim((string) $o->getText());
-                    if ($t !== '') {
-                        $opts[] = $t;
-                    }
-                    if (\count($opts) >= 12) {
-                        break;
-                    }
-                }
-                $displayed = false;
-                try {
-                    $displayed = $s->isDisplayed();
-                } catch (\Throwable $e) {
-                    // stale/hidden
-                }
-                $out[] = [
-                    'id' => (string) ($s->getAttribute('id') ?? ''),
-                    'name' => (string) ($s->getAttribute('name') ?? ''),
-                    'displayed' => $displayed,
-                    'options' => $opts,
-                ];
-            }
-        } catch (\Throwable $e) {
-            // best-effort dump
-        }
-
-        return $out;
     }
 
     /**
