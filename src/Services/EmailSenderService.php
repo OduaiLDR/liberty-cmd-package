@@ -158,19 +158,26 @@ class EmailSenderService
         bool $includeEnvExtras = true,
         bool $strictCompany = false
     ): bool {
-        $list = $this->fetchRecipientsFromTblReports($connector, $reportNames, $companies, $strictCompany);
+        $recipients = $this->fetchRecipientGroupsFromTblReports($connector, $reportNames, $companies, $strictCompany);
         if ($includeEnvExtras) {
             $extras = $this->parseRecipientList((string) env('REPORT_EXTRA_RECIPIENTS', ''));
-            $list = array_merge($list, $extras);
+            $recipients['to'] = array_merge($recipients['to'], $extras);
         }
-        $list = array_values(array_unique(array_filter($list)));
+        $recipients = $this->normalizeRecipientGroups($recipients);
 
-        if (empty($list)) {
+        if ($this->recipientGroupsAreEmpty($recipients)) {
             Log::warning('EmailSenderService: no recipients found for report.', ['reports' => $reportNames, 'companies' => $companies, 'strict_company' => $strictCompany]);
             return false;
         }
 
-        $sent = $this->sendMail($subject, $body, $list, [], [], $attachments);
+        $sent = $this->sendMail(
+            $subject,
+            $body,
+            $recipients['to'],
+            $recipients['cc'],
+            $recipients['bcc'],
+            $attachments
+        );
         
         // Log to TblLog after successful send
         if ($sent) {
@@ -190,19 +197,26 @@ class EmailSenderService
         bool $includeEnvExtras = true,
         bool $strictCompany = false
         ): bool {
-        $list = $this->fetchRecipientsFromTblReports($connector, $reportNames, $companies, $strictCompany);
+        $recipients = $this->fetchRecipientGroupsFromTblReports($connector, $reportNames, $companies, $strictCompany);
         if ($includeEnvExtras) {
             $extras = $this->parseRecipientList((string) env('REPORT_EXTRA_RECIPIENTS', ''));
-            $list = array_merge($list, $extras);
+            $recipients['to'] = array_merge($recipients['to'], $extras);
         }
-        $list = array_values(array_unique(array_filter($list)));
+        $recipients = $this->normalizeRecipientGroups($recipients);
 
-        if (empty($list)) {
+        if ($this->recipientGroupsAreEmpty($recipients)) {
             Log::warning('EmailSenderService: no recipients found for report.', ['reports' => $reportNames, 'companies' => $companies, 'strict_company' => $strictCompany]);
             return false;
         }
 
-        $sent = $this->sendMailHtml($subject, $body, $list, [], [], $attachments);
+        $sent = $this->sendMailHtml(
+            $subject,
+            $body,
+            $recipients['to'],
+            $recipients['cc'],
+            $recipients['bcc'],
+            $attachments
+        );
         
         // Log to TblLog after successful send
         if ($sent) {
@@ -277,19 +291,19 @@ class EmailSenderService
     }
 
     /**
-     * Fetch SendTo/SendCC/SendBCC from TblReports for a given report.
+     * Fetch To/CC/BCC recipient groups from TblReports for a given report.
      *
      * @param  bool  $strictCompany  Fail closed when companies requested but company column missing;
      *                               do not re-query without company filter.
      */
-    private function fetchRecipientsFromTblReports(
+    private function fetchRecipientGroupsFromTblReports(
         \Cmd\Reports\Services\DBConnector $connector,
         array $reportNames,
         array $companies,
         bool $strictCompany = false
     ): array {
         if (empty($reportNames)) {
-            return [];
+            return $this->emptyRecipientGroups();
         }
 
         $escapedReports = array_map(function ($name) {
@@ -315,7 +329,7 @@ class EmailSenderService
                 'report_column' => $reportColumn,
                 'send_columns' => $sendColumns,
             ]);
-            return [];
+            return $this->emptyRecipientGroups();
         }
 
         // Strict dual-portal sends must never drop the company filter.
@@ -324,7 +338,7 @@ class EmailSenderService
                 'reports' => $reportNames,
                 'companies' => $companies,
             ]);
-            return [];
+            return $this->emptyRecipientGroups();
         }
 
         $sendList = implode(', ', $sendColumns);
@@ -342,11 +356,11 @@ class EmailSenderService
         ";
         $result = $connector->querySqlServer($sql);
         $rows = $result['data'] ?? [];
-        $emails = $this->collectRecipients($rows, $sendColumns);
+        $recipients = $this->collectRecipientGroups($rows, $sendColumns);
 
         // Legacy: if company filter yields nothing, broaden to all companies for that report.
         // Disabled under $strictCompany so LDR/PLAW isolation cannot leak.
-        if (empty($emails) && $companyClause !== '' && ! $strictCompany) {
+        if ($this->recipientGroupsAreEmpty($recipients) && $companyClause !== '' && ! $strictCompany) {
             $fallbackSql = "
                 SELECT {$sendList}
                 FROM dbo.TblReports
@@ -354,11 +368,11 @@ class EmailSenderService
             ";
             $fallbackResult = $connector->querySqlServer($fallbackSql);
             $fallbackRows = $fallbackResult['data'] ?? [];
-            $emails = $this->collectRecipients($fallbackRows, $sendColumns);
+            $recipients = $this->collectRecipientGroups($fallbackRows, $sendColumns);
             $rows = $fallbackRows;
         }
 
-        if (empty($emails)) {
+        if ($this->recipientGroupsAreEmpty($recipients)) {
             Log::warning('EmailSenderService: no recipients found for report.', [
                 'reports' => $reportNames,
                 'companies' => $companies,
@@ -370,7 +384,7 @@ class EmailSenderService
             ]);
         }
 
-        return array_values(array_unique($emails));
+        return $this->normalizeRecipientGroups($recipients);
     }
 
     private function getTblReportsColumns(\Cmd\Reports\Services\DBConnector $connector): array
@@ -438,21 +452,74 @@ class EmailSenderService
         return null;
     }
 
-    private function collectRecipients(array $rows, array $keys): array
+    /**
+     * @param  list<array<string, mixed>>  $rows
+     * @param  array{0:string,1:string,2:string}  $keys
+     * @return array{to:list<string>,cc:list<string>,bcc:list<string>}
+     */
+    private function collectRecipientGroups(array $rows, array $keys): array
     {
-        $emails = [];
+        $recipients = $this->emptyRecipientGroups();
+        $roles = ['to', 'cc', 'bcc'];
+
         foreach ($rows as $row) {
             if (!is_array($row)) {
                 continue;
             }
-            foreach ($keys as $key) {
+
+            foreach ($keys as $index => $key) {
                 if (isset($row[$key]) && $row[$key] !== null && $row[$key] !== '') {
-                    $emails = array_merge($emails, $this->parseRecipientList((string) $row[$key]));
+                    $role = $roles[$index] ?? 'to';
+                    $recipients[$role] = array_merge(
+                        $recipients[$role],
+                        $this->parseRecipientList((string) $row[$key])
+                    );
                 }
             }
         }
 
-        return $emails;
+        return $recipients;
+    }
+
+    /** @return array{to:list<string>,cc:list<string>,bcc:list<string>} */
+    private function emptyRecipientGroups(): array
+    {
+        return ['to' => [], 'cc' => [], 'bcc' => []];
+    }
+
+    /** @param array{to:array,cc:array,bcc:array} $recipients */
+    private function recipientGroupsAreEmpty(array $recipients): bool
+    {
+        return empty($recipients['to'])
+            && empty($recipients['cc'])
+            && empty($recipients['bcc']);
+    }
+
+    /**
+     * Deduplicate recipients while preserving To > CC > BCC precedence.
+     *
+     * @param  array{to:array,cc:array,bcc:array}  $recipients
+     * @return array{to:list<string>,cc:list<string>,bcc:list<string>}
+     */
+    private function normalizeRecipientGroups(array $recipients): array
+    {
+        $normalized = $this->emptyRecipientGroups();
+        $seen = [];
+
+        foreach (['to', 'cc', 'bcc'] as $role) {
+            foreach ($recipients[$role] ?? [] as $email) {
+                $email = trim((string) $email);
+                $key = strtolower($email);
+                if ($email === '' || isset($seen[$key])) {
+                    continue;
+                }
+
+                $seen[$key] = true;
+                $normalized[$role][] = $email;
+            }
+        }
+
+        return $normalized;
     }
 
     /**
