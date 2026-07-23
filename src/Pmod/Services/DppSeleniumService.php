@@ -468,11 +468,22 @@ final class DppSeleniumService
         // Drill into the FIRST per-settlement dispatch page (module=settlements&page=dispatch
         // &sid=<offer_id>) to reveal the actual void controls. Read-only — no clicks on
         // void/edit/confirm, so nothing is committed.
+        // Prefer the DISPATCH page (the real void screen). page=new4 is the draft/edit form
+        // and has NO void controls, so only fall back to any sid= link if there's no dispatch.
         $sidHref = '';
         foreach ($report['settlement_links'] as $lnk) {
-            if (stripos((string) ($lnk['href'] ?? ''), 'sid=') !== false) {
-                $sidHref = (string) $lnk['href'];
+            $href = (string) ($lnk['href'] ?? '');
+            if (stripos($href, 'page=dispatch') !== false && stripos($href, 'sid=') !== false) {
+                $sidHref = $href;
                 break;
+            }
+        }
+        if ($sidHref === '') {
+            foreach ($report['settlement_links'] as $lnk) {
+                if (stripos((string) ($lnk['href'] ?? ''), 'sid=') !== false) {
+                    $sidHref = (string) $lnk['href'];
+                    break;
+                }
             }
         }
         $report['settlement_page'] = $sidHref !== ''
@@ -606,6 +617,9 @@ final class DppSeleniumService
                         'url' => $driver->getCurrentURL(),
                         'sett_void_reasons_present' => $hasReasons,
                         'sett_void_reasons_options' => $hasReasons ? $this->optionTexts($driver, '#sett_void_reasons') : 'not present',
+                        // EVERY select in the DOM after #voidbtn — reveals the real reason
+                        // dropdown (id/name + options) when it is NOT #sett_void_reasons.
+                        'all_selects' => $this->dumpAllSelects($driver),
                         'displayed_buttons' => $this->dumpDialogButtons($driver),
                     ];
                 }
@@ -658,6 +672,47 @@ final class DppSeleniumService
         }
 
         return $btns;
+    }
+
+    /**
+     * Dump EVERY <select> in the DOM (id, name, displayed, first ~12 option texts) — read-only,
+     * for the void probe. Reveals the real void-reason dropdown when it isn't #sett_void_reasons.
+     *
+     * @return list<array{id:string,name:string,displayed:bool,options:list<string>}>
+     */
+    private function dumpAllSelects(mixed $driver): array
+    {
+        $out = [];
+        try {
+            foreach ($driver->findElements(\Facebook\WebDriver\WebDriverBy::tagName('select')) as $s) {
+                $opts = [];
+                foreach ($s->findElements(\Facebook\WebDriver\WebDriverBy::tagName('option')) as $o) {
+                    $t = trim((string) $o->getText());
+                    if ($t !== '') {
+                        $opts[] = $t;
+                    }
+                    if (\count($opts) >= 12) {
+                        break;
+                    }
+                }
+                $displayed = false;
+                try {
+                    $displayed = $s->isDisplayed();
+                } catch (\Throwable $e) {
+                    // stale/hidden
+                }
+                $out[] = [
+                    'id' => (string) ($s->getAttribute('id') ?? ''),
+                    'name' => (string) ($s->getAttribute('name') ?? ''),
+                    'displayed' => $displayed,
+                    'options' => $opts,
+                ];
+            }
+        } catch (\Throwable $e) {
+            // best-effort dump
+        }
+
+        return $out;
     }
 
     /**
