@@ -605,47 +605,33 @@ final class DppSeleniumService
                 $out['after_editbtn'] = ['voidbtn_present' => $voidBtn, 'url' => $driver->getCurrentURL()];
 
                 if ($voidBtn) {
-                    // #voidbtn is <a id=voidbtn> with a jQuery-bound handler (no onclick/href), and
-                    // the reason <select> is already populated but display:none inside an unopened
-                    // modal. Try jQuery trigger (DPP uses jQuery) and the inner icon, then report
-                    // whether the reason select becomes VISIBLE (offsetParent!==null) — getText-based
-                    // polling can't see hidden options, so visibility is the real signal.
-                    usleep(1200000);
-                    $openLog = (string) $driver->executeScript(
-                        "var out=[]; out.push('jq='+(window.jQuery?'y':'n'));" .
-                            "if(window.jQuery){try{jQuery('#voidbtn').trigger('click');out.push('jqTrig');}catch(e){out.push('jqErr:'+e.message);}}" .
-                            "return out.join(' ');"
-                    );
+                    // #voidbtn is <a id=voidbtn> with a jQuery-bound handler. jQuery-triggering it
+                    // flips the reason select to display:block. Report the RENDERED state (offsetHeight
+                    // / bounding-rect, NOT offsetParent — a position:fixed modal has null offsetParent
+                    // even when shown), the modal container, and whether an Ok/Cancel button is really
+                    // clickable — that's what tells us the modal is genuinely open.
+                    usleep(1000000);
+                    $driver->executeScript("if(window.jQuery){jQuery('#voidbtn').trigger('click');}else{var b=document.getElementById('voidbtn');if(b)b.click();}");
                     $this->acceptAlertIfPresent($driver);
-                    usleep(1500000);
-                    $shownAfterJq = (string) $driver->executeScript(
-                        "var s=document.getElementById('sett_void_reasons');return s?('display='+getComputedStyle(s).display+' visible='+(s.offsetParent!==null)):'gone';"
-                    );
+                    usleep(3000000);
 
-                    // If still hidden, try clicking the inner <i> icon (handler may be bound there).
-                    $shownAfterIcon = 'not tried';
-                    if (strpos($shownAfterJq, 'visible=1') === false) {
-                        $driver->executeScript("var i=document.querySelector('#voidbtn i, #voidbtn');if(i){i.click();}if(window.jQuery){jQuery('#voidbtn i').trigger('click');}");
-                        $this->acceptAlertIfPresent($driver);
-                        usleep(1500000);
-                        $shownAfterIcon = (string) $driver->executeScript(
-                            "var s=document.getElementById('sett_void_reasons');return s?('display='+getComputedStyle(s).display+' visible='+(s.offsetParent!==null)):'gone';"
-                        );
-                    }
-
-                    // Read options by value:text via JS (getText is empty on a hidden select).
-                    $optsJs = (string) $driver->executeScript(
-                        "var s=document.getElementById('sett_void_reasons'); if(!s)return 'none';" .
-                            "var a=[];for(var i=0;i<s.options.length;i++){a.push(s.options[i].value+':'+s.options[i].text);}return a.join(' | ');"
+                    $diag = (string) $driver->executeScript(
+                        "var s=document.getElementById('sett_void_reasons'); if(!s) return 'no select';" .
+                            "var r=s.getBoundingClientRect();" .
+                            "var out='sel: display='+getComputedStyle(s).display+' offH='+s.offsetHeight+' rectH='+Math.round(r.height);" .
+                            "var m=s.parentElement,modal=null;" .
+                            "while(m){var c=((m.className||'')+'').toLowerCase();if(c.indexOf('modal')>=0||c.indexOf('popup')>=0||c.indexOf('window')>=0||c.indexOf('overlay')>=0||c.indexOf('dialog')>=0){modal=m;break;}m=m.parentElement;}" .
+                            "if(modal){var mr=modal.getBoundingClientRect();out+=' || modal: class='+modal.className+' display='+getComputedStyle(modal).display+' offH='+modal.offsetHeight+' rectH='+Math.round(mr.height);}else{out+=' || modal: none-found';}" .
+                            "var bs=[];var all=document.querySelectorAll('button,a,span,input');for(var i=0;i<all.length;i++){var b=all[i];var t=((b.textContent||b.value||'')+'').trim();if((t==='Ok'||t==='OK'||t==='Cancel')&&b.offsetHeight>0){bs.push(b.tagName+':'+t+':'+(b.id||''));}}" .
+                            "out+=' || visibleOkCancel='+(bs.join(',')||'NONE');return out;"
                     );
 
                     $out['void_dialog'] = [
                         'url' => $driver->getCurrentURL(),
-                        'open_attempt' => $openLog,
-                        'reason_visible_after_jquery' => $shownAfterJq,
-                        'reason_visible_after_icon' => $shownAfterIcon,
-                        'reason_options_via_js' => $optsJs,
-                        'displayed_buttons' => $this->dumpDialogButtons($driver),
+                        'diag' => $diag,
+                        'reason_options_via_js' => (string) $driver->executeScript(
+                            "var s=document.getElementById('sett_void_reasons');if(!s)return 'none';var a=[];for(var i=0;i<s.options.length;i++){a.push(s.options[i].value+':'+s.options[i].text);}return a.join(' | ');"
+                        ),
                     ];
                 }
             } catch (\Throwable $e) {
