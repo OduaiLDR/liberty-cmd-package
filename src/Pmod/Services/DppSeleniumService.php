@@ -615,23 +615,30 @@ final class DppSeleniumService
                     $this->acceptAlertIfPresent($driver);
                     usleep(3000000);
 
-                    // The confirm dialog is #sett_void_dlg (display:none). Probe whether it's a
-                    // jQuery UI dialog we can open directly, and dump its full markup (Ok/Cancel wiring).
+                    // #voidbtn's handler (which .dialog()-inits #sett_void_dlg) won't fire from a
+                    // plain click. Try a full native mouse-event sequence on the <a> and its inner
+                    // <i>, and report whether the dialog initializes + an Ok button appears.
                     $openTry = (string) $driver->executeScript(
-                        "var s=document.getElementById('sett_void_reasons');var out=[];" .
-                            "try{if(window.jQuery){var d=jQuery('#sett_void_dlg');out.push('hasDialogFn='+(typeof d.dialog));" .
-                            "var inst=null;try{inst=d.dialog('instance');}catch(e2){out.push('instErr:'+e2.message);}out.push('inited='+(inst?'y':'n'));" .
-                            "d.dialog('open');out.push('afterOpen render='+(s&&s.offsetHeight>0));}else{out.push('no-jquery');}}catch(e){out.push('openErr:'+e.message);}" .
-                            "return out.join(' | ');"
+                        "var s=document.getElementById('sett_void_reasons');var vb=document.getElementById('voidbtn');" .
+                            "var icon=vb?vb.querySelector('i'):null;var log=[];" .
+                            "function inited(){try{return jQuery('#sett_void_dlg').dialog('instance')!=null;}catch(e){return false;}}" .
+                            "function rend(){return !!(s&&s.offsetHeight>0);}" .
+                            "function fire(el,t){try{el.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window}));}catch(e){}}" .
+                            "if(vb){fire(vb,'mouseover');fire(vb,'mousedown');fire(vb,'mouseup');fire(vb,'click');log.push('mouseA in='+inited()+' r='+rend());}" .
+                            "if(!inited()&&icon){fire(icon,'mouseover');fire(icon,'mousedown');fire(icon,'mouseup');fire(icon,'click');log.push('mouseIcon in='+inited()+' r='+rend());}" .
+                            "if(!inited()&&window.jQuery){try{jQuery('#voidbtn i').trigger('click');}catch(e){}log.push('jqIcon in='+inited()+' r='+rend());}" .
+                            "return log.join(' | ');"
                     );
-                    $dlgHtml = (string) $driver->executeScript(
-                        "var d=document.getElementById('sett_void_dlg');return d?d.outerHTML:'none';"
+                    $okScan = (string) $driver->executeScript(
+                        "var bs=[];var all=document.querySelectorAll('.ui-dialog button, .ui-dialog-buttonpane button, button, a');" .
+                            "for(var i=0;i<all.length;i++){var b=all[i];var t=((b.textContent||'')+'').trim();if(b.offsetHeight>0&&(t==='Ok'||t==='OK'||t==='Cancel')){bs.push(b.tagName+':'+t+':'+(b.className||''));}}" .
+                            "return bs.join(' , ')||'none';"
                     );
 
                     $out['void_dialog'] = [
                         'url' => $driver->getCurrentURL(),
                         'open_try' => $openTry,
-                        'dlg_html' => mb_substr($dlgHtml, 0, 2000),
+                        'ok_button_after' => $okScan,
                     ];
                 }
             } catch (\Throwable $e) {
