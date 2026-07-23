@@ -615,30 +615,32 @@ final class DppSeleniumService
                     $this->acceptAlertIfPresent($driver);
                     usleep(3000000);
 
-                    // #voidbtn's handler (which .dialog()-inits #sett_void_dlg) won't fire from a
-                    // plain click. Try a full native mouse-event sequence on the <a> and its inner
-                    // <i>, and report whether the dialog initializes + an Ok button appears.
-                    $openTry = (string) $driver->executeScript(
-                        "var s=document.getElementById('sett_void_reasons');var vb=document.getElementById('voidbtn');" .
-                            "var icon=vb?vb.querySelector('i'):null;var log=[];" .
+                    // Skip clicking entirely: find the jQuery click handler bound to #voidbtn (or a
+                    // delegated one on document) and INVOKE it directly. That runs the .dialog()-init
+                    // code regardless of why event dispatch won't reach it.
+                    $handlers = (string) $driver->executeScript(
+                        "var vb=document.getElementById('voidbtn');if(!window.jQuery)return 'no-jquery';var out=[];" .
                             "function inited(){try{return jQuery('#sett_void_dlg').dialog('instance')!=null;}catch(e){return false;}}" .
-                            "function rend(){return !!(s&&s.offsetHeight>0);}" .
-                            "function fire(el,t){try{el.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window}));}catch(e){}}" .
-                            "if(vb){fire(vb,'mouseover');fire(vb,'mousedown');fire(vb,'mouseup');fire(vb,'click');log.push('mouseA in='+inited()+' r='+rend());}" .
-                            "if(!inited()&&icon){fire(icon,'mouseover');fire(icon,'mousedown');fire(icon,'mouseup');fire(icon,'click');log.push('mouseIcon in='+inited()+' r='+rend());}" .
-                            "if(!inited()&&window.jQuery){try{jQuery('#voidbtn i').trigger('click');}catch(e){}log.push('jqIcon in='+inited()+' r='+rend());}" .
-                            "return log.join(' | ');"
+                            "var ev=jQuery._data(vb,'events');out.push('directClickHandlers='+(ev&&ev.click?ev.click.length:0));" .
+                            "if(ev&&ev.click){for(var i=0;i<ev.click.length;i++){try{ev.click[i].handler.call(vb,jQuery.Event('click'));}catch(e){out.push('h'+i+'Err:'+e.message);}}out.push('afterDirectInvoke_inited='+inited());}" .
+                            "var dev=jQuery._data(document,'events');if(dev&&dev.click){var sels=[];for(var j=0;j<dev.click.length;j++){if(dev.click[j].selector)sels.push(dev.click[j].selector);}out.push('docDelegatedSelectors='+sels.slice(0,30).join(' ; '));}" .
+                            "return out.join(' | ');"
                     );
-                    $okScan = (string) $driver->executeScript(
-                        "var bs=[];var all=document.querySelectorAll('.ui-dialog button, .ui-dialog-buttonpane button, button, a');" .
-                            "for(var i=0;i<all.length;i++){var b=all[i];var t=((b.textContent||'')+'').trim();if(b.offsetHeight>0&&(t==='Ok'||t==='OK'||t==='Cancel')){bs.push(b.tagName+':'+t+':'+(b.className||''));}}" .
-                            "return bs.join(' , ')||'none';"
+                    $delegatedTry = (string) $driver->executeScript(
+                        "if(!window.jQuery)return 'no-jquery';function inited(){try{return jQuery('#sett_void_dlg').dialog('instance')!=null;}catch(e){return false;}}" .
+                            "if(inited())return 'already-inited';var vb=document.getElementById('voidbtn');var dev=jQuery._data(document,'events');var done='no-matching-delegate';" .
+                            "if(dev&&dev.click){for(var j=0;j<dev.click.length;j++){var sel=dev.click[j].selector;if(sel){try{if(jQuery(vb).is(sel)){var e=jQuery.Event('click');e.currentTarget=vb;e.target=vb;dev.click[j].handler.call(vb,e);done='invoked['+sel+'] inited='+inited();break;}}catch(err){done='err['+sel+']:'+err.message;}}}}" .
+                            "return done;"
+                    );
+                    $okAfter = (string) $driver->executeScript(
+                        "var b=[];var a=document.querySelectorAll('.ui-dialog button, button, a');for(var i=0;i<a.length;i++){var t=((a[i].textContent||'')+'').trim();if(a[i].offsetHeight>0&&(t==='Ok'||t==='Cancel'))b.push(t+':'+(a[i].className||''));}return b.join(' , ')||'none';"
                     );
 
                     $out['void_dialog'] = [
                         'url' => $driver->getCurrentURL(),
-                        'open_try' => $openTry,
-                        'ok_button_after' => $okScan,
+                        'handlers' => $handlers,
+                        'delegated_try' => $delegatedTry,
+                        'ok_after' => $okAfter,
                     ];
                 }
             } catch (\Throwable $e) {
