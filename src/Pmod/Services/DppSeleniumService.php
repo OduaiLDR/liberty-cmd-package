@@ -616,19 +616,22 @@ final class DppSeleniumService
                     usleep(3000000);
 
                     $diag = (string) $driver->executeScript(
+                    $chain = (string) $driver->executeScript(
                         "var s=document.getElementById('sett_void_reasons'); if(!s) return 'no select';" .
-                            "var r=s.getBoundingClientRect();" .
-                            "var out='sel: display='+getComputedStyle(s).display+' offH='+s.offsetHeight+' rectH='+Math.round(r.height);" .
-                            "var m=s.parentElement,modal=null;" .
-                            "while(m){var c=((m.className||'')+'').toLowerCase();if(c.indexOf('modal')>=0||c.indexOf('popup')>=0||c.indexOf('window')>=0||c.indexOf('overlay')>=0||c.indexOf('dialog')>=0){modal=m;break;}m=m.parentElement;}" .
-                            "if(modal){var mr=modal.getBoundingClientRect();out+=' || modal: class='+modal.className+' display='+getComputedStyle(modal).display+' offH='+modal.offsetHeight+' rectH='+Math.round(mr.height);}else{out+=' || modal: none-found';}" .
-                            "var bs=[];var all=document.querySelectorAll('button,a,span,input');for(var i=0;i<all.length;i++){var b=all[i];var t=((b.textContent||b.value||'')+'').trim();if((t==='Ok'||t==='OK'||t==='Cancel')&&b.offsetHeight>0){bs.push(b.tagName+':'+t+':'+(b.id||''));}}" .
-                            "out+=' || visibleOkCancel='+(bs.join(',')||'NONE');return out;"
+                            "var out='win='+window.innerWidth+'x'+window.innerHeight+' | ';" .
+                            "var c=[];var m=s;" .
+                            "for(var lvl=0;lvl<9&&m;lvl++){var st=getComputedStyle(m);c.push(lvl+':'+m.tagName+'#'+(m.id||'')+'.'+(((m.className||'')+'').trim().split(/\\s+/).join('.'))+' d='+st.display+' vis='+st.visibility+' pos='+st.position+' h='+m.offsetHeight);m=m.parentElement;}" .
+                            "return out+c.join('  ||  ');"
+                    );
+                    $containerHtml = (string) $driver->executeScript(
+                        "var s=document.getElementById('sett_void_reasons'); if(!s) return 'no select';" .
+                            "var a=s;for(var i=0;i<5&&a.parentElement;i++)a=a.parentElement;return a.outerHTML.substring(0,1600);"
                     );
 
                     $out['void_dialog'] = [
                         'url' => $driver->getCurrentURL(),
-                        'diag' => $diag,
+                        'ancestor_chain' => $chain,
+                        'container_html' => $containerHtml,
                         'reason_options_via_js' => (string) $driver->executeScript(
                             "var s=document.getElementById('sett_void_reasons');if(!s)return 'none';var a=[];for(var i=0;i<s.options.length;i++){a.push(s.options[i].value+':'+s.options[i].text);}return a.join(' | ');"
                         ),
