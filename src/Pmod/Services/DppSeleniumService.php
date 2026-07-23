@@ -615,25 +615,39 @@ final class DppSeleniumService
                     $this->acceptAlertIfPresent($driver);
                     usleep(3000000);
 
-                    // Walk EVERY ancestor of #voidbtn for a jQuery click handler (direct or delegated
-                    // by a selector #voidbtn matches) and invoke it directly — the last place the
-                    // dialog-opening handler could be bound.
-                    $ancestorHandlers = (string) $driver->executeScript(
-                        "var vb=document.getElementById('voidbtn');if(!window.jQuery)return 'no-jquery';var out=[];var found='NONE';" .
+                    // HYPOTHESIS (VBA used a VISIBLE browser; ours is --headless=new): the void
+                    // dialog's open handler bails when the page reports itself "hidden" (headless
+                    // quirk). Trick the page into visible + not-webdriver, then click #voidbtn with a
+                    // REAL WebDriver click (exactly like the VBA), and check if the jQuery UI dialog
+                    // (appended as a .ui-dialog under body) actually initializes.
+                    $driver->executeScript(
+                        "try{Object.defineProperty(document,'visibilityState',{get:function(){return 'visible';},configurable:true});}catch(e){}" .
+                            "try{Object.defineProperty(document,'hidden',{get:function(){return false;},configurable:true});}catch(e){}" .
+                            "try{Object.defineProperty(navigator,'webdriver',{get:function(){return false;},configurable:true});}catch(e){}" .
+                            "try{document.dispatchEvent(new Event('visibilitychange'));}catch(e){}"
+                    );
+                    usleep(400000);
+                    try {
+                        $this->safeClick($client, '#voidbtn');
+                    } catch (\Throwable $e) {
+                        $out['voidbtn_click_error'] = $e->getMessage();
+                    }
+                    $this->acceptAlertIfPresent($driver);
+                    usleep(2500000);
+
+                    $result = (string) $driver->executeScript(
+                        "var s=document.getElementById('sett_void_reasons');" .
                             "function inited(){try{return jQuery('#sett_void_dlg').dialog('instance')!=null;}catch(e){return false;}}" .
-                            "var node=vb;" .
-                            "for(var lvl=0;lvl<14&&node;lvl++){var ed=jQuery._data(node,'events');if(ed&&ed.click){for(var k=0;k<ed.click.length;k++){var sel=ed.click[k].selector;out.push('lvl'+lvl+' '+node.tagName+'#'+(node.id||'')+' sel='+(sel||'(direct)'));" .
-                            "if((!sel||jQuery(vb).is(sel))&&found==='NONE'){try{ed.click[k].handler.call(vb,jQuery.Event('click',{currentTarget:vb,target:vb}));found='invoked@lvl'+lvl+'['+(sel||'direct')+'] inited='+inited();}catch(e){found='invokeErr:'+e.message;}}}}node=node.parentElement;}" .
-                            "return 'clickHandlersFound='+(out.length?out.join(' ; '):'NONE-in-whole-chain')+' || result='+found;"
+                            "return 'inited='+inited()+' uiDialogCount='+document.querySelectorAll('.ui-dialog').length+' selRendered='+(!!(s&&s.offsetHeight>0))+' visState='+document.visibilityState;"
                     );
                     $okAfter = (string) $driver->executeScript(
-                        "var b=[];var a=document.querySelectorAll('.ui-dialog button, button, a');for(var i=0;i<a.length;i++){var t=((a[i].textContent||'')+'').trim();if(a[i].offsetHeight>0&&(t==='Ok'||t==='Cancel'))b.push(t+':'+(a[i].className||''));}return b.join(' , ')||'none';"
+                        "var b=[];var a=document.querySelectorAll('.ui-dialog button, .ui-dialog-buttonpane button');for(var i=0;i<a.length;i++){var t=((a[i].textContent||'')+'').trim();if(a[i].offsetHeight>0)b.push(t||'(blank)');}return b.join(' , ')||'none';"
                     );
 
                     $out['void_dialog'] = [
                         'url' => $driver->getCurrentURL(),
-                        'ancestor_handlers' => $ancestorHandlers,
-                        'ok_after' => $okAfter,
+                        'result' => $result,
+                        'ok_buttons_after' => $okAfter,
                     ];
                 }
             } catch (\Throwable $e) {
@@ -989,6 +1003,14 @@ final class DppSeleniumService
      * CANCELLING" in #sett_void_reasons → the modal's own "Ok" (scoped to the modal, never the
      * page's "Save Offer"). Throws on any missing selector, an unpopulated reason dropdown, or
      * a void that did not commit — the caller treats a throw as a failed void.
+     *
+     * ⚠️ DEFERRED (2026-07-23): the #voidbtn step below does NOT work headless — see
+     * project_settlement_void_deferred memory. #voidbtn opens a jQuery UI dialog (#sett_void_dlg)
+     * whose init handler is bound in a way the DOM can't reach (no jQuery handler on #voidbtn or
+     * any ancestor; no WebDriver/JS/trigger/native-mouse click fires it). So the reason dropdown
+     * never renders and waitForOption below throws → fail-safe (no void, no drop). This whole path
+     * is gated OFF (DPP_ALLOW_SETTLEMENT_VOID + --max-voids), so it never runs in production.
+     * To revive: capture the void's network POST from a manual void and POST directly (skip the UI).
      */
     private function voidOneSettlement(mixed $client, mixed $driver, string $contactId, string $offerId): void
     {
