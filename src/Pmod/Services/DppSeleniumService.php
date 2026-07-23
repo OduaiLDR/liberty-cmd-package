@@ -136,20 +136,20 @@ final class DppSeleniumService
 
         // 2) Pending settlements. Jennifer + Jacob 2026-07-21: a cancel VOIDS every
         //    active settlement (the client is refunded the escrow by the drop below — no
-        //    creditor call). So when the DPP_ALLOW_SETTLEMENT_VOID switch is on, the
-        //    caller passed the offer ids, and the client will NOT hit the EPF gate after
-        //    voiding, we void all offers HERE (before EPF/drop, since voiding navigates
-        //    away and step 4 re-confirms #cancelbtn) and continue to the drop. A clean void
-        //    failure throws → the caller routes the whole contact to manual and the drop
-        //    never runs. NOTE: voids commit irreversibly per offer, so a multi-offer void is
-        //    NOT atomic — a mid-sequence failure throws a typed settlement_void_partial error
-        //    that the caller turns into a LOUD reconcile-this alert (not a silent backlog).
-        //    Switch OFF → route to manual exactly as before (today's safe default).
+        //    creditor call). The auto-void is gated by the caller's --max-voids: it only passes
+        //    settlement_offers for a contact when a void slot is granted (--max-voids>0, offer
+        //    present, not positive-balance+EPF). So an EMPTY $offers here = the caller decided NOT
+        //    to void this contact → route to manual; a NON-empty $offers = void all offers HERE
+        //    (before EPF/drop, since voiding navigates away and step 4 re-confirms #cancelbtn) then
+        //    continue to the drop. A clean void failure throws → the caller routes the whole
+        //    contact to manual and the drop never runs. NOTE: voids commit irreversibly per offer,
+        //    so a multi-offer void is NOT atomic — a mid-sequence failure throws a typed
+        //    settlement_void_partial error that the caller turns into a LOUD reconcile-this alert.
+        //    --max-voids unset (0) → $offers always empty → route to manual, today's safe default.
         $offers = (array) ($form['settlement_offers'] ?? []);
         $voidedOfferIds = [];
         if ($settlements > 0) {
-            $canVoid = getenv('DPP_ALLOW_SETTLEMENT_VOID') === '1'
-                && $offers !== []
+            $canVoid = $offers !== []
                 && !($balance > 0 && $epf > 0); // don't void if the EPF gate would then block the drop
             if (!$canVoid) {
                 return [
@@ -895,13 +895,11 @@ final class DppSeleniumService
     /**
      * Void ALL of a contact's pending settlement offers, then let the caller drop the
      * client (Jennifer + Jacob 2026-07-21: a cancel voids every active settlement; the
-     * escrow is refunded by the drop, no creditor call). DESTRUCTIVE — fires only from
-     * the settlement gate when DPP_ALLOW_SETTLEMENT_VOID=1. Per offer, drives the exact
-     * UI confirmed via --probe-void-settlements + a live walkthrough (2026-07-22):
-     *   settlements&page=dispatch&sid={offer_id} → #editbtn (accept the JS "OK" confirm)
-     *   → #voidbtn (the void icon) → select "CLIENT CANCELLING" in #sett_void_reasons →
-     *   the modal "Ok".
-     * STOPS ON FIRST FAILURE — but a void commits IRREVERSIBLY the instant its modal "Ok"
+     * escrow is refunded by the drop, no creditor call). DESTRUCTIVE — the caller only passes
+     * offer ids for a contact when a void slot is granted (gated by --max-voids>0), so this
+     * runs only when the auto-void is switched on. Each offer is voided by voidOneSettlement
+     * (a direct form POST — the modal won't open headless; see that method).
+     * STOPS ON FIRST FAILURE — but a void commits IRREVERSIBLY the instant it
      * lands, so this is NOT atomic across multiple offers: if a later offer fails, earlier
      * ones are already voided. A clean (nothing-voided-yet) failure rethrows so the caller
      * routes to manual and the drop never runs; a PARTIAL failure rethrows a typed
