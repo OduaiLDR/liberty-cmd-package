@@ -81,6 +81,7 @@ use Cmd\Reports\Console\Commands\GenerateConsumerAffairsSettlementReport\Generat
 use Cmd\Reports\Console\Commands\GenerateLowBalanceReport\GenerateLowBalanceReport;
 use Cmd\Reports\Console\Commands\GenerateUnclearedSettlementPaymentsReport\GenerateUnclearedSettlementPaymentsReport;
 use Cmd\Reports\Console\Commands\GenerateOfferAuthorizationReport\GenerateOfferAuthorizationReport;
+use Cmd\Reports\Console\Commands\GenerateReconsiderationReport\GenerateReconsiderationReport;
 use Cmd\Reports\Console\Commands\SyncEmployeeSfUids;
 
 class ReportsServiceProvider extends ServiceProvider
@@ -190,6 +191,7 @@ class ReportsServiceProvider extends ServiceProvider
                 GenerateLowBalanceReport::class,
                 GenerateUnclearedSettlementPaymentsReport::class,
                 GenerateOfferAuthorizationReport::class,
+                GenerateReconsiderationReport::class,
                 SyncEmployeeSfUids::class,
             ]);
         }
