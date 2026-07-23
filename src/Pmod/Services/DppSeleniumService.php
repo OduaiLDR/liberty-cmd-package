@@ -633,10 +633,27 @@ final class DppSeleniumService
                         usleep(500000);
                     }
 
+                    // WHY doesn't the modal open? Dump the void trigger itself + any iframes +
+                    // where the "Voided Reason" markup actually lives.
+                    $voidHtml = (string) $driver->executeScript("var b=document.getElementById('voidbtn'); return b ? b.outerHTML : 'NOT FOUND';");
+                    $voidOnclick = (string) $driver->executeScript("var b=document.getElementById('voidbtn'); return b ? (b.getAttribute('onclick')||'(no onclick attr)') : 'NOT FOUND';");
+                    $reasonCtx = (string) $driver->executeScript(
+                        "var s=document.getElementById('sett_void_reasons'); if(!s) return 'no #sett_void_reasons'; " .
+                            "var p=s.closest('div'); return 'parentTag='+(s.parentElement?s.parentElement.tagName:'?')+' optCount='+s.options.length+' ancestorHtmlHead='+(p?p.outerHTML.substring(0,300):'?');"
+                    );
+                    $iframes = [];
+                    foreach ($driver->findElements(\Facebook\WebDriver\WebDriverBy::tagName('iframe')) as $f) {
+                        $iframes[] = (string) ($f->getAttribute('src') ?? '');
+                    }
+
                     $out['void_dialog'] = [
                         'url' => $driver->getCurrentURL(),
                         'reason_options_appeared_after_seconds' => $appearedAfter, // null = never populated
                         'sett_void_reasons_options' => $reasonOpts,
+                        'voidbtn_outer_html' => mb_substr($voidHtml, 0, 500),
+                        'voidbtn_onclick' => $voidOnclick,
+                        'sett_void_reasons_context' => $reasonCtx,
+                        'iframe_srcs' => $iframes,
                         'all_selects' => $this->dumpAllSelects($driver),
                         'displayed_buttons' => $this->dumpDialogButtons($driver),
                     ];
