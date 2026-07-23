@@ -35,7 +35,15 @@ class GenerateEnrollmentSummaryReport extends Command
         // VBA: ReportDate only drives the projection window's start month. Every snapshot metric
         // (Gross Enrollments, Cancels, NSFs, title, etc.) literally uses `Date` (today), regardless
         // of ReportDate. --snapshot-date exists only to reproduce a specific day for testing.
-        $snapshotDate = $this->option('snapshot-date') ?: date('Y-m-d');
+        //
+        // "Today" must be evaluated in the business's own timezone (America/Los_Angeles — this
+        // report's automation entry is configured for that zone, running at 20:00 PT Mon-Fri), NOT
+        // the app's default UTC. At 8pm PT the UTC clock has already rolled to the next calendar
+        // day, so a naive date('Y-m-d') (UTC) reports one day ahead of the intended business day —
+        // confirmed against a real run: the report fired at 20:00 PT on 7/22 but titled itself
+        // "For 7/23" because date('Y-m-d') read 03:xx UTC on the 23rd.
+        $snapshotDate = $this->option('snapshot-date')
+            ?: (new \DateTimeImmutable('now', new \DateTimeZone('America/Los_Angeles')))->format('Y-m-d');
 
         try {
             $connector = $this->initializeSqlServerConnector();
