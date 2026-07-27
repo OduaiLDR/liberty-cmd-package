@@ -4,6 +4,7 @@ namespace Cmd\Reports\Console\Commands;
 
 use Cmd\Reports\Services\DBConnector;
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 
 class SyncEPFData extends Command
@@ -13,6 +14,24 @@ class SyncEPFData extends Command
     protected $description = 'Sync EPF payment data into TblEPFs from Snowflake transactions and settlements';
 
     public function handle(): int
+    {
+        $lock = Cache::lock('sync-epf-data', 10800);
+
+        if (! $lock->get()) {
+            $this->warn('EPF sync is already running.');
+            Log::warning('SyncEPFData command skipped because another run holds the lock.');
+
+            return Command::FAILURE;
+        }
+
+        try {
+            return $this->runSync();
+        } finally {
+            $lock->release();
+        }
+    }
+
+    protected function runSync(): int
     {
         $this->info('EPF sync: starting.');
         Log::info('SyncEPFData command started.');
@@ -131,7 +150,9 @@ class SyncEPFData extends Command
     protected function fetchEpfRowsFromSnowflake(DBConnector $connector): array
     {
         Log::info('SyncEPFData: fetch mode single query (VBA-style).');
-        $this->logSnowflakeCounts($connector);
+        if (env('EPF_DEBUG', false)) {
+            $this->logSnowflakeCounts($connector);
+        }
 
         // Exact VBA query - single query, no pagination
         $sql = <<<SQL
@@ -509,7 +530,7 @@ SQL,
         $totalDeleted = 0;
         $batchSize = 10000; // Delete 10k records at a time as suggested by Jacob
         $maxIterations = 1000; // Safety limit to prevent infinite loops
-        $iteration = 0;
+        $completed = false;
 
         $this->info("[$source] Starting batch deletion (10k records per batch)...");
         Log::info('SyncEPFData: starting batch deletion.', [
@@ -517,22 +538,7 @@ SQL,
             'batch_size' => $batchSize,
         ]);
 
-        while ($iteration < $maxIterations) {
-            $iteration++;
-            
-            // Check current count
-            $currentCount = $this->countEpfBySource($connector, $source);
-            $this->info("[$source] Iteration {$iteration}: {$currentCount} records remaining");
-            
-            if ($currentCount === 0) {
-                $this->info("[$source] All records deleted successfully. Total deleted: {$totalDeleted}");
-                Log::info('SyncEPFData: batch deletion completed.', [
-                    'source' => $source,
-                    'total_deleted' => $totalDeleted,
-                ]);
-                break;
-            }
-
+        for ($iteration = 1; $iteration <= $maxIterations; $iteration++) {
             $sql = "DELETE TOP ({$batchSize}) FROM TblEPFs WHERE Source IN ({$sourceList})";
             $result = $connector->querySqlServer($sql);
 
@@ -546,15 +552,13 @@ SQL,
                 throw new \RuntimeException("Batch delete failed on iteration {$iteration}: " . $errorMsg);
             }
 
-            $deletedThisBatch = 0;
-            if (is_array($result)) {
-                foreach (['rowCount', 'affected_rows', 'row_count'] as $key) {
-                    if (isset($result[$key]) && is_numeric($result[$key])) {
-                        $deletedThisBatch = (int) $result[$key];
-                        break;
-                    }
-                }
+            $deletedThisBatch = $result['row_count'] ?? null;
+            if (! is_numeric($deletedThisBatch)) {
+                throw new \RuntimeException(
+                    "Batch delete did not return an affected-row count on iteration {$iteration}."
+                );
             }
+            $deletedThisBatch = (int) $deletedThisBatch;
 
             $totalDeleted += $deletedThisBatch;
             $this->info("[$source] Iteration {$iteration}: Deleted {$deletedThisBatch} records");
@@ -564,55 +568,30 @@ SQL,
                 'iteration' => $iteration,
                 'deleted_this_batch' => $deletedThisBatch,
                 'total_deleted' => $totalDeleted,
-                'remaining_count' => $currentCount - $deletedThisBatch,
             ]);
 
-            // If we deleted 0 records but count > 0, something is wrong
-            if ($deletedThisBatch === 0 && $currentCount > 0) {
-                Log::warning('SyncEPFData: delete batch returned 0 but rows still exist.', [
-                    'source' => $source,
-                    'count_before' => $currentCount,
-                ]);
-                // Try one more time with a direct delete (no TOP)
-                $directSql = "DELETE FROM TblEPFs WHERE Source IN ({$sourceList})";
-                $directResult = $connector->querySqlServer($directSql);
-                if (is_array($directResult) && isset($directResult['success']) && $directResult['success'] === false) {
-                    throw new \RuntimeException('Direct delete failed: ' . ($directResult['error'] ?? 'Unknown error'));
-                }
-                break;
-            }
-
-            // If we deleted fewer rows than the batch size, we're done
+            // A short batch (including zero) proves that no matching rows remain.
             if ($deletedThisBatch < $batchSize) {
+                $completed = true;
                 break;
             }
         }
 
-        if ($iteration >= $maxIterations) {
-            $finalCount = $this->countEpfBySource($connector, $source);
+        if (! $completed) {
             Log::error('SyncEPFData: delete reached max iterations safety limit.', [
                 'source' => $source,
                 'total_deleted' => $totalDeleted,
-                'remaining_count' => $finalCount,
             ]);
-            throw new \RuntimeException("Deletion incomplete after {$maxIterations} iterations. {$finalCount} records remain.");
+            throw new \RuntimeException("Deletion incomplete after {$maxIterations} iterations.");
         }
+
+        $this->info("[$source] All records deleted successfully. Total deleted: {$totalDeleted}");
+        Log::info('SyncEPFData: batch deletion completed.', [
+            'source' => $source,
+            'total_deleted' => $totalDeleted,
+        ]);
 
         return $totalDeleted;
-    }
-
-    protected function countEpfBySource(DBConnector $connector, string $source): int
-    {
-        $sourceList = $this->buildDeleteSourceList($source);
-        $sql = "SELECT COUNT(*) AS CNT FROM TblEPFs WHERE Source IN ({$sourceList})";
-        $result = $connector->querySqlServer($sql);
-        if (is_array($result) && isset($result['data'][0]) && is_array($result['data'][0])) {
-            $value = $this->valueForKey($result['data'][0], 'CNT');
-            if ($value !== null && is_numeric($value)) {
-                return (int) $value;
-            }
-        }
-        return 0;
     }
 
     protected function buildDeleteSourceList(string $source): string
@@ -676,28 +655,28 @@ SQL,
 
         for ($i = 0; $i < $totalRows; $i += $batchSize) {
             $batch = array_slice($rows, $i, $batchSize);
-            $values = '';
+            $values = [];
 
             foreach ($batch as $row) {
-                $values .= ',(';
-                $values .= "'" . $this->escapeSqlString((string) $row['llg_id']) . "'";
-                $values .= ", '" . $this->escapeSqlString((string) $row['paid_to']) . "'";
-                $values .= ', ' . $this->vbaVal($row['amount']);
-                $values .= ', ' . $this->sqlNullableDateTime($row['draft_date']);
-                $values .= ', ' . $this->sqlNullableDateTime($row['process_date']);
-                $values .= ', ' . $this->sqlNullableDateTime($row['returned_date']);
-                $values .= ', ' . $this->sqlNullableDateTime($row['cleared_date']);
-                $values .= ', ' . $this->sqlNullableString($row['settlement_id']);
-                $values .= ', ' . $this->sqlNullableString($row['original_amount']);
-                $values .= ', ' . $this->sqlNullableString($row['settlement_amount']);
-                $values .= ", '" . $this->escapeSqlString((string) $row['creditor_name']) . "'";
-                $values .= ', ' . $this->vbaVal($row['offer_id']);
-                $values .= ', ' . $this->vbaVal($row['payment_number']);
-                $values .= ", '" . $sourceEsc . "'";
-                $values .= ')';
+                $values[] = '(' . implode(', ', [
+                    "'" . $this->escapeSqlString((string) $row['llg_id']) . "'",
+                    "'" . $this->escapeSqlString((string) $row['paid_to']) . "'",
+                    $this->vbaVal($row['amount']),
+                    $this->sqlNullableDateTime($row['draft_date']),
+                    $this->sqlNullableDateTime($row['process_date']),
+                    $this->sqlNullableDateTime($row['returned_date']),
+                    $this->sqlNullableDateTime($row['cleared_date']),
+                    $this->sqlNullableString($row['settlement_id']),
+                    $this->sqlNullableString($row['original_amount']),
+                    $this->sqlNullableString($row['settlement_amount']),
+                    "'" . $this->escapeSqlString((string) $row['creditor_name']) . "'",
+                    $this->vbaVal($row['offer_id']),
+                    $this->vbaVal($row['payment_number']),
+                    "'" . $sourceEsc . "'",
+                ]) . ')';
             }
 
-            $valuesSql = ltrim($values, ',');
+            $valuesSql = implode(',', $values);
             $sql = "SET NOCOUNT ON; INSERT INTO TblEPFs ({$fields}) VALUES {$valuesSql}";
             $result = $connector->querySqlServer($sql);
             if (is_array($result) && isset($result['success']) && $result['success'] === false) {
