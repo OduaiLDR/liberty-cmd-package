@@ -26,6 +26,7 @@ use Cmd\Reports\Console\Commands\GenerateLegalReport\GenerateLegalReport;
 use Cmd\Reports\Console\Commands\GenerateAgentSummaryReport\GenerateAgentSummaryReport;
 use Cmd\Reports\Console\Commands\GenerateDPPPastDueReport\GenerateDPPPastDueReport;
 use Cmd\Reports\Console\Commands\GenerateResumePayments\GenerateResumePayments;
+use Cmd\Reports\Console\Commands\GenerateResumePayments\ResumePaymentsHealth;
 use Cmd\Reports\Pmod\Console\Commands\DumpForthStagesStatuses;
 use Cmd\Reports\Console\Commands\GenerateNSFReport\GenerateNSFReport;
 use Cmd\Reports\Console\Commands\GeneratePauseHoldReport\GeneratePauseHoldReport;
@@ -109,7 +110,7 @@ class ReportsServiceProvider extends ServiceProvider
         $dbConfigPath = __DIR__ . '/../config/dbConfig.php';
         $databaseConfigPath = __DIR__ . '/../config/database.php';
         $snowflakeConfigPath = __DIR__ . '/../config/snowflake.php';
-        
+
         if (is_file($dbConfigPath)) {
             $this->mergeConfigFrom($dbConfigPath, 'dbConfig');
             $this->publishes([
@@ -155,6 +156,7 @@ class ReportsServiceProvider extends ServiceProvider
                 GenerateAgentSummaryReport::class,
                 GenerateDPPPastDueReport::class,
                 GenerateResumePayments::class,
+                ResumePaymentsHealth::class,
                 DumpForthStagesStatuses::class,
                 GenerateNSFReport::class,
                 GeneratePauseHoldReport::class,
@@ -257,4 +259,3 @@ class ReportsServiceProvider extends ServiceProvider
         });
     }
 }
-
