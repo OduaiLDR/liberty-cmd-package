@@ -95,6 +95,17 @@ final class GenerateResumePayments extends Command
     /** Headless-browser client for the #cancelbtn (Phase 5) flow. (Phase 4 resume is now the API.) */
     private DppSeleniumService $dppSelenium;
 
+    /**
+     * Per-company run-health counters, reset at the top of each company in handle() and emitted
+     * as a machine-readable HEALTH line (emitHealthLine) into the captured output so a "success"
+     * run can still be checked for void/cancel problems (parsed by resume-payments:health).
+     */
+    private int $healthVoidsVerified = 0;
+    private int $healthPartialVoid = 0;
+    private int $healthSessionFailure = 0;
+    private int $healthCompanyFailed = 0;
+    private int $healthDropNotLand = 0;
+
     /** Statuses whose presence in CurrentStatus causes the contact to be SKIPPED entirely. */
     private const SKIP_STATUS_SUBSTRINGS = [
         'Dropped / Cancelled',
@@ -162,6 +173,15 @@ final class GenerateResumePayments extends Command
         }
 
         foreach ($companies as $company) {
+            // Reset per-company health counters + init $statusChanges up front so the finally can
+            // ALWAYS emit a HEALTH line — even if the try throws before Phase 4 assigns it.
+            $this->healthVoidsVerified = 0;
+            $this->healthPartialVoid = 0;
+            $this->healthSessionFailure = 0;
+            $this->healthCompanyFailed = 0;
+            $this->healthDropNotLand = 0;
+            $statusChanges = [];
+
             try {
                 $this->info("[INFO] === {$company} ===");
                 $snowflake = DBConnector::fromEnvironment(strtolower($company));
@@ -203,15 +223,55 @@ final class GenerateResumePayments extends Command
 
                 $this->info(sprintf('[INFO] [%s] Peak memory: %.1f MB', $company, memory_get_peak_usage(true) / 1048576));
             } catch (\Throwable $e) {
+                $this->healthCompanyFailed = 1;
                 $this->error("[{$company}] ResumePayments failed: " . $e->getMessage());
                 Log::error('GenerateResumePayments: company failed', [
                     'company' => $company,
                     'exception' => $e,
                 ]);
+            } finally {
+                // Self-report per-company health into the captured output (automation_logs.output)
+                // so a "success" run (this method almost always returns SUCCESS) can still be
+                // inspected for void/cancel problems by the resume-payments:health command.
+                $this->emitHealthLine($company, $statusChanges);
             }
         }
 
         return Command::SUCCESS;
+    }
+
+    /**
+     * Emit a machine-readable per-company HEALTH line into the captured console output
+     * (automation_logs.output), so a run recorded as "success" can still be checked for
+     * void/cancel problems by the resume-payments:health command. Stage counts are derived from
+     * $statusChanges; void/alert counts come from the per-company counters reset in handle().
+     *
+     * @param list<array<string, mixed>> $statusChanges
+     */
+    private function emitHealthLine(string $company, array $statusChanges): void
+    {
+        $c = array_count_values(array_map(
+            static fn (array $r): string => (string) ($r['stage'] ?? ''),
+            $statusChanges,
+        ));
+        $nsf = ($c['NSF-1'] ?? 0) + ($c['NSF-2'] ?? 0) + ($c['NSF-3'] ?? 0);
+
+        $this->info(sprintf(
+            '[INFO] [%s] HEALTH resolved=%d nsf=%d grace=%d manual=%d queued=%d completed=%d '
+            . 'voids_verified=%d alerts partial_void=%d session_failure=%d company_failed=%d drop_not_land=%d',
+            $company,
+            $c[self::STAGE_RESOLVED] ?? 0,
+            $nsf,
+            $c[self::STAGE_CANCEL_GRACE] ?? 0,
+            $c[self::STAGE_CANCEL_HOLD] ?? 0,
+            $c[self::STAGE_CANCEL_BACKLOG] ?? 0,
+            $c[self::STAGE_CANCEL_COMPLETE] ?? 0,
+            $this->healthVoidsVerified,
+            $this->healthPartialVoid,
+            $this->healthSessionFailure,
+            $this->healthCompanyFailed,
+            $this->healthDropNotLand,
+        ));
     }
 
     /**
@@ -1307,13 +1367,11 @@ final class GenerateResumePayments extends Command
                 // before). Consumes a --max-voids slot in dry-run too, so the preview
                 // reflects exactly which contacts the live run would auto-void.
                 $offersForContact = [];
-                if (
-                    $maxVoids > 0
+                if ($maxVoids > 0
                     && $settlementSum > 0
                     && !($balance > 0 && $epf > 0)
                     && ($settlementOffers[$cid] ?? []) !== []
-                    && $voidsUsed < $maxVoids
-                ) {
+                    && $voidsUsed < $maxVoids) {
                     $offersForContact = $settlementOffers[$cid];
                     $voidsUsed++;
                 }
@@ -1445,6 +1503,7 @@ final class GenerateResumePayments extends Command
             // buried in the Backlog like a transient error. Alert loudly and route to the
             // manual (Release Hold) sheet so a person reconciles and finishes the cancel.
             if ($e instanceof \Cmd\Reports\Pmod\Services\DppSeleniumException && $e->stage === 'settlement_void_partial') {
+                $this->healthPartialVoid++;
                 Log::error('ResumePayments: PARTIAL settlement void — manual reconcile required', [
                     'contact_id' => $contactId,
                     'error' => $e->getMessage(),
@@ -1460,6 +1519,7 @@ final class GenerateResumePayments extends Command
             // and alerts loudly, instead of silently backlogging the whole batch. (This is what
             // masqueraded as "0 cancelled / ~1000 queued" on 2026-07-22.)
             if (preg_match('/login failed|port \d+ is already in use|session (?:deleted|not created|timed out|id is null)|invalid session id|chrome not reachable|disconnected|unable to connect/i', $e->getMessage())) {
+                $this->healthSessionFailure++;
                 Log::error('ResumePayments: DPP SESSION FAILURE during cancel — aborting further attempts', [
                     'contact_id' => $contactId,
                     'error' => $e->getMessage(),
@@ -1486,6 +1546,11 @@ final class GenerateResumePayments extends Command
         }
 
         $status = (string) ($result['status'] ?? 'failed');
+
+        // Count settlement offers that were voided+verified this cancel (fail-closed inside
+        // cancelProgram already; this is pure telemetry for the HEALTH line). Present on both the
+        // success and drop-didn't-land return paths, so it's read once here after the try/catch.
+        $this->healthVoidsVerified += count($result['voided_offer_ids'] ?? []);
 
         if ($status === 'manual_audit') {
             $reason = (string) ($result['message'] ?? 'manual review required');
@@ -1526,6 +1591,7 @@ final class GenerateResumePayments extends Command
         // for a single manual-cancel digest to Rama (sent once per run below), and DON'T
         // set the status — so no Termination Notice fires on a client we didn't drop.
         if (stripos($msg, 'drop did not take effect') !== false) {
+            $this->healthDropNotLand++;
             // Returned Payments Hold / refund blocked the drop — a person must release &
             // cancel it. Lands on the Release Hold Requested sheet (Jacob 2026-07-20: no
             // separate Rama email; held clients live on that sheet).

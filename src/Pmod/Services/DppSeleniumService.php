@@ -267,6 +267,7 @@ final class DppSeleniumService
                 'status' => 'failed',
                 'message' => 'drop did not take effect (still cancellable after save) — likely refund rejection or a Returned Payments Hold',
                 'balance_branch' => $branch,
+                'voided_offer_ids' => $voidedOfferIds,
             ];
         }
 
@@ -276,7 +277,7 @@ final class DppSeleniumService
             'balance_branch' => $branch,
         ]);
 
-        return ['status' => 'success', 'message' => 'program cancelled', 'balance_branch' => $branch];
+        return ['status' => 'success', 'message' => 'program cancelled', 'balance_branch' => $branch, 'voided_offer_ids' => $voidedOfferIds];
     }
 
     /**
@@ -611,12 +612,12 @@ final class DppSeleniumService
                 usleep(800000);
                 $formInfo = (string) $driver->executeScript(
                     "var f=document.getElementById('offer'); if(!f) return 'no #offer form';" .
-                        "function g(n){var e=f.querySelector('[name=\"'+n+'\"]');return e?(e.value||''):'(missing)';}" .
-                        "return 'editid='+g('editid')+' | offer_status='+g('offer_status')+' | saveType='+g('saveType')+' | saveTokenLen='+((''+g('saveToken')).length)+' | hasJson='+(f.querySelector('[name=\"json\"]')?'y':'n')+' | contact_id='+g('contact_id');"
+                    "function g(n){var e=f.querySelector('[name=\"'+n+'\"]');return e?(e.value||''):'(missing)';}" .
+                    "return 'editid='+g('editid')+' | offer_status='+g('offer_status')+' | saveType='+g('saveType')+' | saveTokenLen='+((''+g('saveToken')).length)+' | hasJson='+(f.querySelector('[name=\"json\"]')?'y':'n')+' | contact_id='+g('contact_id');"
                 );
                 $serialized = (string) $driver->executeScript(
                     "if(!window.jQuery) return 'no-jquery'; var f=document.getElementById('offer'); if(!f) return 'no-form';" .
-                        "try{return jQuery(f).serialize();}catch(e){return 'err:'+e.message;}"
+                    "try{return jQuery(f).serialize();}catch(e){return 'err:'+e.message;}"
                 );
                 $out['void_dialog'] = [
                     'url' => $driver->getCurrentURL(),
@@ -1023,9 +1024,9 @@ final class DppSeleniumService
         // Replicate the modal's Ok: set saveType=void + sett_void_reason=89 on #offer, then submit.
         $res = (string) $driver->executeScript(
             "var f=document.getElementById('offer'); if(!f) return 'no-form';" .
-                "function setF(n,v){var e=f.querySelector('[name=\"'+n+'\"]'); if(!e){e=document.createElement('input'); e.type='hidden'; e.name=n; f.appendChild(e);} e.value=v;}" .
-                "setF('saveType','void'); setF('sett_void_reason','89');" .
-                "try{f.submit();}catch(e){return 'submitErr:'+e.message;} return 'submitted';"
+            "function setF(n,v){var e=f.querySelector('[name=\"'+n+'\"]'); if(!e){e=document.createElement('input'); e.type='hidden'; e.name=n; f.appendChild(e);} e.value=v;}" .
+            "setF('saveType','void'); setF('sett_void_reason','89');" .
+            "try{f.submit();}catch(e){return 'submitErr:'+e.message;} return 'submitted';"
         );
         if ($res !== 'submitted') {
             throw new \RuntimeException("void: could not submit #offer for offer {$offerId} ({$res})");
