@@ -8,6 +8,7 @@ use Cmd\Reports\Console\Commands\SyncBalances;
 use Cmd\Reports\Console\Commands\SyncBalancesHistory;
 use Cmd\Reports\Console\Commands\SyncEPFData;
 use Cmd\Reports\Console\Commands\UpdateEPFRates;
+use Cmd\Reports\Console\Commands\SyncNGOEPFClearRates;
 use Cmd\Reports\Console\Commands\SyncEnrollmentPlans;
 use Cmd\Reports\Console\Commands\SyncDebtAccounts;
 use Cmd\Reports\Console\Commands\SyncSubmittedDate;
@@ -143,6 +144,7 @@ class ReportsServiceProvider extends ServiceProvider
                 SyncTimeInProgram::class,
                 SyncEPFData::class,
                 UpdateEPFRates::class,
+                SyncNGOEPFClearRates::class,
                 SyncSettlementData::class,
                 SyncSettledDebtsData::class,
                 SyncEnrollmentStatus::class,
