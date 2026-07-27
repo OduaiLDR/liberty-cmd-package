@@ -4,142 +4,235 @@ namespace Cmd\Reports\Console\Commands\GenerateNSFReport;
 
 use Cmd\Reports\Services\DBConnector;
 use Illuminate\Console\Command;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Log;
 
+/**
+ * Port of VBA GenerateNSFReport for LDR + PLAW.
+ * Same SQL/report for both portals; one workbook + email per portal.
+ *
+ * Sources:
+ * - docs/NSFLDR.md
+ * - docs/NSFPLAW.md
+ */
 class GenerateNSFReport extends Command
 {
-    protected $signature = 'Generate:nsf-report';
+    private const REPORT_TIMEZONE = 'America/Los_Angeles';
 
-    protected $description = 'Generate NSF report for LDR and Progress Law (Snowflake) and email it.';
+    protected $signature = 'Generate:nsf-report
+        {--no-email : Build workbooks only, skip email}';
+
+    protected $description = 'Generate LDR + PLAW NSF reports and email each separately.';
+
+    /** @var list<array{env:string, source:string, company:string}> */
+    private const PORTALS = [
+        ['env' => 'ldr', 'source' => 'LDR', 'company' => 'LDR'],
+        ['env' => 'plaw', 'source' => 'PLAW', 'company' => 'PLAW'],
+    ];
 
     public function handle(): int
     {
-        $this->info('[INFO] NSF report: starting.');
+        ini_set('memory_limit', '1024M');
+        $this->info('[INFO] NSF report (LDR + PLAW): starting.');
 
-        try {
-            $snowflakeLdr = DBConnector::fromEnvironment('ldr');
-            $snowflakePlaw = DBConnector::fromEnvironment('plaw');
-            $sqlConnector = $this->initializeSqlServerConnector();
-        } catch (\Throwable $e) {
-            $this->error('Failed to initialize connectors: ' . $e->getMessage());
-            Log::error('GenerateNSFReport: connector init failed', ['exception' => $e]);
-            return Command::FAILURE;
-        }
+        $reportDate = Carbon::today(self::REPORT_TIMEZONE)->toDateString();
+        $this->info("[INFO] Report date: {$reportDate}");
 
-        $formatter = new Formatter();
+        $sqlConnector = null;
+        if (! $this->option('no-email')) {
+            try {
+                $sqlConnector = $this->initializeSqlServerConnector();
+            } catch (\Throwable $e) {
+                $this->error('Failed to initialize SQL Server: '.$e->getMessage());
+                Log::error('GenerateNSFReport: sql init failed', ['exception' => $e]);
 
-        // Generate LDR NSF Report
-        try {
-            $this->info('[INFO] Generating LDR NSF Report...');
-            $ldrRows = $this->fetchNSFRows($snowflakeLdr);
-            $this->info('[INFO] LDR NSF rows: ' . count($ldrRows));
-
-            if (empty($ldrRows)) {
-                $this->warn('[WARN] No LDR NSF data. Skipping workbook and email.');
-                Log::info('GenerateNSFReport: no LDR data.');
-            } else {
-                $ldrResult = $formatter->buildWorkbook($ldrRows, 'LDR');
-                $this->info("[INFO] LDR NSF Report written to {$ldrResult['path']}");
-                $formatter->sendReport($sqlConnector, $ldrResult['path'], $ldrResult['filename'], 'LDR', $this);
-                if (is_file($ldrResult['path'])) {
-                    @unlink($ldrResult['path']);
-                }
+                return Command::FAILURE;
             }
-        } catch (\Throwable $e) {
-            $this->error('LDR NSF Report failed: ' . $e->getMessage());
-            Log::error('GenerateNSFReport: LDR report failed', ['exception' => $e]);
+        } else {
+            $this->warn('[WARN] --no-email set; workbooks kept under storage/app.');
         }
 
-        // Generate PLAW NSF Report
-        try {
-            $this->info('[INFO] Generating PLAW NSF Report...');
-            $plawRows = $this->fetchNSFRows($snowflakePlaw);
-            $this->info('[INFO] PLAW NSF rows: ' . count($plawRows));
+        $formatter = new Formatter;
+        $failed = 0;
 
-            if (empty($plawRows)) {
-                $this->warn('[WARN] No PLAW NSF data. Skipping workbook and email.');
-                Log::info('GenerateNSFReport: no PLAW data.');
-            } else {
-                $plawResult = $formatter->buildWorkbook($plawRows, 'PLAW');
-                $this->info("[INFO] PLAW NSF Report written to {$plawResult['path']}");
-                $formatter->sendReport($sqlConnector, $plawResult['path'], $plawResult['filename'], 'PLAW', $this);
-                if (is_file($plawResult['path'])) {
-                    @unlink($plawResult['path']);
-                }
+        foreach (self::PORTALS as $portal) {
+            try {
+                $this->generateForPortal($portal, $formatter, $sqlConnector, $reportDate);
+            } catch (\Throwable $e) {
+                $failed++;
+                $this->error("{$portal['source']} failed: ".$e->getMessage());
+                Log::error('GenerateNSFReport: portal failed', [
+                    'portal' => $portal['source'],
+                    'exception' => $e,
+                ]);
             }
-        } catch (\Throwable $e) {
-            $this->error('PLAW NSF Report failed: ' . $e->getMessage());
-            Log::error('GenerateNSFReport: PLAW report failed', ['exception' => $e]);
         }
 
-        return Command::SUCCESS;
+        return $failed > 0 ? Command::FAILURE : Command::SUCCESS;
     }
 
-    private function fetchNSFRows(DBConnector $snowflake): array
+    /**
+     * @param  array{env:string, source:string, company:string}  $portal
+     */
+    private function generateForPortal(
+        array $portal,
+        Formatter $formatter,
+        ?DBConnector $sqlConnector,
+        string $reportDate
+    ): void {
+        $source = $portal['source'];
+        $this->info("[INFO] === {$source} ===");
+
+        $snowflake = DBConnector::fromEnvironment($portal['env']);
+        $rows = $this->fetchNsfRows($snowflake, $reportDate);
+        $this->info("[INFO] {$source} NSF rows: ".count($rows));
+
+        if ($rows === []) {
+            $this->info("[INFO] {$source}: no NSF data; workbook and email skipped.");
+
+            return;
+        }
+
+        $result = $formatter->buildWorkbook($rows, $source);
+        $path = $result['path'];
+        $this->info("[INFO] {$source} workbook: {$path}");
+
+        if ($sqlConnector === null) {
+            return;
+        }
+
+        $sent = $formatter->sendReport(
+            $sqlConnector,
+            $result['path'],
+            $result['filename'],
+            $source,
+            $portal['company'],
+            $this
+        );
+
+        if (! $sent) {
+            throw new \RuntimeException("{$source} email failed. Workbook kept at: {$path}");
+        }
+
+        if (is_file($path) && ! unlink($path)) {
+            Log::warning('GenerateNSFReport: sent workbook could not be deleted.', [
+                'path' => $path,
+                'portal' => $source,
+            ]);
+            $this->warn("[WARN] {$source} workbook was sent but could not be deleted: {$path}");
+        }
+
+        $this->info("[INFO] {$source} email sent.");
+    }
+
+    /**
+     * @return list<array{
+     *   ID:string|int|null,
+     *   CONTACT:string|null,
+     *   ENROLLED_DATE:string|null,
+     *   ENROLLED_DEBT:float|int|string|null,
+     *   STATUS:string|null,
+     *   STATUS_DATE:string|null,
+     *   DAYS:int|string|null,
+     *   PHONE_1:string|null,
+     *   PHONE_2:string|null,
+     *   PHONE_3:string|null,
+     *   PHONE_4:string|null
+     * }>
+     */
+    private function fetchNsfRows(DBConnector $snowflake, string $reportDate): array
     {
-        $sql = "
-            SELECT * FROM (
-                SELECT
-                    c.ID,
-                    CONCAT(c.FIRSTNAME, ' ', c.LASTNAME) AS CONTACT,
-                    TO_VARCHAR(c.ENROLLED_DATE::date, 'YYYY-MM-DD') AS ENROLLED_DATE,
-                    d.ENROLLED_DEBT,
-                    cls.TITLE AS STATUS,
-                    TO_VARCHAR(s.STAMP::date, 'YYYY-MM-DD') AS STATUS_DATE,
-                    DATEDIFF(DAY, s.STAMP, CURRENT_DATE) AS DAYS,
-                    c.PHONE  AS PHONE_1,
-                    c.PHONE2 AS PHONE_2,
-                    c.PHONE3 AS PHONE_3,
-                    c.PHONE4 AS PHONE_4,
-                    ROW_NUMBER() OVER (PARTITION BY c.ID ORDER BY s.STAMP DESC) AS N
-                FROM CONTACTS c
-                LEFT JOIN CONTACTS_STATUS s ON c.ID = s.CONTACT_ID
-                LEFT JOIN CONTACTS_LEAD_STATUS cls ON s.STATUS_ID = cls.ID
-                LEFT JOIN (
-                    SELECT CONTACT_ID, SUM(ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT
-                    FROM DEBTS
-                    WHERE ENROLLED = 1 AND _FIVETRAN_DELETED = FALSE
-                    GROUP BY CONTACT_ID
-                ) d ON c.ID = d.CONTACT_ID
-                WHERE c.DEL = 0
-                  AND c.ENROLLED = 1
-                  AND COALESCE(c.FIRSTNAME, '') <> ''
-                  AND s.STAMP IS NOT NULL
-                  AND c.ID IN (
-                      SELECT c2.ID
-                      FROM CONTACTS c2
-                      LEFT JOIN CONTACTS_STATUS s2 ON c2.ID = s2.CONTACT_ID
-                      LEFT JOIN CONTACTS_LEAD_STATUS cls2 ON s2.STATUS_ID = cls2.ID
-                      WHERE cls2.TITLE LIKE '%NSF%'
-                  )
-            )
-            WHERE N = 1
-        ";
+        // VBA:
+        // latest status per contact (N=1), only contacts that ever had a status title LIKE '%NSF%'
+        $sql = <<<SQL
+WITH NSF_CONTACTS AS (
+    SELECT DISTINCT cs.CONTACT_ID
+    FROM CONTACTS_STATUS AS cs
+    INNER JOIN CONTACTS_LEAD_STATUS AS cls ON cls.ID = cs.STATUS_ID
+    WHERE cls.TITLE LIKE '%NSF%'
+),
+ELIGIBLE_CONTACTS AS (
+    SELECT
+        c.ID,
+        c.FIRSTNAME,
+        c.LASTNAME,
+        c.ENROLLED_DATE,
+        c.PHONE,
+        c.PHONE2,
+        c.PHONE3,
+        c.PHONE4
+    FROM CONTACTS AS c
+    INNER JOIN NSF_CONTACTS AS nc ON nc.CONTACT_ID = c.ID
+    WHERE c.DEL = 0
+      AND c.ENROLLED = 1
+      AND COALESCE(c.FIRSTNAME, '') <> ''
+),
+ENROLLED_DEBT AS (
+    SELECT d.CONTACT_ID, SUM(d.ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT
+    FROM DEBTS AS d
+    INNER JOIN ELIGIBLE_CONTACTS AS ec ON ec.ID = d.CONTACT_ID
+    WHERE d.ENROLLED = 1
+      AND d._FIVETRAN_DELETED = FALSE
+    GROUP BY d.CONTACT_ID
+),
+LATEST_STATUS AS (
+    SELECT
+        ec.ID,
+        CONCAT(ec.FIRSTNAME, ' ', ec.LASTNAME) AS CONTACT,
+        TO_VARCHAR(ec.ENROLLED_DATE::date, 'YYYY-MM-DD') AS ENROLLED_DATE,
+        ed.ENROLLED_DEBT,
+        cls.TITLE AS STATUS,
+        TO_VARCHAR(s.STAMP::date, 'YYYY-MM-DD') AS STATUS_DATE,
+        DATEDIFF(DAY, s.STAMP, TO_DATE('{$reportDate}')) AS DAYS,
+        ec.PHONE AS PHONE_1,
+        ec.PHONE2 AS PHONE_2,
+        ec.PHONE3 AS PHONE_3,
+        ec.PHONE4 AS PHONE_4,
+        s.STAMP AS STATUS_STAMP,
+        ROW_NUMBER() OVER (PARTITION BY ec.ID ORDER BY s.STAMP DESC, s.STATUS_ID DESC) AS N
+    FROM ELIGIBLE_CONTACTS AS ec
+    INNER JOIN CONTACTS_STATUS AS s ON ec.ID = s.CONTACT_ID
+    LEFT JOIN CONTACTS_LEAD_STATUS AS cls ON s.STATUS_ID = cls.ID
+    LEFT JOIN ENROLLED_DEBT AS ed ON ec.ID = ed.CONTACT_ID
+)
+SELECT
+    ID,
+    CONTACT,
+    ENROLLED_DATE,
+    ENROLLED_DEBT,
+    STATUS,
+    STATUS_DATE,
+    DAYS,
+    PHONE_1,
+    PHONE_2,
+    PHONE_3,
+    PHONE_4
+FROM LATEST_STATUS
+WHERE N = 1
+ORDER BY STATUS_STAMP DESC, ID
+SQL;
 
         $result = $snowflake->query($sql);
-        return $result['data'] ?? [];
+        $data = $result['data'] ?? null;
+        if (! is_array($data)) {
+            throw new \UnexpectedValueException('Snowflake returned an invalid report result.');
+        }
+
+        return $data;
     }
 
-    protected function initializeSqlServerConnector(): DBConnector
+    private function initializeSqlServerConnector(): DBConnector
     {
-        $candidates = ['ldr', 'plaw', 'production', 'sandbox'];
-        $errors = [];
-
-        foreach ($candidates as $env) {
+        foreach (['ldr', 'plaw', 'production', 'sandbox'] as $env) {
             try {
                 $connector = DBConnector::fromEnvironment($env);
                 $connector->initializeSqlServer();
+
                 return $connector;
-            } catch (\Throwable $e) {
-                $errors[] = "{$env}: {$e->getMessage()}";
+            } catch (\Throwable) {
             }
         }
 
-        throw new \RuntimeException('Unable to initialize SQL Server connector. Tried: ' . implode('; ', $errors));
-    }
-
-    protected function esc(string $value): string
-    {
-        return str_replace("'", "''", $value);
+        throw new \RuntimeException('Unable to initialize SQL Server connector.');
     }
 }

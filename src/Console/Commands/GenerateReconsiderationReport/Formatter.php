@@ -195,7 +195,7 @@ class Formatter
         ]];
 
         $email = new EmailSenderService;
-        $subject = 'Reconsideration Report - '.Carbon::now(self::REPORT_TIMEZONE)->format('m/d/Y');
+        $subject = $this->emailSubject($company);
         $body = 'Please see the attached Reconsideration Report for '.$source.'.';
 
         $sent = $email->sendMailUsingTblReports(
@@ -722,6 +722,20 @@ class Formatter
         }
 
         return $source;
+    }
+
+    private function companyDisplayName(string $company): string
+    {
+        return $company === 'PLAW' ? 'Progress Law' : 'LDR';
+    }
+
+    private function emailSubject(string $company): string
+    {
+        return sprintf(
+            'Reconsideration Report - %s - %s',
+            $this->companyDisplayName($company),
+            Carbon::now(self::REPORT_TIMEZONE)->format('m/d/Y')
+        );
     }
 
     private function truncateSheetTitle(string $title): string

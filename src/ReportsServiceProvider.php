@@ -83,6 +83,8 @@ use Cmd\Reports\Console\Commands\GenerateUnclearedSettlementPaymentsReport\Gener
 use Cmd\Reports\Console\Commands\GenerateOfferAuthorizationReport\GenerateOfferAuthorizationReport;
 use Cmd\Reports\Console\Commands\GenerateReconsiderationReport\GenerateReconsiderationReport;
 use Cmd\Reports\Console\Commands\SyncEmployeeSfUids;
+use Cmd\Reports\Console\Commands\SyncDroppedStatus\SyncDroppedStatus;
+use Cmd\Reports\Console\Commands\SyncDroppedStatus\SyncDroppedStatusPreview;
 
 class ReportsServiceProvider extends ServiceProvider
 {
@@ -192,6 +194,8 @@ class ReportsServiceProvider extends ServiceProvider
                 GenerateUnclearedSettlementPaymentsReport::class,
                 GenerateOfferAuthorizationReport::class,
                 GenerateReconsiderationReport::class,
+                SyncDroppedStatusPreview::class,
+                SyncDroppedStatus::class,
                 SyncEmployeeSfUids::class,
             ]);
         }

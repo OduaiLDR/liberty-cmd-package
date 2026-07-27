@@ -57,6 +57,21 @@ final class DppDataClient
     }
 
     /**
+     * Validate that a tenant has a configured DPP post key without sending a request.
+     */
+    public function assertConfigured(string $tenant): void
+    {
+        $tenant = strtolower(trim($tenant));
+        $key = trim($this->tenantKeys[$tenant] ?? '', " \t\n\r\0\x0B/");
+
+        if ($key === '') {
+            throw new RuntimeException(
+                "No DPP post API key configured for tenant {$tenant}. Set DPP_POST_API_KEY_" . strtoupper($tenant) . ' in .env.'
+            );
+        }
+    }
+
+    /**
      * Mirrors UpdateCRMData*: strips any "LLG-"/prefix to the numeric id, posts a
      * single field, retries on transport failure. Returns true on a completed
      * 2xx/3xx response.
@@ -77,12 +92,8 @@ final class DppDataClient
             return true;
         }
 
+        $this->assertConfigured($tenant);
         $key = trim($this->tenantKeys[$tenant] ?? '', " \t\n\r\0\x0B/");
-        if ($key === '') {
-            throw new RuntimeException(
-                "No DPP post API key configured for tenant {$tenant}. Set DPP_POST_API_KEY_" . strtoupper($tenant) . ' in .env.'
-            );
-        }
 
         // Build the URL exactly like the VBA: /post/{key}/?updaterecord={id}&{field}={value}.
         // rawurlencode the value (space -> %20, parens -> %28/%29) so titles like
