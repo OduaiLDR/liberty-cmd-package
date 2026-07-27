@@ -46,7 +46,7 @@ final class GenerateResumePayments extends Command
         {--limit= : Process at most N contacts per company (after NSF-state filtering)}
         {--execute-cancels : Actually run the Day-4+ System Cancel (browser drop/refund). Off by default — Phase 5 only reports cancel-ready contacts unless this is passed.}
         {--max-cancels= : Safety cap — process at most N cancel candidates per company per run (the rest are reported as deferred). 0/unset = no cap.}
-        {--max-voids= : Safety cap for the settlement AUTO-VOID — void the settlements of at most N cancel candidates per company per run. 0/unset = no auto-void (settlement contacts route to manual, todays default). Requires DPP_ALLOW_SETTLEMENT_VOID=1; start at 1 for a supervised void.}
+        {--max-voids= : Settlement AUTO-VOID on-switch + safety cap — void the settlements of at most N cancel candidates per company per run. 0/unset = no auto-void (settlement contacts route to manual, todays default). Start at 1; ramp up as it proves out.}
         {--probe-cancel= : Diagnostic only — drive the cancel flow for ONE contact id and print which selectors exist, WITHOUT clicking save (commits nothing). Tenant = first --company (default LDR).}
         {--probe-resume= : Diagnostic only — probe the Forth resume-payments API for ONE contact id. READ-ONLY by default (token health + contact resolve + transactions paths; safe on any contact). Tenant = first --company (default LDR).}
         {--probe-resume-execute : With --probe-resume, also FIRE the resume POST (an action — TEST FILES ONLY). Without it the resume probe is read-only.}
@@ -1279,13 +1279,12 @@ final class GenerateResumePayments extends Command
             $englishFlags = $this->fetchEnglishFlags($snowflake, $contactIds);
             $settlementOffers = $this->fetchPendingSettlementOffers($snowflake, $contactIds);
 
-            // Settlement AUTO-VOID gating (DARK): fires only when the env switch is on AND
-            // --max-voids>0. --max-voids caps how many CONTACTS have their settlements
-            // voided this run (start at 1 for a supervised void); beyond it, settlement
-            // contacts fall through to cancelProgram's manual gate exactly as today. A
-            // slot is only spent on a contact that will actually void — offers present and
-            // NOT positive-balance+EPF (that hits the EPF gate, which still blocks the drop).
-            $voidSwitch = getenv('DPP_ALLOW_SETTLEMENT_VOID') === '1';
+            // Settlement AUTO-VOID gating: fires when --max-voids>0 (the single on-switch —
+            // 0/unset = off, today's safe default). --max-voids caps how many CONTACTS have
+            // their settlements voided this run (start at 1); beyond it, settlement contacts
+            // fall through to cancelProgram's manual gate exactly as today. A slot is only spent
+            // on a contact that will actually void — offers present and NOT positive-balance+EPF
+            // (that hits the EPF gate, which still blocks the drop).
             $maxVoids = (int) ($this->option('max-voids') ?? 0);
             $voidsUsed = 0;
 
@@ -1309,7 +1308,7 @@ final class GenerateResumePayments extends Command
                 // reflects exactly which contacts the live run would auto-void.
                 $offersForContact = [];
                 if (
-                    $voidSwitch && $maxVoids > 0
+                    $maxVoids > 0
                     && $settlementSum > 0
                     && !($balance > 0 && $epf > 0)
                     && ($settlementOffers[$cid] ?? []) !== []

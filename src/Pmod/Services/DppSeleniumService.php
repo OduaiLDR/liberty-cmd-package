@@ -136,20 +136,20 @@ final class DppSeleniumService
 
         // 2) Pending settlements. Jennifer + Jacob 2026-07-21: a cancel VOIDS every
         //    active settlement (the client is refunded the escrow by the drop below — no
-        //    creditor call). So when the DPP_ALLOW_SETTLEMENT_VOID switch is on, the
-        //    caller passed the offer ids, and the client will NOT hit the EPF gate after
-        //    voiding, we void all offers HERE (before EPF/drop, since voiding navigates
-        //    away and step 4 re-confirms #cancelbtn) and continue to the drop. A clean void
-        //    failure throws → the caller routes the whole contact to manual and the drop
-        //    never runs. NOTE: voids commit irreversibly per offer, so a multi-offer void is
-        //    NOT atomic — a mid-sequence failure throws a typed settlement_void_partial error
-        //    that the caller turns into a LOUD reconcile-this alert (not a silent backlog).
-        //    Switch OFF → route to manual exactly as before (today's safe default).
+        //    creditor call). The auto-void is gated by the caller's --max-voids: it only passes
+        //    settlement_offers for a contact when a void slot is granted (--max-voids>0, offer
+        //    present, not positive-balance+EPF). So an EMPTY $offers here = the caller decided NOT
+        //    to void this contact → route to manual; a NON-empty $offers = void all offers HERE
+        //    (before EPF/drop, since voiding navigates away and step 4 re-confirms #cancelbtn) then
+        //    continue to the drop. A clean void failure throws → the caller routes the whole
+        //    contact to manual and the drop never runs. NOTE: voids commit irreversibly per offer,
+        //    so a multi-offer void is NOT atomic — a mid-sequence failure throws a typed
+        //    settlement_void_partial error that the caller turns into a LOUD reconcile-this alert.
+        //    --max-voids unset (0) → $offers always empty → route to manual, today's safe default.
         $offers = (array) ($form['settlement_offers'] ?? []);
         $voidedOfferIds = [];
         if ($settlements > 0) {
-            $canVoid = getenv('DPP_ALLOW_SETTLEMENT_VOID') === '1'
-                && $offers !== []
+            $canVoid = $offers !== []
                 && !($balance > 0 && $epf > 0); // don't void if the EPF gate would then block the drop
             if (!$canVoid) {
                 return [
@@ -604,50 +604,26 @@ final class DppSeleniumService
                 $voidBtn = \count($driver->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('#voidbtn'))) > 0;
                 $out['after_editbtn'] = ['voidbtn_present' => $voidBtn, 'url' => $driver->getCurrentURL()];
 
-                if ($voidBtn) {
-                    // #voidbtn is <a id=voidbtn> with a jQuery-bound handler (no onclick/href), and
-                    // the reason <select> is already populated but display:none inside an unopened
-                    // modal. Try jQuery trigger (DPP uses jQuery) and the inner icon, then report
-                    // whether the reason select becomes VISIBLE (offsetParent!==null) — getText-based
-                    // polling can't see hidden options, so visibility is the real signal.
-                    usleep(1200000);
-                    $openLog = (string) $driver->executeScript(
-                        "var out=[]; out.push('jq='+(window.jQuery?'y':'n'));" .
-                            "if(window.jQuery){try{jQuery('#voidbtn').trigger('click');out.push('jqTrig');}catch(e){out.push('jqErr:'+e.message);}}" .
-                            "return out.join(' ');"
-                    );
-                    $this->acceptAlertIfPresent($driver);
-                    usleep(1500000);
-                    $shownAfterJq = (string) $driver->executeScript(
-                        "var s=document.getElementById('sett_void_reasons');return s?('display='+getComputedStyle(s).display+' visible='+(s.offsetParent!==null)):'gone';"
-                    );
-
-                    // If still hidden, try clicking the inner <i> icon (handler may be bound there).
-                    $shownAfterIcon = 'not tried';
-                    if (strpos($shownAfterJq, 'visible=1') === false) {
-                        $driver->executeScript("var i=document.querySelector('#voidbtn i, #voidbtn');if(i){i.click();}if(window.jQuery){jQuery('#voidbtn i').trigger('click');}");
-                        $this->acceptAlertIfPresent($driver);
-                        usleep(1500000);
-                        $shownAfterIcon = (string) $driver->executeScript(
-                            "var s=document.getElementById('sett_void_reasons');return s?('display='+getComputedStyle(s).display+' visible='+(s.offsetParent!==null)):'gone';"
-                        );
-                    }
-
-                    // Read options by value:text via JS (getText is empty on a hidden select).
-                    $optsJs = (string) $driver->executeScript(
-                        "var s=document.getElementById('sett_void_reasons'); if(!s)return 'none';" .
-                            "var a=[];for(var i=0;i<s.options.length;i++){a.push(s.options[i].value+':'+s.options[i].text);}return a.join(' | ');"
-                    );
-
-                    $out['void_dialog'] = [
-                        'url' => $driver->getCurrentURL(),
-                        'open_attempt' => $openLog,
-                        'reason_visible_after_jquery' => $shownAfterJq,
-                        'reason_visible_after_icon' => $shownAfterIcon,
-                        'reason_options_via_js' => $optsJs,
-                        'displayed_buttons' => $this->dumpDialogButtons($driver),
-                    ];
-                }
+                // Validate the direct-POST void approach (READ-ONLY, no submit): inspect the #offer
+                // edit form that the real void POSTs. Report the key fields + a dry serialize so we can
+                // compare against the captured manual-void payload, and read offer_status (10=active)
+                // to learn the voided-state indicator (run on the already-voided 8740030).
+                usleep(800000);
+                $formInfo = (string) $driver->executeScript(
+                    "var f=document.getElementById('offer'); if(!f) return 'no #offer form';" .
+                        "function g(n){var e=f.querySelector('[name=\"'+n+'\"]');return e?(e.value||''):'(missing)';}" .
+                        "return 'editid='+g('editid')+' | offer_status='+g('offer_status')+' | saveType='+g('saveType')+' | saveTokenLen='+((''+g('saveToken')).length)+' | hasJson='+(f.querySelector('[name=\"json\"]')?'y':'n')+' | contact_id='+g('contact_id');"
+                );
+                $serialized = (string) $driver->executeScript(
+                    "if(!window.jQuery) return 'no-jquery'; var f=document.getElementById('offer'); if(!f) return 'no-form';" .
+                        "try{return jQuery(f).serialize();}catch(e){return 'err:'+e.message;}"
+                );
+                $out['void_dialog'] = [
+                    'url' => $driver->getCurrentURL(),
+                    'form_fields' => $formInfo,
+                    'offer_serialized_len' => \strlen($serialized),
+                    'offer_serialized_head' => mb_substr($serialized, 0, 1200),
+                ];
             } catch (\Throwable $e) {
                 $out['void_dialog_error'] = $e->getMessage();
             }
@@ -919,13 +895,11 @@ final class DppSeleniumService
     /**
      * Void ALL of a contact's pending settlement offers, then let the caller drop the
      * client (Jennifer + Jacob 2026-07-21: a cancel voids every active settlement; the
-     * escrow is refunded by the drop, no creditor call). DESTRUCTIVE — fires only from
-     * the settlement gate when DPP_ALLOW_SETTLEMENT_VOID=1. Per offer, drives the exact
-     * UI confirmed via --probe-void-settlements + a live walkthrough (2026-07-22):
-     *   settlements&page=dispatch&sid={offer_id} → #editbtn (accept the JS "OK" confirm)
-     *   → #voidbtn (the void icon) → select "CLIENT CANCELLING" in #sett_void_reasons →
-     *   the modal "Ok".
-     * STOPS ON FIRST FAILURE — but a void commits IRREVERSIBLY the instant its modal "Ok"
+     * escrow is refunded by the drop, no creditor call). DESTRUCTIVE — the caller only passes
+     * offer ids for a contact when a void slot is granted (gated by --max-voids>0), so this
+     * runs only when the auto-void is switched on. Each offer is voided by voidOneSettlement
+     * (a direct form POST — the modal won't open headless; see that method).
+     * STOPS ON FIRST FAILURE — but a void commits IRREVERSIBLY the instant it
      * lands, so this is NOT atomic across multiple offers: if a later offer fails, earlier
      * ones are already voided. A clean (nothing-voided-yet) failure rethrows so the caller
      * routes to manual and the drop never runs; a PARTIAL failure rethrows a typed
@@ -996,154 +970,111 @@ final class DppSeleniumService
     }
 
     /**
-     * Void ONE settlement offer and VERIFY it committed before returning. Drives the confirmed
-     * UI: dispatch&sid → #editbtn (accept the JS confirm) → #voidbtn → select "CLIENT
-     * CANCELLING" in #sett_void_reasons → the modal's own "Ok" (scoped to the modal, never the
-     * page's "Save Offer"). Throws on any missing selector, an unpopulated reason dropdown, or
-     * a void that did not commit — the caller treats a throw as a failed void.
+     * Void ONE settlement offer via a direct form POST (the DPP void MODAL will not open under
+     * headless automation — see history). Captured from a real manual void 2026-07-23: the void
+     * is simply the settlement edit form (#offer) submitted with saveType=void + sett_void_reason=89
+     * (CLIENT CANCELLING). We load the edit page (which populates every settlement-specific field +
+     * a fresh CSRF saveToken), set those two fields, and submit — exactly what the modal's Ok does.
+     * Then we VERIFY the offer is no longer active before returning; any throw = failed void, so the
+     * caller routes to manual/backlog and the client is never dropped on an unverified void.
      */
     private function voidOneSettlement(mixed $client, mixed $driver, string $contactId, string $offerId): void
     {
         Log::info('DPP: void settlement - start', ['contact_id' => $contactId, 'offer_id' => $offerId]);
 
-        // Open the settlement by its offer id (confirmed: sid == SETTLEMENT_OFFERS.ID). An
-        // already-voided offer no longer renders #editbtn/#voidbtn, so the waitFor times out
-        // and throws — a safe no-op (we never re-void).
-        $client->request('GET', self::DPP_BASE_URL . '/index.php?module=settlements&page=dispatch&sid=' . rawurlencode($offerId));
+        $editUrl = self::DPP_BASE_URL . '/index.php?module=settlements&page=new4&edit=1&sid=' . rawurlencode($offerId);
+        $client->request('GET', $editUrl);
 
-        // "edit this settlement" → its JS confirm → the edit form.
-        $client->waitFor('#editbtn', 20);
-        $this->safeClick($client, '#editbtn');
-        $this->acceptAlertIfPresent($driver);
+        // Wait for the edit form + its CSRF saveToken to be populated by the page JS.
+        $ready = false;
+        $deadline = time() + 20;
+        do {
+            $token = trim((string) $driver->executeScript(
+                "var f=document.getElementById('offer'); if(!f) return ''; var t=f.querySelector('[name=\"saveToken\"]'); return t?(t.value||''):'';"
+            ));
+            if ($token !== '') {
+                $ready = true;
+                break;
+            }
+            usleep(500000);
+        } while (time() < $deadline);
 
-        // The void icon opens the "Are you sure you want to void this offer?" modal. It is an
-        // <a> icon on the edit form; a plain WebDriver click did NOT open the dialog (probe
-        // 2026-07-23: #sett_void_reasons stayed empty + hidden), so drive its handler with a JS
-        // click once the edit form has settled. #voidbtn may also raise a native confirm — accept it.
-        $client->waitFor('#voidbtn', 20);
-        usleep(1200000); // let the edit form finish wiring its JS handlers
-        $driver->executeScript("var b = document.getElementById('voidbtn'); if (b) { b.click(); }");
-        $this->acceptAlertIfPresent($driver);
+        if (! $ready) {
+            throw new \RuntimeException("void: edit form (#offer / saveToken) not ready for offer {$offerId}");
+        }
 
-        // Wait for the required "Settlement Voided Reason" to POPULATE (its options load only
-        // once the modal actually opens), then select CLIENT CANCELLING (confirmed 2026-07-22).
-        // A throw here means the dialog never rendered → failed void (fail-safe, no drop).
-        $this->waitForOption($driver, '#sett_void_reasons', 'CLIENT CANCELLING', 15);
-        $this->select($client, '#sett_void_reasons', 'CLIENT CANCELLING');
+        // Guard: the loaded form must be for THIS offer, and still ACTIVE (offer_status 10). An
+        // already-voided offer (status != 10) is a no-op — never re-submit it.
+        $editId = trim((string) $driver->executeScript(
+            "var f=document.getElementById('offer');var e=f?f.querySelector('[name=\"editid\"]'):null;return e?(e.value||''):'';"
+        ));
+        if ($editId !== '' && $editId !== $offerId) {
+            throw new \RuntimeException("void: edit form editid={$editId} != offer {$offerId}");
+        }
+        $statusBefore = trim((string) $driver->executeScript(
+            "var f=document.getElementById('offer');var e=f?f.querySelector('[name=\"offer_status\"]'):null;return e?(e.value||''):'';"
+        ));
+        if ($statusBefore !== '' && $statusBefore !== '10') {
+            Log::info('DPP: void settlement - already not active, skipping', ['contact_id' => $contactId, 'offer_id' => $offerId, 'offer_status' => $statusBefore]);
 
-        // Confirm with the modal's OWN "Ok" — scoped to the dialog that hosts the reason
-        // select, so a stray page "Ok" / "Save Offer" can never be clicked instead.
-        $this->clickModalOk($driver);
+            return;
+        }
 
-        // The "Ok" may itself raise a native confirm — accept it (mirrors #editbtn/#voidbtn) so
-        // no alert is left open to block the commit OR to be mis-read as success by the verify
-        // below.
-        $this->acceptAlertIfPresent($driver);
+        // Replicate the modal's Ok: set saveType=void + sett_void_reason=89 on #offer, then submit.
+        $res = (string) $driver->executeScript(
+            "var f=document.getElementById('offer'); if(!f) return 'no-form';" .
+                "function setF(n,v){var e=f.querySelector('[name=\"'+n+'\"]'); if(!e){e=document.createElement('input'); e.type='hidden'; e.name=n; f.appendChild(e);} e.value=v;}" .
+                "setF('saveType','void'); setF('sett_void_reason','89');" .
+                "try{f.submit();}catch(e){return 'submitErr:'+e.message;} return 'submitted';"
+        );
+        if ($res !== 'submitted') {
+            throw new \RuntimeException("void: could not submit #offer for offer {$offerId} ({$res})");
+        }
 
-        // VERIFY the void committed: a successful void closes the dialog (the reason select is
-        // gone / the page navigates); a validation error, CSRF/session rejection, or a mis-click
-        // leaves it open. If it is still open — or the state can't be read — the void did NOT
-        // verifiably land, so we throw and the caller never records a phantom void or drops this
-        // client.
-        $this->assertVoidDialogClosed($driver, $offerId);
+        // The submit is a navigation — let it complete.
+        usleep(4000000);
+
+        // VERIFY the void landed before recording success (fail-closed).
+        $this->assertSettlementVoided($client, $driver, $offerId);
 
         Log::info('DPP: void settlement - committed', ['contact_id' => $contactId, 'offer_id' => $offerId]);
     }
 
-    /** Accept a native JS alert/confirm if one is open right now; no-op otherwise. */
-    private function acceptAlertIfPresent(mixed $driver): void
-    {
-        try {
-            $driver->switchTo()->alert()->accept();
-        } catch (\Throwable $e) {
-            // no alert open
-        }
-    }
-
     /**
-     * Poll up to $timeoutSec for a <select> to contain an option with the given visible text
-     * (DPP loads the void-reason options asynchronously). Throws if it never appears.
+     * Confirm a settlement offer is no longer ACTIVE after the void POST. Re-loads the edit form
+     * and reads offer_status: an active offer is status 10 (captured 2026-07-23); a voided one is
+     * NOT 10 (or the editable form is gone). Throws if it still reads active — a fail-closed guard
+     * so an unconfirmed void never lets the caller drop the client.
      */
-    private function waitForOption(mixed $driver, string $css, string $optionText, int $timeoutSec): void
+    private function assertSettlementVoided(mixed $client, mixed $driver, string $offerId): void
     {
-        $deadline = time() + max(1, $timeoutSec);
+        $client->request('GET', self::DPP_BASE_URL . '/index.php?module=settlements&page=new4&edit=1&sid=' . rawurlencode($offerId));
+        usleep(1500000);
+
+        $status = null;
+        $deadline = time() + 10;
         do {
-            foreach ($this->optionTexts($driver, $css) as $txt) {
-                if (strcasecmp(trim((string) $txt), $optionText) === 0) {
-                    return;
-                }
+            $status = $driver->executeScript(
+                "var f=document.getElementById('offer'); if(!f) return 'no-form'; var e=f.querySelector('[name=\"offer_status\"]'); return e?(e.value||''):'';"
+            );
+            if ($status !== null && $status !== '') {
+                break;
             }
-            usleep(300000);
+            usleep(400000);
         } while (time() < $deadline);
 
-        throw new \RuntimeException("option '{$optionText}' not present in {$css} within {$timeoutSec}s");
-    }
-
-    /**
-     * Click the void dialog's OWN "Ok", scoped to the dialog element that hosts
-     * #sett_void_reasons — so a page-level "Ok" / "Save Offer" outside the dialog can never be
-     * clicked by mistake. Matches button/anchor/span text and input[value]. Throws if the
-     * dialog or its Ok button isn't found.
-     */
-    private function clickModalOk(mixed $driver): void
-    {
-        // The dialog = the NEAREST ancestor of the reason select that also contains an "Ok".
-        $modal = $driver->findElement(\Facebook\WebDriver\WebDriverBy::xpath(
-            "//*[@id='sett_void_reasons']/ancestor::*[.//button[normalize-space(.)='Ok'] or .//a[normalize-space(.)='Ok'] or .//span[normalize-space(.)='Ok'] or .//input[@value='Ok']][1]"
-        ));
-
-        // Selector set kept in SYNC with the detection xpath above (button/a/span/input) so any
-        // element that made the xpath match the dialog is also reachable here — an Ok rendered
-        // as a plain <span> or <input value="Ok"> is clicked, not skipped into a spurious failure.
-        foreach ($modal->findElements(\Facebook\WebDriver\WebDriverBy::cssSelector('button, a, span, input')) as $el) {
-            try {
-                if (!$el->isDisplayed()) {
-                    continue;
-                }
-                $label = trim((string) $el->getText());
-                if ($label === '') {
-                    $label = trim((string) ($el->getAttribute('value') ?? ''));
-                }
-                if (strcasecmp($label, 'Ok') === 0) {
-                    $driver->executeScript('arguments[0].scrollIntoView({block:"center"});', [$el]);
-                    usleep(150000);
-                    $el->click();
-
-                    return;
-                }
-            } catch (\Throwable $e) {
-                // stale element; keep looking
-            }
+        $status = $status === null ? '' : trim((string) $status);
+        // Fail-CLOSED: '10' = still active (void failed); '' / 'no-form' = couldn't read the status
+        // (can't confirm). Only a real non-active status (observed 116 = voided, 2026-07-23) counts
+        // as a confirmed void, so an unverifiable result never lets the caller drop the client.
+        if ($status === '' || $status === 'no-form') {
+            throw new \RuntimeException("void not confirmed for offer {$offerId}: offer_status unreadable ('{$status}')");
+        }
+        if ($status === '10') {
+            throw new \RuntimeException("void not confirmed for offer {$offerId}: still active (offer_status=10)");
         }
 
-        throw new \RuntimeException('void dialog "Ok" button not found in the reason dialog');
-    }
-
-    /**
-     * Assert the void dialog closed after "Ok" — the signal that the server committed the void.
-     * A validation error / rejection / mis-click leaves #sett_void_reasons still displayed; in
-     * that case throw so the caller never treats the offer as voided.
-     */
-    private function assertVoidDialogClosed(mixed $driver, string $offerId): void
-    {
-        $deadline = time() + 8;
-        do {
-            try {
-                $displayed = $driver->findElement(\Facebook\WebDriver\WebDriverBy::cssSelector('#sett_void_reasons'))->isDisplayed();
-            } catch (\Facebook\WebDriver\Exception\NoSuchElementException $e) {
-                return; // reason select GONE from the DOM → dialog closed / page navigated → committed
-            }
-            // Present-but-hidden also means the dialog closed. FAIL-CLOSED on everything else:
-            // an open native alert (UnexpectedAlertOpenException), a stale/session/transient
-            // WebDriver error, or a login redirect must NOT be read as success — those throwables
-            // propagate so an unverifiable void is treated as FAILED, never a phantom commit.
-            if (!$displayed) {
-                return;
-            }
-            usleep(300000);
-        } while (time() < $deadline);
-
-        throw new \RuntimeException("void not confirmed for offer {$offerId}: reason dialog still open after Ok");
+        Log::info('DPP: void verified', ['offer_id' => $offerId, 'offer_status_after' => $status]);
     }
 
     /** Select an option by visible text. */
