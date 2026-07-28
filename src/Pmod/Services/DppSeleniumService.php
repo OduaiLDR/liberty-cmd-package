@@ -1287,6 +1287,29 @@ final class DppSeleniumService
         }
     }
 
+    /**
+     * Quit and DROP the current browser session so the next run launches a fresh one. The
+     * automations queue worker can keep this singleton alive across jobs; when a run reaps its
+     * Chromium out-of-band (the command's killStaleBrowsers), the cached client is left pointing at
+     * a dead process — nulling it (and the login state) here forces client() to spin up and
+     * re-authenticate a clean session next time. Safe to call when there is no client (no-op).
+     */
+    public function shutdown(): void
+    {
+        if ($this->client === null) {
+            return;
+        }
+        if (method_exists($this->client, 'quit')) {
+            try {
+                $this->client->quit();
+            } catch (\Throwable $e) {
+                Log::warning('DPP: shutdown quit failed (continuing)', ['error' => $e->getMessage()]);
+            }
+        }
+        $this->client = null;
+        $this->loggedIn = [];
+    }
+
     public function __destruct()
     {
         if ($this->client !== null && method_exists($this->client, 'quit')) {

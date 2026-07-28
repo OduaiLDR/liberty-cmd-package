@@ -130,13 +130,15 @@ final class GenerateResumePayments extends Command
         $probeVoidId = (string) ($this->option('probe-void-settlements') ?? '');
         $dryRun = (bool) $this->option('dry-run');
 
-        // Concurrency guard (2026-07-23): this command drives ONE headless Chromium on the fixed
-        // ChromeDriver port 9515 against ONE DPP login. Two overlapping runs collide ("port 9515
-        // is already in use") and would double-process contacts — that crashed ~26 cancels on
-        // 2026-07-22 when a manual test overlapped the scheduled run. A dry-run uses no browser;
-        // every other invocation (a probe or a live run) takes an exclusive lock and exits cleanly
-        // if another run already holds it. flock auto-releases if a run dies, so no stale locks.
-        // $lockHandle is intentionally held in scope for the whole run — closing it frees the lock.
+        // Concurrency guard (2026-07-23, hardened 2026-07-27): this command drives ONE headless
+        // Chromium on the fixed ChromeDriver port 9515 against ONE DPP login. Two overlapping runs
+        // collide ("port 9515 is already in use") and would double-process contacts. A dry-run uses
+        // no browser; every other invocation (a probe or a live run) takes an exclusive flock and
+        // exits if another run genuinely holds it. NB: the old "flock auto-releases if a run dies"
+        // assumption was WRONG — the spawned Chromium inherits the lock FD, so a browser that
+        // outlives its run keeps the lock held (this wedged every run 2026-07-24 → 27). acquireRunLock
+        // now reaps such a stale lock, and teardownBrowserRun() kills our browser at the end so it
+        // can't outlive the run. $lockHandle is held in scope for the whole run.
         $usesBrowser = $probeCancelId !== '' || $probeResumeId !== '' || $probeVoidId !== '' || ! $dryRun;
         $lockHandle = false;
         if ($usesBrowser) {
@@ -146,6 +148,9 @@ final class GenerateResumePayments extends Command
                 Log::warning('ResumePayments: skipped — another run holds the browser lock');
                 return Command::SUCCESS;
             }
+            // The automations queue worker can carry this singleton (and a now-dead browser client)
+            // over from a previous job; start every run on a clean, re-authenticating session.
+            $this->dppSelenium->shutdown();
         }
 
         if ($probeCancelId !== '') {
@@ -236,6 +241,9 @@ final class GenerateResumePayments extends Command
                 $this->emitHealthLine($company, $statusChanges);
             }
         }
+
+        // Reap our browser + release the lock so nothing outlives the run holding the lock FD.
+        $this->teardownBrowserRun($lockHandle);
 
         return Command::SUCCESS;
     }
@@ -382,31 +390,148 @@ final class GenerateResumePayments extends Command
      * @return list<string>
      */
     /**
-     * Acquire an exclusive, non-blocking file lock so only ONE browser-driving run executes at a
-     * time (prevents the ChromeDriver port-9515 collision + double-processing). Returns the open
-     * lock handle (KEEP it referenced for the whole run — closing/GC releases the lock), null if
-     * another run already holds it, or false if the lock file can't be opened (proceed anyway — a
-     * lock-infra hiccup must not block the daily run). flock is process-scoped, so a crashed run
-     * releases its lock automatically (no stale-lock recovery needed).
+     * Single-run guard: an exclusive, non-blocking flock so only ONE browser-driving run executes
+     * at a time (prevents the ChromeDriver port-9515 collision + double-processing). Returns the
+     * open lock handle (KEEP it referenced for the whole run — closing/GC releases the lock), null
+     * if a genuinely active run holds it, or false if the lock file can't be opened (proceed anyway
+     * — a lock-infra hiccup must not block the daily run).
+     *
+     * SELF-HEALING (2026-07-27): the spawned Chromium inherits the lock's file descriptor, so a
+     * browser that outlives its run keeps the flock held even after the PHP process is gone — that
+     * wedged every run 2026-07-24 → 27. Because runs execute inside a long-lived queue worker, the
+     * recorded PID is the worker's (alive across jobs) and can't by itself distinguish a live run
+     * from a leaked browser; so we ALSO stamp the acquire time and age the lock out: a real run
+     * finishes in ~28 min, so a lock held past $staleSeconds belongs to a finished/hung run whose
+     * browser leaked — kill it and reclaim. Keep $staleSeconds BELOW the LDR/PLAW schedule gap so
+     * the later run can reclaim, and ABOVE the longest real run so a live run is never taken.
      *
      * @return resource|null|false
      */
     private function acquireRunLock()
     {
+        $staleSeconds = 2700; // 45 min: > longest real run (~28 min), < the 60-min LDR→PLAW gap.
+
         $path = storage_path('app/resume-payments-run.lock');
-        $handle = @fopen($path, 'c');
+        $handle = @fopen($path, 'c+');
         if ($handle === false) {
             Log::warning('ResumePayments: could not open run-lock file; proceeding WITHOUT a concurrency lock', ['path' => $path]);
 
             return false;
         }
-        if (! flock($handle, LOCK_EX | LOCK_NB)) {
-            fclose($handle);
 
-            return null;
+        if ($this->grabLock($handle)) {
+            return $handle;
         }
 
-        return $handle;
+        // The flock is held. Decide: an actually-running job, or a browser pinning the lock FD of a
+        // run that already finished / was killed?
+        [$ownerPid, $acquiredAt] = $this->readRunLock($handle);
+        $ownerDead = $ownerPid <= 0 || ! $this->pidAlive($ownerPid);
+        $heldSeconds = $acquiredAt > 0 ? time() - $acquiredAt : null;
+        $stale = $heldSeconds !== null && $heldSeconds > $staleSeconds;
+
+        if (! $ownerDead && ! $stale) {
+            fclose($handle);
+
+            return null; // a genuinely active run owns it — skip
+        }
+
+        Log::warning('ResumePayments: reclaiming a stale run-lock (browser outlived its run)', [
+            'owner_pid' => $ownerPid,
+            'owner_dead' => $ownerDead,
+            'held_seconds' => $heldSeconds,
+        ]);
+        $this->killStaleBrowsers();
+        usleep(500000); // let the OS drop the FD the killed browser held
+
+        if ($this->grabLock($handle)) {
+            return $handle;
+        }
+
+        fclose($handle);
+
+        return null;
+    }
+
+    /**
+     * flock(EX|NB) the handle; on success clear any orphaned driver/browser from a prior leaked run
+     * and stamp "<pid>\n<epoch>" so a later run can tell a live run from a leaked-browser lock.
+     *
+     * @param resource $handle
+     */
+    private function grabLock($handle): bool
+    {
+        if (! flock($handle, LOCK_EX | LOCK_NB)) {
+            return false;
+        }
+        $this->killStaleBrowsers();
+        ftruncate($handle, 0);
+        rewind($handle);
+        fwrite($handle, getmypid() . "\n" . time());
+        fflush($handle);
+
+        return true;
+    }
+
+    /**
+     * Read "<pid>\n<epoch>" back from the lock file.
+     *
+     * @param resource $handle
+     * @return array{0: int, 1: int} [ownerPid, acquiredEpoch]
+     */
+    private function readRunLock($handle): array
+    {
+        rewind($handle);
+        $parts = explode("\n", trim((string) fread($handle, 64)));
+
+        return [(int) ($parts[0] ?? 0), (int) ($parts[1] ?? 0)];
+    }
+
+    /**
+     * True if $pid is a live process. On the prod box /proc is authoritative; if we can't tell,
+     * assume ALIVE so a bad guess never reclaims a genuinely running run (it just skips).
+     */
+    private function pidAlive(int $pid): bool
+    {
+        if ($pid <= 0) {
+            return false;
+        }
+        if (is_dir('/proc/' . $pid)) {
+            return true;
+        }
+
+        return function_exists('posix_kill') ? @posix_kill($pid, 0) : true;
+    }
+
+    /**
+     * Force-kill an orphaned ChromeDriver on our fixed port + any Panther-spawned Chromium. Only
+     * ever called while we hold the lock, or after ageing-out / PID-checking a lock whose run has
+     * ended — so no ACTIVE run's browser is at risk. Runs as www-data killing www-data (no sudo).
+     */
+    private function killStaleBrowsers(): void
+    {
+        foreach (['chromedriver --port=9515', 'org.chromium.Chromium.scoped_dir'] as $pattern) {
+            @exec('pkill -9 -f ' . escapeshellarg($pattern) . ' > /dev/null 2>&1');
+        }
+    }
+
+    /**
+     * End-of-run teardown: quit + reap OUR browser so it can't outlive the run holding the lock FD
+     * (the 2026-07-24 wedge), then release the lock deterministically. Only when we actually hold
+     * the lock (a resource) — never on a dry-run or an unlocked run, or we could reap a peer's
+     * browser. Best-effort: if an unexpected error skips it, the next run's acquireRunLock reclaims.
+     *
+     * @param resource|false|null $lockHandle
+     */
+    private function teardownBrowserRun($lockHandle): void
+    {
+        if (! is_resource($lockHandle)) {
+            return;
+        }
+        $this->dppSelenium->shutdown();
+        $this->killStaleBrowsers();
+        @flock($lockHandle, LOCK_UN);
+        @fclose($lockHandle);
     }
 
     private function resolveCompanies(): array

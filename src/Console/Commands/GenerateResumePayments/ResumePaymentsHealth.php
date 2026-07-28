@@ -54,8 +54,8 @@ class ResumePaymentsHealth extends Command
 
         $days   = max(1, (int) $this->option('days'));
         $filter = array_values(array_filter(
-            array_map(static fn ($c): string => strtoupper(trim((string) $c)), (array) $this->option('company')),
-            static fn (string $c): bool => $c !== '',
+            array_map(static fn($c): string => strtoupper(trim((string) $c)), (array) $this->option('company')),
+            static fn(string $c): bool => $c !== '',
         ));
 
         $todayPt  = Carbon::now(self::TZ)->startOfDay();
@@ -136,6 +136,10 @@ class ResumePaymentsHealth extends Command
                 foreach ($logsForDate as $log) {
                     $status = (string) $log->status;
 
+                    // A run that couldn't get the browser lock exits immediately (~0s) with this line
+                    // in its output and does NO work — flag it distinctly from an old-build no-HEALTH run.
+                    $lockSkipped = stripos((string) $log->output, 'holds the browser lock') !== false;
+
                     // One HEALTH line per company in the run's output, keyed by its [CO] tag.
                     $healthByCo = [];
                     foreach ($this->parseHealthLines((string) $log->output) as $h) {
@@ -143,13 +147,13 @@ class ResumePaymentsHealth extends Command
                     }
 
                     // Attribute rows to the companies that actually emitted HEALTH; if none did
-                    // (old build / crash), fall back to the automation's configured companies.
+                    // (old build / crash / lock-skip), fall back to the automation's configured companies.
                     $targetCompanies = $healthByCo !== [] ? array_keys($healthByCo) : $companies;
 
                     foreach ($this->scopeCompanies($targetCompanies, $filter) as $co) {
                         $counts = $healthByCo[$co] ?? null;
-                        $anoms  = $this->rowAnomalies($date, $co, $status, $counts, $isWeekend, $expectsCancels, $log);
-                        $rows[] = $this->buildRow($date, $co, $log, $counts, $this->worstLevel($anoms, $status));
+                        $anoms  = $this->rowAnomalies($date, $co, $status, $counts, $isWeekend, $expectsCancels, $log, $lockSkipped);
+                        $rows[] = $this->buildRow($date, $co, $log, $counts, $this->worstLevel($anoms, $status), $lockSkipped);
                         foreach ($anoms as $a) {
                             $anomalies[] = $a;
                         }
@@ -214,7 +218,7 @@ class ResumePaymentsHealth extends Command
      * @param array<string, int>|null $counts
      * @return list<array{level: string, date: string, company: string, message: string}>
      */
-    private function rowAnomalies(string $date, string $co, string $status, ?array $counts, bool $isWeekend, bool $expectsCancels, AutomationLog $log): array
+    private function rowAnomalies(string $date, string $co, string $status, ?array $counts, bool $isWeekend, bool $expectsCancels, AutomationLog $log, bool $lockSkipped = false): array
     {
         // Still running (or an unknown state) — don't judge an in-flight run.
         if ($status === 'running') {
@@ -229,8 +233,12 @@ class ResumePaymentsHealth extends Command
         }
 
         if ($counts === null) {
-            // A success with no HEALTH line = old build, or crashed before the per-company summary.
-            if ($status === 'success') {
+            if ($status === 'success' && $lockSkipped) {
+                // Ran but couldn't get the browser lock — did no work. Post-fix this should be rare
+                // (the lock self-heals); a recurring SKIP means a genuine overlap or a regression.
+                $out[] = $this->anomaly('WARN', $date, $co, 'Run skipped — another run held the browser lock; it did NO work.');
+            } elseif ($status === 'success') {
+                // A success with no HEALTH line = old build, or crashed before the per-company summary.
                 $out[] = $this->anomaly('WARN', $date, $co, 'Run succeeded but emitted no HEALTH line (old build, or crashed before the per-company summary).');
             }
 
@@ -292,9 +300,9 @@ class ResumePaymentsHealth extends Command
      * @param array<string, int>|null $counts
      * @return array<string, string>
      */
-    private function buildRow(string $date, string $co, AutomationLog $log, ?array $counts, string $level): array
+    private function buildRow(string $date, string $co, AutomationLog $log, ?array $counts, string $level, bool $lockSkipped = false): array
     {
-        $get = static fn (string $k): string => $counts === null ? '—' : (string) ($counts[$k] ?? 0);
+        $get = static fn(string $k): string => $counts === null ? '—' : (string) ($counts[$k] ?? 0);
 
         return [
             'date'    => $date,
@@ -310,7 +318,7 @@ class ResumePaymentsHealth extends Command
             'compl'   => $get('completed'),
             'voids'   => $get('voids_verified'),
             'alerts'  => $this->alertsCell($counts),
-            'flag'    => $this->flagLabel($level),
+            'flag'    => ($counts === null && $lockSkipped) ? 'SKIP' : $this->flagLabel($level),
         ];
     }
 
@@ -414,7 +422,7 @@ class ResumePaymentsHealth extends Command
             $this->warn('No runs in the window.');
         } else {
             $headers = ['Date (PT)', 'Co', 'Status', 'Start', 'Runtime', 'Rslv', 'NSF', 'Grace', 'Man', 'Queue', 'Compl', 'Voids', 'Alerts', 'Flag'];
-            $this->table($headers, array_map(static fn (array $r): array => array_values($r), $rows));
+            $this->table($headers, array_map(static fn(array $r): array => array_values($r), $rows));
         }
 
         $this->newLine();
