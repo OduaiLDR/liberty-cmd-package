@@ -219,11 +219,42 @@ class Formatter
      */
     private function buildSummaryBody(array $grouped, string $label, bool $cancelsOnly = false): string
     {
+        // Jacob 2026-07-28: group the summary into sections — Resolved on its own line, then the
+        // NSF rows with an "NSF Total" subtotal, then the Cancels rows with a "Cancels Total"
+        // subtotal, and finally the grand Total at the bottom.
+        $subtotalLabel = ['nsf' => 'NSF Total', 'cancels' => 'Cancels Total'];
+        $sectionOf = static function (string $key): string {
+            if (str_starts_with($key, 'NSF')) {
+                return 'nsf';
+            }
+            if (str_starts_with($key, 'Cancels')) {
+                return 'cancels';
+            }
+
+            return 'resolved';
+        };
+        $spacer = '<tr><td colspan="3" style="padding:3px 0;"></td></tr>';
+
         $rows = '';
         $totalClients = 0;
         $totalDebt = 0.0;
+        $prevSection = null;
+        $secClients = 0;
+        $secDebt = 0.0;
 
         foreach ($this->displayStages($cancelsOnly) as $stage) {
+            $section = $sectionOf($stage['key']);
+
+            // Section changed → close out the previous one (its subtotal, if any) + a spacer.
+            if ($prevSection !== null && $section !== $prevSection) {
+                if (isset($subtotalLabel[$prevSection])) {
+                    $rows .= $this->summaryRow($subtotalLabel[$prevSection], $secClients, $secDebt, 'subtotal');
+                }
+                $rows .= $spacer;
+                $secClients = 0;
+                $secDebt = 0.0;
+            }
+
             $bucket = $grouped[$stage['key']] ?? [];
             $count = count($bucket);
             $debt = 0.0;
@@ -232,13 +263,18 @@ class Formatter
             }
             $totalClients += $count;
             $totalDebt += $debt;
+            $secClients += $count;
+            $secDebt += $debt;
 
-            $rows .= '<tr>'
-                . '<td style="padding:4px 16px 4px 0;">' . htmlspecialchars($stage['label'], ENT_QUOTES, 'UTF-8') . '</td>'
-                . '<td style="padding:4px 16px 4px 0; text-align:right;">' . $count . '</td>'
-                . '<td style="padding:4px 0; text-align:right;">$' . number_format($debt, 2) . '</td>'
-                . '</tr>';
+            $rows .= $this->summaryRow($stage['label'], $count, $debt);
+            $prevSection = $section;
         }
+
+        // Close the final section's subtotal (e.g. Cancels), then a spacer before the grand Total.
+        if ($prevSection !== null && isset($subtotalLabel[$prevSection])) {
+            $rows .= $this->summaryRow($subtotalLabel[$prevSection], $secClients, $secDebt, 'subtotal');
+        }
+        $rows .= $spacer;
 
         $heading = $cancelsOnly ? 'System Cancels summary' : 'ResumePayments summary';
         $body  = $heading . ' &mdash; ' . htmlspecialchars($label, ENT_QUOTES, 'UTF-8')
@@ -250,15 +286,33 @@ class Formatter
             . '<th style="text-align:right; padding:4px 0; border-bottom:1px solid #ccc;">Debt</th>'
             . '</tr>';
         $body .= $rows;
-        $body .= '<tr>'
-            . '<td style="padding:6px 16px 4px 0; border-top:1px solid #ccc;"><b>Total</b></td>'
-            . '<td style="padding:6px 16px 4px 0; text-align:right; border-top:1px solid #ccc;"><b>' . $totalClients . '</b></td>'
-            . '<td style="padding:6px 0 4px 0; text-align:right; border-top:1px solid #ccc;"><b>$' . number_format($totalDebt, 2) . '</b></td>'
-            . '</tr>';
+        $body .= $this->summaryRow('Total', $totalClients, $totalDebt, 'grand');
         $body .= '</table>';
         $body .= '<br>Per-client detail (LLG ID, name, debt, days since NSF) is in the attached workbook &mdash; one sheet per stage.';
 
         return $body;
+    }
+
+    /**
+     * One summary-table row. $variant: '' = normal, 'subtotal' = bold + light top rule,
+     * 'grand' = bold + heavier top rule.
+     */
+    private function summaryRow(string $label, int $count, float $debt, string $variant = ''): string
+    {
+        $bold = $variant !== '';
+        $o = $bold ? '<b>' : '';
+        $c = $bold ? '</b>' : '';
+        $border = match ($variant) {
+            'grand' => ' border-top:2px solid #999;',
+            'subtotal' => ' border-top:1px solid #ccc;',
+            default => '',
+        };
+
+        return '<tr>'
+            . '<td style="padding:5px 16px 4px 0;' . $border . '">' . $o . htmlspecialchars($label, ENT_QUOTES, 'UTF-8') . $c . '</td>'
+            . '<td style="padding:5px 16px 4px 0; text-align:right;' . $border . '">' . $o . $count . $c . '</td>'
+            . '<td style="padding:5px 0 4px 0; text-align:right;' . $border . '">' . $o . '$' . number_format($debt, 2) . $c . '</td>'
+            . '</tr>';
     }
 
     /**
