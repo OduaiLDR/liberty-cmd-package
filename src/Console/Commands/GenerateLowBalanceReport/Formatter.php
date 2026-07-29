@@ -56,7 +56,8 @@ class Formatter
             $sheet->setSelectedCells('A1');
         }
 
-        $filename = 'Low Balance - ' . $source . ' - ' . date('m-d-Y') . '.xlsx';
+        $displaySource = $source === 'PLAW' ? 'Progress Law' : $source;
+        $filename = 'Low Balance - ' . $displaySource . ' - ' . date('m-d-Y') . '.xlsx';
         $slug = strtolower($source);
         $path = storage_path('app/low-balance-' . $slug . '-' . date('Ymd-His') . '-' . bin2hex(random_bytes(4)) . '.xlsx');
 
@@ -102,9 +103,10 @@ class Formatter
             'contentBytes' => base64_encode($bytes),
         ]];
 
+        $displaySource = $source === 'PLAW' ? 'Progress Law' : $source;
         $email = new EmailSenderService();
-        $subject = 'Low Balance Report (Process Date) - ' . $source . ' - ' . date('Y-m-d');
-        $body = 'Please see the attached Low Balance Report for ' . $source . ' on ' . date('Y-m-d') . '.';
+        $subject = 'Low Balance Report (Process Date) - ' . $displaySource . ' - ' . date('Y-m-d');
+        $body = 'Please see the attached Low Balance Report for ' . $displaySource . ' on ' . date('Y-m-d') . '.';
 
         // Fail closed: company-filtered TblReports only. No env extras, no shared VBA CC list.
         $sent = $email->sendMailUsingTblReports(

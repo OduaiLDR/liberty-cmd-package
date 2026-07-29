@@ -64,7 +64,8 @@ class Formatter
         $sheet->freezePane('A4');
         $sheet->setSelectedCells('A1');
 
-        $filename = 'Offer Authorization Report - '.$source.' - '.$this->formatFilenameDate($reportDate).'.xlsx';
+        $displaySource = $source === 'PLAW' ? 'Progress Law' : $source;
+        $filename = 'Offer Authorization Report - '.$displaySource.' - '.$this->formatFilenameDate($reportDate).'.xlsx';
         $slug = strtolower($source);
         $path = storage_path(
             'app/offer-authorization-'.$slug.'-'.date('Ymd-His').'-'.bin2hex(random_bytes(4)).'.xlsx'
@@ -122,9 +123,10 @@ class Formatter
             'contentBytes' => base64_encode($bytes),
         ]];
 
+        $displaySource = $source === 'PLAW' ? 'Progress Law' : $source;
         $email = new EmailSenderService;
         $subject = 'Offer Authorization Report';
-        $body = 'Please review the attached Offer Authorization Report - '.$source.'<br><br>Thanks<br><br>';
+        $body = 'Please review the attached Offer Authorization Report - '.$displaySource.'<br><br>Thanks<br><br>';
 
         // Fail closed: company-filtered TblReports only. No env extras, no shared VBA list.
         $sent = $email->sendMailUsingTblReportsHtml(

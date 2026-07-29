@@ -102,16 +102,16 @@ class InvoiceReportController extends Controller
             ['key' => 'Invoice S Jordan LDR', 'label' => 'Invoice S Jordan LDR', 'group' => 'Jordan'],
             ['key' => 'Invoice D Jordan LT', 'label' => 'Invoice D Jordan LT', 'group' => 'Jordan'],
             ['key' => 'Invoice S Jordan LT', 'label' => 'Invoice S Jordan LT', 'group' => 'Jordan'],
-            ['key' => 'Invoice D Jordan PLAW', 'label' => 'Invoice D Jordan PLAW', 'group' => 'Jordan'],
-            ['key' => 'Invoice S Jordan PLAW', 'label' => 'Invoice S Jordan PLAW', 'group' => 'Jordan'],
+            ['key' => 'Invoice D Jordan Progress Law', 'label' => 'Invoice D Jordan Progress Law', 'group' => 'Jordan'],
+            ['key' => 'Invoice S Jordan Progress Law', 'label' => 'Invoice S Jordan Progress Law', 'group' => 'Jordan'],
             ['key' => 'Invoice D Guatemala Combined', 'label' => 'Invoice D Guatemala Combined', 'group' => 'Guatemala'],
             ['key' => 'Invoice S Guatemala Combined', 'label' => 'Invoice S Guatemala Combined', 'group' => 'Guatemala'],
             ['key' => 'Invoice D Guatemala LDR', 'label' => 'Invoice D Guatemala LDR', 'group' => 'Guatemala'],
             ['key' => 'Invoice S Guatemala LDR', 'label' => 'Invoice S Guatemala LDR', 'group' => 'Guatemala'],
             ['key' => 'Invoice D Guatemala LT', 'label' => 'Invoice D Guatemala LT', 'group' => 'Guatemala'],
             ['key' => 'Invoice S Guatemala LT', 'label' => 'Invoice S Guatemala LT', 'group' => 'Guatemala'],
-            ['key' => 'Invoice D Guatemala PLAW', 'label' => 'Invoice D Guatemala PLAW', 'group' => 'Guatemala'],
-            ['key' => 'Invoice S Guatemala PLAW', 'label' => 'Invoice S Guatemala PLAW', 'group' => 'Guatemala'],
+            ['key' => 'Invoice D Guatemala Progress Law', 'label' => 'Invoice D Guatemala Progress Law', 'group' => 'Guatemala'],
+            ['key' => 'Invoice S Guatemala Progress Law', 'label' => 'Invoice S Guatemala Progress Law', 'group' => 'Guatemala'],
         ];
     }
 }

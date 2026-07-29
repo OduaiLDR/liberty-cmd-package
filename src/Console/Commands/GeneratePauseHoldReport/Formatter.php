@@ -30,7 +30,8 @@ class Formatter
 
         $sheet->setSelectedCells('A1');
 
-        $filename = 'Pause Hold Report - ' . $source . ' - ' . date('m-d-Y') . '.xlsx';
+        $displaySource = $source === 'PLAW' ? 'Progress Law' : $source;
+        $filename = 'Pause Hold Report - ' . $displaySource . ' - ' . date('m-d-Y') . '.xlsx';
         $path = storage_path('app/' . $filename);
 
         $writer = new Xlsx($spreadsheet);
@@ -61,9 +62,10 @@ class Formatter
             ],
         ];
 
+        $displayCompany = $company === 'PLAW' ? 'Progress Law' : $company;
         $email = new EmailSenderService();
-        $subject = 'Pause Hold Report - ' . $company . ' - ' . date('m/d/Y');
-        $body = 'Please see the attached Pause Hold report for ' . $company . ' on ' . date('m/d/Y') . '.';
+        $subject = 'Pause Hold Report - ' . $displayCompany . ' - ' . date('m/d/Y');
+        $body = 'Please see the attached Pause Hold report for ' . $displayCompany . ' on ' . date('m/d/Y') . '.';
 
         $sent = $email->sendMailUsingTblReports(
             $connector,

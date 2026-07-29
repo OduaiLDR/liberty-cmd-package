@@ -377,7 +377,8 @@ class GenerateRetentionCommissionSummary extends Command
         string $startDate,
         string $today
     ): void {
-        $subject = "Retention Summary ($display) - $startDate to $today";
+        $displayLabel = $display === 'PLAW' ? 'Progress Law' : $display;
+        $subject = "Retention Summary ($displayLabel) - $startDate to $today";
 
         $body = '<table border="1" cellpadding="4" cellspacing="0" style="border-collapse:collapse;font-family:Calibri,Arial;font-size:13px;">'
               . '<tr style="background:#17853b;color:#fff;text-align:center;">'

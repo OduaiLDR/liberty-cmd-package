@@ -44,7 +44,8 @@ class Formatter
         $sheet->freezePane('A2');
         $sheet->setSelectedCells('A1');
 
-        $filename = 'Uncleared Settlement Payments - '.$source.' - '.date('m-d-Y').'.xlsx';
+        $displaySource = $source === 'PLAW' ? 'Progress Law' : $source;
+        $filename = 'Uncleared Settlement Payments - '.$displaySource.' - '.date('m-d-Y').'.xlsx';
         $slug = strtolower($source);
         $path = storage_path(
             'app/uncleared-settlement-payments-'.$slug.'-'.date('Ymd-His').'-'.bin2hex(random_bytes(4)).'.xlsx'
@@ -102,9 +103,10 @@ class Formatter
             'contentBytes' => base64_encode($bytes),
         ]];
 
+        $displaySource = $source === 'PLAW' ? 'Progress Law' : $source;
         $email = new EmailSenderService;
-        $subject = 'Uncleared Settlement Payments Report - '.$source;
-        $body = 'Please review the attached Uncleared Settlement Payments Report for '.$source.'.';
+        $subject = 'Uncleared Settlement Payments Report - '.$displaySource;
+        $body = 'Please review the attached Uncleared Settlement Payments Report for '.$displaySource.'.';
 
         // Fail closed: company-filtered TblReports only. No env extras, no shared VBA list.
         $sent = $email->sendMailUsingTblReports(
