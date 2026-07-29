@@ -71,7 +71,10 @@ class SyncEnrollmentPlans extends Command
                                 'fallback_connection' => $otherConnection,
                                 'count' => count($crossPlans),
                             ]);
-                            $plans = array_merge($plans, $crossPlans);
+                            // Use union (+=) NOT array_merge: array_merge renumbers integer-string keys
+                            // (contact IDs), which would replace them with sequential 0,1,2,... and break
+                            // both the unmatched-check and the downstream UPDATE by LLG_ID.
+                            $plans += $crossPlans;
                         }
                     } catch (\Throwable $e) {
                         $this->warn("[$source] Cross-source fallback failed: " . $e->getMessage());
