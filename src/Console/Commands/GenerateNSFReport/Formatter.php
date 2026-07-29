@@ -53,7 +53,8 @@ class Formatter
         $sheet->freezePane('A2');
         $sheet->setSelectedCells('A1');
 
-        $filename = 'NSF Report - '.$source.' - '.$now->format('m-d-Y').'.xlsx';
+        $displaySource = $source === 'PLAW' ? 'Progress Law' : $source;
+        $filename = 'NSF Report - '.$displaySource.' - '.$now->format('m-d-Y').'.xlsx';
         $slug = strtolower($source);
 
         if ($outputDir !== null && $outputDir !== '') {
@@ -119,10 +120,11 @@ class Formatter
             'contentBytes' => $contentBytes,
         ]];
 
+        $displaySource = $source === 'PLAW' ? 'Progress Law' : $source;
         $email = new EmailSenderService;
         $today = Carbon::now(self::REPORT_TIMEZONE)->format('m/d/Y');
         $subject = 'NSF Report - '.$today;
-        $body = 'Please see the attached NSF report for '.$source.' on '.$today.'.';
+        $body = 'Please see the attached NSF report for '.$displaySource.' on '.$today.'.';
 
         // Fail closed: company-filtered TblReports only. No env extras, no shared VBA fallback.
         $sent = $email->sendMailUsingTblReports(

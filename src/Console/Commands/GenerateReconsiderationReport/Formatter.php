@@ -136,7 +136,8 @@ class Formatter
         $spreadsheet->setActiveSheetIndex(0);
 
         $now = Carbon::now(self::REPORT_TIMEZONE);
-        $filename = 'Reconsideration Report - '.$source.' - '.$now->format('m-d-Y').'.xlsx';
+        $displaySource = $source === 'PLAW' ? 'Progress Law' : $source;
+        $filename = 'Reconsideration Report - '.$displaySource.' - '.$now->format('m-d-Y').'.xlsx';
         $slug = strtolower($source);
         $path = storage_path(
             'app/reconsideration-'.$slug.'-'.$now->format('Ymd-His').'-'.bin2hex(random_bytes(4)).'.xlsx'
@@ -194,9 +195,10 @@ class Formatter
             'contentBytes' => base64_encode($bytes),
         ]];
 
+        $displaySource = $source === 'PLAW' ? 'Progress Law' : $source;
         $email = new EmailSenderService;
         $subject = $this->emailSubject($company);
-        $body = 'Please see the attached Reconsideration Report for '.$source.'.';
+        $body = 'Please see the attached Reconsideration Report for '.$displaySource.'.';
 
         $sent = $email->sendMailUsingTblReports(
             $connector,

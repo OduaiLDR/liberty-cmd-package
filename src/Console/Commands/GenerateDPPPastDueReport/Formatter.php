@@ -40,7 +40,8 @@ class Formatter
         $spreadsheet->setActiveSheetIndexByName('Active');
         $spreadsheet->getActiveSheet()->setSelectedCells('A1');
 
-        $filename = 'DPP Past Due Report - ' . $source . ' - ' . date('m-d-Y') . '.xlsx';
+        $displaySource = $source === 'PLAW' ? 'Progress Law' : $source;
+        $filename = 'DPP Past Due Report - ' . $displaySource . ' - ' . date('m-d-Y') . '.xlsx';
         $path = storage_path('app/' . $filename);
 
         $writer = new Xlsx($spreadsheet);
@@ -77,15 +78,16 @@ class Formatter
             ],
         ];
 
+        $displayCompany = $company === 'PLAW' ? 'Progress Law' : $company;
         $email = new EmailSenderService();
         $today = date('m/d/Y');
-        $subject = 'DPP Past Due Report - ' . $company . ' - ' . $today;
+        $subject = 'DPP Past Due Report - ' . $displayCompany . ' - ' . $today;
 
         $activeCount = count($partitioned['Active'] ?? []);
         $graduatedCount = count($partitioned['Graduated'] ?? []);
         $droppedCount = count($partitioned['Dropped'] ?? []);
 
-        $body = 'Please see the attached DPP Past Due Report for ' . $company . ' on ' . $today . '.<br><br>'
+        $body = 'Please see the attached DPP Past Due Report for ' . $displayCompany . ' on ' . $today . '.<br><br>'
             . 'Breakdown of past-due PF/C transactions by client status:<br>'
             . '&bull; <b>Active:</b> ' . number_format($activeCount) . '<br>'
             . '&bull; <b>Graduated:</b> ' . number_format($graduatedCount) . '<br>'
