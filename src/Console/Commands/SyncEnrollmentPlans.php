@@ -29,13 +29,15 @@ class SyncEnrollmentPlans extends Command
                 'source' => $source,
             ]);
 
+            unset($connector);
+
             try {
                 $connector = DBConnector::fromEnvironment($connection);
                 $connector->initializeSqlServer();
                 $this->ensureLogTable($connector);
                 $this->assertSqlServerConnection($connector, $source);
 
-                $missingContacts = $this->fetchMissingContactIds($connector);
+                $missingContacts = $this->fetchMissingContactIds($connector, $connection);
 
                 if (empty($missingContacts)) {
                     $this->warn("[$source] No contacts missing Enrollment_Plan in last 90 days.");
@@ -54,6 +56,35 @@ class SyncEnrollmentPlans extends Command
                 $this->info("[$source] Found " . count($missingContacts) . " contacts missing plans.");
 
                 $plans = $this->fetchPlansFromSnowflake($connector, $missingContacts, $connection);
+
+                // Cross-source fallback: some LDR contacts have plans in PLAW Snowflake and vice versa
+                $stillMissing = array_diff($missingContacts, array_keys($plans));
+                if (!empty($stillMissing)) {
+                    $otherConnection = ($connection === 'ldr') ? 'plaw' : 'ldr';
+                    try {
+                        $otherConnector = DBConnector::fromEnvironment($otherConnection);
+                        $crossPlans = $this->fetchPlansFromSnowflake($otherConnector, $stillMissing, $otherConnection);
+                        if (!empty($crossPlans)) {
+                            $this->info("[$source] Cross-source fallback (" . strtoupper($otherConnection) . "): found " . count($crossPlans) . " additional plans.");
+                            Log::info('SyncEnrollmentPlans: cross-source plans found.', [
+                                'source' => $source,
+                                'fallback_connection' => $otherConnection,
+                                'count' => count($crossPlans),
+                            ]);
+                            // Use union (+=) NOT array_merge: array_merge renumbers integer-string keys
+                            // (contact IDs), which would replace them with sequential 0,1,2,... and break
+                            // both the unmatched-check and the downstream UPDATE by LLG_ID.
+                            $plans += $crossPlans;
+                        }
+                    } catch (\Throwable $e) {
+                        $this->warn("[$source] Cross-source fallback failed: " . $e->getMessage());
+                        Log::warning('SyncEnrollmentPlans: cross-source fallback failed.', [
+                            'source' => $source,
+                            'fallback_connection' => $otherConnection,
+                            'exception' => $e->getMessage(),
+                        ]);
+                    }
+                }
 
                 // Log contacts that couldn't be matched in Snowflake
                 $unmatchedIds = array_diff($missingContacts, array_keys($plans));
@@ -153,7 +184,7 @@ class SyncEnrollmentPlans extends Command
         return $hadException ? Command::FAILURE : Command::SUCCESS;
     }
 
-    protected function fetchMissingContactIds(DBConnector $connector): array
+    protected function fetchMissingContactIds(DBConnector $connector, string $connection = 'ldr'): array
     {
         $sql = <<<SQL
 SELECT LTRIM(RTRIM(REPLACE(LLG_ID, 'LLG-', ''))) AS CONTACT_ID
