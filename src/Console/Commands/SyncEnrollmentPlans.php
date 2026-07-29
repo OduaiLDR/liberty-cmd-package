@@ -8,7 +8,9 @@ use Illuminate\Support\Facades\Log;
 
 class SyncEnrollmentPlans extends Command
 {
-    protected $signature = 'enrollment:sync-plans {--diagnose : Show detailed diagnostics for contacts that cannot be matched}';
+    protected $signature = 'enrollment:sync-plans
+        {--diagnose : Show detailed diagnostics for contacts that cannot be matched}
+        {--contact-ids= : Comma-separated LLG IDs to force-sync (bypasses the 90-day Welcome_Call_Date filter). Example: --contact-ids=LLG-807022862,LLG-833541544}';
 
     protected $desription = 'Sync enrollment plans from Snowflake to SQL Server TblEnrollment for contacts missing Enrollment_Plan';
 
@@ -186,6 +188,22 @@ class SyncEnrollmentPlans extends Command
 
     protected function fetchMissingContactIds(DBConnector $connector, string $connection = 'ldr'): array
     {
+        // --contact-ids=LLG-X,LLG-Y overrides the SQL Server query entirely,
+        // letting us force-sync specific contacts regardless of the 90-day
+        // Welcome_Call_Date filter (e.g. Jacob-directed backfills).
+        $override = (string) ($this->option('contact-ids') ?? '');
+        if ($override !== '') {
+            $ids = [];
+            foreach (explode(',', $override) as $raw) {
+                $numeric = preg_replace('/\D+/', '', (string) $raw);
+                if ($numeric !== '' && $numeric !== null) {
+                    $ids[] = (string) $numeric;
+                }
+            }
+            $this->info('Using --contact-ids override: ' . count($ids) . ' IDs.');
+            return $ids;
+        }
+
         $sql = <<<SQL
 SELECT LTRIM(RTRIM(REPLACE(LLG_ID, 'LLG-', ''))) AS CONTACT_ID
 FROM TblEnrollment
