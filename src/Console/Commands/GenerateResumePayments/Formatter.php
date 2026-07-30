@@ -194,7 +194,7 @@ class Formatter
     /**
      * The stages to DISPLAY. A --cancels-only run skips the NSF status step, so its
      * report shows only the four Cancels stages (the NSF/Resolved rows would just be
-     * zeros); a full run shows all eight. Grouping still buckets all eight — this only
+     * zeros); a full run shows all eight. Grouping still buckets all eight — this onlyj
      * controls what the summary + workbook render.
      *
      * @return list<array{key:string,label:string,sheet:string}>
