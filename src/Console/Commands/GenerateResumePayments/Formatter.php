@@ -144,7 +144,9 @@ class Formatter
      */
     private function buildEmptyBody(string $label): string
     {
-        return 'ResumePayments summary &mdash; ' . htmlspecialchars($label, ENT_QUOTES, 'UTF-8')
+        // Jacob 2026-07-30: two-line heading — title on line 1, "LDR — date" on line 2.
+        return 'Resume Payments Summary<br>'
+            . htmlspecialchars($label, ENT_QUOTES, 'UTF-8')
             . ' &mdash; ' . date('m/d/Y') . '<br><br>'
             . 'No NSF status changes or system cancels to report today.';
     }
@@ -236,8 +238,6 @@ class Formatter
         $spacer = '<tr><td colspan="3" style="padding:3px 0;"></td></tr>';
 
         $rows = '';
-        $totalClients = 0;
-        $totalDebt = 0.0;
         $prevSection = null;
         $secClients = 0;
         $secDebt = 0.0;
@@ -248,7 +248,9 @@ class Formatter
             // Section changed → close out the previous one (its subtotal, if any) + a spacer.
             if ($prevSection !== null && $section !== $prevSection) {
                 if (isset($subtotalLabel[$prevSection])) {
-                    $rows .= $this->summaryRow($subtotalLabel[$prevSection], $secClients, $secDebt, 'subtotal');
+                    // Jacob 2026-07-30: line under NSF Total (before Cancels).
+                    $subtotalBottom = ($prevSection === 'nsf');
+                    $rows .= $this->summaryRow($subtotalLabel[$prevSection], $secClients, $secDebt, 'subtotal', $subtotalBottom);
                 }
                 $rows .= $spacer;
                 $secClients = 0;
@@ -261,23 +263,25 @@ class Formatter
             foreach ($bucket as $r) {
                 $debt += (float) ($r['debt'] ?? 0);
             }
-            $totalClients += $count;
-            $totalDebt += $debt;
             $secClients += $count;
             $secDebt += $debt;
 
-            $rows .= $this->summaryRow($stage['label'], $count, $debt);
+            // Jacob 2026-07-30: line under Resolved (it is its own single-row section).
+            $rowBottom = ($stage['key'] === 'Resolved');
+            $rows .= $this->summaryRow($stage['label'], $count, $debt, '', $rowBottom);
             $prevSection = $section;
         }
 
-        // Close the final section's subtotal (e.g. Cancels), then a spacer before the grand Total.
+        // Close the final section's subtotal (e.g. Cancels — no bottom border; last visible row).
         if ($prevSection !== null && isset($subtotalLabel[$prevSection])) {
             $rows .= $this->summaryRow($subtotalLabel[$prevSection], $secClients, $secDebt, 'subtotal');
         }
-        $rows .= $spacer;
+        // Grand Total removed per Jacob 2026-07-30.
 
-        $heading = $cancelsOnly ? 'System Cancels summary' : 'ResumePayments summary';
-        $body  = $heading . ' &mdash; ' . htmlspecialchars($label, ENT_QUOTES, 'UTF-8')
+        // Jacob 2026-07-30: two-line heading — title on line 1, "LDR — date" on line 2.
+        $heading = $cancelsOnly ? 'System Cancels Summary' : 'Resume Payments Summary';
+        $body  = $heading . '<br>'
+            . htmlspecialchars($label, ENT_QUOTES, 'UTF-8')
             . ' &mdash; ' . date('m/d/Y') . '<br><br>';
         $body .= '<table style="border-collapse:collapse; font-family:Calibri,Arial,sans-serif; font-size:13px;">';
         $body .= '<tr>'
@@ -286,9 +290,9 @@ class Formatter
             . '<th style="text-align:right; padding:4px 0; border-bottom:1px solid #ccc;">Debt</th>'
             . '</tr>';
         $body .= $rows;
-        $body .= $this->summaryRow('Total', $totalClients, $totalDebt, 'grand');
         $body .= '</table>';
-        $body .= '<br>Per-client detail (LLG ID, name, debt, days since NSF) is in the attached workbook &mdash; one sheet per stage.';
+        // Jacob 2026-07-30: short closing line.
+        $body .= '<br>Contact level detail attached.';
 
         return $body;
     }
@@ -297,7 +301,7 @@ class Formatter
      * One summary-table row. $variant: '' = normal, 'subtotal' = bold + light top rule,
      * 'grand' = bold + heavier top rule.
      */
-    private function summaryRow(string $label, int $count, float $debt, string $variant = ''): string
+    private function summaryRow(string $label, int $count, float $debt, string $variant = '', bool $borderBottom = false): string
     {
         $bold = $variant !== '';
         $o = $bold ? '<b>' : '';
@@ -307,6 +311,9 @@ class Formatter
             'subtotal' => ' border-top:1px solid #ccc;',
             default => '',
         };
+        if ($borderBottom) {
+            $border .= ' border-bottom:1px solid #ccc;';
+        }
 
         return '<tr>'
             . '<td style="padding:5px 16px 4px 0;' . $border . '">' . $o . htmlspecialchars($label, ENT_QUOTES, 'UTF-8') . $c . '</td>'
