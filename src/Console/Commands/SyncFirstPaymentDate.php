@@ -17,17 +17,24 @@ use Illuminate\Support\Facades\Log;
  * 4. For CANCELLED contacts:
  *    - Don't update first payment date if it already has a value (prevent dates moving up)
  *    - BUT if First_Payment_Date IS NULL, still populate it
+ *    - Once set, First_Payment_Date is frozen for a cancelled contact — it never rolls
+ *      forward again, even if Snowflake later shows a new future-dated draft on the
+ *      account. A cancelled contact isn't waiting on a payment; showing one confuses
+ *      reporting on accounts that dropped long ago.
  */
 class SyncFirstPaymentDate extends Command
 {
-    protected $signature = 'sync:first-payment-date';
+    protected $signature = 'sync:first-payment-date
+                            {--dry-run : Preview what would change without writing to SQL Server or TblLog}';
 
     protected $description = 'Sync First_Payment_Date and First_Payment_Cleared_Date in TblEnrollment from Snowflake TRANSACTIONS';
 
     public function handle(): int
     {
-        $this->info('First payment sync: starting.');
-        Log::info('SyncFirstPaymentDate command started.');
+        $dryRun = (bool) $this->option('dry-run');
+
+        $this->info($dryRun ? 'First payment sync: starting (DRY RUN — no writes will be made).' : 'First payment sync: starting.');
+        Log::info('SyncFirstPaymentDate command started.', ['dry_run' => $dryRun]);
 
         $connections = ['plaw', 'ldr'];
         $hadException = false;
@@ -59,9 +66,11 @@ class SyncFirstPaymentDate extends Command
 
                     // Apply cleared payments (final values)
                     if (!empty($clearedPayments)) {
-                        $this->info("[$source] Applying cleared payments to SQL Server...");
-                        $updatedCleared = $this->updateWithClearedPayments($connector, $clearedPayments);
-                        $this->info("[$source] Updated {$updatedCleared} rows with cleared payment dates.");
+                        $this->info($dryRun
+                            ? "[$source] DRY RUN — previewing cleared payments..."
+                            : "[$source] Applying cleared payments to SQL Server...");
+                        $updatedCleared = $this->updateWithClearedPayments($connector, $clearedPayments, $source, $dryRun);
+                        $this->info("[$source] " . ($dryRun ? 'Would update' : 'Updated') . " {$updatedCleared} rows with cleared payment dates.");
                     }
                 }
 
@@ -86,9 +95,11 @@ class SyncFirstPaymentDate extends Command
 
                     // Apply scheduled payments (update First_Payment_Date only)
                     if (!empty($scheduledPayments)) {
-                        $this->info("[$source] Applying scheduled payments to SQL Server...");
-                        $updatedScheduled = $this->updateWithScheduledPayments($connector, $scheduledPayments);
-                        $this->info("[$source] Updated {$updatedScheduled} rows with scheduled payment dates.");
+                        $this->info($dryRun
+                            ? "[$source] DRY RUN — previewing scheduled payments..."
+                            : "[$source] Applying scheduled payments to SQL Server...");
+                        $updatedScheduled = $this->updateWithScheduledPayments($connector, $scheduledPayments, $source, $dryRun);
+                        $this->info("[$source] " . ($dryRun ? 'Would update' : 'Updated') . " {$updatedScheduled} rows with scheduled payment dates.");
                     }
                 }
 
@@ -103,52 +114,47 @@ class SyncFirstPaymentDate extends Command
                     $this->info("[$source] Found " . count($cancelledPayments) . " payments for cancelled contacts.");
 
                     if (!empty($cancelledPayments)) {
-                        $this->info("[$source] Applying first payment dates for cancelled contacts...");
-                        $updatedCancelled = $this->updateCancelledWithFirstPayment($connector, $cancelledPayments);
-                        $this->info("[$source] Updated {$updatedCancelled} cancelled rows with first payment date.");
+                        $this->info($dryRun
+                            ? "[$source] DRY RUN — previewing first payment dates for cancelled contacts..."
+                            : "[$source] Applying first payment dates for cancelled contacts...");
+                        $updatedCancelled = $this->updateCancelledWithFirstPayment($connector, $cancelledPayments, $source, $dryRun);
+                        $this->info("[$source] " . ($dryRun ? 'Would update' : 'Updated') . " {$updatedCancelled} cancelled rows with first payment date.");
                     }
                 }
 
-                // STEP 5: Handle CANCELLED contacts with OVERDUE First_Payment_Date (roll forward)
-                $this->info("[$source] Fetching cancelled IDs with overdue First_Payment_Date...");
-                $cancelledOverdueIds = $this->fetchCancelledWithOverduePaymentDate($connector);
-                $this->info("[$source] Found " . count($cancelledOverdueIds) . " cancelled IDs with overdue payment date.");
+                // STEP 5 (removed): this used to roll a CANCELLED contact's overdue
+                // First_Payment_Date forward to whatever future-dated draft Snowflake
+                // still had on file. That directly contradicted this class's own rule
+                // above ("don't update first payment date if it already has a value")
+                // and was why accounts that dropped months/years ago kept showing
+                // current/upcoming First_Payment_Date values — Jacob flagged this on
+                // 2026-07-31. Cancelled contacts' First_Payment_Date is now frozen once
+                // set by STEP 4.
 
-                $cancelledRollForward = [];
-                if (!empty($cancelledOverdueIds)) {
-                    // Exclude cancelled contacts whose first payment was returned — their date must stay locked
-                    $cancelledNsfIds = $this->fetchContactsWithReturnedPayments($connector, $cancelledOverdueIds);
-                    if (!empty($cancelledNsfIds)) {
-                        $this->info("[$source] Excluding " . count($cancelledNsfIds) . " cancelled contacts with returned payments from roll-forward.");
-                        $cancelledOverdueIds = array_values(array_diff($cancelledOverdueIds, $cancelledNsfIds));
-                    }
+                $totalUpdated = count($clearedPayments) + count($scheduledPayments) + count($cancelledNullIds);
 
-                    $this->info("[$source] Checking Snowflake for future payments for cancelled overdue contacts...");
-                    $cancelledRollForward = $this->fetchFuturePaymentsForCancelled($connector, $cancelledOverdueIds);
-                    $this->info("[$source] Found " . count($cancelledRollForward) . " future payments for cancelled contacts.");
-
-                    if (!empty($cancelledRollForward)) {
-                        $this->info("[$source] Rolling forward cancelled contacts to future payment dates...");
-                        $updatedRollForward = $this->updateCancelledRollForward($connector, $cancelledRollForward);
-                        $this->info("[$source] Updated {$updatedRollForward} cancelled rows with rolled forward dates.");
-                    }
+                if ($dryRun) {
+                    $this->info(sprintf(
+                        '[%s] DRY RUN summary — would update %d row(s): Cleared: %d, Scheduled: %d, Cancelled: %d. Nothing was written to SQL Server or TblLog.',
+                        $source, $totalUpdated, count($clearedPayments), count($scheduledPayments), count($cancelledNullIds)
+                    ));
+                } else {
+                    $this->insertLogRow(
+                        $connector,
+                        $source,
+                        'SYNC_FIRST_PAYMENT_DATE',
+                        'SUCCESS',
+                        $totalUpdated,
+                        0,
+                        sprintf('Cleared: %d, Scheduled: %d, Cancelled: %d',
+                            count($clearedPayments), count($scheduledPayments), count($cancelledNullIds))
+                    );
                 }
-
-                $totalUpdated = count($clearedPayments) + count($scheduledPayments) + count($cancelledNullIds) + count($cancelledRollForward);
-                $this->insertLogRow(
-                    $connector,
-                    $source,
-                    'SYNC_FIRST_PAYMENT_DATE',
-                    'SUCCESS',
-                    $totalUpdated,
-                    0,
-                    sprintf('Cleared: %d, Scheduled: %d, Cancelled: %d', 
-                        count($clearedPayments), count($scheduledPayments), count($cancelledNullIds))
-                );
 
                 Log::info('SyncFirstPaymentDate: connection finished.', [
                     'connection' => $connection,
                     'source' => $source,
+                    'dry_run' => $dryRun,
                     'cleared' => count($clearedPayments),
                     'scheduled' => count($scheduledPayments),
                 ]);
@@ -419,8 +425,19 @@ SQL;
                     return "('" . $this->escapeSqlString($id) . "')";
                 }, $remainingIds));
 
-                // Get the NEXT future payment (after today) - this is the "roll forward" logic
-                // If old payment didn't clear after 3+ business days, move to next scheduled date
+                // Fallback: earliest remaining uncleared, non-returned D payment,
+                // with NO date restriction. Priority 1 above only looks at payments
+                // still within the 3-business-day grace window; the old version of
+                // this fallback additionally required PROCESS_DATE > CURRENT_DATE
+                // ("next future payment"), which meant a contact whose only uncleared
+                // payment was both stale (past the grace window) AND had nothing
+                // rescheduled after it matched neither query. Those contacts silently
+                // dropped out of $payments every run and First_Payment_Date froze on
+                // the old stale date forever — Jacob flagged this on 2026-07-31 as
+                // "payment dates from 3+ days back that has not moved." Removing the
+                // future-only restriction means every contact with any live uncleared
+                // payment gets a value here, stale or not, so the sync keeps reflecting
+                // reality instead of going silent.
                 $sqlFallback = <<<SQL
 SELECT
     CONTACT_ID,
@@ -435,7 +452,6 @@ FROM (
       AND t.TRANS_TYPE = 'D'
       AND t.RETURNED_DATE IS NULL
       AND t.CLEARED_DATE IS NULL
-      AND TO_DATE(t.PROCESS_DATE) > CURRENT_DATE
 )
 WHERE N = 1
 SQL;
@@ -534,10 +550,17 @@ SQL;
      * Update SQL Server with cleared payments (final values)
      * Sets First_Payment_Date = PROCESS_DATE, First_Payment_Cleared_Date = CLEARED_DATE
      */
-    protected function updateWithClearedPayments(DBConnector $connector, array $payments): int
+    protected function updateWithClearedPayments(DBConnector $connector, array $payments, string $source = '', bool $dryRun = false): int
     {
         if (empty($payments)) {
             return 0;
+        }
+
+        if ($dryRun) {
+            return $this->previewChanges($connector, $source, 'cleared payment', $payments, static fn(array $data) => [
+                $data['process_date'] ?? null,
+                $data['cleared_date'] ?? null,
+            ]);
         }
 
         $totalUpdated = 0;
@@ -590,10 +613,17 @@ SQL;
     /**
      * Update SQL Server with scheduled payments (First_Payment_Date only)
      */
-    protected function updateWithScheduledPayments(DBConnector $connector, array $payments): int
+    protected function updateWithScheduledPayments(DBConnector $connector, array $payments, string $source = '', bool $dryRun = false): int
     {
         if (empty($payments)) {
             return 0;
+        }
+
+        if ($dryRun) {
+            return $this->previewChanges($connector, $source, 'scheduled payment', $payments, static fn(array $data) => [
+                $data['process_date'] ?? null,
+                null, // First_Payment_Cleared_Date is untouched by this update
+            ]);
         }
 
         $totalUpdated = 0;
@@ -625,10 +655,17 @@ SQL;
     /**
      * Update cancelled contacts with first payment date (only if currently NULL)
      */
-    protected function updateCancelledWithFirstPayment(DBConnector $connector, array $payments): int
+    protected function updateCancelledWithFirstPayment(DBConnector $connector, array $payments, string $source = '', bool $dryRun = false): int
     {
         if (empty($payments)) {
             return 0;
+        }
+
+        if ($dryRun) {
+            return $this->previewChanges($connector, $source, 'cancelled first payment', $payments, static fn(array $data) => [
+                $data['process_date'] ?? null,
+                $data['cleared_date'] ?? null,
+            ]);
         }
 
         $totalUpdated = 0;
@@ -673,133 +710,6 @@ SQL;
             
             $sql = "UPDATE dbo.TblEnrollment SET " . implode(", ", $setClauses) . 
                    " WHERE LLG_ID IN ({$idList}) AND First_Payment_Date IS NULL";
-
-            $result = $connector->querySqlServer($sql);
-            $totalUpdated += $this->getRowCount($result);
-        }
-
-        return $totalUpdated;
-    }
-
-    /**
-     * Get CANCELLED contacts with First_Payment_Date that is overdue (3+ business days old)
-     */
-    protected function fetchCancelledWithOverduePaymentDate(DBConnector $connector): array
-    {
-        // Calculate 3 business days back
-        $today = new \DateTime();
-        $dayOfWeek = (int) $today->format('N');
-        $daysBack = match($dayOfWeek) {
-            1 => 5, 2 => 5, 3 => 5, 4 => 3, 5 => 3, 6 => 5, 7 => 6, default => 3,
-        };
-        $cutoffDate = (clone $today)->modify("-{$daysBack} days")->format('Y-m-d');
-
-        $sql = <<<SQL
-SELECT LLG_ID
-FROM dbo.TblEnrollment
-WHERE First_Payment_Date IS NOT NULL
-  AND First_Payment_Cleared_Date IS NULL
-  AND Cancel_Date IS NOT NULL
-  AND First_Payment_Date < '{$cutoffDate}'
-  AND LLG_ID LIKE 'LLG-%'
-  AND TRY_CONVERT(BIGINT, REPLACE(LLG_ID, 'LLG-', '')) IS NOT NULL
-SQL;
-
-        return $this->extractLlgIds($connector->querySqlServer($sql));
-    }
-
-    /**
-     * Fetch NEXT FUTURE payment for cancelled contacts (to roll forward)
-     */
-    protected function fetchFuturePaymentsForCancelled(DBConnector $connector, array $llgIds): array
-    {
-        if (empty($llgIds)) {
-            return [];
-        }
-
-        $contactToLlg = $this->buildContactToLlgMap($llgIds);
-        $contactIds = array_keys($contactToLlg);
-
-        if (empty($contactIds)) {
-            return [];
-        }
-
-        $payments = [];
-        $chunkSize = 500;
-
-        foreach (array_chunk($contactIds, $chunkSize) as $chunk) {
-            $values = implode(', ', array_map(function ($id) {
-                return "('" . $this->escapeSqlString($id) . "')";
-            }, $chunk));
-
-            // Get FIRST future payment (after today)
-            $sql = <<<SQL
-SELECT
-    CONTACT_ID,
-    TO_VARCHAR(PROCESS_DATE, 'YYYY-MM-DD') AS PROCESS_DATE
-FROM (
-    SELECT
-        t.CONTACT_ID,
-        TO_DATE(t.PROCESS_DATE) AS PROCESS_DATE,
-        ROW_NUMBER() OVER (PARTITION BY t.CONTACT_ID ORDER BY TO_DATE(t.PROCESS_DATE) ASC) AS N
-    FROM TRANSACTIONS t
-    WHERE t.CONTACT_ID IN (SELECT TO_NUMBER(column1) FROM VALUES {$values})
-      AND t.TRANS_TYPE = 'D'
-      AND t.RETURNED_DATE IS NULL
-      AND t.CLEARED_DATE IS NULL
-      AND TO_DATE(t.PROCESS_DATE) > CURRENT_DATE
-)
-WHERE N = 1
-SQL;
-
-            $result = $connector->query($sql);
-            $rows = $this->extractRows($result);
-
-            foreach ($rows as $row) {
-                $cid = $this->getRowValue($row, 'CONTACT_ID');
-                $processDate = $this->normalizeDate($this->getRowValue($row, 'PROCESS_DATE'));
-
-                if (!$cid || !$processDate) {
-                    continue;
-                }
-
-                $llgId = $contactToLlg[$cid] ?? ('LLG-' . $cid);
-                $payments[$llgId] = [
-                    'process_date' => $processDate,
-                ];
-            }
-        }
-
-        return $payments;
-    }
-
-    /**
-     * Update cancelled contacts with rolled forward First_Payment_Date
-     */
-    protected function updateCancelledRollForward(DBConnector $connector, array $payments): int
-    {
-        if (empty($payments)) {
-            return 0;
-        }
-
-        $totalUpdated = 0;
-        $batchSize = 500;
-
-        foreach (array_chunk($payments, $batchSize, true) as $chunk) {
-            $casesDate = [];
-            $ids = [];
-
-            foreach ($chunk as $llgId => $data) {
-                $llgEsc = $this->escapeSqlString($llgId);
-                $dateEsc = $this->escapeSqlString($data['process_date']);
-
-                $casesDate[] = "WHEN '{$llgEsc}' THEN '{$dateEsc}'";
-                $ids[] = "'{$llgEsc}'";
-            }
-
-            $idList = implode(', ', $ids);
-            $casesDateSql = implode(' ', $casesDate);
-            $sql = "UPDATE dbo.TblEnrollment SET First_Payment_Date = CASE LLG_ID {$casesDateSql} ELSE First_Payment_Date END WHERE LLG_ID IN ({$idList})";
 
             $result = $connector->querySqlServer($sql);
             $totalUpdated += $this->getRowCount($result);
@@ -856,6 +766,84 @@ SQL;
     }
 
     // Helper methods
+
+    /**
+     * Dry-run helper: shows old value -> new value for each row a write method
+     * would have touched, without executing any UPDATE. Reads current
+     * First_Payment_Date/First_Payment_Cleared_Date so you can see exactly
+     * what would change (or not) before trusting the logic against real data.
+     *
+     * @param array<string, array<string, mixed>> $payments  LLG_ID => payment data
+     * @param callable(array<string,mixed>): array{0:?string,1:?string} $newValuesFor
+     *        Given one payment's data, returns [newFirstPaymentDate, newClearedDate].
+     *        Either can be null to mean "unchanged".
+     */
+    protected function previewChanges(
+        DBConnector $connector,
+        string $source,
+        string $label,
+        array $payments,
+        callable $newValuesFor
+    ): int {
+        $current = $this->fetchCurrentValues($connector, array_keys($payments));
+
+        $this->line(sprintf('[%s] DRY RUN — %s: %d row(s) would be updated.', $source, $label, count($payments)));
+
+        $shown = 0;
+        foreach ($payments as $llgId => $data) {
+            if ($shown >= 15) {
+                $this->line(sprintf('  ... and %d more not shown', count($payments) - $shown));
+                break;
+            }
+
+            [$newDate, $newCleared] = $newValuesFor($data);
+            $cur = $current[$llgId] ?? ['First_Payment_Date' => null, 'First_Payment_Cleared_Date' => null];
+
+            $this->line(sprintf(
+                '  %s: First_Payment_Date %s -> %s | First_Payment_Cleared_Date %s -> %s',
+                $llgId,
+                $cur['First_Payment_Date'] ?? 'NULL',
+                $newDate ?? '(unchanged)',
+                $cur['First_Payment_Cleared_Date'] ?? 'NULL',
+                $newCleared ?? '(unchanged)',
+            ));
+            $shown++;
+        }
+
+        return count($payments);
+    }
+
+    /**
+     * @param list<string> $llgIds
+     * @return array<string, array{First_Payment_Date: ?string, First_Payment_Cleared_Date: ?string}>
+     */
+    protected function fetchCurrentValues(DBConnector $connector, array $llgIds): array
+    {
+        $current = [];
+
+        foreach (array_chunk($llgIds, 500) as $chunk) {
+            $idList = implode(', ', array_map(
+                fn(string $id): string => "'" . $this->escapeSqlString($id) . "'",
+                $chunk
+            ));
+
+            $sql = "SELECT LLG_ID, First_Payment_Date, First_Payment_Cleared_Date FROM dbo.TblEnrollment WHERE LLG_ID IN ({$idList})";
+            $rows = $this->extractRows($connector->querySqlServer($sql));
+
+            foreach ($rows as $row) {
+                $llgId = $this->getRowValue($row, 'LLG_ID');
+                if ($llgId === null) {
+                    continue;
+                }
+                $current[$llgId] = [
+                    'First_Payment_Date' => $this->getRowValue($row, 'First_Payment_Date'),
+                    'First_Payment_Cleared_Date' => $this->getRowValue($row, 'First_Payment_Cleared_Date'),
+                ];
+            }
+        }
+
+        return $current;
+    }
 
     protected function buildContactToLlgMap(array $llgIds): array
     {
