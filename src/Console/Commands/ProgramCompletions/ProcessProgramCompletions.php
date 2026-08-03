@@ -167,7 +167,32 @@ class ProcessProgramCompletions extends Command
 
     private function fetchEligibleCompletions(DBConnector $connector, string $contactFilter, string $company): array
     {
-        // Build WHERE clause for optional contact filter
+        // Aggregate each source independently before joining. Joining raw
+        // settlement rows to raw enrollment rows multiplies both sums when a
+        // client has more than one row in either table.
+        $settlementAggregate = <<<SQL
+SELECT
+    s.LLG_ID,
+    MAX(s.Client) AS Client,
+    SUM(COALESCE(s.Settlement, 0)) AS Total_Settlement_Amounts_Accepted,
+    SUM(COALESCE(s.Debt_Amount, 0)) AS Original_Debt_Amount_Settled,
+    MAX(s.Settlement_Date) AS Latest_Settlement_Date
+FROM TblSettlementDetails AS s
+GROUP BY s.LLG_ID
+SQL;
+        $enrollmentAggregate = <<<SQL
+SELECT
+    e.LLG_ID,
+    MAX(e.Client) AS Client,
+    MAX(e.Welcome_Call_Date) AS Welcome_Call_Date,
+    SUM(COALESCE(e.Debt_Amount, 0)) AS Enrolled_Debt,
+    MAX(e.Enrollment_Plan) AS Enrollment_Plan,
+    MAX(e.Category) AS Category
+FROM TblEnrollment AS e
+GROUP BY e.LLG_ID
+SQL;
+
+        // Build WHERE clause for optional contact and company filters.
         $whereClause = '';
         if ($contactFilter !== '') {
             $whereClause = "AND s.LLG_ID = '{$this->escapeSqlString($contactFilter)}' ";
@@ -182,26 +207,25 @@ class ProcessProgramCompletions extends Command
         if ($this->forceMode && $contactFilter !== '') {
             $havingClause = "";
         } else {
-            $havingClause = "HAVING CASE WHEN SUM(e.Debt_Amount) > 0 THEN SUM(s.Debt_Amount) / SUM(e.Debt_Amount) ELSE 0 END >= 1.0
-AND s.LLG_ID NOT IN (SELECT LLG_ID FROM TblProgramCompletions)";
+            $havingClause = "AND (CASE WHEN COALESCE(e.Enrolled_Debt, 0) > 0 THEN COALESCE(s.Original_Debt_Amount_Settled, 0) / e.Enrolled_Debt ELSE 0 END) >= 1.0
+AND NOT EXISTS (SELECT 1 FROM TblProgramCompletions pc WHERE pc.LLG_ID = s.LLG_ID)";
         }
 
         // CRM Contact ID is the numeric part of LLG_ID (after 'LLG-')
         $sql = <<<SQL
 SELECT 
     s.LLG_ID,
-    s.Client,
+    COALESCE(s.Client, e.Client) AS Client,
     e.Welcome_Call_Date,
-    SUM(s.Settlement) AS Total_Settlement_Amounts_Accepted,
-    SUM(s.Debt_Amount) AS Original_Debt_Amount_Settled,
-    SUM(e.Debt_Amount) AS Enrolled_Debt,
-    CASE WHEN SUM(s.Debt_Amount) > 0 THEN SUM(s.Settlement) / SUM(s.Debt_Amount) ELSE 0 END AS Settlement_Rate,
-    CASE WHEN SUM(e.Debt_Amount) > 0 THEN SUM(s.Debt_Amount) / SUM(e.Debt_Amount) ELSE 0 END AS Program_Completion,
-    MAX(s.Settlement_Date) AS Latest_Settlement_Date
-FROM TblSettlementDetails AS s
-INNER JOIN TblEnrollment AS e ON s.LLG_ID = e.LLG_ID
+    s.Total_Settlement_Amounts_Accepted,
+    s.Original_Debt_Amount_Settled,
+    e.Enrolled_Debt,
+    CASE WHEN COALESCE(s.Original_Debt_Amount_Settled, 0) > 0 THEN s.Total_Settlement_Amounts_Accepted / s.Original_Debt_Amount_Settled ELSE 0 END AS Settlement_Rate,
+    CASE WHEN COALESCE(e.Enrolled_Debt, 0) > 0 THEN s.Original_Debt_Amount_Settled / e.Enrolled_Debt ELSE 0 END AS Program_Completion,
+    s.Latest_Settlement_Date
+FROM ({$settlementAggregate}) AS s
+INNER JOIN ({$enrollmentAggregate}) AS e ON s.LLG_ID = e.LLG_ID
 WHERE 1=1 {$whereClause}
-GROUP BY s.LLG_ID, s.Client, e.Welcome_Call_Date
 {$havingClause}
 ORDER BY Program_Completion DESC
 SQL;
@@ -227,7 +251,9 @@ SQL;
 
         return match (strtoupper($company)) {
             'LDR' => "AND ((UPPER(ISNULL({$planColumn}, '')) LIKE 'LDR%' OR UPPER(ISNULL({$planColumn}, '')) LIKE 'LT L%') OR (({$planColumn} IS NULL OR LTRIM(RTRIM({$planColumn})) = '') AND UPPER(ISNULL({$categoryColumn}, '')) = 'LDR')) ",
-            'PLAW' => "AND (UPPER(ISNULL({$planColumn}, '')) LIKE 'PLAW%' OR UPPER(ISNULL({$planColumn}, '')) LIKE '%PROGRESS%' OR UPPER(ISNULL({$categoryColumn}, '')) = 'PLAW') ",
+            // PLAW/Progress Law rows are stored as Category='CCS' in the
+            // synchronized SQL Server enrollment table.
+            'PLAW' => "AND (UPPER(ISNULL({$planColumn}, '')) LIKE 'PLAW%' OR UPPER(ISNULL({$planColumn}, '')) LIKE '%PROGRESS%' OR UPPER(ISNULL({$categoryColumn}, '')) IN ('PLAW', 'CCS')) ",
             default => '',
         };
     }

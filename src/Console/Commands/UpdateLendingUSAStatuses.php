@@ -48,6 +48,7 @@ class UpdateLendingUSAStatuses extends Command
     protected string $forthApiKeyOverride = '';
     protected string $currentConnection = 'plaw';
     protected ?string $forthApiKeyCache = null;
+    protected bool $statusSourceColumnAvailable = false;
 
     // Counters
     protected int $totalFetched = 0;
@@ -111,6 +112,7 @@ class UpdateLendingUSAStatuses extends Command
             $this->info('[1/6] Initializing database connections...');
             $this->connector = DBConnector::fromEnvironment($connection);
             $this->connector->initializeSqlServer();
+            $this->ensureStatusSourceColumn();
             $this->info('  Snowflake + SQL Server: OK');
 
             // 2. Resolve Forth API key
@@ -191,16 +193,50 @@ class UpdateLendingUSAStatuses extends Command
 
     protected function loadStatusSnapshot(): array
     {
-        $sql = "SELECT CID, Status FROM TblLendingUSAStatuses WHERE Expired = 'FALSE'";
+        $sql = $this->statusSourceColumnAvailable
+            ? "SELECT CID, Status, Source FROM TblLendingUSAStatuses WHERE Expired = 'FALSE' ORDER BY CID, CASE WHEN Source = '{$this->esc(strtoupper($this->currentConnection))}' THEN 0 ELSE 1 END, Processed_Time DESC"
+            : "SELECT CID, Status FROM TblLendingUSAStatuses WHERE Expired = 'FALSE'";
         $result = $this->connector->querySqlServer($sql);
 
         $map = [];
         foreach ($result['data'] ?? [] as $row) {
             $cid = (string) $row['CID'];
-            $map[$cid] = (string) $row['Status'];
+            if ($this->statusSourceColumnAvailable) {
+                $rowSource = strtoupper(trim((string) ($row['Source'] ?? '')));
+                if ($rowSource !== '' && $rowSource !== strtoupper($this->currentConnection)) {
+                    continue;
+                }
+            }
+            if (!isset($map[$cid])) {
+                $map[$cid] = (string) $row['Status'];
+            }
         }
 
         return $map;
+    }
+
+    protected function ensureStatusSourceColumn(): void
+    {
+        $result = $this->connector->querySqlServer(
+            "SELECT COL_LENGTH('dbo.TblLendingUSAStatuses', 'Source') AS ColumnLength"
+        );
+        $this->statusSourceColumnAvailable = !empty($result['data'][0]['ColumnLength']);
+
+        if ($this->statusSourceColumnAvailable || $this->dryRun) {
+            if (!$this->statusSourceColumnAvailable && $this->dryRun) {
+                $this->warn('  Status source column is not installed; dry-run uses legacy shared snapshot.');
+            }
+            return;
+        }
+
+        $alter = $this->connector->querySqlServer(
+            "IF COL_LENGTH('dbo.TblLendingUSAStatuses', 'Source') IS NULL ALTER TABLE dbo.TblLendingUSAStatuses ADD Source VARCHAR(10) NULL"
+        );
+        if (($alter['success'] ?? false) !== true) {
+            throw new \RuntimeException('Unable to add TblLendingUSAStatuses.Source: ' . ($alter['error'] ?? 'Unknown error'));
+        }
+        $this->statusSourceColumnAvailable = true;
+        $this->info('  Added TblLendingUSAStatuses.Source for LDR/PLAW separation.');
     }
 
     // ─── Step 3: Fetch Applications from LendingUSA API ───────────────
@@ -558,17 +594,24 @@ class UpdateLendingUSAStatuses extends Command
             return;
         }
 
-        // Expire old rows
-        $sql = "UPDATE TblLendingUSAStatuses SET Expired = 'TRUE' WHERE CID = '{$this->esc($llgid)}'";
+        $source = strtoupper($this->currentConnection);
+        $sourceClause = $this->statusSourceColumnAvailable
+            ? " AND (Source = '{$this->esc($source)}' OR Source IS NULL)"
+            : '';
+
+        // Expire only this source's rows. Legacy NULL rows are expired when
+        // first replaced by a source-scoped row.
+        $sql = "UPDATE TblLendingUSAStatuses SET Expired = 'TRUE' WHERE CID = '{$this->esc($llgid)}'{$sourceClause}";
         $this->connector->querySqlServer($sql);
 
         // Insert new row
-        $sql = "INSERT INTO TblLendingUSAStatuses (CID, Status, Processed_Time, Status_Date, Expired) VALUES ("
-            . "'{$this->esc($llgid)}'"
-            . ", '{$this->esc($status)}'"
-            . ", '{$this->esc($processTime)}'"
-            . ", '{$this->esc($statusDate)}'"
-            . ", 'FALSE')";
+        $columns = $this->statusSourceColumnAvailable
+            ? 'CID, Status, Processed_Time, Status_Date, Expired, Source'
+            : 'CID, Status, Processed_Time, Status_Date, Expired';
+        $values = $this->statusSourceColumnAvailable
+            ? "'{$this->esc($llgid)}', '{$this->esc($status)}', '{$this->esc($processTime)}', '{$this->esc($statusDate)}', 'FALSE', '{$this->esc($source)}'"
+            : "'{$this->esc($llgid)}', '{$this->esc($status)}', '{$this->esc($processTime)}', '{$this->esc($statusDate)}', 'FALSE'";
+        $sql = "INSERT INTO TblLendingUSAStatuses ({$columns}) VALUES (" . $values . ')';
         $this->connector->querySqlServer($sql);
     }
 
