@@ -223,7 +223,8 @@ class UpdateLendingUSAStatuses extends Command
         }
 
         foreach ($decoded as $cid => $status) {
-            if (is_string($cid) && is_string($status) && $cid !== '' && $status !== '') {
+            $cid = (string) $cid;
+            if ($cid !== '' && is_string($status) && $status !== '') {
                 $this->localStatusSnapshot[$cid] = $status;
             }
         }
