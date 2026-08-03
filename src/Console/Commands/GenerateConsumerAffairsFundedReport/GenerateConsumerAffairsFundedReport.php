@@ -6,11 +6,26 @@ use Cmd\Reports\Services\DBConnector;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
 
+/**
+ * Consumer Affairs Funded Report (Lending Tower).
+ *
+ * Fixed 2026-08-04 per Jacob: the report was only ever reading
+ * TblFundings.Phone, a SQL Server field that's frequently blank. The real
+ * phone data lives in Snowflake's 'lt' CONTACTS table across 4 fields
+ * (PHONE, PHONE2, PHONE3, PHONE4) -- confirmed against production that
+ * 10/10 sampled blank-Phone rows from last month had a real number sitting
+ * in Snowflake PHONE. Now looks up all 4 fields there and falls back
+ * through them in order, using TblFundings.Phone first if it happens to be
+ * populated.
+ */
 class GenerateConsumerAffairsFundedReport extends Command
 {
-    protected $signature = 'Generate:consumer-affairs-funded-report';
+    protected $signature = 'Generate:consumer-affairs-funded-report
+                            {--test : Send only to jacob@libertydebtrelief.com, and skip the Review_Date gate/write-back so a test run never touches production review tracking}';
 
-    protected $description = 'Generate Consumer Affairs funded report (SQL Server) and email it.';
+    protected $description = 'Generate Consumer Affairs funded report (SQL Server + Snowflake) and email it.';
+
+    private const TEST_RECIPIENT = 'jacob@libertydebtrelief.com';
 
     public function handle(): int
     {
@@ -24,9 +39,17 @@ class GenerateConsumerAffairsFundedReport extends Command
             return Command::FAILURE;
         }
 
+        $isTest = (bool) $this->option('test');
         $reportDate = date('Y-m-d');
         $monthStart = date('Y-m-01', strtotime('first day of last month'));
         $monthEnd = date('Y-m-t', strtotime('last day of last month'));
+
+        // Test runs skip the Review_Date gate entirely so testing never
+        // depends on (or disturbs) which rows production has already
+        // marked reviewed.
+        $reviewFilter = $isTest
+            ? ''
+            : "AND (f.Review_Date IS NULL OR CAST(f.Review_Date AS date) = '{$this->esc($reportDate)}')";
 
         $sql = "
             SELECT
@@ -43,7 +66,8 @@ class GenerateConsumerAffairsFundedReport extends Command
                 c.Agent AS [Loan_Representative]
             FROM TblFundings AS f
             LEFT JOIN TblContacts AS c ON f.LLG_ID = c.LLG_ID
-            WHERE (f.Review_Date IS NULL OR CAST(f.Review_Date AS date) = '{$this->esc($reportDate)}')
+            WHERE 1=1
+              {$reviewFilter}
               AND f.Email IN (SELECT Email FROM TblContacts)
               AND f.Funding_Date >= '2022-11-01'
               AND f.Notes NOT LIKE '%Loan Term:  Months'
@@ -65,16 +89,82 @@ class GenerateConsumerAffairsFundedReport extends Command
             $this->warn('Consumer Affairs report: no rows found.');
         }
 
+        try {
+            $rows = $this->attachSnowflakePhones($rows);
+        } catch (\Throwable $e) {
+            // Non-fatal: worst case the report reverts to TblFundings.Phone
+            // only, same as before this fix -- better than failing the
+            // whole report over a phone lookup.
+            $this->warn('[WARN] Snowflake phone lookup failed, falling back to TblFundings.Phone only: ' . $e->getMessage());
+            Log::warning('GenerateConsumerAffairsFundedReport: Snowflake phone lookup failed.', ['exception' => $e]);
+        }
+
         $formatter = new Formatter();
         $report = $formatter->buildWorkbook($rows);
 
-        if (!empty($report['pks'])) {
+        if (!$isTest && !empty($report['pks'])) {
             $this->updateReviewDates($connector, $report['pks'], $reportDate);
         }
 
-        $formatter->sendReport($connector, $report['path'], $report['filename'], $this);
+        $recipients = $isTest ? [self::TEST_RECIPIENT] : null;
+        $formatter->sendReport($connector, $report['path'], $report['filename'], $recipients, $this);
 
         return Command::SUCCESS;
+    }
+
+    /**
+     * Look up PHONE/PHONE2/PHONE3/PHONE4 in Snowflake 'lt' CONTACTS for
+     * every row, keyed by the numeric ID inside LLG_ID (Order_Number), and
+     * attach them to each row so the Formatter can fall back through all 4
+     * fields the same way GenerateConsumerAffairsSettlementReport already
+     * does for LDR/PLAW.
+     *
+     * @param array<int, array<string, mixed>> $rows
+     * @return array<int, array<string, mixed>>
+     */
+    protected function attachSnowflakePhones(array $rows): array
+    {
+        $idToRows = [];
+        foreach ($rows as $i => $row) {
+            $llgId = (string) ($row['Order_Number'] ?? '');
+            $id = preg_replace('/\D+/', '', $llgId);
+            if ($id !== '') {
+                $idToRows[$id][] = $i;
+            }
+        }
+
+        if (empty($idToRows)) {
+            return $rows;
+        }
+
+        $snowflake = DBConnector::fromEnvironment('lt');
+
+        foreach (array_chunk(array_keys($idToRows), 1000) as $chunk) {
+            $idList = implode(',', array_map('intval', $chunk));
+            $sql = "SELECT ID, PHONE, PHONE2, PHONE3, PHONE4 FROM CONTACTS WHERE ID IN ({$idList})";
+
+            $result = $snowflake->query($sql);
+            $sfRows = $result['data'] ?? (is_array($result) && array_is_list($result) ? $result : []);
+
+            foreach ($sfRows as $sfRow) {
+                $sfId = (string) ($sfRow['ID'] ?? '');
+                if ($sfId === '' || !isset($idToRows[$sfId])) {
+                    continue;
+                }
+                foreach ($idToRows[$sfId] as $rowIndex) {
+                    $rows[$rowIndex]['Phone2'] = $sfRow['PHONE2'] ?? null;
+                    $rows[$rowIndex]['Phone3'] = $sfRow['PHONE3'] ?? null;
+                    $rows[$rowIndex]['Phone4'] = $sfRow['PHONE4'] ?? null;
+                    // Only use Snowflake's PHONE as a fallback -- TblFundings.Phone,
+                    // when present, is left untouched as the first choice.
+                    if (trim((string) ($rows[$rowIndex]['Phone'] ?? '')) === '') {
+                        $rows[$rowIndex]['Phone'] = $sfRow['PHONE'] ?? '';
+                    }
+                }
+            }
+        }
+
+        return $rows;
     }
 
     protected function updateReviewDates(DBConnector $connector, array $pks, string $reportDate): void
