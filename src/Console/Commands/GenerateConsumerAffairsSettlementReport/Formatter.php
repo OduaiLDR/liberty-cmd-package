@@ -171,7 +171,11 @@ class Formatter
         ];
     }
 
-    public function sendReport(DBConnector $connector, array $report, ?Command $console = null): void
+    /**
+     * @param list<string>|null $recipientsOverride When set (test mode), sends
+     *        directly to these addresses instead of the TblReports lookup.
+     */
+    public function sendReport(DBConnector $connector, array $report, ?array $recipientsOverride = null, ?Command $console = null): void
     {
         $csvPath = $report['csvPath'] ?? '';
         $idsPath = $report['idsPath'] ?? '';
@@ -203,22 +207,26 @@ class Formatter
         }
 
         $email = new EmailSenderService();
-        $subject = 'Consumer Affairs Settlement Report';
+        $subject = ($recipientsOverride !== null ? '[TEST] ' : '') . 'Consumer Affairs Settlement Report';
         $body = 'Please see the attached Consumer Affairs Settlement Report.';
 
-        $sent = $email->sendMailUsingTblReports(
-            $connector,
-            ['ConsumerAffairsSettlementReport', 'Consumer Affairs Settlement Report'],
-            ['LDR'],
-            $subject,
-            $body,
-            $attachments,
-            true
-        );
+        if ($recipientsOverride !== null) {
+            $sent = $email->sendMailHtml($subject, $body, $recipientsOverride, [], [], $attachments);
+        } else {
+            $sent = $email->sendMailUsingTblReports(
+                $connector,
+                ['ConsumerAffairsSettlementReport', 'Consumer Affairs Settlement Report'],
+                ['LDR'],
+                $subject,
+                $body,
+                $attachments,
+                true
+            );
+        }
 
         if ($console) {
             if ($sent) {
-                $console->info('[INFO] Consumer Affairs Settlement report sent.');
+                $console->info('[INFO] Consumer Affairs Settlement report sent' . ($recipientsOverride !== null ? ' to ' . implode(', ', $recipientsOverride) : '') . '.');
             } else {
                 $console->warn('[WARN] Consumer Affairs Settlement report not sent (no recipients or send failed).');
             }

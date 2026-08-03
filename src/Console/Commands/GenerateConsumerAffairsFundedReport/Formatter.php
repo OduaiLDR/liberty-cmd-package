@@ -82,7 +82,12 @@ class Formatter
             $client = (string) ($row['Client'] ?? '');
             [$firstName, $lastName] = $this->splitName($client);
 
-            $phone = $this->formatPhone((string) ($row['Phone'] ?? ''));
+            $phone = $this->formatPhone($this->firstPhone(
+                (string) ($row['Phone'] ?? ''),
+                (string) ($row['Phone2'] ?? ''),
+                (string) ($row['Phone3'] ?? ''),
+                (string) ($row['Phone4'] ?? '')
+            ));
             $orderNumber = str_replace('LLG-', '', (string) ($row['Order_Number'] ?? ''));
             $source = (string) ($row['Source'] ?? '');
             $source = stripos($source, 'online') !== false ? 'Online Application' : 'Phone Application';
@@ -148,7 +153,11 @@ class Formatter
         ];
     }
 
-    public function sendReport(DBConnector $connector, string $path, string $filename, ?Command $console = null): void
+    /**
+     * @param list<string>|null $recipientsOverride When set (test mode), sends
+     *        directly to these addresses instead of the TblReports lookup.
+     */
+    public function sendReport(DBConnector $connector, string $path, string $filename, ?array $recipientsOverride, ?Command $console = null): void
     {
         if (!is_file($path)) {
             Log::warning('GenerateConsumerAffairsFundedReport: report file missing.', ['path' => $path]);
@@ -167,22 +176,26 @@ class Formatter
             ],
         ];
 
-        $subject = 'Consumer Affairs Funded Report';
+        $subject = ($recipientsOverride !== null ? '[TEST] ' : '') . 'Consumer Affairs Funded Report';
         $body = 'Please see the attached Consumer Affairs Funded Report.';
 
-        $sent = $email->sendMailUsingTblReports(
-            $connector,
-            ['ConsumerAffairsReport', 'Consumer Affairs Report', 'Consumer Affairs Funded Report'],
-            [],
-            $subject,
-            $body,
-            $attachments,
-            true
-        );
+        if ($recipientsOverride !== null) {
+            $sent = $email->sendMailHtml($subject, $body, $recipientsOverride, [], [], $attachments);
+        } else {
+            $sent = $email->sendMailUsingTblReports(
+                $connector,
+                ['ConsumerAffairsReport', 'Consumer Affairs Report', 'Consumer Affairs Funded Report'],
+                [],
+                $subject,
+                $body,
+                $attachments,
+                true
+            );
+        }
 
         if ($console) {
             if ($sent) {
-                $console->info('[INFO] Consumer Affairs report sent.');
+                $console->info('[INFO] Consumer Affairs report sent' . ($recipientsOverride !== null ? ' to ' . implode(', ', $recipientsOverride) : '') . '.');
             } else {
                 $console->warn('[WARN] Consumer Affairs report not sent (no recipients or send failed).');
             }
@@ -206,6 +219,16 @@ class Formatter
         $last = array_pop($parts);
         $first = implode(' ', $parts);
         return [$first, $last];
+    }
+
+    private function firstPhone(string ...$phones): string
+    {
+        foreach ($phones as $phone) {
+            if (trim($phone) !== '') {
+                return $phone;
+            }
+        }
+        return '';
     }
 
     private function formatPhone(string $value): string
