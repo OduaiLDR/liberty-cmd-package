@@ -21,7 +21,7 @@ use Illuminate\Support\Facades\Log;
 class GenerateConsumerAffairsFundedReport extends Command
 {
     protected $signature = 'Generate:consumer-affairs-funded-report
-                            {--test : Send only to jacob@libertydebtrelief.com, and skip the Review_Date gate/write-back so a test run never touches production review tracking}';
+                            {--test : Send only to oduai@libertydebtrelief.com, and skip the Review_Date gate/write-back so a test run never touches production review tracking}';
 
     protected $description = 'Generate Consumer Affairs funded report (SQL Server + Snowflake) and email it.';
 
