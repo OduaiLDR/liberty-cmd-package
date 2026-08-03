@@ -13,7 +13,7 @@ class GenerateConsumerAffairsSettlementReport extends Command
 
     protected $description = 'Generate Consumer Affairs settlement report (Snowflake + SQL Server) and email it.';
 
-    private const TEST_RECIPIENT = 'jacob@libertydebtrelief.com';
+    private const TEST_RECIPIENT = 'oduai@libertydebtrelief.com';
 
     public function handle(): int
     {

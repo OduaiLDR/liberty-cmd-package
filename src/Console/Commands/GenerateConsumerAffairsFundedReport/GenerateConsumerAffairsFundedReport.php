@@ -25,7 +25,7 @@ class GenerateConsumerAffairsFundedReport extends Command
 
     protected $description = 'Generate Consumer Affairs funded report (SQL Server + Snowflake) and email it.';
 
-    private const TEST_RECIPIENT = 'jacob@libertydebtrelief.com';
+    private const TEST_RECIPIENT = 'oduai@libertydebtrelief.com';
 
     public function handle(): int
     {
