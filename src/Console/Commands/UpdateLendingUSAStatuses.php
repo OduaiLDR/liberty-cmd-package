@@ -18,6 +18,7 @@ class UpdateLendingUSAStatuses extends Command
         {--dry-run : Simulate without writing anything}
         {--limit=0 : Limit number of API records to fetch (0=all)}
         {--contact-id= : Process only this specific contact ID}
+        {--initialize-state : Seed the local source-specific snapshot without CRM or Azure status-table writes}
         {--verbose-dry : Show detailed per-client actions in dry run}';
 
     protected $description = 'Sync LendingUSA application statuses via API, replacing VBA UpdateLendingUSAStatuses macro.';
@@ -45,6 +46,7 @@ class UpdateLendingUSAStatuses extends Command
     protected ?Client $httpClient = null;
     protected bool $dryRun = false;
     protected bool $verboseDry = false;
+    protected bool $initializeState = false;
     protected string $forthApiKeyOverride = '';
     protected string $currentConnection = 'plaw';
     protected ?string $forthApiKeyCache = null;
@@ -71,12 +73,14 @@ class UpdateLendingUSAStatuses extends Command
     protected array $enrollmentPlansCache = [];
     protected array $clientNamesCache = [];
     protected array $fundedClientsCache = [];
+    protected array $localStatusSnapshot = [];
 
     public function handle(): int
     {
         $connection = (string) ($this->option('connection') ?? '');
         $this->dryRun = (bool) $this->option('dry-run');
         $this->verboseDry = (bool) $this->option('verbose-dry');
+        $this->initializeState = (bool) $this->option('initialize-state');
 
         // If no connection specified, run both LDR and PLAW
         if ($connection === '') {
@@ -122,10 +126,12 @@ class UpdateLendingUSAStatuses extends Command
             }
             $this->info('  Forth API key: ' . ($forthApiKey !== '' ? 'resolved' : 'not set (dry-run may skip CRM checks)'));
 
-            // 3. Load current status snapshot from TblLendingUSAStatuses
+            // 3. Load the source-specific local status snapshot. LDR and PLAW
+            // share an Azure status table, so it cannot safely be used as the
+            // source key without changing that table.
             $this->info('[2/6] Loading current status snapshot...');
             $statusSnapshot = $this->loadStatusSnapshot();
-            $this->info('  Active statuses in DB: ' . count($statusSnapshot));
+            $this->info('  Active statuses in local snapshot: ' . count($statusSnapshot));
 
             // 4. Fetch LendingUSA applications via API
             $this->info('[3/6] Fetching LendingUSA applications via API...');
@@ -136,6 +142,11 @@ class UpdateLendingUSAStatuses extends Command
             $this->info('[4/6] Normalizing and deduplicating...');
             $normalized = $this->normalizeAndDedupe($applications);
             $this->info("  After filter/dedupe: " . count($normalized) . " (filtered out: {$this->totalFiltered})");
+
+            if ($this->initializeState) {
+                $this->initializeLocalStatusSnapshot($normalized);
+                return Command::SUCCESS;
+            }
 
             // 6. Process each client
             $this->info('[5/6] Processing clients...');
@@ -191,16 +202,72 @@ class UpdateLendingUSAStatuses extends Command
 
     protected function loadStatusSnapshot(): array
     {
-        $sql = "SELECT CID, Status FROM TblLendingUSAStatuses WHERE Expired = 'FALSE'";
-        $result = $this->connector->querySqlServer($sql);
+        $path = $this->statusSnapshotPath();
+        $this->localStatusSnapshot = [];
 
-        $map = [];
-        foreach ($result['data'] ?? [] as $row) {
-            $cid = (string) $row['CID'];
-            $map[$cid] = (string) $row['Status'];
+        if (!is_file($path)) {
+            if ($this->dryRun || $this->initializeState) {
+                $this->warn('  No local source-specific snapshot exists yet.');
+                return [];
+            }
+
+            throw new \RuntimeException(
+                "Local LendingUSA {$this->currentConnection} snapshot is not initialized. "
+                . 'Run with --initialize-state first; no CRM or Azure status-table writes will be made.'
+            );
         }
 
-        return $map;
+        $decoded = json_decode((string) file_get_contents($path), true);
+        if (!is_array($decoded)) {
+            throw new \RuntimeException("Invalid local LendingUSA snapshot: {$path}");
+        }
+
+        foreach ($decoded as $cid => $status) {
+            $cid = (string) $cid;
+            if ($cid !== '' && is_string($status) && $status !== '') {
+                $this->localStatusSnapshot[$cid] = $status;
+            }
+        }
+
+        return $this->localStatusSnapshot;
+    }
+
+    protected function statusSnapshotPath(): string
+    {
+        $directory = storage_path('app/lending-usa-statuses');
+        if (!is_dir($directory) && !$this->dryRun) {
+            if (!mkdir($directory, 0770, true) && !is_dir($directory)) {
+                throw new \RuntimeException("Unable to create local LendingUSA state directory: {$directory}");
+            }
+        }
+
+        return $directory . DIRECTORY_SEPARATOR . strtolower($this->currentConnection) . '.json';
+    }
+
+    protected function initializeLocalStatusSnapshot(array $records): void
+    {
+        $snapshot = [];
+        foreach ($records as $record) {
+            $snapshot[(string) $record['llgid']] = (string) $record['status'];
+        }
+
+        if ($this->dryRun) {
+            $this->info('  [DRY-RUN] Would initialize ' . count($snapshot)
+                . " {$this->currentConnection} statuses locally; CRM and Azure unchanged.");
+            return;
+        }
+
+        $path = $this->statusSnapshotPath();
+        $tempPath = $path . '.tmp.' . getmypid();
+        $json = json_encode($snapshot, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+        if ($json === false || file_put_contents($tempPath, $json . PHP_EOL, LOCK_EX) === false
+            || !rename($tempPath, $path)) {
+            @unlink($tempPath);
+            throw new \RuntimeException("Unable to initialize local LendingUSA snapshot: {$path}");
+        }
+
+        $this->info('  Initialized ' . count($snapshot) . " {$this->currentConnection} statuses locally.");
+        $this->info('  CRM and Azure status table were not changed.');
     }
 
     // ─── Step 3: Fetch Applications from LendingUSA API ───────────────
@@ -554,22 +621,19 @@ class UpdateLendingUSAStatuses extends Command
     protected function recordStatusHistory(string $llgid, string $status, string $processTime, string $statusDate): void
     {
         if ($this->dryRun) {
-            $this->line("    [DRY-RUN] Would expire old statuses and insert new for CID {$llgid}: '{$status}'");
+            $this->line("    [DRY-RUN] Would update local {$this->currentConnection} status for CID {$llgid}: '{$status}'");
             return;
         }
 
-        // Expire old rows
-        $sql = "UPDATE TblLendingUSAStatuses SET Expired = 'TRUE' WHERE CID = '{$this->esc($llgid)}'";
-        $this->connector->querySqlServer($sql);
-
-        // Insert new row
-        $sql = "INSERT INTO TblLendingUSAStatuses (CID, Status, Processed_Time, Status_Date, Expired) VALUES ("
-            . "'{$this->esc($llgid)}'"
-            . ", '{$this->esc($status)}'"
-            . ", '{$this->esc($processTime)}'"
-            . ", '{$this->esc($statusDate)}'"
-            . ", 'FALSE')";
-        $this->connector->querySqlServer($sql);
+        $this->localStatusSnapshot[$llgid] = $status;
+        $path = $this->statusSnapshotPath();
+        $tempPath = $path . '.tmp.' . getmypid();
+        $json = json_encode($this->localStatusSnapshot, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+        if ($json === false || file_put_contents($tempPath, $json . PHP_EOL, LOCK_EX) === false
+            || !rename($tempPath, $path)) {
+            @unlink($tempPath);
+            throw new \RuntimeException("Unable to save local LendingUSA snapshot: {$path}");
+        }
     }
 
     // ─── LendingUSA Auth (Cognito) ────────────────────────────────────
