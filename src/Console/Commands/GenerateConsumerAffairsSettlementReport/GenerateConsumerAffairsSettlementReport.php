@@ -9,7 +9,7 @@ use Illuminate\Support\Facades\Log;
 class GenerateConsumerAffairsSettlementReport extends Command
 {
     protected $signature = 'Generate:consumer-affairs-settlement-report
-                            {--test : Send only to oduai@libertydebtrelief.com instead of the real recipient list}';
+                            {--test : Send only to jacob@libertydebtrelief.com instead of the real recipient list}';
 
     protected $description = 'Generate Consumer Affairs settlement report (Snowflake + SQL Server) and email it.';
 
