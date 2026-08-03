@@ -14,37 +14,42 @@ use Illuminate\Support\Facades\Log;
  * real bugs Jacob flagged 2026-07-31 — cancelled accounts rolling forward to a
  * future draft, and stale payments getting silently stuck forever) with a
  * single, stateless, per-contact walk that's fully recomputed from Snowflake
- * every run:
+ * every run — nothing about "which transaction we're on" is ever persisted:
  *
- * Only contacts with Payment_Attempted IS NULL are pulled. For each, walk
- * their 'D' transactions in process-date order, starting at the first ever:
+ * Only contacts with Payment_Attempted IS NULL are pulled. For each, look at
+ * every fetched 'D' transaction (in process-date order, starting at the very
+ * first one ever) for a cleared or returned date — this check always runs
+ * first, regardless of staleness or cancellation, so a transaction that
+ * clears/returns late (after we'd have otherwise rolled past it) is always
+ * caught on the next run. No separate "undo the roll" logic is needed.
  *
  *   - No transaction found in EITHER Snowflake instance (ldr and plaw)
  *     -> Payment_Attempted = 'N/A'. Done, never pulled again.
  *
- *   - The transaction under consideration has a CLEARED_DATE
+ *   - Some transaction has a CLEARED_DATE
  *     -> First_Payment_Date = its process date, First_Payment_Cleared_Date =
- *        its cleared date, Payment_Attempted = today's date. Done.
+ *        its cleared date, Payment_Attempted = today's date. Locked, done.
  *
- *   - It has a RETURNED_DATE (or RETURN_CODE) instead
+ *   - Some transaction has a RETURNED_DATE (or RETURN_CODE) instead
  *     -> First_Payment_Date = its process date (cleared date stays null),
- *        Payment_Attempted = today's date. Done.
+ *        Payment_Attempted = today's date. Locked, done.
  *
- *   - Neither, and it's less than 4 days stale
- *     -> First_Payment_Date = its process date. Payment_Attempted stays
- *        NULL — still open, re-walked from scratch next run.
+ *   - Nothing has cleared/returned, and 90+ calendar days have passed since
+ *     the very first transaction's date
+ *     -> Give up. First_Payment_Date = the first transaction's date,
+ *        Payment_Attempted = 'No Payment'. Done, never pulled again.
  *
- *   - Neither, and it's 4+ days stale
- *     -> Advance to the next transaction and repeat, up to 3 advances total,
- *        never advancing past 90 days from the FIRST transaction's date.
- *        Once either cap is hit, freeze First_Payment_Date on the last
- *        transaction reached. Payment_Attempted stays NULL — still open.
+ *   - Nothing has cleared/returned, under 90 days, contact is CANCELLED
+ *     -> First_Payment_Date = the first transaction's date. Never rolls
+ *        forward — a cancelled contact isn't waiting on a payment, so there's
+ *        nothing to advance to. Payment_Attempted stays NULL (still open,
+ *        re-checked every run in case it clears/returns or the 90-day window
+ *        above closes it out).
  *
- * Because nothing about "which transaction we rolled to" is persisted, a
- * transaction that clears late (after we'd already advanced past it) is
- * caught automatically: the walk starts over at transaction #1 every run, so
- * the next run just finds the CLEARED_DATE that's now present and resolves
- * there. No separate "undo the roll" logic is needed.
+ *   - Nothing has cleared/returned, under 90 days, contact is ACTIVE
+ *     -> Roll forward through transactions that are 4+ days stale to find
+ *        the most current one still worth showing; First_Payment_Date = its
+ *        date. Payment_Attempted stays NULL — still open.
  */
 class SyncFirstPaymentDate extends Command
 {
@@ -54,9 +59,12 @@ class SyncFirstPaymentDate extends Command
     protected $description = 'Sync First_Payment_Date, First_Payment_Cleared_Date and Payment_Attempted in TblEnrollment from Snowflake TRANSACTIONS';
 
     private const STALE_AFTER_DAYS = 4;
-    private const MAX_ADVANCES = 3;
-    private const MAX_DAYS_PAST_ORIGINAL = 90;
-    private const TXNS_PER_CONTACT_FETCHED = 6; // original + up to 3 advances, plus buffer
+    private const GIVE_UP_AFTER_DAYS = 90;
+    // Safety cap on how many transactions we look at per contact. With no advance-count
+    // limit, a frequent (e.g. weekly) payment schedule could have 12-13 attempts inside
+    // the 90-day give-up window alone, so this needs real headroom above that, not just
+    // enough for a handful of rolls.
+    private const TXNS_PER_CONTACT_FETCHED = 20;
 
     public function handle(): int
     {
@@ -75,14 +83,15 @@ class SyncFirstPaymentDate extends Command
         }
 
         try {
-            $llgIds = $this->fetchIdsAwaitingAttempt($sqlConnector);
-            $this->info('Found ' . count($llgIds) . ' LLG_IDs with Payment_Attempted IS NULL.');
+            $awaiting = $this->fetchIdsAwaitingAttempt($sqlConnector);
+            $this->info('Found ' . count($awaiting) . ' LLG_IDs with Payment_Attempted IS NULL.');
 
-            if (empty($llgIds)) {
+            if (empty($awaiting)) {
                 $this->info('Nothing to process.');
                 return Command::SUCCESS;
             }
 
+            $llgIds = array_keys($awaiting);
             $contactToLlg = $this->buildContactToLlgMap($llgIds);
             $contactIds = array_keys($contactToLlg);
 
@@ -99,6 +108,7 @@ class SyncFirstPaymentDate extends Command
 
             $resolved = [];   // llgId => ['first_payment_date'=>, 'first_payment_cleared_date'=>?, 'payment_attempted'=>today]
             $stillOpen = [];  // llgId => ['first_payment_date'=>]
+            $noPayment = [];  // llgId => ['first_payment_date'=>]  (90-day give-up)
             $notFound = [];   // list of llgId
 
             foreach ($contactToLlg as $cid => $llgId) {
@@ -109,32 +119,36 @@ class SyncFirstPaymentDate extends Command
                     continue;
                 }
 
-                $outcome = $this->walkTransactions($txns, $today);
+                $cancelled = $awaiting[$llgId]['cancelled'] ?? false;
+                $outcome = $this->walkTransactions($txns, $cancelled, $today);
 
-                if ($outcome['resolved']) {
-                    $resolved[$llgId] = [
+                match ($outcome['outcome']) {
+                    'resolved' => $resolved[$llgId] = [
                         'first_payment_date' => $outcome['first_payment_date'],
                         'first_payment_cleared_date' => $outcome['first_payment_cleared_date'],
                         'payment_attempted' => $today,
-                    ];
-                } else {
-                    $stillOpen[$llgId] = [
+                    ],
+                    'no_payment' => $noPayment[$llgId] = [
                         'first_payment_date' => $outcome['first_payment_date'],
-                    ];
-                }
+                    ],
+                    default => $stillOpen[$llgId] = [
+                        'first_payment_date' => $outcome['first_payment_date'],
+                    ],
+                };
             }
 
             $this->info(sprintf(
-                'Resolved: %d (cleared/returned). Still open (frozen or within window): %d. Not found in either Snowflake: %d.',
-                count($resolved), count($stillOpen), count($notFound)
+                'Resolved: %d (cleared/returned). Still open: %d. Gave up (90+ days, no payment): %d. Not found in either Snowflake: %d.',
+                count($resolved), count($stillOpen), count($noPayment), count($notFound)
             ));
 
             if ($dryRun) {
                 $this->previewResolved($sqlConnector, $resolved);
-                $this->previewStillOpen($sqlConnector, $stillOpen);
+                $this->previewStillOpen($sqlConnector, $stillOpen, 'still open');
+                $this->previewStillOpen($sqlConnector, $noPayment, 'gave up (No Payment)');
                 $this->info(sprintf(
-                    'DRY RUN summary — would resolve %d, update %d still-open dates, mark %d as N/A. Nothing was written.',
-                    count($resolved), count($stillOpen), count($notFound)
+                    'DRY RUN summary — would resolve %d, update %d still-open dates, give up on %d (No Payment), mark %d as N/A. Nothing was written.',
+                    count($resolved), count($stillOpen), count($noPayment), count($notFound)
                 ));
                 $this->info('First payment sync: finished (dry run).');
                 return Command::SUCCESS;
@@ -146,12 +160,16 @@ class SyncFirstPaymentDate extends Command
             $updatedOpen = $this->applyStillOpen($sqlConnector, $stillOpen);
             $this->info("Updated {$updatedOpen} rows: First_Payment_Date only, still open.");
 
+            $updatedNoPayment = $this->applyNoPayment($sqlConnector, $noPayment);
+            $this->info("Updated {$updatedNoPayment} rows: gave up after 90+ days, marked No Payment.");
+
             $updatedNotFound = $this->applyNotFound($sqlConnector, $notFound);
             $this->info("Updated {$updatedNotFound} rows: marked N/A.");
 
             Log::info('SyncFirstPaymentDate command finished.', [
                 'resolved' => count($resolved),
                 'still_open' => count($stillOpen),
+                'no_payment' => count($noPayment),
                 'not_found' => count($notFound),
             ]);
 
@@ -171,64 +189,67 @@ class SyncFirstPaymentDate extends Command
     /**
      * @param list<array{process_date:string,cleared_date:?string,returned:bool}> $txns
      *        Sorted ascending by process_date. Guaranteed non-empty.
-     * @return array{resolved:bool,first_payment_date:string,first_payment_cleared_date:?string}
+     * @return array{outcome:'resolved'|'open'|'no_payment',first_payment_date:string,first_payment_cleared_date:?string}
      */
-    protected function walkTransactions(array $txns, string $today): array
+    protected function walkTransactions(array $txns, bool $cancelled, string $today): array
     {
         $originalDate = $txns[0]['process_date'];
-        $advancesUsed = 0;
 
-        foreach ($txns as $i => $txn) {
+        // Priority 1, always: does ANY fetched transaction have a cleared or
+        // returned date? Checked before staleness/cancellation so a late
+        // clear/return — even on a transaction we'd otherwise have rolled
+        // past — is always caught. Locked once found; nothing below can undo it.
+        foreach ($txns as $txn) {
             if ($txn['cleared_date'] !== null) {
                 return [
-                    'resolved' => true,
+                    'outcome' => 'resolved',
                     'first_payment_date' => $txn['process_date'],
                     'first_payment_cleared_date' => $txn['cleared_date'],
                 ];
             }
-
             if ($txn['returned']) {
                 return [
-                    'resolved' => true,
+                    'outcome' => 'resolved',
                     'first_payment_date' => $txn['process_date'],
                     'first_payment_cleared_date' => null,
                 ];
             }
-
-            $daysStale = $this->daysBetween($txn['process_date'], $today);
-
-            if ($daysStale < self::STALE_AFTER_DAYS) {
-                return [
-                    'resolved' => false,
-                    'first_payment_date' => $txn['process_date'],
-                    'first_payment_cleared_date' => null,
-                ];
-            }
-
-            $next = $txns[$i + 1] ?? null;
-            $canAdvance = $advancesUsed < self::MAX_ADVANCES
-                && $next !== null
-                && $this->daysBetween($originalDate, $next['process_date']) <= self::MAX_DAYS_PAST_ORIGINAL;
-
-            if (!$canAdvance) {
-                return [
-                    'resolved' => false,
-                    'first_payment_date' => $txn['process_date'],
-                    'first_payment_cleared_date' => null,
-                ];
-            }
-
-            $advancesUsed++;
-            // loop continues onto $next
         }
 
-        // Fetched window exhausted without resolving or hitting a freeze condition
-        // (shouldn't normally happen given TXNS_PER_CONTACT_FETCHED comfortably
-        // covers MAX_ADVANCES, but freeze on the last one seen rather than error).
-        $last = $txns[count($txns) - 1];
+        // Nothing resolved. Give up once 90 real days have passed since the
+        // very first transaction, regardless of cancelled status.
+        if ($this->daysBetween($originalDate, $today) > self::GIVE_UP_AFTER_DAYS) {
+            return [
+                'outcome' => 'no_payment',
+                'first_payment_date' => $originalDate,
+                'first_payment_cleared_date' => null,
+            ];
+        }
+
+        // Cancelled contacts never roll forward — there's nothing left to
+        // advance toward, so just show the original date and stay open.
+        if ($cancelled) {
+            return [
+                'outcome' => 'open',
+                'first_payment_date' => $originalDate,
+                'first_payment_cleared_date' => null,
+            ];
+        }
+
+        // Active contact: roll forward through transactions that are 4+ days
+        // stale to find the most current one still worth showing.
+        $current = $txns[0];
+        foreach ($txns as $txn) {
+            $current = $txn;
+            if ($this->daysBetween($txn['process_date'], $today) < self::STALE_AFTER_DAYS) {
+                break; // not stale — this is the one to show, stop advancing
+            }
+            // stale — loop continues onto the next fetched transaction, if any
+        }
+
         return [
-            'resolved' => false,
-            'first_payment_date' => $last['process_date'],
+            'outcome' => 'open',
+            'first_payment_date' => $current['process_date'],
             'first_payment_cleared_date' => null,
         ];
     }
@@ -244,18 +265,31 @@ class SyncFirstPaymentDate extends Command
     // Fetch
     // ──────────────────────────────────────────────────────────────────────
 
-    /** @return list<string> */
+    /** @return array<string, array{cancelled: bool}> LLG_ID => info */
     protected function fetchIdsAwaitingAttempt(DBConnector $connector): array
     {
         $sql = <<<SQL
-SELECT LLG_ID
+SELECT LLG_ID, Cancel_Date
 FROM dbo.TblEnrollment
 WHERE Payment_Attempted IS NULL
   AND LLG_ID LIKE 'LLG-%'
   AND TRY_CONVERT(BIGINT, REPLACE(LLG_ID, 'LLG-', '')) IS NOT NULL
 SQL;
 
-        return $this->extractLlgIds($connector->querySqlServer($sql));
+        $rows = $this->extractRows($connector->querySqlServer($sql));
+        $awaiting = [];
+
+        foreach ($rows as $row) {
+            $llgId = $this->getRowValue($row, 'LLG_ID');
+            if ($llgId === null) {
+                continue;
+            }
+            $awaiting[$llgId] = [
+                'cancelled' => $this->getRowValue($row, 'Cancel_Date') !== null,
+            ];
+        }
+
+        return $awaiting;
     }
 
     /**
@@ -404,6 +438,40 @@ SQL;
         return $totalUpdated;
     }
 
+    /** @param array<string, array{first_payment_date:string}> $noPayment */
+    protected function applyNoPayment(DBConnector $connector, array $noPayment): int
+    {
+        if (empty($noPayment)) {
+            return 0;
+        }
+
+        $totalUpdated = 0;
+
+        foreach (array_chunk($noPayment, 500, true) as $chunk) {
+            $casesDate = [];
+            $ids = [];
+
+            foreach ($chunk as $llgId => $data) {
+                $llgEsc = $this->escapeSqlString($llgId);
+                $dateEsc = $this->escapeSqlString($data['first_payment_date']);
+
+                $casesDate[] = "WHEN '{$llgEsc}' THEN '{$dateEsc}'";
+                $ids[] = "'{$llgEsc}'";
+            }
+
+            $idList = implode(', ', $ids);
+            $sql = "UPDATE dbo.TblEnrollment SET "
+                . "First_Payment_Date = CASE LLG_ID " . implode(' ', $casesDate) . " END, "
+                . "Payment_Attempted = 'No Payment' "
+                . "WHERE LLG_ID IN ({$idList})";
+
+            $result = $connector->querySqlServer($sql);
+            $totalUpdated += $this->getRowCount($result);
+        }
+
+        return $totalUpdated;
+    }
+
     /** @param list<string> $llgIds */
     protected function applyNotFound(DBConnector $connector, array $llgIds): int
     {
@@ -473,17 +541,18 @@ SQL;
         }
     }
 
-    protected function previewStillOpen(DBConnector $connector, array $stillOpen): void
+    /** @param array<string, array{first_payment_date:string}> $rows */
+    protected function previewStillOpen(DBConnector $connector, array $rows, string $label = 'still open'): void
     {
-        if (empty($stillOpen)) {
-            $this->line('DRY RUN — still open: none.');
+        if (empty($rows)) {
+            $this->line("DRY RUN — {$label}: none.");
             return;
         }
 
-        $current = $this->fetchCurrentValues($connector, array_keys($stillOpen));
+        $current = $this->fetchCurrentValues($connector, array_keys($rows));
 
         $changed = [];
-        foreach ($stillOpen as $llgId => $data) {
+        foreach ($rows as $llgId => $data) {
             $cur = $current[$llgId] ?? ['First_Payment_Date' => null];
             $curDate = $cur['First_Payment_Date'] !== null ? substr($cur['First_Payment_Date'], 0, 10) : null;
 
@@ -493,8 +562,8 @@ SQL;
         }
 
         $this->line(sprintf(
-            'DRY RUN — still open: %d row(s) matched, %d already correct (no-op), %d would actually change.',
-            count($stillOpen), count($stillOpen) - count($changed), count($changed)
+            'DRY RUN — %s: %d row(s) matched, %d already correct (no-op), %d would actually change.',
+            $label, count($rows), count($rows) - count($changed), count($changed)
         ));
 
         $shown = 0;
