@@ -24,14 +24,17 @@ use Illuminate\Support\Facades\Log;
  */
 class SyncFirstPaymentDate extends Command
 {
-    protected $signature = 'sync:first-payment-date';
+    protected $signature = 'sync:first-payment-date
+                            {--dry-run : Preview what would change without writing to SQL Server or TblLog}';
 
     protected $description = 'Sync First_Payment_Date and First_Payment_Cleared_Date in TblEnrollment from Snowflake TRANSACTIONS';
 
     public function handle(): int
     {
-        $this->info('First payment sync: starting.');
-        Log::info('SyncFirstPaymentDate command started.');
+        $dryRun = (bool) $this->option('dry-run');
+
+        $this->info($dryRun ? 'First payment sync: starting (DRY RUN — no writes will be made).' : 'First payment sync: starting.');
+        Log::info('SyncFirstPaymentDate command started.', ['dry_run' => $dryRun]);
 
         $connections = ['plaw', 'ldr'];
         $hadException = false;
@@ -63,9 +66,11 @@ class SyncFirstPaymentDate extends Command
 
                     // Apply cleared payments (final values)
                     if (!empty($clearedPayments)) {
-                        $this->info("[$source] Applying cleared payments to SQL Server...");
-                        $updatedCleared = $this->updateWithClearedPayments($connector, $clearedPayments);
-                        $this->info("[$source] Updated {$updatedCleared} rows with cleared payment dates.");
+                        $this->info($dryRun
+                            ? "[$source] DRY RUN — previewing cleared payments..."
+                            : "[$source] Applying cleared payments to SQL Server...");
+                        $updatedCleared = $this->updateWithClearedPayments($connector, $clearedPayments, $source, $dryRun);
+                        $this->info("[$source] " . ($dryRun ? 'Would update' : 'Updated') . " {$updatedCleared} rows with cleared payment dates.");
                     }
                 }
 
@@ -90,9 +95,11 @@ class SyncFirstPaymentDate extends Command
 
                     // Apply scheduled payments (update First_Payment_Date only)
                     if (!empty($scheduledPayments)) {
-                        $this->info("[$source] Applying scheduled payments to SQL Server...");
-                        $updatedScheduled = $this->updateWithScheduledPayments($connector, $scheduledPayments);
-                        $this->info("[$source] Updated {$updatedScheduled} rows with scheduled payment dates.");
+                        $this->info($dryRun
+                            ? "[$source] DRY RUN — previewing scheduled payments..."
+                            : "[$source] Applying scheduled payments to SQL Server...");
+                        $updatedScheduled = $this->updateWithScheduledPayments($connector, $scheduledPayments, $source, $dryRun);
+                        $this->info("[$source] " . ($dryRun ? 'Would update' : 'Updated') . " {$updatedScheduled} rows with scheduled payment dates.");
                     }
                 }
 
@@ -107,9 +114,11 @@ class SyncFirstPaymentDate extends Command
                     $this->info("[$source] Found " . count($cancelledPayments) . " payments for cancelled contacts.");
 
                     if (!empty($cancelledPayments)) {
-                        $this->info("[$source] Applying first payment dates for cancelled contacts...");
-                        $updatedCancelled = $this->updateCancelledWithFirstPayment($connector, $cancelledPayments);
-                        $this->info("[$source] Updated {$updatedCancelled} cancelled rows with first payment date.");
+                        $this->info($dryRun
+                            ? "[$source] DRY RUN — previewing first payment dates for cancelled contacts..."
+                            : "[$source] Applying first payment dates for cancelled contacts...");
+                        $updatedCancelled = $this->updateCancelledWithFirstPayment($connector, $cancelledPayments, $source, $dryRun);
+                        $this->info("[$source] " . ($dryRun ? 'Would update' : 'Updated') . " {$updatedCancelled} cancelled rows with first payment date.");
                     }
                 }
 
@@ -123,20 +132,29 @@ class SyncFirstPaymentDate extends Command
                 // set by STEP 4.
 
                 $totalUpdated = count($clearedPayments) + count($scheduledPayments) + count($cancelledNullIds);
-                $this->insertLogRow(
-                    $connector,
-                    $source,
-                    'SYNC_FIRST_PAYMENT_DATE',
-                    'SUCCESS',
-                    $totalUpdated,
-                    0,
-                    sprintf('Cleared: %d, Scheduled: %d, Cancelled: %d', 
-                        count($clearedPayments), count($scheduledPayments), count($cancelledNullIds))
-                );
+
+                if ($dryRun) {
+                    $this->info(sprintf(
+                        '[%s] DRY RUN summary — would update %d row(s): Cleared: %d, Scheduled: %d, Cancelled: %d. Nothing was written to SQL Server or TblLog.',
+                        $source, $totalUpdated, count($clearedPayments), count($scheduledPayments), count($cancelledNullIds)
+                    ));
+                } else {
+                    $this->insertLogRow(
+                        $connector,
+                        $source,
+                        'SYNC_FIRST_PAYMENT_DATE',
+                        'SUCCESS',
+                        $totalUpdated,
+                        0,
+                        sprintf('Cleared: %d, Scheduled: %d, Cancelled: %d',
+                            count($clearedPayments), count($scheduledPayments), count($cancelledNullIds))
+                    );
+                }
 
                 Log::info('SyncFirstPaymentDate: connection finished.', [
                     'connection' => $connection,
                     'source' => $source,
+                    'dry_run' => $dryRun,
                     'cleared' => count($clearedPayments),
                     'scheduled' => count($scheduledPayments),
                 ]);
@@ -532,10 +550,17 @@ SQL;
      * Update SQL Server with cleared payments (final values)
      * Sets First_Payment_Date = PROCESS_DATE, First_Payment_Cleared_Date = CLEARED_DATE
      */
-    protected function updateWithClearedPayments(DBConnector $connector, array $payments): int
+    protected function updateWithClearedPayments(DBConnector $connector, array $payments, string $source = '', bool $dryRun = false): int
     {
         if (empty($payments)) {
             return 0;
+        }
+
+        if ($dryRun) {
+            return $this->previewChanges($connector, $source, 'cleared payment', $payments, static fn(array $data) => [
+                $data['process_date'] ?? null,
+                $data['cleared_date'] ?? null,
+            ]);
         }
 
         $totalUpdated = 0;
@@ -588,10 +613,17 @@ SQL;
     /**
      * Update SQL Server with scheduled payments (First_Payment_Date only)
      */
-    protected function updateWithScheduledPayments(DBConnector $connector, array $payments): int
+    protected function updateWithScheduledPayments(DBConnector $connector, array $payments, string $source = '', bool $dryRun = false): int
     {
         if (empty($payments)) {
             return 0;
+        }
+
+        if ($dryRun) {
+            return $this->previewChanges($connector, $source, 'scheduled payment', $payments, static fn(array $data) => [
+                $data['process_date'] ?? null,
+                null, // First_Payment_Cleared_Date is untouched by this update
+            ]);
         }
 
         $totalUpdated = 0;
@@ -623,10 +655,17 @@ SQL;
     /**
      * Update cancelled contacts with first payment date (only if currently NULL)
      */
-    protected function updateCancelledWithFirstPayment(DBConnector $connector, array $payments): int
+    protected function updateCancelledWithFirstPayment(DBConnector $connector, array $payments, string $source = '', bool $dryRun = false): int
     {
         if (empty($payments)) {
             return 0;
+        }
+
+        if ($dryRun) {
+            return $this->previewChanges($connector, $source, 'cancelled first payment', $payments, static fn(array $data) => [
+                $data['process_date'] ?? null,
+                $data['cleared_date'] ?? null,
+            ]);
         }
 
         $totalUpdated = 0;
@@ -727,6 +766,84 @@ SQL;
     }
 
     // Helper methods
+
+    /**
+     * Dry-run helper: shows old value -> new value for each row a write method
+     * would have touched, without executing any UPDATE. Reads current
+     * First_Payment_Date/First_Payment_Cleared_Date so you can see exactly
+     * what would change (or not) before trusting the logic against real data.
+     *
+     * @param array<string, array<string, mixed>> $payments  LLG_ID => payment data
+     * @param callable(array<string,mixed>): array{0:?string,1:?string} $newValuesFor
+     *        Given one payment's data, returns [newFirstPaymentDate, newClearedDate].
+     *        Either can be null to mean "unchanged".
+     */
+    protected function previewChanges(
+        DBConnector $connector,
+        string $source,
+        string $label,
+        array $payments,
+        callable $newValuesFor
+    ): int {
+        $current = $this->fetchCurrentValues($connector, array_keys($payments));
+
+        $this->line(sprintf('[%s] DRY RUN — %s: %d row(s) would be updated.', $source, $label, count($payments)));
+
+        $shown = 0;
+        foreach ($payments as $llgId => $data) {
+            if ($shown >= 15) {
+                $this->line(sprintf('  ... and %d more not shown', count($payments) - $shown));
+                break;
+            }
+
+            [$newDate, $newCleared] = $newValuesFor($data);
+            $cur = $current[$llgId] ?? ['First_Payment_Date' => null, 'First_Payment_Cleared_Date' => null];
+
+            $this->line(sprintf(
+                '  %s: First_Payment_Date %s -> %s | First_Payment_Cleared_Date %s -> %s',
+                $llgId,
+                $cur['First_Payment_Date'] ?? 'NULL',
+                $newDate ?? '(unchanged)',
+                $cur['First_Payment_Cleared_Date'] ?? 'NULL',
+                $newCleared ?? '(unchanged)',
+            ));
+            $shown++;
+        }
+
+        return count($payments);
+    }
+
+    /**
+     * @param list<string> $llgIds
+     * @return array<string, array{First_Payment_Date: ?string, First_Payment_Cleared_Date: ?string}>
+     */
+    protected function fetchCurrentValues(DBConnector $connector, array $llgIds): array
+    {
+        $current = [];
+
+        foreach (array_chunk($llgIds, 500) as $chunk) {
+            $idList = implode(', ', array_map(
+                fn(string $id): string => "'" . $this->escapeSqlString($id) . "'",
+                $chunk
+            ));
+
+            $sql = "SELECT LLG_ID, First_Payment_Date, First_Payment_Cleared_Date FROM dbo.TblEnrollment WHERE LLG_ID IN ({$idList})";
+            $rows = $this->extractRows($connector->querySqlServer($sql));
+
+            foreach ($rows as $row) {
+                $llgId = $this->getRowValue($row, 'LLG_ID');
+                if ($llgId === null) {
+                    continue;
+                }
+                $current[$llgId] = [
+                    'First_Payment_Date' => $this->getRowValue($row, 'First_Payment_Date'),
+                    'First_Payment_Cleared_Date' => $this->getRowValue($row, 'First_Payment_Cleared_Date'),
+                ];
+            }
+        }
+
+        return $current;
+    }
 
     protected function buildContactToLlgMap(array $llgIds): array
     {
