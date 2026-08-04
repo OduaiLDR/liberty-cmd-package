@@ -4,6 +4,7 @@ namespace Cmd\Reports\Console\Commands\GenerateRetentionBonusCommission;
 
 use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\CommissionResultsWriter;
+use Cmd\Reports\Services\CommissionRosterProvider;
 use Cmd\Reports\Services\EmailSenderService;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
@@ -199,6 +200,23 @@ class GenerateRetentionBonusCommission extends Command
                 }
             }
             unset($row);
+
+            // Retention and Retention Bonus share ONE roster (confirmed by Jacob 2026-08-04), so this
+            // report is limited to the same people as the Retention Commission report. Unlike that
+            // report this command never had an agent whitelist — it took whoever appeared in the data.
+            // SAFETY: an unavailable/empty roster returns [] and we do NOT filter, so a roster problem
+            // can never silently shrink a payroll report.
+            $rosterAgents = CommissionRosterProvider::agents($sql, 'retention', $source, []);
+            if (!empty($rosterAgents)) {
+                $norm = fn (string $n): string => strtolower(preg_replace('/\s+/', ' ', trim($n)));
+                $rosterKeys = array_map($norm, $rosterAgents);
+                $before = count($rows);
+                $rows = array_values(array_filter(
+                    $rows,
+                    fn ($r): bool => in_array($norm((string) ($r['RETENTION_AGENT'] ?? '')), $rosterKeys, true)
+                ));
+                $this->info("[INFO] [$display] Roster filter: {$before} → " . count($rows) . ' rows (' . count($rosterKeys) . ' agents on the retention roster).');
+            }
 
             // Persist per-agent retention BONUS COMMISSION to Azure for the Commission Review app
             // (best-effort; never blocks the report). Aggregates per-contact RETENTION_COMMISSION by agent.

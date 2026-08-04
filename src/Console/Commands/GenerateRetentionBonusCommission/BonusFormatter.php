@@ -141,6 +141,16 @@ class BonusFormatter
                 $summary->setCellValue("B{$sr}", round($agentTotals[$agentName]['commission'], 2, PHP_ROUND_HALF_EVEN));
                 $summary->setCellValue("C{$sr}", $agentTotals[$agentName]['location']);
                 $summary->setCellValue("D{$sr}", $agentTotals[$agentName]['company']);
+
+                // Call out agents with no company or location — without a company they cannot appear
+                // on the Commission Review page (which is separated per company).
+                if (trim((string) ($agentTotals[$agentName]['company'] ?? '')) === ''
+                    || trim((string) ($agentTotals[$agentName]['location'] ?? '')) === '') {
+                    $summary->getStyle("A{$sr}:D{$sr}")->getFill()
+                        ->setFillType(Fill::FILL_SOLID)
+                        ->getStartColor()->setARGB('FFFFC7CE');
+                    $summary->getStyle("A{$sr}:D{$sr}")->getFont()->getColor()->setARGB('FF9C0006');
+                }
                 $sr++;
             }
 

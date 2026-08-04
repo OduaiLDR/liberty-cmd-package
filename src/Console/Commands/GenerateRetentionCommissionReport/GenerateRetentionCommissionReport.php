@@ -580,6 +580,15 @@ class GenerateRetentionCommissionReport extends Command
                 $sheet2->setCellValue("F$r2", $sum['commission']);
                 $sheet2->setCellValue("G$r2", $sum['location']);
                 $sheet2->setCellValue("H$r2", $sum['company']);
+
+                // Call out agents with no company or location — without a company they cannot appear
+                // on the Commission Review page (which is separated per company).
+                if (trim((string) ($sum['company'] ?? '')) === '' || trim((string) ($sum['location'] ?? '')) === '') {
+                    $sheet2->getStyle("A$r2:H$r2")->getFill()
+                        ->setFillType(Fill::FILL_SOLID)
+                        ->getStartColor()->setARGB('FFFFC7CE');
+                    $sheet2->getStyle("A$r2:H$r2")->getFont()->getColor()->setARGB('FF9C0006');
+                }
                 $r2++;
             }
 

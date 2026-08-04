@@ -120,6 +120,16 @@ class Formatter
             $s->setCellValue("I$r", $row['commission']);
             $s->setCellValue("J$r", $row['location'] ?? '');
             $s->setCellValue("K$r", $row['company']  ?? '');
+
+            // Call out agents with no company or location: an agent with no company cannot be shown
+            // on the Commission Review page (which is separated per company), so these need fixing
+            // in the employee directory or they drop off payroll review entirely.
+            if (trim((string) ($row['company'] ?? '')) === '' || trim((string) ($row['location'] ?? '')) === '') {
+                $s->getStyle("A$r:K$r")->getFill()
+                    ->setFillType(Fill::FILL_SOLID)
+                    ->getStartColor()->setARGB('FFFFC7CE');       // light red
+                $s->getStyle("A$r:K$r")->getFont()->getColor()->setARGB('FF9C0006');
+            }
             $r++;
         }
 
