@@ -200,7 +200,7 @@ class GenerateRetentionCommissionSummary extends Command
                 LEFT(p.RETENTION_DATE, 10) AS RETENTION_DATE,
                 p.IMMEDIATE_RESULTS,
                 d.ENROLLED_DEBT,
-                LEFT(c.DROPPED_DATE, 10) AS DROPPED_DATE
+                TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.DROPPED_DATE) AS DATE), 'YYYY-MM-DD') AS DROPPED_DATE
             FROM PivotedFields p
             JOIN CONTACTS c ON c.ID = p.CONTACT_ID
             LEFT JOIN (
@@ -211,7 +211,7 @@ class GenerateRetentionCommissionSummary extends Command
             ) AS d ON c.ID = d.CONTACT_ID
             WHERE (
                    (p.RETENTION_DATE >= '$start' AND p.RETENTION_DATE <= '$end')
-                OR (LEFT(c.DROPPED_DATE, 10) >= '$start' AND LEFT(c.DROPPED_DATE, 10) <= '$end')
+                OR (CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.DROPPED_DATE) AS DATE) >= '$start' AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.DROPPED_DATE) AS DATE) <= '$end')
             )
               AND p.RETENTION_AGENT IS NOT NULL
             ORDER BY p.RETENTION_AGENT ASC
@@ -224,11 +224,11 @@ class GenerateRetentionCommissionSummary extends Command
     {
         // VBA Summary uses ORDER BY DESC → get latest date per contact
         $sql = "
-            SELECT cs.CONTACT_ID, LEFT(cs.STAMP, 10) AS RECON_DATE
+            SELECT cs.CONTACT_ID, TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) AS DATE), 'YYYY-MM-DD') AS RECON_DATE
             FROM   CONTACTS_STATUS AS cs
             WHERE  cs.STATUS_ID = $statusId
               AND  cs.CONTACT_ID IN ($idList)
-            ORDER  BY cs.CONTACT_ID ASC, cs.STAMP DESC
+            ORDER  BY cs.CONTACT_ID ASC, CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) DESC
         ";
         $res = $sf->query($sql);
         $map = [];
@@ -244,7 +244,7 @@ class GenerateRetentionCommissionSummary extends Command
     private function fetchClearedPayments(DBConnector $sf, string $idList): array
     {
         $sql = "
-            SELECT CONTACT_ID, CLEARED_DATE
+            SELECT CONTACT_ID, TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', CLEARED_DATE) AS DATE), 'YYYY-MM-DD') AS CLEARED_DATE
             FROM   TRANSACTIONS
             WHERE  TRANS_TYPE='D' AND CLEARED_DATE IS NOT NULL AND RETURNED_DATE IS NULL
               AND  CONTACT_ID IN ($idList)
@@ -260,13 +260,13 @@ class GenerateRetentionCommissionSummary extends Command
     private function fetchRetainedDates(DBConnector $sf, string $idList): array
     {
         $sql = "
-            SELECT cs.CONTACT_ID, LEFT(cs.STAMP, 10) AS RETAINED_DATE
+            SELECT cs.CONTACT_ID, TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) AS DATE), 'YYYY-MM-DD') AS RETAINED_DATE
             FROM   CONTACTS_STATUS cs
             LEFT JOIN CONTACTS_LEAD_STATUS cls ON cs.STATUS_ID = cls.ID
             WHERE  UPPER(cls.TITLE) LIKE '%ENROLLED%'
               AND  UPPER(cls.TITLE) NOT LIKE '%RECONSIDERATION%'
               AND  cs.CONTACT_ID IN ($idList)
-            ORDER  BY cs.CONTACT_ID ASC, cs.STAMP ASC
+            ORDER  BY cs.CONTACT_ID ASC, CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) ASC
         ";
         $res = $sf->query($sql);
         $map = [];
@@ -283,12 +283,12 @@ class GenerateRetentionCommissionSummary extends Command
         $sql = "
             SELECT CLEARED_DATE
             FROM (
-                SELECT CLEARED_DATE,
-                       ROW_NUMBER() OVER (PARTITION BY CONTACT_ID ORDER BY CLEARED_DATE ASC) AS N
+                SELECT CONVERT_TIMEZONE('America/Los_Angeles', CLEARED_DATE) AS CLEARED_DATE,
+                       ROW_NUMBER() OVER (PARTITION BY CONTACT_ID ORDER BY CONVERT_TIMEZONE('America/Los_Angeles', CLEARED_DATE) ASC) AS N
                 FROM   TRANSACTIONS
                 WHERE  CONTACT_ID=$id AND TRANS_TYPE='D'
                   AND  CLEARED_DATE IS NOT NULL AND RETURNED_DATE IS NULL
-                  AND  CLEARED_DATE >= '$date'
+                  AND  CAST(CONVERT_TIMEZONE('America/Los_Angeles', CLEARED_DATE) AS DATE) >= '$date'
             ) WHERE N=1
         ";
         $res = $sf->query($sql);

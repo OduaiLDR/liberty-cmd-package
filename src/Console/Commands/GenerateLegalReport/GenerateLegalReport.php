@@ -87,18 +87,18 @@ class GenerateLegalReport extends Command
                 TO_VARCHAR(c.DOB::date, 'YYYY-MM-DD') AS DOB,
                 c.STATE,
                 ed.TITLE AS PLAN_NAME,
-                TO_VARCHAR(d.SUMMONS_DATE::date, 'YYYY-MM-DD') AS SUMMONS_DATE,
-                TO_VARCHAR(d.ANSWER_DATE::date, 'YYYY-MM-DD') AS ANSWER_DATE,
+                TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', d.SUMMONS_DATE) AS DATE), 'YYYY-MM-DD') AS SUMMONS_DATE,
+                TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', d.ANSWER_DATE) AS DATE), 'YYYY-MM-DD') AS ANSWER_DATE,
                 cr1.COMPANY AS ORIGINAL_CREDITOR,
                 cr2.COMPANY AS DEBT_BUYER,
                 d.ACCOUNT_NUM,
                 d.VERIFIED_AMOUNT,
                 b.SPA_BALANCE,
-                TO_VARCHAR(d.POA_SENT_DATE::date, 'YYYY-MM-DD') AS POA_SENT_DATE,
+                TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', d.POA_SENT_DATE) AS DATE), 'YYYY-MM-DD') AS POA_SENT_DATE,
                 cd1.LEGAL_NEGOTIATOR,
                 cd2.ATTORNEY_ASSIGNMENT,
                 cd3.LEGAL_CLAIM_ID,
-                TO_VARCHAR(d.SETTLEMENT_DATE::date, 'YYYY-MM-DD') AS SETTLEMENT_DATE,
+                TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', d.SETTLEMENT_DATE) AS DATE), 'YYYY-MM-DD') AS SETTLEMENT_DATE,
                 n.NOTES AS NEGOTIATOR_LAST_NOTE,
                 n.NOTE_DATE AS LATEST_NOTE_DATE,
                 b.N1,
@@ -112,15 +112,15 @@ class GenerateLegalReport extends Command
             LEFT JOIN (
                 SELECT CONTACT_ID,
                        \"CURRENT\" AS SPA_BALANCE,
-                       ROW_NUMBER() OVER (PARTITION BY CONTACT_ID ORDER BY STAMP DESC) AS N1
+                       ROW_NUMBER() OVER (PARTITION BY CONTACT_ID ORDER BY CONVERT_TIMEZONE('America/Los_Angeles', STAMP) DESC) AS N1
                 FROM CONTACT_BALANCES
                 WHERE \"CURRENT\" IS NOT NULL
             ) AS b ON c.ID = b.CONTACT_ID
             LEFT JOIN (
                 SELECT DEBT_ID,
                        NOTES,
-                       TO_VARCHAR(CREATED_AT::date, 'YYYY-MM-DD') AS NOTE_DATE,
-                       ROW_NUMBER() OVER (PARTITION BY DEBT_ID ORDER BY CREATED_AT DESC) AS N2
+                       TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', CREATED_AT) AS DATE), 'YYYY-MM-DD') AS NOTE_DATE,
+                       ROW_NUMBER() OVER (PARTITION BY DEBT_ID ORDER BY CONVERT_TIMEZONE('America/Los_Angeles', CREATED_AT) DESC) AS N2
                 FROM DEBT_NOTES
             ) AS n ON d.ID = n.DEBT_ID
             LEFT JOIN (

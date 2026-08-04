@@ -149,9 +149,9 @@ class GenerateScrubListReport extends Command
             $balanceSql = "
                 SELECT CONTACT_ID, \"CURRENT\"
                 FROM CONTACT_BALANCES
-                WHERE STAMP > '" . date('Y-m-d', strtotime('-14 days')) . "'
+                WHERE CAST(CONVERT_TIMEZONE('America/Los_Angeles', STAMP) AS DATE) > '" . date('Y-m-d', strtotime('-14 days')) . "'
                   AND CONTACT_ID IN ({$contactIdList})
-                ORDER BY STAMP DESC
+                ORDER BY CONVERT_TIMEZONE('America/Los_Angeles', STAMP) DESC
             ";
             $balanceResult = $snowflake->query($balanceSql);
             foreach ($balanceResult['data'] ?? [] as $row) {
@@ -180,8 +180,8 @@ class GenerateScrubListReport extends Command
                   AND CANCELLED = 0
                   AND CLEARED_DATE IS NULL
                   AND RETURNED_DATE IS NULL
-                  AND PROCESS_DATE > '" . date('Y-m-d', strtotime('-1 day')) . "'
-                  AND PROCESS_DATE <= '" . date('Y-m-d', strtotime('+90 days')) . "'
+                  AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', PROCESS_DATE) AS DATE) > '" . date('Y-m-d', strtotime('-1 day')) . "'
+                  AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', PROCESS_DATE) AS DATE) <= '" . date('Y-m-d', strtotime('+90 days')) . "'
                   AND CONTACT_ID IN ({$contactIdList})
             ";
             $transResult = $snowflake->query($transSql);

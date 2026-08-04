@@ -609,18 +609,18 @@ final class GenerateResumePayments extends Command
             SELECT
                 t.CONTACT_ID,
                 CONCAT(COALESCE(c.FIRSTNAME, ''), ' ', COALESCE(c.LASTNAME, '')) AS FULLNAME,
-                TO_VARCHAR(t.PROCESS_DATE::date, 'YYYY-MM-DD') AS PROCESS_DATE,
-                TO_VARCHAR(t.RETURNED_DATE::date, 'YYYY-MM-DD') AS RETURNED_DATE,
+                TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE) AS DATE), 'YYYY-MM-DD') AS PROCESS_DATE,
+                TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', t.RETURNED_DATE) AS DATE), 'YYYY-MM-DD') AS RETURNED_DATE,
                 CASE WHEN t.RESPONSE = 'Invalid Routing Number' THEN 'R03' ELSE t.RETURN_CODE END AS RETURN_CODE
             FROM TRANSACTIONS t
             JOIN CONTACTS c ON t.CONTACT_ID = c.ID
             WHERE t.TRANS_TYPE = 'D'
               AND (t.RETURN_CODE IN ({$rCodeList}) OR t.RESPONSE = 'Invalid Routing Number')
-              AND t.PROCESS_DATE < CURRENT_DATE()
-              AND t.PROCESS_DATE >= '2022-09-01'
+              AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE) AS DATE) < CAST(CONVERT_TIMEZONE('America/Los_Angeles', CURRENT_TIMESTAMP()) AS DATE)
+              AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE) AS DATE) >= '2022-09-01'
               AND c.ENROLLED = 1
               AND c.GRADUATED = 0
-            QUALIFY ROW_NUMBER() OVER (PARTITION BY t.CONTACT_ID ORDER BY t.PROCESS_DATE DESC) = 1
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY t.CONTACT_ID ORDER BY CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE) DESC) = 1
             ORDER BY t.CONTACT_ID ASC
         ";
 
@@ -693,17 +693,17 @@ final class GenerateResumePayments extends Command
         $sql = "
             SELECT
                 CONTACT_ID,
-                TO_VARCHAR(PROCESS_DATE::date, 'YYYY-MM-DD') AS PROCESS_DATE,
-                TO_VARCHAR(RETURNED_DATE::date, 'YYYY-MM-DD') AS RETURNED_DATE,
-                TO_VARCHAR(CLEARED_DATE::date, 'YYYY-MM-DD') AS CLEARED_DATE,
+                TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', PROCESS_DATE) AS DATE), 'YYYY-MM-DD') AS PROCESS_DATE,
+                TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', RETURNED_DATE) AS DATE), 'YYYY-MM-DD') AS RETURNED_DATE,
+                TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', CLEARED_DATE) AS DATE), 'YYYY-MM-DD') AS CLEARED_DATE,
                 RESPONSE,
                 CASE WHEN RESPONSE = 'Invalid Routing Number' THEN 'R03' ELSE RETURN_CODE END AS RETURN_CODE
             FROM TRANSACTIONS
             WHERE CONTACT_ID IN ({$cidList})
               AND TRANS_TYPE = 'D'
-              AND PROCESS_DATE < CURRENT_DATE()
+              AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', PROCESS_DATE) AS DATE) < CAST(CONVERT_TIMEZONE('America/Los_Angeles', CURRENT_TIMESTAMP()) AS DATE)
               AND CANCELLED = 0
-            ORDER BY CONTACT_ID ASC, PROCESS_DATE DESC, CLEARED_DATE ASC
+            ORDER BY CONTACT_ID ASC, CONVERT_TIMEZONE('America/Los_Angeles', PROCESS_DATE) DESC, CONVERT_TIMEZONE('America/Los_Angeles', CLEARED_DATE) ASC
         ";
 
         $result = $snowflake->query($sql);
@@ -842,13 +842,13 @@ final class GenerateResumePayments extends Command
         $sql = "
             SELECT
                 CONTACT_ID,
-                TO_VARCHAR(CREATED_AT::date, 'YYYY-MM-DD') AS CREATED_AT
+                TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', CREATED_AT) AS DATE), 'YYYY-MM-DD') AS CREATED_AT
             FROM TRANSACTIONS
             WHERE CONTACT_ID IN ({$cidList})
               AND TRANS_TYPE = 'D'
               AND CANCELLED = 0
               AND ACTIVE = 1
-              AND PROCESS_DATE >= DATEADD(day, -3, CURRENT_DATE())
+              AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', PROCESS_DATE) AS DATE) >= DATEADD(day, -3, CAST(CONVERT_TIMEZONE('America/Los_Angeles', CURRENT_TIMESTAMP()) AS DATE))
         ";
 
         $result = $snowflake->query($sql);

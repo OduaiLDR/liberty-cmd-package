@@ -69,12 +69,12 @@ class SyncVeritasTransactions extends Command
             SELECT 
                 CONCAT('LLG-', t.CONTACT_ID) AS LLG_ID,
                 NULL AS PAYMENT,
-                TO_VARCHAR(t.PROCESS_DATE::date, 'YYYY-MM-DD') AS PROCESS_DATE,
-                TO_VARCHAR(t.CLEARED_DATE::date, 'YYYY-MM-DD') AS CLEARED_DATE,
-                TO_VARCHAR(t.RETURNED_DATE::date, 'YYYY-MM-DD') AS RETURNED_DATE
+                TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE) AS DATE), 'YYYY-MM-DD') AS PROCESS_DATE,
+                TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', t.CLEARED_DATE) AS DATE), 'YYYY-MM-DD') AS CLEARED_DATE,
+                TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', t.RETURNED_DATE) AS DATE), 'YYYY-MM-DD') AS RETURNED_DATE
             FROM TRANSACTIONS AS t
             WHERE t.TRANS_TYPE = 'D'
-              AND t.PROCESS_DATE <= '{$this->esc($today)}'
+              AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE) AS DATE) <= '{$this->esc($today)}'
               AND t.CONTACT_ID IN (
                   SELECT c.ID
                   FROM CONTACTS AS c
@@ -82,7 +82,7 @@ class SyncVeritasTransactions extends Command
                   LEFT JOIN ENROLLMENT_DEFAULTS2 AS ed ON ep.PLAN_ID = ed.ID
                   WHERE UPPER(ed.TITLE) LIKE '%WITH VERITAS%'
               )
-            ORDER BY CONCAT('LLG-', t.CONTACT_ID) ASC, t.PROCESS_DATE ASC
+            ORDER BY CONCAT('LLG-', t.CONTACT_ID) ASC, CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE) ASC
         ";
 
         try {

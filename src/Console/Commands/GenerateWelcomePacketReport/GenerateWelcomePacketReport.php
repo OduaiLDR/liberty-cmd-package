@@ -42,15 +42,15 @@ class GenerateWelcomePacketReport extends Command
                     CONCAT('LLG-', c.ID) AS LLG_ID,
                     ROW_NUMBER() OVER (
                         PARTITION BY t.CONTACT_ID
-                        ORDER BY t.CONTACT_ID ASC, t.CLEARED_DATE ASC
+                        ORDER BY t.CONTACT_ID ASC, CONVERT_TIMEZONE('America/Los_Angeles', t.CLEARED_DATE) ASC
                     ) AS N,
-                    TO_VARCHAR(t.CLEARED_DATE::date, 'YYYY-MM-DD') AS CLEARED_DATE
+                    TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', t.CLEARED_DATE) AS DATE), 'YYYY-MM-DD') AS CLEARED_DATE
                 FROM CONTACTS AS c
                 LEFT JOIN ENROLLMENT_PLAN AS ep ON c.ID = ep.CONTACT_ID
                 LEFT JOIN ENROLLMENT_DEFAULTS2 AS ed ON ep.PLAN_ID = ed.ID
                 LEFT JOIN TRANSACTIONS AS t ON c.ID = t.CONTACT_ID
                 WHERE t.TRANS_TYPE = 'D'
-                ORDER BY t.CLEARED_DATE ASC
+                ORDER BY CONVERT_TIMEZONE('America/Los_Angeles', t.CLEARED_DATE) ASC
             )
             WHERE N = 1
               AND CLEARED_DATE >= '{$this->esc($startDateString)}'

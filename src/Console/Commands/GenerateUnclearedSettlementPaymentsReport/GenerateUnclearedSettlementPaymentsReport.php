@@ -159,17 +159,17 @@ class GenerateUnclearedSettlementPaymentsReport extends Command
         $sql = "
 SELECT
     t.CONTACT_ID,
-    TO_VARCHAR(t.PROCESS_DATE::date, 'YYYY-MM-DD') AS PROCESS_DATE,
+    TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE) AS DATE), 'YYYY-MM-DD') AS PROCESS_DATE,
     t.AMOUNT,
     t.MEMO
 FROM TRANSACTIONS t
 WHERE t.TRANS_TYPE = 'S'
-  AND t.PROCESS_DATE >= '{$start}'
-  AND t.PROCESS_DATE < '{$endExclusive}'
+  AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE) AS DATE) >= '{$start}'
+  AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE) AS DATE) < '{$endExclusive}'
   AND t.CLEARED_DATE IS NULL
   AND t.RETURNED_DATE IS NULL
   AND t.CANCELLED = 0
-ORDER BY t.PROCESS_DATE ASC
+ORDER BY CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE) ASC
 ";
 
         $out = [];

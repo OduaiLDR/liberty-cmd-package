@@ -72,7 +72,7 @@ class SyncNegotiatorPayrollData extends Command
                 SUM(t.AMOUNT) AS Collected,
                 d.SETTLEMENT_ID,
                 t.MEMO,
-                d.SETTLEMENT_DATE AS SDate,
+                CONVERT_TIMEZONE('America/Los_Angeles', d.SETTLEMENT_DATE) AS SDate,
                 so.NEG_ID
             FROM TRANSACTIONS AS t
             JOIN TRANSACTIONS AS t1 ON (t.CONTACT_ID = t1.CONTACT_ID AND t1.TRANS_TYPE = 'S' AND t.LINKED_TO = t1.ID)
@@ -86,9 +86,9 @@ class SyncNegotiatorPayrollData extends Command
               AND c._FIVETRAN_DELETED = FALSE
               AND so._FIVETRAN_DELETED = FALSE
               AND d._FIVETRAN_DELETED = FALSE
-              AND d.SETTLEMENT_DATE BETWEEN '{$this->esc($startDate)}' AND '{$this->esc($endDate)}'
-            GROUP BY CONCAT(c.FIRSTNAME,' ', c.LASTNAME), d.SETTLEMENT_DATE, d.SETTLEMENT_ID, t.MEMO, t.CONTACT_ID, so.NEG_ID
-            ORDER BY so.NEG_ID ASC, d.SETTLEMENT_DATE ASC
+              AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', d.SETTLEMENT_DATE) AS DATE) BETWEEN '{$this->esc($startDate)}' AND '{$this->esc($endDate)}'
+            GROUP BY CONCAT(c.FIRSTNAME,' ', c.LASTNAME), CONVERT_TIMEZONE('America/Los_Angeles', d.SETTLEMENT_DATE), d.SETTLEMENT_ID, t.MEMO, t.CONTACT_ID, so.NEG_ID
+            ORDER BY so.NEG_ID ASC, CONVERT_TIMEZONE('America/Los_Angeles', d.SETTLEMENT_DATE) ASC
         ";
 
         $result1 = $snowflake->query($sql1);
@@ -120,9 +120,9 @@ class SyncNegotiatorPayrollData extends Command
                 d.SETTLEMENT_ID,
                 cr1.COMPANY AS Creditor_Name,
                 cr2.COMPANY AS Collection_Company,
-                d.SETTLEMENT_DATE,
+                CONVERT_TIMEZONE('America/Los_Angeles', d.SETTLEMENT_DATE) AS SETTLEMENT_DATE,
                 so.NEG_ID,
-                so.CREATED_AT,
+                CONVERT_TIMEZONE('America/Los_Angeles', so.CREATED_AT) AS CREATED_AT,
                 so.SETTLEMENT_AMOUNT,
                 d.ID
             FROM SETTLEMENT_OFFERS AS so
@@ -131,7 +131,7 @@ class SyncNegotiatorPayrollData extends Command
             LEFT JOIN CREDITORS AS cr2 ON d.DEBT_BUYER = cr2.ID
             LEFT JOIN CONTACTS AS c ON d.CONTACT_ID = c.ID
             WHERE so.OFFER_STATUS = 10
-              AND so.CREATED_AT BETWEEN '{$this->esc($startDate)}' AND '{$this->esc($endDate)}'
+              AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', so.CREATED_AT) AS DATE) BETWEEN '{$this->esc($startDate)}' AND '{$this->esc($endDate)}'
         ";
 
         $result2 = $snowflake->query($sql2);

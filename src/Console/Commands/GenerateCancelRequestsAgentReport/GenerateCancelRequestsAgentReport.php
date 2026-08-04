@@ -94,7 +94,7 @@ class GenerateCancelRequestsAgentReport extends Command
             WITH PivotedFields AS (
                 SELECT
                     CONTACT_ID,
-                    MAX(CASE WHEN CUSTOM_ID = $cc THEN TO_DATE(F_DATETIME) END) AS CANCEL_REQUEST_DATE,
+                    MAX(CASE WHEN CUSTOM_ID = $cc THEN CAST(CONVERT_TIMEZONE('America/Los_Angeles', F_DATETIME) AS DATE) END) AS CANCEL_REQUEST_DATE,
                     MAX(CASE WHEN CUSTOM_ID = $ca THEN F_SHORTSTRING END) AS AGENT
                 FROM CONTACTS_USERFIELDS
                 WHERE CUSTOM_ID IN ($cc, $ca)
@@ -104,7 +104,7 @@ class GenerateCancelRequestsAgentReport extends Command
                 CONCAT('LLG-', c.ID)                         AS LLG_ID,
                 TO_VARCHAR(p.CANCEL_REQUEST_DATE, 'MM/DD/YYYY') AS CANCEL_REQUEST_DATE,
                 p.AGENT,
-                LEFT(c.DROPPED_DATE, 10)                     AS DROPPED_DATE
+                TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.DROPPED_DATE) AS DATE), 'YYYY-MM-DD') AS DROPPED_DATE
             FROM PivotedFields p
             JOIN CONTACTS c ON c.ID = p.CONTACT_ID
             WHERE p.CANCEL_REQUEST_DATE >= '$start'

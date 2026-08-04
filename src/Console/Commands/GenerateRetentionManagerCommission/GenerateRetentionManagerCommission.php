@@ -840,7 +840,7 @@ class GenerateRetentionManagerCommission extends Command
                     CU2.NSF_RETURNED_DATE,
                     CU3.NSF_ACTION,
                     CU4.NSF_RECOUP_DATE,
-                    T.CLEARED_DATE,
+                    CAST(CONVERT_TIMEZONE('America/Los_Angeles', T.CLEARED_DATE) AS DATE) AS CLEARED_DATE,
                     T.RN
                 FROM CONTACTS c
                 LEFT JOIN (
@@ -865,7 +865,7 @@ class GenerateRetentionManagerCommission extends Command
                 ) CU4 ON c.ID = CU4.CONTACT_ID
                 LEFT JOIN (
                     SELECT CONTACT_ID, CLEARED_DATE,
-                           ROW_NUMBER() OVER (PARTITION BY CONTACT_ID ORDER BY PROCESS_DATE DESC) AS RN
+                           ROW_NUMBER() OVER (PARTITION BY CONTACT_ID ORDER BY CONVERT_TIMEZONE('America/Los_Angeles', PROCESS_DATE) DESC) AS RN
                     FROM TRANSACTIONS
                     WHERE TRANS_TYPE = 'D'
                       AND CLEARED_DATE IS NOT NULL

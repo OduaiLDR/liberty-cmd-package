@@ -72,7 +72,7 @@ class GenerateCompanyStatsReport extends Command
             FROM CONTACTS
             WHERE ENROLLED = 1
               AND {$clientFilter}
-              AND ENROLLED_DATE >= '{$this->esc($yearStart)}'
+              AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', ENROLLED_DATE) AS DATE) >= '{$this->esc($yearStart)}'
         ");
         $this->addStat($stats, 'Enrolled Clients', $total, $ytd, 'count');
 
@@ -94,7 +94,7 @@ class GenerateCompanyStatsReport extends Command
                   SELECT CONTACT_ID
                   FROM DEBTS
                   WHERE SETTLED = 1
-                    AND SETTLEMENT_DATE >= '{$this->esc($yearStart)}'
+                    AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE) >= '{$this->esc($yearStart)}'
               )
         ");
         $this->addStat($stats, 'Clients With Settlements', $total, $ytd, 'count');
@@ -118,7 +118,7 @@ class GenerateCompanyStatsReport extends Command
               AND CONTACT_ID IN (
                   SELECT ID FROM CONTACTS
                   WHERE {$clientFilter}
-                    AND ENROLLED_DATE >= '{$this->esc($yearStart)}'
+                    AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', ENROLLED_DATE) AS DATE) >= '{$this->esc($yearStart)}'
               )
         ");
         $this->addStat($stats, 'Debt Under Management', $total, $ytd, 'money');
@@ -128,7 +128,7 @@ class GenerateCompanyStatsReport extends Command
             FROM DEBTS
             WHERE ENROLLED = 1
               AND _FIVETRAN_DELETED = FALSE
-              AND COALESCE(SETTLEMENT_DATE, '2018-01-01') >= '2019-01-01'
+              AND COALESCE(CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE), '2018-01-01') >= '2019-01-01'
               AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE ENROLLED = 1 OR GRADUATED = 1)
               AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE {$clientFilter})
         ");
@@ -137,7 +137,7 @@ class GenerateCompanyStatsReport extends Command
             FROM DEBTS
             WHERE ENROLLED = 1
               AND _FIVETRAN_DELETED = FALSE
-              AND COALESCE(SETTLEMENT_DATE, '2018-01-01') >= '{$this->esc($yearStart)}'
+              AND COALESCE(CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE), '2018-01-01') >= '{$this->esc($yearStart)}'
               AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE ENROLLED = 1 OR GRADUATED = 1)
               AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE {$clientFilter})
         ");
@@ -148,7 +148,7 @@ class GenerateCompanyStatsReport extends Command
             FROM DEBTS
             WHERE ENROLLED = 1
               AND _FIVETRAN_DELETED = FALSE
-              AND COALESCE(SETTLEMENT_DATE, '2018-01-01') >= '2019-01-01'
+              AND COALESCE(CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE), '2018-01-01') >= '2019-01-01'
               AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE {$clientFilter})
         ");
         $ytd = $this->snowflakeScalar($snowflake, "
@@ -156,7 +156,7 @@ class GenerateCompanyStatsReport extends Command
             FROM DEBTS
             WHERE ENROLLED = 1
               AND _FIVETRAN_DELETED = FALSE
-              AND COALESCE(SETTLEMENT_DATE, '2018-01-01') >= '{$this->esc($yearStart)}'
+              AND COALESCE(CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE), '2018-01-01') >= '{$this->esc($yearStart)}'
               AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE {$clientFilter})
         ");
         $this->addStat($stats, 'Accounts Settled', $total, $ytd, 'count');
@@ -164,13 +164,13 @@ class GenerateCompanyStatsReport extends Command
         $total = $this->snowflakeScalar($snowflake, "
             SELECT AVG(SETTLEMENT_MONTHS)
             FROM (
-                SELECT DATEDIFF(MONTH, ENROLLED_DATE, SETTLEMENT_DATE) AS SETTLEMENT_MONTHS,
-                       SETTLEMENT_DATE,
-                       ROW_NUMBER() OVER (PARTITION BY CONTACT_ID ORDER BY SETTLEMENT_DATE ASC) AS N
+                SELECT DATEDIFF(MONTH, CAST(CONVERT_TIMEZONE('America/Los_Angeles', ENROLLED_DATE) AS DATE), CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE)) AS SETTLEMENT_MONTHS,
+                       CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE) AS SETTLEMENT_DATE,
+                       ROW_NUMBER() OVER (PARTITION BY CONTACT_ID ORDER BY CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) ASC) AS N
                 FROM DEBTS
                 WHERE ENROLLED = 1
                   AND _FIVETRAN_DELETED = FALSE
-                  AND COALESCE(SETTLEMENT_DATE, '2018-01-01') >= '2019-01-01'
+                  AND COALESCE(CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE), '2018-01-01') >= '2019-01-01'
                   AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE ENROLLED = 1 OR GRADUATED = 1)
                   AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE {$clientFilter})
             )
@@ -181,13 +181,13 @@ class GenerateCompanyStatsReport extends Command
         $ytd = $this->snowflakeScalar($snowflake, "
             SELECT AVG(SETTLEMENT_MONTHS)
             FROM (
-                SELECT DATEDIFF(MONTH, ENROLLED_DATE, SETTLEMENT_DATE) AS SETTLEMENT_MONTHS,
-                       SETTLEMENT_DATE,
-                       ROW_NUMBER() OVER (PARTITION BY CONTACT_ID ORDER BY SETTLEMENT_DATE ASC) AS N
+                SELECT DATEDIFF(MONTH, CAST(CONVERT_TIMEZONE('America/Los_Angeles', ENROLLED_DATE) AS DATE), CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE)) AS SETTLEMENT_MONTHS,
+                       CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE) AS SETTLEMENT_DATE,
+                       ROW_NUMBER() OVER (PARTITION BY CONTACT_ID ORDER BY CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) ASC) AS N
                 FROM DEBTS
                 WHERE ENROLLED = 1
                   AND _FIVETRAN_DELETED = FALSE
-                  AND COALESCE(SETTLEMENT_DATE, '2018-01-01') >= '2019-01-01'
+                  AND COALESCE(CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE), '2018-01-01') >= '2019-01-01'
                   AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE ENROLLED = 1 OR GRADUATED = 1)
                   AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE {$clientFilter})
             )
@@ -204,10 +204,10 @@ class GenerateCompanyStatsReport extends Command
                 FROM DEBTS
                 WHERE ENROLLED = 1
                   AND _FIVETRAN_DELETED = FALSE
-                  AND COALESCE(SETTLEMENT_DATE, '2018-01-01') >= '2019-01-01'
+                  AND COALESCE(CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE), '2018-01-01') >= '2019-01-01'
                   AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE ENROLLED = 1 OR GRADUATED = 1)
                   AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE {$clientFilter})
-                GROUP BY YEAR(SETTLEMENT_DATE), MONTH(SETTLEMENT_DATE)
+                GROUP BY YEAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE)), MONTH(CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE))
             )
         ");
         $ytd = $this->snowflakeScalar($snowflake, "
@@ -217,10 +217,10 @@ class GenerateCompanyStatsReport extends Command
                 FROM DEBTS
                 WHERE ENROLLED = 1
                   AND _FIVETRAN_DELETED = FALSE
-                  AND COALESCE(SETTLEMENT_DATE, '2018-01-01') >= '{$this->esc($yearStart)}'
+                  AND COALESCE(CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE), '2018-01-01') >= '{$this->esc($yearStart)}'
                   AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE ENROLLED = 1 OR GRADUATED = 1)
                   AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE {$clientFilter})
-                GROUP BY YEAR(SETTLEMENT_DATE), MONTH(SETTLEMENT_DATE)
+                GROUP BY YEAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE)), MONTH(CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE))
             )
         ");
         $this->addStat($stats, 'Average Debt Settled Per Month', $total, $ytd, 'money');
@@ -232,9 +232,9 @@ class GenerateCompanyStatsReport extends Command
                 FROM DEBTS
                 WHERE ENROLLED = 1
                   AND _FIVETRAN_DELETED = FALSE
-                  AND COALESCE(SETTLEMENT_DATE, '2018-01-01') >= '2019-01-01'
+                  AND COALESCE(CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE), '2018-01-01') >= '2019-01-01'
                   AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE {$clientFilter})
-                GROUP BY YEAR(SETTLEMENT_DATE), MONTH(SETTLEMENT_DATE)
+                GROUP BY YEAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE)), MONTH(CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE))
             )
         ");
         $ytdSum = $this->snowflakeScalar($snowflake, "
@@ -244,9 +244,9 @@ class GenerateCompanyStatsReport extends Command
                 FROM DEBTS
                 WHERE ENROLLED = 1
                   AND _FIVETRAN_DELETED = FALSE
-                  AND COALESCE(SETTLEMENT_DATE, '2018-01-01') >= '{$this->esc($yearStart)}'
+                  AND COALESCE(CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE), '2018-01-01') >= '{$this->esc($yearStart)}'
                   AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE {$clientFilter})
-                GROUP BY YEAR(SETTLEMENT_DATE), MONTH(SETTLEMENT_DATE)
+                GROUP BY YEAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE)), MONTH(CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE))
             )
         ");
         $ytd = $monthsSoFar > 0 ? ($ytdSum / $monthsSoFar) : 0;

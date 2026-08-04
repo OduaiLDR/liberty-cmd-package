@@ -86,10 +86,10 @@ class GeneratePauseHoldReport extends Command
             SELECT * FROM (
                 SELECT
                     CONTACT_ID,
-                    TO_VARCHAR(STAMP::date, 'YYYY-MM-DD') AS STATUS_DATE,
+                    TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', STAMP) AS DATE), 'YYYY-MM-DD') AS STATUS_DATE,
                     STATUS_ID,
-                    DATEDIFF(DAY, STAMP, CURRENT_DATE) AS DAYS,
-                    ROW_NUMBER() OVER (PARTITION BY CONTACT_ID ORDER BY STAMP DESC) AS N
+                    DATEDIFF(DAY, CAST(CONVERT_TIMEZONE('America/Los_Angeles', STAMP) AS DATE), CAST(CONVERT_TIMEZONE('America/Los_Angeles', CURRENT_TIMESTAMP()) AS DATE)) AS DAYS,
+                    ROW_NUMBER() OVER (PARTITION BY CONTACT_ID ORDER BY CONVERT_TIMEZONE('America/Los_Angeles', STAMP) DESC) AS N
                 FROM CONTACTS_STATUS
             )
             WHERE N = 1

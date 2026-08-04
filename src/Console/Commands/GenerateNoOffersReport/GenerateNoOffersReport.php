@@ -131,12 +131,12 @@ class GenerateNoOffersReport extends Command
                     c.STATE,
                     c.ZIP,
                     cls.TITLE AS STATUS,
-                    ROW_NUMBER() OVER (PARTITION BY cs.CONTACT_ID ORDER BY cs.STAMP DESC) AS N
+                    ROW_NUMBER() OVER (PARTITION BY cs.CONTACT_ID ORDER BY CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) DESC) AS N
                 FROM CONTACTS AS c
                 LEFT JOIN CONTACTS_STATUS AS cs ON c.ID = cs.CONTACT_ID
                 LEFT JOIN CONTACTS_LEAD_STATUS AS cls ON cs.STATUS_ID = cls.ID
                 LEFT JOIN CONTACTS_ASSIGNED AS ca ON c.ID = ca.CONTACT_ID
-                WHERE TO_DATE(LEFT(ca.STAMP, 10)) = '{$this->esc($reportDate)}'
+                WHERE CAST(CONVERT_TIMEZONE('America/Los_Angeles', ca.STAMP) AS DATE) = '{$this->esc($reportDate)}'
                   AND cls.TITLE IN ({$statusIn})
             )
             WHERE N = 1

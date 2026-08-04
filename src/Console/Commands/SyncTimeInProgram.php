@@ -121,7 +121,7 @@ class SyncTimeInProgram extends Command
     {
         $dateFilter = $this->option('full-refresh')
             ? ''
-            : 'AND c.ENROLLED_DATE >= DATEADD(day, -7, CURRENT_DATE)';
+            : 'AND CAST(CONVERT_TIMEZONE(\'America/Los_Angeles\', c.ENROLLED_DATE) AS DATE) >= DATEADD(day, -7, CAST(CONVERT_TIMEZONE(\'America/Los_Angeles\', CURRENT_TIMESTAMP()) AS DATE))';
 
         $sql = <<<SQL
 SELECT c.ID AS CONTACT_ID,
@@ -130,7 +130,7 @@ SELECT c.ID AS CONTACT_ID,
 FROM CONTACTS AS c
 LEFT JOIN ENROLLMENT_PLAN AS p ON c.ID = p.CONTACT_ID
 LEFT JOIN ENROLLMENT_DEFAULTS2 AS ed ON p.PLAN_ID = ed.ID
-WHERE c.CREATED >= '2021-07-01'
+WHERE CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.CREATED) AS DATE) >= '2021-07-01'
   AND c.DEL = FALSE
   AND c.ISCOAPP = 0
   {$dateFilter}
