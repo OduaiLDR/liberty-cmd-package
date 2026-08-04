@@ -152,7 +152,7 @@ class SyncLastDepositDate extends Command
         foreach ($chunks as $i => $chunk) {
             $inList = implode(',', array_map(fn($id) => "'" . str_replace("'", "''", $id) . "'", $chunk));
             $sql    = "
-                SELECT CONTACT_ID, TO_VARCHAR(MAX(CLEARED_DATE), 'YYYY-MM-DD') AS CLEARED_DATE
+                SELECT CONTACT_ID, TO_VARCHAR(CONVERT_TIMEZONE('America/Los_Angeles', MAX(CLEARED_DATE)), 'YYYY-MM-DD') AS CLEARED_DATE
                 FROM TRANSACTIONS
                 WHERE CONTACT_ID IN ({$inList})
                   AND TRANS_TYPE = 'D'

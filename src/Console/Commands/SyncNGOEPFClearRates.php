@@ -193,7 +193,7 @@ class SyncNGOEPFClearRates extends Command
             SELECT
                 so.NEG_ID,
                 SUM(t.AMOUNT) AS EPF_SCHEDULED,
-                SUM(CASE WHEN t.PROCESS_DATE >= '{$startDate}' AND t.PROCESS_DATE <= '{$endDate}' AND t.CLEARED_DATE IS NOT NULL THEN t.AMOUNT ELSE 0 END) AS EPF_CLEARED
+                SUM(CASE WHEN CAST(CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE) AS DATE) >= '{$startDate}' AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE) AS DATE) <= '{$endDate}' AND t.CLEARED_DATE IS NOT NULL THEN t.AMOUNT ELSE 0 END) AS EPF_CLEARED
             FROM TRANSACTIONS AS t
             JOIN TRANSACTIONS AS t1 ON (t.CONTACT_ID = t1.CONTACT_ID AND t1.TRANS_TYPE = 'S' AND t.LINKED_TO = t1.ID)
             LEFT JOIN CONTACTS AS c ON t.CONTACT_ID = c.ID

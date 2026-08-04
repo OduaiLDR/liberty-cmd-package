@@ -90,9 +90,9 @@ class GenerateDroppedReport extends Command
             SELECT
                 c.ID,
                 CONCAT(c.FIRSTNAME, ' ', c.LASTNAME) AS CLIENT,
-                TO_VARCHAR(c.ENROLLED_DATE::date, 'YYYY-MM-DD') AS ENROLLED_DATE,
-                TO_VARCHAR(c.DROPPED_DATE::date, 'YYYY-MM-DD') AS DROPPED_DATE,
-                DATEDIFF(day, c.ENROLLED_DATE, c.DROPPED_DATE) AS DAYS_ENROLLED,
+                TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.ENROLLED_DATE) AS DATE), 'YYYY-MM-DD') AS ENROLLED_DATE,
+                TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.DROPPED_DATE) AS DATE), 'YYYY-MM-DD') AS DROPPED_DATE,
+                DATEDIFF(day, CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.ENROLLED_DATE) AS DATE), CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.DROPPED_DATE) AS DATE)) AS DAYS_ENROLLED,
                 ed.TITLE,
                 d.ENROLLED_DEBT,
                 cr.TITLE AS DROPPED_REASON,
@@ -109,8 +109,8 @@ class GenerateDroppedReport extends Command
             ) AS d ON c.ID = d.CONTACT_ID
             LEFT JOIN CANCELLATION_REASONS AS cr ON c.DROPPED_REASON = cr.ID
             LEFT JOIN CONTACTS_LEAD_STATUS AS cls ON c.LEADSTATUS = cls.ID
-            WHERE c.DROPPED_DATE >= '{$this->esc($startDate)}'
-              AND c.DROPPED_DATE <= '{$this->esc($endDate)}'
+            WHERE CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.DROPPED_DATE) AS DATE) >= '{$this->esc($startDate)}'
+              AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.DROPPED_DATE) AS DATE) <= '{$this->esc($endDate)}'
         ";
 
         $result = $snowflake->query($sql);

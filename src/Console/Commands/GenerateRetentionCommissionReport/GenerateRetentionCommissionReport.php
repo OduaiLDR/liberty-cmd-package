@@ -317,11 +317,11 @@ class GenerateRetentionCommissionReport extends Command
                 c.ID,
                 CONCAT(c.FIRSTNAME,' ',c.LASTNAME)                     AS CLIENT,
                 cu1.F_STRING                                           AS RETENTION_AGENT,
-                LEFT(cu2.F_DATE, 10)                                   AS RETENTION_DATE,
+                LEFT(cu2.F_DATE, 10) AS RETENTION_DATE,
                 cu3.F_STRING                                           AS IMMEDIATE_RESULTS,
                 d.ENROLLED_DEBT,
-                LEFT(c.DROPPED_DATE, 10)                               AS DROPPED_DATE,
-                TO_VARCHAR(TO_DATE(cu4.F_DATETIME), 'YYYY-MM-DD')      AS CANCEL_REQUEST_DATE
+                TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.DROPPED_DATE) AS DATE), 'YYYY-MM-DD') AS DROPPED_DATE,
+                TO_VARCHAR(CONVERT_TIMEZONE('America/Los_Angeles', cu4.F_DATETIME), 'YYYY-MM-DD') AS CANCEL_REQUEST_DATE
             FROM CONTACTS c
             LEFT JOIN CONTACTS_USERFIELDS cu1
                    ON cu1.CONTACT_ID = c.ID AND cu1.CUSTOM_ID = $ca
@@ -353,11 +353,11 @@ class GenerateRetentionCommissionReport extends Command
     private function fetchReconsiderationDates(DBConnector $sf, int $statusId, string $idList): array
     {
         $sql = "
-            SELECT cs.CONTACT_ID, LEFT(cs.STAMP,10) AS RECON_DATE
+            SELECT cs.CONTACT_ID, TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) AS DATE), 'YYYY-MM-DD') AS RECON_DATE
             FROM CONTACTS_STATUS cs
             WHERE cs.STATUS_ID = $statusId
               AND cs.CONTACT_ID IN ($idList)
-            ORDER BY cs.CONTACT_ID ASC, cs.STAMP ASC
+            ORDER BY cs.CONTACT_ID ASC, CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) ASC
         ";
         $map = [];
         foreach ($sf->query($sql)['data'] ?? [] as $r) {
@@ -373,13 +373,13 @@ class GenerateRetentionCommissionReport extends Command
     private function fetchRetainedDates(DBConnector $sf, string $idList): array
     {
         $sql = "
-            SELECT cs.CONTACT_ID, LEFT(cs.STAMP,10) AS RETAINED_DATE
+            SELECT cs.CONTACT_ID, TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) AS DATE), 'YYYY-MM-DD') AS RETAINED_DATE
             FROM CONTACTS_STATUS cs
             LEFT JOIN CONTACTS_LEAD_STATUS cls ON cs.STATUS_ID = cls.ID
             WHERE UPPER(cls.TITLE) LIKE '%ENROLLED%'
               AND UPPER(cls.TITLE) NOT LIKE '%RECONSIDERATION%'
               AND cs.CONTACT_ID IN ($idList)
-            ORDER BY cs.CONTACT_ID ASC, cs.STAMP ASC
+            ORDER BY cs.CONTACT_ID ASC, CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) ASC
         ";
         $map = [];
         foreach ($sf->query($sql)['data'] ?? [] as $r) {
@@ -396,13 +396,13 @@ class GenerateRetentionCommissionReport extends Command
     private function fetchFirstClearedPerContact(DBConnector $sf, string $idList): array
     {
         $sql = "
-            SELECT CONTACT_ID, LEFT(CLEARED_DATE,10) AS CLEARED_DATE
+            SELECT CONTACT_ID, TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', CLEARED_DATE) AS DATE), 'YYYY-MM-DD') AS CLEARED_DATE
             FROM TRANSACTIONS
             WHERE TRANS_TYPE = 'D'
               AND CLEARED_DATE IS NOT NULL
               AND RETURNED_DATE IS NULL
               AND CONTACT_ID IN ($idList)
-            ORDER BY CONTACT_ID ASC, CLEARED_DATE ASC
+            ORDER BY CONTACT_ID ASC, CONVERT_TIMEZONE('America/Los_Angeles', CLEARED_DATE) ASC
         ";
         $map = [];
         foreach ($sf->query($sql)['data'] ?? [] as $r) {

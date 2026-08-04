@@ -78,7 +78,7 @@ class GenerateDPPPastDueReport extends Command
                 t.CONTACT_ID,
                 CONCAT(COALESCE(c.FIRSTNAME, ''), ' ', COALESCE(c.LASTNAME, '')) AS CONTACT_NAME,
                 t.AMOUNT,
-                TO_VARCHAR(t.PROCESS_DATE::date, 'YYYY-MM-DD') AS PROCESS_DATE,
+                TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE) AS DATE), 'YYYY-MM-DD') AS PROCESS_DATE,
                 t.TRANS_TYPE,
                 CASE
                     WHEN c.DROPPED = 1 THEN 'Dropped'
@@ -89,14 +89,14 @@ class GenerateDPPPastDueReport extends Command
             FROM TRANSACTIONS t
             LEFT JOIN CONTACTS c ON t.CONTACT_ID = c.ID
             WHERE t.TRANS_TYPE IN ('PF', 'C')
-              AND t.PROCESS_DATE <= '{$cutoffDate}'
+              AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE) AS DATE) <= '{$cutoffDate}'
               AND t.CLEARED_DATE IS NULL
               AND t.RETURNED_DATE IS NULL
               AND t.ACTIVE = 1
               AND t.CANCELLED = 0
               AND t.AMOUNT > 0
               AND (c.DROPPED = 1 OR c.GRADUATED = 1 OR c.ENROLLED = 1)
-            ORDER BY t.PROCESS_DATE ASC
+            ORDER BY CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE) ASC
         ";
 
         $result = $snowflake->query($sql);

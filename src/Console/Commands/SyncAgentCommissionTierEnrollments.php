@@ -150,8 +150,8 @@ FROM (
         d.ENROLLED_DEBT,
         cu2.CANCEL_DATE,
         cls.TITLE                           AS CUTOFF_STATUS,
-        LEFT(cs.STAMP, 10)                  AS STATUS_DATE,
-        ROW_NUMBER() OVER (PARTITION BY cs.CONTACT_ID ORDER BY cs.STAMP DESC) AS N
+        CAST(CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) AS DATE) AS STATUS_DATE,
+        ROW_NUMBER() OVER (PARTITION BY cs.CONTACT_ID ORDER BY CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) DESC) AS N
     FROM CONTACTS_USERFIELDS AS cu1
     LEFT JOIN CONTACTS             AS c   ON cu1.CONTACT_ID = c.ID
     LEFT JOIN USERS                AS u   ON c.ASSIGNED_TO  = u.UID
@@ -171,7 +171,7 @@ FROM (
     WHERE cu1.CUSTOM_ID = {$cfFpc}
       AND cu1.F_DATE  >= '{$startDate}'
       AND cu1.F_DATE  <= '{$endDate}'
-      AND cs.STAMP    <  '{$cutOffDate}'
+      AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) AS DATE) <  '{$cutOffDate}'
 )
 WHERE N = 1
   AND (CANCEL_DATE IS NULL OR CANCEL_DATE >= '{$cutOffDate}')

@@ -337,9 +337,9 @@ class SyncContactsCCS extends Command
 
         return "
             SELECT
-                TO_CHAR(TIMEADD(hour, -7, c.CREATED), 'YYYY-MM-DD HH24:MI:SS')                                  AS CREATED,
-                TO_CHAR(a.STAMP, 'YYYY-MM-DD HH24:MI:SS')                                                        AS ASSIGNED_ON,
-                TO_CHAR(TIMEADD(hour, -7, COALESCE(c.MODIFIED, a.STAMP, c.CREATED)), 'YYYY-MM-DD HH24:MI:SS')   AS MODIFIED,
+                TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', c.CREATED), 'YYYY-MM-DD HH24:MI:SS')             AS CREATED,
+                TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', a.STAMP), 'YYYY-MM-DD HH24:MI:SS')               AS ASSIGNED_ON,
+                TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', COALESCE(c.MODIFIED, a.STAMP, c.CREATED)), 'YYYY-MM-DD HH24:MI:SS') AS MODIFIED,
                 c.ID                                                                                              AS CONTACT_ID,
                 c.TP_ID                                                                                           AS EXTERNAL_ID,
                 ds.NAME                                                                                           AS DATA_SOURCE,
@@ -363,7 +363,7 @@ class SyncContactsCCS extends Command
                 d.ENROLLED_DEBT,
                 uf_loan.F_DECIMAL                                                                                 AS LOAN_AMOUNT_NEEDED,
                 TO_CHAR(uf_enrolled.F_DATE, 'YYYY-MM-DD HH24:MI:SS')                                            AS ENROLLMENT_DATE,
-                TO_CHAR(uf_dropped.F_DATE,  'YYYY-MM-DD HH24:MI:SS')                                            AS DROPPED_DATE,
+                TO_CHAR(uf_dropped.F_DATE, 'YYYY-MM-DD HH24:MI:SS')                                             AS DROPPED_DATE,
                 uf_payments.F_NUMERIC                                                                             AS PAYMENTS,
                 TO_CHAR(uf_fpc.F_DATE, 'YYYY-MM-DD HH24:MI:SS')                                                 AS FPC_DATE,
                 TO_CHAR(uf_fpr.F_DATE, 'YYYY-MM-DD HH24:MI:SS')                                                 AS FPR_DATE,
@@ -398,7 +398,7 @@ class SyncContactsCCS extends Command
             LEFT JOIN (SELECT CONTACT_ID, F_SHORTSTRING FROM CONTACTS_USERFIELDS WHERE CUSTOM_ID = {$cfFreq})     AS uf_freq      ON c.ID = uf_freq.CONTACT_ID
             WHERE UPPER(ds.NAME) LIKE 'FF-%'
               AND COALESCE(c.FIRSTNAME, '') <> ''
-              AND COALESCE(c.MODIFIED, a.STAMP, c.CREATED) >= DATEADD(hour, 7, '{$start}'::TIMESTAMP_NTZ)
+              AND CONVERT_TIMEZONE('America/Los_Angeles', COALESCE(c.MODIFIED, a.STAMP, c.CREATED)) >= '{$start}'::TIMESTAMP_NTZ
               AND c.ID > {$lastId}
             QUALIFY ROW_NUMBER() OVER(PARTITION BY c.ID ORDER BY s.STAMP DESC) = 1
             ORDER BY c.ID

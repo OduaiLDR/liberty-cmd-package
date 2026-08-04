@@ -151,8 +151,8 @@ class GenerateNSFCommissionReport extends Command
                 CU1.AGENT,
                 TO_VARCHAR(CU2.NSF_RETURNED_DATE, 'YYYY-MM-DD') AS NSF_RETURNED_DATE,
                 CU3.NSF_ACTION,
-                TO_VARCHAR(CU4.NSF_RECOUP_DATE, 'YYYY-MM-DD')   AS NSF_RECOUP_DATE,
-                TO_VARCHAR(T.CLEARED_DATE, 'YYYY-MM-DD')        AS CLEARED_DATE
+                TO_VARCHAR(CU4.NSF_RECOUP_DATE, 'YYYY-MM-DD') AS NSF_RECOUP_DATE,
+                TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', T.CLEARED_DATE) AS DATE), 'YYYY-MM-DD') AS CLEARED_DATE
             FROM CONTACTS c
             LEFT JOIN (
                 SELECT CONTACT_ID, F_SHORTSTRING AS AGENT
@@ -176,7 +176,7 @@ class GenerateNSFCommissionReport extends Command
             ) CU4 ON c.ID = CU4.CONTACT_ID
             LEFT JOIN (
                 SELECT CONTACT_ID, CLEARED_DATE,
-                       ROW_NUMBER() OVER (PARTITION BY CONTACT_ID ORDER BY PROCESS_DATE DESC) AS RN
+                       ROW_NUMBER() OVER (PARTITION BY CONTACT_ID ORDER BY CONVERT_TIMEZONE('America/Los_Angeles', PROCESS_DATE) DESC) AS RN
                 FROM TRANSACTIONS
                 WHERE TRANS_TYPE = 'D'
                   AND CLEARED_DATE IS NOT NULL

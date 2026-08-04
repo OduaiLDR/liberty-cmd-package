@@ -143,7 +143,7 @@ class GenerateSettlementReports extends Command
             SELECT
                 {$idExpr}                                 AS CONTACT_ID,
                 CONCAT(c.FIRSTNAME, ' ', c.LASTNAME)      AS FULL_NAME,
-                TO_VARCHAR(t.PROCESS_DATE, '{$dateFmt}')  AS PROCESS_DATE,
+                TO_VARCHAR(CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE), '{$dateFmt}') AS PROCESS_DATE,
                 t.AMOUNT                                  AS AMOUNT,
                 s.CREDITOR_NAME                           AS CREDITOR_NAME,
                 tp.THIRD_PARTY                            AS DEBT_THIRD_PARTY,
@@ -162,7 +162,7 @@ class GenerateSettlementReports extends Command
             WHERE t.TRANS_TYPE = 'S'
               AND t.STATUS = 1
               AND t.ACTIVE = 1
-            ORDER BY t.PROCESS_DATE
+            ORDER BY CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE)
         ";
     }
 
@@ -173,7 +173,7 @@ class GenerateSettlementReports extends Command
             SELECT
                 {$idExpr}                                 AS CONTACT_ID,
                 CONCAT(c.FIRSTNAME, ' ', c.LASTNAME)      AS FULL_NAME,
-                TO_VARCHAR(t.PROCESS_DATE, '{$dateFmt}')  AS PROCESS_DATE,
+                TO_VARCHAR(CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE), '{$dateFmt}') AS PROCESS_DATE,
                 t.AMOUNT                                  AS AMOUNT,
                 s.REF                                     AS SETT_REF,
                 sub.TITLE                                 AS SUB_TYPE,
@@ -192,7 +192,7 @@ class GenerateSettlementReports extends Command
             WHERE t.TRANS_TYPE = 'S'
               AND t.STATUS = 20
               AND t.ACTIVE = 1
-            ORDER BY t.PROCESS_DATE
+            ORDER BY CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE)
         ";
     }
 
@@ -206,7 +206,7 @@ class GenerateSettlementReports extends Command
         return "
             SELECT
                 CONCAT(c.FIRSTNAME, ' ', c.LASTNAME)      AS FULL_NAME,
-                TO_VARCHAR(t.PROCESS_DATE, '{$dateFmt}')  AS PROCESS_DATE,
+                TO_VARCHAR(CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE), '{$dateFmt}') AS PROCESS_DATE,
                 st.NAME                                   AS STATUS,
                 t.AMOUNT                                  AS AMOUNT,
                 tt.TITLE                                  AS TRANS_TYPE,
@@ -229,8 +229,8 @@ class GenerateSettlementReports extends Command
             WHERE t.TRANS_TYPE = 'S'
               AND t.STATUS IN (0, 14, 20)
               AND t.ACTIVE = 1
-              AND t.PROCESS_DATE < CURRENT_DATE
-            ORDER BY t.PROCESS_DATE
+              AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE) AS DATE) < CAST(CONVERT_TIMEZONE('America/Los_Angeles', CURRENT_TIMESTAMP()) AS DATE)
+            ORDER BY CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE)
         ";
     }
 
@@ -248,7 +248,7 @@ class GenerateSettlementReports extends Command
                     s2.CONTACT_ID,
                     s2.REF,
                     CONCAT(u2.FIRSTNAME, ' ', u2.LASTNAME) AS NEG_NAME,
-                    ROW_NUMBER() OVER (PARTITION BY s2.CONTACT_ID, s2.REF ORDER BY o2.CREATED_AT DESC) AS rn
+                    ROW_NUMBER() OVER (PARTITION BY s2.CONTACT_ID, s2.REF ORDER BY CONVERT_TIMEZONE('America/Los_Angeles', o2.CREATED_AT) DESC) AS rn
                 FROM SETTLEMENTS s2
                 JOIN SETTLEMENT_OFFERS o2 ON o2.ID = s2.OFFER_ID
                 JOIN USERS u2 ON u2.UID = o2.NEG_ID
@@ -270,7 +270,7 @@ class GenerateSettlementReports extends Command
                     s3.CONTACT_ID,
                     s3.REF,
                     cr.COMPANY AS THIRD_PARTY,
-                    ROW_NUMBER() OVER (PARTITION BY s3.CONTACT_ID, s3.REF ORDER BY o3.CREATED_AT DESC) AS rn
+                    ROW_NUMBER() OVER (PARTITION BY s3.CONTACT_ID, s3.REF ORDER BY CONVERT_TIMEZONE('America/Los_Angeles', o3.CREATED_AT) DESC) AS rn
                 FROM SETTLEMENTS s3
                 JOIN SETTLEMENT_OFFERS o3 ON o3.ID = s3.OFFER_ID
                 JOIN DEBTS d3 ON d3.ID = o3.DEBT_ID

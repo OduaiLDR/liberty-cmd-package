@@ -88,9 +88,9 @@ class ImportMissingEnrollments extends Command
                     CONCAT(u.FIRSTNAME, ' ', u.LASTNAME)  AS AGENT,
                     CONCAT(c.FIRSTNAME, ' ', c.LASTNAME)  AS CLIENT,
                     d.DEBT,
-                    TO_CHAR(c.ENROLLED_DATE, 'YYYY-MM-DD')  AS ENROLLED_DATE,
-                    TO_CHAR(t.PROCESS_DATE,  'YYYY-MM-DD')  AS PAYMENT_DATE_1,
-                    TO_CHAR(c.DROPPED_DATE,  'YYYY-MM-DD')  AS CANCEL_DATE,
+                    TO_CHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.ENROLLED_DATE) AS DATE), 'YYYY-MM-DD') AS ENROLLED_DATE,
+                    TO_CHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE) AS DATE), 'YYYY-MM-DD') AS PAYMENT_DATE_1,
+                    TO_CHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.DROPPED_DATE) AS DATE), 'YYYY-MM-DD') AS CANCEL_DATE,
                     ed.TITLE,
                     t.N
                 FROM CONTACTS AS c
@@ -111,7 +111,7 @@ class ImportMissingEnrollments extends Command
                         PROCESS_DATE,
                         ROW_NUMBER() OVER (
                             PARTITION BY CONTACT_ID
-                            ORDER BY CONTACT_ID ASC, PROCESS_DATE ASC
+                            ORDER BY CONTACT_ID ASC, CONVERT_TIMEZONE('America/Los_Angeles', PROCESS_DATE) ASC
                         ) AS N
                     FROM TRANSACTIONS
                     WHERE TRANS_TYPE    = 'D'
@@ -122,7 +122,7 @@ class ImportMissingEnrollments extends Command
                     ON c.ID = ep.CONTACT_ID
                 LEFT JOIN ENROLLMENT_DEFAULTS2 AS ed
                     ON ep.PLAN_ID = ed.ID
-                WHERE c.ENROLLED_DATE    >= '2022-07-01'
+                WHERE CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.ENROLLED_DATE) AS DATE) >= '2022-07-01'
                   AND c._FIVETRAN_DELETED = FALSE
             )
             WHERE N = 1

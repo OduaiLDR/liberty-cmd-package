@@ -238,7 +238,7 @@ class GenerateRetentionBonusCommission extends Command
                 LEFT(cu2.F_DATE, 10) AS RETENTION_DATE,
                 cu3.F_STRING AS IMMEDIATE_RESULTS,
                 d.ENROLLED_DEBT,
-                LEFT(c.DROPPED_DATE, 10) AS DROPPED_DATE
+                TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.DROPPED_DATE) AS DATE), 'YYYY-MM-DD') AS DROPPED_DATE
             FROM CONTACTS c
             LEFT JOIN CONTACTS_USERFIELDS cu1 ON c.ID = cu1.CONTACT_ID
             LEFT JOIN (
@@ -302,10 +302,10 @@ class GenerateRetentionBonusCommission extends Command
     private function fetchReconsiderationDates(DBConnector $sf, int $statusId, string $idList): array
     {
         $sql = "
-            SELECT cs.CONTACT_ID, LEFT(cs.STAMP,10) AS RECON_DATE
+            SELECT cs.CONTACT_ID, TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) AS DATE), 'YYYY-MM-DD') AS RECON_DATE
             FROM CONTACTS_STATUS cs WHERE cs.STATUS_ID=$statusId
              AND cs.CONTACT_ID IN ($idList)
-            ORDER BY cs.CONTACT_ID ASC, cs.STAMP ASC
+            ORDER BY cs.CONTACT_ID ASC, CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) ASC
         ";
         $res = $sf->query($sql);
         $map = [];
@@ -319,12 +319,12 @@ class GenerateRetentionBonusCommission extends Command
     private function fetchRetainedDates(DBConnector $sf, string $idList): array
     {
         $sql = "
-            SELECT cs.CONTACT_ID, LEFT(cs.STAMP,10) AS RETAINED_DATE
+            SELECT cs.CONTACT_ID, TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) AS DATE), 'YYYY-MM-DD') AS RETAINED_DATE
             FROM CONTACTS_STATUS cs
             LEFT JOIN CONTACTS_LEAD_STATUS cls ON cs.STATUS_ID=cls.ID
             WHERE UPPER(cls.TITLE) LIKE '%ENROLLED%' AND UPPER(cls.TITLE) NOT LIKE '%RECONSIDERATION%'
              AND cs.CONTACT_ID IN ($idList)
-            ORDER BY cs.CONTACT_ID ASC, cs.STAMP ASC
+            ORDER BY cs.CONTACT_ID ASC, CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) ASC
         ";
         $res = $sf->query($sql);
         $map = [];

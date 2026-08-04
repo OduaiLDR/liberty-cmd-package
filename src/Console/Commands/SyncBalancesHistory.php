@@ -196,18 +196,21 @@ class SyncBalancesHistory extends Command
     protected function fetchHistoryFromSnowflake(DBConnector $connector): array
     {
         $baseQuery = <<<SQL
-WITH month_end_stamps AS (
-    SELECT LAST_DAY(DATEADD(month, -1, CURRENT_DATE)) AS stamp UNION ALL
-    SELECT LAST_DAY(DATEADD(month, -2, CURRENT_DATE)) UNION ALL
-    SELECT LAST_DAY(DATEADD(month, -3, CURRENT_DATE)) UNION ALL
-    SELECT LAST_DAY(DATEADD(month, -4, CURRENT_DATE))
+WITH bounds AS (
+    SELECT CAST(CONVERT_TIMEZONE('America/Los_Angeles', CURRENT_TIMESTAMP()) AS DATE) AS pst_today
+),
+month_end_stamps AS (
+    SELECT LAST_DAY(DATEADD(month, -1, pst_today)) AS stamp FROM bounds UNION ALL
+    SELECT LAST_DAY(DATEADD(month, -2, pst_today)) FROM bounds UNION ALL
+    SELECT LAST_DAY(DATEADD(month, -3, pst_today)) FROM bounds UNION ALL
+    SELECT LAST_DAY(DATEADD(month, -4, pst_today)) FROM bounds
 )
 SELECT
     CONTACT_ID,
     BALANCE,
-    TO_CHAR(STAMP, 'YYYY-MM-DD') AS STAMP
+    TO_CHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', STAMP) AS DATE), 'YYYY-MM-DD') AS STAMP
 FROM CONTACT_BALANCES
-WHERE DATE(STAMP) IN (SELECT stamp FROM month_end_stamps)
+WHERE CAST(CONVERT_TIMEZONE('America/Los_Angeles', STAMP) AS DATE) IN (SELECT stamp FROM month_end_stamps)
 SQL;
 
         $countSql = "SELECT COUNT(*) AS CNT FROM ({$baseQuery}) AS history_count";

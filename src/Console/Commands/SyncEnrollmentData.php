@@ -178,7 +178,7 @@ class SyncEnrollmentData extends Command
 
         // Get DROPPED_DATE from Snowflake
         $snowflakeSql = "
-            SELECT ID, DROPPED_DATE
+            SELECT ID, CAST(CONVERT_TIMEZONE('America/Los_Angeles', DROPPED_DATE) AS DATE) AS DROPPED_DATE
             FROM CONTACTS
             WHERE _FIVETRAN_DELETED = FALSE
               AND DROPPED_DATE IS NOT NULL

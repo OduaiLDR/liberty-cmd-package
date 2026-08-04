@@ -47,13 +47,13 @@ class GenerateWelcomeLetterReport extends Command
                     c.ZIP,
                     d.ENROLLED_DEBT_ACCOUNTS,
                     d.ENROLLED_DEBT,
-                    TO_VARCHAR(t.PROCESS_DATE::date, 'YYYY-MM-DD') AS PAYMENT_DATE,
+                    TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE) AS DATE), 'YYYY-MM-DD') AS PAYMENT_DATE,
                     t.AMOUNT AS PAYMENT,
                     CONCAT('LLG-', c.ID) AS LLG_ID,
                     ep.FREQUENCY,
                     ROW_NUMBER() OVER (
                         PARTITION BY t.CONTACT_ID
-                        ORDER BY t.CONTACT_ID ASC, t.PROCESS_DATE ASC
+                        ORDER BY t.CONTACT_ID ASC, CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE) ASC
                     ) AS N
                 FROM CONTACTS AS c
                 LEFT JOIN ENROLLMENT_PLAN AS ep ON c.ID = ep.CONTACT_ID
@@ -68,11 +68,11 @@ class GenerateWelcomeLetterReport extends Command
                     GROUP BY CONTACT_ID
                 ) AS d ON c.ID = d.CONTACT_ID
                 LEFT JOIN TRANSACTIONS AS t ON c.ID = t.CONTACT_ID
-                WHERE CAST(c.ENROLLED_DATE AS date) >= '{$this->esc($startDateString)}'
-                  AND CAST(c.ENROLLED_DATE AS date) <= '{$this->esc($endDateString)}'
+                WHERE CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.ENROLLED_DATE) AS DATE) >= '{$this->esc($startDateString)}'
+                  AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.ENROLLED_DATE) AS DATE) <= '{$this->esc($endDateString)}'
                   AND t.TRANS_TYPE = 'D'
                   AND t.ACTIVE = 1
-                ORDER BY t.PROCESS_DATE ASC
+                ORDER BY CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE) ASC
             )
             WHERE N = 1
             ORDER BY UPPER(CLIENT) ASC

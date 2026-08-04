@@ -56,18 +56,18 @@ class GenerateConsumerAffairsSettlementReport extends Command
                     'Liberty Debt Relief' AS COMPANY_INFO,
                     'Debt Settlement' AS ADDITIONAL_INFO,
                     NULL AS PRODUCT_INFO,
-                    c.ENROLLED_DATE AS ENROLLMENT_DATE,
+                    CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.ENROLLED_DATE) AS DATE) AS ENROLLMENT_DATE,
                     d.SETTLEMENTS,
                     cls.TITLE AS ENROLLMENT_STATUS,
-                    ROW_NUMBER() OVER (PARTITION BY cs.CONTACT_ID ORDER BY cs.STAMP DESC) AS N
+                    ROW_NUMBER() OVER (PARTITION BY cs.CONTACT_ID ORDER BY CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) DESC) AS N
                 FROM CONTACTS AS c
                 LEFT JOIN (
                     SELECT CONTACT_ID, COUNT(*) AS SETTLEMENTS
                     FROM DEBTS
                     WHERE ENROLLED = 1
                       AND SETTLED = 1
-                      AND SETTLEMENT_DATE >= '{$this->esc($startDate)}'
-                      AND SETTLEMENT_DATE <= '{$this->esc($endDate)}'
+                      AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE) >= '{$this->esc($startDate)}'
+                      AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE) <= '{$this->esc($endDate)}'
                     GROUP BY CONTACT_ID
                 ) AS d ON c.ID = d.CONTACT_ID
                 LEFT JOIN ENROLLMENT_PLAN AS ep ON c.ID = ep.CONTACT_ID

@@ -140,7 +140,10 @@ class GenerateCancellationReport extends Command
         $startDate = $this->rollingStartDate();
 
         $sql = "
-            SELECT c.ID, c.ENROLLED_DATE, c.DROPPED_DATE, t.PAYMENTS, ed.TITLE
+            SELECT c.ID,
+                   CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.ENROLLED_DATE) AS DATE) AS ENROLLED_DATE,
+                   CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.DROPPED_DATE) AS DATE) AS DROPPED_DATE,
+                   t.PAYMENTS, ed.TITLE
             FROM CONTACTS AS c
             LEFT JOIN (
                 SELECT CONTACT_ID, COUNT(*) AS PAYMENTS
@@ -152,7 +155,7 @@ class GenerateCancellationReport extends Command
             ) AS t ON c.ID = t.CONTACT_ID
             LEFT JOIN ENROLLMENT_PLAN AS ep ON c.ID = ep.CONTACT_ID
             LEFT JOIN ENROLLMENT_DEFAULTS2 AS ed ON ep.PLAN_ID = ed.ID
-            WHERE ENROLLED_DATE >= '{$this->esc($startDate)}'
+            WHERE CAST(CONVERT_TIMEZONE('America/Los_Angeles', ENROLLED_DATE) AS DATE) >= '{$this->esc($startDate)}'
         ";
 
         $rows = $snowflake->query($sql)['data'] ?? [];
@@ -180,7 +183,10 @@ class GenerateCancellationReport extends Command
         $startDate = $this->rollingStartDate();
 
         $sql = "
-            SELECT c.ID, c.ENROLLED_DATE, c.DROPPED_DATE, t.PAYMENTS
+            SELECT c.ID,
+                   CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.ENROLLED_DATE) AS DATE) AS ENROLLED_DATE,
+                   CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.DROPPED_DATE) AS DATE) AS DROPPED_DATE,
+                   t.PAYMENTS
             FROM CONTACTS AS c
             LEFT JOIN (
                 SELECT CONTACT_ID, COUNT(*) AS PAYMENTS
@@ -192,7 +198,7 @@ class GenerateCancellationReport extends Command
             ) AS t ON c.ID = t.CONTACT_ID
             LEFT JOIN ENROLLMENT_PLAN AS ep ON c.ID = ep.CONTACT_ID
             LEFT JOIN ENROLLMENT_DEFAULTS2 AS ed ON ep.PLAN_ID = ed.ID
-            WHERE ENROLLED_DATE >= '{$this->esc($startDate)}'
+            WHERE CAST(CONVERT_TIMEZONE('America/Los_Angeles', ENROLLED_DATE) AS DATE) >= '{$this->esc($startDate)}'
               AND c.ID IN (
                   SELECT CONTACT_ID FROM DEBTS WHERE SETTLED = 1
               )
