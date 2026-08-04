@@ -39,7 +39,7 @@ class GenerateAdvanceRecoupReport extends Command
     private const RENT_AMOUNT = -400.0;
     private const PRIMARY_ACCOUNT_RATE = 0.03;
     private const RECIPIENTS = ['Jacob@progresslaw.com', 'Aaron@progresslaw.com', 'Jessica@cdp.law'];
-    private const TEST_RECIPIENT = 'jacob@progresslaw.com';
+    private const TEST_RECIPIENT = 'oduai@libertydebtrelief.com';
 
     public function handle(): int
     {
