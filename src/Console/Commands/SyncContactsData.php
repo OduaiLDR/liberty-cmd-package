@@ -18,6 +18,7 @@ class SyncContactsData extends Command
     protected $description = 'Sync contacts data from Snowflake to SQL Server (TblContactsLDR, TblContactsPLAW, and TblContactsLT)';
 
     private const PAGE_SIZE = 50000;
+    private const MAX_LT_DEBT_AMOUNT = 999999;
 
     private string $source;
     private int $debtAmountCustomId;
@@ -591,6 +592,13 @@ class SyncContactsData extends Command
 
             $debtAmountRaw = $row['DEBT_AMOUNT_CUSTOM'] ?? 0;
             $debtAmount = is_numeric($debtAmountRaw) ? (float) $debtAmountRaw : 0.0;
+            if ($this->source === 'LT' && ($debtAmount <= 0 || $debtAmount > self::MAX_LT_DEBT_AMOUNT)) {
+                Log::warning('SyncContactsData: ignored invalid LT loan amount', [
+                    'contact_id' => $contactId,
+                    'value'      => $debtAmountRaw,
+                ]);
+                $debtAmount = 0.0;
+            }
             $planTitle  = $row['PLAN_TITLE'] ?? '';
             $category   = $this->normalizePlanTitle($planTitle);
             // LT: agent is the assigned user from USERS join; LDR/PLAW: from custom field
