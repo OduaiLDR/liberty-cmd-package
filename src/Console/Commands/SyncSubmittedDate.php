@@ -51,6 +51,23 @@ class SyncSubmittedDate extends Command
                     continue;
                 }
 
+                $missingIds = $this->fetchMissingIdsFromSqlServer($connector);
+                $submitted = array_intersect_key($submitted, array_fill_keys($missingIds, true));
+
+                if (empty($submitted)) {
+                    $this->info("[$source] No blank Submitted_Date records matched Snowflake.");
+                    $this->insertLogRow(
+                        $connector,
+                        $source,
+                        'SYNC_SUBMITTED_DATE',
+                        'SUCCESS',
+                        0,
+                        0,
+                        'No blank Submitted_Date records matched Snowflake.'
+                    );
+                    continue;
+                }
+
                 $this->info("[$source] Applying submitted dates to SQL Server...");
                 $updated = $this->updateSubmittedDates($connector, $submitted);
 
@@ -183,7 +200,7 @@ SQL;
         $baseSql = <<<SQL
 SELECT
     CONTACT_ID,
-    TO_CHAR(STAMP, 'YYYY-MM-DD') AS SUBMITTED_DATE
+    CAST(CONVERT_TIMEZONE('America/Los_Angeles', STAMP) AS DATE) AS SUBMITTED_DATE
 FROM CONTACTS_STATUS
 WHERE STATUS_ID IN (123480, 377643, 377680, 37768)
   AND STAMP >= DATEADD(month, -24, CURRENT_DATE)
