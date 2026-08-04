@@ -8,9 +8,12 @@ use Illuminate\Support\Facades\Log;
 
 class GenerateConsumerAffairsSettlementReport extends Command
 {
-    protected $signature = 'Generate:consumer-affairs-settlement-report';
+    protected $signature = 'Generate:consumer-affairs-settlement-report
+                            {--test : Send only to jacob@libertydebtrelief.com instead of the real recipient list}';
 
     protected $description = 'Generate Consumer Affairs settlement report (Snowflake + SQL Server) and email it.';
+
+    private const TEST_RECIPIENT = 'jacob@libertydebtrelief.com';
 
     public function handle(): int
     {
@@ -83,6 +86,7 @@ class GenerateConsumerAffairsSettlementReport extends Command
                         AND HAS_SUMMONS = 1
                   )
                   AND ed.TITLE LIKE '%LDR%'
+                  AND d.SETTLEMENTS > 0
             )
             WHERE N = 1
             ORDER BY SETTLEMENTS DESC, ENROLLMENT_DATE DESC
@@ -95,7 +99,9 @@ class GenerateConsumerAffairsSettlementReport extends Command
         $report = $formatter->buildWorkbook($rows, $poorRatings);
         $this->info('[INFO] CSV written to: ' . $report['csvPath']);
         $this->info('[INFO] IDs written to: ' . $report['idsPath']);
-        $formatter->sendReport($sqlConnector, $report, $this);
+
+        $recipients = ((bool) $this->option('test')) ? [self::TEST_RECIPIENT] : null;
+        $formatter->sendReport($sqlConnector, $report, $recipients, $this);
 
         return Command::SUCCESS;
     }

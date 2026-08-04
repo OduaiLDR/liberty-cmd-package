@@ -19,12 +19,17 @@ class Formatter
     private const MONEY_FORMAT = '$#,##0.00';
     private const PCT_FORMAT   = '0%';
 
+    /**
+     * @param string|null $agentFilter When set, only the agent's rows appear and the
+     *                                 filename uses the agent name ("- <Agent Name>")
+     */
     public function buildWorkbook(
         array  $dataRows,
         array  $commissionRows,
         string $source,
         string $startDate,
-        string $endDate
+        string $endDate,
+        ?string $agentFilter = null
     ): array {
         $spreadsheet = new Spreadsheet();
 
@@ -42,7 +47,8 @@ class Formatter
         $spreadsheet->setActiveSheetIndex(0);
 
         $period   = date('m-Y', strtotime($startDate));
-        $filename = "NSF Commission Report - {$source} - {$period}.xlsx";
+        $suffix   = $agentFilter !== null ? $this->safeFilenamePart($agentFilter) : 'All';
+        $filename = "NSF Commission Report - {$source} - {$period} - {$suffix}.xlsx";
         $path     = storage_path("app/{$filename}");
 
         $writer = new Xlsx($spreadsheet);
@@ -190,6 +196,12 @@ class Formatter
             'fill'      => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['argb' => self::HEADER_FILL]],
             'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER],
         ]);
+    }
+
+    /** Strip characters that are illegal in filenames (Windows/Linux). */
+    private function safeFilenamePart(string $name): string
+    {
+        return trim((string) preg_replace('/[\/\\\\:*?"<>|]/', '_', $name), " \t\n\r\0\x0B.");
     }
 
     private function applyBorders(Worksheet $s, string $range): void

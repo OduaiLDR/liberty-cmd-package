@@ -22,7 +22,9 @@ use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
  *   1. "Retention Commission Report" – one row per retained contact with T1/T2/T3 flat-dollar commissions
  *   2. "Commission Summary"          – one row per retention agent with tier and total commission
  *
- * Sends one workbook for LDR and one for PLAW, both to oduai only.
+ * Emails one workbook per source (LDR, PLAW) containing the full dataset
+ * (" - All"), plus one workbook per configured agent filtered to their data
+ * (" - <Agent Name>"), all attached in the same email.
  *
  * LDR:  custom_agent=742096, custom_date=742101, custom_results=742105,
  *        recon_status_id=377650, cancel_request_custom=742098
@@ -263,17 +265,56 @@ class GenerateRetentionCommissionReport extends Command
 
             if ($file) {
                 $this->info("[INFO] [$display] Workbook built: {$file['filename']}");
+
+                // Per-agent workbooks: one per agent that actually has data in this
+                // source (same blacklist philosophy as the report itself — unknown
+                // but valid agents still get their own file).
+                $agentNames = [];
+                foreach ($rows as $row) {
+                    $agent = trim((string) $this->col($row, 'RETENTION_AGENT', ''));
+                    if ($agent !== '') {
+                        $agentNames[] = $agent;
+                    }
+                }
+                $agentNames = array_values(array_unique($agentNames));
+                sort($agentNames, SORT_STRING | SORT_FLAG_CASE);
+
+                $files = [$file];
+                foreach ($agentNames as $agentName) {
+                    $agentRows = array_values(array_filter(
+                        $rows,
+                        fn (array $r): bool => strtoupper((string) $this->col($r, 'RETENTION_AGENT', '')) === strtoupper($agentName)
+                    ));
+                    if ($agentRows === []) {
+                        continue;
+                    }
+                    $agentFile = $this->buildWorkbook($agentRows, $cfg, $display, $startDate, $endDate, $locationMap, $agentName);
+                    if ($agentFile) {
+                        $this->info("[INFO] [$display] Agent workbook built: {$agentFile['filename']}");
+                        $files[] = $agentFile;
+                    }
+                }
+
                 $snapshotPath = $this->saveSnapshotCopy($file, $display, $startDate);
                 $this->info("[INFO] [$display] Snapshot saved: {$snapshotPath}");
+                foreach ($files as $i => $f) {
+                    if ($i === 0) {
+                        continue; // "All" snapshot already saved above
+                    }
+                    $agentSnapshotPath = $this->saveSnapshotCopy($f, $display, $startDate);
+                    $this->info("[INFO] [$display] Agent snapshot saved: {$agentSnapshotPath}");
+                }
                 $this->cleanupOldSnapshots($startDate);
 
                 if ($this->option('no-email')) {
                     $this->info("[INFO] [$display] --no-email set; skipping email send.");
                 } else {
-                    $this->sendReport($file, $display);
+                    $this->sendReport($files, $display);
                 }
-                if (file_exists($file['path'])) {
-                    @unlink($file['path']);
+                foreach ($files as $f) {
+                    if (file_exists($f['path'])) {
+                        @unlink($f['path']);
+                    }
                 }
             } else {
                 $this->error("[$display] Workbook generation failed.");
@@ -417,9 +458,10 @@ class GenerateRetentionCommissionReport extends Command
      * @param array<int,array<string,mixed>> $rows
      * @param array<string,mixed> $cfg
      * @param array<string,string> $locationMap
+     * @param string|null $agentFilter When set, filename uses the agent name
      * @return array{filename:string,path:string}|null
      */
-    private function buildWorkbook(array $rows, array $cfg, string $display, string $startDate, string $endDate, array $locationMap = []): ?array
+    private function buildWorkbook(array $rows, array $cfg, string $display, string $startDate, string $endDate, array $locationMap = [], ?string $agentFilter = null): ?array
     {
         try {
             $sp = new Spreadsheet();
@@ -503,7 +545,7 @@ class GenerateRetentionCommissionReport extends Command
             }
             $this->headerStyle($sheet2, 'A1:H1');
 
-            $agents      = $cfg['agents'];
+            $agents      = $agentFilter !== null ? [$agentFilter] : $cfg['agents'];
             $summaryRows = $this->buildSummary($rows, $agents, $startDate, $endDate, $locationMap, $hasT4);
 
             $r2 = 2;
@@ -534,7 +576,8 @@ class GenerateRetentionCommissionReport extends Command
 
             $sp->setActiveSheetIndex(0);
 
-            $filename = "Retention Commission ({$display}).xlsx";
+            $suffix   = $agentFilter !== null ? $this->safeFilenamePart($agentFilter) : 'All';
+            $filename = "Retention Commission ({$display}) - {$suffix}.xlsx";
             $path     = storage_path("app/{$filename}");
             (new Xlsx($sp))->save($path);
 
@@ -659,15 +702,32 @@ class GenerateRetentionCommissionReport extends Command
 
     // ─── Email ────────────────────────────────────────────────────────────────
 
-    private function sendReport(array $file, string $display): void
+    /**
+     * Send all workbooks (All + per-agent) in a single email.
+     *
+     * @param array<int,array{filename:string,path:string}> $files
+     */
+    private function sendReport(array $files, string $display): void
     {
         $subject = "Retention Commission Report - $display";
         $body    = "See attached Retention Commission Report - $display";
-        $att     = [
-            'name'         => $file['filename'],
-            'contentType'  => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            'contentBytes' => base64_encode((string) file_get_contents($file['path'])),
-        ];
+        $attachments = [];
+        foreach ($files as $f) {
+            if (!file_exists($f['path'])) {
+                $this->warn("[WARN] [$display] Attachment missing: {$f['filename']}");
+                continue;
+            }
+            $attachments[] = [
+                'name'         => $f['filename'],
+                'contentType'  => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                'contentBytes' => base64_encode((string) file_get_contents($f['path'])),
+            ];
+        }
+
+        if ($attachments === []) {
+            $this->warn("[WARN] [$display] No attachments to send.");
+            return;
+        }
 
         $sql   = $this->initSqlServer('ldr');
         $email = new EmailSenderService();
@@ -677,15 +737,15 @@ class GenerateRetentionCommissionReport extends Command
             [strtoupper($display)],
             $subject,
             $body,
-            [$att],
+            $attachments,
             true
         );
 
         if (!$sent) {
-            $email->sendMailHtml($subject, $body, ['oduai@libertydebtrelief.com'], [], [], [$att]);
+            $email->sendMailHtml($subject, $body, ['oduai@libertydebtrelief.com'], [], [], $attachments);
         }
 
-        $this->info("[INFO] [$display] Email sent.");
+        $this->info("[INFO] [$display] Email sent with " . count($attachments) . " attachment(s).");
     }
 
     // ─── Snapshot retention ───────────────────────────────────────────────────
@@ -699,14 +759,14 @@ class GenerateRetentionCommissionReport extends Command
         }
 
         $month = date('Y-m', strtotime($startDate));
-        $period = date('m-Y', strtotime($startDate));
         $source = strtoupper($display) === 'PROGRESS LAW' ? 'Progress Law' : 'LDR';
         $dir = storage_path("app/commission-snapshots/{$month}/retention");
         if (!is_dir($dir)) {
             mkdir($dir, 0775, true);
         }
 
-        $dest = $dir . DIRECTORY_SEPARATOR . "Retention Commission Report - {$source} - {$period}.xlsx";
+        // Filenames already carry the suffix ("Retention Commission (LDR) - All.xlsx").
+        $dest = $dir . DIRECTORY_SEPARATOR . (string) $file['filename'];
         copy((string) $file['path'], $dest); // overwrite same month/source if rerun
 
         return $dest;
@@ -755,6 +815,12 @@ class GenerateRetentionCommissionReport extends Command
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────────────
+
+    /** Strip characters that are illegal in filenames (Windows/Linux). */
+    private function safeFilenamePart(string $name): string
+    {
+        return trim((string) preg_replace('/[\/\\\\:*?"<>|]/', '_', $name), " \t\n\r\0\x0B.");
+    }
 
     /** @return array{t1:int,t2:int,t3:int,t4:int} */
     private function tierAmounts(float $debt): array

@@ -24,8 +24,10 @@ class BonusFormatter
     /**
      * @param array<int,array<string,mixed>> $rows
      * @param array<string,array{location:string,company:string}> $employeeMap  UPPER(agent_name) => employee data
+     * @param string|null $agentFilter When set, only the agent's rows appear and the
+     *                                 filename uses the agent name ("- <Agent Name>")
      */
-    public function buildWorkbook(array $rows, string $source, string $start, string $end, array $employeeMap = []): ?array
+    public function buildWorkbook(array $rows, string $source, string $start, string $end, array $employeeMap = [], ?string $agentFilter = null): ?array
     {
         try {
             $sp    = new Spreadsheet();
@@ -157,7 +159,8 @@ class BonusFormatter
             // Set active sheet back to data tab
             $sp->setActiveSheetIndex(0);
 
-            $filename = "Retention Bonus Commission - {$source}.xlsx";
+            $suffix   = $agentFilter !== null ? $this->safeFilenamePart($agentFilter) : 'All';
+            $filename = "Retention Bonus Commission - {$source} - {$suffix}.xlsx";
             $path     = storage_path("app/{$filename}");
             (new Xlsx($sp))->save($path);
 
@@ -176,6 +179,12 @@ class BonusFormatter
             'fill'      => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['argb' => self::HEADER_FILL]],
             'borders'   => ['allBorders' => ['borderStyle' => Border::BORDER_THIN]],
         ]);
+    }
+
+    /** Strip characters that are illegal in filenames (Windows/Linux). */
+    private function safeFilenamePart(string $name): string
+    {
+        return trim((string) preg_replace('/[\/\\\\:*?"<>|]/', '_', $name), " \t\n\r\0\x0B.");
     }
 
     private function setDateCell(\PhpOffice\PhpSpreadsheet\Worksheet\Worksheet $sheet, string $cell, ?string $val): void
