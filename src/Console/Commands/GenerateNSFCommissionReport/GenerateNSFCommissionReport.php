@@ -3,6 +3,8 @@
 namespace Cmd\Reports\Console\Commands\GenerateNSFCommissionReport;
 
 use Cmd\Reports\Services\DBConnector;
+use Cmd\Reports\Services\CommissionResultsWriter;
+use Cmd\Reports\Services\CommissionRosterProvider;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
 
@@ -109,10 +111,24 @@ class GenerateNSFCommissionReport extends Command
             }
             unset($row);
 
+            // Agent list comes from the roster Rama manages in the Commission Review app
+            // (falls back to the built-in list if the roster is unavailable/empty).
+            $agents = CommissionRosterProvider::agents($sql, 'nsf', $source, $cfg['agents']);
+
             $commissionRows = $this->buildCommissionRows(
                 $dataRows,
-                $cfg['agents'],
+                $agents,
                 $sql
+            );
+
+            // Persist the computed per-agent commission to Azure so the Commission Review app reads
+            // the REAL numbers (best-effort; never blocks the report).
+            CommissionResultsWriter::persist(
+                $sql, 'nsf', $source, $startDate, 'Commission',
+                array_map(
+                    fn ($r) => ['agent' => $r['agent'], 'amount' => $r['commission']],
+                    $commissionRows
+                )
             );
 
             $formatter = new Formatter();
@@ -120,8 +136,10 @@ class GenerateNSFCommissionReport extends Command
             $this->info("[INFO] [$display] Workbook: {$allFile['filename']}");
 
             // Per-agent workbooks: same two sheets, filtered to that agent's data.
+            // Uses $agents (the managed roster), not $cfg['agents'], so the per-agent workbooks
+            // cover exactly the same people as the commission summary above.
             $files = [$allFile];
-            foreach ($cfg['agents'] as $agentName) {
+            foreach ($agents as $agentName) {
                 $agentDataRows = array_values(array_filter(
                     $dataRows,
                     fn (array $r): bool => strtoupper((string) ($r['AGENT'] ?? '')) === strtoupper($agentName)
@@ -291,7 +309,15 @@ class GenerateNSFCommissionReport extends Command
             $actionsTier = $this->matchTier($ratio, [0.2, 0.4, 0.6]);
             $clearedTier = $this->matchTier($actions, [1, 51, 101]);
 
-            if (in_array($agent, self::FLAT_RATE_AGENTS, true)) {
+            // Compare case/space-insensitively: the agent list can now come from the managed
+            // roster, where a name may differ in casing or spacing from the constant below.
+            // A miss here would silently pay the tier rate instead of the flat rate.
+            $agentKey = strtolower(preg_replace('/\s+/', ' ', trim($agent)));
+            $flatRateKeys = array_map(
+                fn ($n) => strtolower(preg_replace('/\s+/', ' ', trim($n))),
+                self::FLAT_RATE_AGENTS
+            );
+            if (in_array($agentKey, $flatRateKeys, true)) {
                 $rate = 4.00;
             } else {
                 $rate = ($actionsTier > 0 && $clearedTier > 0)

@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Cmd\Reports\Console\Commands\GenerateRetentionCommissionReport;
 
 use Cmd\Reports\Services\DBConnector;
+use Cmd\Reports\Services\CommissionResultsWriter;
+use Cmd\Reports\Services\CommissionRosterProvider;
 use Cmd\Reports\Services\EmailSenderService;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
@@ -108,8 +110,15 @@ class GenerateRetentionCommissionReport extends Command
         return Command::SUCCESS;
     }
 
+    /** Per-agent commission summary from the most recent buildWorkbook(), for the Azure results write. */
+    private array $lastSummaryRows = [];
+
     private function runForSource(string $source): void
     {
+        // Reset per source: handle() runs LDR then PLAW on the SAME instance, so a stale value
+        // here would persist one source's commission under the other source's key.
+        $this->lastSummaryRows = [];
+
         $cfg     = self::SOURCE_CONFIG[$source];
         $display = $cfg['display'];
         $this->info("[INFO] GenerateRetentionCommissionReport – $display");
@@ -257,11 +266,23 @@ class GenerateRetentionCommissionReport extends Command
 
             $this->info("[INFO] [$display] Rows after processing: " . count($rows));
 
+            // Agent list (Commission Summary sheet) comes from the roster Rama manages in the
+            // Commission Review app; falls back to the built-in list if unavailable/empty.
+            $cfg['agents'] = CommissionRosterProvider::agents($sql, 'retention', $source, $cfg['agents']);
+
             // ── STEP 6: fetch agent location/company from SQL Server
             $locationMap = $this->fetchLocationMap($sql, $cfg['agents']);
 
             // ── STEP 7: build workbook with both sheets
             $file = $this->buildWorkbook($rows, $cfg, $display, $startDate, $endDate, $locationMap);
+
+            // Persist the computed per-agent retention commission to Azure for the Commission Review
+            // app (best-effort; never blocks the report). $lastSummaryRows is set inside buildWorkbook.
+            $retResults = [];
+            foreach ($this->lastSummaryRows as $agentName => $sum) {
+                $retResults[] = ['agent' => (string) $agentName, 'amount' => $sum['commission'] ?? 0];
+            }
+            CommissionResultsWriter::persist($sql, 'retention', $source, $startDate, 'Commission', $retResults);
 
             if ($file) {
                 $this->info("[INFO] [$display] Workbook built: {$file['filename']}");
@@ -547,6 +568,7 @@ class GenerateRetentionCommissionReport extends Command
 
             $agents      = $agentFilter !== null ? [$agentFilter] : $cfg['agents'];
             $summaryRows = $this->buildSummary($rows, $agents, $startDate, $endDate, $locationMap, $hasT4);
+            $this->lastSummaryRows = $summaryRows;
 
             $r2 = 2;
             foreach ($summaryRows as $agentName => $sum) {

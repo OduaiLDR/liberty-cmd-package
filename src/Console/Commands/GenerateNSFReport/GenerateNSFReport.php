@@ -12,7 +12,7 @@ use Illuminate\Support\Facades\Log;
  * Same SQL/report for both portals; one workbook + email per portal.
  *
  * Sources:
- * - docs/NSFLDR.md
+ * - docs/NSFLDR.mdzx
  * - docs/NSFPLAW.md
  */
 class GenerateNSFReport extends Command

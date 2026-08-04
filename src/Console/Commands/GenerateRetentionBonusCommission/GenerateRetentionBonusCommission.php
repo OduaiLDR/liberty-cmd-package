@@ -3,6 +3,7 @@
 namespace Cmd\Reports\Console\Commands\GenerateRetentionBonusCommission;
 
 use Cmd\Reports\Services\DBConnector;
+use Cmd\Reports\Services\CommissionResultsWriter;
 use Cmd\Reports\Services\EmailSenderService;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
@@ -198,6 +199,20 @@ class GenerateRetentionBonusCommission extends Command
                 }
             }
             unset($row);
+
+            // Persist per-agent retention BONUS COMMISSION to Azure for the Commission Review app
+            // (best-effort; never blocks the report). Aggregates per-contact RETENTION_COMMISSION by agent.
+            $bonusByAgent = [];
+            foreach ($rows as $r) {
+                $agent = trim((string) ($r['RETENTION_AGENT'] ?? ''));
+                if ($agent === '') continue;
+                $bonusByAgent[$agent] = ($bonusByAgent[$agent] ?? 0) + (float) ($r['RETENTION_COMMISSION'] ?? 0);
+            }
+            $bonusResults = [];
+            foreach ($bonusByAgent as $agentName => $amount) {
+                $bonusResults[] = ['agent' => $agentName, 'amount' => round($amount, 2)];
+            }
+            CommissionResultsWriter::persist($sql, 'retention', $source, $reportStartDate, 'Bonus_Commission', $bonusResults);
 
             // Build and send workbooks
             $agentNames  = array_values(array_unique(array_filter(
