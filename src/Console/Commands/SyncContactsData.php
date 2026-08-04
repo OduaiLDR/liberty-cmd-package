@@ -122,7 +122,8 @@ class SyncContactsData extends Command
             $this->agentCustomId      = 742153;
             $this->targetTable        = 'TblContactsPLAW';
         } elseif ($this->source === 'LT') {
-            $this->debtAmountCustomId = 387843;  // loan amount needed field
+            // LT's Loan Amount Needed field is a numeric string custom field.
+            $this->debtAmountCustomId = 595171;
             $this->agentCustomId      = 0;        // agent comes from USERS join, not custom field
             $this->targetTable        = 'TblContacts';
         } else {
@@ -391,7 +392,7 @@ class SyncContactsData extends Command
                 ep.FEE1,
                 c.TP_ID AS TP_ID_COPY,
                 TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', c.ENROLLED_DATE), 'YYYY-MM-DD HH24:MI:SS') AS ENROLLED_DATE,
-                uf_debt.F_DECIMAL AS DEBT_AMOUNT_CUSTOM,
+                uf_debt.F_SHORTSTRING AS DEBT_AMOUNT_CUSTOM,
                 NULL AS PLAN_TITLE,
                 NULL AS AGENT_CUSTOM
             FROM CONTACTS AS c
@@ -406,7 +407,7 @@ class SyncContactsData extends Command
             LEFT JOIN CREDIT_REPORT_REQUEST AS cr ON c.ID = cr.CONTACT_ID
             LEFT JOIN ENROLLMENT_PLAN AS ep ON c.ID = ep.CONTACT_ID
             LEFT JOIN (
-                SELECT CONTACT_ID, F_DECIMAL
+                SELECT CONTACT_ID, F_SHORTSTRING
                 FROM CONTACTS_USERFIELDS
                 WHERE CUSTOM_ID = {$this->debtAmountCustomId}
             ) AS uf_debt ON c.ID = uf_debt.CONTACT_ID
@@ -588,7 +589,8 @@ class SyncContactsData extends Command
                 $seenTpIds[$tpId] = true;
             }
 
-            $debtAmount = $row['DEBT_AMOUNT_CUSTOM'] ?? 0;
+            $debtAmountRaw = $row['DEBT_AMOUNT_CUSTOM'] ?? 0;
+            $debtAmount = is_numeric($debtAmountRaw) ? (float) $debtAmountRaw : 0.0;
             $planTitle  = $row['PLAN_TITLE'] ?? '';
             $category   = $this->normalizePlanTitle($planTitle);
             // LT: agent is the assigned user from USERS join; LDR/PLAW: from custom field
