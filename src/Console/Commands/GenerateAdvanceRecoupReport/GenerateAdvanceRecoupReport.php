@@ -106,9 +106,13 @@ class GenerateAdvanceRecoupReport extends Command
 
         $rates = $this->fetchEpfRates($sqlServer, array_merge($advances, $refunds, $recoups));
 
-        $advances = $this->applyRatesAndProration($advances, $rates);
-        $refunds = $this->applyRatesAndProration($refunds, $rates);
-        $recoups = $this->applyRatesAndProration($recoups, $rates);
+        // Advances/Refunds are shown as negative (money going out), Recoups
+        // as positive -- per Jacob's explicit sign convention, applied here
+        // so the detail sheets and the Summary totals stay consistent with
+        // each other rather than only forcing the sign at the summary level.
+        $advances = $this->applyRatesAndProration($advances, $rates, -1);
+        $refunds = $this->applyRatesAndProration($refunds, $rates, -1);
+        $recoups = $this->applyRatesAndProration($recoups, $rates, 1);
 
         $sheets = [
             'Advances' => $advances,
@@ -244,14 +248,15 @@ class GenerateAdvanceRecoupReport extends Command
     /**
      * @param array<string,float> $rates
      */
-    private function applyRatesAndProration(array $rows, array $rates): array
+    private function applyRatesAndProration(array $rows, array $rates, int $sign): array
     {
         foreach ($rows as &$row) {
             $contactId = (string) ($row['CONTACT_ID'] ?? '');
             $rate = $rates[$contactId] ?? self::DEFAULT_EPF_RATE;
             $rate = $rate > 0 ? $rate : self::DEFAULT_EPF_RATE;
-            $amount = (float) ($row['AMOUNT'] ?? 0);
+            $amount = $sign * abs((float) ($row['AMOUNT'] ?? 0));
 
+            $row['AMOUNT'] = $amount;
             $row['EPF_RATE'] = $rate;
             $row['PRORATED_DEBT'] = round($amount / $rate, 2);
         }
@@ -273,8 +278,12 @@ class GenerateAdvanceRecoupReport extends Command
         $totalOperation = 0.0;
 
         foreach ($sheets as $category => $sheetRows) {
+            // Sign convention (Advances/Refunds negative, Recoups positive)
+            // was already applied per-row in applyRatesAndProration(), so
+            // AMOUNT/PRORATED_DEBT here sum straight through correctly signed.
             $amount = array_sum(array_map(fn (array $r): float => (float) ($r['AMOUNT'] ?? 0), $sheetRows));
             $effectiveDebt = array_sum(array_map(fn (array $r): float => (float) ($r['PRORATED_DEBT'] ?? 0), $sheetRows));
+
             $primary = round($effectiveDebt * self::PRIMARY_ACCOUNT_RATE, 2);
             $operation = round($effectiveDebt - $primary, 2);
 

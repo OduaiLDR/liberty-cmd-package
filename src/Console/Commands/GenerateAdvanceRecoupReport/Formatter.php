@@ -73,6 +73,8 @@ class Formatter
         $sheet->getColumnDimension('C')->setWidth(18);
         $sheet->getColumnDimension('D')->setWidth(18);
         $sheet->getColumnDimension('E')->setWidth(18);
+        $sheet->getDefaultRowDimension()->setRowHeight(20);
+        $sheet->getRowDimension(1)->setRowHeight(22);
 
         $rowIndex = 2;
         foreach ($rows as $row) {
@@ -82,8 +84,28 @@ class Formatter
             $sheet->setCellValue("D{$rowIndex}", $row['primary_account']);
             $sheet->setCellValue("E{$rowIndex}", $row['operation_account']);
 
-            if ($row['category'] === 'Total') {
+            if ($row['category'] === 'Rent') {
+                $sheet->getStyle("A{$rowIndex}:E{$rowIndex}")
+                    ->getFill()
+                    ->setFillType(Fill::FILL_SOLID)
+                    ->getStartColor()
+                    ->setARGB('FFFFF3CD');
+            } elseif ($row['category'] === 'Total') {
                 $sheet->getStyle("A{$rowIndex}:E{$rowIndex}")->getFont()->setBold(true);
+                $sheet->getStyle("A{$rowIndex}:E{$rowIndex}")
+                    ->getFill()
+                    ->setFillType(Fill::FILL_SOLID)
+                    ->getStartColor()
+                    ->setARGB('FFD9E8D9');
+                $sheet->getStyle("A{$rowIndex}:E{$rowIndex}")
+                    ->getBorders()->getTop()
+                    ->setBorderStyle(Border::BORDER_MEDIUM);
+            } elseif ($rowIndex % 2 === 0) {
+                $sheet->getStyle("A{$rowIndex}:E{$rowIndex}")
+                    ->getFill()
+                    ->setFillType(Fill::FILL_SOLID)
+                    ->getStartColor()
+                    ->setARGB('FFF5F7FA');
             }
 
             $rowIndex++;
@@ -93,15 +115,22 @@ class Formatter
         if ($lastRow >= 2) {
             $sheet->getStyle("A2:A{$lastRow}")
                 ->getAlignment()
-                ->setHorizontal(Alignment::HORIZONTAL_LEFT);
+                ->setHorizontal(Alignment::HORIZONTAL_LEFT)
+                ->setVertical(Alignment::VERTICAL_CENTER);
             $sheet->getStyle("B2:E{$lastRow}")
                 ->getNumberFormat()
-                ->setFormatCode('#,##0.00;(#,##0.00)');
+                ->setFormatCode('#,##0.00;[Red](#,##0.00)');
+            $sheet->getStyle("B2:E{$lastRow}")
+                ->getAlignment()
+                ->setVertical(Alignment::VERTICAL_CENTER);
             $sheet->getStyle("A2:E{$lastRow}")
                 ->getBorders()
                 ->getAllBorders()
-                ->setBorderStyle(Border::BORDER_THIN);
+                ->setBorderStyle(Border::BORDER_THIN)
+                ->setColor(new \PhpOffice\PhpSpreadsheet\Style\Color('FFCCCCCC'));
         }
+
+        $sheet->freezePane('A2');
     }
 
     /**
@@ -164,15 +193,23 @@ class Formatter
                 ->setBorderStyle(Border::BORDER_THIN);
             $sheet->getStyle("C2:C{$lastRow}")
                 ->getNumberFormat()
-                ->setFormatCode('#,##0.00;(#,##0.00)');
+                ->setFormatCode('#,##0.00;[Red](#,##0.00)');
             $sheet->getStyle("D2:D{$lastRow}")
                 ->getNumberFormat()
                 ->setFormatCode('0.00%');
             $sheet->getStyle("E2:E{$lastRow}")
                 ->getNumberFormat()
-                ->setFormatCode('#,##0.00;(#,##0.00)');
+                ->setFormatCode('#,##0.00;[Red](#,##0.00)');
+            $sheet->getStyle("A2:G{$lastRow}")
+                ->getAlignment()
+                ->setVertical(Alignment::VERTICAL_CENTER);
+            $sheet->getStyle("C2:E{$lastRow}")
+                ->getAlignment()
+                ->setHorizontal(Alignment::HORIZONTAL_RIGHT);
         }
 
+        $sheet->getRowDimension(1)->setRowHeight(22);
+        $sheet->freezePane('A2');
         $sheet->setSelectedCells('A1');
     }
 
