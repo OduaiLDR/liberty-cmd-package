@@ -284,8 +284,12 @@ class GenerateAdvanceRecoupReport extends Command
             $amount = array_sum(array_map(fn (array $r): float => (float) ($r['AMOUNT'] ?? 0), $sheetRows));
             $effectiveDebt = array_sum(array_map(fn (array $r): float => (float) ($r['PRORATED_DEBT'] ?? 0), $sheetRows));
 
+            // Primary Account is 3% of the prorated (effective) debt, but
+            // Operation Account is the remainder of the real dollar Amount
+            // after Primary's cut -- not the remainder of the prorated
+            // debt figure, which is a much larger derived number.
             $primary = round($effectiveDebt * self::PRIMARY_ACCOUNT_RATE, 2);
-            $operation = round($effectiveDebt - $primary, 2);
+            $operation = round($amount - $primary, 2);
 
             $rows[] = [
                 'category' => $category,
