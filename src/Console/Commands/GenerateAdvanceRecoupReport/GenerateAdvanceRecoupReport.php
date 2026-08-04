@@ -312,9 +312,15 @@ class GenerateAdvanceRecoupReport extends Command
         return $rows;
     }
 
+    /**
+     * Paid_To 35564/35289 are Progress Law codes and only have matching
+     * TRANSACTIONS rows in the 'plaw' Snowflake environment (confirmed:
+     * 'ldr' connects fine but has 0 matching rows; 'plaw' has 420k+).
+     * 'plaw' must be tried first, not just any environment that connects.
+     */
     private function initializeSnowflakeConnector(): DBConnector
     {
-        $candidates = ['ldr', 'plaw', 'production', 'sandbox'];
+        $candidates = ['plaw', 'ldr'];
         $errors = [];
 
         foreach ($candidates as $env) {
