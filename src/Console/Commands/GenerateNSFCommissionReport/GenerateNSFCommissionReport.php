@@ -116,21 +116,52 @@ class GenerateNSFCommissionReport extends Command
             );
 
             $formatter = new Formatter();
-            $file = $formatter->buildWorkbook($dataRows, $commissionRows, $display, $startDate, $endDate);
-            $this->info("[INFO] [$display] Workbook: {$file['filename']}");
+            $allFile = $formatter->buildWorkbook($dataRows, $commissionRows, $display, $startDate, $endDate);
+            $this->info("[INFO] [$display] Workbook: {$allFile['filename']}");
 
-            $snapshotPath = $this->saveSnapshotCopy($file, $startDate);
+            // Per-agent workbooks: same two sheets, filtered to that agent's data.
+            $files = [$allFile];
+            foreach ($cfg['agents'] as $agentName) {
+                $agentDataRows = array_values(array_filter(
+                    $dataRows,
+                    fn (array $r): bool => strtoupper((string) ($r['AGENT'] ?? '')) === strtoupper($agentName)
+                ));
+                if ($agentDataRows === []) {
+                    $this->info("[INFO] [$display] No NSF data for agent {$agentName}; skipping per-agent workbook.");
+                    continue;
+                }
+                $agentCommRows = array_values(array_filter(
+                    $commissionRows,
+                    fn (array $r): bool => strtoupper((string) ($r['agent'] ?? '')) === strtoupper($agentName)
+                ));
+                $agentFile = $formatter->buildWorkbook($agentDataRows, $agentCommRows, $display, $startDate, $endDate, $agentName);
+                if ($agentFile) {
+                    $this->info("[INFO] [$display] Agent workbook built: {$agentFile['filename']}");
+                    $files[] = $agentFile;
+                }
+            }
+
+            $snapshotPath = $this->saveSnapshotCopy($allFile, $startDate);
             $this->info("[INFO] [$display] Snapshot saved: {$snapshotPath}");
+            foreach ($files as $i => $f) {
+                if ($i === 0) {
+                    continue; // "All" snapshot already saved above
+                }
+                $agentSnapshotPath = $this->saveSnapshotCopy($f, $startDate);
+                $this->info("[INFO] [$display] Agent snapshot saved: {$agentSnapshotPath}");
+            }
             $this->cleanupOldSnapshots($startDate);
 
             if ($this->option('no-email')) {
                 $this->info("[INFO] [$display] --no-email set; skipping email send.");
             } else {
-                $this->sendReport($sql, $file, $display, $startDate, $endDate, $commissionRows);
+                $this->sendReport($sql, $files, $display, $startDate, $endDate, $commissionRows);
             }
 
-            if (file_exists($file['path'])) {
-                @unlink($file['path']);
+            foreach ($files as $f) {
+                if (file_exists($f['path'])) {
+                    @unlink($f['path']);
+                }
             }
         } catch (\Throwable $e) {
             $this->error("[$display] Failed: " . $e->getMessage());
@@ -326,10 +357,29 @@ class GenerateNSFCommissionReport extends Command
         return $tier;
     }
 
-    private function sendReport(DBConnector $sql, array $file, string $display, string $start, string $end, array $commissionRows): void
+    /**
+     * Send all workbooks (All + per-agent) in a single email.
+     *
+     * @param array<int,array{filename:string,path:string}> $files
+     */
+    private function sendReport(DBConnector $sql, array $files, string $display, string $start, string $end, array $commissionRows): void
     {
-        if (!file_exists($file['path'])) {
-            $this->warn("[WARN] [$display] File missing — not sent.");
+        // Build attachment list first (skip missing files)
+        $attachments = [];
+        foreach ($files as $f) {
+            if (!file_exists($f['path'])) {
+                $this->warn("[WARN] [$display] Attachment missing: {$f['filename']}");
+                continue;
+            }
+            $attachments[] = [
+                'name'         => $f['filename'],
+                'contentType'  => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                'contentBytes' => base64_encode((string) file_get_contents($f['path'])),
+            ];
+        }
+
+        if ($attachments === []) {
+            $this->warn("[WARN] [$display] No attachments to send.");
             return;
         }
 
@@ -355,19 +405,13 @@ class GenerateNSFCommissionReport extends Command
         }
         $body .= '</table>';
 
-        $attachment = [
-            'name'         => $file['filename'],
-            'contentType'  => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            'contentBytes' => base64_encode((string) file_get_contents($file['path'])),
-        ];
-
         $email  = new \Cmd\Reports\Services\EmailSenderService();
         $testTo = trim((string) env('NSF_REPORT_TEST_TO', ''));
 
         if ($testTo !== '') {
             // Guard: override all recipients — send only to test address
             $this->info("[INFO] [$display] NSF_REPORT_TEST_TO set — sending only to $testTo");
-            $sent = $email->sendMailHtml($subject, $body, [$testTo], [], [], [$attachment]);
+            $sent = $email->sendMailHtml($subject, $body, [$testTo], [], [], $attachments);
         } else {
             $sent = $email->sendMailUsingTblReportsHtml(
                 $sql,
@@ -375,13 +419,13 @@ class GenerateNSFCommissionReport extends Command
                 [strtoupper($display === 'Progress Law' ? 'PLAW' : 'LDR')],
                 $subject,
                 $body,
-                [$attachment],
+                $attachments,
                 true
             );
         }
 
         if ($sent) {
-            $this->info("[INFO] [$display] NSF Commission Report sent.");
+            $this->info("[INFO] [$display] NSF Commission Report sent with " . count($attachments) . " attachment(s).");
         } else {
             $this->warn("[WARN] [$display] Email not sent.");
             Log::warning("GenerateNSFCommissionReport[$display]: email not sent.");

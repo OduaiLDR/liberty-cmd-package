@@ -21,7 +21,8 @@ use Illuminate\Support\Facades\Log;
 class GenerateRetentionBonusCommission extends Command
 {
     protected $signature = 'reports:generate-retention-bonus-commission
-                            {source=both : ldr | plaw | both}';
+                            {source=both : ldr | plaw | both}
+                            {--no-email : Build workbooks only, skip email}';
 
     protected $description = 'Generate Retention Bonus Commission report for LDR and/or PLAW.';
 
@@ -116,19 +117,16 @@ class GenerateRetentionBonusCommission extends Command
             }
             unset($row);
 
-            // STEP 4 – SQL Server enrollment data per contact
+            // STEP 4 – SQL Server enrollment data in one batched query
+            $llgIds = array_values(array_unique(array_filter(
+                array_map(fn ($r) => 'LLG-' . (string) $this->rowValue($r, 'ID', ''), $rows),
+                fn (string $id): bool => $id !== 'LLG-'
+            )));
+            $enrollmentMap = $this->fetchEnrollmentMap($sql, $llgIds);
+
             foreach ($rows as &$row) {
                 $id   = (string) $this->rowValue($row, 'ID', '');
-                $llg  = "LLG-$id";
-                $res  = $sql->querySqlServer(
-                    "SELECT First_Payment_Cleared_Date AS first_payment_cleared_date,
-                            Payments AS payments,
-                            Agent AS agent,
-                            Commission_Rate AS commission_rate
-                     FROM TblEnrollment WHERE LLG_ID = ?",
-                    [$llg]
-                );
-                $en = ($res['data'] ?? [])[0] ?? null;
+                $en   = $enrollmentMap['LLG-' . $id] ?? null;
                 $row['FIRST_PAYMENT_CLEARED_DATE'] = $en ? $this->dateValue($this->rowValue($en, 'first_payment_cleared_date')) : null;
                 $row['PAYMENTS']                   = $en ? (int) $this->rowValue($en, 'payments', 0) : 0;
                 $row['AGENT']                      = $en ? $this->rowValue($en, 'agent') : null;
@@ -170,7 +168,13 @@ class GenerateRetentionBonusCommission extends Command
             }));
             $this->info("[INFO] [$display] Eligible rows after filtering: " . count($rows));
 
-            // STEP 6 – commission and violation deductions
+            // STEP 6 – commission and violation deductions in one batched query
+            $eligibleIds = array_values(array_unique(array_filter(
+                array_map(fn ($r) => (string) $this->rowValue($r, 'ID', ''), $rows),
+                fn (string $id): bool => $id !== ''
+            )));
+            $violationMap = $this->fetchViolationMap($sql, $eligibleIds);
+
             foreach ($rows as &$row) {
                 $id   = (string) $this->rowValue($row, 'ID', '');
                 $debt = (float) $this->rowValue($row, 'ENROLLED_DEBT', 0);
@@ -183,12 +187,7 @@ class GenerateRetentionBonusCommission extends Command
                     $row['RETENTION_COMMISSION'] = round($debt * 0.38 / 100 / 2, 2);
                     $row['AGENT_DEDUCTION']    = '';
                 } else {
-                    // Check violations
-                    $safe = str_replace("'", "''", $id);
-                    $res  = $sql->querySqlServer(
-                        "SELECT ISNULL(SUM(Points),0) AS pts FROM TblSalesAgentViolations WHERE CID='$safe'"
-                    );
-                    $pts = (float) $this->rowValue(($res['data'] ?? [])[0] ?? [], 'pts', 0);
+                    $pts = $violationMap[$id] ?? 0;
                     $violations = min($pts / 10, 1.0);
                     $row['VIOLATIONS'] = $violations;
 
@@ -200,20 +199,45 @@ class GenerateRetentionBonusCommission extends Command
             }
             unset($row);
 
-            // Build and send workbook
+            // Build and send workbooks
             $agentNames  = array_values(array_unique(array_filter(
                 array_map(fn ($r) => (string) ($r['RETENTION_AGENT'] ?? ''), $rows)
             )));
+            sort($agentNames, SORT_STRING | SORT_FLAG_CASE);
             $employeeMap = $this->fetchEmployeeMap($sql, $agentNames);
 
             $formatter = new BonusFormatter();
-            $file = $formatter->buildWorkbook($rows, $display, $reportStartDate, $endDate, $employeeMap);
+            $allFile = $formatter->buildWorkbook($rows, $display, $reportStartDate, $endDate, $employeeMap);
 
-            if ($file) {
-                $this->info("[INFO] [$display] Workbook: {$file['filename']}");
-                $this->sendReport($sql, $file, $display);
-                if (file_exists($file['path'])) {
-                    @unlink($file['path']);
+            if ($allFile) {
+                $this->info("[INFO] [$display] Workbook: {$allFile['filename']}");
+
+                // Per-agent workbooks: same sheets, filtered to that agent's rows.
+                $files = [$allFile];
+                foreach ($agentNames as $agentName) {
+                    $agentRows = array_values(array_filter(
+                        $rows,
+                        fn ($r) => strtoupper((string) ($r['RETENTION_AGENT'] ?? '')) === strtoupper($agentName)
+                    ));
+                    if ($agentRows === []) {
+                        continue;
+                    }
+                    $agentFile = $formatter->buildWorkbook($agentRows, $display, $reportStartDate, $endDate, $employeeMap, $agentName);
+                    if ($agentFile) {
+                        $this->info("[INFO] [$display] Agent workbook built: {$agentFile['filename']}");
+                        $files[] = $agentFile;
+                    }
+                }
+
+                if ($this->option('no-email')) {
+                    $this->info("[INFO] [$display] --no-email set; skipping email send.");
+                } else {
+                    $this->sendReport($sql, $files, $display);
+                    foreach ($files as $f) {
+                        if (file_exists($f['path'])) {
+                            @unlink($f['path']);
+                        }
+                    }
                 }
             }
 
@@ -224,6 +248,55 @@ class GenerateRetentionBonusCommission extends Command
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    /** @param string[] $llgIds @return array<string,array<string,mixed>> */
+    private function fetchEnrollmentMap(DBConnector $sql, array $llgIds): array
+    {
+        $map = [];
+        foreach (array_chunk($llgIds, 500) as $chunk) {
+            $inList = implode(',', array_map(
+                fn (string $id): string => "'" . str_replace("'", "''", $id) . "'",
+                $chunk
+            ));
+            $res = $sql->querySqlServer(
+                "SELECT LLG_ID, First_Payment_Cleared_Date AS first_payment_cleared_date,
+                        Payments AS payments, Agent AS agent, Commission_Rate AS commission_rate
+                 FROM TblEnrollment WHERE LLG_ID IN ($inList)"
+            );
+            foreach ($res['data'] ?? [] as $row) {
+                $key = (string) $this->rowValue($row, 'LLG_ID', '');
+                if ($key !== '') {
+                    $map[$key] = $row;
+                }
+            }
+        }
+        return $map;
+    }
+
+    /** @param string[] $ids @return array<string,float> */
+    private function fetchViolationMap(DBConnector $sql, array $ids): array
+    {
+        $map = [];
+        foreach (array_chunk($ids, 500) as $chunk) {
+            $inList = implode(',', array_map(
+                fn (string $id): string => "'" . str_replace("'", "''", $id) . "'",
+                $chunk
+            ));
+            $res = $sql->querySqlServer(
+                "SELECT CID, ISNULL(SUM(Points),0) AS pts
+                 FROM TblSalesAgentViolations
+                 WHERE CID IN ($inList)
+                 GROUP BY CID"
+            );
+            foreach ($res['data'] ?? [] as $row) {
+                $key = (string) $this->rowValue($row, 'CID', '');
+                if ($key !== '') {
+                    $map[$key] = (float) $this->rowValue($row, 'pts', 0);
+                }
+            }
+        }
+        return $map;
+    }
+
     private function fetchBase(DBConnector $sf, array $cfg, string $start, string $end): array
     {
         $ca = (int)$cfg['custom_agent'];
@@ -334,28 +407,47 @@ class GenerateRetentionBonusCommission extends Command
         return $map;
     }
 
-    private function sendReport(DBConnector $sql, array $file, string $display): void
+    /**
+     * Send all workbooks (All + per-agent) in a single email.
+     *
+     * @param array<int,array{filename:string,path:string}> $files
+     */
+    private function sendReport(DBConnector $sql, array $files, string $display): void
     {
         $subject = "Retention Bonus Commission - $display";
         $body    = "See attached Retention Bonus Commission - $display.";
-        $att     = [
-            'name'         => $file['filename'],
-            'contentType'  => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            'contentBytes' => base64_encode((string)file_get_contents($file['path'])),
-        ];
+        $attachments = [];
+        foreach ($files as $f) {
+            if (!file_exists($f['path'])) {
+                $this->warn("[WARN] [$display] Attachment missing: {$f['filename']}");
+                continue;
+            }
+            $attachments[] = [
+                'name'         => $f['filename'],
+                'contentType'  => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                'contentBytes' => base64_encode((string)file_get_contents($f['path'])),
+            ];
+        }
+
+        if ($attachments === []) {
+            $this->warn("[WARN] [$display] No attachments to send.");
+            return;
+        }
 
         $email = new EmailSenderService();
         $sent  = $email->sendMailUsingTblReports(
             $sql,
             ['RetentionBonusCommission', 'Retention Bonus Commission'],
             [strtoupper($display)],
-            $subject, $body, [$att], true
+            $subject, $body, $attachments, true
         );
 
         if (!$sent) {
             // VBA SendTo: jacob@, rama@ → use fallback until TblReports populated
-            $email->sendMailHtml($subject, $body, ['oduai@libertydebtrelief.com'], [], [], [$att]);
+            $email->sendMailHtml($subject, $body, ['oduai@libertydebtrelief.com'], [], [], $attachments);
         }
+
+        $this->info("[INFO] [$display] Email sent with " . count($attachments) . " attachment(s).");
     }
 
     private function fetchEmployeeMap(DBConnector $sql, array $agents): array
