@@ -88,6 +88,7 @@ use Cmd\Reports\Console\Commands\GenerateReconsiderationReport\GenerateReconside
 use Cmd\Reports\Console\Commands\SyncEmployeeSfUids;
 use Cmd\Reports\Console\Commands\SyncDroppedStatus\SyncDroppedStatus;
 use Cmd\Reports\Console\Commands\SyncDroppedStatus\SyncDroppedStatusPreview;
+use Cmd\Reports\Console\Commands\GenerateAdvanceRecoupReport\GenerateAdvanceRecoupReport;
 
 class ReportsServiceProvider extends ServiceProvider
 {
@@ -203,6 +204,7 @@ class ReportsServiceProvider extends ServiceProvider
                 SyncDroppedStatusPreview::class,
                 SyncDroppedStatus::class,
                 SyncEmployeeSfUids::class,
+                GenerateAdvanceRecoupReport::class,
             ]);
         }
 

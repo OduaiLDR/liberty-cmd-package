@@ -1,0 +1,353 @@
+<?php
+
+namespace Cmd\Reports\Console\Commands\GenerateAdvanceRecoupReport;
+
+use Cmd\Reports\Services\DBConnector;
+use Cmd\Reports\Services\EmailSenderService;
+use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Log;
+
+/**
+ * Monthly EPF adjustments workbook for Jacob/Aaron/Jessica (Progress Law),
+ * built from his exact Snowflake TRANSACTIONS queries (Slack, 2026-07-16 /
+ * 2026-08-02). One workbook, sheets in order: Summary, Advances, Refunds,
+ * Recoups.
+ *
+ * Detail sheets (Advances/Refunds/Recoups) each get: Contact ID, Trans
+ * Type, Amount, EPF Rate, Prorated Debt (= Amount / Rate, 2dp), Process
+ * Date, Cleared Date, Memo. EPF Rate comes from dbo.TblEnrollment.EPF_Rate
+ * (SQL Server), matched via LLG_ID = 'LLG-' + Snowflake CONTACT_ID --
+ * defaults to 0.29 when no match exists, per Jacob's "usually 29% but can
+ * vary."
+ *
+ * Summary sheet: one row per detail sheet (Category, Amount, Effective
+ * Debt = sum of that sheet's Prorated Debt, Primary Account = 3% of
+ * Effective Debt, Operation Account = the remaining 97%), plus a fixed
+ * Rent row (-400, no rate/debt breakdown) and a Total row summing
+ * everything above it.
+ */
+class GenerateAdvanceRecoupReport extends Command
+{
+    protected $signature = 'Generate:advance-recoup-report
+                            {--test : Send only to jacob@progresslaw.com instead of the full recipient list}
+                            {--month= : Month to report on as YYYY-MM (defaults to last full calendar month)}';
+
+    protected $description = 'Email the monthly Advances/Refunds/Recoups EPF adjustments workbook.';
+
+    private const PAID_TO = [35564, 35289];
+    private const DEFAULT_EPF_RATE = 0.29;
+    private const RENT_AMOUNT = -400.0;
+    private const PRIMARY_ACCOUNT_RATE = 0.03;
+    private const RECIPIENTS = ['Jacob@progresslaw.com', 'Aaron@progresslaw.com', 'Jessica@cdp.law'];
+    private const TEST_RECIPIENT = 'jacob@progresslaw.com';
+
+    public function handle(): int
+    {
+        $this->info('[INFO] Advance/Recoup report: starting.');
+
+        try {
+            $snowflake = $this->initializeSnowflakeConnector();
+        } catch (\Throwable $e) {
+            $this->error('Failed to initialize Snowflake connector: ' . $e->getMessage());
+            Log::error('GenerateAdvanceRecoupReport: Snowflake init failed', ['exception' => $e]);
+            return Command::FAILURE;
+        }
+
+        try {
+            $sqlServer = $this->initializeSqlServerConnector();
+        } catch (\Throwable $e) {
+            $this->error('Failed to initialize SQL Server connector: ' . $e->getMessage());
+            Log::error('GenerateAdvanceRecoupReport: SQL Server init failed', ['exception' => $e]);
+            return Command::FAILURE;
+        }
+
+        try {
+            $window = $this->resolveMonthWindow();
+        } catch (\Throwable $e) {
+            $this->error($e->getMessage());
+            return Command::FAILURE;
+        }
+
+        try {
+            $refunds = $this->fetchRows($snowflake, $this->buildQuery(
+                "AND TRANS_TYPE = 'T' AND MEMO LIKE '%Earned Fee%'",
+                $window['start'],
+                $window['endExclusive']
+            ));
+
+            $advancesSA = $this->fetchRows($snowflake, $this->buildQuery(
+                "AND TRANS_TYPE = 'SA'",
+                $window['start'],
+                $window['endExclusive']
+            ));
+
+            $advancesT = $this->fetchRows($snowflake, $this->buildQuery(
+                "AND TRANS_TYPE = 'T' AND MEMO NOT LIKE '%Earned Fee%' AND MEMO LIKE '%Advance%'",
+                $window['start'],
+                $window['endExclusive']
+            ));
+
+            $advances = array_merge($advancesSA, $advancesT);
+            usort($advances, function (array $a, array $b): int {
+                return [(string) ($a['TRANS_TYPE'] ?? ''), (string) ($a['PROCESS_DATE'] ?? ''), (float) ($a['AMOUNT'] ?? 0)]
+                    <=> [(string) ($b['TRANS_TYPE'] ?? ''), (string) ($b['PROCESS_DATE'] ?? ''), (float) ($b['AMOUNT'] ?? 0)];
+            });
+
+            $recoups = $this->fetchRows($snowflake, $this->buildQuery(
+                "AND TRANS_TYPE = 'C' AND MEMO LIKE '%Recoup%'",
+                $window['start'],
+                $window['endExclusive']
+            ));
+        } catch (\Throwable $e) {
+            $this->error('Failed to fetch transactions: ' . $e->getMessage());
+            Log::error('GenerateAdvanceRecoupReport: Snowflake query failed', ['exception' => $e]);
+            return Command::FAILURE;
+        }
+
+        $rates = $this->fetchEpfRates($sqlServer, array_merge($advances, $refunds, $recoups));
+
+        $advances = $this->applyRatesAndProration($advances, $rates);
+        $refunds = $this->applyRatesAndProration($refunds, $rates);
+        $recoups = $this->applyRatesAndProration($recoups, $rates);
+
+        $sheets = [
+            'Advances' => $advances,
+            'Refunds' => $refunds,
+            'Recoups' => $recoups,
+        ];
+
+        $summaryRows = $this->buildSummaryRows($sheets);
+
+        $formatter = new Formatter();
+        $report = $formatter->buildWorkbook($sheets, $summaryRows, $window['label']);
+        $this->info('[INFO] Workbook written to: ' . $report['path']);
+
+        $isTest = (bool) $this->option('test');
+        $recipients = $isTest ? [self::TEST_RECIPIENT] : self::RECIPIENTS;
+
+        $subject = ($isTest ? '[TEST] ' : '') . 'EPF Adjustments - ' . $window['label'];
+        $body = 'Please review the EPF adjustments for ' . $window['label'] . '. '
+            . 'Line item detail is attached. '
+            . 'Thanks';
+
+        $attachments = [[
+            'name' => $report['filename'],
+            'contentType' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'contentBytes' => base64_encode(file_get_contents($report['path'])),
+        ]];
+
+        $email = new EmailSenderService();
+        $sent = $email->sendMailHtml($subject, nl2br(htmlspecialchars($body)), $recipients, [], [], $attachments);
+
+        if ($sent) {
+            $this->info('[INFO] Advance/Recoup report sent to ' . implode(', ', $recipients) . '.');
+        } else {
+            $this->warn('[WARN] Advance/Recoup report failed to send.');
+            Log::warning('GenerateAdvanceRecoupReport: email send failed.');
+        }
+
+        return $sent ? Command::SUCCESS : Command::FAILURE;
+    }
+
+    /**
+     * @return array{label:string,start:string,endExclusive:string}
+     */
+    private function resolveMonthWindow(): array
+    {
+        $monthOpt = $this->option('month');
+
+        if ($monthOpt) {
+            if (!preg_match('/^\d{4}-\d{2}$/', (string) $monthOpt)) {
+                throw new \InvalidArgumentException("Invalid --month value '{$monthOpt}', expected YYYY-MM.");
+            }
+            $start = \Carbon\Carbon::createFromFormat('Y-m-d', $monthOpt . '-01')->startOfMonth();
+        } else {
+            $start = now()->subMonthNoOverflow()->startOfMonth();
+        }
+
+        $endExclusive = $start->copy()->addMonthNoOverflow()->startOfMonth();
+
+        return [
+            'label' => $start->format('F Y'),
+            'start' => $start->format('Y-m-d'),
+            'endExclusive' => $endExclusive->format('Y-m-d'),
+        ];
+    }
+
+    private function buildQuery(string $extraWhere, string $start, string $endExclusive): string
+    {
+        $paidTo = implode(', ', self::PAID_TO);
+        $startEsc = $this->esc($start);
+        $endEsc = $this->esc($endExclusive);
+
+        return "
+            SELECT CONTACT_ID, TRANS_TYPE, AMOUNT, PROCESS_DATE, CLEARED_DATE, MEMO
+            FROM TRANSACTIONS
+            WHERE Paid_To IN ({$paidTo})
+              AND PROCESS_DATE >= '{$startEsc}'
+              AND PROCESS_DATE < '{$endEsc}'
+              {$extraWhere}
+            ORDER BY TRANS_TYPE, PROCESS_DATE ASC, AMOUNT ASC
+        ";
+    }
+
+    private function fetchRows(DBConnector $connector, string $sql): array
+    {
+        $result = $connector->query($sql);
+        return $result['data'] ?? [];
+    }
+
+    /**
+     * Looks up dbo.TblEnrollment.EPF_Rate for every distinct CONTACT_ID
+     * across all three sheets in one batched query, matching via
+     * LLG_ID = 'LLG-' + CONTACT_ID (same convention used throughout this
+     * package -- see SyncEPFData/SyncEnrollmentPlans).
+     *
+     * @return array<string,float> CONTACT_ID => rate
+     */
+    private function fetchEpfRates(DBConnector $connector, array $rows): array
+    {
+        $contactIds = [];
+        foreach ($rows as $row) {
+            $id = (string) ($row['CONTACT_ID'] ?? '');
+            if ($id !== '') {
+                $contactIds[$id] = true;
+            }
+        }
+        $contactIds = array_keys($contactIds);
+
+        if (empty($contactIds)) {
+            return [];
+        }
+
+        $rates = [];
+        foreach (array_chunk($contactIds, 1000) as $chunk) {
+            $idList = implode(', ', array_map(fn (string $id): string => "'" . $this->esc($id) . "'", $chunk));
+            $sql = "
+                SELECT REPLACE(LLG_ID, 'LLG-', '') AS CONTACT_ID, EPF_Rate
+                FROM dbo.TblEnrollment
+                WHERE REPLACE(LLG_ID, 'LLG-', '') IN ({$idList})
+            ";
+            $result = $connector->querySqlServer($sql);
+            foreach ($result['data'] ?? [] as $row) {
+                $id = (string) ($row['CONTACT_ID'] ?? '');
+                $rate = $row['EPF_Rate'] ?? null;
+                if ($id !== '' && $rate !== null && $rate !== '' && !isset($rates[$id])) {
+                    $rates[$id] = (float) $rate;
+                }
+            }
+        }
+
+        return $rates;
+    }
+
+    /**
+     * @param array<string,float> $rates
+     */
+    private function applyRatesAndProration(array $rows, array $rates): array
+    {
+        foreach ($rows as &$row) {
+            $contactId = (string) ($row['CONTACT_ID'] ?? '');
+            $rate = $rates[$contactId] ?? self::DEFAULT_EPF_RATE;
+            $rate = $rate > 0 ? $rate : self::DEFAULT_EPF_RATE;
+            $amount = (float) ($row['AMOUNT'] ?? 0);
+
+            $row['EPF_RATE'] = $rate;
+            $row['PRORATED_DEBT'] = round($amount / $rate, 2);
+        }
+        unset($row);
+
+        return $rows;
+    }
+
+    /**
+     * @param array<string,array<int,array<string,mixed>>> $sheets
+     * @return array<int,array{category:string,amount:?float,effective_debt:?float,primary_account:?float,operation_account:?float}>
+     */
+    private function buildSummaryRows(array $sheets): array
+    {
+        $rows = [];
+        $totalAmount = 0.0;
+        $totalEffectiveDebt = 0.0;
+        $totalPrimary = 0.0;
+        $totalOperation = 0.0;
+
+        foreach ($sheets as $category => $sheetRows) {
+            $amount = array_sum(array_map(fn (array $r): float => (float) ($r['AMOUNT'] ?? 0), $sheetRows));
+            $effectiveDebt = array_sum(array_map(fn (array $r): float => (float) ($r['PRORATED_DEBT'] ?? 0), $sheetRows));
+            $primary = round($effectiveDebt * self::PRIMARY_ACCOUNT_RATE, 2);
+            $operation = round($effectiveDebt - $primary, 2);
+
+            $rows[] = [
+                'category' => $category,
+                'amount' => $amount,
+                'effective_debt' => $effectiveDebt,
+                'primary_account' => $primary,
+                'operation_account' => $operation,
+            ];
+
+            $totalAmount += $amount;
+            $totalEffectiveDebt += $effectiveDebt;
+            $totalPrimary += $primary;
+            $totalOperation += $operation;
+        }
+
+        $rows[] = [
+            'category' => 'Rent',
+            'amount' => self::RENT_AMOUNT,
+            'effective_debt' => null,
+            'primary_account' => null,
+            'operation_account' => null,
+        ];
+        $totalAmount += self::RENT_AMOUNT;
+
+        $rows[] = [
+            'category' => 'Total',
+            'amount' => $totalAmount,
+            'effective_debt' => $totalEffectiveDebt,
+            'primary_account' => $totalPrimary,
+            'operation_account' => $totalOperation,
+        ];
+
+        return $rows;
+    }
+
+    private function initializeSnowflakeConnector(): DBConnector
+    {
+        $candidates = ['ldr', 'plaw', 'production', 'sandbox'];
+        $errors = [];
+
+        foreach ($candidates as $env) {
+            try {
+                return DBConnector::fromEnvironment($env);
+            } catch (\Throwable $e) {
+                $errors[] = "{$env}: {$e->getMessage()}";
+            }
+        }
+
+        throw new \RuntimeException('Unable to initialize Snowflake connector. Tried: ' . implode('; ', $errors));
+    }
+
+    private function initializeSqlServerConnector(): DBConnector
+    {
+        $candidates = ['ldr', 'plaw', 'production', 'sandbox'];
+        $errors = [];
+
+        foreach ($candidates as $env) {
+            try {
+                $connector = DBConnector::fromEnvironment($env);
+                $connector->initializeSqlServer();
+                return $connector;
+            } catch (\Throwable $e) {
+                $errors[] = "{$env}: {$e->getMessage()}";
+            }
+        }
+
+        throw new \RuntimeException('Unable to initialize SQL Server connector. Tried: ' . implode('; ', $errors));
+    }
+
+    private function esc(string $value): string
+    {
+        return str_replace("'", "''", $value);
+    }
+}
