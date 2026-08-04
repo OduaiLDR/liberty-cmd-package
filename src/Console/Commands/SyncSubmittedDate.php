@@ -8,13 +8,16 @@ use Illuminate\Support\Facades\Log;
 
 class SyncSubmittedDate extends Command
 {
-    protected $signature = 'sync:submitted-date';
+    protected $signature = 'sync:submitted-date {--dry-run : Preview matching records without updating SQL Server or writing log rows}';
 
     protected $description = 'Sync Submitted_Date in TblEnrollment from Snowflake CONTACTS_STATUS (statuses 123480, 377643, 377680, 37768; last 7 days)';
 
     public function handle(): int
     {
+        $dryRun = (bool) $this->option('dry-run');
+
         $this->info('Submitted date sync: starting.');
+        $this->info($dryRun ? 'Dry run enabled: no SQL Server updates or log rows will be written.' : 'Live mode enabled: matching SQL Server records will be updated.');
         Log::info('SyncSubmittedDate command started.');
 
         $connections = ['plaw', 'ldr'];
@@ -32,22 +35,26 @@ class SyncSubmittedDate extends Command
             try {
                 $connector = DBConnector::fromEnvironment($connection);
                 $connector->initializeSqlServer();
-                $this->ensureLogTable($connector);
+                if (!$dryRun) {
+                    $this->ensureLogTable($connector);
+                }
 
                 $this->info("[$source] Fetching submitted dates from Snowflake...");
                 $submitted = $this->fetchSubmittedFromSnowflake($connector);
 
                 if (empty($submitted)) {
                     $this->warn("[$source] No submitted dates found in Snowflake.");
-                    $this->insertLogRow(
-                        $connector,
-                        $source,
-                        'SYNC_SUBMITTED_DATE',
-                        'SUCCESS',
-                        0,
-                        0,
-                        'No submitted dates found to sync.'
-                    );
+                    if (!$dryRun) {
+                        $this->insertLogRow(
+                            $connector,
+                            $source,
+                            'SYNC_SUBMITTED_DATE',
+                            'SUCCESS',
+                            0,
+                            0,
+                            'No submitted dates found to sync.'
+                        );
+                    }
                     continue;
                 }
 
@@ -56,15 +63,22 @@ class SyncSubmittedDate extends Command
 
                 if (empty($submitted)) {
                     $this->info("[$source] No blank Submitted_Date records matched Snowflake.");
-                    $this->insertLogRow(
-                        $connector,
-                        $source,
-                        'SYNC_SUBMITTED_DATE',
-                        'SUCCESS',
-                        0,
-                        0,
-                        'No blank Submitted_Date records matched Snowflake.'
-                    );
+                    if (!$dryRun) {
+                        $this->insertLogRow(
+                            $connector,
+                            $source,
+                            'SYNC_SUBMITTED_DATE',
+                            'SUCCESS',
+                            0,
+                            0,
+                            'No blank Submitted_Date records matched Snowflake.'
+                        );
+                    }
+                    continue;
+                }
+
+                if ($dryRun) {
+                    $this->info(sprintf('[%s] Would update %d blank Submitted_Date records.', $source, count($submitted)));
                     continue;
                 }
 
@@ -100,7 +114,7 @@ class SyncSubmittedDate extends Command
                 ]);
 
                 try {
-                    if (!isset($connector)) {
+                    if (!$dryRun && !isset($connector)) {
                         $connector = DBConnector::fromEnvironment($connection);
                         $connector->initializeSqlServer();
                         $this->ensureLogTable($connector);
@@ -108,15 +122,17 @@ class SyncSubmittedDate extends Command
 
                     $errorMessage = mb_substr($e->getMessage(), 0, 900);
 
-                    $this->insertLogRow(
-                        $connector,
-                        $source,
-                        'SYNC_SUBMITTED_DATE',
-                        'FAILED',
-                        0,
-                        0,
-                        $errorMessage
-                    );
+                    if (!$dryRun && isset($connector)) {
+                        $this->insertLogRow(
+                            $connector,
+                            $source,
+                            'SYNC_SUBMITTED_DATE',
+                            'FAILED',
+                            0,
+                            0,
+                            $errorMessage
+                        );
+                    }
                 } catch (\Throwable $logException) {
                     Log::error('SyncSubmittedDate: failed to log to TblLog after exception.', [
                         'connection' => $connection,
