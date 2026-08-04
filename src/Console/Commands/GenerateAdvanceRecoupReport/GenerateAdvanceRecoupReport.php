@@ -13,17 +13,19 @@ use Illuminate\Support\Facades\Log;
  * 2026-08-02). One workbook, sheets in order: Summary, Advances, Refunds,
  * Recoups.
  *
- * Detail sheets (Advances/Refunds/Recoups) each get: Contact ID, Trans
- * Type, Amount, EPF Rate, Prorated Debt (= Amount / Rate, 2dp), Process
- * Date, Cleared Date, Memo. EPF Rate comes from dbo.TblEnrollment.EPF_Rate
- * (SQL Server), matched via LLG_ID = 'LLG-' + Snowflake CONTACT_ID --
- * defaults to 0.29 when no match exists, per Jacob's "usually 29% but can
- * vary."
+ * Detail sheets (Advances/Refunds/Recoups) each get: Contact ID, Client
+ * Name (Snowflake CONTACTS.FIRSTNAME + LASTNAME), Trans Type, Amount, EPF
+ * Rate, Prorated Debt (= Amount / Rate, 2dp), Process Date, Cleared Date,
+ * Memo. EPF Rate comes from dbo.TblEnrollment.EPF_Rate (SQL Server),
+ * matched via LLG_ID = 'LLG-' + Snowflake CONTACT_ID -- defaults to 0.29
+ * when no match exists, per Jacob's "usually 29% but can vary." Amount is
+ * forced negative for Advances/Refunds and positive for Recoups.
  *
- * Summary sheet: one row per detail sheet (Category, Amount, Effective
- * Debt = sum of that sheet's Prorated Debt, Primary Account = 3% of
- * Effective Debt, Operation Account = the remaining 97%), plus a fixed
- * Rent row (-400, no rate/debt breakdown) and a Total row summing
+ * Summary sheet: one row per detail sheet (Category, Amount = that sheet's
+ * fee total, Effective Debt = sum of that sheet's Prorated Debt -- shown
+ * for reference only, Primary Account = 3% of Effective Debt, Operation
+ * Account = Amount minus Primary Account), plus a fixed Rent row (-400,
+ * booked entirely under Operation Account) and a Total row summing
  * everything above it.
  */
 class GenerateAdvanceRecoupReport extends Command
@@ -104,15 +106,17 @@ class GenerateAdvanceRecoupReport extends Command
             return Command::FAILURE;
         }
 
-        $rates = $this->fetchEpfRates($sqlServer, array_merge($advances, $refunds, $recoups));
+        $allRows = array_merge($advances, $refunds, $recoups);
+        $rates = $this->fetchEpfRates($sqlServer, $allRows);
+        $names = $this->fetchClientNames($snowflake, $allRows);
 
         // Advances/Refunds are shown as negative (money going out), Recoups
         // as positive -- per Jacob's explicit sign convention, applied here
         // so the detail sheets and the Summary totals stay consistent with
         // each other rather than only forcing the sign at the summary level.
-        $advances = $this->applyRatesAndProration($advances, $rates, -1);
-        $refunds = $this->applyRatesAndProration($refunds, $rates, -1);
-        $recoups = $this->applyRatesAndProration($recoups, $rates, 1);
+        $advances = $this->applyRatesAndProration($advances, $rates, $names, -1);
+        $refunds = $this->applyRatesAndProration($refunds, $rates, $names, -1);
+        $recoups = $this->applyRatesAndProration($recoups, $rates, $names, 1);
 
         $sheets = [
             'Advances' => $advances,
@@ -246,9 +250,50 @@ class GenerateAdvanceRecoupReport extends Command
     }
 
     /**
-     * @param array<string,float> $rates
+     * Batch-looks up FIRSTNAME/LASTNAME from Snowflake CONTACTS (same
+     * environment as TRANSACTIONS) for every distinct CONTACT_ID, so the
+     * detail sheets can show a human-readable client name next to the ID.
+     *
+     * @return array<string,string> CONTACT_ID => "First Last"
      */
-    private function applyRatesAndProration(array $rows, array $rates, int $sign): array
+    private function fetchClientNames(DBConnector $connector, array $rows): array
+    {
+        $contactIds = [];
+        foreach ($rows as $row) {
+            $id = (string) ($row['CONTACT_ID'] ?? '');
+            if ($id !== '') {
+                $contactIds[$id] = true;
+            }
+        }
+        $contactIds = array_keys($contactIds);
+
+        if (empty($contactIds)) {
+            return [];
+        }
+
+        $names = [];
+        foreach (array_chunk($contactIds, 1000) as $chunk) {
+            $idList = implode(', ', $chunk);
+            $sql = "SELECT ID, FIRSTNAME, LASTNAME FROM CONTACTS WHERE ID IN ({$idList})";
+            $result = $connector->query($sql);
+            foreach ($result['data'] ?? [] as $row) {
+                $id = (string) ($row['ID'] ?? '');
+                if ($id === '') {
+                    continue;
+                }
+                $name = trim(trim((string) ($row['FIRSTNAME'] ?? '')) . ' ' . trim((string) ($row['LASTNAME'] ?? '')));
+                $names[$id] = $name;
+            }
+        }
+
+        return $names;
+    }
+
+    /**
+     * @param array<string,float> $rates
+     * @param array<string,string> $names
+     */
+    private function applyRatesAndProration(array $rows, array $rates, array $names, int $sign): array
     {
         foreach ($rows as &$row) {
             $contactId = (string) ($row['CONTACT_ID'] ?? '');
@@ -259,6 +304,7 @@ class GenerateAdvanceRecoupReport extends Command
             $row['AMOUNT'] = $amount;
             $row['EPF_RATE'] = $rate;
             $row['PRORATED_DEBT'] = round($amount / $rate, 2);
+            $row['CLIENT_NAME'] = $names[$contactId] ?? '';
         }
         unset($row);
 
@@ -310,9 +356,10 @@ class GenerateAdvanceRecoupReport extends Command
             'amount' => self::RENT_AMOUNT,
             'effective_debt' => null,
             'primary_account' => null,
-            'operation_account' => null,
+            'operation_account' => self::RENT_AMOUNT,
         ];
         $totalAmount += self::RENT_AMOUNT;
+        $totalOperation += self::RENT_AMOUNT;
 
         $rows[] = [
             'category' => 'Total',

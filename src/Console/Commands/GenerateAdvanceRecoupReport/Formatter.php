@@ -138,7 +138,7 @@ class Formatter
      */
     private function buildDetailSheet(Worksheet $sheet, array $rows): void
     {
-        $headers = ['Contact ID', 'Trans Type', 'Amount', 'EPF Rate', 'Prorated Debt', 'Process Date', 'Cleared Date', 'Memo'];
+        $headers = ['Contact ID', 'Client Name', 'Trans Type', 'Amount', 'EPF Rate', 'Prorated Debt', 'Process Date', 'Cleared Date', 'Memo'];
 
         $col = 'A';
         foreach ($headers as $header) {
@@ -146,36 +146,37 @@ class Formatter
             $col++;
         }
 
-        $sheet->getStyle('A1:H1')->applyFromArray([
+        $sheet->getStyle('A1:I1')->applyFromArray([
             'font' => ['bold' => true, 'color' => ['argb' => 'FFFFFFFF']],
             'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER],
             'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['argb' => 'FF17853B']],
             'borders' => ['allBorders' => ['borderStyle' => Border::BORDER_THIN, 'color' => ['argb' => 'FF444444']]],
         ]);
-        $sheet->setAutoFilter('A1:H1');
 
         $sheet->getColumnDimension('A')->setWidth(16);
-        $sheet->getColumnDimension('B')->setWidth(12);
-        $sheet->getColumnDimension('C')->setWidth(14);
-        $sheet->getColumnDimension('D')->setWidth(12);
-        $sheet->getColumnDimension('E')->setWidth(16);
+        $sheet->getColumnDimension('B')->setWidth(22);
+        $sheet->getColumnDimension('C')->setWidth(12);
+        $sheet->getColumnDimension('D')->setWidth(14);
+        $sheet->getColumnDimension('E')->setWidth(12);
         $sheet->getColumnDimension('F')->setWidth(16);
         $sheet->getColumnDimension('G')->setWidth(16);
-        $sheet->getColumnDimension('H')->setWidth(40);
+        $sheet->getColumnDimension('H')->setWidth(16);
+        $sheet->getColumnDimension('I')->setWidth(60);
 
         $rowIndex = 2;
         foreach ($rows as $row) {
             $sheet->setCellValue("A{$rowIndex}", (string) ($row['CONTACT_ID'] ?? ''));
-            $sheet->setCellValue("B{$rowIndex}", (string) ($row['TRANS_TYPE'] ?? ''));
-            $sheet->setCellValue("C{$rowIndex}", (float) ($row['AMOUNT'] ?? 0));
-            $sheet->setCellValue("D{$rowIndex}", (float) ($row['EPF_RATE'] ?? 0));
-            $sheet->setCellValue("E{$rowIndex}", (float) ($row['PRORATED_DEBT'] ?? 0));
-            $sheet->setCellValue("F{$rowIndex}", $this->formatDate($row['PROCESS_DATE'] ?? null));
-            $sheet->setCellValue("G{$rowIndex}", $this->formatDate($row['CLEARED_DATE'] ?? null));
-            $sheet->setCellValue("H{$rowIndex}", (string) ($row['MEMO'] ?? ''));
+            $sheet->setCellValue("B{$rowIndex}", (string) ($row['CLIENT_NAME'] ?? ''));
+            $sheet->setCellValue("C{$rowIndex}", (string) ($row['TRANS_TYPE'] ?? ''));
+            $sheet->setCellValue("D{$rowIndex}", (float) ($row['AMOUNT'] ?? 0));
+            $sheet->setCellValue("E{$rowIndex}", (float) ($row['EPF_RATE'] ?? 0));
+            $sheet->setCellValue("F{$rowIndex}", (float) ($row['PRORATED_DEBT'] ?? 0));
+            $sheet->setCellValue("G{$rowIndex}", $this->formatDate($row['PROCESS_DATE'] ?? null));
+            $sheet->setCellValue("H{$rowIndex}", $this->formatDate($row['CLEARED_DATE'] ?? null));
+            $sheet->setCellValue("I{$rowIndex}", (string) ($row['MEMO'] ?? ''));
 
             if ($rowIndex % 2 === 0) {
-                $sheet->getStyle("A{$rowIndex}:H{$rowIndex}")
+                $sheet->getStyle("A{$rowIndex}:I{$rowIndex}")
                     ->getFill()
                     ->setFillType(Fill::FILL_SOLID)
                     ->getStartColor()
@@ -187,23 +188,23 @@ class Formatter
 
         $lastRow = $rowIndex - 1;
         if ($lastRow >= 2) {
-            $sheet->getStyle("A2:H{$lastRow}")
+            $sheet->getStyle("A2:I{$lastRow}")
                 ->getBorders()
                 ->getAllBorders()
                 ->setBorderStyle(Border::BORDER_THIN);
-            $sheet->getStyle("C2:C{$lastRow}")
-                ->getNumberFormat()
-                ->setFormatCode('#,##0.00;[Red](#,##0.00)');
             $sheet->getStyle("D2:D{$lastRow}")
                 ->getNumberFormat()
-                ->setFormatCode('0.00%');
+                ->setFormatCode('#,##0.00;[Red](#,##0.00)');
             $sheet->getStyle("E2:E{$lastRow}")
                 ->getNumberFormat()
+                ->setFormatCode('0.00%');
+            $sheet->getStyle("F2:F{$lastRow}")
+                ->getNumberFormat()
                 ->setFormatCode('#,##0.00;[Red](#,##0.00)');
-            $sheet->getStyle("A2:G{$lastRow}")
+            $sheet->getStyle("A2:H{$lastRow}")
                 ->getAlignment()
                 ->setVertical(Alignment::VERTICAL_CENTER);
-            $sheet->getStyle("C2:E{$lastRow}")
+            $sheet->getStyle("D2:F{$lastRow}")
                 ->getAlignment()
                 ->setHorizontal(Alignment::HORIZONTAL_RIGHT);
         }
