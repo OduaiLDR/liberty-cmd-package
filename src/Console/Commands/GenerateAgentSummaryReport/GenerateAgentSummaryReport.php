@@ -12,7 +12,8 @@ class GenerateAgentSummaryReport extends Command
         {--continuation : Run in continuation mode (single Data Source only)}
         {--start-date= : Period start date (YYYY-MM-DD); defaults to 1st of current month}
         {--end-date= : Period end date (YYYY-MM-DD); defaults to last day of current month}
-        {--month-offset=0 : Offset for default period in months (e.g. -1 for previous month). Ignored if --start-date is set.}';
+        {--month-offset=0 : Offset for default period in months (e.g. -1 for previous month). Ignored if --start-date is set.}
+        {--no-email : Generate the PDF(s) but do NOT send the email; keeps files in storage/app for inspection}';
 
     protected $description = 'Generate Agent Summary report PDF(s) from LDR SQL Server and email them in one consolidated email.';
 
@@ -82,6 +83,16 @@ class GenerateAgentSummaryReport extends Command
 
         if (empty($generatedFiles)) {
             $this->warn('[WARN] No PDFs generated. Nothing to email.');
+            return Command::SUCCESS;
+        }
+
+        // Preview mode: keep the PDFs on disk for inspection and do NOT email anyone.
+        if ($this->option('no-email')) {
+            $this->warn('[WARN] --no-email set: skipping email. Generated PDF(s) kept for inspection:');
+            foreach ($generatedFiles as $file) {
+                $this->line('        ' . $file['path']);
+            }
+            $this->info('[SUCCESS] Agent Summary Report run complete (no email sent).');
             return Command::SUCCESS;
         }
 

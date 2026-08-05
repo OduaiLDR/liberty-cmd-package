@@ -47,16 +47,18 @@ class Formatter
 
         $contLabel = $continuation ? 'Continuation ' : '';
         $contSuffix = $continuation ? ' (' . date('F Y', strtotime($startDate)) . ')' : '';
-        $endDisplay = date('m-d-Y', strtotime($endDate));
-        $endDisplaySlash = date('m/d/Y', strtotime($endDate));
+        // Subject/body show the report's MONTH plus TODAY's date (the generation date),
+        // not the month-end — so an MTD report is never mistaken for an end-of-month one.
+        $reportMonth  = date('F', strtotime($startDate));
+        $todayDisplay = date('m-d-Y');
 
-        $subject = "Agent Summary {$contLabel}Report - {$endDisplay}{$contSuffix}";
+        $subject = "{$reportMonth} Agent Summary {$contLabel}Report as of {$todayDisplay}{$contSuffix}";
 
         if (count($dataSources) === 1) {
-            $body = "Attached is the Agent Summary {$contLabel}Report - {$endDisplaySlash}{$contSuffix} - {$dataSources[0]}.";
+            $body = "Attached is the {$reportMonth} Agent Summary {$contLabel}Report as of {$todayDisplay}{$contSuffix} - {$dataSources[0]}.";
         } else {
             $list = implode(', ', $dataSources);
-            $body = "Attached are the Agent Summary {$contLabel}Reports - {$endDisplaySlash}{$contSuffix} for: {$list}.";
+            $body = "Attached are the {$reportMonth} Agent Summary {$contLabel}Reports as of {$todayDisplay}{$contSuffix} for: {$list}.";
         }
 
         $email = new EmailSenderService();
