@@ -13,6 +13,7 @@ class SyncContactsData extends Command
     protected $signature = 'Sync:contacts-data
         {--source=   : Run a single source only (LDR, PLAW, or LT)}
         {--full      : Force a full refresh even when a previous sync timestamp exists}
+        {--dry-run   : Fetch and report changes without modifying SQL Server or sync watermarks}
         {--no-match  : Skip post-sync table matching (internal flag used by the orchestrator)}';
 
     protected $description = 'Sync contacts data from Snowflake to SQL Server (TblContactsLDR, TblContactsPLAW, and TblContactsLT)';
@@ -48,12 +49,13 @@ class SyncContactsData extends Command
         }
         $artisan  = base_path('artisan');
         $fullFlag = $this->option('full') ? ['--full'] : [];
+        $dryRunFlag = $this->option('dry-run') ? ['--dry-run'] : [];
 
         // ── Step 1: LT ────────────────────────────────────────────────────────
         $this->info("[INFO] Step 1/3: Syncing LT (primary contacts)...");
-        $ltPool = Process::pool(function ($pool) use ($php, $artisan, $fullFlag) {
+        $ltPool = Process::pool(function ($pool) use ($php, $artisan, $fullFlag, $dryRunFlag) {
             $pool->as('LT')->timeout(7200)->command(
-                array_merge([$php, $artisan, 'Sync:contacts-data', '--source=LT', '--no-match'], $fullFlag)
+                array_merge([$php, $artisan, 'Sync:contacts-data', '--source=LT', '--no-match'], $fullFlag, $dryRunFlag)
             );
         })->start(function (string $type, string $output, string $key) {
             foreach (explode("\n", rtrim($output)) as $line) {
@@ -70,10 +72,10 @@ class SyncContactsData extends Command
 
         // ── Step 2: LDR + PLAW (parallel) ────────────────────────────────────
         $this->info("[INFO] Step 2/3: Syncing LDR and PLAW in parallel...");
-        $pool = Process::pool(function ($pool) use ($php, $artisan, $fullFlag) {
+        $pool = Process::pool(function ($pool) use ($php, $artisan, $fullFlag, $dryRunFlag) {
             foreach (['LDR', 'PLAW'] as $src) {
                 $pool->as($src)->timeout(7200)->command(
-                    array_merge([$php, $artisan, 'Sync:contacts-data', "--source={$src}", '--no-match'], $fullFlag)
+                    array_merge([$php, $artisan, 'Sync:contacts-data', "--source={$src}", '--no-match'], $fullFlag, $dryRunFlag)
                 );
             }
         })->start(function (string $type, string $output, string $key) {
@@ -97,6 +99,12 @@ class SyncContactsData extends Command
         }
 
         // ── Step 3: Final matching ─────────────────────────────────────────────
+        if ($this->option('dry-run')) {
+            $this->info('[DRY RUN] Step 3/3: Final table matching skipped.');
+            $this->info('[SUCCESS] Dry run completed; no SQL Server changes were made.');
+            return Command::SUCCESS;
+        }
+
         $this->info("[INFO] Step 3/3: Running final table matching...");
         try {
             $connector = DBConnector::fromEnvironment('ldr');
@@ -158,6 +166,11 @@ class SyncContactsData extends Command
      */
     private function runSourceSync(): int
     {
+        $dryRun = (bool) $this->option('dry-run');
+        if ($dryRun) {
+            $this->warn('[DRY RUN] No SQL Server writes or watermark updates will be performed.');
+        }
+
         $this->info("[DEBUG] Initializing Snowflake connector...");
         try {
             $snowflake = $this->initializeSnowflakeConnector();
@@ -193,8 +206,10 @@ class SyncContactsData extends Command
             $this->info("[INFO] Incremental mode: fetching contacts modified since {$startDate}.");
         } else {
             $startDate = '2021-07-01';
-            $this->info("[INFO] Full refresh mode.");
-            $this->clearTargetTable($sqlConnector);
+            $this->info('[INFO] Full refresh mode.' . ($dryRun ? ' Target table will not be truncated.' : ''));
+            if (!$dryRun) {
+                $this->clearTargetTable($sqlConnector);
+            }
         }
 
         // Record the sync start time before any data is fetched.
@@ -237,16 +252,20 @@ class SyncContactsData extends Command
                 $affiliateChanges[] = $c;
             }
 
-            try {
-                $totalInserted += $this->insertChunk($sqlConnector, $processedChunk, $isIncremental);
-            } catch (\Throwable $e) {
-                $this->error("[ERROR] Insert failed on chunk ending at ID {$lastId}: " . $e->getMessage());
-                Log::error('SyncContactsData: chunk insert failed', [
-                    'source'  => $this->source,
-                    'last_id' => $lastId,
-                    'error'   => $e->getMessage(),
-                ]);
-                return Command::FAILURE;
+            if ($dryRun) {
+                $totalInserted += count($processedChunk);
+            } else {
+                try {
+                    $totalInserted += $this->insertChunk($sqlConnector, $processedChunk, $isIncremental);
+                } catch (\Throwable $e) {
+                    $this->error("[ERROR] Insert failed on chunk ending at ID {$lastId}: " . $e->getMessage());
+                    Log::error('SyncContactsData: chunk insert failed', [
+                        'source'  => $this->source,
+                        'last_id' => $lastId,
+                        'error'   => $e->getMessage(),
+                    ]);
+                    return Command::FAILURE;
+                }
             }
 
             unset($chunk, $enrollmentData, $dropNames, $processedChunk, $newCatChanges, $newAffChanges);
@@ -258,18 +277,22 @@ class SyncContactsData extends Command
         $this->info("[INFO] Completed: {$totalInserted} records upserted into {$this->targetTable}.");
         $this->info("[INFO] Enrollment updates: " . \count($categoryChanges) . " category, " . \count($affiliateChanges) . " affiliate agent");
 
-        $this->applyEnrollmentCategoryUpdates($sqlConnector, $categoryChanges);
-        $this->applyEnrollmentAffiliateUpdates($sqlConnector, $affiliateChanges);
+        if (!$dryRun) {
+            $this->applyEnrollmentCategoryUpdates($sqlConnector, $categoryChanges);
+            $this->applyEnrollmentAffiliateUpdates($sqlConnector, $affiliateChanges);
+        }
 
         // When called from the orchestrator (no --source flag), matching is deferred
         // to handle() so it runs after ALL sources finish. Skip it here in that case.
-        if (!$this->option('no-match')) {
+        if (!$dryRun && !$this->option('no-match')) {
             $this->updateRelatedTables($sqlConnector);
         }
 
         // Persist the watermark only after a fully successful run
-        $this->writeLastSyncTime($this->source, $syncStartedAt);
-        $this->info("[INFO] Sync watermark saved: {$syncStartedAt}");
+        if (!$dryRun) {
+            $this->writeLastSyncTime($this->source, $syncStartedAt);
+            $this->info("[INFO] Sync watermark saved: {$syncStartedAt}");
+        }
 
         $this->info("[SUCCESS] {$this->source} sync completed successfully!");
         return Command::SUCCESS;
@@ -936,8 +959,8 @@ class SyncContactsData extends Command
         }
 
         // Agent update: use MIN(Agent) per LLG_ID to handle duplicate TblContacts rows
-        // deterministically, and only write when TblContacts has a non-empty agent.
-        // Only fills blank TblEnrollment.Agent — never overwrites an existing value.
+        // deterministically. LT ownership is authoritative, so correct stale values
+        // as well as blanks, but never write an empty source value.
         $agentSteps = [
             // Primary: from TblContacts (LT source)
             "UPDATE TblEnrollment
@@ -949,8 +972,9 @@ class SyncContactsData extends Command
                  WHERE Agent IS NOT NULL AND Agent <> ''
                  GROUP BY LLG_ID
              ) c ON TblEnrollment.LLG_ID = c.LLG_ID
-             WHERE (TblEnrollment.Agent IS NULL OR TblEnrollment.Agent = '')"
-            => '[INFO] Updated TblEnrollment.Agent from TblContacts',
+             WHERE TblEnrollment.Agent IS NULL OR TblEnrollment.Agent = ''
+                OR TblEnrollment.Agent <> c.Agent"
+            => '[INFO] Updated TblEnrollment.Agent from LT ownership',
 
             // Fallback: from TblContactsLDR for contacts missing from TblContacts
             "UPDATE TblEnrollment

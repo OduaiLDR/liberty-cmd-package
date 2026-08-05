@@ -8,13 +8,18 @@ use Illuminate\Support\Facades\Log;
 
 class ImportMissingEnrollments extends Command
 {
-    protected $signature = 'enrollment:import-missing';
+    protected $signature = 'enrollment:import-missing
+                            {--dry-run : Report inserts and ownership repairs without changing SQL Server}';
 
     protected $description = 'Insert new enrollments from Snowflake (LDR + PLAW) that are missing from TblEnrollment. Category is LDR or CCS only.';
 
     public function handle(): int
     {
         $this->info('[INFO] ImportMissingEnrollments: starting.');
+        $dryRun = (bool) $this->option('dry-run');
+        if ($dryRun) {
+            $this->warn('[DRY RUN] No inserts or updates will be performed.');
+        }
 
         try {
             $sqlConnector = DBConnector::fromEnvironment('ldr');
@@ -52,12 +57,12 @@ class ImportMissingEnrollments extends Command
                 continue;
             }
 
-            $inserted = $this->importFromSource($snowflake, $sqlConnector, $existingIds, strtoupper($source));
+            $inserted = $this->importFromSource($snowflake, $sqlConnector, $existingIds, strtoupper($source), $dryRun);
             $totalInserted += $inserted;
         }
 
         // Fix any agents that came through as '% User' — pull correct name from TblContacts
-        $fixed = $this->fixUserAgents($sqlConnector);
+        $fixed = $this->fixUserAgents($sqlConnector, $dryRun);
 
         $this->info("\n" . str_repeat('=', 60));
         $this->info("[DONE] Total inserted: {$totalInserted} | Agent fixes applied: {$fixed}");
@@ -69,7 +74,8 @@ class ImportMissingEnrollments extends Command
         DBConnector $snowflake,
         DBConnector $sqlConnector,
         array &$existingIds,
-        string $source
+        string $source,
+        bool $dryRun = false
     ): int {
         // Pull enrolled contacts from Snowflake with all fields needed for TblEnrollment.
         // Mirrors Jacob's ImportMissingEnrollments VBA exactly:
@@ -154,6 +160,11 @@ class ImportMissingEnrollments extends Command
             return 0;
         }
 
+        if ($dryRun) {
+            $this->warn("[DRY RUN] {$source}: would insert " . count($missing) . ' missing enrollment(s).');
+            return count($missing);
+        }
+
         $inserted = 0;
         $skipped  = 0;
 
@@ -219,18 +230,16 @@ class ImportMissingEnrollments extends Command
         return $inserted;
     }
 
-    private function fixUserAgents(DBConnector $sqlConnector): int
+    private function fixUserAgents(DBConnector $sqlConnector, bool $dryRun = false): int
     {
-        // Contacts synced from Snowflake sometimes have a generic '% User' agent name.
-        // Fix those rows by pulling the real agent from TblContacts.
+        // Correct blank or stale enrollment agents from the LT ownership table.
         $sql = "
             SELECT e.LLG_ID, c.Agent AS CorrectAgent
             FROM TblEnrollment AS e
             LEFT JOIN TblContacts AS c ON e.LLG_ID = c.LLG_ID
-            WHERE e.Agent LIKE '% User'
-              AND c.Agent IS NOT NULL
+            WHERE c.Agent IS NOT NULL
               AND c.Agent <> ''
-              AND c.Agent NOT LIKE '% User'
+              AND (e.Agent IS NULL OR e.Agent = '' OR e.Agent <> c.Agent)
         ";
 
         $result = $sqlConnector->querySqlServer($sql);
@@ -241,6 +250,11 @@ class ImportMissingEnrollments extends Command
         if (empty($rows)) {
             $this->info('[INFO] No agent fixes needed.');
             return 0;
+        }
+
+        if ($dryRun) {
+            $this->warn('[DRY RUN] Would correct ' . count($rows) . ' enrollment agent(s) from LT ownership.');
+            return count($rows);
         }
 
         $fixed = 0;
@@ -257,7 +271,7 @@ class ImportMissingEnrollments extends Command
             $fixed++;
         }
 
-        $this->info("[INFO] Fixed {$fixed} agent names from '% User' to correct name");
+        $this->info("[INFO] Corrected {$fixed} enrollment agents from LT ownership");
         return $fixed;
     }
 
