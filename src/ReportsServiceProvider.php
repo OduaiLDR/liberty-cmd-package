@@ -50,7 +50,7 @@ use Cmd\Reports\Console\Commands\GenerateRetentionManagerCommission\GenerateRete
 use Cmd\Reports\Console\Commands\GenerateCancelRequestsAgentReport\GenerateCancelRequestsAgentReport;
 use Cmd\Reports\Console\Commands\GenerateRetentionBonusCommission\GenerateRetentionBonusCommission;
 use Cmd\Reports\Console\Commands\GenerateNSFCommissionReport\GenerateNSFCommissionReport;
-use Cmd\Reports\Console\Commands\GenerateEnrollmentStatusReport\GenerateEnrollmentStatusReport;
+use Cmd\Reports\Console\Commands\GenerateEnrollmentBonusReport\GenerateEnrollmentBonusReport;
 use Cmd\Reports\Console\Commands\SyncContactsData;
 use Cmd\Reports\Console\Commands\SyncCollectionCompanies;
 use Cmd\Reports\Console\Commands\SyncLastDepositDate;
@@ -182,7 +182,7 @@ class ReportsServiceProvider extends ServiceProvider
                 GenerateCancelRequestsAgentReport::class,
                 GenerateRetentionBonusCommission::class,
                 GenerateNSFCommissionReport::class,
-                GenerateEnrollmentStatusReport::class,
+                GenerateEnrollmentBonusReport::class,
                 SyncContactsData::class,
                 SyncCollectionCompanies::class,
                 SyncLastDepositDate::class,
