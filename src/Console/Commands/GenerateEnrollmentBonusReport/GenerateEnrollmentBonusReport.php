@@ -37,11 +37,10 @@ class GenerateEnrollmentBonusReport extends Command
             $enrolledContactIds = $this->contactIdsFromEnrollmentRows($enrollmentRows);
             $pendingRows = $this->fetchPendingRows($from, $to, $enrolledContactIds);
             $summary = $this->buildSummary($enrollmentRows, $pendingRows);
-            $statusHistory = $this->buildStatusHistory($enrollmentRows, $pendingRows);
 
             $filename = "Enrollment Bonus Report - {$to}.xlsx";
             $path = storage_path("app/{$filename}");
-            (new Formatter())->buildWorkbook($enrollmentRows, $pendingRows, $summary, $statusHistory, $path);
+            (new Formatter())->buildWorkbook($enrollmentRows, $pendingRows, $summary, $path);
             $this->info('Workbook created: ' . $path);
 
             if ($this->option('download')) {
@@ -64,12 +63,13 @@ class GenerateEnrollmentBonusReport extends Command
     private function fetchAzureRows(DBConnector $sql, string $from, string $exclusiveTo): array
     {
         $result = $sql->querySqlServer(
-            "SELECT LLG_ID, Client, Debt_Amount, Enrollment_Status, Enrollment_Plan, Submitted_Date, Category
+            "SELECT LLG_ID, Client, Debt_Amount, Enrollment_Status, Enrollment_Plan, Submitted_Date
              FROM TblEnrollment
              WHERE Submitted_Date >= ? AND Submitted_Date < ? AND LLG_ID IS NOT NULL
              ORDER BY Submitted_Date ASC, LLG_ID ASC",
             [$from, $exclusiveTo]
         );
+
         return $result['data'] ?? [];
     }
 
@@ -136,7 +136,7 @@ class GenerateEnrollmentBonusReport extends Command
                 continue;
             }
             $plan = (string) $this->value($azure, 'Enrollment_Plan', '');
-            $source = $this->resolveSnowflakeSource($azure);
+            $source = stripos($plan, 'Progress') !== false ? 'plaw' : 'ldr';
             $rows[$contactId] = [
                 'LLG_ID' => $llg,
                 'CLIENT' => (string) $this->value($azure, 'Client', ''),
@@ -166,134 +166,11 @@ class GenerateEnrollmentBonusReport extends Command
                     $rows[$id]['ASOF_TITLE'] = $status['asof_title'];
                     $rows[$id]['ENROLLED'] = $status['enrolled'];
                     $rows[$id]['SNOWFLAKE_MATCH'] = 'Yes';
-                    $rows[$id]['SNOWFLAKE_SOURCE'] = strtoupper($source === 'plaw' ? 'PLAW' : 'LDR');
                 }
-            }
-        }
-
-        $unmatched = array_keys(array_filter($rows, fn (array $row): bool => $row['SNOWFLAKE_MATCH'] === 'No'));
-        foreach (['ldr', 'plaw'] as $source) {
-            if ($unmatched === []) {
-                break;
-            }
-            $found = $this->fetchStatuses($source, $unmatched, $from, $to);
-            foreach ($found as $id => $status) {
-                if (! isset($rows[$id]) || $rows[$id]['SNOWFLAKE_MATCH'] === 'Yes') {
-                    continue;
-                }
-                $rows[$id]['STATUS_TITLE'] = $status['title'];
-                $rows[$id]['STATUS_STAMP_PT'] = $status['stamp_pt'];
-                $rows[$id]['ASOF_TITLE'] = $status['asof_title'];
-                $rows[$id]['ENROLLED'] = $status['enrolled'];
-                $rows[$id]['SNOWFLAKE_MATCH'] = 'Yes';
-                $rows[$id]['SNOWFLAKE_SOURCE'] = strtoupper($source === 'plaw' ? 'PLAW' : 'LDR');
-                $unmatched = array_values(array_diff($unmatched, [$id]));
             }
         }
 
         return array_values($rows);
-    }
-
-    private function resolveSnowflakeSource(array $azure): string
-    {
-        $category = strtoupper(trim((string) $this->value($azure, 'Category', '')));
-        if (in_array($category, ['CCS', 'PLAW'], true)) {
-            return 'plaw';
-        }
-        if ($category === 'LDR') {
-            return 'ldr';
-        }
-
-        $plan = (string) $this->value($azure, 'Enrollment_Plan', '');
-
-        return stripos($plan, 'Progress') !== false ? 'plaw' : 'ldr';
-    }
-
-    private function buildStatusHistory(array $enrollmentRows, array $pendingRows): array
-    {
-        $grouped = ['ldr' => [], 'plaw' => [], 'lt' => []];
-        foreach ($enrollmentRows as $row) {
-            $id = (string) ($row['SNOWFLAKE_CONTACT_ID'] ?? '');
-            if ($id === '') {
-                continue;
-            }
-            $source = strtoupper((string) ($row['SNOWFLAKE_SOURCE'] ?? 'LDR')) === 'PLAW' ? 'plaw' : 'ldr';
-            $grouped[$source][$id] = true;
-            if (($row['SNOWFLAKE_MATCH'] ?? 'No') === 'No') {
-                $grouped[$source === 'plaw' ? 'ldr' : 'plaw'][$id] = true;
-            }
-        }
-        foreach ($pendingRows as $row) {
-            $id = (string) ($row['CONTACT_ID'] ?? '');
-            if ($id === '') {
-                continue;
-            }
-            $grouped['lt'][$id] = true;
-        }
-
-        $history = [];
-        $seen = [];
-        foreach ($grouped as $source => $ids) {
-            if ($ids === []) {
-                continue;
-            }
-            foreach ($this->fetchStatusHistory($source, array_keys($ids)) as $entry) {
-                $key = $entry['CONTACT_ID'] . '|' . $entry['STATUS_STAMP_PT'] . '|' . $entry['STATUS_TITLE'];
-                if (isset($seen[$key])) {
-                    continue;
-                }
-                $seen[$key] = true;
-                $history[] = $entry;
-            }
-        }
-
-        usort($history, function (array $left, array $right): int {
-            $byContact = strcmp((string) $left['CONTACT_ID'], (string) $right['CONTACT_ID']);
-            if ($byContact !== 0) {
-                return $byContact;
-            }
-
-            return strcmp((string) $left['STATUS_STAMP_PT'], (string) $right['STATUS_STAMP_PT']);
-        });
-
-        return $history;
-    }
-
-    private function fetchStatusHistory(string $source, array $ids): array
-    {
-        $connector = DBConnector::fromEnvironment($source);
-        $history = [];
-
-        foreach (array_chunk($this->filterValidContactIds($ids), 500) as $chunk) {
-            $values = $this->buildContactValuesClause($chunk);
-            if ($values === '') {
-                continue;
-            }
-            $sql = "
-SELECT TO_VARCHAR(cs.CONTACT_ID) AS CONTACT_ID,
-       TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP), 'YYYY-MM-DD HH24:MI:SS') AS STAMP_PT,
-       cls.TITLE AS TITLE
-FROM CONTACTS_STATUS cs
-LEFT JOIN CONTACTS_LEAD_STATUS cls ON cs.STATUS_ID = cls.ID
-INNER JOIN (SELECT column1 AS CONTACT_ID_STR FROM VALUES {$values}) r ON TO_VARCHAR(cs.CONTACT_ID) = r.CONTACT_ID_STR
-WHERE cs.STATUS_ID > 0
-ORDER BY cs.CONTACT_ID, cs.STAMP ASC";
-            foreach (($connector->query($sql)['data'] ?? []) as $row) {
-                $id = (string) $this->value($row, 'CONTACT_ID', '');
-                $title = (string) $this->value($row, 'TITLE', '');
-                $stamp = $this->normalizeSnowflakeStamp((string) $this->value($row, 'STAMP_PT', ''));
-                if ($id === '' || $title === '' || $stamp === '') {
-                    continue;
-                }
-                $history[] = [
-                    'CONTACT_ID' => $id,
-                    'STATUS_STAMP_PT' => $stamp,
-                    'STATUS_TITLE' => $title,
-                ];
-            }
-        }
-
-        return $history;
     }
 
     private function fetchStatuses(string $source, array $ids, string $from, string $to): array
@@ -301,13 +178,13 @@ ORDER BY cs.CONTACT_ID, cs.STAMP ASC";
         $connector = DBConnector::fromEnvironment($source);
         $map = [];
         $asOfExclusive = date('Y-m-d', strtotime('+1 day', strtotime($to)));
+        $asOfEscaped = $this->escapeSqlLiteral($asOfExclusive);
 
         foreach (array_chunk($this->filterValidContactIds($ids), 500) as $chunk) {
             $values = $this->buildContactValuesClause($chunk);
             if ($values === '') {
                 continue;
             }
-            $asOfEscaped = $this->escapeSqlLiteral($asOfExclusive);
             $sql = "
 WITH requested AS (SELECT column1 AS CONTACT_ID_STR FROM VALUES {$values}), statuses AS (
  SELECT TO_VARCHAR(cs.CONTACT_ID) AS CONTACT_ID,
@@ -318,7 +195,7 @@ WITH requested AS (SELECT column1 AS CONTACT_ID_STR FROM VALUES {$values}), stat
         ROW_NUMBER() OVER (
             PARTITION BY cs.CONTACT_ID
             ORDER BY CASE WHEN CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) < '{$asOfEscaped}' THEN 0 ELSE 1 END,
-                     CASE WHEN CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) < '{$asOfEscaped}' THEN cs.STAMP END DESC
+                     cs.STAMP DESC
         ) AS asof_rn
  FROM CONTACTS_STATUS cs
  LEFT JOIN CONTACTS_LEAD_STATUS cls ON cs.STATUS_ID = cls.ID
@@ -328,11 +205,7 @@ WITH requested AS (SELECT column1 AS CONTACT_ID_STR FROM VALUES {$values}), stat
 SELECT c.CONTACT_ID, c.TITLE AS CURRENT_TITLE, c.STAMP_PT_STR AS CURRENT_STAMP,
        a.TITLE AS ASOF_TITLE, a.STAMP_PT_STR AS ASOF_STAMP
 FROM (SELECT CONTACT_ID, STAMP_PT_STR, TITLE FROM statuses WHERE current_rn = 1) c
-LEFT JOIN (
-    SELECT CONTACT_ID, STAMP_PT_STR, TITLE
-    FROM statuses
-    WHERE asof_rn = 1 AND STAMP_PT < '{$asOfEscaped}'
-) a ON a.CONTACT_ID = c.CONTACT_ID";
+LEFT JOIN (SELECT CONTACT_ID, STAMP_PT_STR, TITLE FROM statuses WHERE asof_rn = 1) a ON a.CONTACT_ID = c.CONTACT_ID";
             foreach (($connector->query($sql)['data'] ?? []) as $row) {
                 $id = (string) $this->value($row, 'CONTACT_ID', '');
                 if ($id === '') {
@@ -340,13 +213,11 @@ LEFT JOIN (
                 }
                 $currentTitle = (string) $this->value($row, 'CURRENT_TITLE', '');
                 $asofTitle = (string) $this->value($row, 'ASOF_TITLE', '');
-                $cutoffTitle = $asofTitle !== '' ? $asofTitle : $currentTitle;
                 $map[$id] = [
                     'title' => $currentTitle,
                     'stamp_pt' => $this->normalizeSnowflakeStamp((string) $this->value($row, 'CURRENT_STAMP', '')),
                     'asof_title' => $asofTitle,
-                    'asof_stamp_pt' => $this->normalizeSnowflakeStamp((string) $this->value($row, 'ASOF_STAMP', '')),
-                    'enrolled' => $this->isEnrolledTitle($cutoffTitle),
+                    'enrolled' => $this->isEnrolledTitle($currentTitle) || $this->isEnrolledTitle($asofTitle),
                 ];
             }
         }
@@ -411,7 +282,8 @@ LEFT JOIN (
             }
             $sql = "
 WITH requested AS (SELECT column1 AS CONTACT_ID_STR FROM VALUES {$values}), latest AS (
- SELECT cs.CONTACT_ID, cls.TITLE, TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP), 'YYYY-MM-DD HH24:MI:SS') AS STAMP_PT,
+ SELECT cs.CONTACT_ID, cls.TITLE,
+        TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP), 'YYYY-MM-DD HH24:MI:SS') AS STAMP_PT,
         CONCAT(c.FIRSTNAME, ' ', c.LASTNAME) AS CLIENT,
         ROW_NUMBER() OVER (PARTITION BY cs.CONTACT_ID ORDER BY cs.STAMP DESC) AS rn
  FROM CONTACTS_STATUS cs
@@ -422,13 +294,16 @@ WITH requested AS (SELECT column1 AS CONTACT_ID_STR FROM VALUES {$values}), late
 SELECT CONTACT_ID, TITLE, STAMP_PT, CLIENT FROM latest WHERE rn = 1";
             foreach (($connector->query($sql)['data'] ?? []) as $row) {
                 $id = (string) $this->value($row, 'CONTACT_ID', '');
-                if ($id !== '') $map[$id] = [
-                    'title' => (string) $this->value($row, 'TITLE', ''),
-                    'stamp_pt' => $this->normalizeSnowflakeStamp((string) $this->value($row, 'STAMP_PT', '')),
-                    'client' => (string) $this->value($row, 'CLIENT', ''),
-                ];
+                if ($id !== '') {
+                    $map[$id] = [
+                        'title' => (string) $this->value($row, 'TITLE', ''),
+                        'stamp_pt' => $this->normalizeSnowflakeStamp((string) $this->value($row, 'STAMP_PT', '')),
+                        'client' => (string) $this->value($row, 'CLIENT', ''),
+                    ];
+                }
             }
         }
+
         return $map;
     }
 
@@ -440,12 +315,19 @@ SELECT CONTACT_ID, TITLE, STAMP_PT, CLIENT FROM latest WHERE rn = 1";
             if ($values === '') {
                 continue;
             }
-            $sql = "SELECT DISTINCT ep.CONTACT_ID, ed.TITLE FROM ENROLLMENT_PLAN ep LEFT JOIN ENROLLMENT_DEFAULTS2 ed ON ep.PLAN_ID = ed.ID INNER JOIN (SELECT column1 AS CONTACT_ID_STR FROM VALUES {$values}) r ON TO_VARCHAR(ep.CONTACT_ID) = r.CONTACT_ID_STR";
+            $sql = "SELECT DISTINCT ep.CONTACT_ID, ed.TITLE
+                    FROM ENROLLMENT_PLAN ep
+                    LEFT JOIN ENROLLMENT_DEFAULTS2 ed ON ep.PLAN_ID = ed.ID
+                    INNER JOIN (SELECT column1 AS CONTACT_ID_STR FROM VALUES {$values}) r
+                      ON TO_VARCHAR(ep.CONTACT_ID) = r.CONTACT_ID_STR";
             foreach (($connector->query($sql)['data'] ?? []) as $row) {
                 $id = (string) $this->value($row, 'CONTACT_ID', '');
-                if ($id !== '' && !isset($map[$id])) $map[$id] = (string) $this->value($row, 'TITLE', '');
+                if ($id !== '' && ! isset($map[$id])) {
+                    $map[$id] = (string) $this->value($row, 'TITLE', '');
+                }
             }
         }
+
         return $map;
     }
 
@@ -457,12 +339,20 @@ SELECT CONTACT_ID, TITLE, STAMP_PT, CLIENT FROM latest WHERE rn = 1";
             if ($values === '') {
                 continue;
             }
-            $sql = "SELECT CONTACT_ID, SUM(ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT FROM DEBTS WHERE ENROLLED = 1 AND _FIVETRAN_DELETED = FALSE AND TO_VARCHAR(CONTACT_ID) IN (SELECT column1 FROM VALUES {$values}) GROUP BY CONTACT_ID";
+            $sql = "SELECT CONTACT_ID, SUM(ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT
+                    FROM DEBTS
+                    WHERE ENROLLED = 1
+                      AND _FIVETRAN_DELETED = FALSE
+                      AND TO_VARCHAR(CONTACT_ID) IN (SELECT column1 FROM VALUES {$values})
+                    GROUP BY CONTACT_ID";
             foreach (($connector->query($sql)['data'] ?? []) as $row) {
                 $id = (string) $this->value($row, 'CONTACT_ID', '');
-                if ($id !== '') $map[$id] = (float) $this->value($row, 'ENROLLED_DEBT', 0);
+                if ($id !== '') {
+                    $map[$id] = (float) $this->value($row, 'ENROLLED_DEBT', 0);
+                }
             }
         }
+
         return $map;
     }
 
@@ -477,11 +367,10 @@ SELECT CONTACT_ID, TITLE, STAMP_PT, CLIENT FROM latest WHERE rn = 1";
         foreach ($rows as $row) {
             $source = strtoupper((string) $row['SNOWFLAKE_SOURCE']) === 'PLAW' ? 'Progress Law' : 'LDR';
             $debt = (float) $row['DEBT_AMOUNT'];
-            $cutoffStatus = (string) ($row['ASOF_TITLE'] !== '' ? $row['ASOF_TITLE'] : $row['STATUS_TITLE']);
-            if ($cutoffStatus === '' || $cutoffStatus === 'No Snowflake status found') {
-                $cutoffStatus = (string) $row['AZURE_STATUS'];
+            $category = $this->classifyStatus((string) $row['AZURE_STATUS']);
+            if ((bool) ($row['ENROLLED'] ?? false)) {
+                $category = 'Enrolled';
             }
-            $category = $this->classifyStatus($cutoffStatus);
             foreach ([$source, 'Combined'] as $column) {
                 $summary[$column]['All Enrollments'] += $debt;
                 $summary[$column][$category] += $debt;
@@ -505,12 +394,10 @@ SELECT CONTACT_ID, TITLE, STAMP_PT, CLIENT FROM latest WHERE rn = 1";
 
     private function classifyStatus(string $status): string
     {
-        $status = strtoupper(trim((string) $status));
+        $status = strtoupper(trim($status));
+
         return match (true) {
-            $this->isEnrolledTitle($status),
-            str_contains($status, 'LDR ENROLLED'),
-            str_contains($status, 'PROLAW ENROLLED'),
-            str_contains($status, 'PLAW ENROLLED') => 'Enrolled',
+            $status === 'LDR ENROLLED', $status === 'PROLAW ENROLLED' => 'Enrolled',
             str_contains($status, 'CANCEL'), str_contains($status, 'DROPPED'), str_contains($status, 'SYSTEM CANCEL') => 'Cancels',
             str_contains($status, 'RECONSIDERATION PENDING') => 'Reconsideration Pending',
             default => 'At-Risk',
@@ -520,11 +407,8 @@ SELECT CONTACT_ID, TITLE, STAMP_PT, CLIENT FROM latest WHERE rn = 1";
     private function isEnrolledTitle(string $title): bool
     {
         $title = strtoupper(trim($title));
-        return $title === 'LDR ENROLLED'
-            || $title === 'PROLAW ENROLLED'
-            || str_contains($title, 'LDR ENROLLED')
-            || str_contains($title, 'PROLAW ENROLLED')
-            || str_contains($title, 'PLAW ENROLLED');
+
+        return $title === 'LDR ENROLLED' || $title === 'PROLAW ENROLLED';
     }
 
     private function sendReport(DBConnector $sql, string $path, string $filename, array $summary, string $to): void
@@ -540,7 +424,11 @@ SELECT CONTACT_ID, TITLE, STAMP_PT, CLIENT FROM latest WHERE rn = 1";
             $body .= '<tr>' . $cells . '</tr>';
         }
         $body .= '</table>';
-        $attachment = ['name' => $filename, 'contentType' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'contentBytes' => base64_encode((string) file_get_contents($path))];
+        $attachment = [
+            'name' => $filename,
+            'contentType' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'contentBytes' => base64_encode((string) file_get_contents($path)),
+        ];
         $sent = (new EmailSenderService())->sendMailUsingTblReportsHtml(
             $sql,
             ['Enrollment Bonus Report', 'EnrollmentBonusReport'],
@@ -551,24 +439,31 @@ SELECT CONTACT_ID, TITLE, STAMP_PT, CLIENT FROM latest WHERE rn = 1";
             false,
             true
         );
-        if (!$sent) $this->warn('Enrollment Bonus Report email was not sent.');
+        if (! $sent) {
+            $this->warn('Enrollment Bonus Report email was not sent.');
+        }
     }
 
     private function dataThroughLabel(string $to): string
     {
-        $through = min($to, date('Y-m-d'));
-
-        return date('m/d/Y', strtotime($through));
+        return date('m/d/Y', strtotime(min($to, date('Y-m-d'))));
     }
 
     private function copyToDownloads(string $path, string $filename): string
     {
         $profile = getenv('USERPROFILE') ?: getenv('HOME');
-        if (!$profile) throw new \RuntimeException('User profile directory is unavailable.');
+        if (! $profile) {
+            throw new \RuntimeException('User profile directory is unavailable.');
+        }
         $directory = rtrim($profile, '\\/') . DIRECTORY_SEPARATOR . 'Downloads';
-        if (!is_dir($directory) && !mkdir($directory, 0775, true) && !is_dir($directory)) throw new \RuntimeException('Unable to create Downloads directory.');
+        if (! is_dir($directory) && ! mkdir($directory, 0775, true) && ! is_dir($directory)) {
+            throw new \RuntimeException('Unable to create Downloads directory.');
+        }
         $destination = $directory . DIRECTORY_SEPARATOR . $filename;
-        if (!copy($path, $destination)) throw new \RuntimeException('Unable to copy workbook to Downloads.');
+        if (! copy($path, $destination)) {
+            throw new \RuntimeException('Unable to copy workbook to Downloads.');
+        }
+
         return $destination;
     }
 

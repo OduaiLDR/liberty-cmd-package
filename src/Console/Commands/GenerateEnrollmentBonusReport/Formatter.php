@@ -11,14 +11,15 @@ use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 
 class Formatter
 {
-    public function buildWorkbook(array $rows, array $pending, array $summary, array $statusHistory, string $path): string
+    public function buildWorkbook(array $rows, array $pending, array $summary, string $path): string
     {
         $spreadsheet = new Spreadsheet();
         $this->buildSummarySheet($spreadsheet->getActiveSheet(), $summary);
         $this->buildEnrollmentSheet($spreadsheet->createSheet(), $rows, $pending);
-        $this->buildStatusSheet($spreadsheet->createSheet(), $statusHistory);
+        $this->buildStatusSheet($spreadsheet->createSheet(), $rows, $pending);
         $spreadsheet->setActiveSheetIndex(0);
         (new Xlsx($spreadsheet))->save($path);
+
         return $path;
     }
 
@@ -28,7 +29,9 @@ class Formatter
         $sheet->setShowGridlines(false);
         $columns = ['LDR', 'Progress Law', 'Combined'];
         $headers = ['Enrollment Status'];
-        foreach ($columns as $column) $headers[] = $column;
+        foreach ($columns as $column) {
+            $headers[] = $column;
+        }
         $rows = [];
         foreach (array_keys($summary['Combined'] ?? []) as $category) {
             $row = [$category];
@@ -49,15 +52,14 @@ class Formatter
         $sheet->setTitle('Enrollment Data');
         $data = [];
         foreach ($rows as $row) {
-            $cutoffStatus = $row['ASOF_TITLE'] !== '' ? $row['ASOF_TITLE'] : $row['STATUS_TITLE'];
             $data[] = [
                 $row['SNOWFLAKE_CONTACT_ID'],
                 $row['CLIENT'],
                 $row['SUBMITTED_DATE'],
                 $row['DEBT_AMOUNT'],
                 $row['AZURE_STATUS'],
-                $cutoffStatus,
-                $this->relevantStatus($cutoffStatus),
+                $row['ASOF_TITLE'] !== '' ? $row['ASOF_TITLE'] : $row['STATUS_TITLE'],
+                $this->relevantStatus($row['STATUS_TITLE']),
             ];
         }
         foreach ($pending as $row) {
@@ -71,18 +73,28 @@ class Formatter
                 'Pending',
             ];
         }
-        $this->writeSheet($sheet, ['CID', 'Client', 'Submitted Date', 'Debt Amount', 'Current Status', 'Cut Off Status', 'Relevant Status'], $data);
+        $this->writeSheet($sheet, [
+            'CID', 'Client', 'Submitted Date', 'Debt Amount',
+            'Current Status', 'Cut Off Status', 'Relevant Status',
+        ], $data);
         $this->formatDate($sheet, 3, count($data) + 1, 'mm/dd/yyyy');
         $this->formatCurrency($sheet, 4, count($data) + 1);
         $this->selectTopLeft($sheet);
     }
 
-    private function buildStatusSheet($sheet, array $statusHistory): void
+    private function buildStatusSheet($sheet, array $rows, array $pending): void
     {
         $sheet->setTitle('Status Data');
         $data = [];
-        foreach ($statusHistory as $row) {
-            $data[] = [$row['CONTACT_ID'], $row['STATUS_STAMP_PT'], $row['STATUS_TITLE']];
+        foreach ($rows as $row) {
+            if ($row['STATUS_STAMP_PT'] !== '') {
+                $data[] = [$row['SNOWFLAKE_CONTACT_ID'], $row['STATUS_STAMP_PT'], $row['STATUS_TITLE']];
+            }
+        }
+        foreach ($pending as $row) {
+            if ($row['STATUS_STAMP_PT'] !== '') {
+                $data[] = [$row['CONTACT_ID'], $row['STATUS_STAMP_PT'], $row['STATUS_TITLE']];
+            }
         }
         $this->writeSheet($sheet, ['CID', 'Date', 'Enrollment Status'], $data);
         $this->formatDate($sheet, 2, count($data) + 1, 'mm/dd/yyyy hh:mm AM/PM');
@@ -108,11 +120,13 @@ class Formatter
             $sheet->getColumnDimension($column)->setAutoSize(true);
         }
         $sheet->freezePane('A2');
+        $sheet->setSelectedCells('A1');
     }
 
     private function selectTopLeft($sheet): void
     {
         $sheet->setSelectedCells('A1');
+        $sheet->getStyle('A1');
     }
 
     private function formatCurrency($sheet, int $column, int $lastRow, string $format = '$#,##0.00'): void
@@ -192,6 +206,7 @@ class Formatter
             $name = chr(65 + (($number - 1) % 26)) . $name;
             $number = intdiv($number - 1, 26);
         }
+
         return $name;
     }
 }
