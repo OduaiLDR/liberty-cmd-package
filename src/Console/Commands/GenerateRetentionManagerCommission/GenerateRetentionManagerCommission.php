@@ -20,10 +20,14 @@ use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 /**
  * Manager-level retention commission workbooks from the Retention Manager Commission.xlsx rules.
  *
- * Supported reports:
- *   - Rama - Retention & NSF Manager
- *   - Nick - Retention Team Leader
- *   - Anthony - NSF Team Leader
+ * Schedule via cmd-runner Admin → Automations (not routes/console.php). Example:
+ *   command: reports:retention-manager-commission all
+ *   schedule_mode: specific_dates, specific_dates: [3], run_times: [06:00]
+ *
+ * Supported reports (email recipients from dbo.TblReports by Report_Name + Company):
+ *   - Rama - Retention & NSF Manager   → Report_Name 'Retention & NSF Manager', Company 'Rama'
+ *   - Nick - Retention Team Leader     → Report_Name 'Retention Team Leader', Company 'Nick'
+ *   - Anthony - NSF Team Leader        → Report_Name 'NSF Team Leader', Company 'Anthony'
  */
 class GenerateRetentionManagerCommission extends Command
 {
@@ -89,6 +93,9 @@ class GenerateRetentionManagerCommission extends Command
         ['min' => 0.40, 'rates' => [4.0, 5.0, 6.0, 7.0]],
         ['min' => 0.30, 'rates' => [0.9, 1.0, 2.0, 3.0]],
     ];
+
+    /** Nick - Retention Team Leader total commission cap (Jacob 2026-08-06). */
+    private const NICK_COMMISSION_CAP = 2000.0;
 
     /** @var array<string,string> */
     /**
@@ -548,124 +555,32 @@ class GenerateRetentionManagerCommission extends Command
             throw new \RuntimeException("Cannot email {$cfg['report']} because workbook file is missing.");
         }
 
-        $sql = $this->initSqlServer('ldr');
-        $recipients = $this->fetchManagerReportRecipients($sql, $cfg['report'], $cfg['company']);
-        if (empty($recipients['to'])) {
-            $this->hadFailures = true;
-            $this->warn("[WARN] {$cfg['report']} email not sent: no Send_To recipients found in TblReports for company {$cfg['company']}.");
-            return;
-        }
-
         $attachment = [
             'name' => (string) $file['filename'],
             'contentType' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             'contentBytes' => base64_encode((string) file_get_contents((string) $file['path'])),
         ];
 
+        $sql = $this->initSqlServer('ldr');
         $subject = (string) $cfg['report'];
         $body = "See attached {$cfg['report']} report.";
-        $sent = (new EmailSenderService())->sendMail(
+        $sent = (new EmailSenderService())->sendMailUsingTblReports(
+            $sql,
+            [$cfg['report']],
+            [$cfg['company']],
             $subject,
             $body,
-            $recipients['to'],
-            $recipients['cc'],
-            $recipients['bcc'],
-            [$attachment]
+            [$attachment],
+            true,
+            true
         );
 
         if ($sent) {
-            $this->info("[INFO] {$cfg['report']} email sent. TO=" . implode(';', $recipients['to']) . " CC=" . implode(';', $recipients['cc']));
+            $this->info("[INFO] {$cfg['report']} email sent via TblReports (company {$cfg['company']}).");
         } else {
             $this->hadFailures = true;
-            $this->warn("[WARN] {$cfg['report']} email failed to send.");
+            $this->warn("[WARN] {$cfg['report']} email not sent: no Send_To recipients found in TblReports for company {$cfg['company']}.");
         }
-    }
-
-    /** @return array{to:array<int,string>,cc:array<int,string>,bcc:array<int,string>} */
-    private function fetchManagerReportRecipients(DBConnector $sql, string $reportName, string $company): array
-    {
-        $cols = $this->detectTblReportsRecipientColumns($sql);
-        foreach (['report', 'company', 'to', 'cc', 'bcc'] as $required) {
-            if (($cols[$required] ?? null) === null) {
-                throw new \RuntimeException("TblReports missing required recipient column mapping: {$required}");
-            }
-        }
-
-        $reportCol = $cols['report'];
-        $companyCol = $cols['company'];
-        $toCol = $cols['to'];
-        $ccCol = $cols['cc'];
-        $bccCol = $cols['bcc'];
-        $reportEsc = str_replace("'", "''", $reportName);
-        $companyEsc = str_replace("'", "''", $company);
-
-        $res = $sql->querySqlServer("
-            SELECT {$toCol} AS SendToValue, {$ccCol} AS SendCcValue, {$bccCol} AS SendBccValue
-            FROM dbo.TblReports
-            WHERE LTRIM(RTRIM({$reportCol})) = '{$reportEsc}'
-              AND LTRIM(RTRIM({$companyCol})) = '{$companyEsc}'
-        ");
-
-        $to = [];
-        $cc = [];
-        $bcc = [];
-        foreach ($res['data'] ?? [] as $row) {
-            $to = array_merge($to, $this->parseEmailList((string) ($row['SendToValue'] ?? '')));
-            $cc = array_merge($cc, $this->parseEmailList((string) ($row['SendCcValue'] ?? '')));
-            $bcc = array_merge($bcc, $this->parseEmailList((string) ($row['SendBccValue'] ?? '')));
-        }
-
-        return [
-            'to' => array_values(array_unique($to)),
-            'cc' => array_values(array_unique($cc)),
-            'bcc' => array_values(array_unique($bcc)),
-        ];
-    }
-
-    /** @return array{report:?string,company:?string,to:?string,cc:?string,bcc:?string} */
-    private function detectTblReportsRecipientColumns(DBConnector $sql): array
-    {
-        $res = $sql->querySqlServer("
-            SELECT COLUMN_NAME
-            FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA = 'dbo'
-              AND TABLE_NAME = 'TblReports'
-        ");
-        $names = [];
-        foreach ($res['data'] ?? [] as $row) {
-            foreach ($row as $value) {
-                if (is_string($value) && $value !== '') {
-                    $names[$value] = true;
-                    break;
-                }
-            }
-        }
-
-        $pick = static function (array $candidates) use ($names): ?string {
-            foreach ($candidates as $candidate) {
-                if (isset($names[$candidate])) {
-                    return $candidate;
-                }
-            }
-            return null;
-        };
-
-        return [
-            'report' => $pick(['Report_Name', 'ReportName']),
-            'company' => $pick(['Company', 'Company_Name', 'CompanyName']),
-            'to' => $pick(['Send_To', 'SendTo']),
-            'cc' => $pick(['Send_CC', 'SendCC']),
-            'bcc' => $pick(['Send_BCC', 'SendBCC']),
-        ];
-    }
-
-    /** @return array<int,string> */
-    private function parseEmailList(string $value): array
-    {
-        $parts = preg_split('/[;,\s]+/', $value) ?: [];
-        return array_values(array_filter(array_map('trim', $parts), function (string $email): bool {
-            return $email !== '' && filter_var($email, FILTER_VALIDATE_EMAIL) !== false;
-        }));
     }
 
     private function generateAnthonyReport(string $reportName, string $startDate, string $endDate): void
@@ -1027,6 +942,7 @@ class GenerateRetentionManagerCommission extends Command
         $sheet->getStyle("D2:D{$totalRow}")->getNumberFormat()->setFormatCode('0.00%');
         $sheet->getStyle("I14")->getNumberFormat()->setFormatCode('0');
         $sheet->getStyle("I16")->getNumberFormat()->setFormatCode('$#,##0.00');
+        $this->highlightFinalCommissionCell($sheet, 'I16');
 
         foreach (range('A', 'J') as $col) {
             $sheet->getColumnDimension($col)->setAutoSize(true);
@@ -1219,6 +1135,7 @@ class GenerateRetentionManagerCommission extends Command
         $sheet->setCellValue('X14', $c1 + $c2);
         $sheet->getStyle('X6:X11')->getNumberFormat()->setFormatCode('0%');
         $sheet->getStyle('X7:X14')->getNumberFormat()->setFormatCode('$#,##0');
+        $this->highlightFinalCommissionCell($sheet, 'X14');
         foreach (range('W', 'X') as $col) {
             $sheet->getColumnDimension($col)->setWidth(22);
         }
@@ -1246,12 +1163,15 @@ class GenerateRetentionManagerCommission extends Command
         $sheet->setCellValue('X5', $pct);
         $sheet->setCellValue('W6', 'Tier');
         $sheet->setCellValue('X6', $tier);
+        $commission = $this->capNickCommission($commission);
+
         $sheet->setCellValue('W7', 'Commission');
         $sheet->setCellValue('X7', $commission);
         $sheet->fromArray([['Rate 1', 'Rate 2', 'Rate 3', 'Rate 4']], null, 'Z5');
         $sheet->fromArray([[$this->nickRateForTier($tier, 0), $this->nickRateForTier($tier, 1), $this->nickRateForTier($tier, 2), $this->nickRateForTier($tier, 3)]], null, 'Z6');
         $sheet->getStyle('X5')->getNumberFormat()->setFormatCode('0%');
         $sheet->getStyle('X7')->getNumberFormat()->setFormatCode('$#,##0');
+        $this->highlightFinalCommissionCell($sheet, 'X7');
         foreach (['W', 'X', 'Z', 'AA', 'AB', 'AC'] as $col) {
             $sheet->getColumnDimension($col)->setWidth(16);
         }
@@ -1504,6 +1424,21 @@ class GenerateRetentionManagerCommission extends Command
             'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['argb' => 'FF17853B']],
             'borders' => ['allBorders' => ['borderStyle' => Border::BORDER_THIN]],
         ]);
+    }
+
+    private function capNickCommission(float $commission): float
+    {
+        return min($commission, self::NICK_COMMISSION_CAP);
+    }
+
+    private function highlightFinalCommissionCell(\PhpOffice\PhpSpreadsheet\Worksheet\Worksheet $sheet, string $cell): void
+    {
+        $sheet->getStyle($cell)->applyFromArray([
+            'font' => ['bold' => true],
+            'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['argb' => 'FFFFFF00']],
+            'borders' => ['outline' => ['borderStyle' => Border::BORDER_MEDIUM]],
+        ]);
+        $sheet->setSelectedCells($cell);
     }
 
     private function cell(int $column, int $row): string
