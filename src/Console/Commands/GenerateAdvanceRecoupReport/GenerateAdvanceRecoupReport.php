@@ -11,9 +11,8 @@ use Illuminate\Support\Facades\Log;
  * Monthly EPF adjustments workbook for Jacob/Aaron/Jessica (Progress Law),
  * built from his exact Snowflake TRANSACTIONS queries (Slack, 2026-07-16 /
  * 2026-08-02). One workbook, sheets in order: Summary, Advances, Refunds,
- * Recoups. The month window filters on CLEARED_DATE, not PROCESS_DATE
- * (per Jacob, 2026-08-05: "this data is all based on cleared date") --
- * rows that haven't cleared yet (NULL CLEARED_DATE) are excluded.
+ * Recoups. The month window filters on PROCESS_DATE (all three sheets),
+ * and CLEARED_DATE must be non-null -- clearing may fall in a later month.
  *
  * Detail sheets (Advances/Refunds/Recoups) each get: Contact ID, Client
  * Name (Snowflake CONTACTS.FIRSTNAME + LASTNAME), Trans Type, Amount, EPF
@@ -204,17 +203,15 @@ class GenerateAdvanceRecoupReport extends Command
         $startEsc = $this->esc($start);
         $endEsc = $this->esc($endExclusive);
 
-        // Windowed on CLEARED_DATE, not PROCESS_DATE -- per Jacob (2026-08-05):
-        // "this data is all based on cleared date." Filtering by PROCESS_DATE
-        // let in rows that hadn't cleared yet, which is why some Recoups
-        // showed a blank Cleared Date. NULL CLEARED_DATE rows now fall
-        // outside any range and are excluded automatically.
+        // Windowed on PROCESS_DATE for all three sheets; CLEARED_DATE must be
+        // set (may clear in a later month). Uncleared rows are excluded.
         return "
             SELECT CONTACT_ID, TRANS_TYPE, AMOUNT, PROCESS_DATE, CLEARED_DATE, MEMO
             FROM TRANSACTIONS
             WHERE Paid_To IN ({$paidTo})
-              AND CLEARED_DATE >= '{$startEsc}'
-              AND CLEARED_DATE < '{$endEsc}'
+              AND PROCESS_DATE >= '{$startEsc}'
+              AND PROCESS_DATE < '{$endEsc}'
+              AND CLEARED_DATE IS NOT NULL
               {$extraWhere}
             ORDER BY TRANS_TYPE, PROCESS_DATE ASC, AMOUNT ASC
         ";
