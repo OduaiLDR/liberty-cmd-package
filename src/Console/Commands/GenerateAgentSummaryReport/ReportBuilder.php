@@ -113,8 +113,9 @@ class ReportBuilder
             'marginBottom' => 720,
         ]);
 
-        // Title
-        $titleText = 'Agent Summary Report - ' . date('n/j/Y', strtotime($endDate));
+        // Title — use TODAY's date (the generation date), matching the file name,
+        // so an MTD report run on the 14th reads "7/14/2026", not the month-end "7/31/2026".
+        $titleText = 'Agent Summary Report - ' . date('n/j/Y');
         if ($continuation) {
             $titleText .= ' (' . date('F Y', strtotime($startDate)) . ')';
         }
