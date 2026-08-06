@@ -33,7 +33,7 @@ use Illuminate\Support\Facades\Log;
 class GenerateAdvanceRecoupReport extends Command
 {
     protected $signature = 'Generate:advance-recoup-report
-                            {--test : Send only to jacob@progresslaw.com instead of the full recipient list}
+                            {--test : Send only to oduai@libertydebtrelief.com instead of TblReports recipients}
                             {--month= : Month to report on as YYYY-MM (defaults to last full calendar month)}';
 
     protected $description = 'Email the monthly Advances/Refunds/Recoups EPF adjustments workbook.';
@@ -42,7 +42,6 @@ class GenerateAdvanceRecoupReport extends Command
     private const DEFAULT_EPF_RATE = 0.29;
     private const RENT_AMOUNT = -400.0;
     private const PRIMARY_ACCOUNT_RATE = 0.03;
-    private const RECIPIENTS = ['Jacob@progresslaw.com', 'Aaron@progresslaw.com', 'Jessica@cdp.law'];
     private const TEST_RECIPIENT = 'oduai@libertydebtrelief.com';
 
     public function handle(): int
@@ -133,7 +132,6 @@ class GenerateAdvanceRecoupReport extends Command
         $this->info('[INFO] Workbook written to: ' . $report['path']);
 
         $isTest = (bool) $this->option('test');
-        $recipients = $isTest ? [self::TEST_RECIPIENT] : self::RECIPIENTS;
 
         $subject = ($isTest ? '[TEST] ' : '') . 'EPF Adjustments - ' . $window['label'];
         $body = 'Please review the EPF adjustments for ' . $window['label'] . '. '
@@ -147,10 +145,26 @@ class GenerateAdvanceRecoupReport extends Command
         ]];
 
         $email = new EmailSenderService();
-        $sent = $email->sendMailHtml($subject, nl2br(htmlspecialchars($body)), $recipients, [], [], $attachments);
+        if ($isTest) {
+            $recipients = [self::TEST_RECIPIENT];
+            $sent = $email->sendMailHtml($subject, nl2br(htmlspecialchars($body)), $recipients, [], [], $attachments);
+        } else {
+            $sent = $email->sendMailUsingTblReportsHtml(
+                $sqlServer,
+                ['AdvanceRecoupReport'],
+                ['LDR'],
+                $subject,
+                nl2br(htmlspecialchars($body)),
+                $attachments,
+                false,
+                true
+            );
+        }
 
         if ($sent) {
-            $this->info('[INFO] Advance/Recoup report sent to ' . implode(', ', $recipients) . '.');
+            $this->info($isTest
+                ? '[INFO] Advance/Recoup test report sent to ' . self::TEST_RECIPIENT . '.'
+                : '[INFO] Advance/Recoup report sent to TblReports recipients for LDR.');
         } else {
             $this->warn('[WARN] Advance/Recoup report failed to send.');
             Log::warning('GenerateAdvanceRecoupReport: email send failed.');
