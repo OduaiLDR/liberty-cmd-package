@@ -40,7 +40,7 @@ class EnrollmentIntegrityCheck extends Command
         // severity = 'info'  → log only; gap means source data doesn't exist, not a broken sync
         return [
             [
-                'label'    => 'Import Missing Enrollments',
+                'label'    => 'Enrollment Date Consistency',
                 'command'  => 'enrollment:import-missing',
                 'severity' => 'info',
                 'check'    => "
@@ -48,9 +48,9 @@ class EnrollmentIntegrityCheck extends Command
                     FROM TblEnrollment
                     WHERE Category IN ('LDR', 'CCS')
                       AND Welcome_Call_Date IS NULL
-                      AND Import_Time >= CAST(GETDATE() AS DATE)
+                      AND Submitted_Date IS NOT NULL
                 ",
-                'reason'   => 'Rows inserted today are missing Welcome_Call_Date — likely not yet set in CRM',
+                'reason'   => 'Existing enrollments have Submitted_Date but no Welcome_Call_Date',
             ],
             [
                 'label'    => 'Sync Enrollment Data (Drop_Name / State)',
