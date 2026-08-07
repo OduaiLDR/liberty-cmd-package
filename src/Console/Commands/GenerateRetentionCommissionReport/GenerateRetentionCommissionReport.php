@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Cmd\Reports\Console\Commands\GenerateRetentionCommissionReport;
 
 use Cmd\Reports\Services\DBConnector;
+use Cmd\Reports\Services\CommissionAgentEmailFiles;
 use Cmd\Reports\Services\CommissionResultsWriter;
 use Cmd\Reports\Services\EmailSenderService;
 use Illuminate\Console\Command;
@@ -727,49 +728,76 @@ class GenerateRetentionCommissionReport extends Command
     // ─── Email ────────────────────────────────────────────────────────────────
 
     /**
-     * Send all workbooks (All + per-agent) in a single email.
+     * Email All to the report distribution list; one email per agent workbook to Rama only.
      *
      * @param array<int,array{filename:string,path:string}> $files
      */
     private function sendReport(array $files, string $display): void
     {
-        $subject = "Retention Commission Report - $display";
-        $body    = "See attached Retention Commission Report - $display";
-        $attachments = [];
-        foreach ($files as $f) {
-            if (!file_exists($f['path'])) {
-                $this->warn("[WARN] [$display] Attachment missing: {$f['filename']}");
-                continue;
-            }
-            $attachments[] = [
-                'name'         => $f['filename'],
-                'contentType'  => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                'contentBytes' => base64_encode((string) file_get_contents($f['path'])),
-            ];
-        }
-
-        if ($attachments === []) {
-            $this->warn("[WARN] [$display] No attachments to send.");
-            return;
-        }
-
         $sql   = $this->initSqlServer('ldr');
         $email = new EmailSenderService();
-        $sent  = $email->sendMailUsingTblReports(
-            $sql,
-            ['RetentionCommissionReport', 'Retention Commission Report'],
-            [strtoupper($display)],
-            $subject,
-            $body,
-            $attachments,
-            true
-        );
+        $reportNames = ['RetentionCommissionReport', 'Retention Commission Report'];
+        $baseSubject = "Retention Commission Report - $display";
+        $baseBody    = "See attached Retention Commission Report - $display";
 
-        if (!$sent) {
-            $email->sendMailHtml($subject, $body, ['oduai@libertydebtrelief.com'], [], [], $attachments);
+        $parts = CommissionAgentEmailFiles::partition($files);
+        foreach ($parts['missing'] as $missingName) {
+            $this->warn("[WARN] [$display] Attachment missing: {$missingName}");
+        }
+        $allFiles = $parts['all'];
+        $agentFiles = $parts['agents'];
+
+        if ($allFiles !== []) {
+            $attachments = CommissionAgentEmailFiles::toAttachments($allFiles);
+            $sent = $email->sendMailUsingTblReports(
+                $sql,
+                $reportNames,
+                [strtoupper($display)],
+                $baseSubject,
+                $baseBody,
+                $attachments,
+                true
+            );
+            if (!$sent) {
+                $email->sendMailHtml($baseSubject, $baseBody, ['oduai@libertydebtrelief.com'], [], [], $attachments);
+            }
+            $this->info("[INFO] [$display] All report emailed (" . count($attachments) . " attachment(s)).");
+        } else {
+            $this->warn("[WARN] [$display] No All workbook to email.");
         }
 
-        $this->info("[INFO] [$display] Email sent with " . count($attachments) . " attachment(s).");
+        // Avoid PHP max_execution_time killing a long per-agent send loop.
+        @set_time_limit(0);
+
+        $agentSent = 0;
+        $agentCount = count($agentFiles);
+        foreach ($agentFiles as $i => $f) {
+            $agentName = CommissionAgentEmailFiles::agentNameFromFilename((string) $f['filename']);
+            $subject   = $baseSubject . ' - ' . $agentName;
+            $body      = "See attached Retention Commission Report - $display - $agentName";
+            $attachments = CommissionAgentEmailFiles::toAttachments([$f]);
+            // Agent copies go only to Rama (hardcoded per Jacob — she forwards manually).
+            $sent = $email->sendMail(
+                $subject,
+                $body,
+                ['rama@libertydebtrelief.com'],
+                [],
+                [],
+                $attachments
+            );
+            if ($sent) {
+                $agentSent++;
+            } else {
+                $this->warn("[WARN] [$display] Agent copy not sent for {$agentName}.");
+            }
+            // Pace Graph calls so overlapping reports are less likely to throttle each other.
+            if ($i < $agentCount - 1) {
+                usleep(250_000);
+            }
+        }
+        if ($agentFiles !== []) {
+            $this->info("[INFO] [$display] Agent copies emailed to Rama: {$agentSent}/" . count($agentFiles) . ".");
+        }
     }
 
     // ─── Snapshot retention ───────────────────────────────────────────────────
