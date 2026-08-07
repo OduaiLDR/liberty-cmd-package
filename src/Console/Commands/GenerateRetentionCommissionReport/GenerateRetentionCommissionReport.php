@@ -6,7 +6,6 @@ namespace Cmd\Reports\Console\Commands\GenerateRetentionCommissionReport;
 
 use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\CommissionResultsWriter;
-use Cmd\Reports\Services\CommissionRosterProvider;
 use Cmd\Reports\Services\EmailSenderService;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
@@ -51,18 +50,13 @@ class GenerateRetentionCommissionReport extends Command
             'recon_status_id'       => 377650,
             'cancel_request_custom' => 742098,
             'has_t4'                => true,
-            // Summary agents (drives Commission Summary sheet rows and Location/Company lookup).
+            // Summary agents from Jacob's July 2026 correct All workbook (Commission Summary).
             'agents' => [
                 'Alice Kennedy', 'Andrea Mendoza', 'Gracia Rivera', 'Javier Deras',
-                'John Pozuelos', 'Jose Melgar', 'Ken Smith', 'Marco Gonzalez',
-                'Mike Wexford', 'Rick Mills',
+                'John Pozuelos', 'Ken Smith', 'Mike Wexford', 'Wendy Kazem',
             ],
-            // Agents explicitly excluded from the Retention Commission Report sheet.
-            // Blacklist approach (vs. whitelist) so we don't drop valid agents we
-            // don't know about. Add here only if a name should never appear.
-            'excluded_agents' => [
-                'WENDY KAZEM',
-            ],
+            // VBA does not exclude anyone from the detail sheet.
+            'excluded_agents' => [],
         ],
         'plaw' => [
             'display'               => 'Progress Law',
@@ -71,15 +65,14 @@ class GenerateRetentionCommissionReport extends Command
             'custom_results'        => 742106,
             'recon_status_id'       => 377687,
             'cancel_request_custom' => 742100,
+            // Keep T4 (Jacob request) even though older PLAW VBA had tiers 0-3 only.
             'has_t4'                => true,
+            // Summary agents from Jacob's July 2026 correct All workbook (Commission Summary).
             'agents' => [
                 'Alexander Malone', 'Andrea Galvez', 'Edgar Gonzalez', 'Maria Lezana',
-                'Melody Martinez', 'Nick Jones', 'Theo Clayton', 'Tony Walker',
-                'Vicente Gonzalez', 'Alfred Brown',
+                'Melody Martinez', 'Theo Clayton',
             ],
-            'excluded_agents' => [
-                // None confirmed yet. Add only known-bad names here.
-            ],
+            'excluded_agents' => [],
         ],
     ];
 
@@ -140,14 +133,14 @@ class GenerateRetentionCommissionReport extends Command
             // ── STEP 1: base rows (no date filter — VBA doesn't filter by date on initial query)
             $rows = $this->fetchBase($sf, $cfg);
 
-            // Normalize known misspellings from the source so they line up with the
-            // configured agent list (e.g. "ANDREA MENDOZE" -> "ANDREA MENDOZA").
-            // Forth will be corrected going forward; this keeps historical data
-            // attributable to the same agent.
+            // Normalize known misspellings so Summary matches the configured agent list.
             foreach ($rows as &$row) {
                 $agent = strtoupper((string) $this->col($row, 'RETENTION_AGENT', ''));
                 if ($agent === 'ANDREA MENDOZE') {
                     $row['RETENTION_AGENT'] = 'ANDREA MENDOZA';
+                } elseif ($agent === 'ANDREA GALVES') {
+                    // VBA list typo "Galves"; CRM / Summary use Galvez.
+                    $row['RETENTION_AGENT'] = 'ANDREA GALVEZ';
                 }
             }
             unset($row);
@@ -189,7 +182,9 @@ class GenerateRetentionCommissionReport extends Command
                 $count = 0;
                 if ($recon && !empty($allTxMap[$id])) {
                     foreach ($allTxMap[$id] as $d) {
-                        if ($d < $recon) {
+                        // Compare on calendar date (VBA used LEFT(CLEARED_DATE,10)).
+                        $txDay = $this->toDate($d);
+                        if ($txDay !== null && $txDay < $recon) {
                             $count++;
                         }
                     }
@@ -231,10 +226,11 @@ class GenerateRetentionCommissionReport extends Command
                 }
 
                 $id      = (string) $this->col($row, 'ID', '');
-                // Find first cleared date >= recon date from the pre-fetched map
+                // Find first cleared datetime with calendar date >= recon (VBA LEFT stamp).
                 $firstTx = null;
                 foreach ($allTxMap[$id] ?? [] as $txDate) {
-                    if ($txDate >= $recon) {
+                    $txDay = $this->toDate($txDate);
+                    if ($txDay !== null && $txDay >= $recon) {
                         $firstTx = $txDate;
                         break;
                     }
@@ -246,7 +242,8 @@ class GenerateRetentionCommissionReport extends Command
 
                 // VBA: if payment_date >= dropped_date → nullify
                 $dropped = $this->toDate($this->col($row, 'DROPPED_DATE'));
-                if ($dropped !== null && $firstTx >= $dropped) {
+                $payDay  = $this->toDate($firstTx);
+                if ($dropped !== null && $payDay !== null && $payDay >= $dropped) {
                     continue;
                 }
 
@@ -254,21 +251,21 @@ class GenerateRetentionCommissionReport extends Command
 
                 $debt  = (float) $this->col($row, 'ENROLLED_DEBT', 0);
                 $agent = strtoupper((string) $this->col($row, 'RETENTION_AGENT', ''));
-                $multi = ($agent === 'SYDNEY LEYVA') ? 2 : 1;
+                // PLAW VBA only: Sydney Leyva doubles T1-T3 (no T4 in that VBA). Keep T4 undoubled.
+                $multi = ($source === 'plaw' && $agent === 'SYDNEY LEYVA') ? 2 : 1;
                 $tier  = $this->tierAmounts($debt);
 
                 $row['T1'] = $tier['t1'] * $multi;
                 $row['T2'] = $tier['t2'] * $multi;
                 $row['T3'] = $tier['t3'] * $multi;
-                $row['T4'] = $tier['t4'] * $multi;
+                $row['T4'] = $tier['t4'];
             }
             unset($row);
 
             $this->info("[INFO] [$display] Rows after processing: " . count($rows));
 
-            // Agent list (Commission Summary sheet) comes from the roster Rama manages in the
-            // Commission Review app; falls back to the built-in list if unavailable/empty.
-            $cfg['agents'] = CommissionRosterProvider::agents($sql, 'retention', $source, $cfg['agents']);
+            // Commission Summary uses the built-in agent list (SOURCE_CONFIG), matching Jacob's VBA roster.
+            // Do not pull from TblCommissionRoster for this payroll Excel report.
 
             // ── STEP 6: fetch agent location/company from SQL Server
             $locationMap = $this->fetchLocationMap($sql, $cfg['agents']);
@@ -287,9 +284,6 @@ class GenerateRetentionCommissionReport extends Command
             if ($file) {
                 $this->info("[INFO] [$display] Workbook built: {$file['filename']}");
 
-                // Per-agent workbooks: one per agent that actually has data in this
-                // source (same blacklist philosophy as the report itself — unknown
-                // but valid agents still get their own file).
                 $agentNames = [];
                 foreach ($rows as $row) {
                     $agent = trim((string) $this->col($row, 'RETENTION_AGENT', ''));
@@ -360,10 +354,7 @@ class GenerateRetentionCommissionReport extends Command
         $cr = (int) $cfg['custom_results'];
         $cc = (int) $cfg['cancel_request_custom'];
 
-        // Detail report uses a blacklist (excluded_agents) rather than a whitelist,
-        // so unknown-but-valid agents (legacy LDR names, additional PL names) still
-        // appear in the report. Add known-bad names (e.g. "WENDY KAZEM") to
-        // excluded_agents in the source config.
+
         $excludedAgents = $cfg['excluded_agents'] ?? [];
         $excludeSql = '';
         if (!empty($excludedAgents)) {
@@ -382,8 +373,9 @@ class GenerateRetentionCommissionReport extends Command
                 LEFT(cu2.F_DATE, 10) AS RETENTION_DATE,
                 cu3.F_STRING                                           AS IMMEDIATE_RESULTS,
                 d.ENROLLED_DEBT,
-                TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.DROPPED_DATE) AS DATE), 'YYYY-MM-DD') AS DROPPED_DATE,
-                TO_VARCHAR(CONVERT_TIMEZONE('America/Los_Angeles', cu4.F_DATETIME), 'YYYY-MM-DD') AS CANCEL_REQUEST_DATE
+                LEFT(c.DROPPED_DATE, 10)                               AS DROPPED_DATE,
+                -- Keep full datetime like VBA (Excel COUNTIFS vs DateSerial end = midnight).
+                TO_VARCHAR(cu4.F_DATETIME)                             AS CANCEL_REQUEST_DATE
             FROM CONTACTS c
             LEFT JOIN CONTACTS_USERFIELDS cu1
                    ON cu1.CONTACT_ID = c.ID AND cu1.CUSTOM_ID = $ca
@@ -415,11 +407,11 @@ class GenerateRetentionCommissionReport extends Command
     private function fetchReconsiderationDates(DBConnector $sf, int $statusId, string $idList): array
     {
         $sql = "
-            SELECT cs.CONTACT_ID, TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) AS DATE), 'YYYY-MM-DD') AS RECON_DATE
+            SELECT cs.CONTACT_ID, LEFT(cs.STAMP,10) AS RECON_DATE
             FROM CONTACTS_STATUS cs
             WHERE cs.STATUS_ID = $statusId
               AND cs.CONTACT_ID IN ($idList)
-            ORDER BY cs.CONTACT_ID ASC, CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) ASC
+            ORDER BY cs.CONTACT_ID ASC, cs.STAMP ASC
         ";
         $map = [];
         foreach ($sf->query($sql)['data'] ?? [] as $r) {
@@ -435,13 +427,13 @@ class GenerateRetentionCommissionReport extends Command
     private function fetchRetainedDates(DBConnector $sf, string $idList): array
     {
         $sql = "
-            SELECT cs.CONTACT_ID, TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) AS DATE), 'YYYY-MM-DD') AS RETAINED_DATE
+            SELECT cs.CONTACT_ID, LEFT(cs.STAMP,10) AS RETAINED_DATE
             FROM CONTACTS_STATUS cs
             LEFT JOIN CONTACTS_LEAD_STATUS cls ON cs.STATUS_ID = cls.ID
             WHERE UPPER(cls.TITLE) LIKE '%ENROLLED%'
               AND UPPER(cls.TITLE) NOT LIKE '%RECONSIDERATION%'
               AND cs.CONTACT_ID IN ($idList)
-            ORDER BY cs.CONTACT_ID ASC, CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) ASC
+            ORDER BY cs.CONTACT_ID ASC, cs.STAMP ASC
         ";
         $map = [];
         foreach ($sf->query($sql)['data'] ?? [] as $r) {
@@ -458,17 +450,17 @@ class GenerateRetentionCommissionReport extends Command
     private function fetchFirstClearedPerContact(DBConnector $sf, string $idList): array
     {
         $sql = "
-            SELECT CONTACT_ID, TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', CLEARED_DATE) AS DATE), 'YYYY-MM-DD') AS CLEARED_DATE
+            SELECT CONTACT_ID, TO_VARCHAR(CLEARED_DATE) AS CLEARED_DATE
             FROM TRANSACTIONS
             WHERE TRANS_TYPE = 'D'
               AND CLEARED_DATE IS NOT NULL
               AND RETURNED_DATE IS NULL
               AND CONTACT_ID IN ($idList)
-            ORDER BY CONTACT_ID ASC, CONVERT_TIMEZONE('America/Los_Angeles', CLEARED_DATE) ASC
+            ORDER BY CONTACT_ID ASC, CLEARED_DATE ASC
         ";
         $map = [];
         foreach ($sf->query($sql)['data'] ?? [] as $r) {
-            $map[(string) $r['CONTACT_ID']][] = substr((string) $r['CLEARED_DATE'], 0, 10);
+            $map[(string) $r['CONTACT_ID']][] = (string) $r['CLEARED_DATE'];
         }
         return $map;
     }
@@ -523,23 +515,27 @@ class GenerateRetentionCommissionReport extends Command
                 $this->setDate($sheet1, "H$r", $this->col($row, 'RECONSIDERATION_DATE'));
                 $this->setDate($sheet1, "I$r", $this->col($row, 'DROPPED_DATE'));
                 $this->setDate($sheet1, "J$r", $this->col($row, 'RETAINED_DATE'));
-                $this->setDate($sheet1, "K$r", $this->col($row, 'RETENTION_PAYMENT_DATE'));
+                // Keep full datetime like VBA (Excel COUNTIFS vs DateSerial end = midnight).
+                $this->setDateTime($sheet1, "K$r", $this->col($row, 'RETENTION_PAYMENT_DATE'));
                 $sheet1->setCellValue("L$r", $row['T1'] ?? '');
                 $sheet1->setCellValue("M$r", $row['T2'] ?? '');
                 $sheet1->setCellValue("N$r", $row['T3'] ?? '');
                 if ($hasT4) {
                     $sheet1->setCellValue("O$r", $row['T4'] ?? '');
-                    $this->setDate($sheet1, "P$r", $this->col($row, 'CANCEL_REQUEST_DATE'));
+                    $this->setDateTime($sheet1, "P$r", $this->col($row, 'CANCEL_REQUEST_DATE'));
                 } else {
-                    $this->setDate($sheet1, "O$r", $this->col($row, 'CANCEL_REQUEST_DATE'));
+                    $this->setDateTime($sheet1, "O$r", $this->col($row, 'CANCEL_REQUEST_DATE'));
                 }
                 $r++;
             }
 
             $last1 = max($r - 1, 1);
-            $dateCols = ['D', 'H', 'I', 'J', 'K', $cancelCol];
-            foreach ($dateCols as $c) {
+            // Date-only fields (VBA formats D,H,I). Cancel/payment keep datetime for period math.
+            foreach (['D', 'H', 'I', 'J'] as $c) {
                 $sheet1->getStyle("{$c}2:{$c}{$last1}")->getNumberFormat()->setFormatCode('mm/dd/yyyy');
+            }
+            foreach (['K', $cancelCol] as $c) {
+                $sheet1->getStyle("{$c}2:{$c}{$last1}")->getNumberFormat()->setFormatCode('mm/dd/yyyy hh:mm:ss');
             }
             $sheet1->getStyle("F2:F{$last1}")->getNumberFormat()->setFormatCode('$#,##0');
             $tierRange = $hasT4 ? "L2:O{$last1}" : "L2:N{$last1}";
@@ -651,15 +647,13 @@ class GenerateRetentionCommissionReport extends Command
                     continue;
                 }
 
-                // Assigned: cancel_request_date falls in period
-                $cancelDate = $this->toDate($this->col($row, 'CANCEL_REQUEST_DATE'));
-                if ($cancelDate && $cancelDate >= $startDate && $cancelDate <= $endDate) {
+                // Assigned: cancel datetime in VBA COUNTIFS window (see inExcelPeriod).
+                if ($this->inExcelPeriod($this->col($row, 'CANCEL_REQUEST_DATE'), $startDate, $endDate, true)) {
                     $assigned++;
                 }
 
-                // Retained: retention_date falls in period
-                $retentionDate = $this->toDate($this->col($row, 'RETENTION_DATE'));
-                if ($retentionDate && $retentionDate >= $startDate && $retentionDate <= $endDate) {
+                // Retained: retention date (date-only in Excel) inclusive through endDate.
+                if ($this->inExcelPeriod($this->col($row, 'RETENTION_DATE'), $startDate, $endDate, false)) {
                     $retained++;
                 }
             }
@@ -674,8 +668,7 @@ class GenerateRetentionCommissionReport extends Command
                 if ($rowAgent !== $agentUpper) {
                     continue;
                 }
-                $payDate = $this->toDate($this->col($row, 'RETENTION_PAYMENT_DATE'));
-                if ($payDate && $payDate >= $startDate && $payDate <= $endDate && $tierCol !== null) {
+                if ($tierCol !== null && $this->inExcelPeriod($this->col($row, 'RETENTION_PAYMENT_DATE'), $startDate, $endDate, true)) {
                     $commission += (float) $this->col($row, $tierCol, 0);
                 }
             }
@@ -790,14 +783,21 @@ class GenerateRetentionCommissionReport extends Command
         }
 
         $month = date('Y-m', strtotime($startDate));
+        $period = date('m-Y', strtotime($startDate));
         $source = strtoupper($display) === 'PROGRESS LAW' ? 'Progress Law' : 'LDR';
         $dir = storage_path("app/commission-snapshots/{$month}/retention");
         if (!is_dir($dir)) {
             mkdir($dir, 0775, true);
         }
 
-        // Filenames already carry the suffix ("Retention Commission (LDR) - All.xlsx").
-        $dest = $dir . DIRECTORY_SEPARATOR . (string) $file['filename'];
+        // Stable name so retention-manager-commission can find the All workbook.
+        // Per-agent files keep their generated filename; only the All snapshot uses this path.
+        $filename = (string) $file['filename'];
+        $isAll = str_ends_with($filename, ' - All.xlsx') || str_contains($filename, ' - All.');
+        $destName = $isAll
+            ? "Retention Commission Report - {$source} - {$period}.xlsx"
+            : $filename;
+        $dest = $dir . DIRECTORY_SEPARATOR . $destName;
         copy((string) $file['path'], $dest); // overwrite same month/source if rerun
 
         return $dest;
@@ -878,6 +878,40 @@ class GenerateRetentionCommissionReport extends Command
         return $default;
     }
 
+    /**
+     * VBA Excel COUNTIFS vs DateSerial(start)/DateSerial(end).
+     * DateTime fields (cancel / payment): include only timestamps from start 00:00:00 through end 00:00:00.
+     * That matches Excel's end bound at midnight, so most last-day times are excluded.
+     * Date-only fields (retention date): full calendar day inclusive through endDate.
+     */
+    private function inExcelPeriod(mixed $value, string $startDate, string $endDate, bool $dateTimeField): bool
+    {
+        if ($value === null || $value === '') {
+            return false;
+        }
+
+        $startTs = strtotime($startDate . ' 00:00:00');
+        $endTs   = strtotime($endDate . ' 00:00:00');
+        if ($startTs === false || $endTs === false) {
+            return false;
+        }
+
+        if ($dateTimeField) {
+            $ts = $value instanceof \DateTimeInterface
+                ? $value->getTimestamp()
+                : strtotime((string) $value);
+            if ($ts === false) {
+                return false;
+            }
+
+            return $ts >= $startTs && $ts <= $endTs;
+        }
+
+        $d = $this->toDate($value);
+
+        return $d !== null && $d >= $startDate && $d <= $endDate;
+    }
+
     private function toDate(mixed $value): ?string
     {
         if ($value instanceof \DateTimeInterface) {
@@ -911,6 +945,22 @@ class GenerateRetentionCommissionReport extends Command
             $sheet->setCellValue($cell, XlDate::PHPToExcel(strtotime($d)));
             $sheet->getStyle($cell)->getNumberFormat()->setFormatCode('mm/dd/yyyy');
         }
+    }
+
+    /** Write full datetime (VBA dumps F_DATETIME / CLEARED_DATE with time). */
+    private function setDateTime(\PhpOffice\PhpSpreadsheet\Worksheet\Worksheet $sheet, string $cell, mixed $val): void
+    {
+        if ($val === null || $val === '') {
+            return;
+        }
+        $ts = $val instanceof \DateTimeInterface
+            ? $val->getTimestamp()
+            : strtotime((string) $val);
+        if ($ts === false) {
+            return;
+        }
+        $sheet->setCellValue($cell, XlDate::PHPToExcel($ts));
+        $sheet->getStyle($cell)->getNumberFormat()->setFormatCode('mm/dd/yyyy hh:mm:ss');
     }
 
     private function initSqlServer(string $source): DBConnector

@@ -27,7 +27,8 @@ use Illuminate\Support\Facades\Log;
  * for reference only, Primary Account = 3% of Effective Debt, Operation
  * Account = Amount minus Primary Account), plus a fixed Rent row (-400,
  * booked entirely under Operation Account) and a Total row summing
- * everything above it.
+ * everything above it. The same Summary table is included in the email
+ * body; the full workbook remains attached.
  */
 class GenerateAdvanceRecoupReport extends Command
 {
@@ -133,9 +134,7 @@ class GenerateAdvanceRecoupReport extends Command
         $isTest = (bool) $this->option('test');
 
         $subject = ($isTest ? '[TEST] ' : '') . 'EPF Adjustments - ' . $window['label'];
-        $body = 'Please review the EPF adjustments for ' . $window['label'] . '. '
-            . 'Line item detail is attached. '
-            . 'Thanks';
+        $body = $this->buildSummaryEmailBody($summaryRows, $window['label']);
 
         $attachments = [[
             'name' => $report['filename'],
@@ -146,14 +145,14 @@ class GenerateAdvanceRecoupReport extends Command
         $email = new EmailSenderService();
         if ($isTest) {
             $recipients = [self::TEST_RECIPIENT];
-            $sent = $email->sendMailHtml($subject, nl2br(htmlspecialchars($body)), $recipients, [], [], $attachments);
+            $sent = $email->sendMailHtml($subject, $body, $recipients, [], [], $attachments);
         } else {
             $sent = $email->sendMailUsingTblReportsHtml(
                 $sqlServer,
                 ['AdvanceRecoupReport'],
                 ['LDR'],
                 $subject,
-                nl2br(htmlspecialchars($body)),
+                $body,
                 $attachments,
                 false,
                 true
@@ -327,6 +326,65 @@ class GenerateAdvanceRecoupReport extends Command
         unset($row);
 
         return $rows;
+    }
+
+    /**
+     * HTML email body with the same Summary table as the workbook attachment.
+     *
+     * @param array<int,array{category:string,amount:?float,effective_debt:?float,primary_account:?float,operation_account:?float}> $rows
+     */
+    private function buildSummaryEmailBody(array $rows, string $monthLabel): string
+    {
+        $html = '<p>Please review the EPF adjustments for '
+            . htmlspecialchars($monthLabel)
+            . '. Summary is below; line item detail is attached.</p>';
+
+        $html .= '<table border="1" cellpadding="6" cellspacing="0" '
+            . 'style="border-collapse:collapse;font-family:Calibri,Arial,sans-serif;font-size:13px;">';
+        $html .= '<tr style="background:#17853b;color:#fff;text-align:center;">'
+            . '<th>Category</th>'
+            . '<th>Amount</th>'
+            . '<th>Effective Debt</th>'
+            . '<th>Primary Account</th>'
+            . '<th>Operation Account</th>'
+            . '</tr>';
+
+        foreach ($rows as $row) {
+            $isTotal = ($row['category'] === 'Total');
+            $isRent = ($row['category'] === 'Rent');
+            $rowStyle = '';
+            if ($isTotal) {
+                $rowStyle = 'font-weight:bold;background:#d9e8d9;';
+            } elseif ($isRent) {
+                $rowStyle = 'background:#fff3cd;';
+            }
+
+            $html .= '<tr' . ($rowStyle !== '' ? ' style="' . $rowStyle . '"' : '') . '>'
+                . '<td>' . htmlspecialchars((string) $row['category']) . '</td>'
+                . '<td align="right">' . $this->formatMoneyHtml($row['amount']) . '</td>'
+                . '<td align="right">' . $this->formatMoneyHtml($row['effective_debt']) . '</td>'
+                . '<td align="right">' . $this->formatMoneyHtml($row['primary_account']) . '</td>'
+                . '<td align="right">' . $this->formatMoneyHtml($row['operation_account']) . '</td>'
+                . '</tr>';
+        }
+
+        $html .= '</table>';
+
+        return $html;
+    }
+
+    private function formatMoneyHtml(?float $value): string
+    {
+        if ($value === null) {
+            return '';
+        }
+
+        $formatted = number_format(abs($value), 2);
+        if ($value < 0) {
+            return '(' . $formatted . ')';
+        }
+
+        return $formatted;
     }
 
     /**
