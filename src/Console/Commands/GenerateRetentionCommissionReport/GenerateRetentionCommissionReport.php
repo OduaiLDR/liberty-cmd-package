@@ -8,6 +8,7 @@ use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\CommissionAgentEmailFiles;
 use Cmd\Reports\Services\CommissionResultsWriter;
 use Cmd\Reports\Services\EmailSenderService;
+use Cmd\Reports\Services\RetentionCommissionTierStore;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
 use PhpOffice\PhpSpreadsheet\Shared\Date as XlDate;
@@ -271,8 +272,26 @@ class GenerateRetentionCommissionReport extends Command
             // ── STEP 6: fetch agent location/company from SQL Server
             $locationMap = $this->fetchLocationMap($sql, $cfg['agents']);
 
+            $useRetainedMonthTier = filter_var(env('RETENTION_TIER_BY_RETAINED_MONTH', false), FILTER_VALIDATE_BOOLEAN);
+            $tierSnapshotMap = RetentionCommissionTierStore::fetchMap(
+                $sql,
+                $source,
+                $this->retentionPeriodStarts($rows)
+            );
+
             // ── STEP 7: build workbook with both sheets
-            $file = $this->buildWorkbook($rows, $cfg, $display, $startDate, $endDate, $locationMap);
+            $file = $this->buildWorkbook(
+                $rows,
+                $cfg,
+                $display,
+                $startDate,
+                $endDate,
+                $locationMap,
+                null,
+                $tierSnapshotMap,
+                $useRetainedMonthTier,
+                true
+            );
 
             // Persist the computed per-agent retention commission to Azure for the Commission Review
             // app (best-effort; never blocks the report). $lastSummaryRows is set inside buildWorkbook.
@@ -281,6 +300,12 @@ class GenerateRetentionCommissionReport extends Command
                 $retResults[] = ['agent' => (string) $agentName, 'amount' => $sum['commission'] ?? 0];
             }
             CommissionResultsWriter::persist($sql, 'retention', $source, $startDate, 'Commission', $retResults);
+            RetentionCommissionTierStore::persist(
+                $sql,
+                $source,
+                $startDate,
+                RetentionCommissionTierStore::rowsFromSummary($this->lastSummaryRows)
+            );
 
             if ($file) {
                 $this->info("[INFO] [$display] Workbook built: {$file['filename']}");
@@ -304,7 +329,18 @@ class GenerateRetentionCommissionReport extends Command
                     if ($agentRows === []) {
                         continue;
                     }
-                    $agentFile = $this->buildWorkbook($agentRows, $cfg, $display, $startDate, $endDate, $locationMap, $agentName);
+                    $agentFile = $this->buildWorkbook(
+                        $agentRows,
+                        $cfg,
+                        $display,
+                        $startDate,
+                        $endDate,
+                        $locationMap,
+                        $agentName,
+                        $tierSnapshotMap,
+                        $useRetainedMonthTier,
+                        false
+                    );
                     if ($agentFile) {
                         $this->info("[INFO] [$display] Agent workbook built: {$agentFile['filename']}");
                         $files[] = $agentFile;
@@ -471,11 +507,23 @@ class GenerateRetentionCommissionReport extends Command
     /**
      * @param array<int,array<string,mixed>> $rows
      * @param array<string,mixed> $cfg
-     * @param array<string,string> $locationMap
+     * @param array<string,array{location:string,company:string}> $locationMap
+     * @param array<string,int> $tierSnapshotMap
      * @param string|null $agentFilter When set, filename uses the agent name
      * @return array{filename:string,path:string}|null
      */
-    private function buildWorkbook(array $rows, array $cfg, string $display, string $startDate, string $endDate, array $locationMap = [], ?string $agentFilter = null): ?array
+    private function buildWorkbook(
+        array $rows,
+        array $cfg,
+        string $display,
+        string $startDate,
+        string $endDate,
+        array $locationMap = [],
+        ?string $agentFilter = null,
+        array $tierSnapshotMap = [],
+        bool $useRetainedMonthTier = false,
+        bool $logShadowCompare = false
+    ): ?array
     {
         try {
             $sp = new Spreadsheet();
@@ -564,7 +612,17 @@ class GenerateRetentionCommissionReport extends Command
             $this->headerStyle($sheet2, 'A1:H1');
 
             $agents      = $agentFilter !== null ? [$agentFilter] : $cfg['agents'];
-            $summaryRows = $this->buildSummary($rows, $agents, $startDate, $endDate, $locationMap, $hasT4);
+            $summaryRows = $this->buildSummary(
+                $rows,
+                $agents,
+                $startDate,
+                $endDate,
+                $locationMap,
+                $hasT4,
+                $tierSnapshotMap,
+                $useRetainedMonthTier,
+                $logShadowCompare
+            );
             $this->lastSummaryRows = $summaryRows;
 
             $r2 = 2;
@@ -625,22 +683,37 @@ class GenerateRetentionCommissionReport extends Command
      * Tier       = 4 if has_t4 AND pct >= 70% AND retained >= 50
      *              0 if pct<20%, 1 if <35%, 2 if <50%, 3 otherwise
      * Commission = sum of T{tier} for rows where retention_payment_date falls in period
+     *              (tier from retained-month snapshot when RETENTION_TIER_BY_RETAINED_MONTH=true)
      *
      * @param  array<int,array<string,mixed>> $rows
      * @param  string[] $agents
      * @param  array<string,array{location:string,company:string}> $locationMap
+     * @param  array<string,int> $tierSnapshotMap
      * @return array<string,array{assigned:int,retained:int,pct_retained:float,tier:int,commission:float,location:string,company:string}>
      */
-    private function buildSummary(array $rows, array $agents, string $startDate, string $endDate, array $locationMap = [], bool $hasT4 = false): array
+    private function buildSummary(
+        array $rows,
+        array $agents,
+        string $startDate,
+        string $endDate,
+        array $locationMap = [],
+        bool $hasT4 = false,
+        array $tierSnapshotMap = [],
+        bool $useRetainedMonthTier = false,
+        bool $logShadowCompare = false
+    ): array
     {
         $summary = [];
+        $shadowDiffs = 0;
+        $missingWarned = [];
 
         foreach ($agents as $agentName) {
             $agentUpper = strtoupper($agentName);
 
             $assigned   = 0;
             $retained   = 0;
-            $commission = 0.0;
+            $commissionOld = 0.0;
+            $commissionNew = 0.0;
 
             foreach ($rows as $row) {
                 $rowAgent = strtoupper((string) $this->col($row, 'RETENTION_AGENT', ''));
@@ -662,16 +735,50 @@ class GenerateRetentionCommissionReport extends Command
             $pct  = ($assigned > 0) ? ($retained / $assigned) : 0.0;
             $tier = $this->resolveTier($pct, $retained, $hasT4);
 
-            // Sum commission using the agent's tier column for rows where payment landed in period
-            $tierCol = $tier > 0 ? "T$tier" : null;
             foreach ($rows as $row) {
                 $rowAgent = strtoupper((string) $this->col($row, 'RETENTION_AGENT', ''));
                 if ($rowAgent !== $agentUpper) {
                     continue;
                 }
-                if ($tierCol !== null && $this->inExcelPeriod($this->col($row, 'RETENTION_PAYMENT_DATE'), $startDate, $endDate, true)) {
-                    $commission += (float) $this->col($row, $tierCol, 0);
+                if (!$this->inExcelPeriod($this->col($row, 'RETENTION_PAYMENT_DATE'), $startDate, $endDate, true)) {
+                    continue;
                 }
+
+                $commissionOld += $this->amountForTier($row, $tier);
+
+                $retainedPeriod = RetentionCommissionTierStore::periodStartFromDate(
+                    (string) ($this->col($row, 'RETENTION_DATE') ?? '')
+                );
+                $snapshotTier = null;
+                if ($retainedPeriod !== null) {
+                    $key = RetentionCommissionTierStore::tierMapKey($retainedPeriod, $agentName);
+                    if (array_key_exists($key, $tierSnapshotMap)) {
+                        $snapshotTier = $tierSnapshotMap[$key];
+                    } elseif (
+                        $retainedPeriod !== $startDate
+                        && ($useRetainedMonthTier || $logShadowCompare)
+                        && !isset($missingWarned[$key])
+                    ) {
+                        $missingWarned[$key] = true;
+                        Log::warning('RetentionCommissionTierStore: missing tier snapshot; using current-month tier', [
+                            'agent' => $agentName,
+                            'retained_period' => $retainedPeriod,
+                        ]);
+                    }
+                }
+                $payTier = RetentionCommissionTierStore::resolveTierForPayment($tier, $snapshotTier);
+                $commissionNew += $this->amountForTier($row, $payTier);
+            }
+
+            $commission = $useRetainedMonthTier ? $commissionNew : $commissionOld;
+            if ($logShadowCompare && abs($commissionOld - $commissionNew) >= 0.005) {
+                $shadowDiffs++;
+                Log::info('Retention commission shadow compare', [
+                    'agent' => $agentName,
+                    'old' => round($commissionOld, 2),
+                    'new' => round($commissionNew, 2),
+                    'delta' => round($commissionNew - $commissionOld, 2),
+                ]);
             }
 
             $summary[$agentName] = [
@@ -683,6 +790,10 @@ class GenerateRetentionCommissionReport extends Command
                 'location'    => $locationMap[$agentUpper]['location'] ?? '',
                 'company'     => $locationMap[$agentUpper]['company'] ?? '',
             ];
+        }
+
+        if ($logShadowCompare && $shadowDiffs === 0) {
+            Log::info('Retention commission shadow compare: no agent diffs');
         }
 
         uksort($summary, function (string $a, string $b) use ($summary): int {
@@ -698,6 +809,37 @@ class GenerateRetentionCommissionReport extends Command
         });
 
         return $summary;
+    }
+
+    /**
+     * @param  array<string,mixed> $row
+     */
+    private function amountForTier(array $row, int $tier): float
+    {
+        if ($tier <= 0) {
+            return 0.0;
+        }
+
+        return (float) $this->col($row, 'T' . $tier, 0);
+    }
+
+    /**
+     * @param  array<int,array<string,mixed>> $rows
+     * @return list<string>
+     */
+    private function retentionPeriodStarts(array $rows): array
+    {
+        $months = [];
+        foreach ($rows as $row) {
+            $period = RetentionCommissionTierStore::periodStartFromDate(
+                (string) ($this->col($row, 'RETENTION_DATE') ?? '')
+            );
+            if ($period !== null) {
+                $months[$period] = true;
+            }
+        }
+
+        return array_keys($months);
     }
 
     /**
