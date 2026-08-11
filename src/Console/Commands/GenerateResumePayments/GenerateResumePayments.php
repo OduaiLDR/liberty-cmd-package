@@ -620,6 +620,8 @@ final class GenerateResumePayments extends Command
               AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE) AS DATE) >= '2022-09-01'
               AND c.ENROLLED = 1
               AND c.GRADUATED = 0
+              AND c.ISCOAPP = 0
+              AND c.DROPPED = 0
             QUALIFY ROW_NUMBER() OVER (PARTITION BY t.CONTACT_ID ORDER BY CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE) DESC) = 1
             ORDER BY t.CONTACT_ID ASC
         ";
@@ -1227,6 +1229,28 @@ final class GenerateResumePayments extends Command
     }
 
     /**
+     * Route an age>105 cancel candidate by its current lead status (Jacob 2026-08-10):
+     *   'excluded'    — %LUSA-FUNDED% (never cancel; graduated is already filtered in the candidate query)
+     *   'cancellable' — %NSF% / 'No Re-Draft' / %System Cancel% → the grace → queued → complete flow
+     *   'manual'      — Enrolled / Reconsideration Pending / ANY other status → Manual Review (Rama)
+     */
+    private function cancelRoute(string $currentStatus): string
+    {
+        if (stripos($currentStatus, 'LUSA-FUNDED') !== false) {
+            return 'excluded';
+        }
+        if (
+            stripos($currentStatus, 'NSF') !== false
+            || stripos($currentStatus, 'No Re-Draft') !== false
+            || stripos($currentStatus, 'System Cancel') !== false
+        ) {
+            return 'cancellable';
+        }
+
+        return 'manual';
+    }
+
+    /**
      * NSF "Enrolled" ladder for R01/R09 (VBA age buckets 18/34/45/63/93).
      */
     private function nsfEnrolledStatus(string $plan, int $age): string
@@ -1401,6 +1425,21 @@ final class GenerateResumePayments extends Command
         // grace (Day 6+) that are NOT cancelled today (weekend / reporting-only run) are
         // COUNTED, not listed — Jacob 2026-07-10 wants the grace days then only the clients
         // dropped that day, no running "Day N" list.
+        // Current lead statuses for the age>105 candidates, fetched up front so Pass 1 can route by
+        // status (Jacob 2026-08-10): only %NSF% / No Re-Draft / System Cancel% auto-cancel; Enrolled /
+        // Reconsideration Pending / any other status → Manual Review; LUSA-FUNDED excluded outright.
+        $queueIds = [];
+        foreach ($states as $state) {
+            if (((bool) ($state['is_current'] ?? false)) || (int) ($state['age_days'] ?? 0) <= self::SYSTEM_CANCEL_AGE_DAYS) {
+                continue;
+            }
+            $cid = (string) ($state['CONTACT_ID'] ?? '');
+            if ($cid !== '') {
+                $queueIds[] = $cid;
+            }
+        }
+        $queueStatuses = $queueIds === [] ? [] : $this->fetchCurrentStatuses($snowflake, $queueIds);
+
         $toCancel = [];
         foreach ($states as $state) {
             $isCurrent = (bool) ($state['is_current'] ?? false);
@@ -1418,6 +1457,19 @@ final class GenerateResumePayments extends Command
             $llgId = 'LLG-' . $contactId;
             $name = trim((string) ($state['FULLNAME'] ?? ''));
             $debt = (float) ($state['debt_amount'] ?? 0.0);
+
+            // Status routing (Jacob 2026-08-10): LUSA-FUNDED never cancels; Enrolled / Reconsideration
+            // Pending / any non-cancellable status → Manual Review (Rama), which persists day-to-day;
+            // only %NSF% / No Re-Draft / System Cancel% fall through to the grace → queued → cancel
+            // flow. Closes the gap where age>105 alone drove the cancel regardless of status.
+            $route = $this->cancelRoute((string) ($queueStatuses[$contactId] ?? ''));
+            if ($route === 'excluded') {
+                continue;
+            }
+            if ($route === 'manual') {
+                $statusChanges[] = $this->row($contactId, $name, self::STAGE_CANCEL_HOLD, $ageDays, $debt);
+                continue;
+            }
 
             $anchorDate = (string) ($state['nsf_anchor_date'] ?? '');
             $day = $this->resolveCancelDay($sqlConnector, $llgId, $today, $anchorDate, $dryRun)['day'];

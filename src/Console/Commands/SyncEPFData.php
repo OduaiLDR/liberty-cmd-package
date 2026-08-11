@@ -154,22 +154,36 @@ class SyncEPFData extends Command
             $this->logSnowflakeCounts($connector);
         }
 
-        // Exact VBA query - single query, no pagination
+        // Exact VBA query - single query, no pagination.
+        //
+        // Do NOT wrap these columns in CONVERT_TIMEZONE:
+        //   - PAID_TO is a NUMBER (creditor/account id), not a timestamp. Snowflake
+        //     rejects the query outright: "Invalid argument types for function
+        //     CONVERT_TIMEZONE".
+        //   - DRAFT/PROCESS/RETURNED/CLEARED_DATE are DATE columns with no time
+        //     component. Wrapping them changes the SQL-API wire format from
+        //     epoch-days ("20640") to epoch-seconds + offset
+        //     ("1783321200.000000000 1020"). sqlNullableDateTime() only knows the
+        //     epoch-days form, so every value fell through to its NULL fallback and
+        //     Cleared_Date/Draft_Date/etc. landed empty in TblEPFs.
+        //     (The conversion does not shift the calendar date — the Snowflake
+        //     session TZ is already America/Los_Angeles, so it is a no-op on a bare
+        //     DATE. It is purely the wire format that breaks the parser.)
         $sql = <<<SQL
 SELECT
     CONCAT('LLG-', t.CONTACT_ID) AS LLG_ID,
-    CONVERT_TIMEZONE('America/Los_Angeles', t.PAID_TO) AS PAID_TO,
+    t.PAID_TO,
     t.AMOUNT,
-    CONVERT_TIMEZONE('America/Los_Angeles', t.DRAFT_DATE) AS DRAFT_DATE,
-    CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE) AS PROCESS_DATE,
-    CONVERT_TIMEZONE('America/Los_Angeles', t.RETURNED_DATE) AS RETURNED_DATE,
-    CONVERT_TIMEZONE('America/Los_Angeles', t.CLEARED_DATE) AS CLEARED_DATE,
+    t.DRAFT_DATE,
+    t.PROCESS_DATE,
+    t.RETURNED_DATE,
+    t.CLEARED_DATE,
     s.ID AS SETTLEMENT_ID,
     s.ORIGINAL_AMOUNT,
     s.SETTLEMENT_AMOUNT,
     s.CREDITOR_NAME,
     s.OFFER_ID,
-    ROW_NUMBER() OVER(PARTITION BY t.CONTACT_ID, s.OFFER_ID ORDER BY CONVERT_TIMEZONE('America/Los_Angeles', t.DRAFT_DATE) ASC) AS N
+    ROW_NUMBER() OVER(PARTITION BY t.CONTACT_ID, s.OFFER_ID ORDER BY t.DRAFT_DATE ASC) AS N
 FROM TRANSACTIONS AS t, SETTLEMENTS AS s
 WHERE t.LINKED_TO = s.TRANS_ID
   AND t.TRANS_TYPE = 'PF'
@@ -177,7 +191,7 @@ WHERE t.LINKED_TO = s.TRANS_ID
   AND t.LINKED_TO <> 0
   AND t._FIVETRAN_DELETED = 'FALSE'
   AND s._FIVETRAN_DELETED = 'FALSE'
-ORDER BY t.CONTACT_ID ASC, s.OFFER_ID ASC, CONVERT_TIMEZONE('America/Los_Angeles', t.CLEARED_DATE) ASC, CONVERT_TIMEZONE('America/Los_Angeles', t.DRAFT_DATE) ASC
+ORDER BY t.CONTACT_ID ASC, s.OFFER_ID ASC, t.CLEARED_DATE ASC, t.DRAFT_DATE ASC
 SQL;
 
         try {
