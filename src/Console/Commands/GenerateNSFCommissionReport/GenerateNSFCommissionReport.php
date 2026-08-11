@@ -137,10 +137,8 @@ class GenerateNSFCommissionReport extends Command
             $this->info("[INFO] [$display] Workbook: {$allFile['filename']}");
 
             // Per-agent workbooks: same two sheets, filtered to that agent's data.
-            // Uses $agents (the managed roster), not $cfg['agents'], so the per-agent workbooks
-            // cover exactly the same people as the commission summary above.
             $files = [$allFile];
-            foreach ($agents as $agentName) {
+            foreach ($cfg['agents'] as $agentName) {
                 $agentDataRows = array_values(array_filter(
                     $dataRows,
                     fn (array $r): bool => strtoupper((string) ($r['AGENT'] ?? '')) === strtoupper($agentName)

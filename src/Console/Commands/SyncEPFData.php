@@ -161,10 +161,14 @@ class SyncEPFData extends Command
         //     rejects the query outright: "Invalid argument types for function
         //     CONVERT_TIMEZONE".
         //   - DRAFT/PROCESS/RETURNED/CLEARED_DATE are DATE columns with no time
-        //     component. Converting them shifts the calendar date back a day for LA,
-        //     and changes the API wire format from epoch-days ("20640") to
-        //     epoch-seconds + offset ("1783321200.000000000 1020"), which
-        //     sqlNullableDateTime() cannot parse — every value silently became NULL.
+        //     component. Wrapping them changes the SQL-API wire format from
+        //     epoch-days ("20640") to epoch-seconds + offset
+        //     ("1783321200.000000000 1020"). sqlNullableDateTime() only knows the
+        //     epoch-days form, so every value fell through to its NULL fallback and
+        //     Cleared_Date/Draft_Date/etc. landed empty in TblEPFs.
+        //     (The conversion does not shift the calendar date — the Snowflake
+        //     session TZ is already America/Los_Angeles, so it is a no-op on a bare
+        //     DATE. It is purely the wire format that breaks the parser.)
         $sql = <<<SQL
 SELECT
     CONCAT('LLG-', t.CONTACT_ID) AS LLG_ID,
