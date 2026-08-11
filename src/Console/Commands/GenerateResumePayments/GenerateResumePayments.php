@@ -2125,7 +2125,7 @@ final class GenerateResumePayments extends Command
             } catch (\Throwable $e) {
                 $errors[] = "{$env}: {$e->getMessage()}";
             }
-        }
+        } 
 
         throw new \RuntimeException('Unable to initialize SQL Server connector. Tried: ' . implode('; ', $errors));
     }
