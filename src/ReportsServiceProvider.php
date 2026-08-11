@@ -43,6 +43,7 @@ use Cmd\Reports\Console\Commands\GenerateScrubListReportLDR\GenerateScrubListRep
 use Cmd\Reports\Console\Commands\GenerateSettlementReports\GenerateSettlementReports;
 use Cmd\Reports\Console\Commands\GenerateLookbackSummaryReport\GenerateLookbackSummaryReport;
 use Cmd\Reports\Console\Commands\GenerateEnrollmentSummaryReport\GenerateEnrollmentSummaryReport;
+use Cmd\Reports\Console\Commands\GenerateEnrollmentGrossNetReport\GenerateEnrollmentGrossNetReport;
 use Cmd\Reports\Console\Commands\GenerateReportSummary\GenerateReportSummary;
 use Cmd\Reports\Console\Commands\GenerateSyncSummary\GenerateSyncSummary;
 use Cmd\Reports\Console\Commands\GenerateRetentionCommissionReport\GenerateRetentionCommissionReport;
@@ -176,6 +177,7 @@ class ReportsServiceProvider extends ServiceProvider
                 GenerateSettlementReports::class,
                 GenerateLookbackSummaryReport::class,
                 GenerateEnrollmentSummaryReport::class,
+                GenerateEnrollmentGrossNetReport::class,
                 GenerateReportSummary::class,
                 GenerateSyncSummary::class,
                 GenerateRetentionCommissionReport::class,

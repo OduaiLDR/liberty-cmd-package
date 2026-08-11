@@ -5,6 +5,7 @@ namespace Cmd\Reports\Console\Commands\GenerateEnrollmentSummaryReport;
 use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\EmailSenderService;
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Log;
 
 class GenerateEnrollmentSummaryReport extends Command
@@ -29,6 +30,9 @@ class GenerateEnrollmentSummaryReport extends Command
 
     /** Reset per buildColumn() pass so blank-row synthetic labels line up identically across all 3 passes. */
     private int $blankCounter = 0;
+
+    /** Trailing-12 sellable ratio for the report month (Total column only); computed once per run. */
+    private ?float $trailing12SellableRatio = null;
 
     public function handle(): int
     {
@@ -58,6 +62,17 @@ class GenerateEnrollmentSummaryReport extends Command
         $this->info("[INFO] Enrollment Summary Report: starting (window={$windowDate}, snapshot={$snapshotDate}).");
 
         try {
+            $this->trailing12SellableRatio = $this->computeTrailing12SellableRatio(
+                $connector,
+                $windowDate,
+                self::COLUMNS['Total']
+            );
+            $this->info('[INFO] Trailing 12 Month Sellable Ratio: ' . (
+                $this->trailing12SellableRatio === null
+                    ? 'n/a'
+                    : round($this->trailing12SellableRatio * 100) . '%'
+            ));
+
             foreach (self::COLUMNS as $columnKey => $criteria) {
                 $this->info("[INFO] Building column: {$columnKey}");
                 $this->buildColumn($connector, $columnKey, $criteria, $windowDate, $snapshotDate);
@@ -99,11 +114,17 @@ class GenerateEnrollmentSummaryReport extends Command
 
         $formatter = new Formatter();
         $workbook = $formatter->buildWorkbook($this->rows, array_keys(self::COLUMNS), $snapshotDate, $trancheRows, $capitalReport, $monthlyResiduals);
+        $emailHtml = $formatter->buildEnrollmentSummaryEmailHtml($this->rows, array_keys(self::COLUMNS), $snapshotDate);
 
         $outputPath = $this->option('output');
         if ($outputPath !== null && $workbook !== null) {
             copy($workbook['path'], $outputPath);
             $this->info("[INFO] Workbook saved to {$outputPath}");
+
+            $htmlPath = preg_replace('/\.xlsx$/i', '-Enrollment-Summary.html', $outputPath)
+                ?: ($outputPath . '-Enrollment-Summary.html');
+            file_put_contents($htmlPath, $emailHtml);
+            $this->info("[INFO] Enrollment Summary HTML preview saved to {$htmlPath}");
         }
 
         $skipEmail = $this->option('no-email') || $outputPath !== null;
@@ -122,6 +143,16 @@ class GenerateEnrollmentSummaryReport extends Command
         if (!$sent) {
             $this->warn('[WARN] Enrollment Summary Report email failed to send.');
             return Command::FAILURE;
+        }
+
+        // Same schedule: send Gross/Net as a separate email right after Enrollment Summary.
+        if (!$skipEmail) {
+            $this->info('[INFO] Triggering Enrollment Gross/Net report (separate email)...');
+            $grossNetExit = Artisan::call('Generate:enrollment-gross-net-report');
+            $this->output->write(Artisan::output());
+            if ($grossNetExit !== Command::SUCCESS) {
+                $this->warn('[WARN] Enrollment Gross/Net report failed after Enrollment Summary.');
+            }
         }
 
         $this->info('[SUCCESS] Enrollment Summary Report completed.');
@@ -346,6 +377,26 @@ class GenerateEnrollmentSummaryReport extends Command
             ", [$monthStart, $monthEnd]);
             $this->setRow("Sellable Debt Paying in {$monthLabel}", $columnKey, $sellableDebt, 'currency', bold: true);
 
+            // Trailing 12 Month Sellable Ratio + Projected Sellable: Total column only; LDR/Legal grayed.
+            $rate = $this->trailing12SellableRatio;
+            $projected = ($columnKey === 'Total' && $rate !== null) ? ($totalDebt * $rate) : null;
+            $this->setRow(
+                "Trailing 12 Month Sellable Ratio ({$monthLabel})",
+                $columnKey,
+                $columnKey === 'Total' ? $rate : null,
+                'percent',
+                bold: false,
+                totalOnly: true
+            );
+            $this->setRow(
+                "Projected Sellable ({$monthLabel})",
+                $columnKey,
+                $projected,
+                'currency',
+                bold: false,
+                totalOnly: true
+            );
+
             $reconsiderationDebt = (float) $this->scalar($connector, "
                 SELECT SUM(Debt_Amount) FROM TblEnrollment
                 WHERE Cancel_Date IS NULL AND NSF_Date IS NULL
@@ -375,6 +426,43 @@ class GenerateEnrollmentSummaryReport extends Command
     }
 
     /**
+     * Trailing 12 months before the report month (e.g. July report → Jul prior year through Jun).
+     * Denominator: all enrolled debt by First_Payment_Date (any status).
+     * Numerator: sold (Debt_Sold_To + Tranche) OR unsold + LDR/ProLaw Enrolled.
+     */
+    private function computeTrailing12SellableRatio(DBConnector $connector, string $windowDate, string $criteria): ?float
+    {
+        $reportMonth = new \DateTimeImmutable($windowDate);
+        $reportMonthStart = $reportMonth->modify('first day of this month');
+        $trailEnd = $reportMonthStart->modify('-1 day');
+        $trailStart = $reportMonthStart->modify('-12 months');
+
+        $denominator = (float) $this->scalar($connector, "
+            SELECT COALESCE(SUM(Debt_Amount), 0) FROM TblEnrollment
+            WHERE First_Payment_Date >= ? AND First_Payment_Date <= ? {$criteria}
+        ", [$trailStart->format('Y-m-d'), $trailEnd->format('Y-m-d')]);
+
+        if ($denominator <= 0) {
+            return null;
+        }
+
+        $numerator = (float) $this->scalar($connector, "
+            SELECT COALESCE(SUM(Debt_Amount), 0) FROM TblEnrollment
+            WHERE First_Payment_Date >= ? AND First_Payment_Date <= ?
+              AND (
+                    (Debt_Sold_To IS NOT NULL AND Tranche IS NOT NULL)
+                 OR (
+                        Debt_Sold_To IS NULL
+                    AND (Tranche IS NULL)
+                    AND Enrollment_Status IN ('LDR Enrolled', 'ProLaw Enrolled')
+                 )
+              ) {$criteria}
+        ", [$trailStart->format('Y-m-d'), $trailEnd->format('Y-m-d')]);
+
+        return $numerator / $denominator;
+    }
+
+    /**
      * Sets (or updates, on later column passes) a row value by label. Row order is fixed by the first pass (Total).
      *
      * Blank spacer rows have no label to dedupe on, so they're given a synthetic one ("__blank_N__")
@@ -382,8 +470,15 @@ class GenerateEnrollmentSummaryReport extends Command
      * sequence of setRow() calls in the same order, the same synthetic label recurs across all 3 passes
      * and collapses into a single row instead of one blank row per column.
      */
-    private function setRow(string $label, string $columnKey, mixed $value, string $format, bool $bold = false, bool $blank = false): void
-    {
+    private function setRow(
+        string $label,
+        string $columnKey,
+        mixed $value,
+        string $format,
+        bool $bold = false,
+        bool $blank = false,
+        bool $totalOnly = false
+    ): void {
         if ($blank) {
             $label = '__blank_' . ($this->blankCounter++) . '__';
         }
@@ -402,6 +497,7 @@ class GenerateEnrollmentSummaryReport extends Command
             'format' => $format,
             'bold' => $bold,
             'blank' => $blank,
+            'totalOnly' => $totalOnly,
         ];
     }
 

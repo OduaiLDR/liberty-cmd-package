@@ -143,6 +143,62 @@ class Formatter
         ];
     }
 
+    /**
+     * HTML preview of the Enrollment Summary sheet (for review / Downloads).
+     *
+     * @param array<int, array<string, mixed>> $rows
+     * @param string[] $columnKeys
+     */
+    public function buildEnrollmentSummaryEmailHtml(array $rows, array $columnKeys, string $reportDate): string
+    {
+        $thStyle = 'border:1px solid #000;padding:6px 10px;background:#D3D3D3;text-align:center;';
+        $tdStyle = 'border:1px solid #000;padding:6px 10px;';
+        $grayStyle = 'border:1px solid #000;padding:6px 10px;background:#D9D9D9;';
+
+        $html = '<b>Enrollment Summary For ' . date('n/j/Y', strtotime($reportDate)) . '</b><br><br>';
+        $html .= '<table style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:12px;">';
+        $html .= '<tr><th style="' . $thStyle . '">Category</th>';
+        foreach ($columnKeys as $columnKey) {
+            $html .= '<th style="' . $thStyle . '">' . htmlspecialchars($columnKey) . '</th>';
+        }
+        $html .= '</tr>';
+
+        foreach ($rows as $row) {
+            if (!empty($row['blank'])) {
+                $html .= '<tr><td colspan="' . (count($columnKeys) + 1) . '" style="background:#C5C5C5;height:10px;"></td></tr>';
+                continue;
+            }
+
+            $html .= '<tr><td style="' . $tdStyle . ';font-weight:bold;">' . htmlspecialchars((string) $row['label']) . '</td>';
+            foreach ($columnKeys as $columnKey) {
+                $value = $row['values'][$columnKey] ?? null;
+                $isGray = !empty($row['totalOnly']) && $columnKey !== 'Total';
+                $style = $isGray ? $grayStyle : $tdStyle;
+
+                if ($isGray || ($row['format'] === 'percent' && $value === null) || $value === null) {
+                    $html .= '<td style="' . $style . '"></td>';
+                    continue;
+                }
+
+                if ($row['format'] === 'currency') {
+                    $display = '$' . number_format((float) $value, 0);
+                } elseif ($row['format'] === 'percent') {
+                    $display = round(((float) $value) * 100) . '%';
+                } else {
+                    $display = number_format((float) $value, 0);
+                }
+
+                $html .= '<td style="' . $style . ';text-align:right;">' . htmlspecialchars($display) . '</td>';
+            }
+            $html .= '</tr>';
+        }
+
+        $html .= '</table>';
+        $html .= '<p style="margin-top:12px;font-size:11px;color:#888;">Full workbook attached (Enrollment Summary, Tranche Summary, Capital Report).</p>';
+
+        return $html;
+    }
+
     private function buildEnrollmentSummarySheet(Spreadsheet $spreadsheet, array $rows, array $columnKeys, string $reportDate): void
     {
         $sheet = $spreadsheet->createSheet();
@@ -188,11 +244,28 @@ class Formatter
             $col = 'B';
             foreach ($columnKeys as $columnKey) {
                 $value = $row['values'][$columnKey] ?? 0;
-                $sheet->setCellValue("{$col}{$rowIndex}", $value);
-                if ($row['format'] === 'currency') {
-                    $sheet->getStyle("{$col}{$rowIndex}")->getNumberFormat()->setFormatCode('$#,##0');
+                $isTotalOnlyGray = !empty($row['totalOnly']) && $columnKey !== 'Total';
+
+                if ($isTotalOnlyGray || ($row['format'] === 'percent' && $value === null)) {
+                    $sheet->setCellValue("{$col}{$rowIndex}", '');
                 } else {
-                    $sheet->getStyle("{$col}{$rowIndex}")->getNumberFormat()->setFormatCode('#,##0');
+                    $sheet->setCellValue("{$col}{$rowIndex}", $value);
+                    if ($row['format'] === 'currency') {
+                        $sheet->getStyle("{$col}{$rowIndex}")->getNumberFormat()->setFormatCode('$#,##0');
+                    } elseif ($row['format'] === 'percent') {
+                        $sheet->getStyle("{$col}{$rowIndex}")->getNumberFormat()->setFormatCode('0%');
+                    } else {
+                        $sheet->getStyle("{$col}{$rowIndex}")->getNumberFormat()->setFormatCode('#,##0');
+                    }
+                }
+
+                if ($isTotalOnlyGray) {
+                    $sheet->getStyle("{$col}{$rowIndex}")->applyFromArray([
+                        'fill' => [
+                            'fillType' => Fill::FILL_SOLID,
+                            'startColor' => ['rgb' => 'D9D9D9'],
+                        ],
+                    ]);
                 }
                 $col++;
             }
