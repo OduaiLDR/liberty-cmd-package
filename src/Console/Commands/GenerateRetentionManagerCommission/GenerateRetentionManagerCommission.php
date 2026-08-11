@@ -664,10 +664,15 @@ class GenerateRetentionManagerCommission extends Command
         $period = date('m-Y', strtotime($startDate));
         $dir = storage_path("app/commission-snapshots/{$month}/nsf");
 
-        return [
-            $dir . DIRECTORY_SEPARATOR . "NSF Commission Report - LDR - {$period}.xlsx",
-            $dir . DIRECTORY_SEPARATOR . "NSF Commission Report - Progress Law - {$period}.xlsx",
-        ];
+        $ldrAll = $dir . DIRECTORY_SEPARATOR . "NSF Commission Report - LDR - {$period} - All.xlsx";
+        $ldrLegacy = $dir . DIRECTORY_SEPARATOR . "NSF Commission Report - LDR - {$period}.xlsx";
+        $ldr = is_file($ldrAll) ? $ldrAll : $ldrLegacy;
+
+        $plawAll = $dir . DIRECTORY_SEPARATOR . "NSF Commission Report - Progress Law - {$period} - All.xlsx";
+        $plawLegacy = $dir . DIRECTORY_SEPARATOR . "NSF Commission Report - Progress Law - {$period}.xlsx";
+        $plaw = is_file($plawAll) ? $plawAll : $plawLegacy;
+
+        return [$ldr, $plaw];
     }
 
     /** @return array<int,array<string,mixed>> */
