@@ -1239,9 +1239,11 @@ final class GenerateResumePayments extends Command
         if (stripos($currentStatus, 'LUSA-FUNDED') !== false) {
             return 'excluded';
         }
-        if (stripos($currentStatus, 'NSF') !== false
+        if (
+            stripos($currentStatus, 'NSF') !== false
             || stripos($currentStatus, 'No Re-Draft') !== false
-            || stripos($currentStatus, 'System Cancel') !== false) {
+            || stripos($currentStatus, 'System Cancel') !== false
+        ) {
             return 'cancellable';
         }
 
