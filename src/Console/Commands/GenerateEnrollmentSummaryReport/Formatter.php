@@ -96,14 +96,13 @@ class Formatter
     private const CAPITAL_REPORT_TEXT = ['Tranche'];
 
     /**
-     * Builds the combined workbook: Enrollment Summary, Monthly Enrollment Summary, Tranche Summary, Capital Report.
+     * Builds the combined workbook: Enrollment Summary, Tranche Summary, Capital Report.
      *
      * @param array<int, array<string, mixed>> $enrollmentRows Ordered row definitions from the command.
      * @param string[] $columnKeys e.g. ['Total', 'LDR', 'Legal']
      * @param array<int, array<string, mixed>>|null $trancheRows
      * @param array{rows: array<int, array<string, mixed>>, totals: array<string, mixed>}|null $capitalReport
      * @param array<int, array{label: string, contacts: int, fee: ?float, residual: float, projection: float, bold: bool}>|null $monthlyResiduals
-     * @param array{months: array<int, array{key: string, label: string, start: string, end: string}>, rows: array<int, array{label: string, format: string, bold: bool, values: array<string, float|int|null>}>}|null $monthlyEnrollmentSummary
      */
     public function buildWorkbook(
         array $enrollmentRows,
@@ -111,8 +110,7 @@ class Formatter
         string $reportDate,
         ?array $trancheRows = null,
         ?array $capitalReport = null,
-        ?array $monthlyResiduals = null,
-        ?array $monthlyEnrollmentSummary = null
+        ?array $monthlyResiduals = null
     ): ?array {
         if (empty($enrollmentRows)) {
             return null;
@@ -125,10 +123,6 @@ class Formatter
         $spreadsheet->removeSheetByIndex(0);
 
         $this->buildEnrollmentSummarySheet($spreadsheet, $enrollmentRows, $columnKeys, $reportDate);
-
-        if ($monthlyEnrollmentSummary !== null) {
-            $this->buildMonthlyEnrollmentSummarySheet($spreadsheet, $monthlyEnrollmentSummary, $reportDate);
-        }
 
         if ($trancheRows !== null) {
             $this->buildTrancheSummarySheet($spreadsheet, $trancheRows);
@@ -215,80 +209,6 @@ class Formatter
         $sheet->getStyle("A3:{$lastColLetter}{$lastRow}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
         $sheet->getStyle("A1:{$lastColLetter}{$lastRow}")->getFont()->setName('Calibri')->setSize(9);
         $sheet->setSelectedCells('B1');
-    }
-
-    /**
-     * @param array{
-     *     months: array<int, array{key: string, label: string, start: string, end: string}>,
-     *     rows: array<int, array{label: string, format: string, bold: bool, values: array<string, float|int|null>}>
-     * } $data
-     */
-    private function buildMonthlyEnrollmentSummarySheet(Spreadsheet $spreadsheet, array $data, string $reportDate): void
-    {
-        $sheet = $spreadsheet->createSheet();
-        $sheet->setTitle('Monthly Enrollment Summary');
-        $sheet->setShowGridlines(false);
-
-        $months = $data['months'];
-        $rows = $data['rows'];
-        if ($months === [] || $rows === []) {
-            return;
-        }
-
-        $sheet->getColumnDimension('A')->setWidth(42);
-        $lastColLetter = $this->columnLetter(count($months) + 1);
-
-        $sheet->setCellValue('A1', 'Monthly Enrollment Summary For ' . date('n/j/Y', strtotime($reportDate)));
-        $sheet->getStyle('A1')->getFont()->setBold(true);
-
-        $sheet->setCellValue('A3', 'Category');
-        $colIndex = 2;
-        foreach ($months as $month) {
-            $colLetter = $this->columnLetter($colIndex);
-            $sheet->setCellValue("{$colLetter}3", $month['label']);
-            $sheet->getColumnDimension($colLetter)->setWidth(14);
-            $colIndex++;
-        }
-        $sheet->getStyle("A3:{$lastColLetter}3")->applyFromArray([
-            'font' => ['bold' => true],
-            'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER],
-        ]);
-
-        $rowIndex = 4;
-        foreach ($rows as $row) {
-            $sheet->setCellValue("A{$rowIndex}", $row['label']);
-            $colIndex = 2;
-            foreach ($months as $month) {
-                $colLetter = $this->columnLetter($colIndex);
-                $value = $row['values'][$month['key']] ?? 0;
-                if ($row['format'] === 'percent' && $value === null) {
-                    $sheet->setCellValue("{$colLetter}{$rowIndex}", '');
-                } else {
-                    $sheet->setCellValue("{$colLetter}{$rowIndex}", $value);
-                }
-
-                if ($row['format'] === 'currency') {
-                    $sheet->getStyle("{$colLetter}{$rowIndex}")->getNumberFormat()->setFormatCode('$#,##0');
-                } elseif ($row['format'] === 'count') {
-                    $sheet->getStyle("{$colLetter}{$rowIndex}")->getNumberFormat()->setFormatCode('#,##0');
-                } elseif ($row['format'] === 'percent') {
-                    $sheet->getStyle("{$colLetter}{$rowIndex}")->getNumberFormat()->setFormatCode('0%');
-                }
-
-                $colIndex++;
-            }
-
-            if ($row['bold']) {
-                $sheet->getStyle("A{$rowIndex}:{$lastColLetter}{$rowIndex}")->getFont()->setBold(true);
-            }
-
-            $rowIndex++;
-        }
-
-        $lastRow = $rowIndex - 1;
-        $sheet->getStyle("A3:{$lastColLetter}{$lastRow}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
-        $sheet->getStyle("A1:{$lastColLetter}{$lastRow}")->getFont()->setName('Calibri')->setSize(9);
-        $sheet->setSelectedCells('B4');
     }
 
     /**
