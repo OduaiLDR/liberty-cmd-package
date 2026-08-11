@@ -331,9 +331,20 @@ class GenerateCompanyStatsReport extends Command
 
     private function initializeSqlServerConnector(): DBConnector
     {
-        $connector = new DBConnector([]);
-        $connector->initializeSqlServer();
-        return $connector;
+        $candidates = ['ldr', 'plaw', 'production', 'sandbox'];
+        $errors = [];
+
+        foreach ($candidates as $env) {
+            try {
+                $connector = DBConnector::fromEnvironment($env);
+                $connector->initializeSqlServer();
+                return $connector;
+            } catch (\Throwable $e) {
+                $errors[] = "{$env}: {$e->getMessage()}";
+            }
+        }
+
+        throw new \RuntimeException('Unable to initialize SQL Server connector. Tried: ' . implode('; ', $errors));
     }
 
     private function esc(string $value): string

@@ -390,8 +390,14 @@ class ReportBuilder
     {
         $binary = $this->resolveLibreOfficeBinary();
 
+        $profileDir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'libreoffice_profile_' . uniqid('', true);
+        if (!is_dir($profileDir)) {
+            @mkdir($profileDir, 0775, true);
+        }
+
         $process = new Process([
             $binary,
+            "-env:UserInstallation=file:///" . str_replace('\\', '/', $profileDir),
             '--headless',
             '--convert-to',
             'pdf',
@@ -402,18 +408,36 @@ class ReportBuilder
         $process->setTimeout(180);
         $process->run();
 
+        @$this->removeDirectory($profileDir);
+
         if (!$process->isSuccessful()) {
-            $stderr = $process->getErrorOutput();
+            $stderr = trim($process->getErrorOutput());
+            $stdout = trim($process->getOutput());
+            $errMsg = implode(' | ', array_filter([$stderr, $stdout])) ?: 'Unknown LibreOffice conversion error';
+
             Log::error('LibreOffice PDF conversion failed.', [
                 'docx' => $docxPath,
                 'output_dir' => $outputDir,
                 'binary' => $binary,
                 'exit_code' => $process->getExitCode(),
                 'stderr' => $stderr,
-                'stdout' => $process->getOutput(),
+                'stdout' => $stdout,
             ]);
-            throw new \RuntimeException("LibreOffice failed (exit {$process->getExitCode()}): {$stderr}");
+            throw new \RuntimeException("LibreOffice failed (exit {$process->getExitCode()}): {$errMsg}");
         }
+    }
+
+    private function removeDirectory(string $dir): void
+    {
+        if (!is_dir($dir)) {
+            return;
+        }
+        $items = array_diff(scandir($dir) ?: [], ['.', '..']);
+        foreach ($items as $item) {
+            $path = $dir . DIRECTORY_SEPARATOR . $item;
+            is_dir($path) ? $this->removeDirectory($path) : @unlink($path);
+        }
+        @rmdir($dir);
     }
 
     private function resolveLibreOfficeBinary(): string
