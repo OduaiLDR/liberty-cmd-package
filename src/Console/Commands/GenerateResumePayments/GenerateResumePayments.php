@@ -52,7 +52,8 @@ final class GenerateResumePayments extends Command
         {--probe-resume-execute : With --probe-resume, also FIRE the resume POST (an action — TEST FILES ONLY). Without it the resume probe is read-only.}
         {--probe-void-settlements= : Diagnostic only — READ-ONLY dump of a single contact settlement-void screen (selectors, void-reason options, settlement rows) plus the pending settlement offers we would target for auto-void. Commits nothing. Tenant = first --company.}
         {--no-recap : Skip the Phase 6 recap email (status writes + resumes still happen). Use for controlled live tests so the team is not emailed a partial run.}
-        {--cancels-only : Skip Phase 4 (NSF status updates + resume) and run ONLY the Day-4+ System Cancels. Use with --execute-cancels to work extra cancel batches through the backlog WITHOUT re-writing statuses or re-firing status-change triggers (Jacob 2026-07-20).}';
+        {--cancels-only : Skip Phase 4 (NSF status updates + resume) and run ONLY the Day-4+ System Cancels. Use with --execute-cancels to work extra cancel batches through the backlog WITHOUT re-writing statuses or re-firing status-change triggers (Jacob 2026-07-20).}
+        {--run-on-weekend : Override the Mon-Fri guard and run on a Sat/Sun (business PT). For manual weekend ops only; the scheduled run should never pass this. Dry-runs + probes already run any day.}';
 
     protected $description = 'Process NSF contacts for LDR and Progress Law: update statuses, resume drafts, and execute system cancels per the ResumePayments VBA workflow.';
 
@@ -146,6 +147,21 @@ final class GenerateResumePayments extends Command
         $probeResumeId = (string) ($this->option('probe-resume') ?? '');
         $probeVoidId = (string) ($this->option('probe-void-settlements') ?? '');
         $dryRun = (bool) $this->option('dry-run');
+
+        // Mon–Fri guard (Jacob 2026-08-11: "run Mon-Fri and cancel the weekend runs"). A live
+        // (non-dry-run) run that fires on a Sat/Sun in business time (America/Los_Angeles) no-ops
+        // — cancels were already weekday-only, this also stops weekend status changes. Dry-runs
+        // and probes still run any day (testing/diagnostics); --run-on-weekend is the manual
+        // override for a one-off weekend op. The scheduled automation stays 7-day; it self-skips.
+        $isProbe = $probeCancelId !== '' || $probeResumeId !== '' || $probeVoidId !== '';
+        if (!$dryRun && !$isProbe && !$this->option('run-on-weekend')) {
+            $businessDow = (int) (new \DateTimeImmutable('now', new \DateTimeZone('America/Los_Angeles')))->format('N');
+            if ($businessDow >= 6) { // 6 = Sat, 7 = Sun
+                $this->info('[INFO] ResumePayments: weekend (PT) — skipping. Runs Mon–Fri; pass --run-on-weekend to override.');
+                Log::info('ResumePayments: weekend skip', ['business_dow' => $businessDow]);
+                return Command::SUCCESS;
+            }
+        }
 
         // Concurrency guard (2026-07-23, hardened 2026-07-27): this command drives ONE headless
         // Chromium on the fixed ChromeDriver port 9515 against ONE DPP login. Two overlapping runs
