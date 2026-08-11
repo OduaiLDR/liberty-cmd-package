@@ -3,6 +3,7 @@
 namespace Cmd\Reports\Console\Commands\GenerateNSFCommissionReport;
 
 use Cmd\Reports\Services\DBConnector;
+use Cmd\Reports\Services\CommissionAgentEmailFiles;
 use Cmd\Reports\Services\CommissionResultsWriter;
 use Cmd\Reports\Services\CommissionRosterProvider;
 use Illuminate\Console\Command;
@@ -384,34 +385,22 @@ class GenerateNSFCommissionReport extends Command
     }
 
     /**
-     * Send all workbooks (All + per-agent) in a single email.
+     * Email All to the report distribution list; one email per agent workbook to Rama only.
      *
      * @param array<int,array{filename:string,path:string}> $files
      */
     private function sendReport(DBConnector $sql, array $files, string $display, string $start, string $end, array $commissionRows): void
     {
-        // Build attachment list first (skip missing files)
-        $attachments = [];
-        foreach ($files as $f) {
-            if (!file_exists($f['path'])) {
-                $this->warn("[WARN] [$display] Attachment missing: {$f['filename']}");
-                continue;
-            }
-            $attachments[] = [
-                'name'         => $f['filename'],
-                'contentType'  => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                'contentBytes' => base64_encode((string) file_get_contents($f['path'])),
-            ];
+        $parts = CommissionAgentEmailFiles::partition($files);
+        foreach ($parts['missing'] as $missingName) {
+            $this->warn("[WARN] [$display] Attachment missing: {$missingName}");
         }
-
-        if ($attachments === []) {
-            $this->warn("[WARN] [$display] No attachments to send.");
-            return;
-        }
+        $allFiles = $parts['all'];
+        $agentFiles = $parts['agents'];
 
         $subject = "NSF Commission Report - $display";
 
-        // Build HTML table body matching VBA
+        // Build HTML table body matching VBA (All email only)
         $body  = '<table border="1">';
         $body .= '<tr><th>Agent</th><th>Assignments</th><th>Actions</th><th>Ratio</th><th>Commission Rate</th><th>Commission</th><th>Location</th></tr>';
         foreach ($commissionRows as $row) {
@@ -433,28 +422,62 @@ class GenerateNSFCommissionReport extends Command
 
         $email  = new \Cmd\Reports\Services\EmailSenderService();
         $testTo = trim((string) env('NSF_REPORT_TEST_TO', ''));
+        $reportNames = ['NSFCommissionReport', 'NSF Commission Report'];
+        $company = [strtoupper($display === 'Progress Law' ? 'PLAW' : 'LDR')];
 
-        if ($testTo !== '') {
-            // Guard: override all recipients — send only to test address
-            $this->info("[INFO] [$display] NSF_REPORT_TEST_TO set — sending only to $testTo");
-            $sent = $email->sendMailHtml($subject, $body, [$testTo], [], [], $attachments);
+        if ($allFiles !== []) {
+            $attachments = CommissionAgentEmailFiles::toAttachments($allFiles);
+            if ($testTo !== '') {
+                $this->info("[INFO] [$display] NSF_REPORT_TEST_TO set — sending All only to $testTo");
+                $sent = $email->sendMailHtml($subject, $body, [$testTo], [], [], $attachments);
+            } else {
+                $sent = $email->sendMailUsingTblReportsHtml(
+                    $sql,
+                    $reportNames,
+                    $company,
+                    $subject,
+                    $body,
+                    $attachments,
+                    true
+                );
+            }
+            if ($sent) {
+                $this->info("[INFO] [$display] All NSF report emailed (" . count($attachments) . " attachment(s)).");
+            } else {
+                $this->warn("[WARN] [$display] All NSF email not sent.");
+                Log::warning("GenerateNSFCommissionReport[$display]: All email not sent.");
+            }
         } else {
-            $sent = $email->sendMailUsingTblReportsHtml(
-                $sql,
-                ['NSFCommissionReport', 'NSF Commission Report'],
-                [strtoupper($display === 'Progress Law' ? 'PLAW' : 'LDR')],
-                $subject,
-                $body,
-                $attachments,
-                true
-            );
+            $this->warn("[WARN] [$display] No All workbook to email.");
         }
 
-        if ($sent) {
-            $this->info("[INFO] [$display] NSF Commission Report sent with " . count($attachments) . " attachment(s).");
-        } else {
-            $this->warn("[WARN] [$display] Email not sent.");
-            Log::warning("GenerateNSFCommissionReport[$display]: email not sent.");
+        // Avoid PHP max_execution_time killing a long per-agent send loop.
+        @set_time_limit(0);
+
+        $agentSent = 0;
+        $agentCount = count($agentFiles);
+        foreach ($agentFiles as $i => $f) {
+            $agentName = CommissionAgentEmailFiles::agentNameFromFilename((string) $f['filename']);
+            $agentSubject = $subject . ' - ' . $agentName;
+            $agentBody = '<p>See attached NSF Commission Report - '
+                . htmlspecialchars($display) . ' - ' . htmlspecialchars($agentName) . '.</p>';
+            $attachments = CommissionAgentEmailFiles::toAttachments([$f]);
+
+            // Agent copies go only to Rama (hardcoded per Jacob — she forwards manually).
+            // NSF_REPORT_TEST_TO still overrides for test runs.
+            $agentTo = $testTo !== '' ? [$testTo] : ['rama@libertydebtrelief.com'];
+            $sent = $email->sendMailHtml($agentSubject, $agentBody, $agentTo, [], [], $attachments);
+            if ($sent) {
+                $agentSent++;
+            } else {
+                $this->warn("[WARN] [$display] Agent copy not sent for {$agentName}.");
+            }
+            if ($i < $agentCount - 1) {
+                usleep(250_000);
+            }
+        }
+        if ($agentFiles !== []) {
+            $this->info("[INFO] [$display] Agent copies emailed to Rama: {$agentSent}/" . count($agentFiles) . ".");
         }
     }
 

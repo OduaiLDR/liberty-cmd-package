@@ -10,7 +10,7 @@ use Illuminate\Support\Facades\Log;
 class GenerateEnrollmentSummaryReport extends Command
 {
     protected $signature = 'Generate:enrollment-summary-report
-        {--date= : Window date (Y-m-d), drives which month the "Paying in X" projection window starts from. If omitted, resolved automatically via SoldTranche() (see resolveDefaultWindowDate).}
+        {--date= : Window date (Y-m-d). If omitted, resolved automatically via SoldTranche() (see resolveDefaultWindowDate).}
         {--snapshot-date= : TESTING ONLY. Overrides today\'s date for snapshot metrics (Gross Enrollments, Cancels, NSFs, etc). The VBA always uses today for these regardless of --date.}
         {--no-email : Skip sending the email, just build the file}
         {--output= : Save the workbook to this path instead of the temp storage path (implies --no-email unless combined with normal flow)}';
@@ -97,8 +97,29 @@ class GenerateEnrollmentSummaryReport extends Command
             Log::error('GenerateEnrollmentSummaryReport: monthly residuals failed', ['exception' => $e]);
         }
 
+        $monthlyEnrollmentSummary = null;
+        try {
+            $this->info('[INFO] Building Monthly Enrollment Summary...');
+            $monthlyEnrollmentSummary = (new MonthlyEnrollmentSummaryBuilder())->build(
+                $connector,
+                $snapshotDate,
+                self::COLUMNS['Total']
+            );
+        } catch (\Throwable $e) {
+            $this->warn('[WARN] Monthly Enrollment Summary failed: ' . $e->getMessage());
+            Log::error('GenerateEnrollmentSummaryReport: monthly enrollment summary failed', ['exception' => $e]);
+        }
+
         $formatter = new Formatter();
-        $workbook = $formatter->buildWorkbook($this->rows, array_keys(self::COLUMNS), $snapshotDate, $trancheRows, $capitalReport, $monthlyResiduals);
+        $workbook = $formatter->buildWorkbook(
+            $this->rows,
+            array_keys(self::COLUMNS),
+            $snapshotDate,
+            $trancheRows,
+            $capitalReport,
+            $monthlyResiduals,
+            $monthlyEnrollmentSummary
+        );
 
         $outputPath = $this->option('output');
         if ($outputPath !== null && $workbook !== null) {
@@ -174,8 +195,6 @@ class GenerateEnrollmentSummaryReport extends Command
 
         $this->setRow('Net New Enrollments', $columnKey, $enrollments - $cancels - $nsfs, 'count');
 
-        $this->buildMonthBuckets($connector, $columnKey, $criteria, $windowDate, $snapshotDate);
-
         // Post-loop totals (Cancel/NSF Peel Offs are hard-coded to Category = 'LDR' in the VBA, kept as-is).
         $this->setRow('', $columnKey, null, 'blank', blank: true);
 
@@ -248,130 +267,6 @@ class GenerateEnrollmentSummaryReport extends Command
             WHERE Category = 'LDR' AND Cancel_Date IS NULL AND NSF_Date IS NULL {$criteria}
         ");
         $this->setRow('Total Net Enrolled Debt', $columnKey, $totalNetEnrolledDebt, 'currency');
-    }
-
-    /**
-     * Month-bucketed "Paying in X" rows, mirrors the VBA's `For j = StartDate To EndDate` month loop.
-     */
-    private function buildMonthBuckets(DBConnector $connector, string $columnKey, string $criteria, string $windowDate, string $snapshotDate): void
-    {
-        // VBA: StartDate = first day of ReportDate's month (no offset); EndDate = last day of the
-        // month containing ReportDate + 45 days.
-        $start = new \DateTime($windowDate);
-        $start->modify('first day of this month');
-
-        $end = new \DateTime($windowDate);
-        $end->modify('+45 days');
-        $end->modify('last day of this month');
-
-        $cursor = clone $start;
-        $monthIndex = 0;
-
-        while ($cursor <= $end) {
-            $monthIndex++;
-            $monthStart = $cursor->format('Y-m-d');
-            $monthEnd = (clone $cursor)->modify('last day of this month')->format('Y-m-d');
-            $monthLabel = $cursor->format('F');
-
-            $this->setRow('', $columnKey, null, 'blank', blank: true);
-
-            $paidCoalesce = 'COALESCE(First_Payment_Date, Payment_Date_2, Payment_Date_1)';
-
-            $grossNew = (int) $this->scalar($connector, "
-                SELECT COUNT(*) FROM TblEnrollment
-                WHERE Welcome_Call_Date = ?
-                  AND {$paidCoalesce} >= ? AND {$paidCoalesce} <= ? {$criteria}
-            ", [$snapshotDate, $monthStart, $monthEnd]);
-            $this->setRow("Gross New Enrollments Paying In {$monthLabel}", $columnKey, $grossNew, 'count');
-
-            $cancels = (int) $this->scalar($connector, "
-                SELECT COUNT(*) FROM TblEnrollment
-                WHERE Cancel_Date = ?
-                  AND {$paidCoalesce} >= ? AND {$paidCoalesce} <= ? {$criteria}
-            ", [$snapshotDate, $monthStart, $monthEnd]);
-            $this->setRow("Cancels of Client's Paying in {$monthLabel}", $columnKey, $cancels, 'count');
-
-            $nsfs = (int) $this->scalar($connector, "
-                SELECT COUNT(*) FROM TblEnrollment
-                WHERE NSF_Date = ?
-                  AND {$paidCoalesce} >= ? AND {$paidCoalesce} <= ? {$criteria}
-            ", [$snapshotDate, $monthStart, $monthEnd]);
-            $this->setRow("NSFs of Client's Paying in {$monthLabel}", $columnKey, $nsfs, 'count');
-
-            $this->setRow("Net New Clients Paying in {$monthLabel}", $columnKey, $grossNew - $cancels - $nsfs, 'count');
-
-            $grossDebt = (float) $this->scalar($connector, "
-                SELECT SUM(Debt_Amount) FROM TblEnrollment
-                WHERE Welcome_Call_Date = ?
-                  AND {$paidCoalesce} >= ? AND {$paidCoalesce} <= ? {$criteria}
-            ", [$snapshotDate, $monthStart, $monthEnd]);
-            $this->setRow("Gross Debt Enrolled Paying in {$monthLabel}", $columnKey, $grossDebt, 'currency');
-
-            $debtCancel = (float) $this->scalar($connector, "
-                SELECT SUM(Debt_Amount) FROM TblEnrollment
-                WHERE Cancel_Date = ?
-                  AND {$paidCoalesce} >= ? AND {$paidCoalesce} <= ? {$criteria}
-            ", [$snapshotDate, $monthStart, $monthEnd]);
-            $this->setRow("Cancel Peel Offs Paying in {$monthLabel}", $columnKey, $debtCancel, 'currency');
-
-            $debtNsf = (float) $this->scalar($connector, "
-                SELECT SUM(Debt_Amount) FROM TblEnrollment
-                WHERE NSF_Date = ?
-                  AND {$paidCoalesce} >= ? AND {$paidCoalesce} <= ? {$criteria}
-            ", [$snapshotDate, $monthStart, $monthEnd]);
-            $this->setRow("NSF Peel Offs Paying in {$monthLabel}", $columnKey, $debtNsf, 'currency');
-
-            $this->setRow("Total Net Debt Enrolled Paying in {$monthLabel}", $columnKey, $grossDebt - $debtCancel - $debtNsf, 'currency');
-
-            $deals = (int) $this->scalar($connector, "
-                SELECT COUNT(*) FROM TblEnrollment
-                WHERE Cancel_Date IS NULL AND NSF_Date IS NULL
-                  AND {$paidCoalesce} >= ? AND {$paidCoalesce} <= ? {$criteria}
-            ", [$monthStart, $monthEnd]);
-            $this->setRow("Total Deals Paying in {$monthLabel}", $columnKey, $deals, 'count', bold: true);
-
-            $totalDebt = (float) $this->scalar($connector, "
-                SELECT SUM(Debt_Amount) FROM TblEnrollment
-                WHERE Cancel_Date IS NULL AND NSF_Date IS NULL
-                  AND {$paidCoalesce} >= ? AND {$paidCoalesce} <= ? {$criteria}
-            ", [$monthStart, $monthEnd]);
-            $this->setRow("Total Debt Paying in {$monthLabel}", $columnKey, $totalDebt, 'currency', bold: true);
-
-            $sellableDebt = (float) $this->scalar($connector, "
-                SELECT SUM(Debt_Amount) FROM TblEnrollment
-                WHERE Cancel_Date IS NULL AND NSF_Date IS NULL
-                  AND {$paidCoalesce} >= ? AND {$paidCoalesce} <= ?
-                  AND Debt_Sold_To IS NULL
-                  AND Enrollment_Status IN('LDR Enrolled', 'ProLaw Enrolled', 'Approved') {$criteria}
-            ", [$monthStart, $monthEnd]);
-            $this->setRow("Sellable Debt Paying in {$monthLabel}", $columnKey, $sellableDebt, 'currency', bold: true);
-
-            $reconsiderationDebt = (float) $this->scalar($connector, "
-                SELECT SUM(Debt_Amount) FROM TblEnrollment
-                WHERE Cancel_Date IS NULL AND NSF_Date IS NULL
-                  AND {$paidCoalesce} >= ? AND {$paidCoalesce} <= ?
-                  AND Debt_Sold_To IS NULL
-                  AND Enrollment_Status = 'Enrolled (Reconsideration Pending)' {$criteria}
-            ", [$monthStart, $monthEnd]);
-            $this->setRow("Reconsideration Pending Debt Paying in {$monthLabel}", $columnKey, $reconsiderationDebt, 'currency', bold: true);
-
-            // Only computed for the first two months in the window (VBA: `If Row = 23` / `ElseIf Row = 37`).
-            // Month 1 uses a hardcoded 7/1/2022 lower bound on First_Payment_Date; month 2 uses that month's bounds.
-            if ($monthIndex === 1 || $monthIndex === 2) {
-                $firstPaymentStart = $monthIndex === 1 ? '2022-07-01' : $monthStart;
-
-                $clearedDebt = (float) $this->scalar($connector, "
-                    SELECT SUM(Debt_Amount) FROM TblEnrollment
-                    WHERE First_Payment_Date >= ? AND First_Payment_Date <= ?
-                      AND First_Payment_Cleared_Date IS NOT NULL
-                      AND Debt_Sold_To IS NULL
-                      AND Enrollment_Status IN('LDR Enrolled', 'ProLaw Enrolled', 'Approved') {$criteria}
-                ", [$firstPaymentStart, $monthEnd]);
-                $this->setRow("Sellable Debt Cleared in {$monthLabel}", $columnKey, $clearedDebt, 'currency', bold: true);
-            }
-
-            $cursor->modify('first day of next month');
-        }
     }
 
     /**

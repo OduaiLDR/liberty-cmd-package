@@ -18,12 +18,13 @@ class RetentionCommissionReportBuilder
             'recon_status_id'       => 377650,
             'cancel_request_custom' => 742098,
             'has_t4'                => true,
+            // Summary agents from Jacob's July 2026 correct All workbook.
             'agents' => [
                 'Alice Kennedy', 'Andrea Mendoza', 'Gracia Rivera', 'Javier Deras',
-                'John Pozuelos', 'Jose Melgar', 'Ken Smith', 'Marco Gonzalez',
-                'Mike Wexford', 'Rick Mills',
+                'John Pozuelos', 'Ken Smith', 'Mike Wexford', 'Wendy Kazem',
             ],
-            'excluded_agents' => ['WENDY KAZEM'],
+            // VBA does not exclude anyone from the detail sheet.
+            'excluded_agents' => [],
         ],
         'plaw' => [
             'display'               => 'Progress Law',
@@ -32,11 +33,12 @@ class RetentionCommissionReportBuilder
             'custom_results'        => 742106,
             'recon_status_id'       => 377687,
             'cancel_request_custom' => 742100,
+            // Keep T4 (Jacob request) even though older PLAW VBA had tiers 0-3 only.
             'has_t4'                => true,
+            // Summary agents from Jacob's July 2026 correct All workbook.
             'agents' => [
                 'Alexander Malone', 'Andrea Galvez', 'Edgar Gonzalez', 'Maria Lezana',
-                'Melody Martinez', 'Nick Jones', 'Theo Clayton', 'Tony Walker',
-                'Vicente Gonzalez', 'Alfred Brown',
+                'Melody Martinez', 'Theo Clayton',
             ],
             'excluded_agents' => [],
         ],
@@ -69,6 +71,9 @@ class RetentionCommissionReportBuilder
             $agent = strtoupper((string) $this->col($row, 'RETENTION_AGENT', ''));
             if ($agent === 'ANDREA MENDOZE') {
                 $row['RETENTION_AGENT'] = 'ANDREA MENDOZA';
+            } elseif ($agent === 'ANDREA GALVES') {
+                // VBA list typo "Galves"; CRM / Summary use Galvez.
+                $row['RETENTION_AGENT'] = 'ANDREA GALVEZ';
             }
             $row['SOURCE'] = $display;
         }
@@ -104,7 +109,8 @@ class RetentionCommissionReportBuilder
             $count = 0;
             if ($recon && !empty($allTxMap[$id])) {
                 foreach ($allTxMap[$id] as $d) {
-                    if ($d < $recon) {
+                    $txDay = $this->toDate($d);
+                    if ($txDay !== null && $txDay < $recon) {
                         $count++;
                     }
                 }
@@ -145,7 +151,8 @@ class RetentionCommissionReportBuilder
             $id = (string) $this->col($row, 'ID', '');
             $firstTx = null;
             foreach ($allTxMap[$id] ?? [] as $txDate) {
-                if ($txDate >= $recon) {
+                $txDay = $this->toDate($txDate);
+                if ($txDay !== null && $txDay >= $recon) {
                     $firstTx = $txDate;
                     break;
                 }
@@ -155,19 +162,21 @@ class RetentionCommissionReportBuilder
             }
 
             $dropped = $this->toDate($this->col($row, 'DROPPED_DATE'));
-            if ($dropped !== null && $firstTx >= $dropped) {
+            $payDay  = $this->toDate($firstTx);
+            if ($dropped !== null && $payDay !== null && $payDay >= $dropped) {
                 continue;
             }
 
             $row['RETENTION_PAYMENT_DATE'] = $firstTx;
             $debt = (float) $this->col($row, 'ENROLLED_DEBT', 0);
             $agent = strtoupper((string) $this->col($row, 'RETENTION_AGENT', ''));
-            $multi = ($agent === 'SYDNEY LEYVA') ? 2 : 1;
+            // PLAW VBA only: Sydney Leyva doubles T1-T3. Keep T4 undoubled.
+            $multi = ($source === 'plaw' && $agent === 'SYDNEY LEYVA') ? 2 : 1;
             $tier = $this->tierAmounts($debt);
             $row['T1'] = $tier['t1'] * $multi;
             $row['T2'] = $tier['t2'] * $multi;
             $row['T3'] = $tier['t3'] * $multi;
-            $row['T4'] = $tier['t4'] * $multi;
+            $row['T4'] = $tier['t4'];
         }
         unset($row);
 
@@ -205,8 +214,8 @@ class RetentionCommissionReportBuilder
         }
 
         $all = array_values(array_filter($all, function (array $row) use ($startDate, $endDate): bool {
-            $cancelRequestDate = $this->toDate($this->col($row, 'CANCEL_REQUEST_DATE'));
-            return $cancelRequestDate !== null && $cancelRequestDate >= $startDate && $cancelRequestDate <= $endDate;
+            // Match VBA Excel COUNTIFS: cancel datetime <= endDate at midnight.
+            return $this->inExcelPeriod($this->col($row, 'CANCEL_REQUEST_DATE'), $startDate, $endDate, true);
         }));
 
         $all = $this->dedupeRetentionRowsByContactId($all);
@@ -263,7 +272,8 @@ class RetentionCommissionReportBuilder
                 cu3.F_STRING AS IMMEDIATE_RESULTS,
                 d.ENROLLED_DEBT,
                 LEFT(c.DROPPED_DATE, 10) AS DROPPED_DATE,
-                TO_VARCHAR(TO_DATE(cu4.F_DATETIME), 'YYYY-MM-DD') AS CANCEL_REQUEST_DATE
+                -- Keep full datetime like VBA (Excel COUNTIFS vs DateSerial end = midnight).
+                TO_VARCHAR(cu4.F_DATETIME) AS CANCEL_REQUEST_DATE
             FROM CONTACTS c
             LEFT JOIN CONTACTS_USERFIELDS cu1 ON cu1.CONTACT_ID = c.ID AND cu1.CUSTOM_ID = {$ca}
             LEFT JOIN (SELECT CONTACT_ID, F_DATE FROM CONTACTS_USERFIELDS WHERE CUSTOM_ID = {$cd}) cu2 ON c.ID = cu2.CONTACT_ID
@@ -323,7 +333,7 @@ class RetentionCommissionReportBuilder
     private function fetchFirstClearedPerContact(DBConnector $sf, string $idList): array
     {
         $sql = "
-            SELECT CONTACT_ID, LEFT(CLEARED_DATE,10) AS CLEARED_DATE
+            SELECT CONTACT_ID, TO_VARCHAR(CLEARED_DATE) AS CLEARED_DATE
             FROM TRANSACTIONS
             WHERE TRANS_TYPE = 'D'
               AND CLEARED_DATE IS NOT NULL
@@ -333,9 +343,42 @@ class RetentionCommissionReportBuilder
         ";
         $map = [];
         foreach ($sf->query($sql)['data'] ?? [] as $r) {
-            $map[(string) $r['CONTACT_ID']][] = substr((string) $r['CLEARED_DATE'], 0, 10);
+            $map[(string) $r['CONTACT_ID']][] = (string) $r['CLEARED_DATE'];
         }
         return $map;
+    }
+
+    /**
+     * VBA Excel COUNTIFS vs DateSerial(start)/DateSerial(end).
+     * DateTime fields: timestamps from start 00:00:00 through end 00:00:00 inclusive.
+     * Date-only fields: full calendar day inclusive through endDate.
+     */
+    public function inExcelPeriod(mixed $value, string $startDate, string $endDate, bool $dateTimeField): bool
+    {
+        if ($value === null || $value === '') {
+            return false;
+        }
+
+        $startTs = strtotime($startDate . ' 00:00:00');
+        $endTs   = strtotime($endDate . ' 00:00:00');
+        if ($startTs === false || $endTs === false) {
+            return false;
+        }
+
+        if ($dateTimeField) {
+            $ts = $value instanceof \DateTimeInterface
+                ? $value->getTimestamp()
+                : strtotime((string) $value);
+            if ($ts === false) {
+                return false;
+            }
+
+            return $ts >= $startTs && $ts <= $endTs;
+        }
+
+        $d = $this->toDate($value);
+
+        return $d !== null && $d >= $startDate && $d <= $endDate;
     }
 
     /** @param array<int,array<string,mixed>> $rows */
