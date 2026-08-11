@@ -59,7 +59,7 @@ class Formatter
     /**
      * @param list<array{llg_id:string,name:string,stage:string,days:int,debt:float,enrollment_status:string,cleared_payments:int}> $statusChanges
      */
-    public function sendRecap(DBConnector $connector, array $statusChanges, string $company, bool $dryRun = false, ?Command $console = null, bool $cancelsOnly = false): bool
+    public function sendRecap(DBConnector $connector, array $statusChanges, string $company, bool $dryRun = false, ?Command $console = null, bool $cancelsOnly = false, string $previewTo = ''): bool
     {
         // VBA: LDR macro subject says "LDR"; PLAW macro subject says "ProLaw".
         $subjectSuffix = strtoupper($company) === 'PLAW' ? 'ProLaw' : 'LDR';
@@ -99,12 +99,23 @@ class Formatter
                 'status_change_count' => count($statusChanges),
                 'workbook' => $builtPath,
             ]);
+            // --recap-to: email the exact built recap (body + workbook) to ONE preview address so
+            // the format can be eyeballed before a real run. Still zero CRM writes (dry-run) and no
+            // team email — the TblReports recipients are bypassed entirely.
+            if ($previewTo !== '') {
+                $previewSent = (new EmailSenderService())->sendMailHtml('[PREVIEW] ' . $subject, $body, [$previewTo], [], [], $attachments);
+                if ($console) {
+                    $console->info($previewSent
+                        ? "[INFO] [{$company}] DRY RUN - preview recap emailed to {$previewTo}."
+                        : "[WARN] [{$company}] DRY RUN - preview recap send to {$previewTo} FAILED.");
+                }
+            }
             if ($builtPath !== null && is_file($builtPath)) {
                 @unlink($builtPath);
             }
             if ($console) {
                 $note = $builtPath !== null ? basename($builtPath) . ' built' : 'no activity — plain note, no attachment';
-                $console->info("[INFO] [{$company}] DRY RUN - recap email not sent ({$note}).");
+                $console->info("[INFO] [{$company}] DRY RUN - recap email not sent to team ({$note}).");
             }
 
             return true;

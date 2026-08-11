@@ -53,7 +53,8 @@ final class GenerateResumePayments extends Command
         {--probe-void-settlements= : Diagnostic only — READ-ONLY dump of a single contact settlement-void screen (selectors, void-reason options, settlement rows) plus the pending settlement offers we would target for auto-void. Commits nothing. Tenant = first --company.}
         {--no-recap : Skip the Phase 6 recap email (status writes + resumes still happen). Use for controlled live tests so the team is not emailed a partial run.}
         {--cancels-only : Skip Phase 4 (NSF status updates + resume) and run ONLY the Day-4+ System Cancels. Use with --execute-cancels to work extra cancel batches through the backlog WITHOUT re-writing statuses or re-firing status-change triggers (Jacob 2026-07-20).}
-        {--run-on-weekend : Override the Mon-Fri guard and run on a Sat/Sun (business PT). For manual weekend ops only; the scheduled run should never pass this. Dry-runs + probes already run any day.}';
+        {--run-on-weekend : Override the Mon-Fri guard and run on a Sat/Sun (business PT). For manual weekend ops only; the scheduled run should never pass this. Dry-runs + probes already run any day.}
+        {--recap-to= : Preview the recap. In --dry-run, send the exact recap email (body + .xlsx) to ONLY this address (no team email, no CRM writes) so the format can be eyeballed before a real run.}';
 
     protected $description = 'Process NSF contacts for LDR and Progress Law: update statuses, resume drafts, and execute system cancels per the ResumePayments VBA workflow.';
 
@@ -2185,9 +2186,10 @@ final class GenerateResumePayments extends Command
     /**
      * Phase 6 — Build the "Status Changes" Excel and send the recap email.
      * Recipients + two-section body live in {@see Formatter}. In dry-run the
-     * workbook is built (to prove it works) but no email is sent.
+     * workbook is built (to prove it works) but no email is sent — unless --recap-to
+     * is set, which emails the built recap to that one preview address.
      *
-     * @param list<array{llg_id:string,name:string,stage:string,days:int,debt:float}> $statusChanges
+     * @param list<array{llg_id:string,name:string,stage:string,days:int,debt:float,enrollment_status:string,cleared_payments:int}> $statusChanges
      */
     private function sendRecap(DBConnector $connector, string $company, array $statusChanges, bool $dryRun): void
     {
@@ -2195,7 +2197,7 @@ final class GenerateResumePayments extends Command
             // --cancels-only runs skip the NSF step, so their report is a pure cancels
             // report (NSF stages hidden, "System Cancels" subject). The full run keeps
             // the standard NSF format.
-            (new Formatter())->sendRecap($connector, $statusChanges, $company, $dryRun, $this, (bool) $this->option('cancels-only'));
+            (new Formatter())->sendRecap($connector, $statusChanges, $company, $dryRun, $this, (bool) $this->option('cancels-only'), (string) ($this->option('recap-to') ?? ''));
         } catch (\Throwable $e) {
             $this->error("[{$company}] recap email failed: " . $e->getMessage());
             Log::error('GenerateResumePayments: sendRecap failed', [
