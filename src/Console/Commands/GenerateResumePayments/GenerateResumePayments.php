@@ -807,14 +807,20 @@ final class GenerateResumePayments extends Command
     }
 
     /**
-     * Phase 3 — Successful-draft adjustment.
+     * Phase 3 — Successful-draft (reschedule) adjustment.
      *
      * For each contact with a latest-NSF PROCESS_DATE (col C from Phase 1):
      *   - count successful (ACTIVE=1, CANCELLED=0) D-type txns CREATED after that
      *     PROCESS_DATE with their own PROCESS_DATE within the last 3 days
-     *   - subtract that count from nsf_count
-     *   - subtract count*30 from age_days (floor at 0)
-     *   - if nsf_count drops below 1 → mark Current (clear R-code, clear age, clear count)
+     *   - subtract that count — CAPPED AT 3 — from nsf_count (a reschedule can undo up
+     *     to 3 NSF levels, never more)
+     *   - if nsf_count drops below 1 → mark Current (Enrolled) for this cycle
+     *
+     * A reschedule NEVER resets the days-since-payment clock (age_days): only a real
+     * cleared payment does, and computeNsfStates already handles that (it breaks the
+     * NSF chain at the first cleared draft). So age_days is left untouched here — a
+     * serial rescheduler keeps aging and climbs back to NSF next cycle instead of
+     * sitting in Enrolled indefinitely.
      *
      * Implemented as a single batch fetch of recent successful drafts for all
      * candidate contacts, then a per-contact in-PHP filter against each contact's
@@ -885,13 +891,15 @@ final class GenerateResumePayments extends Command
                 continue;
             }
 
-            $state['nsf_count'] = max(0, ((int) ($state['nsf_count'] ?? 0)) - $count);
-            $state['age_days'] = max(0, ((int) ($state['age_days'] ?? 0)) - ($count * 30));
+            // Cap the reschedule credit at 3 NSF levels; never touch age_days (the
+            // days-since-payment clock only resets on a real cleared payment, handled
+            // by computeNsfStates when it breaks the chain at a cleared draft).
+            $offset = min($count, 3);
+            $state['nsf_count'] = max(0, ((int) ($state['nsf_count'] ?? 0)) - $offset);
 
             if ($state['nsf_count'] < 1) {
                 $state['is_current'] = true;
                 $state['current_rcode'] = '';
-                $state['age_days'] = 0;
                 $state['nsf_count'] = 0;
             }
         }
