@@ -158,7 +158,9 @@ class SyncEPFData extends Command
         $sql = <<<SQL
 SELECT
     CONCAT('LLG-', t.CONTACT_ID) AS LLG_ID,
-    CONVERT_TIMEZONE('America/Los_Angeles', t.PAID_TO) AS PAID_TO,
+    -- PAID_TO is a NUMBER (creditor/account id), not a timestamp. CONVERT_TIMEZONE
+    -- on it raises "Invalid argument types for function CONVERT_TIMEZONE".
+    t.PAID_TO,
     t.AMOUNT,
     CONVERT_TIMEZONE('America/Los_Angeles', t.DRAFT_DATE) AS DRAFT_DATE,
     CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE) AS PROCESS_DATE,
