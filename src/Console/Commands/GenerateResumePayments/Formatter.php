@@ -17,11 +17,12 @@ use PhpOffice\PhpSpreadsheet\Worksheet\Worksheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 
 /**
- * Phase 6 — recap for a ResumePayments run (Jacob 2026-07-20 format):
+ * Phase 6 — recap for a ResumePayments run (Jacob 2026-07-20, restructured 2026-08-11):
  *   - Email BODY: a per-stage summary — one line per stage with the client count
  *     and total debt. No client lists in the body.
- *   - Attachment: one worksheet per stage, columns LLG ID / Name / Debt / Days
- *     since NSF, sorted by days (desc) then name (asc).
+ *   - Attachment: one worksheet per stage, columns LLG ID / Name / Enrollment Status /
+ *     Cleared Payments / Debt / Days since NSF, sorted by enrollment status (asc) then
+ *     days since payment (desc).
  * One recap per company (LDR / ProLaw). Recipients live in dbo.TblReports.
  */
 class Formatter
@@ -40,9 +41,9 @@ class Formatter
      */
     private const STAGES = [
         ['key' => 'Resolved', 'label' => 'Resolved', 'sheet' => 'Resolved'],
-        ['key' => 'NSF-1', 'label' => 'NSF-1', 'sheet' => 'NSF-1'],
-        ['key' => 'NSF-2', 'label' => 'NSF-2', 'sheet' => 'NSF-2'],
-        ['key' => 'NSF-3', 'label' => 'NSF-3', 'sheet' => 'NSF-3'],
+        // Jacob 2026-08-11: the three fixed NSF-1/2/3 sheets are replaced by one At-Risk sheet
+        // (everyone who changed to an at-risk status today and isn't cancelling yet).
+        ['key' => 'At-Risk', 'label' => 'At-Risk', 'sheet' => 'At-Risk'],
         ['key' => 'Cancels - Grace Period', 'label' => 'Cancels - Grace Period', 'sheet' => 'Cancel - Grace Period'],
         // Internal key stays 'Cancels - Release Hold Requested' to match the command's
         // STAGE_CANCEL_HOLD (no matched-pair change), but the DISPLAY label is "Manual
@@ -56,7 +57,7 @@ class Formatter
     ];
 
     /**
-     * @param list<array{llg_id:string,name:string,stage:string,days:int,debt:float}> $statusChanges
+     * @param list<array{llg_id:string,name:string,stage:string,days:int,debt:float,enrollment_status:string,cleared_payments:int}> $statusChanges
      */
     public function sendRecap(DBConnector $connector, array $statusChanges, string $company, bool $dryRun = false, ?Command $console = null, bool $cancelsOnly = false): bool
     {
@@ -152,13 +153,13 @@ class Formatter
     }
 
     /**
-     * Bucket the rows by stage (in STAGES order) and sort each bucket by
-     * days-since-NSF descending, then client name ascending (Jacob 2026-07-20).
-     * Every stage gets a bucket (possibly empty) so the layout is stable. Rows with
-     * an unrecognized stage are dropped (they should not occur).
+     * Bucket the rows by stage (in STAGES order) and sort each bucket by enrollment
+     * status ascending, then days-since-payment descending, then client name ascending
+     * (Jacob 2026-08-11). Every stage gets a bucket (possibly empty) so the layout is
+     * stable. Rows with an unrecognized stage are dropped (they should not occur).
      *
-     * @param list<array{llg_id:string,name:string,stage:string,days:int,debt:float}> $statusChanges
-     * @return array<string, list<array{llg_id:string,name:string,stage:string,days:int,debt:float}>>
+     * @param list<array{llg_id:string,name:string,stage:string,days:int,debt:float,enrollment_status:string,cleared_payments:int}> $statusChanges
+     * @return array<string, list<array{llg_id:string,name:string,stage:string,days:int,debt:float,enrollment_status:string,cleared_payments:int}>>
      */
     private function groupByStage(array $statusChanges): array
     {
@@ -175,6 +176,11 @@ class Formatter
         }
 
         $sorter = static function (array $a, array $b): int {
+            // Jacob 2026-08-11: enrollment status ascending, then days-since-payment descending.
+            $byStatus = strcasecmp((string) ($a['enrollment_status'] ?? ''), (string) ($b['enrollment_status'] ?? ''));
+            if ($byStatus !== 0) {
+                return $byStatus;
+            }
             $byDays = ((int) ($b['days'] ?? 0)) <=> ((int) ($a['days'] ?? 0)); // days desc
             if ($byDays !== 0) {
                 return $byDays;
@@ -217,17 +223,17 @@ class Formatter
      * "give a summary and totals only ... put detail in attachment"). A cancels-only
      * run renders only the Cancels stages (see displayStages).
      *
-     * @param array<string, list<array{llg_id:string,name:string,stage:string,days:int,debt:float}>> $grouped
+     * @param array<string, list<array{llg_id:string,name:string,stage:string,days:int,debt:float,enrollment_status:string,cleared_payments:int}>> $grouped
      */
     private function buildSummaryBody(array $grouped, string $label, bool $cancelsOnly = false): string
     {
-        // Jacob 2026-07-28: group the summary into sections — Resolved on its own line, then the
-        // NSF rows with an "NSF Total" subtotal, then the Cancels rows with a "Cancels Total"
-        // subtotal, and finally the grand Total at the bottom.
-        $subtotalLabel = ['nsf' => 'NSF Total', 'cancels' => 'Cancels Total'];
+        // Summary sections (Jacob 2026-08-11): Resolved on its own line, then At-Risk on its own
+        // line, then the Cancels rows closed by a "Cancels Total" subtotal. Resolved and At-Risk
+        // are each a single row; only Cancels carries a subtotal.
+        $subtotalLabel = ['cancels' => 'Cancels Total'];
         $sectionOf = static function (string $key): string {
-            if (str_starts_with($key, 'NSF')) {
-                return 'nsf';
+            if ($key === 'At-Risk') {
+                return 'atrisk';
             }
             if (str_starts_with($key, 'Cancels')) {
                 return 'cancels';
@@ -248,9 +254,7 @@ class Formatter
             // Section changed → close out the previous one (its subtotal, if any) + a spacer.
             if ($prevSection !== null && $section !== $prevSection) {
                 if (isset($subtotalLabel[$prevSection])) {
-                    // Jacob 2026-07-30: line under NSF Total (before Cancels).
-                    $subtotalBottom = ($prevSection === 'nsf');
-                    $rows .= $this->summaryRow($subtotalLabel[$prevSection], $secClients, $secDebt, 'subtotal', $subtotalBottom);
+                    $rows .= $this->summaryRow($subtotalLabel[$prevSection], $secClients, $secDebt, 'subtotal');
                 }
                 $rows .= $spacer;
                 $secClients = 0;
@@ -266,8 +270,8 @@ class Formatter
             $secClients += $count;
             $secDebt += $debt;
 
-            // Jacob 2026-07-30: line under Resolved (it is its own single-row section).
-            $rowBottom = ($stage['key'] === 'Resolved');
+            // Line under each single-row section (Resolved, At-Risk) before the next section.
+            $rowBottom = in_array($stage['key'], ['Resolved', 'At-Risk'], true);
             $rows .= $this->summaryRow($stage['label'], $count, $debt, '', $rowBottom);
             $prevSection = $section;
         }
@@ -323,11 +327,12 @@ class Formatter
     }
 
     /**
-     * One worksheet per stage: LLG ID / Name / Debt / Days since NSF, sorted by days
-     * (desc) then name. Empty stages still get a header-only sheet so the layout is
-     * stable run-to-run.
+     * One worksheet per stage: LLG ID / Name / Enrollment Status / Cleared Payments /
+     * Debt / Days since NSF, sorted by enrollment status (asc) then days-since-payment
+     * (desc). Empty stages still get a header-only sheet so the layout is stable
+     * run-to-run.
      *
-     * @param array<string, list<array{llg_id:string,name:string,stage:string,days:int,debt:float}>> $grouped
+     * @param array<string, list<array{llg_id:string,name:string,stage:string,days:int,debt:float,enrollment_status:string,cleared_payments:int}>> $grouped
      * @return array{filename:string, path:string}
      */
     public function buildWorkbook(array $grouped, string $company, bool $cancelsOnly = false): array
@@ -342,28 +347,33 @@ class Formatter
             $sheet->setTitle($stage['sheet']);
             $sheet->setShowGridlines(false);
 
-            $sheet->fromArray(['LLG ID', 'Name', 'Debt', 'Days since NSF'], null, 'A1');
-            $this->styleHeader($sheet, 'A1:D1');
+            // Jacob 2026-08-11: add Enrollment Status + Cleared Payments to every sheet.
+            $sheet->fromArray(['LLG ID', 'Name', 'Enrollment Status', 'Cleared Payments', 'Debt', 'Days since NSF'], null, 'A1');
+            $this->styleHeader($sheet, 'A1:F1');
 
             $rowIndex = 2;
             foreach ($grouped[$stage['key']] ?? [] as $change) {
                 $sheet->setCellValue("A{$rowIndex}", (string) ($change['llg_id'] ?? ''));
                 $sheet->setCellValue("B{$rowIndex}", (string) ($change['name'] ?? ''));
-                $sheet->setCellValueExplicit("C{$rowIndex}", (float) ($change['debt'] ?? 0), DataType::TYPE_NUMERIC);
-                $sheet->setCellValueExplicit("D{$rowIndex}", (int) ($change['days'] ?? 0), DataType::TYPE_NUMERIC);
+                $sheet->setCellValue("C{$rowIndex}", (string) ($change['enrollment_status'] ?? ''));
+                $sheet->setCellValueExplicit("D{$rowIndex}", (int) ($change['cleared_payments'] ?? 0), DataType::TYPE_NUMERIC);
+                $sheet->setCellValueExplicit("E{$rowIndex}", (float) ($change['debt'] ?? 0), DataType::TYPE_NUMERIC);
+                $sheet->setCellValueExplicit("F{$rowIndex}", (int) ($change['days'] ?? 0), DataType::TYPE_NUMERIC);
                 $rowIndex++;
             }
 
             $lastRow = max(2, $rowIndex - 1);
 
-            $this->applyBorders($sheet, "A1:D{$lastRow}");
-            $sheet->getStyle("A1:D{$lastRow}")->getFont()->setName('Calibri')->setSize(9);
-            $sheet->getStyle("A1:D{$lastRow}")->getAlignment()->setVertical(Alignment::VERTICAL_TOP);
-            $sheet->getStyle("C2:C{$lastRow}")->getNumberFormat()->setFormatCode('#,##0.00');
+            $this->applyBorders($sheet, "A1:F{$lastRow}");
+            $sheet->getStyle("A1:F{$lastRow}")->getFont()->setName('Calibri')->setSize(9);
+            $sheet->getStyle("A1:F{$lastRow}")->getAlignment()->setVertical(Alignment::VERTICAL_TOP);
+            $sheet->getStyle("E2:E{$lastRow}")->getNumberFormat()->setFormatCode('#,##0.00');
             $sheet->getColumnDimension('A')->setWidth(18);
             $sheet->getColumnDimension('B')->setWidth(26);
-            $sheet->getColumnDimension('C')->setWidth(14);
-            $sheet->getColumnDimension('D')->setWidth(14);
+            $sheet->getColumnDimension('C')->setWidth(34);
+            $sheet->getColumnDimension('D')->setWidth(16);
+            $sheet->getColumnDimension('E')->setWidth(14);
+            $sheet->getColumnDimension('F')->setWidth(14);
             $sheet->freezePane('A2');
             $sheet->setSelectedCells('A1');
         }

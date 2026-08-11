@@ -74,13 +74,17 @@ final class GenerateResumePayments extends Command
     private const CANDIDATE_CHUNK_SIZE = 500;
 
     /**
-     * Recap stage keys (Jacob 2026-07-20): every processed client lands in exactly
-     * one stage. The recap email shows a per-stage COUNT + total debt, and the
-     * attached workbook has one sheet per stage (LLG ID / Name / Debt / Days since
-     * NSF). NSF-1/2/3 are derived from nsf_count via nsfStage(). These keys MUST
-     * stay in sync with Formatter::STAGES.
+     * Recap stage keys (Jacob 2026-07-20, restructured 2026-08-11): every processed client
+     * lands in exactly one stage. The recap email shows a per-stage COUNT + total debt, and
+     * the attached workbook has one sheet per stage. The old NSF-1/2/3 buckets are now a single
+     * At-Risk bucket. These keys MUST stay in sync with Formatter::STAGES.
      */
     private const STAGE_RESOLVED = 'Resolved';
+    // Jacob 2026-08-11 redesign: the NSF-1/2/3 sheets are replaced by a single "At-Risk"
+    // bucket — every contact that changed to an at-risk (NSF/reason-ladder) status today and
+    // is NOT yet in the cancel funnel (age <= 105). Drops the "missing statuses" gap of the
+    // three fixed NSF sheets.
+    private const STAGE_AT_RISK = 'At-Risk';
     private const STAGE_CANCEL_GRACE = 'Cancels - Grace Period';
     private const STAGE_CANCEL_HOLD = 'Cancels - Release Hold Requested';
     private const STAGE_CANCEL_BACKLOG = 'Cancels - Backlog';
@@ -105,6 +109,19 @@ final class GenerateResumePayments extends Command
     private int $healthSessionFailure = 0;
     private int $healthCompanyFailed = 0;
     private int $healthDropNotLand = 0;
+
+    /**
+     * Per-contact enrichment for the recap rows (Jacob 2026-08-11: every sheet shows the
+     * enrollment status + a lifetime cleared-payment count). Keyed by raw CONTACT_ID.
+     * $statusByContact is filled incrementally by fetchCurrentStatuses (so any contact whose
+     * status was looked up is available to row()); $clearedByContact is filled once per
+     * company from fetchClearedPaymentCounts. row() reads both — no call-site churn.
+     *
+     * @var array<string, string>
+     */
+    private array $statusByContact = [];
+    /** @var array<string, int> */
+    private array $clearedByContact = [];
 
     /** Statuses whose presence in CurrentStatus causes the contact to be SKIPPED entirely. */
     private const SKIP_STATUS_SUBSTRINGS = [
@@ -185,6 +202,9 @@ final class GenerateResumePayments extends Command
             $this->healthSessionFailure = 0;
             $this->healthCompanyFailed = 0;
             $this->healthDropNotLand = 0;
+            // Per-company recap enrichment maps (enrollment status + cleared-payment count).
+            $this->statusByContact = [];
+            $this->clearedByContact = [];
             $statusChanges = [];
 
             try {
@@ -207,6 +227,14 @@ final class GenerateResumePayments extends Command
                 // Enrich each state with the enrolled debt (TblEnrollment.Debt_Amount)
                 // for the recap's Debt column (Jacob 2026-07-20).
                 $this->applyDebtAmounts($sqlConnector, $states);
+
+                // Lifetime cleared-payment count per candidate for the recap's new
+                // "Cleared Payments" column (Jacob 2026-08-11) — one batched query.
+                $candidateIds = array_values(array_filter(array_map(
+                    static fn(array $s): string => (string) ($s['CONTACT_ID'] ?? ''),
+                    $states,
+                )));
+                $this->clearedByContact = $this->fetchClearedPaymentCounts($snowflake, $candidateIds);
 
                 if ($this->option('cancels-only')) {
                     // Jacob 2026-07-20: extra backlog batches — run only the Day-4+ cancels,
@@ -262,7 +290,9 @@ final class GenerateResumePayments extends Command
             static fn(array $r): string => (string) ($r['stage'] ?? ''),
             $statusChanges,
         ));
-        $nsf = ($c['NSF-1'] ?? 0) + ($c['NSF-2'] ?? 0) + ($c['NSF-3'] ?? 0);
+        // At-Risk replaces the old NSF-1/2/3 buckets (Jacob 2026-08-11); the HEALTH key stays
+        // `nsf=` so resume-payments:health keeps parsing it — it now means the At-Risk count.
+        $nsf = $c[self::STAGE_AT_RISK] ?? 0;
 
         $this->info(sprintf(
             '[INFO] [%s] HEALTH resolved=%d nsf=%d grace=%d manual=%d queued=%d completed=%d '
@@ -1062,9 +1092,12 @@ final class GenerateResumePayments extends Command
                 if ($this->tryResume($tenant, $cid, $dryRun)) {
                     $this->dppClient->addNote($tenant, $cid, 'Payments Resumed. New draft scheduled.', $dryRun);
                 }
-                // Resumed or not, the recap stage is the same NSF bucket (Jacob 2026-07-20
-                // folds the resume outcome into NSF-1/2/3); the status write below records it.
-                $statusChanges[] = $this->row($cid, $name, $this->nsfStage($nsfCount), $age, $debt);
+                // At-Risk sheet (Jacob 2026-08-11): only list them here while they're not yet
+                // in the cancel funnel (age <= 105). Past 105 days they belong to the cancel
+                // sheets (Phase 5) — listing them in both would double-count the client.
+                if ($age <= self::SYSTEM_CANCEL_AGE_DAYS) {
+                    $statusChanges[] = $this->row($cid, $name, self::STAGE_AT_RISK, $age, $debt);
+                }
 
                 $this->insertResumePayments($sqlConnector, $cid, $today, $returnDate, $nsfCount, $monthStart, $dryRun);
                 $this->dppClient->setClientStatus($tenant, $cid, $status, $dryRun);
@@ -1079,7 +1112,10 @@ final class GenerateResumePayments extends Command
             }
 
             $this->dppClient->setClientStatus($tenant, $cid, $status, $dryRun);
-            $statusChanges[] = $this->row($cid, $name, $this->nsfStage($nsfCount), $age, $debt);
+            // At-Risk sheet, but not once they cross into the cancel funnel (see NSF branch).
+            if ($age <= self::SYSTEM_CANCEL_AGE_DAYS) {
+                $statusChanges[] = $this->row($cid, $name, self::STAGE_AT_RISK, $age, $debt);
+            }
         }
 
         return $statusChanges;
@@ -1087,10 +1123,11 @@ final class GenerateResumePayments extends Command
 
     /**
      * Build one recap row in the shape the {@see Formatter} consumes: LLG id, client
-     * name, the recap STAGE (a STAGE_* constant or nsfStage()), days-since-NSF (age),
-     * and enrolled debt. One client = one stage.
+     * name, the recap STAGE (a STAGE_* constant), days-since-NSF (age), enrolled debt,
+     * and — Jacob 2026-08-11 — the current enrollment status + lifetime cleared-payment
+     * count (both looked up from the per-contact enrichment maps). One client = one stage.
      *
-     * @return array{llg_id:string,name:string,stage:string,days:int,debt:float}
+     * @return array{llg_id:string,name:string,stage:string,days:int,debt:float,enrollment_status:string,cleared_payments:int}
      */
     private function row(string $contactId, string $name, string $stage, int $days, float $debt): array
     {
@@ -1100,13 +1137,9 @@ final class GenerateResumePayments extends Command
             'stage' => $stage,
             'days' => $days,
             'debt' => $debt,
+            'enrollment_status' => $this->statusByContact[$contactId] ?? '',
+            'cleared_payments' => $this->clearedByContact[$contactId] ?? 0,
         ];
-    }
-
-    /** nsf_count → NSF-1/2/3 recap stage (Jacob folds 15/30/45/60/90 into 1/2/3). */
-    private function nsfStage(int $nsfCount): string
-    {
-        return 'NSF-' . max(1, min(3, $nsfCount));
     }
 
     /**
@@ -1145,6 +1178,50 @@ final class GenerateResumePayments extends Command
             $cid = (string) ($row['CONTACT_ID'] ?? '');
             if ($cid !== '') {
                 $map[$cid] = (string) ($row['TITLE'] ?? '');
+            }
+        }
+
+        // Keep an instance-wide copy so row() can stamp each recap line with the enrollment
+        // status without every call site having to pass it (Jacob 2026-08-11). Every contact
+        // that reaches a row() has had its status looked up here first.
+        $this->statusByContact += $map;
+
+        return $map;
+    }
+
+    /**
+     * Lifetime count of cleared (successful, not returned, not cancelled) drafts per contact,
+     * for the recap's "Cleared Payments" column (Jacob 2026-08-11). Batched for all candidates.
+     *
+     * @param list<string> $contactIds
+     * @return array<string, int> contactId => cleared-payment count
+     */
+    private function fetchClearedPaymentCounts(DBConnector $snowflake, array $contactIds): array
+    {
+        if ($contactIds === []) {
+            return [];
+        }
+
+        $cidList = implode(',', array_map('intval', $contactIds));
+
+        $sql = "
+            SELECT CONTACT_ID, COUNT(*) AS CLEARED
+            FROM TRANSACTIONS
+            WHERE CONTACT_ID IN ({$cidList})
+              AND TRANS_TYPE = 'D'
+              AND CLEARED_DATE IS NOT NULL
+              AND RETURNED_DATE IS NULL
+              AND CANCELLED = 0
+            GROUP BY CONTACT_ID
+        ";
+
+        $result = $snowflake->query($sql);
+
+        $map = [];
+        foreach ($result['data'] ?? [] as $row) {
+            $cid = (string) ($row['CONTACT_ID'] ?? '');
+            if ($cid !== '') {
+                $map[$cid] = (int) ($row['CLEARED'] ?? 0);
             }
         }
 
