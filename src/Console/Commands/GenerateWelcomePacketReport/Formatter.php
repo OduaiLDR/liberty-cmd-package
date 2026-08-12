@@ -16,7 +16,7 @@ class Formatter
 {
     public function buildWorkbook(array $rows, \DateTimeInterface $startDate, \DateTimeInterface $endDate, string $source): ?array
     {
-        $sourceLabel = strtoupper(trim($source)) !== '' ? $source : 'Report';
+        $sourceLabel = strtoupper(trim($source)) === 'PLAW' ? 'Progress Law' : (strtoupper(trim($source)) !== '' ? $source : 'Report');
         $headers = [
             'Client',
             'Plan',

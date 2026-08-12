@@ -356,22 +356,35 @@ class SyncLeaderboardRecords extends Command
     // Writes
     // ------------------------------------------------------------------
 
+    /** @var array<string, array<string, bool>> */
+    private array $dbRecordSet = [];
+
+    private function isDbDuplicate(string $category, string $period, string $date, $agentId, $amount): bool
+    {
+        $key = $category . '|' . $period;
+        if (! isset($this->dbRecordSet[$key])) {
+            $rows = $this->conn()->select(
+                'SELECT Leaderboard_Date, Agent_ID, Amount FROM TblLeaderboard WHERE Category = ? AND Period = ?',
+                [$category, $period]
+            );
+            $set = [];
+            foreach ($rows as $r) {
+                $subKey = ((string) $r->Leaderboard_Date) . '|' . ($r->Agent_ID ?? 'NULL') . '|' . sprintf('%.7f', (float) $r->Amount);
+                $set[$subKey] = true;
+            }
+            $this->dbRecordSet[$key] = $set;
+        }
+
+        $lookupKey = $date . '|' . ($agentId ?? 'NULL') . '|' . sprintf('%.7f', (float) $amount);
+        return isset($this->dbRecordSet[$key][$lookupKey]);
+    }
+
     /** @return 'inserted'|'duplicate' */
     private function writeRecord(string $category, string $period, $agentId, $amount, $tb1, $tb2, string $date, int $place): string
     {
         $conn = $this->conn();
 
-        $where = 'Category = ? AND Period = ? AND Leaderboard_Date = ? AND Amount = ?';
-        $bindings = [$category, $period, $date, $amount];
-        if ($agentId === null) {
-            $where .= ' AND Agent_ID IS NULL';
-        } else {
-            $where .= ' AND Agent_ID = ?';
-            $bindings[] = $agentId;
-        }
-
-        $exists = (int) ($conn->selectOne("SELECT COUNT(*) AS c FROM TblLeaderboard WHERE {$where}", $bindings)->c ?? 0);
-        if ($exists > 0) {
+        if ($this->isDbDuplicate($category, $period, $date, $agentId, $amount)) {
             $this->duplicates++;
             return 'duplicate';
         }
@@ -386,6 +399,10 @@ class SyncLeaderboardRecords extends Command
                 [$category, $period, $agentId, $amount, $tb1, $tb2, $date, $place]
             );
         }
+
+        $key = $category . '|' . $period;
+        $lookupKey = $date . '|' . ($agentId ?? 'NULL') . '|' . sprintf('%.7f', (float) $amount);
+        $this->dbRecordSet[$key][$lookupKey] = true;
 
         $this->inserted++;
         return 'inserted';

@@ -705,14 +705,17 @@ class Formatter
         ]);
     }
 
-    private function finishSheet(Worksheet $sheet, string $range, int $cols): void
+    private function finishSheet(Worksheet $sheet, string $range, int $cols, bool $autoSize = false): void
     {
         $sheet->getStyle($range)->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
         $sheet->getStyle($range)->getFont()->setName('Calibri')->setSize(9);
         for ($c = 1; $c <= $cols; $c++) {
-            $sheet->getColumnDimension(Coordinate::stringFromColumnIndex($c))->setAutoSize(true);
             $dim = $sheet->getColumnDimension(Coordinate::stringFromColumnIndex($c));
-            // Excel autofit happens on open; enforce VBA min width ~12 where possible later.
+            if ($autoSize) {
+                $dim->setAutoSize(true);
+            } else {
+                $dim->setWidth(18);
+            }
         }
     }
 
