@@ -54,7 +54,8 @@ final class GenerateResumePayments extends Command
         {--no-recap : Skip the Phase 6 recap email (status writes + resumes still happen). Use for controlled live tests so the team is not emailed a partial run.}
         {--cancels-only : Skip Phase 4 (NSF status updates + resume) and run ONLY the Day-4+ System Cancels. Use with --execute-cancels to work extra cancel batches through the backlog WITHOUT re-writing statuses or re-firing status-change triggers (Jacob 2026-07-20).}
         {--run-on-weekend : Override the Mon-Fri guard and run on a Sat/Sun (business PT). For manual weekend ops only; the scheduled run should never pass this. Dry-runs + probes already run any day.}
-        {--recap-to= : Preview the recap. In --dry-run, send the exact recap email (body + .xlsx) to ONLY this address (no team email, no CRM writes) so the format can be eyeballed before a real run.}';
+        {--recap-to= : Preview the recap. In --dry-run, send the exact recap email (body + .xlsx) to ONLY this address (no team email, no CRM writes) so the format can be eyeballed before a real run.}
+        {--include-no-payment : Include never-first-payment clients (TblEnrollment Payment_Attempted=No Payment, 105+ days, still enrolled) in the Manual Review pickup (Jacob 2026-08-14). Off during rollout; preview with --dry-run --recap-to first, then this becomes the default.}';
 
     protected $description = 'Process NSF contacts for LDR and Progress Law: update statuses, resume drafts, and execute system cancels per the ResumePayments VBA workflow.';
 
@@ -264,6 +265,16 @@ final class GenerateResumePayments extends Command
                     $this->info(sprintf('[INFO] [%s] Phase 4 status changes: %d', $company, count($statusChanges)));
                 }
                 $this->processSystemCancels($gateway, $snowflake, $sqlConnector, $company, $states, $statusChanges, $dryRun);
+
+                // Never-first-payment manual-cancel pickup (Jacob 2026-08-14): clients who never
+                // made a first payment have NO NSF, so the NSF-driven path above never sees them.
+                // Surface the ones still enrolled past 105 days to Manual Review (Rama). Report-only
+                // — these are never auto-dropped. Gated behind --include-no-payment for the first
+                // preview cycle so it doesn't hit the team's inbox before Jacob signs off; flip to
+                // always-on once approved.
+                if ($this->option('include-no-payment')) {
+                    $this->processNoFirstPaymentCancels($snowflake, $sqlConnector, $company, $statusChanges);
+                }
 
                 if ($this->option('no-recap')) {
                     $this->info(sprintf('[INFO] [%s] --no-recap: skipping recap email (%d status changes).', $company, count($statusChanges)));
@@ -1011,6 +1022,101 @@ final class GenerateResumePayments extends Command
             $state['debt_amount'] = $cid !== '' ? ($debtByLlg['LLG-' . $cid] ?? 0.0) : 0.0;
         }
         unset($state);
+    }
+
+    /**
+     * Never-first-payment manual-cancel pickup (Jacob 2026-08-14). SyncFirstPaymentDate flags
+     * clients whose first payment never cleared or returned as Payment_Attempted = 'No Payment'
+     * in TblEnrollment. Those have no NSF return code, so the NSF-driven cancel path never sees
+     * them and they sit unpaid indefinitely. Here we pull the ones still enrolled (verified in
+     * this company's Snowflake), not already cancelled, whose first payment date is >= 105 days
+     * old, and add them to the Manual Review sheet — Jacob: "manual cancelling only". They are
+     * NEVER auto-dropped (STAGE_CANCEL_HOLD is report-only). The Cancel_Date IS NULL filter makes
+     * them persist on the sheet daily until Rama cancels them. Any query failure logs + skips —
+     * this must never fail the run.
+     *
+     * @param list<array<string, mixed>> $statusChanges  appended to by reference
+     */
+    private function processNoFirstPaymentCancels(DBConnector $snowflake, DBConnector $sqlConnector, string $company, array &$statusChanges): void
+    {
+        // 1) TblEnrollment: never-paid ('No Payment'), not already cancelled, first payment >= 105 days ago.
+        try {
+            $sql = "SELECT LLG_ID, Debt_Amount, CONVERT(varchar(10), First_Payment_Date, 120) AS FPD "
+                 . "FROM dbo.TblEnrollment "
+                 . "WHERE Payment_Attempted = 'No Payment' AND Cancel_Date IS NULL "
+                 . "AND First_Payment_Date <= DATEADD(day, -" . self::SYSTEM_CANCEL_AGE_DAYS . ", CAST(GETDATE() AS date))";
+            $rows = $sqlConnector->querySqlServer($sql)['data'] ?? [];
+        } catch (\Throwable $e) {
+            Log::warning('ResumePayments: no-first-payment pickup TblEnrollment query failed; skipped', ['error' => $e->getMessage()]);
+            return;
+        }
+        if ($rows === []) {
+            return;
+        }
+
+        $info = []; // contactId => ['debt' => float, 'fpd' => 'Y-m-d']
+        foreach ($rows as $row) {
+            $cid = preg_replace('/\D+/', '', (string) ($row['LLG_ID'] ?? ''));
+            if ($cid === '') {
+                continue;
+            }
+            $info[$cid] = [
+                'debt' => (float) ($row['Debt_Amount'] ?? 0),
+                'fpd' => (string) ($row['FPD'] ?? ''),
+            ];
+        }
+        if ($info === []) {
+            return;
+        }
+
+        // 2) Verify still enrolled in THIS company's Snowflake (also scopes LDR vs PLAW) + get name.
+        //    Same enrollment gate as the NSF candidate query.
+        $cidList = implode(',', array_map('intval', array_keys($info)));
+        try {
+            $contactSql = "SELECT ID, CONCAT(COALESCE(FIRSTNAME, ''), ' ', COALESCE(LASTNAME, '')) AS FULLNAME "
+                        . "FROM CONTACTS WHERE ID IN ({$cidList}) "
+                        . "AND ENROLLED = 1 AND GRADUATED = 0 AND ISCOAPP = 0 AND DROPPED = 0";
+            $contacts = $snowflake->query($contactSql)['data'] ?? [];
+        } catch (\Throwable $e) {
+            Log::warning('ResumePayments: no-first-payment pickup CONTACTS query failed; skipped', ['error' => $e->getMessage()]);
+            return;
+        }
+
+        $names = [];
+        foreach ($contacts as $row) {
+            $cid = (string) ($row['ID'] ?? '');
+            if ($cid !== '') {
+                $names[$cid] = trim((string) ($row['FULLNAME'] ?? ''));
+            }
+        }
+        if ($names === []) {
+            return;
+        }
+
+        // 3) Populate the enrollment-status map (fetchCurrentStatuses merges into statusByContact,
+        //    which row() reads for the recap's Enrollment Status column).
+        $this->fetchCurrentStatuses($snowflake, array_keys($names));
+
+        // Guard against double-listing a client the NSF path already added.
+        $existing = [];
+        foreach ($statusChanges as $r) {
+            $existing[(string) ($r['llg_id'] ?? '')] = true;
+        }
+
+        // 4) One Manual Review row per still-enrolled never-payer. days = age of the first payment date.
+        $today = strtotime('today');
+        $added = 0;
+        foreach ($names as $cid => $name) {
+            if (isset($existing['LLG-' . $cid])) {
+                continue;
+            }
+            $fpd = $info[$cid]['fpd'] ?? '';
+            $days = $fpd !== '' ? (int) floor(($today - strtotime($fpd)) / 86400) : 0;
+            $statusChanges[] = $this->row($cid, $name, self::STAGE_CANCEL_HOLD, $days, (float) ($info[$cid]['debt'] ?? 0.0));
+            $added++;
+        }
+
+        $this->info(sprintf('[INFO] [%s] No-first-payment manual-cancel pickups: %d', $company, $added));
     }
 
     /**
