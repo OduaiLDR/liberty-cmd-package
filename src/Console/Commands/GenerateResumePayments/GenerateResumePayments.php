@@ -1107,6 +1107,7 @@ final class GenerateResumePayments extends Command
         $today = strtotime('today');
         $added = 0;
         foreach ($names as $cid => $name) {
+            $cid = (string) $cid; // numeric-string array keys come back as int — row() needs string
             if (isset($existing['LLG-' . $cid])) {
                 continue;
             }
