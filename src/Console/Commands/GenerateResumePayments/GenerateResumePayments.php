@@ -894,6 +894,11 @@ final class GenerateResumePayments extends Command
 
         $cidList = implode(',', array_map('intval', $contactIds));
 
+        // Reschedule window = the last 3 days, PAST ONLY (2026-08-14 fix). The lower bound alone
+        // (>= today-3) also matched FUTURE scheduled drafts, so a client with a long live draft
+        // schedule (e.g. contact 958172297: monthly drafts out to 2029) had those future drafts
+        // counted as reschedules — up to 3 NSF wrongly credited (Phase 2 cap), which zeroed the NSF
+        // and let a genuine cancel candidate escape. The <= today bound restores the documented intent.
         $sql = "
             SELECT
                 CONTACT_ID,
@@ -904,6 +909,7 @@ final class GenerateResumePayments extends Command
               AND CANCELLED = 0
               AND ACTIVE = 1
               AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', PROCESS_DATE) AS DATE) >= DATEADD(day, -3, CAST(CONVERT_TIMEZONE('America/Los_Angeles', CURRENT_TIMESTAMP()) AS DATE))
+              AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', PROCESS_DATE) AS DATE) <= CAST(CONVERT_TIMEZONE('America/Los_Angeles', CURRENT_TIMESTAMP()) AS DATE)
         ";
 
         $result = $snowflake->query($sql);
