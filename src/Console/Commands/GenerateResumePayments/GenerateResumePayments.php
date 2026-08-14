@@ -865,24 +865,20 @@ final class GenerateResumePayments extends Command
     }
 
     /**
-     * Phase 3 — Successful-draft (reschedule) adjustment.
+     * Phase 3 — Reschedule adjustment (Jacob 2026-08-14, DAY-based).
      *
-     * For each contact with a latest-NSF PROCESS_DATE (col C from Phase 1):
-     *   - count successful (ACTIVE=1, CANCELLED=0) D-type txns CREATED after that
-     *     PROCESS_DATE with their own PROCESS_DATE within the last 3 days
-     *   - subtract that count — CAPPED AT 3 — from nsf_count (a reschedule can undo up
-     *     to 3 NSF levels, never more)
-     *   - if nsf_count drops below 1 → mark Current (Enrolled) for this cycle
+     * A "reschedule" is an active (ACTIVE=1, CANCELLED=0) D-type payment whose CREATED date is
+     * AFTER the contact's LATEST NSF date. Each reschedule (capped at 3) subtracts 30 days from
+     * age_days — 90 days max. The NSF status ladder + the cancel gate are age-driven, so this
+     * walks the client down the ladder; if the reduction takes age_days to <= 0 they go Enrolled
+     * for this cycle. age_days is recomputed from the NSF anchor every run and the offset is
+     * capped at 90 days, so a client keeps aging and climbs NSF-1 → 2 → 3 → cancel over time.
      *
-     * A reschedule NEVER resets the days-since-payment clock (age_days): only a real
-     * cleared payment does, and computeNsfStates already handles that (it breaks the
-     * NSF chain at the first cleared draft). So age_days is left untouched here — a
-     * serial rescheduler keeps aging and climbs back to NSF next cycle instead of
-     * sitting in Enrolled indefinitely.
-     *
-     * Implemented as a single batch fetch of recent successful drafts for all
-     * candidate contacts, then a per-contact in-PHP filter against each contact's
-     * own PROCESS_DATE cutoff.
+     * Two things this fixes over the earlier approaches (level-subtraction + a process-date
+     * window): (1) keying off the CREATED date is Jacob's rule — a real reschedule is a NEW draft
+     * created after the bounce, not part of the original enrollment schedule; (2) the 90-day cap
+     * on the subtraction means a genuinely old non-payer can't be rescued by a bulk future
+     * schedule (e.g. 958172297, age ~546: 546 − 90 = 456 > 105, so he still auto-cancels).
      *
      * @param list<array<string, mixed>> $states
      */
@@ -904,67 +900,70 @@ final class GenerateResumePayments extends Command
         }
 
         $cidList = implode(',', array_map('intval', $contactIds));
+        $rCodeList = "'" . implode("','", self::PROCESSED_R_CODES) . "'";
 
-        // Reschedule window = the last 3 days, PAST ONLY (2026-08-14 fix). The lower bound alone
-        // (>= today-3) also matched FUTURE scheduled drafts, so a client with a long live draft
-        // schedule (e.g. contact 958172297: monthly drafts out to 2029) had those future drafts
-        // counted as reschedules — up to 3 NSF wrongly credited (Phase 2 cap), which zeroed the NSF
-        // and let a genuine cancel candidate escape. The <= today bound restores the documented intent.
+        // Per contact: the number of active payments CREATED after their LATEST NSF date. That
+        // count is the reschedule count (capped at 3 below); each reschedule subtracts 30 days
+        // from age. Done entirely in Snowflake (a per-contact COUNT) so we never load every
+        // active draft into PHP.
         $sql = "
-            SELECT
-                CONTACT_ID,
-                TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', CREATED_AT) AS DATE), 'YYYY-MM-DD') AS CREATED_AT
-            FROM TRANSACTIONS
-            WHERE CONTACT_ID IN ({$cidList})
-              AND TRANS_TYPE = 'D'
-              AND CANCELLED = 0
-              AND ACTIVE = 1
-              AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', PROCESS_DATE) AS DATE) >= DATEADD(day, -3, CAST(CONVERT_TIMEZONE('America/Los_Angeles', CURRENT_TIMESTAMP()) AS DATE))
-              AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', PROCESS_DATE) AS DATE) <= CAST(CONVERT_TIMEZONE('America/Los_Angeles', CURRENT_TIMESTAMP()) AS DATE)
+            WITH nsf AS (
+                SELECT CONTACT_ID,
+                       MAX(CAST(CONVERT_TIMEZONE('America/Los_Angeles', PROCESS_DATE) AS DATE)) AS NSF_DATE
+                FROM TRANSACTIONS
+                WHERE CONTACT_ID IN ({$cidList})
+                  AND TRANS_TYPE = 'D'
+                  AND (RETURN_CODE IN ({$rCodeList}) OR RESPONSE = 'Invalid Routing Number')
+                  AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', PROCESS_DATE) AS DATE) < CAST(CONVERT_TIMEZONE('America/Los_Angeles', CURRENT_TIMESTAMP()) AS DATE)
+                GROUP BY CONTACT_ID
+            )
+            SELECT d.CONTACT_ID, COUNT(*) AS RESCHEDULES
+            FROM TRANSACTIONS d
+            JOIN nsf n ON n.CONTACT_ID = d.CONTACT_ID
+            WHERE d.TRANS_TYPE = 'D'
+              AND d.CANCELLED = 0
+              AND d.ACTIVE = 1
+              AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', d.CREATED_AT) AS DATE) > n.NSF_DATE
+            GROUP BY d.CONTACT_ID
         ";
 
         $result = $snowflake->query($sql);
         $rows = $result['data'] ?? [];
 
-        $createdByContact = [];
+        $rescheduleByContact = [];
         foreach ($rows as $row) {
             $cid = (string) ($row['CONTACT_ID'] ?? '');
-            $created = (string) ($row['CREATED_AT'] ?? '');
-            if ($cid === '' || $created === '') {
-                continue;
+            if ($cid !== '') {
+                $rescheduleByContact[$cid] = (int) ($row['RESCHEDULES'] ?? 0);
             }
-            $createdByContact[$cid][] = $created;
         }
 
         foreach ($states as &$state) {
             $cid = (string) ($state['CONTACT_ID'] ?? '');
-            $cutoff = (string) ($state['PROCESS_DATE'] ?? '');
-            if ($cid === '' || $cutoff === '') {
+            if ($cid === '') {
                 continue;
             }
 
-            $candidates = $createdByContact[$cid] ?? [];
-            $count = 0;
-            foreach ($candidates as $created) {
-                if ($created >= $cutoff) {
-                    $count++;
-                }
-            }
-
-            if ($count === 0) {
+            $count = $rescheduleByContact[$cid] ?? 0;
+            if ($count <= 0) {
                 continue;
             }
 
-            // Cap the reschedule credit at 3 NSF levels; never touch age_days (the
-            // days-since-payment clock only resets on a real cleared payment, handled
-            // by computeNsfStates when it breaks the chain at a cleared draft).
-            $offset = min($count, 3);
-            $state['nsf_count'] = max(0, ((int) ($state['nsf_count'] ?? 0)) - $offset);
+            // Each reschedule subtracts 30 days from age, capped at 3 (90 days max).
+            $offsetDays = min($count, 3) * 30;
+            $adjusted = ((int) ($state['age_days'] ?? 0)) - $offsetDays;
 
-            if ($state['nsf_count'] < 1) {
+            if ($adjusted <= 0) {
+                // Reschedules fully offset the NSF age → Enrolled for this cycle. Ephemeral:
+                // age_days is recomputed from the NSF anchor next run, so they climb back if
+                // they keep not paying.
                 $state['is_current'] = true;
                 $state['current_rcode'] = '';
+                $state['age_days'] = 0;
                 $state['nsf_count'] = 0;
+            } else {
+                // Reduced but still NSF — walk them down the age-driven status ladder.
+                $state['age_days'] = $adjusted;
             }
         }
         unset($state);
