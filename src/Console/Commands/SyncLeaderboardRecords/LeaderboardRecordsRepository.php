@@ -53,6 +53,29 @@ class LeaderboardRecordsRepository
         return $category === 'Cancellation Ratio' ? 'Cancel_Date' : 'NSF_Date';
     }
 
+    /** @var array<string, object>|null */
+    private ?array $settingsMap = null;
+
+    /** @var array<string, int> */
+    private array $contactsCache = [];
+
+    private function loadSettings(): void
+    {
+        if ($this->settingsMap !== null) {
+            return;
+        }
+
+        $rows = $this->conn()->select(
+            "SELECT PK, Category, Period, Active, Bonus_1, Bonus_2, Bonus_3, Bonus_4, Threshold, Activity_Cutoff, Tiebreaker, Notes FROM TblLeaderboardSettings ORDER BY PK"
+        );
+
+        $this->settingsMap = [];
+        foreach ($rows as $r) {
+            $key = $r->Category . '|' . $r->Period;
+            $this->settingsMap[$key] = $r;
+        }
+    }
+
     /**
      * Active periods configured for a category (TblLeaderboardSettings.Active = 'TRUE').
      *
@@ -60,21 +83,24 @@ class LeaderboardRecordsRepository
      */
     public function periodsFor(string $category): Collection
     {
-        $rows = $this->conn()->select(
-            "SELECT Period FROM TblLeaderboardSettings WHERE Category = ? AND Active = 'TRUE' ORDER BY PK",
-            [$category]
-        );
+        $this->loadSettings();
 
-        return collect($rows)->pluck('Period')->filter()->unique()->values();
+        $periods = [];
+        foreach ($this->settingsMap ?? [] as $s) {
+            $act = strtoupper(trim((string) ($s->Active ?? '')));
+            if ($s->Category === $category && ($act === 'TRUE' || $act === '1')) {
+                $periods[] = $s->Period;
+            }
+        }
+
+        return collect($periods)->filter()->unique()->values();
     }
 
     public function settings(string $category, string $period): ?object
     {
-        return $this->conn()->selectOne(
-            'SELECT Bonus_1, Bonus_2, Bonus_3, Bonus_4, Threshold, Activity_Cutoff, Tiebreaker, Notes '
-            . 'FROM TblLeaderboardSettings WHERE Category = ? AND Period = ?',
-            [$category, $period]
-        );
+        $this->loadSettings();
+
+        return $this->settingsMap[$category . '|' . $period] ?? null;
     }
 
     public function fullThreshold(string $category, string $period): int
@@ -354,6 +380,11 @@ class LeaderboardRecordsRepository
 
     private function contactsFor(?string $agent, Carbon $from, Carbon $to): int
     {
+        $key = ($agent ?? '__COMPANY__') . '|' . $from->format('Y-m-d') . '|' . $to->format('Y-m-d');
+        if (isset($this->contactsCache[$key])) {
+            return $this->contactsCache[$key];
+        }
+
         $sql = 'SELECT COUNT(*) AS c FROM TblContacts '
             . 'WHERE COALESCE(Assigned_Date, Created_Date) >= ? AND COALESCE(Assigned_Date, Created_Date) < ?';
         $bindings = [$from->format('Y-m-d'), $to->copy()->addDay()->format('Y-m-d')];
@@ -363,7 +394,10 @@ class LeaderboardRecordsRepository
             $bindings[] = $agent;
         }
 
-        return (int) ($this->conn()->selectOne($sql, $bindings)->c ?? 0);
+        $count = (int) ($this->conn()->selectOne($sql, $bindings)->c ?? 0);
+        $this->contactsCache[$key] = $count;
+
+        return $count;
     }
 
     /**

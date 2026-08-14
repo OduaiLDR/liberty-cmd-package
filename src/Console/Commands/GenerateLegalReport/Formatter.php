@@ -32,7 +32,7 @@ class Formatter
         $spreadsheet->setActiveSheetIndexByName('Legal Report - Not Settled');
         $spreadsheet->getActiveSheet()->setSelectedCells('A1');
 
-        $sourceLabel = $source === 'Progress Law' ? 'Progress Law' : $source;
+        $sourceLabel = ($source === 'PLAW' || $source === 'Progress Law') ? 'Progress Law' : $source;
         $filename = 'Legal Report - ' . $sourceLabel . ' - ' . date('m-d-Y') . '.xlsx';
         $path = storage_path('app/' . $filename);
 

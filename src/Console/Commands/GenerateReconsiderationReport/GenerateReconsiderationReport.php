@@ -19,8 +19,7 @@ class GenerateReconsiderationReport extends Command
 {
     private const REPORT_TIMEZONE = 'America/Los_Angeles';
 
-    /** Keep generated IN clauses small enough for reliable Snowflake execution. */
-    private const QUERY_CHUNK_SIZE = 1000;
+    private const SYSTEM_USER_IDS = '3121141, 7803971';
 
     protected $signature = 'Generate:reconsideration-report
         {--no-email : Build workbooks only, skip email}';
@@ -107,7 +106,7 @@ class GenerateReconsiderationReport extends Command
         $this->info("[INFO] === {$source} ===");
 
         $snowflake = DBConnector::fromEnvironment($portal['env']);
-        $data = $this->buildReportData($snowflake, $portal);
+        $data = $this->buildReportData($snowflake, $portal, $source);
 
         $this->info(sprintf(
             '[INFO] %s rows — Dropped: %d | Reconsideration: %d | Pending: %d',
@@ -117,7 +116,7 @@ class GenerateReconsiderationReport extends Command
             count($data['reconsideration_pending'])
         ));
 
-        $result = $formatter->buildWorkbook($data, $source);
+        $result = $this->timed("{$source} workbook", fn () => $formatter->buildWorkbook($data, $source));
         $path = $result['path'];
         $this->info("[INFO] {$source} workbook: {$path}");
 
@@ -125,14 +124,14 @@ class GenerateReconsiderationReport extends Command
             return;
         }
 
-        $sent = $formatter->sendReport(
+        $sent = $this->timed("{$source} email", fn () => $formatter->sendReport(
             $sqlConnector,
             $result['path'],
             $result['filename'],
             $source,
             $portal['company'],
             $this
-        );
+        ));
 
         if (! $sent) {
             throw new \RuntimeException("{$source} email failed. Workbook kept at: {$path}");
@@ -160,17 +159,38 @@ class GenerateReconsiderationReport extends Command
      *   months:list<string>
      * }
      */
-    private function buildReportData(DBConnector $snowflake, array $portal): array
+    private function buildReportData(DBConnector $snowflake, array $portal, string $source = ''): array
     {
-        $dropped = $this->fetchDroppedClients($snowflake);
-        $reconsideration = $this->fetchReconsiderationClients($snowflake, $portal);
-        $pending = $this->fetchReconsiderationPending($snowflake, (int) $portal['status_id']);
-        $reconsiderationIds = array_values(array_unique(array_filter(array_map(
-            static fn (array $row): string => (string) ($row['ID'] ?? ''),
-            $reconsideration
-        ))));
-        $status1 = $this->fetchCurrentStatus($snowflake, false, $reconsiderationIds);
-        $status2 = $this->fetchCurrentStatus($snowflake, true, $reconsiderationIds);
+        $prefix = $source !== '' ? "{$source} " : '';
+
+        $dropped = $this->timed($prefix.'query Dropped', fn () => $this->fetchDroppedClients($snowflake));
+        $reconsideration = $this->timed($prefix.'query Reconsideration', fn () => $this->fetchReconsiderationClients($snowflake, $portal));
+        $bundle = $this->timed($prefix.'query Status bundle', fn () => $this->fetchStatusBundle($snowflake, (int) $portal['status_id']));
+
+        return $this->assembleReportData($dropped, $reconsideration, $bundle);
+    }
+
+    /**
+     * @param  list<array<string,mixed>>  $dropped
+     * @param  list<array<string,mixed>>  $reconsideration
+     * @param  array{
+     *   pending:list<array<string,mixed>>,
+     *   status1:array<string, array{CONTACT_ID:string, ENROLLED_BY:string, TITLE:string, STATUS_DATE:string}>,
+     *   status2:array<string, array{CONTACT_ID:string, ENROLLED_BY:string, TITLE:string, STATUS_DATE:string}>
+     * }  $bundle
+     * @return array{
+     *   dropped_clients:list<array<string,mixed>>,
+     *   reconsideration_clients:list<array<string,mixed>>,
+     *   reconsideration_pending:list<array<string,mixed>>,
+     *   current_status_1:list<array<string,mixed>>,
+     *   current_status_2:list<array<string,mixed>>,
+     *   months:list<string>
+     * }
+     */
+    private function assembleReportData(array $dropped, array $reconsideration, array $bundle): array
+    {
+        $status1All = $bundle['status1'];
+        $status2All = $bundle['status2'];
 
         $droppedBy = [];
         foreach ($dropped as $row) {
@@ -184,8 +204,12 @@ class GenerateReconsiderationReport extends Command
         }
 
         $clients = [];
+        $status1 = [];
+        $status2 = [];
+        $seenStatusIds = [];
         foreach ($reconsideration as $row) {
             $cid = (string) ($row['ID'] ?? '');
+            $statusKey = $this->statusLookupKey($cid);
             $active = (string) ($row['ACTIVE_STATUS'] ?? '');
             $drop = $droppedBy[$cid] ?? null;
 
@@ -193,11 +217,21 @@ class GenerateReconsiderationReport extends Command
             $statusDate = '';
             $lastStatusBy = '';
             if (strcasecmp($active, 'Active') === 0) {
-                $s1 = $status1[$cid] ?? null;
-                $s2 = $status2[$cid] ?? null;
+                $s1 = $status1All[$cid] ?? ($statusKey !== '' ? ($status1All[$statusKey] ?? null) : null);
+                $s2 = $status2All[$cid] ?? ($statusKey !== '' ? ($status2All[$statusKey] ?? null) : null);
                 $currentStatus = (string) ($s1['TITLE'] ?? '');
                 $statusDate = (string) ($s1['STATUS_DATE'] ?? '');
                 $lastStatusBy = (string) ($s2['ENROLLED_BY'] ?? '');
+            }
+
+            if ($statusKey !== '' && ! isset($seenStatusIds[$statusKey])) {
+                $seenStatusIds[$statusKey] = true;
+                if (isset($status1All[$statusKey])) {
+                    $status1[$statusKey] = $status1All[$statusKey];
+                }
+                if (isset($status2All[$statusKey])) {
+                    $status2[$statusKey] = $status2All[$statusKey];
+                }
             }
 
             $clients[] = [
@@ -234,7 +268,7 @@ class GenerateReconsiderationReport extends Command
         }
 
         $pendingRows = [];
-        foreach ($pending as $row) {
+        foreach ($bundle['pending'] as $row) {
             $pendingRows[] = [
                 'contact_id' => (string) ($row['CONTACT_ID'] ?? ''),
                 'status' => (string) ($row['STATUS'] ?? ''),
@@ -250,6 +284,14 @@ class GenerateReconsiderationReport extends Command
             'current_status_2' => array_values($status2),
             'months' => $this->monthStarts(),
         ];
+    }
+
+    /** Same keying as the old chunked status lookup: trim + digits only. */
+    private function statusLookupKey(string $contactId): string
+    {
+        $contactId = trim($contactId);
+
+        return ctype_digit($contactId) ? $contactId : '';
     }
 
     /** @return list<string> YYYY-MM-01 for current and previous 3 months */
@@ -278,7 +320,13 @@ SELECT
     d.DEBT AS ENROLLED_DEBT
 FROM CONTACTS AS c
 LEFT JOIN CANCELLATION_REASONS AS cr ON c.DROPPED_REASON = cr.ID
-LEFT JOIN CONTACTS_LOG AS l ON c.ID = l.CONTACT_ID
+LEFT JOIN (
+    SELECT CONTACT_ID, MAX(CREATED_BY) AS CREATED_BY
+    FROM CONTACTS_LOG
+    WHERE MESSAGE LIKE '%Drop%'
+      AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE DROPPED = 1 AND ENROLLED_DATE IS NOT NULL)
+    GROUP BY CONTACT_ID
+) AS l ON c.ID = l.CONTACT_ID
 LEFT JOIN USERS AS u ON l.CREATED_BY = u.UID
 LEFT JOIN (
     SELECT CONTACT_ID, SUM(ORIGINAL_DEBT_AMOUNT) AS DEBT
@@ -293,7 +341,6 @@ WHERE c.ENROLLED_DATE IS NOT NULL
   AND UPPER(c.LASTNAME) <> 'TEST'
   AND COALESCE(c.FIRSTNAME, '') <> ''
   AND CONCAT(u.FIRSTNAME, ' ', u.LASTNAME) <> '% User'
-  AND l.MESSAGE LIKE '%Drop%'
 ORDER BY CONCAT(u.FIRSTNAME, ' ', u.LASTNAME) ASC, c.DROPPED_DATE ASC
 SQL;
 
@@ -317,11 +364,11 @@ SELECT
     TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.DROPPED_DATE) AS DATE), 'YYYY-MM-DD') AS DROPPED_DATE,
     d.DEBT AS ENROLLED_DEBT,
     CASE WHEN c.DROPPED = 0 THEN 'Active' ELSE 'Dropped' END AS ACTIVE_STATUS,
-    cu1.F_STRING AS RETENTION_AGENT,
-    cu2.F_STRING AS REASON_FOR_REQUEST,
-    cu3.F_STRING AS RETENTION_IMMEDIATE_RESULTS,
-    cu4.F_SHORTSTRING AS ASSIGNED_TO,
-    TO_VARCHAR(CONVERT_TIMEZONE('America/Los_Angeles', cu5.F_DATETIME), 'YYYY-MM-DD HH24:MI:SS') AS CANCEL_REQUEST_DATE
+    cu.RETENTION_AGENT,
+    cu.REASON_FOR_REQUEST,
+    cu.RETENTION_IMMEDIATE_RESULTS,
+    cu.ASSIGNED_TO,
+    TO_VARCHAR(CONVERT_TIMEZONE('America/Los_Angeles', cu.CANCEL_REQUEST_DATE), 'YYYY-MM-DD HH24:MI:SS') AS CANCEL_REQUEST_DATE
 FROM CONTACTS AS c
 LEFT JOIN (
     SELECT CONTACT_ID, SUM(ORIGINAL_DEBT_AMOUNT) AS DEBT
@@ -331,30 +378,17 @@ LEFT JOIN (
     GROUP BY CONTACT_ID
 ) AS d ON c.ID = d.CONTACT_ID
 LEFT JOIN (
-    SELECT CONTACT_ID, F_STRING
+    SELECT
+        CONTACT_ID,
+        MAX(CASE WHEN CUSTOM_ID = {$c['retention_agent']} THEN F_STRING END) AS RETENTION_AGENT,
+        MAX(CASE WHEN CUSTOM_ID = {$c['reason_for_request']} THEN F_STRING END) AS REASON_FOR_REQUEST,
+        MAX(CASE WHEN CUSTOM_ID = {$c['retention_immediate_results']} THEN F_STRING END) AS RETENTION_IMMEDIATE_RESULTS,
+        MAX(CASE WHEN CUSTOM_ID = {$c['assigned_to']} THEN F_SHORTSTRING END) AS ASSIGNED_TO,
+        MAX(CASE WHEN CUSTOM_ID = {$c['cancel_request_date']} THEN F_DATETIME END) AS CANCEL_REQUEST_DATE
     FROM CONTACTS_USERFIELDS
-    WHERE CUSTOM_ID = {$c['retention_agent']}
-) AS cu1 ON c.ID = cu1.CONTACT_ID
-LEFT JOIN (
-    SELECT CONTACT_ID, F_STRING
-    FROM CONTACTS_USERFIELDS
-    WHERE CUSTOM_ID = {$c['reason_for_request']}
-) AS cu2 ON c.ID = cu2.CONTACT_ID
-LEFT JOIN (
-    SELECT CONTACT_ID, F_STRING
-    FROM CONTACTS_USERFIELDS
-    WHERE CUSTOM_ID = {$c['retention_immediate_results']}
-) AS cu3 ON c.ID = cu3.CONTACT_ID
-LEFT JOIN (
-    SELECT CONTACT_ID, F_SHORTSTRING
-    FROM CONTACTS_USERFIELDS
-    WHERE CUSTOM_ID = {$c['assigned_to']}
-) AS cu4 ON c.ID = cu4.CONTACT_ID
-LEFT JOIN (
-    SELECT CONTACT_ID, F_DATETIME
-    FROM CONTACTS_USERFIELDS
-    WHERE CUSTOM_ID = {$c['cancel_request_date']}
-) AS cu5 ON c.ID = cu5.CONTACT_ID
+    WHERE CUSTOM_ID IN ({$c['retention_agent']}, {$c['reason_for_request']}, {$c['retention_immediate_results']}, {$c['assigned_to']}, {$c['cancel_request_date']})
+    GROUP BY CONTACT_ID
+) AS cu ON c.ID = cu.CONTACT_ID
 WHERE c.ENROLLED_DATE IS NOT NULL
   AND UPPER(c.FIRSTNAME) <> 'TEST'
   AND UPPER(c.LASTNAME) <> 'TEST'
@@ -369,92 +403,145 @@ WHERE c.ENROLLED_DATE IS NOT NULL
         return $this->queryRows($snowflake, $sql);
     }
 
-    /** @return list<array<string,mixed>> */
-    private function fetchReconsiderationPending(DBConnector $snowflake, int $statusId): array
+    /**
+     * Latest status (pending + current-status variants) in one Snowflake round trip.
+     *
+     * pending: absolute latest row (no USER_ID filter) for every contact that ever
+     * had the reconsideration status — same population as the old pending query.
+     * status1 / status2: latest among USER_ID > 0 (status2 also drops system users).
+     * Hidden Current Status sheets are still limited to reconsideration clients in PHP.
+     *
+     * @return array{
+     *   pending:list<array<string,mixed>>,
+     *   status1:array<string, array{CONTACT_ID:string, ENROLLED_BY:string, TITLE:string, STATUS_DATE:string}>,
+     *   status2:array<string, array{CONTACT_ID:string, ENROLLED_BY:string, TITLE:string, STATUS_DATE:string}>
+     * }
+     */
+    private function fetchStatusBundle(DBConnector $snowflake, int $statusId): array
     {
         $sql = "
-SELECT CONTACT_ID, STATUS, STATUS_DATE
-FROM (
+WITH base AS (
     SELECT
         cs.CONTACT_ID,
-        cls.TITLE AS STATUS,
+        cs.USER_ID,
+        CONCAT(u.FIRSTNAME, ' ', u.LASTNAME) AS ENROLLED_BY,
+        cls.TITLE,
         TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) AS DATE), 'YYYY-MM-DD') AS STATUS_DATE,
-        ROW_NUMBER() OVER (PARTITION BY cs.CONTACT_ID ORDER BY CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) DESC) AS N
+        CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) AS STAMP_LA
     FROM CONTACTS_STATUS AS cs
+    INNER JOIN CONTACTS AS c ON cs.CONTACT_ID = c.ID
     LEFT JOIN CONTACTS_LEAD_STATUS AS cls ON cs.STATUS_ID = cls.ID
-    LEFT JOIN CONTACTS AS c ON cs.CONTACT_ID = c.ID
+    LEFT JOIN USERS AS u ON cs.USER_ID = u.UID
     WHERE c.ID IN (
         SELECT CONTACT_ID
         FROM CONTACTS_STATUS
         WHERE STATUS_ID = {$statusId}
     )
-)
-WHERE N = 1
-";
-
-        return $this->queryRows($snowflake, $sql);
-    }
-
-    /**
-     * @return array<string, array{CONTACT_ID:string, ENROLLED_BY:string, TITLE:string, STATUS_DATE:string}>
-     */
-    private function fetchCurrentStatus(
-        DBConnector $snowflake,
-        bool $excludeSystemUsers,
-        array $contactIds
-    ): array
-    {
-        $contactIds = array_values(array_unique(array_filter(
-            array_map(static fn (mixed $id): string => trim((string) $id), $contactIds),
-            static fn (string $id): bool => ctype_digit($id)
-        )));
-        if ($contactIds === []) {
-            return [];
-        }
-
-        $exclude = $excludeSystemUsers
-            ? 'AND cs.USER_ID NOT IN (3121141, 7803971)'
-            : '';
-
-        $out = [];
-        foreach (array_chunk($contactIds, self::QUERY_CHUNK_SIZE) as $chunk) {
-            $contactIn = implode(', ', $chunk);
-            $sql = "
-SELECT CONTACT_ID, ENROLLED_BY, TITLE, STATUS_DATE
-FROM (
+),
+ranked AS (
     SELECT
-        cs.CONTACT_ID,
-        CONCAT(u.FIRSTNAME, ' ', u.LASTNAME) AS ENROLLED_BY,
-        cls.TITLE,
-        TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) AS DATE), 'YYYY-MM-DD') AS STATUS_DATE,
-        ROW_NUMBER() OVER (PARTITION BY cs.CONTACT_ID ORDER BY CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) DESC) AS N
-    FROM CONTACTS_STATUS AS cs
-    LEFT JOIN CONTACTS_LEAD_STATUS AS cls ON cs.STATUS_ID = cls.ID
-    LEFT JOIN USERS AS u ON cs.USER_ID = u.UID
-    WHERE cs.USER_ID > 0
-      AND cs.CONTACT_ID > 0
-      AND cs.CONTACT_ID IN ({$contactIn})
-      {$exclude}
+        CONTACT_ID,
+        USER_ID,
+        ENROLLED_BY,
+        TITLE,
+        STATUS_DATE,
+        ROW_NUMBER() OVER (PARTITION BY CONTACT_ID ORDER BY STAMP_LA DESC) AS N_PENDING,
+        ROW_NUMBER() OVER (
+            PARTITION BY CONTACT_ID, IFF(USER_ID > 0 AND CONTACT_ID > 0, 1, 0)
+            ORDER BY STAMP_LA DESC
+        ) AS N_STATUS1,
+        ROW_NUMBER() OVER (
+            PARTITION BY CONTACT_ID, IFF(USER_ID > 0 AND CONTACT_ID > 0 AND USER_ID NOT IN (".self::SYSTEM_USER_IDS."), 1, 0)
+            ORDER BY STAMP_LA DESC
+        ) AS N_STATUS2
+    FROM base
 )
-WHERE N = 1
-ORDER BY CONTACT_ID
+SELECT KIND, CONTACT_ID, ENROLLED_BY, TITLE, STATUS_DATE
+FROM (
+    SELECT 'pending' AS KIND, CONTACT_ID, ENROLLED_BY, TITLE, STATUS_DATE
+    FROM ranked
+    WHERE N_PENDING = 1
+    UNION ALL
+    SELECT 'status1' AS KIND, CONTACT_ID, ENROLLED_BY, TITLE, STATUS_DATE
+    FROM ranked
+    WHERE N_STATUS1 = 1
+      AND USER_ID > 0
+      AND CONTACT_ID > 0
+    UNION ALL
+    SELECT 'status2' AS KIND, CONTACT_ID, ENROLLED_BY, TITLE, STATUS_DATE
+    FROM ranked
+    WHERE N_STATUS2 = 1
+      AND USER_ID > 0
+      AND CONTACT_ID > 0
+      AND USER_ID NOT IN (".self::SYSTEM_USER_IDS.")
+) AS status_bundle
 ";
 
-            foreach ($this->queryRows($snowflake, $sql) as $row) {
-                $cid = (string) ($row['CONTACT_ID'] ?? '');
-                if ($cid === '') {
-                    continue;
-                }
-                $out[$cid] = [
+        $pending = [];
+        $status1 = [];
+        $status2 = [];
+        foreach ($this->queryRows($snowflake, $sql) as $row) {
+            $kind = strtolower((string) ($row['KIND'] ?? ''));
+            $cid = (string) ($row['CONTACT_ID'] ?? '');
+            if ($cid === '') {
+                continue;
+            }
+            if ($kind === 'pending') {
+                $pending[] = [
                     'CONTACT_ID' => $cid,
-                    'ENROLLED_BY' => (string) ($row['ENROLLED_BY'] ?? ''),
-                    'TITLE' => (string) ($row['TITLE'] ?? ''),
+                    'STATUS' => (string) ($row['TITLE'] ?? ''),
                     'STATUS_DATE' => (string) ($row['STATUS_DATE'] ?? ''),
                 ];
+                continue;
+            }
+
+            $mapped = [
+                'CONTACT_ID' => $cid,
+                'ENROLLED_BY' => (string) ($row['ENROLLED_BY'] ?? ''),
+                'TITLE' => (string) ($row['TITLE'] ?? ''),
+                'STATUS_DATE' => (string) ($row['STATUS_DATE'] ?? ''),
+            ];
+            if ($kind === 'status1') {
+                $status1[$cid] = $mapped;
+            } elseif ($kind === 'status2') {
+                $status2[$cid] = $mapped;
             }
         }
 
-        return $out;
+        return [
+            'pending' => $pending,
+            'status1' => $status1,
+            'status2' => $status2,
+        ];
+    }
+
+    /**
+     * @template T
+     * @param  callable(): T  $fn
+     * @return T
+     */
+    private function timed(string $label, callable $fn): mixed
+    {
+        $started = microtime(true);
+        try {
+            return $fn();
+        } finally {
+            $seconds = round(microtime(true) - $started, 1);
+            $line = "[INFO] {$label}: {$seconds}s";
+            try {
+                Log::info('GenerateReconsiderationReport timing', [
+                    'label' => $label,
+                    'seconds' => $seconds,
+                ]);
+            } catch (\Throwable) {
+                // Log facade is not bound in unit tests.
+            }
+            try {
+                $this->info($line);
+            } catch (\Throwable) {
+                // Command output is not bound in unit tests.
+            }
+        }
     }
 
     /** @return list<array<string,mixed>> */

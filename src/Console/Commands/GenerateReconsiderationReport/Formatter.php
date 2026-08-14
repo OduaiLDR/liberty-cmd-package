@@ -7,8 +7,10 @@ use Cmd\Reports\Services\EmailSenderService;
 use Illuminate\Console\Command;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Log;
+use PhpOffice\PhpSpreadsheet\Cell\Cell;
 use PhpOffice\PhpSpreadsheet\Cell\Coordinate;
 use PhpOffice\PhpSpreadsheet\Cell\DataType;
+use PhpOffice\PhpSpreadsheet\Cell\DefaultValueBinder;
 use PhpOffice\PhpSpreadsheet\Shared\Date as ExcelDate;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Style\Alignment;
@@ -233,24 +235,22 @@ class Formatter
     private function fillDroppedClients(Worksheet $sheet, array $rows): void
     {
         $sheet->setShowGridlines(false);
-        foreach (self::DROPPED_HEADERS as $i => $header) {
-            $sheet->setCellValueByColumnAndRow($i + 1, 1, $header);
+        $data = [self::DROPPED_HEADERS];
+        foreach ($rows as $row) {
+            $data[] = [
+                (string) ($row['id'] ?? ''),
+                (string) ($row['client'] ?? ''),
+                $this->excelDateValue((string) ($row['enrolled_date'] ?? '')),
+                $this->excelDateValue((string) ($row['dropped_date'] ?? '')),
+                (string) ($row['dropped_by'] ?? ''),
+                (string) ($row['dropped_reason'] ?? ''),
+                (float) ($row['enrolled_debt'] ?? 0),
+            ];
         }
+        $this->fromArrayPreserveIdColumn($sheet, $data);
         $this->styleHeader($sheet, 'A1:G1');
 
-        $r = 2;
-        foreach ($rows as $row) {
-            $sheet->setCellValueExplicit("A{$r}", (string) ($row['id'] ?? ''), DataType::TYPE_STRING);
-            $sheet->setCellValue("B{$r}", (string) ($row['client'] ?? ''));
-            $this->setDateCell($sheet, "C{$r}", (string) ($row['enrolled_date'] ?? ''));
-            $this->setDateCell($sheet, "D{$r}", (string) ($row['dropped_date'] ?? ''));
-            $sheet->setCellValue("E{$r}", (string) ($row['dropped_by'] ?? ''));
-            $sheet->setCellValue("F{$r}", (string) ($row['dropped_reason'] ?? ''));
-            $sheet->setCellValue("G{$r}", (float) ($row['enrolled_debt'] ?? 0));
-            $r++;
-        }
-
-        $last = max(1, $r - 1);
+        $last = max(1, count($data));
         if ($last >= 2) {
             $sheet->getStyle("C2:D{$last}")->getNumberFormat()->setFormatCode(NumberFormat::FORMAT_DATE_XLSX14);
             $sheet->getStyle("G2:G{$last}")->getNumberFormat()->setFormatCode('$#,##0');
@@ -263,33 +263,31 @@ class Formatter
     private function fillReconsiderationClients(Worksheet $sheet, array $rows): void
     {
         $sheet->setShowGridlines(false);
-        foreach (self::RECON_HEADERS as $i => $header) {
-            $sheet->setCellValueByColumnAndRow($i + 1, 1, $header);
+        $data = [self::RECON_HEADERS];
+        foreach ($rows as $row) {
+            $data[] = [
+                (string) ($row['id'] ?? ''),
+                (string) ($row['client'] ?? ''),
+                $this->excelDateValue((string) ($row['enrolled_date'] ?? '')),
+                $this->excelDateValue((string) ($row['dropped_date'] ?? '')),
+                (string) ($row['dropped_by'] ?? ''),
+                (string) ($row['dropped_reason'] ?? ''),
+                (float) ($row['enrolled_debt'] ?? 0),
+                (string) ($row['active_status'] ?? ''),
+                (string) ($row['current_status'] ?? ''),
+                $this->excelDateValue((string) ($row['status_date'] ?? '')),
+                (string) ($row['last_status_by'] ?? ''),
+                (string) ($row['retention_agent'] ?? ''),
+                (string) ($row['reason_for_request'] ?? ''),
+                (string) ($row['retention_immediate_results'] ?? ''),
+                (string) ($row['assigned_to'] ?? ''),
+                (string) ($row['cancel_request_date'] ?? ''),
+            ];
         }
+        $this->fromArrayPreserveIdColumn($sheet, $data);
         $this->styleHeader($sheet, 'A1:P1');
 
-        $r = 2;
-        foreach ($rows as $row) {
-            $sheet->setCellValueExplicit("A{$r}", (string) ($row['id'] ?? ''), DataType::TYPE_STRING);
-            $sheet->setCellValue("B{$r}", (string) ($row['client'] ?? ''));
-            $this->setDateCell($sheet, "C{$r}", (string) ($row['enrolled_date'] ?? ''));
-            $this->setDateCell($sheet, "D{$r}", (string) ($row['dropped_date'] ?? ''));
-            $sheet->setCellValue("E{$r}", (string) ($row['dropped_by'] ?? ''));
-            $sheet->setCellValue("F{$r}", (string) ($row['dropped_reason'] ?? ''));
-            $sheet->setCellValue("G{$r}", (float) ($row['enrolled_debt'] ?? 0));
-            $sheet->setCellValue("H{$r}", (string) ($row['active_status'] ?? ''));
-            $sheet->setCellValue("I{$r}", (string) ($row['current_status'] ?? ''));
-            $this->setDateCell($sheet, "J{$r}", (string) ($row['status_date'] ?? ''));
-            $sheet->setCellValue("K{$r}", (string) ($row['last_status_by'] ?? ''));
-            $sheet->setCellValue("L{$r}", (string) ($row['retention_agent'] ?? ''));
-            $sheet->setCellValue("M{$r}", (string) ($row['reason_for_request'] ?? ''));
-            $sheet->setCellValue("N{$r}", (string) ($row['retention_immediate_results'] ?? ''));
-            $sheet->setCellValue("O{$r}", (string) ($row['assigned_to'] ?? ''));
-            $sheet->setCellValue("P{$r}", (string) ($row['cancel_request_date'] ?? ''));
-            $r++;
-        }
-
-        $last = max(1, $r - 1);
+        $last = max(1, count($data));
         if ($last >= 2) {
             $sheet->getStyle("C2:D{$last}")->getNumberFormat()->setFormatCode(NumberFormat::FORMAT_DATE_XLSX14);
             $sheet->getStyle("G2:G{$last}")->getNumberFormat()->setFormatCode('$#,##0');
@@ -303,17 +301,17 @@ class Formatter
     private function fillPending(Worksheet $sheet, array $rows): void
     {
         $sheet->setShowGridlines(false);
-        $sheet->fromArray(['CONTACT_ID', 'STATUS', 'STATUS_DATE'], null, 'A1');
-        $this->styleHeader($sheet, 'A1:C1');
-
-        $r = 2;
+        $data = [['CONTACT_ID', 'STATUS', 'STATUS_DATE']];
         foreach ($rows as $row) {
-            $sheet->setCellValueExplicit("A{$r}", (string) ($row['contact_id'] ?? ''), DataType::TYPE_STRING);
-            $sheet->setCellValue("B{$r}", (string) ($row['status'] ?? ''));
-            $this->setDateCell($sheet, "C{$r}", (string) ($row['status_date'] ?? ''));
-            $r++;
+            $data[] = [
+                (string) ($row['contact_id'] ?? ''),
+                (string) ($row['status'] ?? ''),
+                $this->excelDateValue((string) ($row['status_date'] ?? '')),
+            ];
         }
-        $last = max(1, $r - 1);
+        $this->fromArrayPreserveIdColumn($sheet, $data);
+        $this->styleHeader($sheet, 'A1:C1');
+        $last = max(1, count($data));
         if ($last >= 2) {
             $sheet->getStyle("C2:C{$last}")->getNumberFormat()->setFormatCode(NumberFormat::FORMAT_DATE_XLSX14);
         }
@@ -324,19 +322,19 @@ class Formatter
     private function fillCurrentStatus(Worksheet $sheet, array $rows): void
     {
         $sheet->setShowGridlines(false);
-        $sheet->fromArray(['CONTACT_ID', 'ENROLLED_BY', 'TITLE', 'STATUS_DATE'], null, 'A1');
+        $data = [['CONTACT_ID', 'ENROLLED_BY', 'TITLE', 'STATUS_DATE']];
+        foreach ($rows as $row) {
+            $data[] = [
+                (string) ($row['CONTACT_ID'] ?? ''),
+                (string) ($row['ENROLLED_BY'] ?? ''),
+                (string) ($row['TITLE'] ?? ''),
+                $this->excelDateValue((string) ($row['STATUS_DATE'] ?? '')),
+            ];
+        }
+        $this->fromArrayPreserveIdColumn($sheet, $data);
         $this->styleHeader($sheet, 'A1:D1');
 
-        $r = 2;
-        foreach ($rows as $row) {
-            $sheet->setCellValueExplicit("A{$r}", (string) ($row['CONTACT_ID'] ?? ''), DataType::TYPE_STRING);
-            $sheet->setCellValue("B{$r}", (string) ($row['ENROLLED_BY'] ?? ''));
-            $sheet->setCellValue("C{$r}", (string) ($row['TITLE'] ?? ''));
-            $this->setDateCell($sheet, "D{$r}", (string) ($row['STATUS_DATE'] ?? ''));
-            $r++;
-        }
-
-        $last = max(1, $r - 1);
+        $last = max(1, count($data));
         if ($last >= 2) {
             $sheet->getStyle("D2:D{$last}")->getNumberFormat()->setFormatCode(NumberFormat::FORMAT_DATE_XLSX14);
         }
@@ -354,12 +352,13 @@ class Formatter
         }
         $this->styleHeader($sheet, 'A1:E1');
 
+        $counts = $this->tallyDroppedByReason($rows, $months);
         $r = 2;
         foreach (self::REASON_LIST as $reason) {
             $sheet->setCellValue("A{$r}", $reason);
             foreach ($months as $i => $month) {
                 $col = Coordinate::stringFromColumnIndex($i + 2);
-                $sheet->setCellValue("{$col}{$r}", $this->countDroppedByReasonMonth($rows, $reason, $month));
+                $sheet->setCellValue("{$col}{$r}", $counts[$reason][$i] ?? 0);
             }
             $r++;
         }
@@ -389,24 +388,15 @@ class Formatter
         }
         $this->styleHeader($sheet, 'A1:I1');
 
-        $agents = [];
-        foreach ($rows as $row) {
-            $agent = trim((string) ($row['dropped_by'] ?? ''));
-            if ($agent !== '') {
-                $agents[$agent] = true;
-            }
-        }
-        $agentNames = array_keys($agents);
-        sort($agentNames, SORT_NATURAL | SORT_FLAG_CASE);
+        [$agentNames, $stats] = $this->tallyDroppedByAgent($rows, $months);
 
         $r = 2;
         foreach ($agentNames as $agent) {
             $sheet->setCellValue("A{$r}", $agent);
             foreach ($months as $i => $month) {
                 [$countCol, $sumCol] = $pairs[$i];
-                [$count, $sum] = $this->countSumDroppedByAgentMonth($rows, $agent, $month);
-                $sheet->setCellValue("{$countCol}{$r}", $count);
-                $sheet->setCellValue("{$sumCol}{$r}", $sum);
+                $sheet->setCellValue("{$countCol}{$r}", $stats[$agent][$i][0] ?? 0);
+                $sheet->setCellValue("{$sumCol}{$r}", $stats[$agent][$i][1] ?? 0.0);
             }
             $r++;
         }
@@ -439,24 +429,15 @@ class Formatter
         }
         $this->styleHeader($sheet, 'A1:I1');
 
-        $agents = [];
-        foreach ($rows as $row) {
-            $agent = trim((string) ($row['last_status_by'] ?? ''));
-            if ($agent !== '') {
-                $agents[$agent] = true;
-            }
-        }
-        $agentNames = array_keys($agents);
-        sort($agentNames, SORT_NATURAL | SORT_FLAG_CASE);
+        [$agentNames, $stats] = $this->tallyReconSummary($rows, $months);
 
         $r = 2;
         foreach ($agentNames as $agent) {
             $sheet->setCellValue("A{$r}", $agent);
             foreach ($months as $i => $month) {
                 [$countCol, $sumCol] = $pairs[$i];
-                [$count, $sum] = $this->countSumReconSummary($rows, $agent, $month);
-                $sheet->setCellValue("{$countCol}{$r}", $count);
-                $sheet->setCellValue("{$sumCol}{$r}", $sum);
+                $sheet->setCellValue("{$countCol}{$r}", $stats[$agent][$i][0] ?? 0);
+                $sheet->setCellValue("{$sumCol}{$r}", $stats[$agent][$i][1] ?? 0.0);
             }
             $r++;
         }
@@ -488,42 +469,7 @@ class Formatter
         }
         $this->styleHeader($sheet, 'A1:F1');
 
-        $agents = [];
-        $reasons = [];
-        foreach ($rows as $row) {
-            $agent = trim((string) ($row['dropped_by'] ?? ''));
-            $reason = trim((string) ($row['dropped_reason'] ?? ''));
-            if ($agent !== '') {
-                $agents[$agent] = true;
-            }
-            if ($reason !== '') {
-                $reasons[$reason] = true;
-            }
-        }
-        $agentNames = array_keys($agents);
-        $reasonNames = array_keys($reasons);
-        sort($agentNames, SORT_NATURAL | SORT_FLAG_CASE);
-        sort($reasonNames, SORT_NATURAL | SORT_FLAG_CASE);
-
-        $matrix = [];
-        foreach ($agentNames as $agent) {
-            foreach ($reasonNames as $reason) {
-                $counts = [];
-                $total = 0;
-                foreach ($months as $mi => $month) {
-                    $c = $this->countReconDroppedDetail($rows, $agent, $reason, $month);
-                    $counts[$mi] = $c;
-                    // VBA deletes rows where sum of first 3 month columns is 0 (C:E)
-                    if ($mi < 3) {
-                        $total += $c;
-                    }
-                }
-                if ($total === 0) {
-                    continue;
-                }
-                $matrix[] = ['agent' => $agent, 'reason' => $reason, 'counts' => $counts];
-            }
-        }
+        $matrix = $this->tallyDroppedDetail($rows, $months);
 
         $r = 2;
         $prevAgent = null;
@@ -556,59 +502,89 @@ class Formatter
         }
     }
 
-    /** @param list<array<string,mixed>> $rows */
-    private function countDroppedByReasonMonth(array $rows, string $reason, string $monthStart): int
+    /**
+     * @param  list<array<string,mixed>>  $rows
+     * @param  list<string>  $months
+     * @return array<string, array<int, int>>
+     */
+    private function tallyDroppedByReason(array $rows, array $months): array
     {
-        [$start, $end] = $this->monthRange($monthStart);
-        $n = 0;
+        $ranges = $this->monthRanges($months);
+        $monthCount = count($months);
+        $counts = [];
+        foreach (self::REASON_LIST as $reason) {
+            $counts[$reason] = array_fill(0, $monthCount, 0);
+        }
         foreach ($rows as $row) {
-            if ((string) ($row['dropped_reason'] ?? '') !== $reason) {
+            $reason = (string) ($row['dropped_reason'] ?? '');
+            if (! isset($counts[$reason])) {
                 continue;
             }
-            $d = (string) ($row['dropped_date'] ?? '');
-            if ($d !== '' && $d >= $start && $d <= $end) {
-                $n++;
+            $mi = $this->monthIndex((string) ($row['dropped_date'] ?? ''), $ranges);
+            if ($mi === null) {
+                continue;
             }
+            $counts[$reason][$mi]++;
         }
 
-        return $n;
+        return $counts;
     }
 
     /**
-     * @param list<array<string,mixed>> $rows
-     * @return array{0:int,1:float}
+     * @param  list<array<string,mixed>>  $rows
+     * @param  list<string>  $months
+     * @return array{0:list<string>,1:array<string, array<int, array{0:int,1:float}>>}
      */
-    private function countSumDroppedByAgentMonth(array $rows, string $agent, string $monthStart): array
+    private function tallyDroppedByAgent(array $rows, array $months): array
     {
-        [$start, $end] = $this->monthRange($monthStart);
-        $n = 0;
-        $sum = 0.0;
+        $ranges = $this->monthRanges($months);
+        $monthCount = count($months);
+        $names = [];
+        $rawStats = [];
         foreach ($rows as $row) {
-            if ((string) ($row['dropped_by'] ?? '') !== $agent) {
+            $rawAgent = (string) ($row['dropped_by'] ?? '');
+            $trimmed = trim($rawAgent);
+            if ($trimmed !== '') {
+                $names[$trimmed] = true;
+            }
+            $mi = $this->monthIndex((string) ($row['dropped_date'] ?? ''), $ranges);
+            if ($mi === null) {
                 continue;
             }
-            $d = (string) ($row['dropped_date'] ?? '');
-            if ($d !== '' && $d >= $start && $d <= $end) {
-                $n++;
-                $sum += (float) ($row['enrolled_debt'] ?? 0);
+            if (! isset($rawStats[$rawAgent])) {
+                $rawStats[$rawAgent] = array_fill(0, $monthCount, [0, 0.0]);
             }
+            $rawStats[$rawAgent][$mi][0]++;
+            $rawStats[$rawAgent][$mi][1] += (float) ($row['enrolled_debt'] ?? 0);
         }
 
-        return [$n, $sum];
+        $agentNames = array_keys($names);
+        sort($agentNames, SORT_NATURAL | SORT_FLAG_CASE);
+
+        $stats = [];
+        foreach ($agentNames as $agent) {
+            $stats[$agent] = $rawStats[$agent] ?? array_fill(0, $monthCount, [0, 0.0]);
+        }
+
+        return [$agentNames, $stats];
     }
 
     /**
-     * @param list<array<string,mixed>> $rows
-     * @return array{0:int,1:float}
+     * @param  list<array<string,mixed>>  $rows
+     * @param  list<string>  $months
+     * @return array{0:list<string>,1:array<string, array<int, array{0:int,1:float}>>}
      */
-    private function countSumReconSummary(array $rows, string $agent, string $monthStart): array
+    private function tallyReconSummary(array $rows, array $months): array
     {
-        [$start, $end] = $this->monthRange($monthStart);
-        $n = 0;
-        $sum = 0.0;
+        $ranges = $this->monthRanges($months);
+        $monthCount = count($months);
+        $names = [];
+        $rawStats = [];
         foreach ($rows as $row) {
-            if ((string) ($row['last_status_by'] ?? '') !== $agent) {
-                continue;
+            $rawAgent = (string) ($row['last_status_by'] ?? '');
+            $trimmed = trim($rawAgent);
+            if ($trimmed !== '') {
+                $names[$trimmed] = true;
             }
             if (strcasecmp((string) ($row['active_status'] ?? ''), 'Active') !== 0) {
                 continue;
@@ -616,36 +592,117 @@ class Formatter
             if ((string) ($row['current_status'] ?? '') === 'Enrolled (Reconsideration Pending)') {
                 continue;
             }
-            $d = (string) ($row['status_date'] ?? '');
-            if ($d !== '' && $d >= $start && $d <= $end) {
-                $n++;
-                $sum += (float) ($row['enrolled_debt'] ?? 0);
+            $mi = $this->monthIndex((string) ($row['status_date'] ?? ''), $ranges);
+            if ($mi === null) {
+                continue;
             }
+            if (! isset($rawStats[$rawAgent])) {
+                $rawStats[$rawAgent] = array_fill(0, $monthCount, [0, 0.0]);
+            }
+            $rawStats[$rawAgent][$mi][0]++;
+            $rawStats[$rawAgent][$mi][1] += (float) ($row['enrolled_debt'] ?? 0);
         }
 
-        return [$n, $sum];
+        $agentNames = array_keys($names);
+        sort($agentNames, SORT_NATURAL | SORT_FLAG_CASE);
+
+        $stats = [];
+        foreach ($agentNames as $agent) {
+            $stats[$agent] = $rawStats[$agent] ?? array_fill(0, $monthCount, [0, 0.0]);
+        }
+
+        return [$agentNames, $stats];
     }
 
-    /** @param list<array<string,mixed>> $rows */
-    private function countReconDroppedDetail(array $rows, string $agent, string $reason, string $monthStart): int
+    /**
+     * @param  list<array<string,mixed>>  $rows
+     * @param  list<string>  $months
+     * @return list<array{agent:string, reason:string, counts:array<int,int>}>
+     */
+    private function tallyDroppedDetail(array $rows, array $months): array
     {
-        [$start, $end] = $this->monthRange($monthStart);
-        $n = 0;
+        $ranges = $this->monthRanges($months);
+        $monthCount = count($months);
+        $agentNames = [];
+        $reasonNames = [];
+        $rawCounts = [];
         foreach ($rows as $row) {
-            if ((string) ($row['dropped_by'] ?? '') !== $agent) {
+            $rawAgent = (string) ($row['dropped_by'] ?? '');
+            $rawReason = (string) ($row['dropped_reason'] ?? '');
+            $trimmedAgent = trim($rawAgent);
+            $trimmedReason = trim($rawReason);
+            if ($trimmedAgent !== '') {
+                $agentNames[$trimmedAgent] = true;
+            }
+            if ($trimmedReason !== '') {
+                $reasonNames[$trimmedReason] = true;
+            }
+            $mi = $this->monthIndex((string) ($row['enrolled_date'] ?? ''), $ranges);
+            if ($mi === null) {
                 continue;
             }
-            if ((string) ($row['dropped_reason'] ?? '') !== $reason) {
-                continue;
+            $key = $rawAgent."\0".$rawReason;
+            if (! isset($rawCounts[$key])) {
+                $rawCounts[$key] = array_fill(0, $monthCount, 0);
             }
-            // VBA COUNTIFS uses enrolled_date (column C)
-            $d = (string) ($row['enrolled_date'] ?? '');
-            if ($d !== '' && $d >= $start && $d <= $end) {
-                $n++;
+            $rawCounts[$key][$mi]++;
+        }
+
+        $agents = array_keys($agentNames);
+        $reasons = array_keys($reasonNames);
+        sort($agents, SORT_NATURAL | SORT_FLAG_CASE);
+        sort($reasons, SORT_NATURAL | SORT_FLAG_CASE);
+
+        $matrix = [];
+        foreach ($agents as $agent) {
+            foreach ($reasons as $reason) {
+                $counts = $rawCounts[$agent."\0".$reason] ?? array_fill(0, $monthCount, 0);
+                $total = 0;
+                foreach ($counts as $mi => $c) {
+                    if ($mi < 3) {
+                        $total += $c;
+                    }
+                }
+                if ($total === 0) {
+                    continue;
+                }
+                $matrix[] = ['agent' => $agent, 'reason' => $reason, 'counts' => $counts];
             }
         }
 
-        return $n;
+        return $matrix;
+    }
+
+    /**
+     * @param  list<string>  $months
+     * @return list<array{0:string,1:string}>
+     */
+    private function monthRanges(array $months): array
+    {
+        $ranges = [];
+        foreach ($months as $month) {
+            $ranges[] = $this->monthRange($month);
+        }
+
+        return $ranges;
+    }
+
+    /**
+     * @param  list<array{0:string,1:string}>  $ranges
+     */
+    private function monthIndex(string $ymd, array $ranges): ?int
+    {
+        if ($ymd === '') {
+            return null;
+        }
+        $d = substr($ymd, 0, 10);
+        foreach ($ranges as $i => [$start, $end]) {
+            if ($d >= $start && $d <= $end) {
+                return $i;
+            }
+        }
+
+        return null;
     }
 
     /** @return array{0:string,1:string} */
@@ -680,18 +737,45 @@ class Formatter
         }
     }
 
-    private function setDateCell(Worksheet $sheet, string $cell, string $ymd): void
+    private function excelDateValue(string $ymd): mixed
     {
         if ($ymd === '') {
-            $sheet->setCellValue($cell, '');
-
-            return;
+            return '';
         }
         $date = \DateTimeImmutable::createFromFormat('!Y-m-d', substr($ymd, 0, 10));
         if ($date !== false) {
-            $sheet->setCellValue($cell, ExcelDate::PHPToExcel($date));
-        } else {
-            $sheet->setCellValue($cell, $ymd);
+            return ExcelDate::PHPToExcel($date);
+        }
+
+        return $ymd;
+    }
+
+    /**
+     * Write a grid in one shot, but keep column A (contact IDs) as Excel strings
+     * so large IDs are not coerced to numbers.
+     *
+     * @param  list<list<mixed>>  $rows
+     */
+    private function fromArrayPreserveIdColumn(Worksheet $sheet, array $rows): void
+    {
+        $previous = Cell::getValueBinder();
+        Cell::setValueBinder(new class extends DefaultValueBinder
+        {
+            public function bindValue(Cell $cell, $value): bool
+            {
+                if ($cell->getColumn() === 'A' && $cell->getRow() >= 2) {
+                    $cell->setValueExplicit((string) $value, DataType::TYPE_STRING);
+
+                    return true;
+                }
+
+                return parent::bindValue($cell, $value);
+            }
+        });
+        try {
+            $sheet->fromArray($rows, null, 'A1', true);
+        } finally {
+            Cell::setValueBinder($previous);
         }
     }
 
@@ -705,14 +789,17 @@ class Formatter
         ]);
     }
 
-    private function finishSheet(Worksheet $sheet, string $range, int $cols): void
+    private function finishSheet(Worksheet $sheet, string $range, int $cols, bool $autoSize = false): void
     {
         $sheet->getStyle($range)->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
         $sheet->getStyle($range)->getFont()->setName('Calibri')->setSize(9);
         for ($c = 1; $c <= $cols; $c++) {
-            $sheet->getColumnDimension(Coordinate::stringFromColumnIndex($c))->setAutoSize(true);
             $dim = $sheet->getColumnDimension(Coordinate::stringFromColumnIndex($c));
-            // Excel autofit happens on open; enforce VBA min width ~12 where possible later.
+            if ($autoSize) {
+                $dim->setAutoSize(true);
+            } else {
+                $dim->setWidth(18);
+            }
         }
     }
 
