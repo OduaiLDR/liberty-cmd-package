@@ -262,30 +262,49 @@ SQL;
                 return "('" . $this->escapeSqlString($id) . "')";
             }, $chunk));
 
-            // Match VBA logic EXACTLY:
-            // 1) Find first CLEARED_DATE per contact.
+            // First CLEARED draft drives First_Payment_Cleared_Date + Program_Payment (amount).
+            // But First_Payment_Date is the process date of the first CLEARED-OR-RETURNED draft
+            // (Jacob 2026-08-17): if an earlier payment returned before this one cleared, FPD must
+            // be that earlier return's process date, not the clear's. So PROCESS_DATE here is the
+            // first cleared-or-returned process date (RETURN_CODE = '' is not a return).
             $sql = <<<SQL
 SELECT
-    CONTACT_ID,
-    TO_VARCHAR(CONVERT_TIMEZONE('America/Los_Angeles', CLEARED_DATE), 'YYYY-MM-DD') AS CLEARED_DATE,
-    TO_VARCHAR(CONVERT_TIMEZONE('America/Los_Angeles', PROCESS_DATE), 'YYYY-MM-DD') AS PROCESS_DATE,
-    AMOUNT
+    fc.CONTACT_ID,
+    fc.CLEARED_DATE,
+    fa.PROCESS_DATE AS PROCESS_DATE,
+    fc.AMOUNT
 FROM (
     SELECT
-        t.CONTACT_ID,
-        CONVERT_TIMEZONE('America/Los_Angeles', t.CLEARED_DATE) AS CLEARED_DATE,
-        CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE) AS PROCESS_DATE,
-        t.AMOUNT,
-        ROW_NUMBER() OVER (PARTITION BY t.CONTACT_ID ORDER BY CONVERT_TIMEZONE('America/Los_Angeles', t.CLEARED_DATE)) AS N
-    FROM TRANSACTIONS t
-    WHERE t.CONTACT_ID IN (SELECT TO_NUMBER(column1) FROM VALUES {$values})
-      AND t.TRANS_TYPE = 'D'
-      AND t.CLEARED_DATE IS NOT NULL
-      AND t.RETURNED_DATE IS NULL
-      AND (t.RETURN_CODE IS NULL OR t.RETURN_CODE = '')
-      AND t._FIVETRAN_DELETED = FALSE
-)
-WHERE N = 1
+        CONTACT_ID,
+        TO_VARCHAR(CLEARED_DATE, 'YYYY-MM-DD') AS CLEARED_DATE,
+        AMOUNT
+    FROM (
+        SELECT
+            t.CONTACT_ID,
+            CONVERT_TIMEZONE('America/Los_Angeles', t.CLEARED_DATE) AS CLEARED_DATE,
+            t.AMOUNT,
+            ROW_NUMBER() OVER (PARTITION BY t.CONTACT_ID ORDER BY CONVERT_TIMEZONE('America/Los_Angeles', t.CLEARED_DATE)) AS N
+        FROM TRANSACTIONS t
+        WHERE t.CONTACT_ID IN (SELECT TO_NUMBER(column1) FROM VALUES {$values})
+          AND t.TRANS_TYPE = 'D'
+          AND t.CLEARED_DATE IS NOT NULL
+          AND t.RETURNED_DATE IS NULL
+          AND (t.RETURN_CODE IS NULL OR t.RETURN_CODE = '')
+          AND t._FIVETRAN_DELETED = FALSE
+    )
+    WHERE N = 1
+) fc
+JOIN (
+    SELECT
+        CONTACT_ID,
+        TO_VARCHAR(MIN(CAST(CONVERT_TIMEZONE('America/Los_Angeles', PROCESS_DATE) AS DATE)), 'YYYY-MM-DD') AS PROCESS_DATE
+    FROM TRANSACTIONS
+    WHERE CONTACT_ID IN (SELECT TO_NUMBER(column1) FROM VALUES {$values})
+      AND TRANS_TYPE = 'D'
+      AND _FIVETRAN_DELETED = FALSE
+      AND (CLEARED_DATE IS NOT NULL OR RETURNED_DATE IS NOT NULL OR (RETURN_CODE IS NOT NULL AND RETURN_CODE <> ''))
+    GROUP BY CONTACT_ID
+) fa ON fa.CONTACT_ID = fc.CONTACT_ID
 SQL;
 
             try {
