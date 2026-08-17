@@ -308,6 +308,16 @@ class GenerateEnrollmentSummaryReport extends Command
 
             $paidCoalesce = 'COALESCE(First_Payment_Date, Payment_Date_2, Payment_Date_1)';
 
+            // Jacob 2026-08-17 (#4): on the currently-paying PROJECTION totals (Total Deals/Debt,
+            // Sellable, Reconsideration — the ones already scoped to Cancel_Date IS NULL AND
+            // NSF_Date IS NULL), drop a payment that never processed: not cleared and its date is
+            // 3+ days past. Cleared always counts; not-yet-due (within 3 days) still counts; NSF'd
+            // is already excluded by NSF_Date IS NULL. No-op for future months (their dates are
+            // always >= the cutoff). The Gross/day-based rows above are left as-is per Jacob ("the
+            // new debt and clients is only for that particular day so that is the same").
+            $threeDayCutoff = date('Y-m-d', strtotime($snapshotDate . ' -3 days'));
+            $payingClause = "AND (First_Payment_Cleared_Date IS NOT NULL OR {$paidCoalesce} >= '{$threeDayCutoff}')";
+
             $grossNew = (int) $this->scalar($connector, "
                 SELECT COUNT(*) FROM TblEnrollment
                 WHERE Welcome_Call_Date = ?
@@ -357,14 +367,14 @@ class GenerateEnrollmentSummaryReport extends Command
             $deals = (int) $this->scalar($connector, "
                 SELECT COUNT(*) FROM TblEnrollment
                 WHERE Cancel_Date IS NULL AND NSF_Date IS NULL
-                  AND {$paidCoalesce} >= ? AND {$paidCoalesce} <= ? {$criteria}
+                  AND {$paidCoalesce} >= ? AND {$paidCoalesce} <= ? {$criteria} {$payingClause}
             ", [$monthStart, $monthEnd]);
             $this->setRow("Total Deals Paying in {$monthLabel}", $columnKey, $deals, 'count', bold: true);
 
             $totalDebt = (float) $this->scalar($connector, "
                 SELECT SUM(Debt_Amount) FROM TblEnrollment
                 WHERE Cancel_Date IS NULL AND NSF_Date IS NULL
-                  AND {$paidCoalesce} >= ? AND {$paidCoalesce} <= ? {$criteria}
+                  AND {$paidCoalesce} >= ? AND {$paidCoalesce} <= ? {$criteria} {$payingClause}
             ", [$monthStart, $monthEnd]);
             $this->setRow("Total Debt Paying in {$monthLabel}", $columnKey, $totalDebt, 'currency', bold: true);
 
@@ -373,7 +383,7 @@ class GenerateEnrollmentSummaryReport extends Command
                 WHERE Cancel_Date IS NULL AND NSF_Date IS NULL
                   AND {$paidCoalesce} >= ? AND {$paidCoalesce} <= ?
                   AND Debt_Sold_To IS NULL
-                  AND Enrollment_Status IN('LDR Enrolled', 'ProLaw Enrolled', 'Approved') {$criteria}
+                  AND Enrollment_Status IN('LDR Enrolled', 'ProLaw Enrolled', 'Approved') {$criteria} {$payingClause}
             ", [$monthStart, $monthEnd]);
             $this->setRow("Sellable Debt Paying in {$monthLabel}", $columnKey, $sellableDebt, 'currency', bold: true);
 
@@ -402,7 +412,7 @@ class GenerateEnrollmentSummaryReport extends Command
                 WHERE Cancel_Date IS NULL AND NSF_Date IS NULL
                   AND {$paidCoalesce} >= ? AND {$paidCoalesce} <= ?
                   AND Debt_Sold_To IS NULL
-                  AND Enrollment_Status = 'Enrolled (Reconsideration Pending)' {$criteria}
+                  AND Enrollment_Status = 'Enrolled (Reconsideration Pending)' {$criteria} {$payingClause}
             ", [$monthStart, $monthEnd]);
             $this->setRow("Reconsideration Pending Debt Paying in {$monthLabel}", $columnKey, $reconsiderationDebt, 'currency', bold: true);
 
