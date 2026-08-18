@@ -34,7 +34,8 @@ class SyncPhoneNumbers extends Command
 
             $sqlServer = null;
             if ($this->option('dry-run')) {
-                $this->warn('[DRY RUN] SQL Server connection and all writes are disabled.');
+                $this->warn('[
+                 RUN] SQL Server connection and all writes are disabled.');
             } else {
                 $this->info('[DEBUG] Initializing LDR SQL Server connection...');
                 $sqlServer = $this->initializeSqlServerConnector();
