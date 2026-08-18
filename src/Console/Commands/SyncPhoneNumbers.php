@@ -9,7 +9,7 @@ use Illuminate\Support\Facades\Log;
 class SyncPhoneNumbers extends Command
 {
     protected $signature = 'Sync:phone-numbers
-        {--batch-size=2000 : Number of rows per INSERT}
+        {--batch-size=1000 : Number of rows per INSERT (SQL Server maximum)}
         {--dry-run : Read and normalize the source data without changing SQL Server}';
 
     protected $description = 'Sync LT phone numbers from Snowflake CONTACTS into LDR SQL Server TblPhoneNumbers.';
@@ -23,9 +23,10 @@ class SyncPhoneNumbers extends Command
         Log::info('SyncPhoneNumbers command started.', ['source' => self::SOURCE]);
 
         $batchSize = (int) $this->option('batch-size');
-        if ($batchSize <= 0) {
-            $batchSize = 2000;
-        }
+        // SQL Server permits at most 1,000 row constructors in one INSERT.
+        $batchSize = min(max(1, $batchSize), 1000);
+
+        $stagePath = null;
 
         try {
             $this->info('[DEBUG] Initializing LT Snowflake connector...');
@@ -34,8 +35,7 @@ class SyncPhoneNumbers extends Command
 
             $sqlServer = null;
             if ($this->option('dry-run')) {
-                $this->warn('[
-                 RUN] SQL Server connection and all writes are disabled.');
+                $this->warn('[DRY RUN] SQL Server connection and all writes are disabled.');
             } else {
                 $this->info('[DEBUG] Initializing LDR SQL Server connection...');
                 $sqlServer = $this->initializeSqlServerConnector();
@@ -70,13 +70,11 @@ class SyncPhoneNumbers extends Command
                 return Command::SUCCESS;
             }
 
-            $phones = $this->fetchPhonesFromSnowflake($snowflake);
-            $this->info('[INFO] Fetched ' . count($phones) . ' phone rows from Snowflake.');
+            [$stagePath, $sourceCount, $normalizedCount] = $this->stagePhonesFromSnowflake($snowflake);
+            $this->info("[INFO] Fetched {$sourceCount} phone rows from Snowflake.");
+            $this->info("[INFO] Normalized to {$normalizedCount} non-empty phones (matches VBA, duplicates preserved).");
 
-            $normalized = $this->normalizePhones($phones);
-            $this->info('[INFO] Normalized to ' . count($normalized) . ' non-empty phones (matches VBA, duplicates preserved).');
-
-            if (empty($normalized)) {
+            if ($normalizedCount === 0) {
                 $this->warn('[WARN] No phones to insert.');
                 Log::info('SyncPhoneNumbers: no phones to insert.');
                 return Command::SUCCESS;
@@ -85,7 +83,7 @@ class SyncPhoneNumbers extends Command
             $deleted = $this->deleteExistingPhones($sqlServer);
             $this->info("[INFO] Deleted {$deleted} existing rows for Source = '" . self::SOURCE . "'.");
 
-            $inserted = $this->insertPhonesInBatches($sqlServer, $normalized, $batchSize);
+            $inserted = $this->insertPhonesFromFile($sqlServer, $stagePath, $batchSize);
             $this->info("[INFO] Inserted {$inserted} rows into TblPhoneNumbers.");
 
             $cleaned = $this->cleanupEmptyPhones($sqlServer);
@@ -103,22 +101,64 @@ class SyncPhoneNumbers extends Command
             $this->error('SyncPhoneNumbers failed: ' . $e->getMessage());
             Log::error('SyncPhoneNumbers: exception', ['exception' => $e]);
             return Command::FAILURE;
+        } finally {
+            if ($stagePath !== null && is_file($stagePath)) {
+                @unlink($stagePath);
+            }
         }
 
         $this->info('[SUCCESS] SyncPhoneNumbers completed successfully!');
         return Command::SUCCESS;
     }
 
-    private function fetchPhonesFromSnowflake(DBConnector $snowflake): array
+    private function stagePhonesFromSnowflake(DBConnector $snowflake): array
     {
-        // Flatten the four phone columns in one CONTACTS scan. COMPACT removes
-        // nulls before flattening but preserves duplicates, matching UNION ALL.
+        $pageSize = 5000;
+        $offset = 0;
+        $sourceCount = 0;
+        $normalizedCount = 0;
+        $stagePath = tempnam(sys_get_temp_dir(), 'sync-phone-');
+
+        if ($stagePath === false) {
+            throw new \RuntimeException('Unable to create temporary phone staging file.');
+        }
+
+        $handle = fopen($stagePath, 'wb');
+        if ($handle === false) {
+            throw new \RuntimeException('Unable to open temporary phone staging file.');
+        }
+
+        try {
+            do {
+                $rows = $this->fetchPhonePage($snowflake, $pageSize, $offset);
+                $sourceCount += count($rows);
+                $normalized = $this->normalizePhones($rows);
+
+                foreach ($normalized as $phone) {
+                    fwrite($handle, json_encode($phone, JSON_THROW_ON_ERROR) . PHP_EOL);
+                }
+
+                $normalizedCount += count($normalized);
+                $offset += $pageSize;
+            } while (count($rows) === $pageSize);
+        } finally {
+            fclose($handle);
+        }
+
+        return [$stagePath, $sourceCount, $normalizedCount];
+    }
+
+    private function fetchPhonePage(DBConnector $snowflake, int $limit, int $offset): array
+    {
+        // Query only one page so DBConnector never has to hold the full result set.
         $sql = "
             SELECT c.ID, phone_values.VALUE::STRING AS PHONE
             FROM CONTACTS AS c,
                  LATERAL FLATTEN(
                      INPUT => ARRAY_CONSTRUCT_COMPACT(c.PHONE, c.PHONE2, c.PHONE3, c.PHONE4)
                  ) AS phone_values
+            ORDER BY c.ID, phone_values.INDEX
+            LIMIT {$limit} OFFSET {$offset}
         ";
 
         $result = $snowflake->query($sql);
@@ -177,35 +217,60 @@ class SyncPhoneNumbers extends Command
         return $this->extractAffected($result);
     }
 
-    private function insertPhonesInBatches(DBConnector $connector, array $phones, int $batchSize): int
+    private function insertPhonesFromFile(DBConnector $connector, string $stagePath, int $batchSize): int
     {
+        $handle = fopen($stagePath, 'rb');
+        if ($handle === false) {
+            throw new \RuntimeException('Unable to read temporary phone staging file.');
+        }
+
         $totalInserted = 0;
-        $sourceEsc = $this->esc(self::SOURCE);
-        $chunks = array_chunk($phones, $batchSize);
+        $batch = [];
+        $batchNumber = 0;
 
-        foreach ($chunks as $index => $chunk) {
-            $values = [];
-            foreach ($chunk as $item) {
-                $phoneEsc = $this->esc($item['phone']);
-                $cid = $item['cid'] !== null ? (int) $item['cid'] : 'NULL';
-                $values[] = "('{$phoneEsc}', '{$sourceEsc}', {$cid})";
+        try {
+            while (($line = fgets($handle)) !== false) {
+                $batch[] = json_decode($line, true, 512, JSON_THROW_ON_ERROR);
+
+                if (count($batch) < $batchSize) {
+                    continue;
+                }
+
+                $batchNumber++;
+                $totalInserted += $this->insertPhoneBatch($connector, $batch, $batchNumber);
+                $batch = [];
             }
 
-            if (empty($values)) {
-                continue;
+            if ($batch !== []) {
+                $batchNumber++;
+                $totalInserted += $this->insertPhoneBatch($connector, $batch, $batchNumber);
             }
-
-            $sql = 'INSERT INTO TblPhoneNumbers (Phone, Source, CID) VALUES ' . implode(', ', $values);
-            $result = $connector->querySqlServer($sql);
-            $this->assertSqlServerSuccess($result, 'insert phone batch ' . ($index + 1));
-            $affected = $this->extractAffected($result);
-            $inserted = $affected > 0 ? $affected : count($chunk);
-            $totalInserted += $inserted;
-
-            $this->info(sprintf('[INFO] Batch %d: inserted %d rows.', $index + 1, $inserted));
+        } finally {
+            fclose($handle);
         }
 
         return $totalInserted;
+    }
+
+    private function insertPhoneBatch(DBConnector $connector, array $chunk, int $batchNumber): int
+    {
+        $sourceEsc = $this->esc(self::SOURCE);
+        $values = [];
+
+        foreach ($chunk as $item) {
+            $phoneEsc = $this->esc($item['phone']);
+            $cid = $item['cid'] !== null ? (int) $item['cid'] : 'NULL';
+            $values[] = "('{$phoneEsc}', '{$sourceEsc}', {$cid})";
+        }
+
+        $sql = 'INSERT INTO TblPhoneNumbers (Phone, Source, CID) VALUES ' . implode(', ', $values);
+        $result = $connector->querySqlServer($sql);
+        $this->assertSqlServerSuccess($result, 'insert phone batch ' . $batchNumber);
+        $affected = $this->extractAffected($result);
+        $inserted = $affected > 0 ? $affected : count($chunk);
+
+        $this->info(sprintf('[INFO] Batch %d: inserted %d rows.', $batchNumber, $inserted));
+        return $inserted;
     }
 
     private function cleanupEmptyPhones(DBConnector $connector): int
