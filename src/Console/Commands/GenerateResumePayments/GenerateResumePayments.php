@@ -1131,7 +1131,7 @@ final class GenerateResumePayments extends Command
             if (isset($existing['LLG-' . $cid])) {
                 continue;
             }
-            $statusChanges[] = $this->row($cid, $meta['name'], self::STAGE_CANCEL_HOLD, (int) $meta['days'], $debtByCid[$cid] ?? 0.0);
+            $statusChanges[] = $this->row($cid, $meta['name'], self::STAGE_CANCEL_HOLD, (int) $meta['days'], $debtByCid[$cid] ?? 0.0, 'No cleared payment in 105+ days and no genuine NSF to auto-cancel on — manual cancel review');
             $added++;
         }
 
@@ -1274,10 +1274,12 @@ final class GenerateResumePayments extends Command
      * name, the recap STAGE (a STAGE_* constant), days-since-NSF (age), enrolled debt,
      * and — Jacob 2026-08-11 — the current enrollment status + lifetime cleared-payment
      * count (both looked up from the per-contact enrichment maps). One client = one stage.
+     * $notes (Jacob 2026-08-17) carries the reason a Manual Review client isn't being
+     * cancelled; it is only rendered on the Manual Review sheet and is '' elsewhere.
      *
-     * @return array{llg_id:string,name:string,stage:string,days:int,debt:float,enrollment_status:string,cleared_payments:int}
+     * @return array{llg_id:string,name:string,stage:string,days:int,debt:float,enrollment_status:string,cleared_payments:int,notes:string}
      */
-    private function row(string $contactId, string $name, string $stage, int $days, float $debt): array
+    private function row(string $contactId, string $name, string $stage, int $days, float $debt, string $notes = ''): array
     {
         return [
             'llg_id' => "LLG-{$contactId}",
@@ -1287,6 +1289,7 @@ final class GenerateResumePayments extends Command
             'debt' => $debt,
             'enrollment_status' => $this->statusByContact[$contactId] ?? '',
             'cleared_payments' => $this->clearedByContact[$contactId] ?? 0,
+            'notes' => $notes,
         ];
     }
 
@@ -1700,7 +1703,11 @@ final class GenerateResumePayments extends Command
                 continue;
             }
             if ($route === 'manual') {
-                $statusChanges[] = $this->row($contactId, $name, self::STAGE_CANCEL_HOLD, $ageDays, $debt);
+                $manualStatus = trim((string) ($queueStatuses[$contactId] ?? ''));
+                $note = $manualStatus !== ''
+                    ? "Status \"{$manualStatus}\" is not auto-cancellable (not NSF / System Cancel) — needs manual review"
+                    : 'Status is not auto-cancellable (not NSF / System Cancel) — needs manual review';
+                $statusChanges[] = $this->row($contactId, $name, self::STAGE_CANCEL_HOLD, $ageDays, $debt, $note);
                 continue;
             }
 
@@ -1709,9 +1716,10 @@ final class GenerateResumePayments extends Command
 
             if ($day < self::CANCEL_COOLDOWN_DAYS) {
                 // Grace period — managers can still intervene (Grace Period sheet). Jacob
-                // 2026-07-22: show the cooldown day 1-indexed (Day 1 the first eligible day
-                // .. Day 5), NOT the NSF age. $day is 0-indexed internally, so display $day+1.
-                $statusChanges[] = $this->row($contactId, $name, self::STAGE_CANCEL_GRACE, $day + 1, $debt);
+                // 2026-08-17: show the NSF age (days since the first NSF in the sequence, ~105+
+                // since these are past the cancel threshold), NOT the 1..5 cooldown index — so the
+                // "Days since NSF" column is consistent with the other cancel sheets.
+                $statusChanges[] = $this->row($contactId, $name, self::STAGE_CANCEL_GRACE, $ageDays, $debt);
                 continue;
             }
 
@@ -1722,7 +1730,10 @@ final class GenerateResumePayments extends Command
             if ($cancelInfo === null) {
                 // Past grace but the return code doesn't map to a cancel type — it can't be
                 // auto-cancelled, so a person must handle it (Release Hold / manual sheet).
-                $statusChanges[] = $this->row($contactId, $name, self::STAGE_CANCEL_HOLD, $ageDays, $debt);
+                $note = $rcode !== ''
+                    ? "Return code \"{$rcode}\" has no auto-cancel mapping — needs manual review"
+                    : 'No return code to map to a cancel type — needs manual review';
+                $statusChanges[] = $this->row($contactId, $name, self::STAGE_CANCEL_HOLD, $ageDays, $debt, $note);
                 continue;
             }
 
@@ -1890,7 +1901,12 @@ final class GenerateResumePayments extends Command
             ]);
             // Preview lands in the stage it WOULD end in: a clean drop → Complete,
             // a settlement gate → Release Hold Requested (manual).
-            $statusChanges[] = $this->row($contactId, $name, $gate === null ? self::STAGE_CANCEL_COMPLETE : self::STAGE_CANCEL_HOLD, $days, $debt);
+            $previewNote = match ($gate) {
+                'settlement' => 'Scheduled settlement present — must be voided manually before the cancel',
+                'epf' => 'Positive balance with EPF — verify/refund manually before the cancel',
+                default => '',
+            };
+            $statusChanges[] = $this->row($contactId, $name, $gate === null ? self::STAGE_CANCEL_COMPLETE : self::STAGE_CANCEL_HOLD, $days, $debt, $previewNote);
             return;
         }
 
@@ -1921,7 +1937,7 @@ final class GenerateResumePayments extends Command
                     'error' => $e->getMessage(),
                 ]);
                 $this->emailCancellationAudit($contactId, 'URGENT — PARTIAL settlement void; client NOT dropped/refunded, reconcile manually: ' . $e->getMessage());
-                $statusChanges[] = $this->row($contactId, $name, self::STAGE_CANCEL_HOLD, $days, $debt);
+                $statusChanges[] = $this->row($contactId, $name, self::STAGE_CANCEL_HOLD, $days, $debt, 'URGENT: partial settlement void — client NOT dropped/refunded; reconcile manually');
                 return;
             }
 
@@ -1971,7 +1987,7 @@ final class GenerateResumePayments extends Command
                 'reason' => $reason,
             ]);
             $this->emailCancellationAudit($contactId, $reason);
-            $statusChanges[] = $this->row($contactId, $name, self::STAGE_CANCEL_HOLD, $days, $debt);
+            $statusChanges[] = $this->row($contactId, $name, self::STAGE_CANCEL_HOLD, $days, $debt, 'Cancel flow flagged for manual review: ' . $reason);
             return;
         }
 
@@ -2007,7 +2023,7 @@ final class GenerateResumePayments extends Command
             // Returned Payments Hold / refund blocked the drop — a person must release &
             // cancel it. Lands on the Release Hold Requested sheet (Jacob 2026-07-20: no
             // separate Rama email; held clients live on that sheet).
-            $statusChanges[] = $this->row($contactId, $name, self::STAGE_CANCEL_HOLD, $days, $debt);
+            $statusChanges[] = $this->row($contactId, $name, self::STAGE_CANCEL_HOLD, $days, $debt, 'Drop ran but did not take effect (Returned Payments Hold / refund rejected) — release & cancel manually');
             return;
         }
 

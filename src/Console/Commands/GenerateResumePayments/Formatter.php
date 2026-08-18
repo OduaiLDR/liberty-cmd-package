@@ -23,7 +23,7 @@ use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
  *   - Attachment: one worksheet per stage, columns LLG ID / Name / Enrollment Status /
  *     Cleared Payments / Debt / Days since NSF, sorted by enrollment status (asc) then
  *     days since payment (desc).
- * One recap per company (LDR / ProLaw). Recipients live in dbo.TblReports.
+ * One recap per company (LDR / Progress Law). Recipients live in dbo.TblReports.
  */
 class Formatter
 {
@@ -57,12 +57,12 @@ class Formatter
     ];
 
     /**
-     * @param list<array{llg_id:string,name:string,stage:string,days:int,debt:float,enrollment_status:string,cleared_payments:int}> $statusChanges
+     * @param list<array{llg_id:string,name:string,stage:string,days:int,debt:float,enrollment_status:string,cleared_payments:int,notes:string}> $statusChanges
      */
     public function sendRecap(DBConnector $connector, array $statusChanges, string $company, bool $dryRun = false, ?Command $console = null, bool $cancelsOnly = false, string $previewTo = ''): bool
     {
-        // VBA: LDR macro subject says "LDR"; PLAW macro subject says "ProLaw".
-        $subjectSuffix = strtoupper($company) === 'PLAW' ? 'ProLaw' : 'LDR';
+        // LDR run subject says "LDR"; the PLAW company shows as "Progress Law" (Jacob 2026-08-17).
+        $subjectSuffix = $this->companyDisplay($company);
         // A --cancels-only run skips the NSF status step (the day's first/full run
         // already did it), so its report is a pure cancels report: NSF stages omitted,
         // its own subject. The main full run keeps Jacob's NSF format unchanged.
@@ -169,8 +169,8 @@ class Formatter
      * (Jacob 2026-08-11). Every stage gets a bucket (possibly empty) so the layout is
      * stable. Rows with an unrecognized stage are dropped (they should not occur).
      *
-     * @param list<array{llg_id:string,name:string,stage:string,days:int,debt:float,enrollment_status:string,cleared_payments:int}> $statusChanges
-     * @return array<string, list<array{llg_id:string,name:string,stage:string,days:int,debt:float,enrollment_status:string,cleared_payments:int}>>
+     * @param list<array{llg_id:string,name:string,stage:string,days:int,debt:float,enrollment_status:string,cleared_payments:int,notes:string}> $statusChanges
+     * @return array<string, list<array{llg_id:string,name:string,stage:string,days:int,debt:float,enrollment_status:string,cleared_payments:int,notes:string}>>
      */
     private function groupByStage(array $statusChanges): array
     {
@@ -234,7 +234,7 @@ class Formatter
      * "give a summary and totals only ... put detail in attachment"). A cancels-only
      * run renders only the Cancels stages (see displayStages).
      *
-     * @param array<string, list<array{llg_id:string,name:string,stage:string,days:int,debt:float,enrollment_status:string,cleared_payments:int}>> $grouped
+     * @param array<string, list<array{llg_id:string,name:string,stage:string,days:int,debt:float,enrollment_status:string,cleared_payments:int,notes:string}>> $grouped
      */
     private function buildSummaryBody(array $grouped, string $label, bool $cancelsOnly = false): string
     {
@@ -343,7 +343,7 @@ class Formatter
      * (desc). Empty stages still get a header-only sheet so the layout is stable
      * run-to-run.
      *
-     * @param array<string, list<array{llg_id:string,name:string,stage:string,days:int,debt:float,enrollment_status:string,cleared_payments:int}>> $grouped
+     * @param array<string, list<array{llg_id:string,name:string,stage:string,days:int,debt:float,enrollment_status:string,cleared_payments:int,notes:string}>> $grouped
      * @return array{filename:string, path:string}
      */
     public function buildWorkbook(array $grouped, string $company, bool $cancelsOnly = false): array
@@ -359,25 +359,36 @@ class Formatter
             $sheet->setShowGridlines(false);
 
             // Jacob 2026-08-11: add Enrollment Status + Cleared Payments to every sheet.
-            $sheet->fromArray(['LLG ID', 'Name', 'Enrollment Status', 'Cleared Payments', 'Debt', 'Days since NSF'], null, 'A1');
-            $this->styleHeader($sheet, 'A1:F1');
+            // Jacob 2026-08-17: the Manual Review sheet gets an extra "Notes" column at the end
+            // saying why each client isn't being cancelled; the other sheets keep the 6 columns.
+            $withNotes = $stage['key'] === 'Cancels - Release Hold Requested';
+            $lastCol = $withNotes ? 'G' : 'F';
+            $headers = ['LLG ID', 'Name', 'Enrollment Status', 'Cleared Payments', 'Debt', 'Days since NSF'];
+            if ($withNotes) {
+                $headers[] = 'Notes';
+            }
+            $sheet->fromArray($headers, null, 'A1');
+            $this->styleHeader($sheet, "A1:{$lastCol}1");
 
             $rowIndex = 2;
             foreach ($grouped[$stage['key']] ?? [] as $change) {
                 $sheet->setCellValue("A{$rowIndex}", (string) ($change['llg_id'] ?? ''));
                 $sheet->setCellValue("B{$rowIndex}", (string) ($change['name'] ?? ''));
-                $sheet->setCellValue("C{$rowIndex}", (string) ($change['enrollment_status'] ?? ''));
+                $sheet->setCellValue("C{$rowIndex}", $this->displayStatus((string) ($change['enrollment_status'] ?? '')));
                 $sheet->setCellValueExplicit("D{$rowIndex}", (int) ($change['cleared_payments'] ?? 0), DataType::TYPE_NUMERIC);
                 $sheet->setCellValueExplicit("E{$rowIndex}", (float) ($change['debt'] ?? 0), DataType::TYPE_NUMERIC);
                 $sheet->setCellValueExplicit("F{$rowIndex}", (int) ($change['days'] ?? 0), DataType::TYPE_NUMERIC);
+                if ($withNotes) {
+                    $sheet->setCellValue("G{$rowIndex}", (string) ($change['notes'] ?? ''));
+                }
                 $rowIndex++;
             }
 
             $lastRow = max(2, $rowIndex - 1);
 
-            $this->applyBorders($sheet, "A1:F{$lastRow}");
-            $sheet->getStyle("A1:F{$lastRow}")->getFont()->setName('Calibri')->setSize(9);
-            $sheet->getStyle("A1:F{$lastRow}")->getAlignment()->setVertical(Alignment::VERTICAL_TOP);
+            $this->applyBorders($sheet, "A1:{$lastCol}{$lastRow}");
+            $sheet->getStyle("A1:{$lastCol}{$lastRow}")->getFont()->setName('Calibri')->setSize(9);
+            $sheet->getStyle("A1:{$lastCol}{$lastRow}")->getAlignment()->setVertical(Alignment::VERTICAL_TOP);
             $sheet->getStyle("E2:E{$lastRow}")->getNumberFormat()->setFormatCode('#,##0.00');
             $sheet->getColumnDimension('A')->setWidth(18);
             $sheet->getColumnDimension('B')->setWidth(26);
@@ -385,13 +396,17 @@ class Formatter
             $sheet->getColumnDimension('D')->setWidth(16);
             $sheet->getColumnDimension('E')->setWidth(14);
             $sheet->getColumnDimension('F')->setWidth(14);
+            if ($withNotes) {
+                $sheet->getColumnDimension('G')->setWidth(60);
+                $sheet->getStyle("G2:G{$lastRow}")->getAlignment()->setWrapText(true);
+            }
             $sheet->freezePane('A2');
             $sheet->setSelectedCells('A1');
         }
 
         $spreadsheet->setActiveSheetIndex(0);
 
-        $filename = 'ResumePayments - ' . $company . ' - ' . date('m-d-Y') . '.xlsx';
+        $filename = 'ResumePayments - ' . $this->companyDisplay($company) . ' - ' . date('m-d-Y') . '.xlsx';
         $path = storage_path('app/' . $filename);
 
         $writer = new Xlsx($spreadsheet);
@@ -399,6 +414,25 @@ class Formatter
         $writer->save($path);
 
         return ['filename' => $filename, 'path' => $path];
+    }
+
+    /**
+     * Human-facing company name for the subject, body heading and filename. The PLAW
+     * company is displayed as "Progress Law"; LDR stays "LDR" (Jacob 2026-08-17).
+     * Display-only — internal keys / DB values / recipient lookups still use the raw code.
+     */
+    private function companyDisplay(string $company): string
+    {
+        return strtoupper($company) === 'PLAW' ? 'Progress Law' : 'LDR';
+    }
+
+    /**
+     * Display transform for the Enrollment Status column: show "Progress Law" instead of
+     * "ProLaw" / "PLAW" (Jacob 2026-08-17). Display-only — the stored status is unchanged.
+     */
+    private function displayStatus(string $status): string
+    {
+        return str_ireplace(['ProLaw', 'PLAW'], 'Progress Law', $status);
     }
 
     private function styleHeader(Worksheet $sheet, string $range): void
