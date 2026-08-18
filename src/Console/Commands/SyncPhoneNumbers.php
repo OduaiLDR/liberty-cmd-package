@@ -8,7 +8,9 @@ use Illuminate\Support\Facades\Log;
 
 class SyncPhoneNumbers extends Command
 {
-    protected $signature = 'Sync:phone-numbers {--batch-size=1000 : Number of rows per INSERT}';
+    protected $signature = 'Sync:phone-numbers
+        {--batch-size=2000 : Number of rows per INSERT}
+        {--dry-run : Read and normalize the source data without changing SQL Server}';
 
     protected $description = 'Sync LT phone numbers from Snowflake CONTACTS into LDR SQL Server TblPhoneNumbers.';
 
@@ -22,7 +24,7 @@ class SyncPhoneNumbers extends Command
 
         $batchSize = (int) $this->option('batch-size');
         if ($batchSize <= 0) {
-            $batchSize = 1000;
+            $batchSize = 2000;
         }
 
         try {
@@ -30,9 +32,14 @@ class SyncPhoneNumbers extends Command
             $snowflake = DBConnector::fromEnvironment(self::SNOWFLAKE_ENV);
             $this->info('[DEBUG] LT Snowflake connector OK.');
 
-            $this->info('[DEBUG] Initializing LDR SQL Server connection...');
-            $sqlServer = $this->initializeSqlServerConnector();
-            $this->info('[DEBUG] LDR SQL Server OK.');
+            $sqlServer = null;
+            if ($this->option('dry-run')) {
+                $this->warn('[DRY RUN] SQL Server connection and all writes are disabled.');
+            } else {
+                $this->info('[DEBUG] Initializing LDR SQL Server connection...');
+                $sqlServer = $this->initializeSqlServerConnector();
+                $this->info('[DEBUG] LDR SQL Server OK.');
+            }
         } catch (\Throwable $e) {
             $this->error('Failed to initialize connectors: ' . $e->getMessage());
             Log::error('SyncPhoneNumbers: connector init failed', ['exception' => $e]);
@@ -40,8 +47,27 @@ class SyncPhoneNumbers extends Command
         }
 
         try {
-            $deleted = $this->deleteExistingPhones($sqlServer);
-            $this->info("[INFO] Deleted {$deleted} existing rows for Source = '" . self::SOURCE . "'.");
+            if ($this->option('dry-run')) {
+                $summary = $this->fetchDryRunSummary($snowflake);
+                $sourceRows = (int) ($summary['SOURCE_ROWS'] ?? 0);
+                $normalizedRows = (int) ($summary['NORMALIZED_ROWS'] ?? 0);
+                $contacts = (int) ($summary['CONTACTS'] ?? 0);
+
+                $this->info(sprintf(
+                    '[DRY RUN] Source rows: %d; contacts: %d; normalized rows to insert: %d; batches of %d.',
+                    $sourceRows,
+                    $contacts,
+                    $normalizedRows,
+                    $batchSize
+                ));
+                Log::info('SyncPhoneNumbers dry run finished.', [
+                    'source' => self::SOURCE,
+                    'source_rows' => $sourceRows,
+                    'normalized_rows' => $normalizedRows,
+                    'contacts' => $contacts,
+                ]);
+                return Command::SUCCESS;
+            }
 
             $phones = $this->fetchPhonesFromSnowflake($snowflake);
             $this->info('[INFO] Fetched ' . count($phones) . ' phone rows from Snowflake.');
@@ -54,6 +80,9 @@ class SyncPhoneNumbers extends Command
                 Log::info('SyncPhoneNumbers: no phones to insert.');
                 return Command::SUCCESS;
             }
+
+            $deleted = $this->deleteExistingPhones($sqlServer);
+            $this->info("[INFO] Deleted {$deleted} existing rows for Source = '" . self::SOURCE . "'.");
 
             $inserted = $this->insertPhonesInBatches($sqlServer, $normalized, $batchSize);
             $this->info("[INFO] Inserted {$inserted} rows into TblPhoneNumbers.");
@@ -81,18 +110,44 @@ class SyncPhoneNumbers extends Command
 
     private function fetchPhonesFromSnowflake(DBConnector $snowflake): array
     {
+        // Flatten the four phone columns in one CONTACTS scan. COMPACT removes
+        // nulls before flattening but preserves duplicates, matching UNION ALL.
         $sql = "
-            SELECT ID, PHONE AS PHONE FROM CONTACTS WHERE PHONE IS NOT NULL
-            UNION ALL
-            SELECT ID, PHONE2 AS PHONE FROM CONTACTS WHERE PHONE2 IS NOT NULL
-            UNION ALL
-            SELECT ID, PHONE3 AS PHONE FROM CONTACTS WHERE PHONE3 IS NOT NULL
-            UNION ALL
-            SELECT ID, PHONE4 AS PHONE FROM CONTACTS WHERE PHONE4 IS NOT NULL
+            SELECT c.ID, phone_values.VALUE::STRING AS PHONE
+            FROM CONTACTS AS c,
+                 LATERAL FLATTEN(
+                     INPUT => ARRAY_CONSTRUCT_COMPACT(c.PHONE, c.PHONE2, c.PHONE3, c.PHONE4)
+                 ) AS phone_values
         ";
 
         $result = $snowflake->query($sql);
         return $result['data'] ?? [];
+    }
+
+    private function fetchDryRunSummary(DBConnector $snowflake): array
+    {
+        $sql = "
+            WITH source_phones AS (
+                SELECT
+                    c.ID AS CID,
+                    phone_values.VALUE::STRING AS RAW_PHONE
+                FROM CONTACTS AS c,
+                     LATERAL FLATTEN(
+                         INPUT => ARRAY_CONSTRUCT_COMPACT(c.PHONE, c.PHONE2, c.PHONE3, c.PHONE4)
+                     ) AS phone_values
+            ), normalized AS (
+                SELECT CID
+                FROM source_phones
+                WHERE REGEXP_REPLACE(RAW_PHONE, '[^0-9]', '') <> ''
+            )
+            SELECT
+                (SELECT COUNT(*) FROM source_phones) AS SOURCE_ROWS,
+                (SELECT COUNT(*) FROM normalized) AS NORMALIZED_ROWS,
+                (SELECT COUNT(DISTINCT CID) FROM normalized) AS CONTACTS
+        ";
+
+        $result = $snowflake->query($sql);
+        return $result['data'][0] ?? [];
     }
 
     private function normalizePhones(array $rows): array
@@ -117,6 +172,7 @@ class SyncPhoneNumbers extends Command
         $source = $this->esc(self::SOURCE);
         $sql = "DELETE FROM TblPhoneNumbers WHERE Source = '{$source}'";
         $result = $connector->querySqlServer($sql);
+        $this->assertSqlServerSuccess($result, 'delete existing phones');
         return $this->extractAffected($result);
     }
 
@@ -140,6 +196,7 @@ class SyncPhoneNumbers extends Command
 
             $sql = 'INSERT INTO TblPhoneNumbers (Phone, Source, CID) VALUES ' . implode(', ', $values);
             $result = $connector->querySqlServer($sql);
+            $this->assertSqlServerSuccess($result, 'insert phone batch ' . ($index + 1));
             $affected = $this->extractAffected($result);
             $inserted = $affected > 0 ? $affected : count($chunk);
             $totalInserted += $inserted;
@@ -152,9 +209,22 @@ class SyncPhoneNumbers extends Command
 
     private function cleanupEmptyPhones(DBConnector $connector): int
     {
-        $sql = "DELETE FROM TblPhoneNumbers WHERE Phone = ''";
+        $source = $this->esc(self::SOURCE);
+        $sql = "DELETE FROM TblPhoneNumbers WHERE Source = '{$source}' AND Phone = ''";
         $result = $connector->querySqlServer($sql);
+        $this->assertSqlServerSuccess($result, 'cleanup empty phones');
         return $this->extractAffected($result);
+    }
+
+    private function assertSqlServerSuccess(array $result, string $operation): void
+    {
+        if (($result['success'] ?? true) === false) {
+            throw new \RuntimeException(sprintf(
+                'SQL Server %s failed: %s',
+                $operation,
+                $result['error'] ?? 'unknown database error'
+            ));
+        }
     }
 
     private function extractAffected($result): int
