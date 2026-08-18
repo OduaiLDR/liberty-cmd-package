@@ -374,7 +374,9 @@ class Formatter
             foreach ($grouped[$stage['key']] ?? [] as $change) {
                 $sheet->setCellValue("A{$rowIndex}", (string) ($change['llg_id'] ?? ''));
                 $sheet->setCellValue("B{$rowIndex}", (string) ($change['name'] ?? ''));
-                $sheet->setCellValue("C{$rowIndex}", $this->displayStatus((string) ($change['enrollment_status'] ?? '')));
+                // Jacob 2026-08-18: show the enrollment status EXACTLY as it comes from Forth —
+                // no renaming (PLAW = Paramount Law, ProLaw = Progress Law both stay verbatim).
+                $sheet->setCellValue("C{$rowIndex}", (string) ($change['enrollment_status'] ?? ''));
                 $sheet->setCellValueExplicit("D{$rowIndex}", (int) ($change['cleared_payments'] ?? 0), DataType::TYPE_NUMERIC);
                 $sheet->setCellValueExplicit("E{$rowIndex}", (float) ($change['debt'] ?? 0), DataType::TYPE_NUMERIC);
                 $sheet->setCellValueExplicit("F{$rowIndex}", (int) ($change['days'] ?? 0), DataType::TYPE_NUMERIC);
@@ -419,24 +421,13 @@ class Formatter
     /**
      * Human-facing company name for the subject, body heading and filename. The run company
      * coded 'PLAW' is Progress Law, shown as "Progress Law"; LDR stays "LDR" (Jacob 2026-08-17).
-     * This is the RUN label, NOT a per-client status: a "PLAW Enrolled" status inside the LDR
-     * run is Paramount Law, handled separately in displayStatus(). Display-only — internal keys /
-     * DB values / recipient lookups still use the raw code.
+     * This is the RUN label only — per-client statuses are shown VERBATIM from Forth and are not
+     * renamed (Jacob 2026-08-18: a "PLAW Enrolled" status is Paramount Law; "ProLaw" is Progress
+     * Law). Display-only — internal keys / DB values / recipient lookups still use the raw code.
      */
     private function companyDisplay(string $company): string
     {
         return strtoupper($company) === 'PLAW' ? 'Progress Law' : 'LDR';
-    }
-
-    /**
-     * Display transform for the Enrollment Status column: rename only "ProLaw" (Progress Law) to
-     * "Progress Law". "PLAW" is Paramount Law — a different entity that lives in the LDR portal —
-     * and MUST stay as-is, e.g. "PLAW Enrolled" / "PLAW NSF-1" (Jacob 2026-08-18). Display-only;
-     * the stored status is unchanged.
-     */
-    private function displayStatus(string $status): string
-    {
-        return str_ireplace('ProLaw', 'Progress Law', $status);
     }
 
     private function styleHeader(Worksheet $sheet, string $range): void

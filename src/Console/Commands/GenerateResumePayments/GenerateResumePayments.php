@@ -1703,9 +1703,8 @@ final class GenerateResumePayments extends Command
                 continue;
             }
             if ($route === 'manual') {
-                // Same rename as the status column: only "ProLaw" (Progress Law) is renamed;
-                // "PLAW" is Paramount Law and stays as-is (Jacob 2026-08-18).
-                $manualStatus = str_ireplace('ProLaw', 'Progress Law', trim((string) ($queueStatuses[$contactId] ?? '')));
+                // Jacob 2026-08-18: the note quotes the status verbatim from Forth (no renaming).
+                $manualStatus = trim((string) ($queueStatuses[$contactId] ?? ''));
                 $note = $manualStatus !== ''
                     ? "Status \"{$manualStatus}\" is not auto-cancellable (not NSF / System Cancel) — needs manual review"
                     : 'Status is not auto-cancellable (not NSF / System Cancel) — needs manual review';
