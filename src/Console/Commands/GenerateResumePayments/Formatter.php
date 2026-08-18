@@ -417,9 +417,11 @@ class Formatter
     }
 
     /**
-     * Human-facing company name for the subject, body heading and filename. The PLAW
-     * company is displayed as "Progress Law"; LDR stays "LDR" (Jacob 2026-08-17).
-     * Display-only — internal keys / DB values / recipient lookups still use the raw code.
+     * Human-facing company name for the subject, body heading and filename. The run company
+     * coded 'PLAW' is Progress Law, shown as "Progress Law"; LDR stays "LDR" (Jacob 2026-08-17).
+     * This is the RUN label, NOT a per-client status: a "PLAW Enrolled" status inside the LDR
+     * run is Paramount Law, handled separately in displayStatus(). Display-only — internal keys /
+     * DB values / recipient lookups still use the raw code.
      */
     private function companyDisplay(string $company): string
     {
@@ -427,12 +429,14 @@ class Formatter
     }
 
     /**
-     * Display transform for the Enrollment Status column: show "Progress Law" instead of
-     * "ProLaw" / "PLAW" (Jacob 2026-08-17). Display-only — the stored status is unchanged.
+     * Display transform for the Enrollment Status column: rename only "ProLaw" (Progress Law) to
+     * "Progress Law". "PLAW" is Paramount Law — a different entity that lives in the LDR portal —
+     * and MUST stay as-is, e.g. "PLAW Enrolled" / "PLAW NSF-1" (Jacob 2026-08-18). Display-only;
+     * the stored status is unchanged.
      */
     private function displayStatus(string $status): string
     {
-        return str_ireplace(['ProLaw', 'PLAW'], 'Progress Law', $status);
+        return str_ireplace('ProLaw', 'Progress Law', $status);
     }
 
     private function styleHeader(Worksheet $sheet, string $range): void
