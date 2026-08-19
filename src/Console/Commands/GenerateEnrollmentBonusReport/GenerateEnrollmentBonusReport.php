@@ -75,16 +75,23 @@ class GenerateEnrollmentBonusReport extends Command
 
     private function resolvePeriod(string $fromInput, string $toInput): array
     {
+        $yesterday = date('Y-m-d', strtotime('-1 day'));
+
         if ($fromInput !== '' && $toInput !== '') {
-            return $this->parseDateRange($fromInput, $toInput);
+            [$from, $to] = $this->parseDateRange($fromInput, $toInput);
+            $monthEnd = date('Y-m-t', strtotime($from));
+            $effectiveTo = min($to, $monthEnd, $yesterday);
+
+            return [$from, $effectiveTo];
         }
 
         // Days 1-6 report the previous month; from the 7th report the current month.
         $monthAnchor = ((int) date('j')) <= 6 ? 'first day of last month' : 'first day of this month';
         $from = date('Y-m-01', strtotime($monthAnchor));
-        $to = date('Y-m-t', strtotime($from));
+        $monthEnd = date('Y-m-t', strtotime($from));
+        $effectiveTo = min($monthEnd, $yesterday);
 
-        return [$from, $to];
+        return [$from, $effectiveTo];
     }
 
     private function parseDateRange(string $fromInput, string $toInput): array
@@ -413,7 +420,7 @@ SELECT CONTACT_ID, TITLE, STAMP_PT, CLIENT FROM latest WHERE rn = 1";
 
     private function sendReport(DBConnector $sql, string $path, string $filename, array $summary, string $to): void
     {
-        $subject = 'Enrollment Bonus Report - ' . date('m/d/Y');
+        $subject = 'Enrollment Bonus Report - ' . date('m/d/Y', strtotime($to));
         $body = '<p>Sales data through ' . $this->dataThroughLabel($to) . '</p>';
         $body .= '<table border="1"><tr><th>Enrollment Status</th><th>LDR</th><th>Progress Law</th><th>Combined</th></tr>';
         foreach (array_keys($summary['Combined'] ?? []) as $category) {
@@ -446,7 +453,7 @@ SELECT CONTACT_ID, TITLE, STAMP_PT, CLIENT FROM latest WHERE rn = 1";
 
     private function dataThroughLabel(string $to): string
     {
-        return date('m/d/Y', strtotime(min($to, date('Y-m-d'))));
+        return date('m/d/Y', strtotime($to));
     }
 
     private function copyToDownloads(string $path, string $filename): string
