@@ -15,7 +15,10 @@ class SyncEPFData extends Command
 
     public function handle(): int
     {
-        $lock = Cache::lock('sync-epf-data', 10800);
+        // Safety net for a run that dies before the finally block (worker SIGKILL on
+        // timeout). A normal run is ~12 min; the old 3h TTL meant one killed run
+        // silently blocked every following run for the rest of that window.
+        $lock = Cache::lock('sync-epf-data', 1800);
 
         if (! $lock->get()) {
             $this->warn('EPF sync is already running.');
