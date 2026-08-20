@@ -75,7 +75,9 @@ class GenerateEnrollmentBonusReport extends Command
 
     private function resolvePeriod(string $fromInput, string $toInput): array
     {
-        $yesterday = date('Y-m-d', strtotime('-1 day'));
+        $now = new \DateTimeImmutable('now', new \DateTimeZone('America/Los_Angeles'));
+        $yesterday = $now->modify('-1 day')->format('Y-m-d');
+        $dayOfMonth = (int) $now->format('j');
 
         if ($fromInput !== '' && $toInput !== '') {
             [$from, $to] = $this->parseDateRange($fromInput, $toInput);
@@ -86,8 +88,10 @@ class GenerateEnrollmentBonusReport extends Command
         }
 
         // Days 1-6 report the previous month; from the 7th report the current month.
-        $monthAnchor = ((int) date('j')) <= 6 ? 'first day of last month' : 'first day of this month';
-        $from = date('Y-m-01', strtotime($monthAnchor));
+        $monthAnchor = $dayOfMonth <= 6
+            ? $now->modify('first day of last month')->format('Y-m-01')
+            : $now->format('Y-m-01');
+        $from = $monthAnchor;
         $monthEnd = date('Y-m-t', strtotime($from));
         $effectiveTo = min($monthEnd, $yesterday);
 

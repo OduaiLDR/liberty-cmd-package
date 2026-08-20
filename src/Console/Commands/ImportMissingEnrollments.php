@@ -78,40 +78,45 @@ class ImportMissingEnrollments extends Command
         bool $dryRun = false
     ): int {
         // Pull enrolled contacts from Snowflake with all fields needed for TblEnrollment.
-        // Mirrors Jacob's ImportMissingEnrollments VBA exactly:
         //   - ENROLLED_DATE >= 2022-07-01 (program start)
         //   - Agent from USERS table (not TblContacts)
         //   - Debt_Amount = SUM(ORIGINAL_DEBT_AMOUNT) from enrolled DEBTS
-        //   - Payment_Date_1 = first qualifying deposit PROCESS_DATE (N=1)
+        //   - Payment_Date_1 = 1st deposit PROCESS_DATE (N=1)
+        //   - Payment_Date_2 = 2nd deposit PROCESS_DATE (N=2, populated only when frequency is non-monthly)
+        //   - Payment_Frequency from ENROLLMENT_PLAN.FREQUENCY
         //   - Cancel_Date from DROPPED_DATE
         //   - Category = 'CCS' if ed.TITLE contains 'CCS', else 'LDR'
         $sfSql = "
-            SELECT *
-            FROM (
+            SELECT
+                c.ID,
+                c.STATE,
+                CONCAT(u.FIRSTNAME, ' ', u.LASTNAME)  AS AGENT,
+                CONCAT(c.FIRSTNAME, ' ', c.LASTNAME)  AS CLIENT,
+                d.DEBT,
+                TO_CHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.ENROLLED_DATE) AS DATE), 'YYYY-MM-DD') AS ENROLLED_DATE,
+                TO_CHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.DROPPED_DATE) AS DATE), 'YYYY-MM-DD') AS CANCEL_DATE,
+                ed.TITLE,
+                ep.FREQUENCY AS PAYMENT_FREQUENCY,
+                t.PAYMENT_DATE_1,
+                t.PAYMENT_DATE_2
+            FROM CONTACTS AS c
+            LEFT JOIN USERS AS u
+                ON c.ASSIGNED_TO = u.UID
+            LEFT JOIN (
                 SELECT
-                    c.ID,
-                    c.STATE,
-                    CONCAT(u.FIRSTNAME, ' ', u.LASTNAME)  AS AGENT,
-                    CONCAT(c.FIRSTNAME, ' ', c.LASTNAME)  AS CLIENT,
-                    d.DEBT,
-                    TO_CHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.ENROLLED_DATE) AS DATE), 'YYYY-MM-DD') AS ENROLLED_DATE,
-                    TO_CHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE) AS DATE), 'YYYY-MM-DD') AS PAYMENT_DATE_1,
-                    TO_CHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.DROPPED_DATE) AS DATE), 'YYYY-MM-DD') AS CANCEL_DATE,
-                    ed.TITLE,
-                    t.N
-                FROM CONTACTS AS c
-                LEFT JOIN USERS AS u
-                    ON c.ASSIGNED_TO = u.UID
-                LEFT JOIN (
-                    SELECT
-                        CONTACT_ID,
-                        SUM(ORIGINAL_DEBT_AMOUNT) AS DEBT
-                    FROM DEBTS
-                    WHERE ENROLLED          = 1
-                      AND _FIVETRAN_DELETED = FALSE
-                    GROUP BY CONTACT_ID
-                ) AS d ON c.ID = d.CONTACT_ID
-                LEFT JOIN (
+                    CONTACT_ID,
+                    SUM(ORIGINAL_DEBT_AMOUNT) AS DEBT
+                FROM DEBTS
+                WHERE ENROLLED          = 1
+                  AND _FIVETRAN_DELETED = FALSE
+                GROUP BY CONTACT_ID
+            ) AS d ON c.ID = d.CONTACT_ID
+            LEFT JOIN (
+                SELECT
+                    CONTACT_ID,
+                    MAX(CASE WHEN N = 1 THEN TO_CHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', PROCESS_DATE) AS DATE), 'YYYY-MM-DD') END) AS PAYMENT_DATE_1,
+                    MAX(CASE WHEN N = 2 THEN TO_CHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', PROCESS_DATE) AS DATE), 'YYYY-MM-DD') END) AS PAYMENT_DATE_2
+                FROM (
                     SELECT
                         CONTACT_ID,
                         PROCESS_DATE,
@@ -120,19 +125,18 @@ class ImportMissingEnrollments extends Command
                             ORDER BY CONTACT_ID ASC, CONVERT_TIMEZONE('America/Los_Angeles', PROCESS_DATE) ASC
                         ) AS N
                     FROM TRANSACTIONS
-                    WHERE TRANS_TYPE    = 'D'
-                      AND RETURNED_DATE IS NULL
-                      AND CANCELLED     = 0
-                ) AS t ON c.ID = t.CONTACT_ID
-                LEFT JOIN ENROLLMENT_PLAN AS ep
-                    ON c.ID = ep.CONTACT_ID
-                LEFT JOIN ENROLLMENT_DEFAULTS2 AS ed
-                    ON ep.PLAN_ID = ed.ID
-                WHERE CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.ENROLLED_DATE) AS DATE) >= '2022-07-01'
-                  AND c._FIVETRAN_DELETED = FALSE
-            )
-            WHERE N = 1
-               OR N IS NULL
+                    WHERE TRANS_TYPE        = 'D'
+                      AND _FIVETRAN_DELETED = FALSE
+                )
+                WHERE N <= 2
+                GROUP BY CONTACT_ID
+            ) AS t ON c.ID = t.CONTACT_ID
+            LEFT JOIN ENROLLMENT_PLAN AS ep
+                ON c.ID = ep.CONTACT_ID
+            LEFT JOIN ENROLLMENT_DEFAULTS2 AS ed
+                ON ep.PLAN_ID = ed.ID
+            WHERE CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.ENROLLED_DATE) AS DATE) >= '2022-07-01'
+              AND c._FIVETRAN_DELETED = FALSE
         ";
 
         $sfResult  = $snowflake->query($sfSql);
@@ -173,10 +177,17 @@ class ImportMissingEnrollments extends Command
             $agent        = $this->esc(trim((string) ($row['AGENT']        ?? '')));
             $client       = $this->esc(trim((string) ($row['CLIENT']       ?? '')));
             $enrolledDate = trim((string) ($row['ENROLLED_DATE'] ?? ''));
-            $paymentDate1 = trim((string) ($row['PAYMENT_DATE_1'] ?? ''));
             $cancelDate   = trim((string) ($row['CANCEL_DATE']   ?? ''));
             $title        = trim((string) ($row['TITLE']         ?? ''));
+            $freq         = trim((string) ($row['PAYMENT_FREQUENCY'] ?? ''));
             $debt         = $row['DEBT'] ?? null;
+
+            $normalizedFreq = strtoupper($freq);
+            $isMonthly = ($normalizedFreq === 'MONTHLY' || $normalizedFreq === 'M' || $normalizedFreq === '' || $normalizedFreq === 'NULL');
+
+            $paymentDate1 = trim((string) ($row['PAYMENT_DATE_1'] ?? ''));
+            // If not monthly, populate Payment_Date_2; if monthly, keep null.
+            $paymentDate2 = (!$isMonthly) ? trim((string) ($row['PAYMENT_DATE_2'] ?? '')) : '';
 
             if ($enrolledDate === '') {
                 $skipped++;
@@ -188,14 +199,16 @@ class ImportMissingEnrollments extends Command
 
             $debtSql  = is_numeric($debt) ? (float) $debt : 'NULL';
             $pay1Sql  = $paymentDate1 !== '' ? "'{$this->esc($paymentDate1)}'" : 'NULL';
+            $pay2Sql  = $paymentDate2 !== '' ? "'{$this->esc($paymentDate2)}'" : 'NULL';
+            $freqSql  = $freq !== '' ? "'{$this->esc($freq)}'" : 'NULL';
             $cxlSql   = $cancelDate   !== '' ? "'{$this->esc($cancelDate)}'"   : 'NULL';
 
             try {
                 $sqlConnector->querySqlServer("
                     INSERT INTO TblEnrollment
-                        (LLG_ID, Category, State, Agent, Client, Debt_Amount, Welcome_Call_Date, Payment_Date_1, Cancel_Date)
+                        (LLG_ID, Category, State, Agent, Client, Debt_Amount, Welcome_Call_Date, Payment_Date_1, Payment_Date_2, Payment_Frequency, Cancel_Date)
                     SELECT '{$llgId}', '{$category}', '{$state}', '{$agent}', '{$client}',
-                           {$debtSql}, '{$this->esc($enrolledDate)}', {$pay1Sql}, {$cxlSql}
+                           {$debtSql}, '{$this->esc($enrolledDate)}', {$pay1Sql}, {$pay2Sql}, {$freqSql}, {$cxlSql}
                     WHERE NOT EXISTS (
                         SELECT 1 FROM TblEnrollment WHERE LLG_ID = '{$llgId}'
                     )

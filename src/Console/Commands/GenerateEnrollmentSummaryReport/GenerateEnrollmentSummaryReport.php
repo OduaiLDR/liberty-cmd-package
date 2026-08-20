@@ -31,8 +31,8 @@ class GenerateEnrollmentSummaryReport extends Command
     /** Reset per buildColumn() pass so blank-row synthetic labels line up identically across all 3 passes. */
     private int $blankCounter = 0;
 
-    /** Trailing-12 sellable ratio for the report month (Total column only); computed once per run. */
-    private ?float $trailing12SellableRatio = null;
+    /** Trailing-6 sellable ratio for the report month (Total column only); computed once per run. */
+    private ?float $trailing6SellableRatio = null;
 
     public function handle(): int
     {
@@ -62,15 +62,15 @@ class GenerateEnrollmentSummaryReport extends Command
         $this->info("[INFO] Enrollment Summary Report: starting (window={$windowDate}, snapshot={$snapshotDate}).");
 
         try {
-            $this->trailing12SellableRatio = $this->computeTrailing12SellableRatio(
+            $this->trailing6SellableRatio = $this->computeTrailing6SellableRatio(
                 $connector,
                 $windowDate,
                 self::COLUMNS['Total']
             );
-            $this->info('[INFO] Trailing 12 Month Sellable Ratio: ' . (
-                $this->trailing12SellableRatio === null
+            $this->info('[INFO] Trailing 6 Month Sellable Ratio: ' . (
+                $this->trailing6SellableRatio === null
                     ? 'n/a'
-                    : round($this->trailing12SellableRatio * 100) . '%'
+                    : round($this->trailing6SellableRatio * 100) . '%'
             ));
 
             foreach (self::COLUMNS as $columnKey => $criteria) {
@@ -387,11 +387,19 @@ class GenerateEnrollmentSummaryReport extends Command
             ", [$monthStart, $monthEnd]);
             $this->setRow("Sellable Debt Paying in {$monthLabel}", $columnKey, $sellableDebt, 'currency', bold: true);
 
-            // Trailing 12 Month Sellable Ratio + Projected Sellable: Total column only; LDR/Legal grayed.
-            $rate = $this->trailing12SellableRatio;
-            $projected = ($columnKey === 'Total' && $rate !== null) ? ($totalDebt * $rate) : null;
+            // Gross Debt Paying in X: all scheduled debt for the month regardless of cancel, NSF, status, or 3-day rule.
+            $grossDebtScheduled = (float) $this->scalar($connector, "
+                SELECT SUM(Debt_Amount) FROM TblEnrollment
+                WHERE {$paidCoalesce} >= ? AND {$paidCoalesce} <= ? {$criteria}
+            ", [$monthStart, $monthEnd]);
+            $this->setRow("Gross Debt Paying in {$monthLabel}", $columnKey, $grossDebtScheduled, 'currency', bold: true);
+
+            // Trailing 6 Month Sellable Ratio + Projected Sellable: Total column only; LDR/Legal grayed.
+            // Projected Sellable = Gross Debt Paying in X * Trailing 6 Month Sellable Ratio.
+            $rate = $this->trailing6SellableRatio;
+            $projected = ($columnKey === 'Total' && $rate !== null) ? ($grossDebtScheduled * $rate) : null;
             $this->setRow(
-                "Trailing 12 Month Sellable Ratio ({$monthLabel})",
+                "Trailing 6 Month Sellable Ratio ({$monthLabel})",
                 $columnKey,
                 $columnKey === 'Total' ? $rate : null,
                 'percent',
@@ -436,16 +444,16 @@ class GenerateEnrollmentSummaryReport extends Command
     }
 
     /**
-     * Trailing 12 months before the report month (e.g. July report → Jul prior year through Jun).
+     * Trailing 6 months before the report month (e.g. August report → Feb prior year through Jul).
      * Denominator: all enrolled debt by First_Payment_Date (any status).
      * Numerator: sold (Debt_Sold_To + Tranche) OR unsold + LDR/ProLaw Enrolled.
      */
-    private function computeTrailing12SellableRatio(DBConnector $connector, string $windowDate, string $criteria): ?float
+    private function computeTrailing6SellableRatio(DBConnector $connector, string $windowDate, string $criteria): ?float
     {
         $reportMonth = new \DateTimeImmutable($windowDate);
         $reportMonthStart = $reportMonth->modify('first day of this month');
         $trailEnd = $reportMonthStart->modify('-1 day');
-        $trailStart = $reportMonthStart->modify('-12 months');
+        $trailStart = $reportMonthStart->modify('-6 months');
 
         $denominator = (float) $this->scalar($connector, "
             SELECT COALESCE(SUM(Debt_Amount), 0) FROM TblEnrollment
