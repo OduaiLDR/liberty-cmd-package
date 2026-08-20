@@ -444,40 +444,91 @@ class GenerateEnrollmentSummaryReport extends Command
     }
 
     /**
-     * Trailing 6 months before the report month (e.g. August report → Feb prior year through Jul).
-     * Denominator: all enrolled debt by First_Payment_Date (any status).
-     * Numerator: sold (Debt_Sold_To + Tranche) OR unsold + LDR/ProLaw Enrolled.
+     * Jacob 2026-08-20: 12-month linear regression trend + 6-month weighted forecasting ratio.
+     * Evaluates monthly numerator/denominator over trailing 12 months, fits linear trend slope,
+     * applies 6-month weights (months 1-3 @ 20%, months 4-6 @ 13.33%), and adjusts by 3 months of trend slope.
      */
     private function computeTrailing6SellableRatio(DBConnector $connector, string $windowDate, string $criteria): ?float
     {
         $reportMonth = new \DateTimeImmutable($windowDate);
         $reportMonthStart = $reportMonth->modify('first day of this month');
+        $trailStart = $reportMonthStart->modify('-12 months');
         $trailEnd = $reportMonthStart->modify('-1 day');
-        $trailStart = $reportMonthStart->modify('-6 months');
 
-        $denominator = (float) $this->scalar($connector, "
-            SELECT COALESCE(SUM(Debt_Amount), 0) FROM TblEnrollment
-            WHERE First_Payment_Date >= ? AND First_Payment_Date <= ? {$criteria}
-        ", [$trailStart->format('Y-m-d'), $trailEnd->format('Y-m-d')]);
+        $cur = clone $trailStart;
+        $monthlyData = [];
+        $monthIdx = 0;
 
-        if ($denominator <= 0) {
+        while ($cur <= $trailEnd) {
+            $monthIdx++;
+            $mStart = $cur->format('Y-m-d');
+            $mEnd = $cur->modify('last day of this month')->format('Y-m-d');
+
+            $den = (float) $this->scalar($connector, "
+                SELECT COALESCE(SUM(Debt_Amount), 0) FROM TblEnrollment
+                WHERE Welcome_Call_Date >= ? AND Welcome_Call_Date <= ? {$criteria}
+            ", [$mStart, $mEnd]);
+
+            $num = (float) $this->scalar($connector, "
+                SELECT COALESCE(SUM(Debt_Amount), 0) FROM TblEnrollment
+                WHERE Welcome_Call_Date >= ? AND Welcome_Call_Date <= ?
+                  AND (
+                        (Debt_Sold_To IS NOT NULL AND Tranche IS NOT NULL)
+                     OR (
+                            Debt_Sold_To IS NULL
+                        AND (Tranche IS NULL)
+                        AND Enrollment_Status IN ('LDR Enrolled', 'ProLaw Enrolled')
+                     )
+                  ) {$criteria}
+            ", [$mStart, $mEnd]);
+
+            $ratio = $den > 0 ? ($num / $den) : 0.0;
+
+            $monthlyData[] = [
+                'month_number' => $monthIdx,
+                'numerator'    => $num,
+                'denominator'  => $den,
+                'ratio'        => $ratio,
+            ];
+
+            $cur = $cur->modify('first day of next month');
+        }
+
+        if (empty($monthlyData)) {
             return null;
         }
 
-        $numerator = (float) $this->scalar($connector, "
-            SELECT COALESCE(SUM(Debt_Amount), 0) FROM TblEnrollment
-            WHERE First_Payment_Date >= ? AND First_Payment_Date <= ?
-              AND (
-                    (Debt_Sold_To IS NOT NULL AND Tranche IS NOT NULL)
-                 OR (
-                        Debt_Sold_To IS NULL
-                    AND (Tranche IS NULL)
-                    AND Enrollment_Status IN ('LDR Enrolled', 'ProLaw Enrolled')
-                 )
-              ) {$criteria}
-        ", [$trailStart->format('Y-m-d'), $trailEnd->format('Y-m-d')]);
+        // 1. Calculate 12-month Linear Regression Trend Slope
+        $n = count($monthlyData);
+        $avgX = array_sum(array_column($monthlyData, 'month_number')) / $n;
+        $avgY = array_sum(array_column($monthlyData, 'ratio')) / $n;
 
-        return $numerator / $denominator;
+        $numeratorSlope = 0.0;
+        $denominatorSlope = 0.0;
+
+        foreach ($monthlyData as $m) {
+            $xDiff = $m['month_number'] - $avgX;
+            $yDiff = $m['ratio'] - $avgY;
+            $numeratorSlope += ($xDiff * $yDiff);
+            $denominatorSlope += pow($xDiff, 2);
+        }
+
+        $trendSlope = $denominatorSlope > 0 ? ($numeratorSlope / $denominatorSlope) : 0.0;
+
+        // 2. Six Month Weighted Ratio (Months 7 to 12 -> 1 to 6 in 6-month window)
+        $sixMonths = array_slice($monthlyData, -6);
+        $baseWeightedRatio = 0.0;
+
+        foreach ($sixMonths as $idx => $m) {
+            $sixMonthNumber = $idx + 1; // 1 to 6
+            $weight = $sixMonthNumber <= 3 ? 0.20 : 0.1333333333;
+            $baseWeightedRatio += ($m['ratio'] * $weight);
+        }
+
+        // 3. Forecast Ratio = Base_Weighted_Ratio + (Trend_Slope * 3)
+        $forecastRatio = $baseWeightedRatio + ($trendSlope * 3);
+
+        return $forecastRatio;
     }
 
     /**
