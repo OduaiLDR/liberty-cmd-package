@@ -31,8 +31,8 @@ class GenerateEnrollmentSummaryReport extends Command
     /** Reset per buildColumn() pass so blank-row synthetic labels line up identically across all 3 passes. */
     private int $blankCounter = 0;
 
-    /** Trailing-12 sellable ratio for the report month (Total column only); computed once per run. */
-    private ?float $trailing12SellableRatio = null;
+    /** Trailing-6 sellable ratio for the report month (Total column only); computed once per run. */
+    private ?float $trailing6SellableRatio = null;
 
     public function handle(): int
     {
@@ -62,15 +62,15 @@ class GenerateEnrollmentSummaryReport extends Command
         $this->info("[INFO] Enrollment Summary Report: starting (window={$windowDate}, snapshot={$snapshotDate}).");
 
         try {
-            $this->trailing12SellableRatio = $this->computeTrailing12SellableRatio(
+            $this->trailing6SellableRatio = $this->computeTrailing6SellableRatio(
                 $connector,
                 $windowDate,
                 self::COLUMNS['Total']
             );
-            $this->info('[INFO] Trailing 12 Month Sellable Ratio: ' . (
-                $this->trailing12SellableRatio === null
+            $this->info('[INFO] Trailing 6 Month Sellable Ratio: ' . (
+                $this->trailing6SellableRatio === null
                     ? 'n/a'
-                    : round($this->trailing12SellableRatio * 100) . '%'
+                    : round($this->trailing6SellableRatio * 100) . '%'
             ));
 
             foreach (self::COLUMNS as $columnKey => $criteria) {
@@ -387,11 +387,19 @@ class GenerateEnrollmentSummaryReport extends Command
             ", [$monthStart, $monthEnd]);
             $this->setRow("Sellable Debt Paying in {$monthLabel}", $columnKey, $sellableDebt, 'currency', bold: true);
 
-            // Trailing 12 Month Sellable Ratio + Projected Sellable: Total column only; LDR/Legal grayed.
-            $rate = $this->trailing12SellableRatio;
-            $projected = ($columnKey === 'Total' && $rate !== null) ? ($totalDebt * $rate) : null;
+            // Gross Debt Paying in X: all scheduled debt for the month regardless of cancel, NSF, status, or 3-day rule.
+            $grossDebtScheduled = (float) $this->scalar($connector, "
+                SELECT SUM(Debt_Amount) FROM TblEnrollment
+                WHERE {$paidCoalesce} >= ? AND {$paidCoalesce} <= ? {$criteria}
+            ", [$monthStart, $monthEnd]);
+            $this->setRow("Gross Debt Paying in {$monthLabel}", $columnKey, $grossDebtScheduled, 'currency', bold: true);
+
+            // Trailing 6 Month Sellable Ratio + Projected Sellable: Total column only; LDR/Legal grayed.
+            // Projected Sellable = Gross Debt Paying in X * Trailing 6 Month Sellable Ratio.
+            $rate = $this->trailing6SellableRatio;
+            $projected = ($columnKey === 'Total' && $rate !== null) ? ($grossDebtScheduled * $rate) : null;
             $this->setRow(
-                "Trailing 12 Month Sellable Ratio ({$monthLabel})",
+                "Trailing 6 Month Sellable Ratio ({$monthLabel})",
                 $columnKey,
                 $columnKey === 'Total' ? $rate : null,
                 'percent',
@@ -436,40 +444,91 @@ class GenerateEnrollmentSummaryReport extends Command
     }
 
     /**
-     * Trailing 12 months before the report month (e.g. July report → Jul prior year through Jun).
-     * Denominator: all enrolled debt by First_Payment_Date (any status).
-     * Numerator: sold (Debt_Sold_To + Tranche) OR unsold + LDR/ProLaw Enrolled.
+     * Jacob 2026-08-20: 12-month linear regression trend + 6-month weighted forecasting ratio.
+     * Evaluates monthly numerator/denominator over trailing 12 months, fits linear trend slope,
+     * applies 6-month weights (months 1-3 @ 20%, months 4-6 @ 13.33%), and adjusts by 3 months of trend slope.
      */
-    private function computeTrailing12SellableRatio(DBConnector $connector, string $windowDate, string $criteria): ?float
+    private function computeTrailing6SellableRatio(DBConnector $connector, string $windowDate, string $criteria): ?float
     {
         $reportMonth = new \DateTimeImmutable($windowDate);
         $reportMonthStart = $reportMonth->modify('first day of this month');
-        $trailEnd = $reportMonthStart->modify('-1 day');
         $trailStart = $reportMonthStart->modify('-12 months');
+        $trailEnd = $reportMonthStart->modify('-1 day');
 
-        $denominator = (float) $this->scalar($connector, "
-            SELECT COALESCE(SUM(Debt_Amount), 0) FROM TblEnrollment
-            WHERE First_Payment_Date >= ? AND First_Payment_Date <= ? {$criteria}
-        ", [$trailStart->format('Y-m-d'), $trailEnd->format('Y-m-d')]);
+        $cur = clone $trailStart;
+        $monthlyData = [];
+        $monthIdx = 0;
 
-        if ($denominator <= 0) {
+        while ($cur <= $trailEnd) {
+            $monthIdx++;
+            $mStart = $cur->format('Y-m-d');
+            $mEnd = $cur->modify('last day of this month')->format('Y-m-d');
+
+            $den = (float) $this->scalar($connector, "
+                SELECT COALESCE(SUM(Debt_Amount), 0) FROM TblEnrollment
+                WHERE Welcome_Call_Date >= ? AND Welcome_Call_Date <= ? {$criteria}
+            ", [$mStart, $mEnd]);
+
+            $num = (float) $this->scalar($connector, "
+                SELECT COALESCE(SUM(Debt_Amount), 0) FROM TblEnrollment
+                WHERE Welcome_Call_Date >= ? AND Welcome_Call_Date <= ?
+                  AND (
+                        (Debt_Sold_To IS NOT NULL AND Tranche IS NOT NULL)
+                     OR (
+                            Debt_Sold_To IS NULL
+                        AND (Tranche IS NULL)
+                        AND Enrollment_Status IN ('LDR Enrolled', 'ProLaw Enrolled')
+                     )
+                  ) {$criteria}
+            ", [$mStart, $mEnd]);
+
+            $ratio = $den > 0 ? ($num / $den) : 0.0;
+
+            $monthlyData[] = [
+                'month_number' => $monthIdx,
+                'numerator'    => $num,
+                'denominator'  => $den,
+                'ratio'        => $ratio,
+            ];
+
+            $cur = $cur->modify('first day of next month');
+        }
+
+        if (empty($monthlyData)) {
             return null;
         }
 
-        $numerator = (float) $this->scalar($connector, "
-            SELECT COALESCE(SUM(Debt_Amount), 0) FROM TblEnrollment
-            WHERE First_Payment_Date >= ? AND First_Payment_Date <= ?
-              AND (
-                    (Debt_Sold_To IS NOT NULL AND Tranche IS NOT NULL)
-                 OR (
-                        Debt_Sold_To IS NULL
-                    AND (Tranche IS NULL)
-                    AND Enrollment_Status IN ('LDR Enrolled', 'ProLaw Enrolled')
-                 )
-              ) {$criteria}
-        ", [$trailStart->format('Y-m-d'), $trailEnd->format('Y-m-d')]);
+        // 1. Calculate 12-month Linear Regression Trend Slope
+        $n = count($monthlyData);
+        $avgX = array_sum(array_column($monthlyData, 'month_number')) / $n;
+        $avgY = array_sum(array_column($monthlyData, 'ratio')) / $n;
 
-        return $numerator / $denominator;
+        $numeratorSlope = 0.0;
+        $denominatorSlope = 0.0;
+
+        foreach ($monthlyData as $m) {
+            $xDiff = $m['month_number'] - $avgX;
+            $yDiff = $m['ratio'] - $avgY;
+            $numeratorSlope += ($xDiff * $yDiff);
+            $denominatorSlope += pow($xDiff, 2);
+        }
+
+        $trendSlope = $denominatorSlope > 0 ? ($numeratorSlope / $denominatorSlope) : 0.0;
+
+        // 2. Six Month Weighted Ratio (Months 7 to 12 -> 1 to 6 in 6-month window)
+        $sixMonths = array_slice($monthlyData, -6);
+        $baseWeightedRatio = 0.0;
+
+        foreach ($sixMonths as $idx => $m) {
+            $sixMonthNumber = $idx + 1; // 1 to 6
+            $weight = $sixMonthNumber <= 3 ? 0.20 : 0.1333333333;
+            $baseWeightedRatio += ($m['ratio'] * $weight);
+        }
+
+        // 3. Forecast Ratio = Base_Weighted_Ratio + (Trend_Slope * 3)
+        $forecastRatio = $baseWeightedRatio + ($trendSlope * 3);
+
+        return $forecastRatio;
     }
 
     /**
