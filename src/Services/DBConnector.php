@@ -3,6 +3,12 @@
 namespace Cmd\Reports\Services;
 
 use GuzzleHttp\Client;
+use GuzzleHttp\Exception\BadResponseException;
+use GuzzleHttp\Exception\ConnectException;
+use GuzzleHttp\HandlerStack;
+use GuzzleHttp\Middleware;
+use Psr\Http\Message\RequestInterface;
+use Psr\Http\Message\ResponseInterface;
 use Firebase\JWT\JWT;
 use Exception;
 use Illuminate\Support\Facades\Log;
@@ -47,7 +53,81 @@ class DBConnector
         $this->privateKey = $config['private_key'];
         $this->privateKeyPassphrase = $config['private_key_passphrase'] ?? '';
 
-        $this->client = new Client([
+        $this->client = $this->buildHttpClient();
+    }
+
+    /**
+     * Snowflake SQL API statuses worth retrying.
+     *
+     * 429 is Snowflake shedding load ("The server is busy. Please retry the request.",
+     * code 000645) and 503 is the service being briefly unavailable. In both cases the
+     * statement was rejected before execution, so a retry cannot double-apply anything.
+     *
+     * Deliberately excluded:
+     *   - 4xx other than 429: a 422 (e.g. CONVERT_TIMEZONE on a NUMBER column) will fail
+     *     identically forever; retrying only turns a fast failure into a slow one.
+     *   - 5xx other than 503: a 504 can mean the statement IS still running server-side,
+     *     so resending it risks executing the same statement twice.
+     */
+    private const RETRYABLE_STATUSES = [429, 503];
+
+    /** Retries after the initial attempt, so at most 4 requests total. */
+    private const MAX_HTTP_RETRIES = 3;
+
+    /**
+     * HTTP client for the Snowflake SQL API, with retry/backoff on transient failures.
+     *
+     * The retry middleware is pushed onto the default stack, which puts it outside
+     * Guzzle's http_errors middleware — so a failing response arrives here as a thrown
+     * BadResponseException rather than as $response. The decider handles both forms.
+     */
+    private function buildHttpClient(): Client
+    {
+        $stack = HandlerStack::create();
+
+        $stack->push(Middleware::retry(
+            function (
+                int $retries,
+                RequestInterface $request,
+                ?ResponseInterface $response = null,
+                ?\Throwable $exception = null
+            ): bool {
+                if ($retries >= self::MAX_HTTP_RETRIES) {
+                    return false;
+                }
+
+                $status = $response?->getStatusCode();
+
+                if ($status === null && $exception instanceof BadResponseException) {
+                    $status = $exception->getResponse()->getStatusCode();
+                }
+
+                // A ConnectException never reached Snowflake at all, so it is always safe
+                // to resend regardless of what the statement would have done.
+                $retryable = ($status !== null && in_array($status, self::RETRYABLE_STATUSES, true))
+                    || $exception instanceof ConnectException;
+
+                if ($retryable) {
+                    Log::warning('DBConnector: retrying transient Snowflake failure.', [
+                        'attempt' => $retries + 1,
+                        'max_retries' => self::MAX_HTTP_RETRIES,
+                        'status' => $status,
+                        'uri' => (string) $request->getUri(),
+                    ]);
+                }
+
+                return $retryable;
+            },
+            // Exponential backoff (1s, 2s, 4s) plus jitter. The jitter matters here: eight
+            // automation workers can be hitting Snowflake at once, and lockstep retries
+            // would just re-trigger the same throttle that caused the 429.
+            static function (int $retries): int {
+                return (int) ((2 ** ($retries - 1)) * 1000) + random_int(0, 500);
+            }
+        ));
+
+        return new Client([
+            'handler' => $stack,
             'timeout' => 60,
             'connect_timeout' => 10,
             'read_timeout' => 60,
