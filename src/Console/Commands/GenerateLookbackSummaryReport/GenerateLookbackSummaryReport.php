@@ -75,13 +75,13 @@ class GenerateLookbackSummaryReport extends Command
             WHERE e1.Debt_Sold_To = 'NGF'
               AND e1.Cancel_Date IS NOT NULL
               AND (
-                  (CAST(e1.Tranche AS INT) <= 46
-                    AND e1.Cancel_Date >= DATEADD(day, 3, d.Payment_Date)
-                    AND e1.Cancel_Date <= DATEADD(day, 57, d.Payment_Date))
+                  (CAST(e1.Tranche AS INT) < 46
+                    AND e1.Cancel_Date > DATEADD(day, 3, d.Payment_Date)
+                    AND e1.Cancel_Date < DATEADD(day, 57, d.Payment_Date))
                   OR
-                  (CAST(e1.Tranche AS INT) >= 47
-                    AND e1.Cancel_Date >= d.Payment_Date
-                    AND e1.Cancel_Date <= DATEADD(day, 59, d.Payment_Date))
+                  (CAST(e1.Tranche AS INT) > 47
+                    AND e1.Cancel_Date > d.Payment_Date
+                    AND e1.Cancel_Date < DATEADD(day, 59, d.Payment_Date))
               )
             GROUP BY d.Tranche, d.Payment_Date
             ORDER BY d.Tranche DESC
