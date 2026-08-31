@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Cmd\Reports\Pmod\Services;
 
+use Cmd\Reports\Pmod\Contracts\PmodCreditorDirectory;
 use Cmd\Reports\Pmod\Contracts\PmodExecutionGateway;
 use Cmd\Reports\Pmod\Data\PmodWorkItem;
 use Cmd\Reports\Pmod\Support\PmodBusinessDateResolver;
@@ -12,13 +13,16 @@ use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Http;
 
-final class ForthPayPmodExecutionGateway implements PmodExecutionGateway
+final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCreditorDirectory
 {
     private const FORTH_CRM_BASE_URL = 'https://api.forthcrm.com/v1';
     private const FORTH_PAY_BASE_URL = 'https://api.forthpay.com/v1';
 
     private ?DBConnector $dbConnector = null;
     private array $apiKeyCache = [];
+
+    /** @var array<string, array<string, list<string>>> in-request memo of the creditor catalogue */
+    private array $creditorMapCache = [];
 
     private function getDbConnector(): DBConnector
     {
@@ -1197,5 +1201,183 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway
         $data = $response->json('response', []);
         Log::info('PMOD: Debt cancelled', ['debt_id' => $debtId]);
         return $data;
+    }
+
+    /**
+     * Resolve a creditor NAME to Forth's creditor id. Returns null when the name
+     * is unknown or matches more than one creditor — see PmodCreditorDirectory
+     * for why this fails closed rather than guessing.
+     *
+     * Matching is done on a normalised form (uppercase, punctuation flattened to
+     * spaces) so "SYNCB/ABCWH" and "SYNCB ABCWH" resolve identically. An exact
+     * normalised hit wins; only if there is none does it fall back to a substring
+     * match, and then only for names of 5+ characters, so a short name like
+     * "AT T" cannot sweep up unrelated creditors.
+     */
+    public function findCreditorId(string $tenantId, string $creditorName): ?string
+    {
+        $needle = self::normalizeCreditorName($creditorName);
+
+        if ($needle === '') {
+            return null;
+        }
+
+        $map = $this->creditorMap($tenantId);
+
+        if (isset($map[$needle])) {
+            if (count($map[$needle]) === 1) {
+                Log::info('PMOD: creditor resolved by exact name', [
+                    'tenant' => $tenantId, 'name' => $creditorName, 'creditor_id' => $map[$needle][0],
+                ]);
+
+                return $map[$needle][0];
+            }
+
+            Log::warning('PMOD: creditor name is ambiguous, refusing to guess', [
+                'tenant' => $tenantId, 'name' => $creditorName, 'candidates' => $map[$needle],
+            ]);
+
+            return null;
+        }
+
+        if (mb_strlen($needle) < 5) {
+            Log::info('PMOD: creditor name not found and too short for substring matching', [
+                'tenant' => $tenantId, 'name' => $creditorName,
+            ]);
+
+            return null;
+        }
+
+        $hits = [];
+        foreach ($map as $name => $ids) {
+            if (mb_strlen((string) $name) < 5) {
+                continue;
+            }
+
+            if (str_contains((string) $name, $needle) || str_contains($needle, (string) $name)) {
+                foreach ($ids as $id) {
+                    $hits[$id] = $name;
+                }
+            }
+        }
+
+        if (count($hits) === 1) {
+            $id = (string) array_key_first($hits);
+
+            Log::info('PMOD: creditor resolved by substring', [
+                'tenant' => $tenantId, 'name' => $creditorName, 'matched' => reset($hits), 'creditor_id' => $id,
+            ]);
+
+            return $id;
+        }
+
+        Log::warning('PMOD: creditor could not be resolved', [
+            'tenant' => $tenantId, 'name' => $creditorName, 'match_count' => count($hits),
+            'candidates' => array_slice($hits, 0, 5, true),
+        ]);
+
+        return null;
+    }
+
+    /**
+     * normalised creditor name => list of ids. Cached for 24h per tenant; the
+     * catalogue is large and effectively static.
+     *
+     * @return array<string, list<string>>
+     */
+    private function creditorMap(string $tenantId): array
+    {
+        $cacheKey = 'pmod_creditors_' . strtolower($tenantId);
+
+        if (isset($this->creditorMapCache[$cacheKey])) {
+            return $this->creditorMapCache[$cacheKey];
+        }
+
+        $map = Cache::remember($cacheKey, now()->addHours(24), function () use ($tenantId): array {
+            $map = [];
+            $seen = [];
+            $offset = 0;
+            $limit = 1000;
+
+            // Hard page cap plus a "no new ids" break: if Forth ignores _limit/_offset
+            // it returns the same page forever, and this must not spin.
+            for ($page = 0; $page < 25; $page++) {
+                $rows = $this->fetchCreditorPage($tenantId, $offset, $limit);
+
+                if ($rows === []) {
+                    break;
+                }
+
+                $new = 0;
+                foreach ($rows as $row) {
+                    if (! is_array($row)) {
+                        continue;
+                    }
+
+                    $id = trim((string) ($row['id'] ?? ''));
+                    $name = self::normalizeCreditorName((string) ($row['company_name'] ?? ''));
+
+                    if ($id === '' || $name === '' || isset($seen[$id])) {
+                        continue;
+                    }
+
+                    $seen[$id] = true;
+                    $new++;
+                    $map[$name][] = $id;
+                }
+
+                if ($new === 0 || count($rows) < $limit) {
+                    break;
+                }
+
+                $offset += $limit;
+            }
+
+            Log::info('PMOD: creditor catalogue loaded', [
+                'tenant' => $tenantId, 'distinct_names' => count($map), 'creditors' => count($seen),
+            ]);
+
+            return $map;
+        });
+
+        $this->creditorMapCache[$cacheKey] = $map;
+
+        return $map;
+    }
+
+    /** @return list<array<string, mixed>> */
+    private function fetchCreditorPage(string $tenantId, int $offset, int $limit): array
+    {
+        $response = $this->crmClient($tenantId)->get('/creditors', [
+            '_limit' => $limit,
+            '_offset' => $offset,
+        ]);
+
+        if (! $response->successful()) {
+            Log::error('PMOD: Failed to list creditors', [
+                'tenant_id' => $tenantId, 'offset' => $offset,
+                'status' => $response->status(), 'response' => mb_substr($response->body(), 0, 300),
+            ]);
+
+            return [];
+        }
+
+        // Observed shape: {"response":{"data":[{id, company_name, ...}]}}
+        $rows = $response->json('response.data');
+
+        if (! is_array($rows)) {
+            $rows = $response->json('response');
+        }
+
+        return is_array($rows) ? array_values($rows) : [];
+    }
+
+    private static function normalizeCreditorName(string $value): string
+    {
+        $value = strtoupper(trim($value));
+        $value = preg_replace('/[^A-Z0-9 ]+/', ' ', $value) ?? $value;
+        $value = preg_replace('/\s+/', ' ', $value) ?? $value;
+
+        return trim($value);
     }
 }

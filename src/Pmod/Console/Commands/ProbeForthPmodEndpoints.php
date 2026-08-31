@@ -27,6 +27,7 @@ final class ProbeForthPmodEndpoints extends Command
     protected $signature = 'pmod:probe-endpoints
         {--tenant=PLAW : Tenant slug - LDR, PLAW or LT.}
         {--contact= : Forth contact id to probe against. Required.}
+        {--creditor=* : Resolve these creditor NAMES to Forth ids and exit (no contact needed).}
         {--execute : Also create a probe debt and immediately cancel it. TEST FILES ONLY.}
         {--execute-banking : Also probe the bank-account write paths with an empty body. TEST FILES ONLY.}';
 
@@ -34,6 +35,33 @@ final class ProbeForthPmodEndpoints extends Command
 
     public function handle(ForthPayPmodExecutionGateway $gateway): int
     {
+        $tenant = strtoupper(trim((string) $this->option('tenant')));
+
+        // Creditor-name resolution is a standalone diagnostic: it needs no contact,
+        // so handle it before the --contact requirement below.
+        $names = array_values(array_filter(array_map('trim', (array) $this->option('creditor'))));
+
+        if ($names !== []) {
+            if (! $gateway instanceof \Cmd\Reports\Pmod\Contracts\PmodCreditorDirectory) {
+                $this->error('This gateway cannot resolve creditor names.');
+
+                return self::FAILURE;
+            }
+
+            $rows = [];
+            foreach ($names as $name) {
+                $id = $gateway->findCreditorId(strtolower($tenant), $name);
+                $rows[] = [$name, $id ?? '— unresolved —'];
+            }
+
+            $this->table(['Creditor name', 'Forth creditor id'], $rows);
+            $this->line('');
+            $this->line('Unresolved means unknown or ambiguous. The resolver never guesses —');
+            $this->line('an ambiguous name routes the PMOD to manual review instead.');
+
+            return self::SUCCESS;
+        }
+
         $contactId = trim((string) $this->option('contact'));
 
         if ($contactId === '') {
@@ -42,7 +70,6 @@ final class ProbeForthPmodEndpoints extends Command
             return self::FAILURE;
         }
 
-        $tenant         = strtoupper(trim((string) $this->option('tenant')));
         $execute        = (bool) $this->option('execute');
         $executeBanking = (bool) $this->option('execute-banking');
 

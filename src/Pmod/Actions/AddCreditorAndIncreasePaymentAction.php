@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Cmd\Reports\Pmod\Actions;
 
 use Cmd\Reports\Pmod\Contracts\PmodActionHandler;
+use Cmd\Reports\Pmod\Contracts\PmodCreditorDirectory;
 use Cmd\Reports\Pmod\Contracts\PmodExecutionGateway;
 use Cmd\Reports\Pmod\Data\PmodResult;
 use Cmd\Reports\Pmod\Data\PmodWorkItem;
@@ -45,11 +46,22 @@ final class AddCreditorAndIncreasePaymentAction implements PmodActionHandler
             ]);
         }
 
-        // Step 1: create the debt — Forth API requires creditor ID
-        // creditor_id must be the Forth CRM creditor ID — if missing, capture for manual review
+        // Step 1: create the debt. Forth needs its numeric creditor id, but only
+        // ~46% of real payloads carry creditor_change.creditor_id — the rest send a
+        // name only (the legacy VBA never used an id; it typed the name straight
+        // into the DPP form). Fall back to Forth's creditor catalogue, which fails
+        // closed on an ambiguous name rather than guessing.
         $creditorId = $creditorChange['creditor_id'] ?? null;
+
+        if ($creditorId === null && $this->gateway instanceof PmodCreditorDirectory) {
+            $creditorId = $this->gateway->findCreditorId(
+                $workItem->tenantId,
+                (string) ($creditorChange['creditor_name'] ?? ''),
+            );
+        }
+
         if ($creditorId === null) {
-            return $this->capture($workItem, 'Add Creditor and Increase Payment requires creditor_id (Forth CRM creditor ID).', [
+            return $this->capture($workItem, 'Add Creditor and Increase Payment could not determine the Forth creditor id.', [
                 'reason'        => 'missing_creditor_id',
                 'creditor_name' => $creditorChange['creditor_name'] ?? null,
             ]);
