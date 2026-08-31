@@ -46,16 +46,15 @@ final class AddCreditorAndExtendProgramAction implements PmodActionHandler
             ]);
         }
 
-        if (!$this->allowLiveDraftUpdates || $workItem->dryRun) {
-            return $this->capture($workItem, 'Add Creditor and Extend Program matched but live updates are disabled.', [
-                'reason'          => $workItem->dryRun ? 'dry_run_only' : 'live_draft_updates_disabled',
-                'months_to_extend' => $monthsToExtend,
-            ]);
-        }
 
-        // Step 1: create the debt. Forth needs its numeric creditor id, but the
-        // id consumers send cannot be trusted - measured 2026-08-31, only 1 of 4
-        // real payload creditor_ids existed in the catalogue. resolveCreditorId
+        // Resolve the creditor BEFORE the live-updates gate. Resolution is a
+        // read-only catalogue lookup, so it is safe in dry run - and doing it
+        // here is what makes a dry run worth running: the capture below reports
+        // the creditor id it WOULD have used. With this after the gate, a dry run
+        // exercised none of the resolution logic and proved nothing.
+        //
+        // The id consumers send cannot be trusted: measured 2026-08-31, only 1 of
+        // 4 real payload creditor_ids existed in the catalogue. resolveCreditorId
         // validates a claimed id and falls back to matching the name, failing
         // closed rather than guessing.
         $creditorId = null;
@@ -72,8 +71,17 @@ final class AddCreditorAndExtendProgramAction implements PmodActionHandler
 
         if ($creditorId === null) {
             return $this->capture($workItem, 'Add Creditor and Extend Program could not determine the Forth creditor id.', [
-                'reason'        => 'missing_creditor_id',
-                'creditor_name' => $creditorChange['creditor_name'] ?? null,
+                'reason'         => 'missing_creditor_id',
+                'creditor_name'  => $creditorChange['creditor_name'] ?? null,
+                'claimed_id'     => $creditorChange['creditor_id'] ?? null,
+            ]);
+        }
+
+        if (!$this->allowLiveDraftUpdates || $workItem->dryRun) {
+            return $this->capture($workItem, 'Add Creditor and Extend Program matched but live updates are disabled.', [
+                'reason'      => $workItem->dryRun ? 'dry_run_only' : 'live_draft_updates_disabled',
+                'creditor_id' => $creditorId,
+                'would_send'  => ["months_to_extend" => $monthsToExtend, "amount" => $amount],
             ]);
         }
 
