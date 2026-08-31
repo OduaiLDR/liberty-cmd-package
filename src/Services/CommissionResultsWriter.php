@@ -74,6 +74,31 @@ class CommissionResultsWriter
         }
     }
 
+    /**
+     * Reset one computed component before a report re-run. This lets the
+     * generator clear a formerly qualifying agent without overwriting the
+     * sibling component stored on the same result row.
+     */
+    public static function resetColumn(DBConnector $sql, string $reportType, string $source, string $periodStart, string $column): void
+    {
+        if (!in_array($column, self::COLUMNS, true)) {
+            throw new \InvalidArgumentException("Unsupported commission result column: {$column}");
+        }
+
+        try {
+            self::ensureTable($sql);
+            $sql->querySqlServer(
+                'UPDATE dbo.' . self::TABLE . ' SET ' . $column . ' = 0, Updated_At = GETDATE()'
+                . ' WHERE Report_Type = ? AND Source = ? AND Period_Start = CAST(? AS DATE)',
+                [strtolower(trim($reportType)), strtolower(trim($source)), $periodStart]
+            );
+        } catch (\Throwable $e) {
+            Log::warning("CommissionResultsWriter: {$reportType}/{$source} {$periodStart} {$column} reset skipped", [
+                'ex' => $e->getMessage(),
+            ]);
+        }
+    }
+
     private static function ensureTable(DBConnector $sql): void
     {
         $ddl = "IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = '" . self::TABLE . "')

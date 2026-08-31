@@ -266,13 +266,30 @@ class GenerateRetentionCommissionReport extends Command
 
             $this->info("[INFO] [$display] Rows after processing: " . count($rows));
 
-            // Commission Summary uses the built-in agent list (SOURCE_CONFIG), matching Jacob's VBA roster.
-            // Do not pull from TblCommissionRoster for this payroll Excel report.
+            // This source job must include every actual retention agent. Aurora
+            // Payroll Review performs the authoritative roster eligibility check;
+            // a hard-coded list here would hide valid people before that check.
+            $agentsByKey = [];
+            foreach ($rows as $row) {
+                $agent = trim((string) $this->col($row, 'RETENTION_AGENT', ''));
+                $key = strtolower((string) preg_replace('/\s+/', ' ', $agent));
+                if ($key !== '' && !isset($agentsByKey[$key])) {
+                    $agentsByKey[$key] = $agent;
+                }
+            }
+            if ($agentsByKey !== []) {
+                $cfg['agents'] = array_values($agentsByKey);
+                sort($cfg['agents'], SORT_STRING | SORT_FLAG_CASE);
+            }
 
             // ── STEP 6: fetch agent location/company from SQL Server
             $locationMap = $this->fetchLocationMap($sql, $cfg['agents']);
 
-            $useRetainedMonthTier = filter_var(env('RETENTION_TIER_BY_RETAINED_MONTH', false), FILTER_VALIDATE_BOOLEAN);
+            // Payroll policy: a retained account is paid at the tier earned in
+            // its retained month, even when the payment clears in a later month.
+            // Keep an explicit environment override for rollback, but make the
+            // correct business rule the safe default for scheduled runs too.
+            $useRetainedMonthTier = filter_var(env('RETENTION_TIER_BY_RETAINED_MONTH', true), FILTER_VALIDATE_BOOLEAN);
             $tierSnapshotMap = RetentionCommissionTierStore::fetchMap(
                 $sql,
                 $source,
