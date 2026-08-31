@@ -1,0 +1,20 @@
+{
+    "folders": [
+        {
+            "name": "cmd-runner",
+            "path": "../../../../cmd-runner"
+        },
+        {
+            "name": "liberty-cmd-package",
+            "path": "../../.."
+        },
+        {
+            "name": "DebtPlete",
+            "path": "../../../../DebtPlete"
+        },
+        {
+            "name": "Docs",
+            "path": "../../../../Docs"
+        }
+    ]
+}

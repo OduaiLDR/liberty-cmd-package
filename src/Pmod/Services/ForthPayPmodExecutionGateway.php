@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Cmd\Reports\Pmod\Services;
 
+use Cmd\Reports\Pmod\Contracts\PmodCreditorDirectory;
 use Cmd\Reports\Pmod\Contracts\PmodExecutionGateway;
 use Cmd\Reports\Pmod\Data\PmodWorkItem;
 use Cmd\Reports\Pmod\Support\PmodBusinessDateResolver;
@@ -12,13 +13,30 @@ use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Http;
 
-final class ForthPayPmodExecutionGateway implements PmodExecutionGateway
+final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCreditorDirectory
 {
     private const FORTH_CRM_BASE_URL = 'https://api.forthcrm.com/v1';
     private const FORTH_PAY_BASE_URL = 'https://api.forthpay.com/v1';
 
+    /** Forth honours a perPage large enough to return the whole catalogue in one call. */
+    private const CREDITOR_PAGE_SIZE = 25000;
+
+    /**
+     * Only reached if a future server-side cap forces real paging. Sized so any
+     * sane cap (>= 200/page) still covers the catalogue. If Forth ever caps
+     * perPage low enough that this truncates, the map logs
+     * "creditor catalogue incomplete" and names fail closed to manual review —
+     * but the real fix then is a warm-ahead command, not a bigger cap: 500+
+     * sequential requests inside a PMOD job would blow the job timeout and
+     * never write the cache at all.
+     */
+    private const CREDITOR_MAX_PAGES = 60;
+
     private ?DBConnector $dbConnector = null;
     private array $apiKeyCache = [];
+
+    /** @var array<string, array<string, list<string>>> in-request memo of the creditor catalogue */
+    private array $creditorMapCache = [];
 
     private function getDbConnector(): DBConnector
     {
@@ -620,6 +638,167 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway
     }
 
     /**
+     * Diagnostic for the Forth endpoints behind the six capture-only banking and
+     * creditor actions (add/remove creditor, client banking, sponsor banking).
+     *
+     * Those handlers were written, tested live in 2026-06, then reverted to
+     * capture-only because the Forth calls came back 404 or 400 - but which of
+     * the two was never recorded per endpoint, and they are different problems:
+     * 404 means the path is wrong, 400 means the path is right and the payload
+     * is wrong. This separates them, endpoint by endpoint.
+     *
+     * READ-ONLY by default and safe on any contact, including real ones.
+     *
+     * $execute additionally creates a debt and immediately cancels it. That is
+     * an ACTION - TEST FILES ONLY - but self-cleaning, mirroring the
+     * pause/resume round-trip in probeResumePayments().
+     *
+     * $executeBanking is deliberately separate and NOT implied by $execute:
+     * banking writes change where a client's money is drafted from. It sends an
+     * EMPTY body, so it cannot set an account - a live path answers 400 (bad
+     * payload) and a wrong path answers 404, which is the whole signal we need.
+     *
+     * Never throws - every call's raw status + body is reported.
+     *
+     * @return array<string, mixed>
+     */
+    public function probeCreditorAndBankingEndpoints(
+        string $tenantId,
+        string $contactId,
+        bool $execute = false,
+        bool $executeBanking = false,
+    ): array {
+        $out = [
+            'tenant' => $tenantId,
+            'contact_id' => $contactId,
+            'execute' => $execute,
+            'execute_banking' => $executeBanking,
+            'checks' => [],
+        ];
+
+        $call = function (string $label, string $method, string $path, callable $send) use (&$out): ?array {
+            try {
+                $response = $send();
+
+                $out['checks'][] = [
+                    'label'  => $label,
+                    'call'   => $method . ' ' . $path,
+                    'status' => $response->status(),
+                    'ok'     => $response->successful(),
+                    'body'   => mb_substr($response->body(), 0, 1000),
+                ];
+
+                return $response->successful() ? ($response->json() ?? []) : null;
+            } catch (\Throwable $e) {
+                $out['checks'][] = [
+                    'label'  => $label,
+                    'call'   => $method . ' ' . $path,
+                    'status' => 0,
+                    'ok'     => false,
+                    'body'   => 'EXCEPTION: ' . $e->getMessage(),
+                ];
+
+                return null;
+            }
+        };
+
+        // --- READ-ONLY (safe on real contacts) ---
+
+        // Token health first: a 404 here means the token is stale
+        // (refresh:forth-api-tokens), not that the paths below are wrong.
+        $call('token health', 'GET', '/contact-stages',
+            fn () => $this->crmClient($tenantId)->get('/contact-stages'));
+
+        $call('contact resolves', 'GET', "/contacts/{$contactId}",
+            fn () => $this->crmClient($tenantId)->get("/contacts/{$contactId}"));
+
+        // Both Remove Creditor actions call this before cancelling a debt.
+        $call('list debts (remove-creditor step 1)', 'GET', "/contacts/{$contactId}/debts",
+            fn () => $this->crmClient($tenantId)->get("/contacts/{$contactId}/debts"));
+
+        // Does a creditor catalogue exist? Both Add Creditor actions hard-require
+        // a Forth creditor_id and capture without one, so if portals only send a
+        // creditor name we need a name -> id lookup before they can go live.
+        $call('creditor catalogue (name -> id lookup)', 'GET', '/creditors',
+            fn () => $this->crmClient($tenantId)->get('/creditors'));
+
+        // addBankAccount() targets this resource. A GET establishes whether it
+        // exists at all without writing anything.
+        $call('bank account resource', 'GET', "/contacts/{$contactId}/bank-account",
+            fn () => $this->crmClient($tenantId)->get("/contacts/{$contactId}/bank-account"));
+
+        // Void Settlement is note-only too, and voidSettlementOffer() is the
+        // same call PmodLumpSumAction and SkipPaymentAction make on their live
+        // path when settlement ids are present - so this path matters beyond
+        // the note-only action itself, and has never been confirmed either.
+        $settlements = $call('list settlements', 'GET', "/contacts/{$contactId}/settlements",
+            fn () => $this->crmClient($tenantId)->get("/contacts/{$contactId}/settlements"));
+
+        // A void cannot be undone, so there is no safe write probe for it.
+        // GETting the void path is the non-destructive substitute: a route that
+        // does not exist answers 404, one that exists but only accepts POST
+        // answers 405. Either way nothing is voided.
+        $settlementId = $settlements['response']['results'][0]['id']
+            ?? $settlements['response'][0]['id']
+            ?? null;
+
+        if ($settlementId !== null) {
+            $call('void route exists (GET, 405 = yes)', 'GET', "/settlements/{$settlementId}/void",
+                fn () => $this->crmClient($tenantId)->get("/settlements/{$settlementId}/void"));
+        } else {
+            $out['checks'][] = [
+                'label'  => 'void route exists (GET, 405 = yes)',
+                'call'   => 'GET /settlements/{id}/void',
+                'status' => 0,
+                'ok'     => false,
+                'body'   => 'SKIPPED: no settlement id on this contact to probe with. Re-run against a contact that has one.',
+            ];
+        }
+
+        // --- ACTION: debt create then immediate cancel (test files only) ---
+        if ($execute) {
+            // 'creditor' is omitted on purpose: createDebt() sends it as the Forth
+            // creditor id, which we do not have here. If the path is live, Forth's
+            // 400 names the fields it wants - which is exactly what we are after.
+            $created = $call('create debt (add-creditor step 1)', 'POST', '/debts',
+                fn () => $this->crmClient($tenantId)->post('/debts', [
+                    'client_id'       => $contactId,
+                    'account_number'  => 'PMOD-PROBE',
+                    'balance'         => '1.00',
+                    'original_amount' => '1.00',
+                ]));
+
+            $debtId = $created['response']['id'] ?? $created['id'] ?? $created['debt_id'] ?? null;
+
+            if ($debtId !== null) {
+                $call('delete probe debt (cleanup)', 'DELETE', "/debts/{$debtId}",
+                    fn () => $this->crmClient($tenantId)->delete("/debts/{$debtId}"));
+            } else {
+                $out['checks'][] = [
+                    'label'  => 'delete probe debt (cleanup)',
+                    'call'   => 'DELETE /debts/{id}',
+                    'status' => 0,
+                    'ok'     => false,
+                    'body'   => 'SKIPPED: create returned no debt id, so nothing was left behind.',
+                ];
+            }
+        }
+
+        // --- ACTION: banking write paths, empty body so nothing can be set ---
+        if ($executeBanking) {
+            $call('bank account write (PUT, empty body)', 'PUT', "/contacts/{$contactId}/bank-account",
+                fn () => $this->crmClient($tenantId)->put("/contacts/{$contactId}/bank-account", []));
+
+            $call('bank account write (POST, empty body)', 'POST', "/contacts/{$contactId}/bank-account",
+                fn () => $this->crmClient($tenantId)->post("/contacts/{$contactId}/bank-account", []));
+        }
+
+        Log::info('PMOD: probeCreditorAndBankingEndpoints', $out);
+
+        return $out;
+    }
+
+    /**
      * Resume a paused contact via the real Forth CRM endpoint (confirmed from the
      * doc page 2026-06-30): POST /contacts/{id}/resume, where {id} is the contact
      * id. Success is HTTP 200 with response.paused === false. This replaces the
@@ -1017,8 +1196,12 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway
             return ['debt_id' => $debtId, 'status' => 'dry_run_cancelled'];
         }
 
+        // Forth deletes a debt with DELETE /debts/{id}. POST /debts/{id}/cancel
+        // answers 404 — verified against production 2026-08-28, which is why both
+        // Remove Creditor actions failed. A success returns
+        // {"code":200,"message":"Successfully deleted object"}.
         $response = $this->crmClient($workItem->tenantId)
-            ->post("/debts/{$debtId}/cancel");
+            ->delete("/debts/{$debtId}");
 
         if (!$response->successful()) {
             Log::error('PMOD: Failed to cancel debt', [
@@ -1032,5 +1215,282 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway
         $data = $response->json('response', []);
         Log::info('PMOD: Debt cancelled', ['debt_id' => $debtId]);
         return $data;
+    }
+
+    /**
+     * Resolve a creditor NAME to Forth's creditor id. Returns null when the name
+     * is unknown or matches more than one creditor — see PmodCreditorDirectory
+     * for why this fails closed rather than guessing.
+     *
+     * Matching is done on a normalised form (uppercase, punctuation flattened to
+     * spaces) so "SYNCB/ABCWH" and "SYNCB ABCWH" resolve identically. An exact
+     * normalised hit wins; only if there is none does it fall back to a substring
+     * match, and then only for names of 5+ characters, so a short name like
+     * "AT T" cannot sweep up unrelated creditors.
+     */
+    /**
+     * Drop the cached catalogue so the next lookup refetches. The cache key lives
+     * in creditorCacheKey() and nowhere else - a caller that rebuilt the key
+     * itself would silently clear the wrong entry the moment the key changed,
+     * which is exactly what happened when it moved to v2.
+     *
+     * Returns the key it cleared, so a diagnostic can report it.
+     */
+    public function forgetCreditorCatalogue(string $tenantId): string
+    {
+        $cacheKey = self::creditorCacheKey($tenantId);
+
+        unset($this->creditorMapCache[$cacheKey]);
+        Cache::forget($cacheKey);
+
+        return $cacheKey;
+    }
+
+    /**
+     * v2: the cached shape changed when id-validation was added. The suffix stops
+     * a v1 map (names only) being read back as a v2 one.
+     */
+    private static function creditorCacheKey(string $tenantId): string
+    {
+        return 'pmod_creditors_v2_' . strtolower($tenantId);
+    }
+
+    /**
+     * Decide which Forth creditor id to use, given whatever the consumer claimed
+     * and the creditor name they sent.
+     *
+     * A claimed id is VALIDATED, never trusted. Measured 2026-08-31: of four
+     * creditor ids seen in real payloads, only one existed in the Forth
+     * catalogue. 10016072, 10100974 and 601 are from another id space (DPP
+     * legacy), while the catalogue runs 25,399,828..28,315,871. Sending one of
+     * those to POST /debts would attach the debt to nothing, or to the wrong
+     * creditor.
+     *
+     * Order: a claimed id that exists wins; otherwise resolve the name; otherwise
+     * null, and the caller captures for manual review.
+     */
+    public function resolveCreditorId(string $tenantId, ?string $claimedId, string $creditorName): ?string
+    {
+        $claimedId = trim((string) $claimedId);
+
+        if ($claimedId !== '') {
+            if ($this->creditorExists($tenantId, $claimedId)) {
+                return $claimedId;
+            }
+
+            Log::warning('PMOD: payload creditor_id is not in the Forth catalogue, ignoring it', [
+                'tenant' => $tenantId, 'claimed_creditor_id' => $claimedId, 'creditor_name' => $creditorName,
+            ]);
+        }
+
+        return $this->findCreditorId($tenantId, $creditorName);
+    }
+
+    public function creditorExists(string $tenantId, string $creditorId): bool
+    {
+        $creditorId = trim($creditorId);
+
+        return $creditorId !== '' && isset($this->creditorCatalogue($tenantId)['ids'][$creditorId]);
+    }
+
+    /**
+     * Resolve a creditor NAME to a Forth creditor id. Returns null when the name
+     * is unknown or matches more than one creditor.
+     *
+     * Matching is on a normalised form (uppercase, punctuation flattened to
+     * spaces), so SYNCB/ABCWH and SYNCB ABCWH resolve identically. An exact hit
+     * wins; only without one does it try a substring match, and then only for
+     * names of 5+ characters so a short name cannot sweep up unrelated rows.
+     *
+     * Ambiguity is real, not theoretical: the LDR catalogue holds 55 CITI* rows
+     * including CITIBANK N. A., CITIBANKNA, CITI/costco and the typo CITI/cosco,
+     * so a bare Citibank correctly resolves to nothing.
+     */
+    public function findCreditorId(string $tenantId, string $creditorName): ?string
+    {
+        $needle = self::normalizeCreditorName($creditorName);
+
+        if ($needle === '') {
+            return null;
+        }
+
+        $names = $this->creditorCatalogue($tenantId)['names'];
+
+        if (isset($names[$needle])) {
+            if (count($names[$needle]) === 1) {
+                Log::info('PMOD: creditor resolved by exact name', [
+                    'tenant' => $tenantId, 'name' => $creditorName, 'creditor_id' => $names[$needle][0],
+                ]);
+
+                return $names[$needle][0];
+            }
+
+            Log::warning('PMOD: creditor name is ambiguous, refusing to guess', [
+                'tenant' => $tenantId, 'name' => $creditorName, 'candidates' => $names[$needle],
+            ]);
+
+            return null;
+        }
+
+        if (mb_strlen($needle) < 5) {
+            return null;
+        }
+
+        $hits = [];
+        foreach ($names as $name => $ids) {
+            if (mb_strlen((string) $name) < 5) {
+                continue;
+            }
+
+            if (str_contains((string) $name, $needle) || str_contains($needle, (string) $name)) {
+                foreach ($ids as $id) {
+                    $hits[$id] = $name;
+                }
+            }
+        }
+
+        if (count($hits) === 1) {
+            $id = (string) array_key_first($hits);
+
+            Log::info('PMOD: creditor resolved by substring', [
+                'tenant' => $tenantId, 'name' => $creditorName, 'matched' => reset($hits), 'creditor_id' => $id,
+            ]);
+
+            return $id;
+        }
+
+        Log::warning('PMOD: creditor could not be resolved', [
+            'tenant' => $tenantId, 'name' => $creditorName, 'match_count' => count($hits),
+            'candidates' => array_slice($hits, 0, 5, true),
+        ]);
+
+        return null;
+    }
+
+    /**
+     * The creditor catalogue, indexed both ways: normalised name => list of ids
+     * for resolution, and id => name for validating a claimed id. Cached 24h per
+     * tenant; 10,077 rows on LDR as of 2026-08-31 and effectively static.
+     *
+     * @return array{names: array<string, list<string>>, ids: array<string, string>}
+     */
+    private function creditorCatalogue(string $tenantId): array
+    {
+        // v2: the cached shape changed when id-validation was added. The suffix
+        // stops a v1 map (names only) being read back as a v2 one.
+        $cacheKey = self::creditorCacheKey($tenantId);
+
+        if (isset($this->creditorMapCache[$cacheKey])) {
+            return $this->creditorMapCache[$cacheKey];
+        }
+
+        $catalogue = Cache::remember($cacheKey, now()->addHours(24), function () use ($tenantId): array {
+            $names = [];
+            $ids = [];
+            $expected = null;
+
+            // Forth pages with pageNo/perPage - camelCase, echoed back in the
+            // envelope alongside total. It honours a perPage large enough to
+            // return the whole catalogue in one request, so the normal path is a
+            // single call. The loop stays so a future server-side cap degrades to
+            // real paging rather than silently truncating. (_limit/_offset are
+            // ignored here - that convention belongs to the ForthPay reports API.)
+            for ($pageNo = 1; $pageNo <= self::CREDITOR_MAX_PAGES; $pageNo++) {
+                [$rows, $total] = $this->fetchCreditorPage($tenantId, $pageNo, self::CREDITOR_PAGE_SIZE);
+                $expected ??= $total;
+
+                if ($rows === []) {
+                    break;
+                }
+
+                $new = 0;
+                foreach ($rows as $row) {
+                    if (! is_array($row)) {
+                        continue;
+                    }
+
+                    $id = trim((string) ($row['id'] ?? ''));
+                    $name = self::normalizeCreditorName((string) ($row['company_name'] ?? ''));
+
+                    if ($id === '' || isset($ids[$id])) {
+                        continue;
+                    }
+
+                    $ids[$id] = $name;
+                    $new++;
+
+                    if ($name !== '') {
+                        $names[$name][] = $id;
+                    }
+                }
+
+                // No new ids means paging is not advancing - stop rather than spin.
+                if ($new === 0) {
+                    break;
+                }
+
+                if ($expected !== null && count($ids) >= $expected) {
+                    break;
+                }
+            }
+
+            if ($expected !== null && count($ids) < $expected) {
+                Log::warning('PMOD: creditor catalogue incomplete - names may fail to resolve', [
+                    'tenant' => $tenantId, 'fetched' => count($ids), 'total_reported' => $expected,
+                ]);
+            }
+
+            Log::info('PMOD: creditor catalogue loaded', [
+                'tenant' => $tenantId, 'creditors' => count($ids),
+                'distinct_names' => count($names), 'total_reported' => $expected,
+            ]);
+
+            return ['names' => $names, 'ids' => $ids];
+        });
+
+        $this->creditorMapCache[$cacheKey] = $catalogue;
+
+        return $catalogue;
+    }
+
+    /**
+     * One page of the creditor catalogue.
+     *
+     * @return array{0: list<array<string, mixed>>, 1: int|null} rows, and the
+     *         total the envelope reports (null when unavailable)
+     */
+    private function fetchCreditorPage(string $tenantId, int $pageNo, int $perPage): array
+    {
+        $response = $this->crmClient($tenantId)->get('/creditors', [
+            'pageNo' => $pageNo,
+            'perPage' => $perPage,
+        ]);
+
+        if (! $response->successful()) {
+            Log::error('PMOD: Failed to list creditors', [
+                'tenant_id' => $tenantId, 'page_no' => $pageNo,
+                'status' => $response->status(), 'response' => mb_substr($response->body(), 0, 300),
+            ]);
+
+            return [[], null];
+        }
+
+        // Envelope: {"response":{"data":[...],"total":N,"pageNo":N,"perPage":N}}
+        $rows = $response->json('response.data');
+        $total = $response->json('response.total');
+
+        return [
+            is_array($rows) ? array_values($rows) : [],
+            is_numeric($total) ? (int) $total : null,
+        ];
+    }
+
+    private static function normalizeCreditorName(string $value): string
+    {
+        $value = strtoupper(trim($value));
+        $value = preg_replace('/[^A-Z0-9 ]+/', ' ', $value) ?? $value;
+        $value = preg_replace('/\s+/', ' ', $value) ?? $value;
+
+        return trim($value);
     }
 }

@@ -26,6 +26,7 @@ use Cmd\Reports\Console\Commands\GenerateWelcomePacketReport\GenerateWelcomePack
 use Cmd\Reports\Console\Commands\GenerateDroppedReport\GenerateDroppedReport;
 use Cmd\Reports\Console\Commands\GenerateResumePayments\GenerateResumePayments;
 use Cmd\Reports\Pmod\Console\Commands\DumpForthStagesStatuses;
+use Cmd\Reports\Pmod\Console\Commands\ProbeForthPmodEndpoints;
 use Cmd\Reports\Console\Commands\GenerateScrubListReport\GenerateScrubListReport;
 use Cmd\Reports\Console\Commands\GenerateLookbackSummaryReport\GenerateLookbackSummaryReport;
 use Cmd\Reports\Console\Commands\GenerateReportSummary\GenerateReportSummary;
@@ -125,6 +126,7 @@ class ReportsServiceProvider extends ServiceProvider
                 GenerateDroppedReport::class,
                 GenerateResumePayments::class,
                 DumpForthStagesStatuses::class,
+                ProbeForthPmodEndpoints::class,
                 GenerateScrubListReport::class,
                 GenerateLookbackSummaryReport::class,
                 GenerateReportSummary::class,
