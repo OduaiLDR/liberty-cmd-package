@@ -58,7 +58,7 @@ final class ProbeForthPmodEndpoints extends Command
             $rows = [];
             foreach ($names as $name) {
                 $id = $gateway->findCreditorId(strtolower($tenant), $name);
-                $rows[] = [$name, $id ?? '— unresolved —'];
+                $rows[] = [$name, $id ?? '-- unresolved --'];
             }
 
             $this->table(['Creditor name', 'Forth creditor id'], $rows);

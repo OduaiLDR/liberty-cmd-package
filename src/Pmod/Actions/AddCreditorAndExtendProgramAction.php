@@ -53,18 +53,21 @@ final class AddCreditorAndExtendProgramAction implements PmodActionHandler
             ]);
         }
 
-        // Step 1: create the debt. Forth needs its numeric creditor id, but only
-        // ~46% of real payloads carry creditor_change.creditor_id — the rest send a
-        // name only (the legacy VBA never used an id; it typed the name straight
-        // into the DPP form). Fall back to Forth's creditor catalogue, which fails
-        // closed on an ambiguous name rather than guessing.
-        $creditorId = $creditorChange['creditor_id'] ?? null;
+        // Step 1: create the debt. Forth needs its numeric creditor id, but the
+        // id consumers send cannot be trusted - measured 2026-08-31, only 1 of 4
+        // real payload creditor_ids existed in the catalogue. resolveCreditorId
+        // validates a claimed id and falls back to matching the name, failing
+        // closed rather than guessing.
+        $creditorId = null;
 
-        if ($creditorId === null && $this->gateway instanceof PmodCreditorDirectory) {
-            $creditorId = $this->gateway->findCreditorId(
+        if ($this->gateway instanceof PmodCreditorDirectory) {
+            $creditorId = $this->gateway->resolveCreditorId(
                 $workItem->tenantId,
+                isset($creditorChange['creditor_id']) ? (string) $creditorChange['creditor_id'] : null,
                 (string) ($creditorChange['creditor_name'] ?? ''),
             );
+        } else {
+            $creditorId = $creditorChange['creditor_id'] ?? null;
         }
 
         if ($creditorId === null) {

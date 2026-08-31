@@ -1228,6 +1228,57 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCr
      * match, and then only for names of 5+ characters, so a short name like
      * "AT T" cannot sweep up unrelated creditors.
      */
+    /**
+     * Decide which Forth creditor id to use, given whatever the consumer claimed
+     * and the creditor name they sent.
+     *
+     * A claimed id is VALIDATED, never trusted. Measured 2026-08-31: of four
+     * creditor ids seen in real payloads, only one existed in the Forth
+     * catalogue. 10016072, 10100974 and 601 are from another id space (DPP
+     * legacy), while the catalogue runs 25,399,828..28,315,871. Sending one of
+     * those to POST /debts would attach the debt to nothing, or to the wrong
+     * creditor.
+     *
+     * Order: a claimed id that exists wins; otherwise resolve the name; otherwise
+     * null, and the caller captures for manual review.
+     */
+    public function resolveCreditorId(string $tenantId, ?string $claimedId, string $creditorName): ?string
+    {
+        $claimedId = trim((string) $claimedId);
+
+        if ($claimedId !== '') {
+            if ($this->creditorExists($tenantId, $claimedId)) {
+                return $claimedId;
+            }
+
+            Log::warning('PMOD: payload creditor_id is not in the Forth catalogue, ignoring it', [
+                'tenant' => $tenantId, 'claimed_creditor_id' => $claimedId, 'creditor_name' => $creditorName,
+            ]);
+        }
+
+        return $this->findCreditorId($tenantId, $creditorName);
+    }
+
+    public function creditorExists(string $tenantId, string $creditorId): bool
+    {
+        $creditorId = trim($creditorId);
+
+        return $creditorId !== '' && isset($this->creditorCatalogue($tenantId)['ids'][$creditorId]);
+    }
+
+    /**
+     * Resolve a creditor NAME to a Forth creditor id. Returns null when the name
+     * is unknown or matches more than one creditor.
+     *
+     * Matching is on a normalised form (uppercase, punctuation flattened to
+     * spaces), so SYNCB/ABCWH and SYNCB ABCWH resolve identically. An exact hit
+     * wins; only without one does it try a substring match, and then only for
+     * names of 5+ characters so a short name cannot sweep up unrelated rows.
+     *
+     * Ambiguity is real, not theoretical: the LDR catalogue holds 55 CITI* rows
+     * including CITIBANK N. A., CITIBANKNA, CITI/costco and the typo CITI/cosco,
+     * so a bare Citibank correctly resolves to nothing.
+     */
     public function findCreditorId(string $tenantId, string $creditorName): ?string
     {
         $needle = self::normalizeCreditorName($creditorName);
@@ -1236,34 +1287,30 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCr
             return null;
         }
 
-        $map = $this->creditorMap($tenantId);
+        $names = $this->creditorCatalogue($tenantId)['names'];
 
-        if (isset($map[$needle])) {
-            if (count($map[$needle]) === 1) {
+        if (isset($names[$needle])) {
+            if (count($names[$needle]) === 1) {
                 Log::info('PMOD: creditor resolved by exact name', [
-                    'tenant' => $tenantId, 'name' => $creditorName, 'creditor_id' => $map[$needle][0],
+                    'tenant' => $tenantId, 'name' => $creditorName, 'creditor_id' => $names[$needle][0],
                 ]);
 
-                return $map[$needle][0];
+                return $names[$needle][0];
             }
 
             Log::warning('PMOD: creditor name is ambiguous, refusing to guess', [
-                'tenant' => $tenantId, 'name' => $creditorName, 'candidates' => $map[$needle],
+                'tenant' => $tenantId, 'name' => $creditorName, 'candidates' => $names[$needle],
             ]);
 
             return null;
         }
 
         if (mb_strlen($needle) < 5) {
-            Log::info('PMOD: creditor name not found and too short for substring matching', [
-                'tenant' => $tenantId, 'name' => $creditorName,
-            ]);
-
             return null;
         }
 
         $hits = [];
-        foreach ($map as $name => $ids) {
+        foreach ($names as $name => $ids) {
             if (mb_strlen((string) $name) < 5) {
                 continue;
             }
@@ -1294,38 +1341,33 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCr
     }
 
     /**
-     * normalised creditor name => list of ids. Cached for 24h per tenant; the
-     * catalogue is large and effectively static.
+     * The creditor catalogue, indexed both ways: normalised name => list of ids
+     * for resolution, and id => name for validating a claimed id. Cached 24h per
+     * tenant; 10,077 rows on LDR as of 2026-08-31 and effectively static.
      *
-     * @return array<string, list<string>>
+     * @return array{names: array<string, list<string>>, ids: array<string, string>}
      */
-    /**
-     * normalised creditor name => list of ids. Cached 24h per tenant; the
-     * catalogue is large (10,077 rows on LDR as of 2026-08-31) and static enough
-     * that a day-old copy is fine.
-     *
-     * @return array<string, list<string>>
-     */
-    private function creditorMap(string $tenantId): array
+    private function creditorCatalogue(string $tenantId): array
     {
-        $cacheKey = 'pmod_creditors_' . strtolower($tenantId);
+        // v2: the cached shape changed when id-validation was added. The suffix
+        // stops a v1 map (names only) being read back as a v2 one.
+        $cacheKey = 'pmod_creditors_v2_' . strtolower($tenantId);
 
         if (isset($this->creditorMapCache[$cacheKey])) {
             return $this->creditorMapCache[$cacheKey];
         }
 
-        $map = Cache::remember($cacheKey, now()->addHours(24), function () use ($tenantId): array {
-            $map = [];
-            $seen = [];
+        $catalogue = Cache::remember($cacheKey, now()->addHours(24), function () use ($tenantId): array {
+            $names = [];
+            $ids = [];
             $expected = null;
 
-            // Forth pages with pageNo/perPage — camelCase, and echoed back in the
-            // envelope alongside `total`. It honours a perPage large enough to
-            // return the entire catalogue in a single request, so the normal path
-            // is one call. The loop stays so that a future server-side cap on
-            // perPage degrades to real paging rather than silently truncating the
-            // map. (_limit/_offset are ignored here — that convention belongs to
-            // the ForthPay reports API, not Forth CRM.)
+            // Forth pages with pageNo/perPage - camelCase, echoed back in the
+            // envelope alongside total. It honours a perPage large enough to
+            // return the whole catalogue in one request, so the normal path is a
+            // single call. The loop stays so a future server-side cap degrades to
+            // real paging rather than silently truncating. (_limit/_offset are
+            // ignored here - that convention belongs to the ForthPay reports API.)
             for ($pageNo = 1; $pageNo <= self::CREDITOR_MAX_PAGES; $pageNo++) {
                 [$rows, $total] = $this->fetchCreditorPage($tenantId, $pageNo, self::CREDITOR_PAGE_SIZE);
                 $expected ??= $total;
@@ -1343,42 +1385,45 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCr
                     $id = trim((string) ($row['id'] ?? ''));
                     $name = self::normalizeCreditorName((string) ($row['company_name'] ?? ''));
 
-                    if ($id === '' || $name === '' || isset($seen[$id])) {
+                    if ($id === '' || isset($ids[$id])) {
                         continue;
                     }
 
-                    $seen[$id] = true;
+                    $ids[$id] = $name;
                     $new++;
-                    $map[$name][] = $id;
+
+                    if ($name !== '') {
+                        $names[$name][] = $id;
+                    }
                 }
 
-                // No new ids means paging is not advancing — stop rather than spin.
+                // No new ids means paging is not advancing - stop rather than spin.
                 if ($new === 0) {
                     break;
                 }
 
-                if ($expected !== null && count($seen) >= $expected) {
+                if ($expected !== null && count($ids) >= $expected) {
                     break;
                 }
             }
 
-            if ($expected !== null && count($seen) < $expected) {
-                Log::warning('PMOD: creditor catalogue incomplete — names may fail to resolve', [
-                    'tenant' => $tenantId, 'fetched' => count($seen), 'total_reported' => $expected,
+            if ($expected !== null && count($ids) < $expected) {
+                Log::warning('PMOD: creditor catalogue incomplete - names may fail to resolve', [
+                    'tenant' => $tenantId, 'fetched' => count($ids), 'total_reported' => $expected,
                 ]);
             }
 
             Log::info('PMOD: creditor catalogue loaded', [
-                'tenant' => $tenantId, 'creditors' => count($seen),
-                'distinct_names' => count($map), 'total_reported' => $expected,
+                'tenant' => $tenantId, 'creditors' => count($ids),
+                'distinct_names' => count($names), 'total_reported' => $expected,
             ]);
 
-            return $map;
+            return ['names' => $names, 'ids' => $ids];
         });
 
-        $this->creditorMapCache[$cacheKey] = $map;
+        $this->creditorMapCache[$cacheKey] = $catalogue;
 
-        return $map;
+        return $catalogue;
     }
 
     /**
