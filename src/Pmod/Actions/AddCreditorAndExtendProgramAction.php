@@ -61,11 +61,17 @@ final class AddCreditorAndExtendProgramAction implements PmodActionHandler
             ]);
         }
 
+        // Forth's own field names, read off a live debt record 2026-08-28. The
+        // port had used account_number / balance / original_amount, none of which
+        // Forth recognises — the INSERT then failed on non-nullable columns and
+        // returned 500 code 1048 ("Column cannot be null"). client_id is added by
+        // the gateway. Minimum accepted set confirmed as
+        // client_id + creditor + original_debt_amount + current_debt_amount.
         $debtResult = $this->gateway->createDebt($workItem, [
-            'creditor'       => $creditorId,
-            'account_number' => $creditorChange['account_number'] ?? null,
-            'balance'        => $creditorChange['balance'] ?? null,
-            'original_amount' => $creditorChange['balance'] ?? null,
+            'creditor'             => $creditorId,
+            'original_debt_amount' => $creditorChange['balance'] ?? null,
+            'current_debt_amount'  => $creditorChange['balance'] ?? null,
+            'og_account_num'       => $creditorChange['account_number'] ?? null,
         ]);
 
         $debtId = $debtResult['id'] ?? $debtResult['debt_id'] ?? null;

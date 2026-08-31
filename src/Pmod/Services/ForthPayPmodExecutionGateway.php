@@ -620,6 +620,167 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway
     }
 
     /**
+     * Diagnostic for the Forth endpoints behind the six capture-only banking and
+     * creditor actions (add/remove creditor, client banking, sponsor banking).
+     *
+     * Those handlers were written, tested live in 2026-06, then reverted to
+     * capture-only because the Forth calls came back 404 or 400 - but which of
+     * the two was never recorded per endpoint, and they are different problems:
+     * 404 means the path is wrong, 400 means the path is right and the payload
+     * is wrong. This separates them, endpoint by endpoint.
+     *
+     * READ-ONLY by default and safe on any contact, including real ones.
+     *
+     * $execute additionally creates a debt and immediately cancels it. That is
+     * an ACTION - TEST FILES ONLY - but self-cleaning, mirroring the
+     * pause/resume round-trip in probeResumePayments().
+     *
+     * $executeBanking is deliberately separate and NOT implied by $execute:
+     * banking writes change where a client's money is drafted from. It sends an
+     * EMPTY body, so it cannot set an account - a live path answers 400 (bad
+     * payload) and a wrong path answers 404, which is the whole signal we need.
+     *
+     * Never throws - every call's raw status + body is reported.
+     *
+     * @return array<string, mixed>
+     */
+    public function probeCreditorAndBankingEndpoints(
+        string $tenantId,
+        string $contactId,
+        bool $execute = false,
+        bool $executeBanking = false,
+    ): array {
+        $out = [
+            'tenant' => $tenantId,
+            'contact_id' => $contactId,
+            'execute' => $execute,
+            'execute_banking' => $executeBanking,
+            'checks' => [],
+        ];
+
+        $call = function (string $label, string $method, string $path, callable $send) use (&$out): ?array {
+            try {
+                $response = $send();
+
+                $out['checks'][] = [
+                    'label'  => $label,
+                    'call'   => $method . ' ' . $path,
+                    'status' => $response->status(),
+                    'ok'     => $response->successful(),
+                    'body'   => mb_substr($response->body(), 0, 1000),
+                ];
+
+                return $response->successful() ? ($response->json() ?? []) : null;
+            } catch (\Throwable $e) {
+                $out['checks'][] = [
+                    'label'  => $label,
+                    'call'   => $method . ' ' . $path,
+                    'status' => 0,
+                    'ok'     => false,
+                    'body'   => 'EXCEPTION: ' . $e->getMessage(),
+                ];
+
+                return null;
+            }
+        };
+
+        // --- READ-ONLY (safe on real contacts) ---
+
+        // Token health first: a 404 here means the token is stale
+        // (refresh:forth-api-tokens), not that the paths below are wrong.
+        $call('token health', 'GET', '/contact-stages',
+            fn () => $this->crmClient($tenantId)->get('/contact-stages'));
+
+        $call('contact resolves', 'GET', "/contacts/{$contactId}",
+            fn () => $this->crmClient($tenantId)->get("/contacts/{$contactId}"));
+
+        // Both Remove Creditor actions call this before cancelling a debt.
+        $call('list debts (remove-creditor step 1)', 'GET', "/contacts/{$contactId}/debts",
+            fn () => $this->crmClient($tenantId)->get("/contacts/{$contactId}/debts"));
+
+        // Does a creditor catalogue exist? Both Add Creditor actions hard-require
+        // a Forth creditor_id and capture without one, so if portals only send a
+        // creditor name we need a name -> id lookup before they can go live.
+        $call('creditor catalogue (name -> id lookup)', 'GET', '/creditors',
+            fn () => $this->crmClient($tenantId)->get('/creditors'));
+
+        // addBankAccount() targets this resource. A GET establishes whether it
+        // exists at all without writing anything.
+        $call('bank account resource', 'GET', "/contacts/{$contactId}/bank-account",
+            fn () => $this->crmClient($tenantId)->get("/contacts/{$contactId}/bank-account"));
+
+        // Void Settlement is note-only too, and voidSettlementOffer() is the
+        // same call PmodLumpSumAction and SkipPaymentAction make on their live
+        // path when settlement ids are present - so this path matters beyond
+        // the note-only action itself, and has never been confirmed either.
+        $settlements = $call('list settlements', 'GET', "/contacts/{$contactId}/settlements",
+            fn () => $this->crmClient($tenantId)->get("/contacts/{$contactId}/settlements"));
+
+        // A void cannot be undone, so there is no safe write probe for it.
+        // GETting the void path is the non-destructive substitute: a route that
+        // does not exist answers 404, one that exists but only accepts POST
+        // answers 405. Either way nothing is voided.
+        $settlementId = $settlements['response']['results'][0]['id']
+            ?? $settlements['response'][0]['id']
+            ?? null;
+
+        if ($settlementId !== null) {
+            $call('void route exists (GET, 405 = yes)', 'GET', "/settlements/{$settlementId}/void",
+                fn () => $this->crmClient($tenantId)->get("/settlements/{$settlementId}/void"));
+        } else {
+            $out['checks'][] = [
+                'label'  => 'void route exists (GET, 405 = yes)',
+                'call'   => 'GET /settlements/{id}/void',
+                'status' => 0,
+                'ok'     => false,
+                'body'   => 'SKIPPED: no settlement id on this contact to probe with. Re-run against a contact that has one.',
+            ];
+        }
+
+        // --- ACTION: debt create then immediate cancel (test files only) ---
+        if ($execute) {
+            // 'creditor' is omitted on purpose: createDebt() sends it as the Forth
+            // creditor id, which we do not have here. If the path is live, Forth's
+            // 400 names the fields it wants - which is exactly what we are after.
+            $created = $call('create debt (add-creditor step 1)', 'POST', '/debts',
+                fn () => $this->crmClient($tenantId)->post('/debts', [
+                    'client_id'       => $contactId,
+                    'account_number'  => 'PMOD-PROBE',
+                    'balance'         => '1.00',
+                    'original_amount' => '1.00',
+                ]));
+
+            $debtId = $created['response']['id'] ?? $created['id'] ?? $created['debt_id'] ?? null;
+
+            if ($debtId !== null) {
+                $call('delete probe debt (cleanup)', 'DELETE', "/debts/{$debtId}",
+                    fn () => $this->crmClient($tenantId)->delete("/debts/{$debtId}"));
+            } else {
+                $out['checks'][] = [
+                    'label'  => 'delete probe debt (cleanup)',
+                    'call'   => 'DELETE /debts/{id}',
+                    'status' => 0,
+                    'ok'     => false,
+                    'body'   => 'SKIPPED: create returned no debt id, so nothing was left behind.',
+                ];
+            }
+        }
+
+        // --- ACTION: banking write paths, empty body so nothing can be set ---
+        if ($executeBanking) {
+            $call('bank account write (PUT, empty body)', 'PUT', "/contacts/{$contactId}/bank-account",
+                fn () => $this->crmClient($tenantId)->put("/contacts/{$contactId}/bank-account", []));
+
+            $call('bank account write (POST, empty body)', 'POST', "/contacts/{$contactId}/bank-account",
+                fn () => $this->crmClient($tenantId)->post("/contacts/{$contactId}/bank-account", []));
+        }
+
+        Log::info('PMOD: probeCreditorAndBankingEndpoints', $out);
+
+        return $out;
+    }
+
+    /**
      * Resume a paused contact via the real Forth CRM endpoint (confirmed from the
      * doc page 2026-06-30): POST /contacts/{id}/resume, where {id} is the contact
      * id. Success is HTTP 200 with response.paused === false. This replaces the
@@ -1017,8 +1178,12 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway
             return ['debt_id' => $debtId, 'status' => 'dry_run_cancelled'];
         }
 
+        // Forth deletes a debt with DELETE /debts/{id}. POST /debts/{id}/cancel
+        // answers 404 — verified against production 2026-08-28, which is why both
+        // Remove Creditor actions failed. A success returns
+        // {"code":200,"message":"Successfully deleted object"}.
         $response = $this->crmClient($workItem->tenantId)
-            ->post("/debts/{$debtId}/cancel");
+            ->delete("/debts/{$debtId}");
 
         if (!$response->successful()) {
             Log::error('PMOD: Failed to cancel debt', [

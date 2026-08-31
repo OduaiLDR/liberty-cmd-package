@@ -29,6 +29,7 @@ use Cmd\Reports\Console\Commands\GenerateDPPPastDueReport\GenerateDPPPastDueRepo
 use Cmd\Reports\Console\Commands\GenerateResumePayments\GenerateResumePayments;
 use Cmd\Reports\Console\Commands\GenerateResumePayments\ResumePaymentsHealth;
 use Cmd\Reports\Pmod\Console\Commands\DumpForthStagesStatuses;
+use Cmd\Reports\Pmod\Console\Commands\ProbeForthPmodEndpoints;
 use Cmd\Reports\Console\Commands\GenerateNSFReport\GenerateNSFReport;
 use Cmd\Reports\Console\Commands\GeneratePauseHoldReport\GeneratePauseHoldReport;
 use Cmd\Reports\Console\Commands\GenerateGraduationReport\GenerateGraduationReport;
@@ -163,6 +164,7 @@ class ReportsServiceProvider extends ServiceProvider
                 GenerateResumePayments::class,
                 ResumePaymentsHealth::class,
                 DumpForthStagesStatuses::class,
+                ProbeForthPmodEndpoints::class,
                 GenerateNSFReport::class,
                 GeneratePauseHoldReport::class,
                 GenerateGraduationReport::class,

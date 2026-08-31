@@ -51,7 +51,10 @@ final class AddBankAccountAction implements PmodActionHandler
             'account_number'      => $bankingUpdate['account_number'],
             'routing_number'      => $bankingUpdate['routing_number'],
             'account_type'        => $bankingUpdate['account_type'],
-            'bank_name'           => $bankingUpdate['bank_name'] ?? null,
+            // bank_name is deliberately NOT sent. Forth derives it from the routing
+            // number and 404s the entire request if it is present: "Bank Name will
+            // be searched with Routing Number. Do not pass any value for bank_name."
+            // Verified against production 2026-08-28 — this was the June failure.
             'account_holder_name' => $bankingUpdate['account_holder_name'] ?? $bankingUpdate['name_on_account'] ?? null,
         ]);
 

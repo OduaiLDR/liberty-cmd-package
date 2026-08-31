@@ -49,7 +49,8 @@ final class CaptureSponsorBankingAction implements PmodActionHandler
             'account_number'      => $sponsorUpdate['sponsor_account_number'],
             'routing_number'      => $sponsorUpdate['sponsor_routing_number'],
             'account_type'        => $sponsorUpdate['sponsor_account_type'],
-            'bank_name'           => $sponsorUpdate['sponsor_bank_name'] ?? null,
+            // Not sent — see AddBankAccountAction: Forth rejects any request
+            // carrying bank_name and derives it from the routing number.
             'account_holder_name' => $sponsorUpdate['sponsor_name'] ?? null,
             'sponsor'             => true,
             'sponsor_id'          => $sponsorUpdate['sponsor_id'] ?? null,
