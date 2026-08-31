@@ -31,6 +31,14 @@ interface PmodCreditorDirectory
      */
     public function resolveCreditorId(string $tenantId, ?string $claimedId, string $creditorName): ?string;
 
+    /**
+     * Drop any cached copy of the catalogue so the next lookup refetches, and
+     * return the cache key that was cleared. Implementations MUST own the key -
+     * a caller that rebuilds it would clear the wrong entry whenever the key
+     * changes.
+     */
+    public function forgetCreditorCatalogue(string $tenantId): string;
+
     /** True when this creditor id exists in the tenant's Forth catalogue. */
     public function creditorExists(string $tenantId, string $creditorId): bool;
 

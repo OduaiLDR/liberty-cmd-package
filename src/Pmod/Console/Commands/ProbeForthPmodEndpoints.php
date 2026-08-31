@@ -50,9 +50,8 @@ final class ProbeForthPmodEndpoints extends Command
             }
 
             if ($this->option('refresh')) {
-                $key = 'pmod_creditors_' . strtolower($tenant);
-                \Illuminate\Support\Facades\Cache::forget($key);
-                $this->info("[INFO] Forgot cached catalogue [{$key}] — refetching.");
+                $key = $gateway->forgetCreditorCatalogue(strtolower($tenant));
+                $this->info("[INFO] Forgot cached catalogue [{$key}] - refetching.");
             }
 
             $rows = [];

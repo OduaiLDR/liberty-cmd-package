@@ -1229,6 +1229,33 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCr
      * "AT T" cannot sweep up unrelated creditors.
      */
     /**
+     * Drop the cached catalogue so the next lookup refetches. The cache key lives
+     * in creditorCacheKey() and nowhere else - a caller that rebuilt the key
+     * itself would silently clear the wrong entry the moment the key changed,
+     * which is exactly what happened when it moved to v2.
+     *
+     * Returns the key it cleared, so a diagnostic can report it.
+     */
+    public function forgetCreditorCatalogue(string $tenantId): string
+    {
+        $cacheKey = self::creditorCacheKey($tenantId);
+
+        unset($this->creditorMapCache[$cacheKey]);
+        Cache::forget($cacheKey);
+
+        return $cacheKey;
+    }
+
+    /**
+     * v2: the cached shape changed when id-validation was added. The suffix stops
+     * a v1 map (names only) being read back as a v2 one.
+     */
+    private static function creditorCacheKey(string $tenantId): string
+    {
+        return 'pmod_creditors_v2_' . strtolower($tenantId);
+    }
+
+    /**
      * Decide which Forth creditor id to use, given whatever the consumer claimed
      * and the creditor name they sent.
      *
@@ -1351,7 +1378,7 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCr
     {
         // v2: the cached shape changed when id-validation was added. The suffix
         // stops a v1 map (names only) being read back as a v2 one.
-        $cacheKey = 'pmod_creditors_v2_' . strtolower($tenantId);
+        $cacheKey = self::creditorCacheKey($tenantId);
 
         if (isset($this->creditorMapCache[$cacheKey])) {
             return $this->creditorMapCache[$cacheKey];
