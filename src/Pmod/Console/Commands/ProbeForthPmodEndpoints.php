@@ -28,6 +28,7 @@ final class ProbeForthPmodEndpoints extends Command
         {--tenant=PLAW : Tenant slug - LDR, PLAW or LT.}
         {--contact= : Forth contact id to probe against. Required.}
         {--creditor=* : Resolve these creditor NAMES to Forth ids and exit (no contact needed).}
+        {--refresh : Forget the cached creditor catalogue first (24h TTL — use after a code or catalogue change).}
         {--execute : Also create a probe debt and immediately cancel it. TEST FILES ONLY.}
         {--execute-banking : Also probe the bank-account write paths with an empty body. TEST FILES ONLY.}';
 
@@ -46,6 +47,12 @@ final class ProbeForthPmodEndpoints extends Command
                 $this->error('This gateway cannot resolve creditor names.');
 
                 return self::FAILURE;
+            }
+
+            if ($this->option('refresh')) {
+                $key = 'pmod_creditors_' . strtolower($tenant);
+                \Illuminate\Support\Facades\Cache::forget($key);
+                $this->info("[INFO] Forgot cached catalogue [{$key}] — refetching.");
             }
 
             $rows = [];
