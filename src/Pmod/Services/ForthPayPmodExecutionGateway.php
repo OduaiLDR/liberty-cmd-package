@@ -18,6 +18,20 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCr
     private const FORTH_CRM_BASE_URL = 'https://api.forthcrm.com/v1';
     private const FORTH_PAY_BASE_URL = 'https://api.forthpay.com/v1';
 
+    /** Forth honours a perPage large enough to return the whole catalogue in one call. */
+    private const CREDITOR_PAGE_SIZE = 25000;
+
+    /**
+     * Only reached if a future server-side cap forces real paging. Sized so any
+     * sane cap (>= 200/page) still covers the catalogue. If Forth ever caps
+     * perPage low enough that this truncates, the map logs
+     * "creditor catalogue incomplete" and names fail closed to manual review —
+     * but the real fix then is a warm-ahead command, not a bigger cap: 500+
+     * sequential requests inside a PMOD job would blow the job timeout and
+     * never write the cache at all.
+     */
+    private const CREDITOR_MAX_PAGES = 60;
+
     private ?DBConnector $dbConnector = null;
     private array $apiKeyCache = [];
 
@@ -1285,6 +1299,13 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCr
      *
      * @return array<string, list<string>>
      */
+    /**
+     * normalised creditor name => list of ids. Cached 24h per tenant; the
+     * catalogue is large (10,077 rows on LDR as of 2026-08-31) and static enough
+     * that a day-old copy is fine.
+     *
+     * @return array<string, list<string>>
+     */
     private function creditorMap(string $tenantId): array
     {
         $cacheKey = 'pmod_creditors_' . strtolower($tenantId);
@@ -1296,13 +1317,18 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCr
         $map = Cache::remember($cacheKey, now()->addHours(24), function () use ($tenantId): array {
             $map = [];
             $seen = [];
-            $offset = 0;
-            $limit = 1000;
+            $expected = null;
 
-            // Hard page cap plus a "no new ids" break: if Forth ignores _limit/_offset
-            // it returns the same page forever, and this must not spin.
-            for ($page = 0; $page < 25; $page++) {
-                $rows = $this->fetchCreditorPage($tenantId, $offset, $limit);
+            // Forth pages with pageNo/perPage — camelCase, and echoed back in the
+            // envelope alongside `total`. It honours a perPage large enough to
+            // return the entire catalogue in a single request, so the normal path
+            // is one call. The loop stays so that a future server-side cap on
+            // perPage degrades to real paging rather than silently truncating the
+            // map. (_limit/_offset are ignored here — that convention belongs to
+            // the ForthPay reports API, not Forth CRM.)
+            for ($pageNo = 1; $pageNo <= self::CREDITOR_MAX_PAGES; $pageNo++) {
+                [$rows, $total] = $this->fetchCreditorPage($tenantId, $pageNo, self::CREDITOR_PAGE_SIZE);
+                $expected ??= $total;
 
                 if ($rows === []) {
                     break;
@@ -1326,15 +1352,25 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCr
                     $map[$name][] = $id;
                 }
 
-                if ($new === 0 || count($rows) < $limit) {
+                // No new ids means paging is not advancing — stop rather than spin.
+                if ($new === 0) {
                     break;
                 }
 
-                $offset += $limit;
+                if ($expected !== null && count($seen) >= $expected) {
+                    break;
+                }
+            }
+
+            if ($expected !== null && count($seen) < $expected) {
+                Log::warning('PMOD: creditor catalogue incomplete — names may fail to resolve', [
+                    'tenant' => $tenantId, 'fetched' => count($seen), 'total_reported' => $expected,
+                ]);
             }
 
             Log::info('PMOD: creditor catalogue loaded', [
-                'tenant' => $tenantId, 'distinct_names' => count($map), 'creditors' => count($seen),
+                'tenant' => $tenantId, 'creditors' => count($seen),
+                'distinct_names' => count($map), 'total_reported' => $expected,
             ]);
 
             return $map;
@@ -1345,31 +1381,36 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCr
         return $map;
     }
 
-    /** @return list<array<string, mixed>> */
-    private function fetchCreditorPage(string $tenantId, int $offset, int $limit): array
+    /**
+     * One page of the creditor catalogue.
+     *
+     * @return array{0: list<array<string, mixed>>, 1: int|null} rows, and the
+     *         total the envelope reports (null when unavailable)
+     */
+    private function fetchCreditorPage(string $tenantId, int $pageNo, int $perPage): array
     {
         $response = $this->crmClient($tenantId)->get('/creditors', [
-            '_limit' => $limit,
-            '_offset' => $offset,
+            'pageNo' => $pageNo,
+            'perPage' => $perPage,
         ]);
 
         if (! $response->successful()) {
             Log::error('PMOD: Failed to list creditors', [
-                'tenant_id' => $tenantId, 'offset' => $offset,
+                'tenant_id' => $tenantId, 'page_no' => $pageNo,
                 'status' => $response->status(), 'response' => mb_substr($response->body(), 0, 300),
             ]);
 
-            return [];
+            return [[], null];
         }
 
-        // Observed shape: {"response":{"data":[{id, company_name, ...}]}}
+        // Envelope: {"response":{"data":[...],"total":N,"pageNo":N,"perPage":N}}
         $rows = $response->json('response.data');
+        $total = $response->json('response.total');
 
-        if (! is_array($rows)) {
-            $rows = $response->json('response');
-        }
-
-        return is_array($rows) ? array_values($rows) : [];
+        return [
+            is_array($rows) ? array_values($rows) : [],
+            is_numeric($total) ? (int) $total : null,
+        ];
     }
 
     private static function normalizeCreditorName(string $value): string
