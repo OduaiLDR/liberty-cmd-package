@@ -69,7 +69,8 @@ final class RemoveCreditorAndDecreasePaymentAction implements PmodActionHandler
         $updateErrors  = [];
 
         foreach ($transactions as $txn) {
-            if (($txn['type'] ?? '') !== 'D' || ($txn['active'] ?? '') !== '1' || ($txn['process_date'] ?? '') < $today) {
+            // See AddCreditorAndIncreasePayment: a cancelled draft keeps active = 1.
+            if (($txn['type'] ?? '') !== 'D' || ($txn['active'] ?? '') !== '1' || ! empty($txn['cancelled']) || ($txn['process_date'] ?? '') < $today) {
                 continue;
             }
             $draftId = (string) ($txn['transaction_id'] ?? $txn['id'] ?? '');

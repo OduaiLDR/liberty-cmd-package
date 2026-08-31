@@ -735,19 +735,20 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCr
             fn () => $this->crmClient($tenantId)->get("/contacts/{$contactId}/settlements"));
 
         // A void cannot be undone, so there is no safe write probe for it.
-        // GETting the void path is the non-destructive substitute: a route that
-        // does not exist answers 404, one that exists but only accepts POST
-        // answers 405. Either way nothing is voided.
+        // There is no safe read-only substitute: Forth answers 404 for a wrong VERB
+        // as well as a wrong path (GET /reports/transactions 404s though POST works,
+        // verified 2026-08-31), so probing the void route with a GET cannot tell an
+        // absent route from a POST-only one. Reported for the record, not as a signal.
         $settlementId = $settlements['response']['results'][0]['id']
             ?? $settlements['response'][0]['id']
             ?? null;
 
         if ($settlementId !== null) {
-            $call('void route exists (GET, 405 = yes)', 'GET', "/settlements/{$settlementId}/void",
+            $call('void route (GET - inconclusive, see note)', 'GET', "/settlements/{$settlementId}/void",
                 fn () => $this->crmClient($tenantId)->get("/settlements/{$settlementId}/void"));
         } else {
             $out['checks'][] = [
-                'label'  => 'void route exists (GET, 405 = yes)',
+                'label'  => 'void route (GET - inconclusive, see note)',
                 'call'   => 'GET /settlements/{id}/void',
                 'status' => 0,
                 'ok'     => false,

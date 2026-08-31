@@ -71,7 +71,9 @@ final class RemoveCreditorAndDecreaseTermAction implements PmodActionHandler
 
         $futureDrafts = array_values(array_filter(
             $transactions,
-            fn ($t) => ($t['type'] ?? '') === 'D' && ($t['active'] ?? '') === '1' && ($t['process_date'] ?? '') >= $today,
+            // Excludes already-cancelled drafts - Forth keeps active = 1 on them, so
+            // this would otherwise try to cancel drafts that are already cancelled.
+            fn ($t) => ($t['type'] ?? '') === 'D' && ($t['active'] ?? '') === '1' && empty($t['cancelled']) && ($t['process_date'] ?? '') >= $today,
         ));
 
         usort($futureDrafts, fn ($a, $b) => strcmp($a['process_date'] ?? '', $b['process_date'] ?? ''));

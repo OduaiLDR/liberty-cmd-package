@@ -105,7 +105,10 @@ final class AddCreditorAndExtendProgramAction implements PmodActionHandler
         $lastDate     = null;
         foreach ($transactions as $txn) {
             $d = $txn['process_date'] ?? '';
-            if ($txn['type'] === 'D' && $txn['active'] === '1' && ($lastDate === null || $d > $lastDate)) {
+            // A cancelled draft keeps active = 1 in Forth (verified 2026-08-31), so
+            // active alone is not enough - without the cancelled check this would
+            // anchor the extension on a draft that is no longer going to be taken.
+            if ($txn['type'] === 'D' && $txn['active'] === '1' && empty($txn['cancelled']) && ($lastDate === null || $d > $lastDate)) {
                 $lastDate = $d;
             }
         }

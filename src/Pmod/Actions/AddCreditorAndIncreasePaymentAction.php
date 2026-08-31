@@ -101,7 +101,10 @@ final class AddCreditorAndIncreasePaymentAction implements PmodActionHandler
 
         foreach ($futureDrafts as $txn) {
             $processDate = $txn['process_date'] ?? '';
-            if ($txn['type'] !== 'D' || $txn['active'] !== '1' || $processDate < $today) {
+            // active === 1 is not enough: Forth leaves active = 1 on a cancelled
+            // draft (verified 2026-08-31), so without this the update would push a
+            // new amount onto drafts that will never be taken.
+            if ($txn['type'] !== 'D' || $txn['active'] !== '1' || ! empty($txn['cancelled']) || $processDate < $today) {
                 continue;
             }
             try {
