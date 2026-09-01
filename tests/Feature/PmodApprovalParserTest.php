@@ -172,4 +172,139 @@ class PmodApprovalParserTest extends TestCase
         $this->assertSame('200.00', $result['data']['total_amount']);
         $this->assertSame('2025-04-25', $result['data']['end_date']);
     }
+
+    /**
+     * Verbatim body of a real Progress Law portal email (contact 1228154188,
+     * 2026-08). Two things this pins down, both of which used to be broken:
+     * the SECOND `Action:` line must not win, and the bank labels must land in
+     * banking_update.
+     */
+    public function testParseRawTextSupportsUpdatedBankingPortalEmail(): void
+    {
+        $parser = new PmodApprovalParser();
+
+        $result = $parser->parseRawText(implode("\n", [
+            'Name: Antonette U Tulenkun',
+            'Customer Id: 1228154188',
+            'Action: Updated Banking',
+            'New Bank: ALOHA PACIFIC FEDERAL CREDIT UNION',
+            'Account type: Savings',
+            'New Routing Number: 321379148',
+            'New Account Number: 13000003555732',
+            'Set as default account for future payments?: Yes',
+            'Authorization: Uploaded',
+            'Action: Request Release',
+            'Message: Updated authorization uploaded for your review, please release hold. Thank you.',
+            'User: Client',
+        ]));
+
+        $this->assertSame([], $result['errors']);
+        $this->assertSame('1228154188', $result['data']['customer_id']);
+        $this->assertSame('Updated Banking', $result['data']['action']);
+        $this->assertSame('Client', $result['data']['requested_by']);
+
+        $banking = $result['data']['banking_update'];
+        $this->assertSame('ALOHA PACIFIC FEDERAL CREDIT UNION', $banking['bank_name']);
+        $this->assertSame('Savings', $banking['account_type']);
+        $this->assertSame('321379148', $banking['routing_number']);
+        $this->assertSame('13000003555732', $banking['account_number']);
+        $this->assertSame('Uploaded', $banking['authorization']);
+
+        // The bank labels are shared with Updated Sponsor Banking, so a CLIENT
+        // banking email must not come out carrying a sponsor block.
+        $this->assertSame([], $result['data']['sponsor_update']);
+    }
+
+    /**
+     * Verbatim body of a real Progress Law portal email (contact 1201385085,
+     * 2026-08). `Creditor:` is a bare string, so the container-key path never
+     * matched it and the whole creditor block came back empty. `$1993` must also
+     * survive as a number - the handlers cast balance to float, and (float)"$1993"
+     * is 0.0, which would create the debt for nothing.
+     */
+    public function testParseRawTextSupportsRemoveCreditorPortalEmail(): void
+    {
+        $parser = new PmodApprovalParser();
+
+        $result = $parser->parseRawText(implode("\n", [
+            'Name: Xochitl Willis',
+            'Customer Id: 1201385085',
+            'Action: Remove Creditor and Decrease Payment',
+            'Remove Reason: Entered payment arrangement on my own',
+            'Creditor: UPSTART/DRBANK',
+            'Account number: SDDR6300043',
+            'Original Balance: $1993',
+            'Number of Payments Reduced: 6',
+            'New payment: $331.95',
+            'Next Draft date: 08/31/2026',
+            'User: Client',
+        ]));
+
+        $this->assertSame([], $result['errors']);
+        $this->assertSame('1201385085', $result['data']['customer_id']);
+        $this->assertSame('Remove Creditor and Decrease Payment', $result['data']['action']);
+        $this->assertSame('331.95', $result['data']['amount']);
+
+        $creditor = $result['data']['creditor_change'];
+        $this->assertSame('UPSTART/DRBANK', $creditor['creditor_name']);
+        $this->assertSame('SDDR6300043', $creditor['account_number']);
+        $this->assertSame('1993.00', $creditor['balance']);
+        $this->assertSame('6', $creditor['months_to_decrease']);
+    }
+
+    /**
+     * Verbatim body of a real Progress Law portal email (contact 983537452,
+     * 2026-08). The portal sent an EMPTY amount, so the request is genuinely
+     * incomplete: the date must still parse, and the missing amount must surface
+     * as a parser error rather than silently becoming zero.
+     */
+    public function testParseRawTextSupportsAdditionalPaymentPortalEmailWithEmptyAmount(): void
+    {
+        $parser = new PmodApprovalParser();
+
+        $result = $parser->parseRawText(implode("\n", [
+            'Name: Denys Tsuguy',
+            'Customer Id: 983537452',
+            'Action: Make an additional payment',
+            'Bank Account: ....5815',
+            'Scheduled Date: 08/27/2026',
+            'Additional Amount: $',
+            'User: Client',
+        ]));
+
+        $this->assertSame('983537452', $result['data']['customer_id']);
+        $this->assertSame('Make an additional payment', $result['data']['action']);
+        $this->assertSame('2026-08-27', $result['data']['target_date']);
+        $this->assertNull($result['data']['amount']);
+        $this->assertArrayHasKey('amounts', $result['errors']);
+    }
+
+    /**
+     * Updated Sponsor Banking reuses the client bank labels; only the sponsor
+     * identity fields separate the two shapes.
+     */
+    public function testParseRawTextRoutesSponsorBankingToSponsorUpdate(): void
+    {
+        $parser = new PmodApprovalParser();
+
+        $result = $parser->parseRawText(implode("\n", [
+            'Customer Id: 1201385085',
+            'Action: Updated Sponsor Banking',
+            'Sponsor Name: Jane Q Sponsor',
+            'Sponsor SSN: 123-45-6789',
+            'New Bank: WELLS FARGO',
+            'Account type: Checking',
+            'New Routing Number: 121000248',
+            'New Account Number: 9988776655',
+            'User: Client',
+        ]));
+
+        $sponsor = $result['data']['sponsor_update'];
+        $this->assertSame('Jane Q Sponsor', $sponsor['sponsor_name']);
+        $this->assertSame('123-45-6789', $sponsor['sponsor_ssn']);
+        $this->assertSame('WELLS FARGO', $sponsor['sponsor_bank_name']);
+        $this->assertSame('Checking', $sponsor['sponsor_account_type']);
+        $this->assertSame('121000248', $sponsor['sponsor_routing_number']);
+        $this->assertSame('9988776655', $sponsor['sponsor_account_number']);
+    }
 }
