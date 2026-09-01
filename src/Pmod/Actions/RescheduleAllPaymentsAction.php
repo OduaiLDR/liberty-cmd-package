@@ -16,8 +16,7 @@ final class RescheduleAllPaymentsAction implements PmodActionHandler
     public function __construct(
         private readonly PmodExecutionGateway $gateway,
         private readonly bool $allowLiveDraftUpdates = false,
-    ) {
-    }
+    ) {}
 
     public function actionType(): PmodActionType
     {
@@ -28,6 +27,17 @@ final class RescheduleAllPaymentsAction implements PmodActionHandler
     {
         $startDate = $workItem->paymentChange['start_date'] ?? ($workItem->targetDates[0] ?? null);
         $frequency = $workItem->frequency ?? 'monthly';
+
+        // A Reschedule All request may carry a NEW payment amount as well as new
+        // dates. The VBA parsed "New Payment Amount" and typed it into #damount
+        // (ProcessRescheduleAllPayments, pmodLdr.md line 758 parse / 808 apply);
+        // this port discarded it and kept every draft on its existing amount, so
+        // a client who asked for a different payment got the dates moved and
+        // nothing else.
+        //
+        // Null when the consumer sends dates only - 6 of 13 measured requests do -
+        // and in that case each draft keeps its own amount exactly as before.
+        $newAmount = $workItem->amount ?? ($workItem->amounts[0] ?? null);
 
         if ($startDate === null) {
             return $this->captureForManualReview(
@@ -42,8 +52,8 @@ final class RescheduleAllPaymentsAction implements PmodActionHandler
 
         $futureDrafts = array_values(array_filter(
             $transactions,
-            static fn (array $tx): bool =>
-                strtoupper(trim((string) ($tx['type'] ?? $tx['trans_type'] ?? ''))) === 'D' &&
+            static fn(array $tx): bool =>
+            strtoupper(trim((string) ($tx['type'] ?? $tx['trans_type'] ?? ''))) === 'D' &&
                 trim((string) ($tx['process_date'] ?? '')) >= $today &&
                 empty($tx['cancelled']) &&
                 empty($tx['completed']),
@@ -65,8 +75,8 @@ final class RescheduleAllPaymentsAction implements PmodActionHandler
             );
         }
 
-        usort($futureDrafts, static fn (array $a, array $b): int =>
-            strcmp((string) ($a['process_date'] ?? ''), (string) ($b['process_date'] ?? '')));
+        usort($futureDrafts, static fn(array $a, array $b): int =>
+        strcmp((string) ($a['process_date'] ?? ''), (string) ($b['process_date'] ?? '')));
 
         $interval    = $this->resolveMonthInterval($frequency);
         $updateResults = [];
@@ -84,7 +94,7 @@ final class RescheduleAllPaymentsAction implements PmodActionHandler
             try {
                 $response = $this->gateway->updateDraft($workItem, $draftId, [
                     'client_id'    => $workItem->contactId,
-                    'amount'       => $draft['amount'] ?? $draft['debit_amount'] ?? null,
+                    'amount'       => $newAmount ?? $draft['amount'] ?? $draft['debit_amount'] ?? null,
                     'process_date' => $newDate,
                     'memo'         => sprintf('Reschedule All - moved to %s by System Admin', $newDate),
                 ]);
@@ -97,7 +107,7 @@ final class RescheduleAllPaymentsAction implements PmodActionHandler
         // Calculate estimated graduation based on last draft date
         $lastDraftDate = end($futureDrafts)['process_date'] ?? null;
         $firstOriginalDate = $futureDrafts[0]['process_date'] ?? null;
-        
+
         $noteLines = [
             'Reschedule All Future Payments Request:',
             'Request Status: Successful',
@@ -107,22 +117,28 @@ final class RescheduleAllPaymentsAction implements PmodActionHandler
             'Void Settlement:',
             'Current Frequency: ' . ucfirst($frequency),
         ];
-        
+
         if ($firstOriginalDate) {
             $noteLines[] = 'Original Scheduled Date: ' . date('m/d/Y', strtotime($firstOriginalDate));
         }
         if ($startDate) {
             $noteLines[] = 'New Draft Date: ' . date('m/d/Y', strtotime($startDate));
         }
-        
+
         $noteLines[] = 'New Frequency: ' . ucfirst($frequency);
-        if (!empty($futureDrafts[0]['amount'])) {
-            $noteLines[] = 'New Payment Amount: $' . number_format((float) ($futureDrafts[0]['amount'] ?? $futureDrafts[0]['debit_amount'] ?? 0) / 2, 3);
+        // Report the amount the drafts will actually carry: the new one if the
+        // request supplied it, otherwise the existing amount. Previously this
+        // printed the existing amount DIVIDED BY TWO at three decimal places -
+        // a figure that was neither the old nor the new payment - and this note
+        // posts with public = true, so the client reads it.
+        $appliedAmount = $newAmount ?? ($futureDrafts[0]['amount'] ?? $futureDrafts[0]['debit_amount'] ?? null);
+        if ($appliedAmount !== null && trim((string) $appliedAmount) !== '') {
+            $noteLines[] = 'New Payment Amount: $' . number_format((float) $appliedAmount, 2);
         }
-        
+
         $noteLines[] = 'User: ' . ($workItem->requestedBy ?? 'Client');
         $noteLines[] = 'Device: ' . ($workItem->normalizedPayload['device'] ?? 'mobile');
-        
+
         $this->gateway->createContactNote($workItem, implode("\n", $noteLines));
 
         return new PmodResult(
