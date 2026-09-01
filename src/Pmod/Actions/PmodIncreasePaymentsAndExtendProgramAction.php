@@ -16,8 +16,7 @@ final class PmodIncreasePaymentsAndExtendProgramAction implements PmodActionHand
     public function __construct(
         private readonly PmodExecutionGateway $gateway,
         private readonly bool $allowLiveDraftUpdates = false,
-    ) {
-    }
+    ) {}
 
     public function actionType(): PmodActionType
     {
@@ -30,6 +29,17 @@ final class PmodIncreasePaymentsAndExtendProgramAction implements PmodActionHand
         $extensionAmount = $workItem->paymentChange['extended_amount'] ?? $increaseAmount;
         $months = $workItem->paymentChange['extend_months'] ?? $workItem->paymentChange['months_to_extend'] ?? null;
 
+        // The increase is BOUNDED by start_date/end_date when the consumer sends
+        // them, mirroring PmodIncreasePaymentsAction. Without this the action
+        // raised EVERY future draft regardless of the range, so a request meaning
+        // "increase Jun-Dec" left the client on the higher amount for the whole
+        // remaining program. The API integration guide already documents the
+        // bounded behaviour and warns that the combined handler may not honour it;
+        // this brings the code in line with the contract. Sending no dates behaves
+        // exactly as before.
+        $startDate = $workItem->paymentChange['start_date'] ?? ($workItem->normalizedPayload['start_date'] ?? null);
+        $endDate = $workItem->paymentChange['end_date'] ?? ($workItem->normalizedPayload['end_date'] ?? null);
+
         if ($increaseAmount === null || (float) $increaseAmount <= 0) {
             return $this->capture($workItem, 'PMOD Increase And Extend requires amount.', ['reason' => 'missing_required_fields']);
         }
@@ -41,6 +51,17 @@ final class PmodIncreasePaymentsAndExtendProgramAction implements PmodActionHand
         $futureDrafts = $this->futureDrafts($this->gateway->getContactTransactions($workItem));
         $extensionDates = $this->extensionDates($futureDrafts, (int) $months);
 
+        // extensionDates() above deliberately uses the UNFILTERED list: the
+        // extension has to anchor on the true last draft, not the last one inside
+        // the increase range, or the new drafts land in the wrong place. Only the
+        // UPDATE loop below is bounded.
+        $targetDrafts = array_values(array_filter($futureDrafts, static function (array $draft) use ($startDate, $endDate): bool {
+            $date = trim((string) ($draft['process_date'] ?? ''));
+
+            return ($startDate === null || $date >= $startDate)
+                && ($endDate === null || $date <= $endDate);
+        }));
+
         if ($extensionDates === []) {
             return $this->capture($workItem, 'PMOD Increase And Extend could not resolve extension start.', ['reason' => 'cannot_resolve_extension_start']);
         }
@@ -49,6 +70,9 @@ final class PmodIncreasePaymentsAndExtendProgramAction implements PmodActionHand
             return $this->capture($workItem, 'PMOD Increase And Extend planned updates but live updates are disabled.', [
                 'reason' => $workItem->dryRun ? 'dry_run_only' : 'live_draft_updates_disabled',
                 'existing_draft_count' => count($futureDrafts),
+                'drafts_in_range' => count($targetDrafts),
+                'start_date' => $startDate,
+                'end_date' => $endDate,
                 'extension_count' => count($extensionDates),
             ]);
         }
@@ -57,7 +81,7 @@ final class PmodIncreasePaymentsAndExtendProgramAction implements PmodActionHand
         $creates = [];
         $errors = [];
 
-        foreach ($futureDrafts as $draft) {
+        foreach ($targetDrafts as $draft) {
             $draftId = PmodTransactionMatcher::extractAuthoritativeDraftId($draft);
             if ($draftId === null) {
                 $errors[] = ['reason' => 'missing_draft_id'];
@@ -112,11 +136,13 @@ final class PmodIncreasePaymentsAndExtendProgramAction implements PmodActionHand
     {
         $today = date('Y-m-d');
 
-        return array_values(array_filter($transactions, static fn (array $tx): bool =>
+        return array_values(array_filter(
+            $transactions,
+            static fn(array $tx): bool =>
             strtoupper(trim((string) ($tx['type'] ?? $tx['trans_type'] ?? ''))) === 'D'
-            && trim((string) ($tx['process_date'] ?? '')) >= $today
-            && empty($tx['cancelled'])
-            && empty($tx['completed'])
+                && trim((string) ($tx['process_date'] ?? '')) >= $today
+                && empty($tx['cancelled'])
+                && empty($tx['completed'])
         ));
     }
 
