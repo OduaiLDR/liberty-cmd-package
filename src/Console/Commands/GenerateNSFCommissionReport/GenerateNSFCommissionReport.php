@@ -14,7 +14,8 @@ class GenerateNSFCommissionReport extends Command
     protected $signature = 'reports:generate-nsf-commission-report
                             {source=both : ldr | plaw | both}
                             {period? : Period start date YYYY-MM-01; defaults to first day of last month}
-                            {--no-email : Build/save snapshot but do not send email}';
+                            {--no-email : Build/save snapshot but do not send email}
+                            {--test-recipient= : Send EVERY email (All + agent copies) only to this address}';
 
     protected $description = 'Generate NSF Commission Report for LDR and/or Progress Law. Runs for the previous calendar month.';
 
@@ -419,7 +420,9 @@ class GenerateNSFCommissionReport extends Command
         $body .= '</table>';
 
         $email  = new \Cmd\Reports\Services\EmailSenderService();
-        $testTo = trim((string) env('NSF_REPORT_TEST_TO', ''));
+        // --test-recipient overrides the recipient for this run; NSF_REPORT_TEST_TO
+        // is the env-level fallback. Either one redirects ALL mail (All + agents).
+        $testTo = trim((string) ($this->option('test-recipient') ?: env('NSF_REPORT_TEST_TO', '')));
         $reportNames = ['NSFCommissionReport', 'NSF Commission Report'];
         $company = [strtoupper($display === 'Progress Law' ? 'PLAW' : 'LDR')];
 

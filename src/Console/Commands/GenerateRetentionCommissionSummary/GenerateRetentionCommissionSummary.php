@@ -19,7 +19,8 @@ use Illuminate\Support\Facades\Log;
 class GenerateRetentionCommissionSummary extends Command
 {
     protected $signature = 'reports:generate-retention-commission-summary
-                            {source=both : ldr | plaw | both}';
+                            {source=both : ldr | plaw | both}
+                            {--test-recipient= : Send the summary email only to this address}';
 
     protected $description = 'Generate and email the real-time Retention Commission Summary (HTML table).';
 
@@ -397,12 +398,15 @@ class GenerateRetentionCommissionSummary extends Command
         }
         $body .= '</table>';
 
-        $to  = ['rama@libertydebtrelief.com','candice@libertydebtrelief.com',
-                'adrian@libertydebtrelief.com','scarlett@libertydebtrelief.com'];
-        $cc  = $cfg['send_cc'];
-        $bcc = ['oduai@libertydebtrelief.com'];
-
         $email = new EmailSenderService();
+
+        // --test-recipient: send the whole summary only to this address (no CC/BCC).
+        $testTo = trim((string) ($this->option('test-recipient') ?: ''));
+        if ($testTo !== '') {
+            $this->info("[INFO] [$display] --test-recipient set — summary only to $testTo");
+            $email->sendMailHtml($subject, $body, [$testTo], [], [], []);
+            return;
+        }
 
         $sent = $email->sendMailUsingTblReports(
             $sql,
