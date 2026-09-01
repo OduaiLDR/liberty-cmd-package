@@ -89,6 +89,14 @@ final class AddCreditorAndIncreasePaymentAction implements PmodActionHandler
             'original_debt_amount' => $creditorChange['balance'] ?? null,
             'current_debt_amount'  => $creditorChange['balance'] ?? null,
             'og_account_num'       => $creditorChange['account_number'] ?? null,
+            // Forth defaults a created debt to enrolled=0, i.e. added to the
+            // contact but NOT participating in the program. The VBA handled this
+            // by ticking the include checkbox on Edit Debts after creating (the
+            // col-13 "Yes" flag, see the working reference 4.4); without it we
+            // would extend the payment schedule to cover a creditor that is not
+            // actually in the plan. Verified 2026-08-31 that POST /debts accepts
+            // enrolled on the create payload and it reads back as 1.
+            'enrolled'             => '1',
         ]);
 
         $debtId = $debtResult['id'] ?? $debtResult['debt_id'] ?? null;
@@ -101,7 +109,10 @@ final class AddCreditorAndIncreasePaymentAction implements PmodActionHandler
 
         foreach ($futureDrafts as $txn) {
             $processDate = $txn['process_date'] ?? '';
-            if ($txn['type'] !== 'D' || $txn['active'] !== '1' || $processDate < $today) {
+            // active === 1 is not enough: Forth leaves active = 1 on a cancelled
+            // draft (verified 2026-08-31), so without this the update would push a
+            // new amount onto drafts that will never be taken.
+            if ($txn['type'] !== 'D' || $txn['active'] !== '1' || ! empty($txn['cancelled']) || $processDate < $today) {
                 continue;
             }
             try {
