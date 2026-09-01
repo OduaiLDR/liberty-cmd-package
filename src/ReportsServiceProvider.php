@@ -91,6 +91,7 @@ use Cmd\Reports\Console\Commands\SyncEmployeeSfUids;
 use Cmd\Reports\Console\Commands\SyncDroppedStatus\SyncDroppedStatus;
 use Cmd\Reports\Console\Commands\SyncDroppedStatus\SyncDroppedStatusPreview;
 use Cmd\Reports\Console\Commands\GenerateAdvanceRecoupReport\GenerateAdvanceRecoupReport;
+use Cmd\Reports\Console\Commands\GenerateParamountEpfSummary\GenerateParamountEpfSummary;
 
 class ReportsServiceProvider extends ServiceProvider
 {
@@ -209,6 +210,7 @@ class ReportsServiceProvider extends ServiceProvider
                 SyncDroppedStatus::class,
                 SyncEmployeeSfUids::class,
                 GenerateAdvanceRecoupReport::class,
+                GenerateParamountEpfSummary::class,
             ]);
         }
 

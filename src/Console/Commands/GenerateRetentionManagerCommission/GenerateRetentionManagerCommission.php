@@ -936,13 +936,14 @@ class GenerateRetentionManagerCommission extends Command
         $ratioTotal = $totalAssignments > 0 ? $totalActions / $totalAssignments : 0.0;
         $clearsTotal = (float) $totalClears;
         $rate = $this->anthonyRate($ratioTotal, $clearsTotal);
+        $commission = round($clearsTotal * $rate, 2);
 
         $sheet->setCellValue('H14', 'Clears');
         $sheet->setCellValue("I14", $clearsTotal);
         $sheet->setCellValue('H15', 'Rate');
         $sheet->setCellValue('I15', $rate);
         $sheet->setCellValue('H16', 'Commission');
-        $sheet->setCellValue('I16', $clearsTotal * $rate);
+        $sheet->setCellValue('I16', $commission);
 
         $sheet->getStyle("D2:D{$totalRow}")->getNumberFormat()->setFormatCode('0.00%');
         $sheet->getStyle("I14")->getNumberFormat()->setFormatCode('0');
@@ -1152,12 +1153,7 @@ class GenerateRetentionManagerCommission extends Command
         $retained = $this->retainedCount($rows);
         $pct = $assigned > 0 ? $retained / $assigned : 0.0;
         $tier = $this->nickTier($pct);
-        $commission = 0.0;
-        foreach ($rows as $row) {
-            if (strtoupper((string) $this->col($row, 'IMMEDIATE_RESULTS', '')) === 'RETAINED') {
-                $commission += $this->nickCommissionRate((float) $this->col($row, 'ENROLLED_DEBT', 0), $pct);
-            }
-        }
+        $commission = $this->computeNickCommission($rows);
 
         $sheet->setCellValue('W2', 'Nick');
         $sheet->setCellValue('W3', 'Reconsideration Pending');
@@ -1168,7 +1164,6 @@ class GenerateRetentionManagerCommission extends Command
         $sheet->setCellValue('X5', $pct);
         $sheet->setCellValue('W6', 'Tier');
         $sheet->setCellValue('X6', $tier);
-        $commission = $this->capNickCommission($commission);
 
         $sheet->setCellValue('W7', 'Commission');
         $sheet->setCellValue('X7', $commission);
@@ -1429,6 +1424,22 @@ class GenerateRetentionManagerCommission extends Command
             'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['argb' => 'FF17853B']],
             'borders' => ['allBorders' => ['borderStyle' => Border::BORDER_THIN]],
         ]);
+    }
+
+    /** @param array<int,array<string,mixed>> $rows */
+    private function computeNickCommission(array $rows): float
+    {
+        $assigned = count($rows);
+        $retained = $this->retainedCount($rows);
+        $pct = $assigned > 0 ? $retained / $assigned : 0.0;
+        $commission = 0.0;
+        foreach ($rows as $row) {
+            if (strtoupper((string) $this->col($row, 'IMMEDIATE_RESULTS', '')) === 'RETAINED') {
+                $commission += $this->nickCommissionRate((float) $this->col($row, 'ENROLLED_DEBT', 0), $pct);
+            }
+        }
+
+        return $this->capNickCommission($commission);
     }
 
     private function capNickCommission(float $commission): float

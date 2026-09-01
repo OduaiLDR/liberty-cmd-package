@@ -382,7 +382,7 @@ class RetentionCommissionReportBuilder
     }
 
     /** @param array<int,array<string,mixed>> $rows */
-    private function dedupeRetentionRowsByContactId(array $rows): array
+    public function dedupeRetentionRowsByContactId(array $rows): array
     {
         $byId = [];
         foreach ($rows as $row) {
