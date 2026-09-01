@@ -69,6 +69,16 @@ final class PmodWebhookRequest extends FormRequest
             'extended_start_date' => ['nullable', 'date_format:Y-m-d'],
             'extended_end_date' => ['nullable', 'date_format:Y-m-d'],
             'extended_amount' => ['nullable', 'regex:/^-?\d+\.\d{2}$/'],
+            // Month counts must be declared here or normalizedPayload() drops them:
+            // it returns validated(), which keeps only keys named in these rules.
+            // Extend Program and Increase Payments & Extend Program read the
+            // top-level key, so without this they silently capture for manual
+            // review. Bounds stay wider than any handler's own cap (60 for
+            // extend, 120 for decrease) so validation never rejects a payload a
+            // handler would have accepted.
+            'months_to_extend' => ['nullable', 'integer', 'min:1', 'max:120'],
+            'months_to_decrease' => ['nullable', 'integer', 'min:1', 'max:120'],
+            'extend_months' => ['nullable', 'integer', 'min:1', 'max:120'],
             'frequency' => ['nullable', 'string'],
             'void_settlements' => ['nullable', 'boolean'],
             'banking_update' => ['nullable', 'array'],

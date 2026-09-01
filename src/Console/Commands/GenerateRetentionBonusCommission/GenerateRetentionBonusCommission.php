@@ -5,7 +5,6 @@ namespace Cmd\Reports\Console\Commands\GenerateRetentionBonusCommission;
 use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\CommissionAgentEmailFiles;
 use Cmd\Reports\Services\CommissionResultsWriter;
-use Cmd\Reports\Services\CommissionRosterProvider;
 use Cmd\Reports\Services\EmailSenderService;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
@@ -25,6 +24,7 @@ class GenerateRetentionBonusCommission extends Command
 {
     protected $signature = 'reports:generate-retention-bonus-commission
                             {source=both : ldr | plaw | both}
+                            {period? : Period start date YYYY-MM-01; defaults to first day of last month}
                             {--no-email : Build workbooks only, skip email}';
 
     protected $description = 'Generate Retention Bonus Commission report for LDR and/or PLAW.';
@@ -52,25 +52,37 @@ class GenerateRetentionBonusCommission extends Command
     {
         $arg     = strtolower((string)$this->argument('source'));
         $sources = ($arg === 'both') ? ['ldr', 'plaw'] : [$arg];
+        $period  = trim((string) $this->argument('period'));
+        if ($period !== '' && !$this->isValidPeriodStart($period)) {
+            $this->error('period must be a valid YYYY-MM-01 date.');
+            return Command::FAILURE;
+        }
         foreach ($sources as $src) {
             if (!isset(self::SOURCE_CONFIG[$src])) {
                 $this->error("Unknown source: $src");
                 return Command::FAILURE;
             }
-            $this->runForSource($src);
+            $this->runForSource($src, $period ?: null);
         }
         return Command::SUCCESS;
     }
 
-    private function runForSource(string $source): void
+    private function isValidPeriodStart(string $period): bool
+    {
+        $date = \DateTimeImmutable::createFromFormat('!Y-m-d', $period);
+
+        return $date !== false && $date->format('Y-m-d') === $period && $date->format('d') === '01';
+    }
+
+    private function runForSource(string $source, ?string $periodStart = null): void
     {
         $cfg     = self::SOURCE_CONFIG[$source];
         $display = $cfg['display'];
         $this->info("[INFO] GenerateRetentionBonusCommission – $display");
 
-        $reportStartDate = date('Y-m-01', strtotime('first day of last month'));
+        $reportStartDate = $periodStart ?: date('Y-m-01', strtotime('first day of last month'));
         $endDate         = date('Y-m-t', strtotime($reportStartDate));
-        $baseStartDate   = date('Y-m-01', strtotime('-' . (int) $cfg['base_months_back'] . ' months'));
+        $baseStartDate   = date('Y-m-01', strtotime('-' . (int) $cfg['base_months_back'] . ' months', strtotime($reportStartDate)));
         $this->info("[INFO] Base period: $baseStartDate → $endDate; report cutoff period: $reportStartDate → $endDate");
 
         try {
@@ -202,22 +214,9 @@ class GenerateRetentionBonusCommission extends Command
             }
             unset($row);
 
-            // Retention and Retention Bonus share ONE roster (confirmed by Jacob 2026-08-04), so this
-            // report is limited to the same people as the Retention Commission report. Unlike that
-            // report this command never had an agent whitelist — it took whoever appeared in the data.
-            // SAFETY: an unavailable/empty roster returns [] and we do NOT filter, so a roster problem
-            // can never silently shrink a payroll report.
-            $rosterAgents = CommissionRosterProvider::agents($sql, 'retention', $source, []);
-            if (!empty($rosterAgents)) {
-                $norm = fn (string $n): string => strtolower(preg_replace('/\s+/', ' ', trim($n)));
-                $rosterKeys = array_map($norm, $rosterAgents);
-                $before = count($rows);
-                $rows = array_values(array_filter(
-                    $rows,
-                    fn ($r): bool => in_array($norm((string) ($r['RETENTION_AGENT'] ?? '')), $rosterKeys, true)
-                ));
-                $this->info("[INFO] [$display] Roster filter: {$before} → " . count($rows) . ' rows (' . count($rosterKeys) . ' agents on the retention roster).');
-            }
+            // Aurora Payroll Review is the roster eligibility gate. Persist the
+            // complete raw source feed here so a legacy or hard-coded roster can
+            // never hide a valid retention employee before payroll evaluates it.
 
             // Persist per-agent retention BONUS COMMISSION to Azure for the Commission Review app
             // (best-effort; never blocks the report). Aggregates per-contact RETENTION_COMMISSION by agent.
@@ -231,6 +230,15 @@ class GenerateRetentionBonusCommission extends Command
             foreach ($bonusByAgent as $agentName => $amount) {
                 $bonusResults[] = ['agent' => $agentName, 'amount' => round($amount, 2)];
             }
+            // A re-run must clear a previously calculated bonus when an agent no
+            // longer qualifies. The shared retention roster supplies zero rows
+            // while preserving the Commission column from the main report.
+            foreach ($rosterAgents as $agentName) {
+                if (!array_key_exists($agentName, $bonusByAgent)) {
+                    $bonusResults[] = ['agent' => $agentName, 'amount' => 0.0];
+                }
+            }
+            CommissionResultsWriter::resetColumn($sql, 'retention', $source, $reportStartDate, 'Bonus_Commission');
             CommissionResultsWriter::persist($sql, 'retention', $source, $reportStartDate, 'Bonus_Commission', $bonusResults);
 
             // Build and send workbooks

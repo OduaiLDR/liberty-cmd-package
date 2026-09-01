@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Cmd\Reports\Pmod\Actions;
 
 use Cmd\Reports\Pmod\Contracts\PmodActionHandler;
+use Cmd\Reports\Pmod\Contracts\PmodCreditorDirectory;
 use Cmd\Reports\Pmod\Contracts\PmodExecutionGateway;
 use Cmd\Reports\Pmod\Data\PmodResult;
 use Cmd\Reports\Pmod\Data\PmodWorkItem;
@@ -45,27 +46,64 @@ final class AddCreditorAndExtendProgramAction implements PmodActionHandler
             ]);
         }
 
+
+        // Resolve the creditor BEFORE the live-updates gate. Resolution is a
+        // read-only catalogue lookup, so it is safe in dry run - and doing it
+        // here is what makes a dry run worth running: the capture below reports
+        // the creditor id it WOULD have used. With this after the gate, a dry run
+        // exercised none of the resolution logic and proved nothing.
+        //
+        // The id consumers send cannot be trusted: measured 2026-08-31, only 1 of
+        // 4 real payload creditor_ids existed in the catalogue. resolveCreditorId
+        // validates a claimed id and falls back to matching the name, failing
+        // closed rather than guessing.
+        $creditorId = null;
+
+        if ($this->gateway instanceof PmodCreditorDirectory) {
+            $creditorId = $this->gateway->resolveCreditorId(
+                $workItem->tenantId,
+                isset($creditorChange['creditor_id']) ? (string) $creditorChange['creditor_id'] : null,
+                (string) ($creditorChange['creditor_name'] ?? ''),
+            );
+        } else {
+            $creditorId = $creditorChange['creditor_id'] ?? null;
+        }
+
+        if ($creditorId === null) {
+            return $this->capture($workItem, 'Add Creditor and Extend Program could not determine the Forth creditor id.', [
+                'reason'         => 'missing_creditor_id',
+                'creditor_name'  => $creditorChange['creditor_name'] ?? null,
+                'claimed_id'     => $creditorChange['creditor_id'] ?? null,
+            ]);
+        }
+
         if (!$this->allowLiveDraftUpdates || $workItem->dryRun) {
             return $this->capture($workItem, 'Add Creditor and Extend Program matched but live updates are disabled.', [
-                'reason'          => $workItem->dryRun ? 'dry_run_only' : 'live_draft_updates_disabled',
-                'months_to_extend' => $monthsToExtend,
+                'reason'      => $workItem->dryRun ? 'dry_run_only' : 'live_draft_updates_disabled',
+                'creditor_id' => $creditorId,
+                'would_send'  => ["months_to_extend" => $monthsToExtend, "amount" => $amount],
             ]);
         }
 
-        // Step 1: create debt — Forth API requires creditor ID
-        $creditorId = $creditorChange['creditor_id'] ?? null;
-        if ($creditorId === null) {
-            return $this->capture($workItem, 'Add Creditor and Extend Program requires creditor_id (Forth CRM creditor ID).', [
-                'reason'        => 'missing_creditor_id',
-                'creditor_name' => $creditorChange['creditor_name'] ?? null,
-            ]);
-        }
-
+        // Forth's own field names, read off a live debt record 2026-08-28. The
+        // port had used account_number / balance / original_amount, none of which
+        // Forth recognises — the INSERT then failed on non-nullable columns and
+        // returned 500 code 1048 ("Column cannot be null"). client_id is added by
+        // the gateway. Minimum accepted set confirmed as
+        // client_id + creditor + original_debt_amount + current_debt_amount.
         $debtResult = $this->gateway->createDebt($workItem, [
-            'creditor'       => $creditorId,
-            'account_number' => $creditorChange['account_number'] ?? null,
-            'balance'        => $creditorChange['balance'] ?? null,
-            'original_amount' => $creditorChange['balance'] ?? null,
+            'creditor'             => $creditorId,
+            'original_debt_amount' => $creditorChange['balance'] ?? null,
+            'current_debt_amount'  => $creditorChange['balance'] ?? null,
+            'og_account_num'       => $creditorChange['account_number'] ?? null,
+            // Forth defaults a created debt to enrolled=0, i.e. added to the
+            // contact but NOT participating in the program. The VBA handled this
+            // by ticking the include checkbox on Edit Debts after creating (the
+            // col-13 "Yes" flag, see the working reference 4.4); without it we
+            // would extend the payment schedule to cover a creditor that is not
+            // actually in the plan. Verified 2026-08-31 that POST /debts accepts
+            // enrolled on the create payload and it reads back as 1.
+            'enrolled'             => '1',
         ]);
 
         $debtId = $debtResult['id'] ?? $debtResult['debt_id'] ?? null;
@@ -75,7 +113,10 @@ final class AddCreditorAndExtendProgramAction implements PmodActionHandler
         $lastDate     = null;
         foreach ($transactions as $txn) {
             $d = $txn['process_date'] ?? '';
-            if ($txn['type'] === 'D' && $txn['active'] === '1' && ($lastDate === null || $d > $lastDate)) {
+            // A cancelled draft keeps active = 1 in Forth (verified 2026-08-31), so
+            // active alone is not enough - without the cancelled check this would
+            // anchor the extension on a draft that is no longer going to be taken.
+            if ($txn['type'] === 'D' && $txn['active'] === '1' && empty($txn['cancelled']) && ($lastDate === null || $d > $lastDate)) {
                 $lastDate = $d;
             }
         }

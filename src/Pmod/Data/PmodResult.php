@@ -27,4 +27,20 @@ final class PmodResult
             metadata: $metadata,
         );
     }
+
+    /**
+     * Only a genuine failure counts. `captured_for_manual_review` and
+     * `partial_update` are valid outcomes, not errors - a dry run always
+     * captures, so treating capture as failure would report every dry run as
+     * broken.
+     *
+     * Two callers relied on this before it existed and fatalled on every call:
+     * PmodCsAgentRequestController (so /api/pmod/request 500d instead of
+     * answering 200/422) and TestPmodHandler, which called isSucceeded() at the
+     * end of every run.
+     */
+    public function isFailed(): bool
+    {
+        return $this->status === 'failed';
+    }
 }

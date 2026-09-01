@@ -28,14 +28,32 @@ final class ProcessPmodWorkItemJob implements ShouldQueue, ShouldBeUnique
     /** Idempotency window: one hour. Duplicate dispatches within this window are no-ops. */
     public int $uniqueFor = 3600;
 
-    /** Retry up to 3 times on transient failures (network blip, API rate limit). */
-    public int $tries = 3;
+    /**
+     * NEVER retry. PMOD work is irreversible: it creates debts and bank drafts.
+     *
+     * This was `3` with a 30/60/120 s back-off, and it stacked. Proven live on
+     * 2026-08-31 (working reference §8.6): the same request run twice 30 seconds
+     * apart produced TWO debts (426018780, 426018849) and TWO drafts, because
+     * nothing in any handler detects that a previous attempt already did the
+     * work. A job that creates the debt and then fails on a later step gets
+     * retried and creates a second one.
+     *
+     * resume-payments runs `--tries=1` for exactly this reason. A transient
+     * failure now surfaces as one `failed` row, which `pmod:alert-unprocessed`
+     * reports, and a human decides whether to re-run it — the right trade when
+     * the alternative is charging a client twice.
+     */
+    public int $tries = 1;
 
-    /** Hard cap: kill the job if it has not finished within 2 minutes. */
-    public int $timeout = 120;
-
-    /** Exponential back-off: 30 s → 60 s → 120 s between retries. */
-    public array $backoff = [30, 60, 120];
+    /**
+     * Was 120 s. Raised because a timeout mid-job now leaves partial state with
+     * no retry to finish it, so being too tight costs more than it did. One
+     * action can walk ~60 drafts a PUT at a time, and the creditor catalogue
+     * fetch (10,077 rows) lands on the first request after its 24 h cache
+     * expires. The `default` worker allows 600 s (cmd-runner-worker.conf), so the
+     * worker was never the constraint — this property was.
+     */
+    public int $timeout = 300;
 
     public function __construct(public readonly PmodWorkItem $workItem)
     {
@@ -59,6 +77,17 @@ final class ProcessPmodWorkItemJob implements ShouldQueue, ShouldBeUnique
         }
 
         try {
+            if ($this->alreadyExecuted()) {
+                Log::warning('Skipped PMOD work item that has already been executed.', [
+                    'queue_key'       => $this->workItem->queueKey(),
+                    'idempotency_key' => $this->workItem->idempotencyKey,
+                    'action_type'     => $this->workItem->actionType->value,
+                    'contact_id'      => $this->workItem->contactId,
+                ]);
+
+                return;
+            }
+
             $result = $dispatcher->dispatch($this->workItem);
             $notified = $emails->sendResult($this->workItem, $result);
             $this->updateTrackedRequest($result->status, $result->message, $result->metadata, notified: $notified);
@@ -91,6 +120,58 @@ final class ProcessPmodWorkItemJob implements ShouldQueue, ShouldBeUnique
             throw $exception;
         } finally {
             $lock->release();
+        }
+    }
+
+    /**
+     * Has the dispatcher already run to completion for this idempotency key?
+     *
+     * `$uniqueFor` and the cache lock above both expire, so neither protects
+     * against the same request arriving again hours or days later — a portal
+     * re-send, a re-posted webhook, or a mailbox reader re-reading a message it
+     * already handled. The tracking row is the only durable record, and
+     * re-applying a PMOD means a second debt or a second draft on a real client.
+     *
+     * `result_type` is the column to test: it is written ONLY by
+     * updateTrackedRequest() below, i.e. only once the dispatcher has returned.
+     * `processed_at` looks tempting and is wrong — PmodTrackingWebhookController
+     * stamps it the moment the webhook is ACCEPTED (202), before the job runs, so
+     * a guard on it would skip every job.
+     *
+     * A previous `failed` counts as executed too. That is deliberate: a failure
+     * may have been PARTIAL — debt created, draft not — and the safe response is
+     * a human looking at it, not an automatic replay. `pmod:alert-unprocessed`
+     * already reports failed rows. To re-run one deliberately, clear its
+     * result_type, or use `pmod:test`, which calls the dispatcher directly and
+     * never touches this table.
+     */
+    private function alreadyExecuted(): bool
+    {
+        try {
+            $schema = DB::getSchemaBuilder();
+
+            // No tracking table (the DebtPlete forwarder has none) means no guard
+            // is possible; behave exactly as before rather than blocking work.
+            if (! $schema->hasTable('pmod_requests') || ! $schema->hasColumn('pmod_requests', 'result_type')) {
+                return false;
+            }
+
+            return DB::table('pmod_requests')
+                ->where('idempotency_key', $this->workItem->idempotencyKey)
+                ->whereNotNull('result_type')
+                ->exists();
+        } catch (Throwable $e) {
+            // Fail CLOSED. If we cannot tell whether this already ran, skipping
+            // leaves a row in `accepted` that pmod:alert-unprocessed reports and a
+            // human can replay; running it risks charging a client twice.
+            Log::error('PMOD execution guard could not be evaluated — skipping the work item.', [
+                'idempotency_key' => $this->workItem->idempotencyKey,
+                'action_type'     => $this->workItem->actionType->value,
+                'contact_id'      => $this->workItem->contactId,
+                'error'           => $e->getMessage(),
+            ]);
+
+            return true;
         }
     }
 

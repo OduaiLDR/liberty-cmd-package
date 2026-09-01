@@ -70,12 +70,100 @@ final class CapturePmodRequestAction implements PmodActionHandler
             $lines[] = 'Rescheduled to : ' . implode(', ', $workItem->targetDates);
         }
 
+        $lines = [...$lines, ...$this->detailLines($workItem)];
+
         $lines[] = '';
         $lines[] = 'This action could not be processed automatically and has been flagged for manual review.';
         $lines[] = '';
         $lines[] = '- oduai';
 
         return implode("\n", $lines);
+    }
+
+    /**
+     * Action-specific detail a reviewer needs to complete the work by hand.
+     * Mirrors PmodEmailNotificationService::capturedBody() so the CRM note and
+     * the manual-review email carry the same facts - the note previously held
+     * only contact/requested-by/source/amount, which is not enough to action a
+     * creditor or banking change.
+     *
+     * Bank and routing numbers are masked: createContactNote() posts with
+     * public = true, so this note is visible to the client.
+     *
+     * @return list<string>
+     */
+    private function detailLines(PmodWorkItem $workItem): array
+    {
+        $banking  = $workItem->bankingUpdate;
+        $creditor = $workItem->creditorChange;
+        $sponsor  = $workItem->sponsorUpdate;
+
+        // Flat month counts reach us inside creditor_change (the parser folds
+        // them in) as well as at the top level, so check both.
+        $months = $creditor['months_to_extend']
+            ?? $creditor['months_to_decrease']
+            ?? $workItem->normalizedPayload['months_to_extend']
+            ?? $workItem->normalizedPayload['months_to_decrease']
+            ?? null;
+
+        $rows = match ($workItem->actionType->value) {
+            'add_bank_account' => [
+                'Bank Name'      => $banking['bank_name'] ?? null,
+                'Account Type'   => $banking['account_type'] ?? null,
+                'Routing Number' => $this->mask($banking['routing_number'] ?? null),
+                'Account Number' => $this->mask($banking['account_number'] ?? null),
+                'Account Holder' => $banking['account_holder_name'] ?? $banking['name_on_account'] ?? null,
+            ],
+            'capture_sponsor_banking' => [
+                'Sponsor Name'   => $sponsor['sponsor_name'] ?? null,
+                'Bank Name'      => $sponsor['sponsor_bank_name'] ?? null,
+                'Account Type'   => $sponsor['sponsor_account_type'] ?? null,
+                'Routing Number' => $this->mask($sponsor['sponsor_routing_number'] ?? null),
+                'Account Number' => $this->mask($sponsor['sponsor_account_number'] ?? null),
+            ],
+            'add_creditor_and_increase_payment', 'add_creditor_and_extend_program' => [
+                'Creditor Name'      => $creditor['creditor_name'] ?? null,
+                'Creditor ID'        => $creditor['creditor_id'] ?? null,
+                'Creditor Account #' => $creditor['account_number'] ?? null,
+                'Balance'            => $this->money($creditor['balance'] ?? null),
+                'Months to Extend'   => $months,
+            ],
+            'remove_creditor_and_decrease_payment', 'remove_creditor_and_decrease_term' => [
+                'Creditor Name'      => $creditor['creditor_name'] ?? null,
+                'Creditor ID'        => $creditor['creditor_id'] ?? null,
+                'Creditor Account #' => $creditor['account_number'] ?? null,
+                'Months to Decrease' => $months,
+            ],
+            default => [],
+        };
+
+        $lines = [];
+
+        foreach ($rows as $label => $value) {
+            $value = trim((string) ($value ?? ''));
+
+            if ($value !== '') {
+                $lines[] = $label . ' : ' . $value;
+            }
+        }
+
+        return $lines;
+    }
+
+    private function mask(mixed $value): ?string
+    {
+        $value = trim((string) ($value ?? ''));
+
+        return $value === '' ? null : '***' . substr($value, -4);
+    }
+
+    private function money(mixed $value): ?string
+    {
+        if ($value === null || ! is_numeric($value)) {
+            return null;
+        }
+
+        return '$' . number_format((float) $value, 2);
     }
 
     private function formatValue(mixed $value): string
