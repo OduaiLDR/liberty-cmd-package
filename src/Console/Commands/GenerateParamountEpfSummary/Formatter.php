@@ -6,6 +6,7 @@ use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Style\Alignment;
 use PhpOffice\PhpSpreadsheet\Style\Border;
 use PhpOffice\PhpSpreadsheet\Style\Fill;
+use PhpOffice\PhpSpreadsheet\Shared\Date;
 use PhpOffice\PhpSpreadsheet\Worksheet\Worksheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 
@@ -112,7 +113,7 @@ class Formatter
             $values = [
                 (string) ($data['CONTACT_ID'] ?? ''),
                 (string) ($data['PLAN'] ?? ''),
-                $this->formatDate($data['CLEARED_DATE'] ?? null),
+                $this->excelDate($data['CLEARED_DATE'] ?? null),
                 (float) ($data['DEBT_AMOUNT'] ?? 0),
                 (float) ($data['EPF_RATE'] ?? 0),
                 (float) ($data['EPF'] ?? 0),
@@ -121,8 +122,8 @@ class Formatter
                 (float) ($data['EPF_TIER_DEBT'] ?? 0),
                 (string) ($data['DEBT_ID'] ?? ''),
                 (string) ($data['CREDITOR_NAME'] ?? ''),
-                $this->formatDate($data['PROCESS_DATE'] ?? null),
-                $this->formatDate($data['DRAFT_DATE'] ?? null),
+                $this->excelDate($data['PROCESS_DATE'] ?? null),
+                $this->excelDate($data['DRAFT_DATE'] ?? null),
             ];
             foreach ($values as $index => $value) {
                 $column = $this->columnLetter($index + 1);
@@ -145,8 +146,11 @@ class Formatter
         $sheet->getStyle("F2:G{$lastRow}")->getNumberFormat()->setFormatCode($currencyFormat);
         $sheet->getStyle("H2:H{$lastRow}")->getNumberFormat()->setFormatCode('0.00%');
         $sheet->getStyle("I2:I{$lastRow}")->getNumberFormat()->setFormatCode($currencyFormat);
+        $sheet->getStyle("C2:C{$lastRow}")->getNumberFormat()->setFormatCode('mm/dd/yyyy');
+        $sheet->getStyle("L2:M{$lastRow}")->getNumberFormat()->setFormatCode('mm/dd/yyyy');
         $sheet->getStyle("A1:M{$lastRow}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
         $sheet->freezePane('A2');
+        $sheet->setSelectedCells('A1');
         $sheet->setShowGridlines(false);
     }
 
@@ -174,6 +178,7 @@ class Formatter
         $sheet->getStyle("B2:D{$lastRow}")->getNumberFormat()->setFormatCode('$#,##0.00;[Red]($#,##0.00)');
         $sheet->getStyle("A1:D{$lastRow}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
         $sheet->freezePane('A2');
+        $sheet->setSelectedCells('A1');
         $sheet->setShowGridlines(false);
     }
 
@@ -199,16 +204,20 @@ class Formatter
         return \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($index);
     }
 
-    private function formatDate($value): string
+    private function excelDate($value): ?float
     {
         if ($value === null || $value === '') {
-            return '';
+            return null;
         }
         $string = (string) $value;
         if (preg_match('/^\d{4,5}$/', $string) && (int) $string > 10000 && (int) $string < 50000) {
-            return (new \DateTimeImmutable('1970-01-01'))->modify('+' . (int) $string . ' days')->format('m/d/Y');
+            $date = (new \DateTimeImmutable('1970-01-01'))->modify('+' . (int) $string . ' days');
+            return Date::PHPToExcel($date);
         }
-        $timestamp = strtotime($string);
-        return $timestamp === false ? $string : date('m/d/Y', $timestamp);
+        try {
+            return Date::PHPToExcel(new \DateTimeImmutable($string));
+        } catch (\Throwable) {
+            return null;
+        }
     }
 }
