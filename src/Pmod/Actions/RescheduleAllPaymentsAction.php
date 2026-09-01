@@ -71,7 +71,18 @@ final class RescheduleAllPaymentsAction implements PmodActionHandler
             return $this->captureForManualReview(
                 $workItem,
                 sprintf('Reschedule All Payments found %d future draft(s) but live updates are disabled.', count($futureDrafts)),
-                ['reason' => $workItem->dryRun ? 'dry_run_only' : 'live_draft_updates_disabled', 'start_date' => $startDate, 'frequency' => $frequency, 'draft_count' => count($futureDrafts)],
+                [
+                    'reason' => $workItem->dryRun ? 'dry_run_only' : 'live_draft_updates_disabled',
+                    'start_date' => $startDate,
+                    'frequency' => $frequency,
+                    'draft_count' => count($futureDrafts),
+                    // Surfaced so a dry run can show which amount WOULD be applied.
+                    // Without this the only way to verify is a live run, and this
+                    // action rewrites every future draft - 59 on the test contact -
+                    // which is an expensive thing to revert. null here means the
+                    // request sent no amount, so each draft keeps its own.
+                    'new_amount' => $newAmount,
+                ],
             );
         }
 
