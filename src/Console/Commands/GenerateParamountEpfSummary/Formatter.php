@@ -37,7 +37,7 @@ class Formatter
 
         $debtTable = $spreadsheet->createSheet();
         $debtTable->setTitle('Debt Table');
-        $this->buildDebtTableSheet($debtTable, $debtRows);
+        $this->buildDebtTableSheet($debtTable, $debtRows, $tier);
 
         $spreadsheet->setActiveSheetIndex(0);
         $summary->setSelectedCells('A1');
@@ -61,7 +61,7 @@ class Formatter
         int $tier,
         float $payment
     ): void {
-        $this->writeHeader($sheet, 'A1:B1', ['Unique Contact ID', 'LDR Tier Debt']);
+        $this->writeHeader($sheet, 'A1:B1', ['Contact ID', 'LDR Tier Debt']);
         $row = 2;
         foreach ($clientRows as $client) {
             $sheet->setCellValueExplicit("A{$row}", $client['contact_id'], \PhpOffice\PhpSpreadsheet\Cell\DataType::TYPE_STRING);
@@ -86,10 +86,10 @@ class Formatter
         $sheet->getColumnDimension('B')->setWidth(18);
         $sheet->getColumnDimension('D')->setWidth(20);
         $sheet->getColumnDimension('E')->setWidth(18);
-        $sheet->getStyle("B2:B{$lastClientRow}")->getNumberFormat()->setFormatCode('#,##0.00');
-        $sheet->getStyle('E2')->getNumberFormat()->setFormatCode('#,##0.00');
+        $sheet->getStyle("B2:B{$lastClientRow}")->getNumberFormat()->setFormatCode('$#,##0.00;[Red]($#,##0.00)');
+        $sheet->getStyle('E2')->getNumberFormat()->setFormatCode('$#,##0.00;[Red]($#,##0.00)');
         $sheet->getStyle('E3')->getNumberFormat()->setFormatCode('0');
-        $sheet->getStyle('E4')->getNumberFormat()->setFormatCode('#,##0.00');
+        $sheet->getStyle('E4')->getNumberFormat()->setFormatCode('$#,##0.00;[Red]($#,##0.00)');
         $sheet->getStyle("A1:B{$lastClientRow}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
         $sheet->getStyle('D1:E4')->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
         $sheet->freezePane('A2');
@@ -139,27 +139,39 @@ class Formatter
         foreach (['A' => 16, 'B' => 30, 'C' => 16, 'D' => 16, 'E' => 12, 'F' => 14, 'G' => 18, 'H' => 24, 'I' => 16, 'J' => 16, 'K' => 30, 'L' => 16, 'M' => 16] as $column => $width) {
             $sheet->getColumnDimension($column)->setWidth($width);
         }
-        $sheet->getStyle("D2:D{$lastRow}")->getNumberFormat()->setFormatCode('#,##0.00');
+        $currencyFormat = '$#,##0.00;[Red]($#,##0.00)';
+        $sheet->getStyle("D2:D{$lastRow}")->getNumberFormat()->setFormatCode($currencyFormat);
         $sheet->getStyle("E2:E{$lastRow}")->getNumberFormat()->setFormatCode('0.00%');
-        $sheet->getStyle("F2:I{$lastRow}")->getNumberFormat()->setFormatCode('#,##0.00');
+        $sheet->getStyle("F2:G{$lastRow}")->getNumberFormat()->setFormatCode($currencyFormat);
+        $sheet->getStyle("H2:H{$lastRow}")->getNumberFormat()->setFormatCode('0.00%');
+        $sheet->getStyle("I2:I{$lastRow}")->getNumberFormat()->setFormatCode($currencyFormat);
         $sheet->getStyle("A1:M{$lastRow}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
         $sheet->freezePane('A2');
         $sheet->setShowGridlines(false);
     }
 
     /** @param array<int,array{tier:int,low:float,high:float,amount:float}> $rows */
-    private function buildDebtTableSheet(Worksheet $sheet, array $rows): void
+    private function buildDebtTableSheet(Worksheet $sheet, array $rows, int $currentTier): void
     {
         $this->writeHeader($sheet, 'A1:D1', ['Tier', 'Low Tier', 'High Teir', 'Amount']);
         foreach ($rows as $index => $data) {
             $row = $index + 2;
             $sheet->fromArray([[$data['tier'], $data['low'], $data['high'], $data['amount']]], null, "A{$row}");
+            if ($data['tier'] === $currentTier) {
+                $sheet->getStyle("A{$row}:D{$row}")->applyFromArray([
+                    'font' => ['bold' => true],
+                    'fill' => [
+                        'fillType' => Fill::FILL_SOLID,
+                        'startColor' => ['argb' => 'FFFFF3CD'],
+                    ],
+                ]);
+            }
         }
         $lastRow = count($rows) + 1;
         foreach (['A' => 10, 'B' => 18, 'C' => 18, 'D' => 16] as $column => $width) {
             $sheet->getColumnDimension($column)->setWidth($width);
         }
-        $sheet->getStyle("B2:D{$lastRow}")->getNumberFormat()->setFormatCode('#,##0.00');
+        $sheet->getStyle("B2:D{$lastRow}")->getNumberFormat()->setFormatCode('$#,##0.00;[Red]($#,##0.00)');
         $sheet->getStyle("A1:D{$lastRow}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
         $sheet->freezePane('A2');
         $sheet->setShowGridlines(false);
