@@ -43,7 +43,8 @@ class GenerateRetentionManagerCommission extends Command
                             {--require-snapshots : Fail if monthly retention/NSF snapshot files are missing instead of falling back to live Snowflake}
                             {--no-email : Generate files but do not email manager reports}
                             {--all-data-xlsx= : Test mode path to existing manager All Data / Rama tab workbook}
-                            {--all-data-sheet= : Optional sheet name for --all-data-xlsx; defaults to first sheet}';
+                            {--all-data-sheet= : Optional sheet name for --all-data-xlsx; defaults to first sheet}
+                            {--test-recipient= : Send EVERY manager report email only to this address}';
 
     protected $description = 'Generate Rama - Retention & NSF Manager, Nick - Retention Team Leader, and/or Anthony - NSF Team Leader workbooks.';
 
@@ -564,6 +565,17 @@ class GenerateRetentionManagerCommission extends Command
         $sql = $this->initSqlServer('ldr');
         $subject = (string) $cfg['report'];
         $body = "See attached {$cfg['report']} report.";
+
+        // --test-recipient: redirect this manager report to one address instead of
+        // the TblReports Send_To list.
+        $testTo = trim((string) ($this->option('test-recipient') ?: ''));
+        if ($testTo !== '') {
+            $sent = (new EmailSenderService())->sendMailHtml($subject, $body, [$testTo], [], [], [$attachment]);
+            $this->info("[INFO] [{$key}] --test-recipient set — {$cfg['report']} only to {$testTo}" . ($sent ? '' : ' (send failed)'));
+            if (!$sent) { $this->hadFailures = true; }
+            return;
+        }
+
         $sent = (new EmailSenderService())->sendMailUsingTblReports(
             $sql,
             [$cfg['report']],

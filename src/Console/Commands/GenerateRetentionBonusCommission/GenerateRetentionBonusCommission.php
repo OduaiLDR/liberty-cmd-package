@@ -25,7 +25,8 @@ class GenerateRetentionBonusCommission extends Command
     protected $signature = 'reports:generate-retention-bonus-commission
                             {source=both : ldr | plaw | both}
                             {period? : Period start date YYYY-MM-01; defaults to first day of last month}
-                            {--no-email : Build workbooks only, skip email}';
+                            {--no-email : Build workbooks only, skip email}
+                            {--test-recipient= : Send EVERY email (All + agent copies) only to this address}';
 
     protected $description = 'Generate Retention Bonus Commission report for LDR and/or PLAW.';
 
@@ -461,6 +462,9 @@ class GenerateRetentionBonusCommission extends Command
         $baseSubject = "Retention Bonus Commission - $display";
         $baseBody    = "See attached Retention Bonus Commission - $display.";
 
+        // --test-recipient: redirect EVERY email for this run to one address.
+        $testTo = trim((string) ($this->option('test-recipient') ?: ''));
+
         $parts = CommissionAgentEmailFiles::partition($files);
         foreach ($parts['missing'] as $missingName) {
             $this->warn("[WARN] [$display] Attachment missing: {$missingName}");
@@ -470,17 +474,22 @@ class GenerateRetentionBonusCommission extends Command
 
         if ($allFiles !== []) {
             $attachments = CommissionAgentEmailFiles::toAttachments($allFiles);
-            $sent = $email->sendMailUsingTblReports(
-                $sql,
-                $reportNames,
-                [strtoupper($display)],
-                $baseSubject,
-                $baseBody,
-                $attachments,
-                true
-            );
-            if (!$sent) {
-                $email->sendMailHtml($baseSubject, $baseBody, ['oduai@libertydebtrelief.com'], [], [], $attachments);
+            if ($testTo !== '') {
+                $this->info("[INFO] [$display] --test-recipient set — All report only to $testTo");
+                $email->sendMailHtml($baseSubject, $baseBody, [$testTo], [], [], $attachments);
+            } else {
+                $sent = $email->sendMailUsingTblReports(
+                    $sql,
+                    $reportNames,
+                    [strtoupper($display)],
+                    $baseSubject,
+                    $baseBody,
+                    $attachments,
+                    true
+                );
+                if (!$sent) {
+                    $email->sendMailHtml($baseSubject, $baseBody, ['oduai@libertydebtrelief.com'], [], [], $attachments);
+                }
             }
             $this->info("[INFO] [$display] All report emailed (" . count($attachments) . " attachment(s)).");
         } else {
@@ -497,11 +506,11 @@ class GenerateRetentionBonusCommission extends Command
             $subject   = $baseSubject . ' - ' . $agentName;
             $body      = "See attached Retention Bonus Commission - $display - $agentName.";
             $attachments = CommissionAgentEmailFiles::toAttachments([$f]);
-            // Agent copies go only to Rama (hardcoded per Jacob — she forwards manually).
+            // Agent copies go only to Rama (hardcoded per Jacob). --test-recipient overrides.
             $sent = $email->sendMail(
                 $subject,
                 $body,
-                ['rama@libertydebtrelief.com'],
+                [$testTo !== '' ? $testTo : 'rama@libertydebtrelief.com'],
                 [],
                 [],
                 $attachments
