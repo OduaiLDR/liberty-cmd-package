@@ -522,7 +522,8 @@ class GenerateRetentionBonusCommission extends Command
             }
         }
         if ($agentFiles !== []) {
-            $this->info("[INFO] [$display] Agent copies emailed to Rama: {$agentSent}/" . count($agentFiles) . ".");
+            $dest = $testTo !== '' ? $testTo : 'Rama';
+            $this->info("[INFO] [$display] Agent copies emailed to {$dest}: {$agentSent}/" . count($agentFiles) . ".");
         }
     }
 
