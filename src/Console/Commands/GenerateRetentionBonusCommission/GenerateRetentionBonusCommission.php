@@ -232,13 +232,10 @@ class GenerateRetentionBonusCommission extends Command
                 $bonusResults[] = ['agent' => $agentName, 'amount' => round($amount, 2)];
             }
             // A re-run must clear a previously calculated bonus when an agent no
-            // longer qualifies. The shared retention roster supplies zero rows
-            // while preserving the Commission column from the main report.
-            foreach ($rosterAgents as $agentName) {
-                if (!array_key_exists($agentName, $bonusByAgent)) {
-                    $bonusResults[] = ['agent' => $agentName, 'amount' => 0.0];
-                }
-            }
+            // longer qualifies. resetColumn() zeroes the whole Bonus_Commission
+            // column for the period first, then persist() writes only the agents
+            // who earned a bonus this run — so stale bonuses are cleared without
+            // needing a separate roster list.
             CommissionResultsWriter::resetColumn($sql, 'retention', $source, $reportStartDate, 'Bonus_Commission');
             CommissionResultsWriter::persist($sql, 'retention', $source, $reportStartDate, 'Bonus_Commission', $bonusResults);
 
