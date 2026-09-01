@@ -18,7 +18,7 @@ class PmodApprovalParser
             'settlement_id' => $this->getFirst($payload, ['settlement_id', 'settlementId', 'Settlement ID']),
             'settlement_ids' => $this->getFirst($payload, ['settlement_ids', 'settlementIds']),
             'void_settlement' => $this->getFirst($payload, ['void_settlement', 'voidSettlement', 'Void Settlement']),
-            'amounts' => $this->getFirst($payload, ['amounts', 'Amounts', 'amount', 'payment_amount', 'new_amount', 'Payment Amount', 'Lump Sum Amount']),
+            'amounts' => $this->getFirst($payload, ['amounts', 'Amounts', 'amount', 'payment_amount', 'new_amount', 'Payment Amount', 'New Payment Amount', 'Lump Sum Amount']),
             'increase_amount' => $this->getFirst($payload, ['increase_amount', 'increaseAmount', 'Increase Payment Amount']),
             'total_amount' => $this->getFirst($payload, ['total_amount', 'totalAmount', 'Total Payment Amount', 'Total Refund']),
             'original_dates' => $this->getFirst($payload, ['original_dates', 'originalDates', 'Original Scheduled Date']),
