@@ -12,6 +12,7 @@ class GenerateParamountEpfSummary extends Command
     protected $signature = 'Generate:paramount-epf-summary
                             {--month= : Month to report as YYYY-MM (defaults to last full calendar month)}
                             {--output= : Copy the workbook to this path}
+                            {--jacob-only : Send only to Jacob Wuydts}
                             {--send : Send the report email to the configured Paramount recipients}';
 
     protected $description = 'Generate the monthly Paramount Law EPF Summary workbook.';
@@ -42,8 +43,15 @@ class GenerateParamountEpfSummary extends Command
             $this->info('[INFO] Workbook written to: ' . ($output ?? $report['path']));
             $this->info(sprintf('[INFO] EPF debt: $%s; tier: T%d; payment: $%s', number_format($totalDebt, 2), $tier, number_format($payment, 2)));
 
-            if ($this->option('send')) {
-                $this->sendReport($report, $window['label'], $totalDebt, $tier, $payment);
+            if ($this->option('send') || $this->option('jacob-only')) {
+                $this->sendReport(
+                    $report,
+                    $window['label'],
+                    $totalDebt,
+                    $tier,
+                    $payment,
+                    (bool) $this->option('jacob-only')
+                );
             } else {
                 $this->info('[INFO] Email not sent. Pass --send to send it.');
             }
@@ -198,7 +206,14 @@ class GenerateParamountEpfSummary extends Command
     }
 
     /** @param array{filename:string,path:string} $report */
-    private function sendReport(array $report, string $monthLabel, float $debt, int $tier, float $payment): void
+    private function sendReport(
+        array $report,
+        string $monthLabel,
+        float $debt,
+        int $tier,
+        float $payment,
+        bool $jacobOnly = false
+    ): void
     {
         $body = "Hi,\n\n"
             . "Here is the EPF Summary for {$monthLabel}.\n\n"
@@ -210,24 +225,28 @@ class GenerateParamountEpfSummary extends Command
             'contentType' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             'contentBytes' => base64_encode(file_get_contents($report['path'])),
         ]];
+        $to = $jacobOnly ? ['jacob@libertydebtrelief.com'] : ['emcmurtrey@Higbee.law'];
+        $cc = $jacobOnly ? [] : [
+            'omar@libertydebtrelief.com',
+            'sam@libertydebtrelief.com',
+            'ABegg@Higbee.law',
+            'michael@libertydebtrelief.com',
+            'jacob@libertydebtrelief.com',
+        ];
         $sent = (new EmailSenderService())->sendMailHtml(
             "Paramount Law EPF Summary - {$monthLabel}",
             nl2br(htmlspecialchars($body)),
-            ['emcmurtrey@Higbee.law'],
-            [
-                'omar@libertydebtrelief.com',
-                'sam@libertydebtrelief.com',
-                'ABegg@Higbee.law',
-                'michael@libertydebtrelief.com',
-                'jacob@libertydebtrelief.com',
-            ],
+            $to,
+            $cc,
             [],
             $attachments
         );
         if (!$sent) {
             throw new \RuntimeException('Email send failed.');
         }
-        $this->info('[INFO] Paramount Law EPF Summary email sent.');
+        $this->info($jacobOnly
+            ? '[INFO] Paramount Law EPF Summary email sent only to Jacob Wuydts.'
+            : '[INFO] Paramount Law EPF Summary email sent.');
     }
 
     private function esc(string $value): string
