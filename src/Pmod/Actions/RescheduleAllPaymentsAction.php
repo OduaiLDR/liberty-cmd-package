@@ -9,6 +9,7 @@ use Cmd\Reports\Pmod\Contracts\PmodExecutionGateway;
 use Cmd\Reports\Pmod\Data\PmodResult;
 use Cmd\Reports\Pmod\Data\PmodWorkItem;
 use Cmd\Reports\Pmod\Enums\PmodActionType;
+use Cmd\Reports\Pmod\Support\PmodBusinessDateResolver;
 use Cmd\Reports\Pmod\Support\PmodTransactionMatcher;
 
 final class RescheduleAllPaymentsAction implements PmodActionHandler
@@ -67,6 +68,24 @@ final class RescheduleAllPaymentsAction implements PmodActionHandler
             );
         }
 
+        // Resolved BEFORE the live gate so an unhonourable frequency is caught in a
+        // dry run too, and so the capture below can report the interval it would
+        // have used.
+        $interval = $this->resolveMonthInterval($frequency);
+
+        if ($interval === null) {
+            return $this->captureForManualReview(
+                $workItem,
+                sprintf('Reschedule All Payments cannot honour a frequency of "%s".', $frequency),
+                [
+                    'reason' => 'unsupported_frequency',
+                    'frequency' => $frequency,
+                    'start_date' => $startDate,
+                    'draft_count' => count($futureDrafts),
+                ],
+            );
+        }
+
         if (!$this->allowLiveDraftUpdates || $workItem->dryRun) {
             return $this->captureForManualReview(
                 $workItem,
@@ -89,7 +108,6 @@ final class RescheduleAllPaymentsAction implements PmodActionHandler
         usort($futureDrafts, static fn(array $a, array $b): int =>
         strcmp((string) ($a['process_date'] ?? ''), (string) ($b['process_date'] ?? '')));
 
-        $interval    = $this->resolveMonthInterval($frequency);
         $updateResults = [];
         $errors        = [];
 
@@ -100,7 +118,10 @@ final class RescheduleAllPaymentsAction implements PmodActionHandler
                 continue;
             }
 
-            $newDate = date('Y-m-d', strtotime($startDate . ' +' . ($idx * $interval) . ' months'));
+            // Clamped month arithmetic: `strtotime('+1 months')` from a 31st rolls
+            // into the following month (§7.7), which on a full reschedule pushed
+            // every subsequent draft off the client's drafting day.
+            $newDate = PmodBusinessDateResolver::addMonths($startDate, $idx * $interval);
 
             try {
                 $response = $this->gateway->updateDraft($workItem, $draftId, [
@@ -183,14 +204,29 @@ final class RescheduleAllPaymentsAction implements PmodActionHandler
         );
     }
 
-    private function resolveMonthInterval(string $frequency): int
+    /**
+     * Months between drafts, or NULL when the frequency cannot be honoured.
+     *
+     * `bi-monthly` and friends used to return **0**, which put every future draft
+     * on the same date - one client, one day, twenty debits (§7.2). Nothing about
+     * "bi-monthly" justifies that: the word genuinely means either *every two
+     * months* or *twice a month*, and the second cannot be expressed as a whole
+     * number of months at all. Guessing picks a real payment schedule for a real
+     * client, so it returns null and the request goes to a human.
+     *
+     * An unrecognised frequency also returns null rather than quietly becoming
+     * monthly. An ABSENT frequency is different and still defaults to monthly at
+     * the call site - 7 of 13 measured requests send none, and monthly is what
+     * those clients are already on.
+     */
+    private function resolveMonthInterval(string $frequency): ?int
     {
         return match (strtolower(trim($frequency))) {
-            'bi-monthly', 'bi_monthly', 'bimonthly', 'twice-monthly' => 0,
+            'monthly', 'month' => 1,
             'quarterly' => 3,
             'semi-annual', 'semi_annual', 'semiannual' => 6,
             'annual', 'yearly' => 12,
-            default => 1,
+            default => null,
         };
     }
 }

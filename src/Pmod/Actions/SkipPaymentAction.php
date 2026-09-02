@@ -9,6 +9,7 @@ use Cmd\Reports\Pmod\Contracts\PmodExecutionGateway;
 use Cmd\Reports\Pmod\Data\PmodResult;
 use Cmd\Reports\Pmod\Data\PmodWorkItem;
 use Cmd\Reports\Pmod\Enums\PmodActionType;
+use Cmd\Reports\Pmod\Support\PmodBusinessDateResolver;
 use Cmd\Reports\Pmod\Support\PmodTransactionMatcher;
 
 final class SkipPaymentAction implements PmodActionHandler
@@ -42,15 +43,30 @@ final class SkipPaymentAction implements PmodActionHandler
         $transactions = $this->gateway->getContactTransactions($workItem);
 
         if (empty($targetDates)) {
-            $endOfTerm = $this->resolveEndOfTerm($transactions);
-            if ($endOfTerm === null) {
+            $lastDraftDate = $this->resolveEndOfTerm($transactions);
+            if ($lastDraftDate === null) {
                 return $this->captureForManualReview(
                     $workItem,
                     'Skip Payment could not determine end of term from transactions.',
                     ['reason' => 'cannot_resolve_end_of_term', 'original_dates' => $originalDates],
                 );
             }
-            $targetDates = array_fill(0, count($originalDates), $endOfTerm);
+
+            // The skipped payment goes AFTER the end of the term, not on top of it.
+            // This used to reuse the last draft's own date, so the skipped payment
+            // collided with an existing draft and the client was billed twice that
+            // day (§7.4). The VBA computed "last D-transaction process date + 1
+            // month", then slid past weekends and holidays (§4.3 C).
+            //
+            // With several payments skipped at once they step a month apart rather
+            // than all landing on one day - stacking N drafts on a single date is
+            // the same collision, N times over.
+            $targetDates = [];
+            foreach (array_keys($originalDates) as $offset) {
+                $targetDates[] = PmodBusinessDateResolver::nextBusinessDay(
+                    PmodBusinessDateResolver::addMonths($lastDraftDate, $offset + 1),
+                );
+            }
         }
 
         if (count($originalDates) !== count($targetDates)) {
@@ -181,16 +197,37 @@ final class SkipPaymentAction implements PmodActionHandler
         );
     }
 
-    /** @param list<array<string, mixed>> $transactions */
+    /**
+     * The process date of the LAST scheduled draft on the contact.
+     *
+     * Drafts only. This scanned every transaction, so a fee row or a cancelled
+     * draft dated later than the real end of the schedule would win and the
+     * skipped payment landed relative to something that is not a payment (§7.4).
+     * Cancelled drafts matter in particular: Forth leaves `active = 1` on them
+     * (§8.6), so they look live unless the `cancelled` flag is checked.
+     *
+     * @param list<array<string, mixed>> $transactions
+     */
     private function resolveEndOfTerm(array $transactions): ?string
     {
         $lastDate = null;
+
         foreach ($transactions as $tx) {
+            if (strtoupper(trim((string) ($tx['type'] ?? $tx['trans_type'] ?? ''))) !== 'D') {
+                continue;
+            }
+
+            if (! empty($tx['cancelled'])) {
+                continue;
+            }
+
             $date = trim((string) ($tx['process_date'] ?? ''));
+
             if ($date !== '' && ($lastDate === null || $date > $lastDate)) {
                 $lastDate = $date;
             }
         }
+
         return $lastDate;
     }
 }

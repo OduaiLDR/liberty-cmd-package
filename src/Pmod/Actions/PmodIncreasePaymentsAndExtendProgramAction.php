@@ -9,6 +9,7 @@ use Cmd\Reports\Pmod\Contracts\PmodExecutionGateway;
 use Cmd\Reports\Pmod\Data\PmodResult;
 use Cmd\Reports\Pmod\Data\PmodWorkItem;
 use Cmd\Reports\Pmod\Enums\PmodActionType;
+use Cmd\Reports\Pmod\Support\PmodBusinessDateResolver;
 use Cmd\Reports\Pmod\Support\PmodTransactionMatcher;
 
 final class PmodIncreasePaymentsAndExtendProgramAction implements PmodActionHandler
@@ -161,10 +162,11 @@ final class PmodIncreasePaymentsAndExtendProgramAction implements PmodActionHand
             return [];
         }
 
-        $base = new \DateTimeImmutable($last);
+        // addMonths() rather than `+N month`: PHP rolls 31 January into 3 March
+        // (§7.7), so a client drafting on the 31st drifted a month forward.
         $dates = [];
         for ($i = 1; $i <= $months; $i++) {
-            $dates[] = $base->modify("+{$i} month")->format('Y-m-d');
+            $dates[] = PmodBusinessDateResolver::addMonths($last, $i);
         }
 
         return $dates;
