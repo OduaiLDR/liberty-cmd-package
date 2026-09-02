@@ -9,6 +9,7 @@ use Cmd\Reports\Pmod\Services\PmodDispatcher;
 use Cmd\Reports\Pmod\Support\PmodIdempotency;
 use Cmd\Reports\Pmod\Support\PmodWorkItemFactory;
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Cache;
 
 final class TestPmodHandler extends Command
 {
@@ -31,7 +32,8 @@ final class TestPmodHandler extends Command
                             {--account-holder= : Name on the account}
                             {--company=LDR : Company context, LDR or PLAW}
                             {--requested_by=CLI Test : Requesting user label}
-                            {--no-dry-run : Allow live execution when PMOD_LIVE_DRAFT_UPDATES=true}';
+                            {--no-dry-run : Allow live execution when PMOD_LIVE_DRAFT_UPDATES=true}
+                            {--force : Re-run a live request this command has already executed within the hour}';
 
     protected $description = 'Test a PMOD handler directly. Defaults to dry-run mode.';
 
@@ -76,7 +78,7 @@ final class TestPmodHandler extends Command
             'creditor_id'    => $this->option('creditor-id'),
             'balance'        => $this->option('balance'),
             'account_number' => $this->option('account-number'),
-        ], static fn (mixed $v): bool => $v !== null && $v !== '');
+        ], static fn(mixed $v): bool => $v !== null && $v !== '');
 
         if ($creditorChange !== []) {
             $payload['creditor_change'] = $creditorChange;
@@ -87,14 +89,14 @@ final class TestPmodHandler extends Command
             'account_number'      => $this->option('bank-account-number'),
             'account_type'        => $this->option('account-type'),
             'account_holder_name' => $this->option('account-holder'),
-        ], static fn (mixed $v): bool => $v !== null && $v !== '');
+        ], static fn(mixed $v): bool => $v !== null && $v !== '');
 
         if ($bankingUpdate !== []) {
             $payload['banking_update'] = $bankingUpdate;
         }
 
         $settlementIds = array_values(array_filter(array_map(
-            static fn (mixed $value): string => trim((string) $value),
+            static fn(mixed $value): string => trim((string) $value),
             (array) $this->option('settlement_id'),
         )));
 
@@ -121,7 +123,7 @@ final class TestPmodHandler extends Command
         } catch (\InvalidArgumentException $exception) {
             $this->error($exception->getMessage());
             $this->line('Available action values: ' . implode(', ', array_map(
-                static fn (PmodActionType $type): string => $type->value,
+                static fn(PmodActionType $type): string => $type->value,
                 PmodActionType::cases(),
             )));
 
@@ -130,6 +132,16 @@ final class TestPmodHandler extends Command
 
         $this->info("Testing {$workItem->actionType->value} for contact {$workItem->contactId}");
         $this->line('Mode: ' . ($dryRun ? 'dry-run' : 'live'));
+
+        // A live CLI run has NO duplicate protection of its own: this command
+        // calls the dispatcher directly, so ProcessPmodWorkItemJob's guard never
+        // sees it. Measured 2026-09-02 - the same command run twice 23 seconds
+        // apart created TWO debts and TWO drafts on contact 462464571, with the
+        // second extension anchored a month past the first. Identical arguments
+        // produce an identical idempotency key, so that is what we lock on.
+        if (! $dryRun && ! $this->guardLiveRun($idempotencyKey)) {
+            return self::FAILURE;
+        }
 
         $result = $dispatcher->dispatch($workItem);
 
@@ -143,7 +155,7 @@ final class TestPmodHandler extends Command
             $this->table(
                 ['Key', 'Value'],
                 collect($result->metadata)->map(
-                    static fn (mixed $value, string|int $key): array => [
+                    static fn(mixed $value, string|int $key): array => [
                         (string) $key,
                         is_array($value) ? json_encode($value) : (string) $value,
                     ],
@@ -152,6 +164,43 @@ final class TestPmodHandler extends Command
         }
 
         return $result->isFailed() ? self::FAILURE : self::SUCCESS;
+    }
+
+    /**
+     * Refuse a live run this command has already executed within the hour.
+     *
+     * `Cache::add()` is atomic: it only writes when the key is absent, so the
+     * first run claims the key and any repeat inside the TTL is refused. One hour
+     * matches ProcessPmodWorkItemJob::$uniqueFor, so the CLI and the queue path
+     * hold the same line.
+     *
+     * This is a safety net, not a substitute for the durable guard: it is
+     * per-cache, so clearing the cache or a different cache store reopens it.
+     * `--force` is the deliberate way past it, and a re-run is often legitimate
+     * (cleanup, then test again) - the point is that it has to be a decision.
+     */
+    private function guardLiveRun(string $idempotencyKey): bool
+    {
+        $cacheKey = 'pmod_cli_live_' . $idempotencyKey;
+
+        if (Cache::add($cacheKey, now()->toIso8601String(), now()->addHour())) {
+            return true;
+        }
+
+        if ($this->option('force')) {
+            $this->warn('[FORCE] This exact live request already ran within the hour. Proceeding anyway.');
+
+            return true;
+        }
+
+        $this->error('This exact live request already ran within the last hour, at ' . Cache::get($cacheKey) . '.');
+        $this->line('');
+        $this->line('Identical arguments mean an identical idempotency key. Running it again would apply');
+        $this->line('the change a SECOND time - on 2026-09-02 that produced two debts and two drafts.');
+        $this->line('');
+        $this->line('If you have cleaned up and genuinely want to run it again, add --force.');
+
+        return false;
     }
 
     private function tenantId(): string
