@@ -10,6 +10,7 @@ use Cmd\Reports\Pmod\Contracts\PmodExecutionGateway;
 use Cmd\Reports\Pmod\Data\PmodResult;
 use Cmd\Reports\Pmod\Data\PmodWorkItem;
 use Cmd\Reports\Pmod\Enums\PmodActionType;
+use Cmd\Reports\Pmod\Support\PmodBusinessDateResolver;
 
 final class AddCreditorAndIncreasePaymentAction implements PmodActionHandler
 {
@@ -105,14 +106,21 @@ final class AddCreditorAndIncreasePaymentAction implements PmodActionHandler
         $futureDrafts    = $this->gateway->getContactTransactions($workItem);
         $updateResults   = [];
         $updateErrors    = [];
-        $today           = now()->toDateString();
+        $skippedInFlight = 0;
+        // Drafts within two days are already at the bank. The VBA selected
+        // `CDate(col4) > Date + 2` here (pmodLdr.md 1718).
+        $cutoff          = PmodBusinessDateResolver::draftModificationCutoff();
 
         foreach ($futureDrafts as $txn) {
             $processDate = $txn['process_date'] ?? '';
             // active === 1 is not enough: Forth leaves active = 1 on a cancelled
             // draft (verified 2026-08-31), so without this the update would push a
             // new amount onto drafts that will never be taken.
-            if ($txn['type'] !== 'D' || $txn['active'] !== '1' || ! empty($txn['cancelled']) || $processDate < $today) {
+            if ($txn['type'] !== 'D' || $txn['active'] !== '1' || ! empty($txn['cancelled'])) {
+                continue;
+            }
+            if ((string) $processDate <= $cutoff) {
+                $skippedInFlight++;
                 continue;
             }
             try {
@@ -152,6 +160,7 @@ final class AddCreditorAndIncreasePaymentAction implements PmodActionHandler
                 'debt_id'        => $debtId,
                 'creditor_name'  => $creditorChange['creditor_name'] ?? null,
                 'drafts_updated' => count($updateResults),
+                'drafts_skipped_in_flight' => $skippedInFlight,
                 'update_errors'  => $updateErrors,
             ],
         );

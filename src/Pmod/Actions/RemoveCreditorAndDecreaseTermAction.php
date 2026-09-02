@@ -9,6 +9,7 @@ use Cmd\Reports\Pmod\Contracts\PmodExecutionGateway;
 use Cmd\Reports\Pmod\Data\PmodResult;
 use Cmd\Reports\Pmod\Data\PmodWorkItem;
 use Cmd\Reports\Pmod\Enums\PmodActionType;
+use Cmd\Reports\Pmod\Support\PmodBusinessDateResolver;
 use Cmd\Reports\Pmod\Support\PmodDebtMatcher;
 
 final class RemoveCreditorAndDecreaseTermAction implements PmodActionHandler
@@ -79,13 +80,18 @@ final class RemoveCreditorAndDecreaseTermAction implements PmodActionHandler
 
         // Step 3: cancel the last N future type-D drafts (shorten the program)
         $transactions = $this->gateway->getContactTransactions($workItem);
-        $today        = now()->toDateString();
+        // Two-day window, as everywhere else a draft is touched: one that close is
+        // already submitted to the bank, and cancelling it in Forth does not recall
+        // the debit. This action takes the LAST N drafts, so the window normally
+        // does not bite - it only matters for a client with almost no term left,
+        // which is exactly when a mistake is least recoverable.
+        $cutoff       = PmodBusinessDateResolver::draftModificationCutoff();
 
         $futureDrafts = array_values(array_filter(
             $transactions,
             // Excludes already-cancelled drafts - Forth keeps active = 1 on them, so
             // this would otherwise try to cancel drafts that are already cancelled.
-            fn ($t) => ($t['type'] ?? '') === 'D' && ($t['active'] ?? '') === '1' && empty($t['cancelled']) && ($t['process_date'] ?? '') >= $today,
+            fn ($t) => ($t['type'] ?? '') === 'D' && ($t['active'] ?? '') === '1' && empty($t['cancelled']) && (string) ($t['process_date'] ?? '') > $cutoff,
         ));
 
         usort($futureDrafts, fn ($a, $b) => strcmp($a['process_date'] ?? '', $b['process_date'] ?? ''));
