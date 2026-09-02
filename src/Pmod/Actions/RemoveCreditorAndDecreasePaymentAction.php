@@ -9,6 +9,7 @@ use Cmd\Reports\Pmod\Contracts\PmodExecutionGateway;
 use Cmd\Reports\Pmod\Data\PmodResult;
 use Cmd\Reports\Pmod\Data\PmodWorkItem;
 use Cmd\Reports\Pmod\Enums\PmodActionType;
+use Cmd\Reports\Pmod\Support\PmodBusinessDateResolver;
 use Cmd\Reports\Pmod\Support\PmodDebtMatcher;
 
 final class RemoveCreditorAndDecreasePaymentAction implements PmodActionHandler
@@ -79,13 +80,22 @@ final class RemoveCreditorAndDecreasePaymentAction implements PmodActionHandler
 
         // Update all future active type-D drafts to the new lower amount
         $transactions  = $this->gateway->getContactTransactions($workItem);
-        $today         = now()->toDateString();
+        // Drafts within two days are already submitted to the bank. The VBA
+        // selected `CDate(col4) > Date + 2` here (pmodLdr.md 1953); changing one
+        // inside that window leaves the bank taking the old amount while our
+        // records claim the new one.
+        $cutoff        = PmodBusinessDateResolver::draftModificationCutoff();
         $updateResults = [];
         $updateErrors  = [];
+        $skippedInFlight = 0;
 
         foreach ($transactions as $txn) {
             // See AddCreditorAndIncreasePayment: a cancelled draft keeps active = 1.
-            if (($txn['type'] ?? '') !== 'D' || ($txn['active'] ?? '') !== '1' || ! empty($txn['cancelled']) || ($txn['process_date'] ?? '') < $today) {
+            if (($txn['type'] ?? '') !== 'D' || ($txn['active'] ?? '') !== '1' || ! empty($txn['cancelled'])) {
+                continue;
+            }
+            if ((string) ($txn['process_date'] ?? '') <= $cutoff) {
+                $skippedInFlight++;
                 continue;
             }
             $draftId = (string) ($txn['transaction_id'] ?? $txn['id'] ?? '');
@@ -129,6 +139,7 @@ final class RemoveCreditorAndDecreasePaymentAction implements PmodActionHandler
                 'new_payment'    => $newPaymentAmount,
                 'cancel_result'  => $cancelResult,
                 'drafts_updated' => count($updateResults),
+                'drafts_skipped_in_flight' => $skippedInFlight,
                 'update_errors'  => $updateErrors,
             ],
         );
