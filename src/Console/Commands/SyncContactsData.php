@@ -13,7 +13,8 @@ class SyncContactsData extends Command
     protected $signature = 'Sync:contacts-data
         {--source=   : Run a single source only (LDR, PLAW, or LT)}
         {--full      : Force a full refresh even when a previous sync timestamp exists}
-        {--dry-run   : Fetch and report changes without modifying SQL Server or sync watermarks}
+        {--dry-run   : Fetch and report changes without modifying SQL Server or sync watermarks; matching runs as read-only verification}
+        {--verify-match : Read-only matching verification only (no Snowflake fetch, no SQL writes)}
         {--no-match  : Skip post-sync table matching (internal flag used by the orchestrator)}';
 
     protected $description = 'Sync contacts data from Snowflake to SQL Server (TblContactsLDR, TblContactsPLAW, and TblContactsLT)';
@@ -26,11 +27,25 @@ class SyncContactsData extends Command
     private int $agentCustomId;
     private string $targetTable;
 
+    /** Matching-step counters reset at the start of each matching run. */
+    private int $matchingStepsOk = 0;
+    private int $matchingStepsFailed = 0;
+    private int $matchingRowsAffected = 0;
+    private int $matchingStepNumber = 0;
+    private int $matchingStepTotal = 0;
+
+    /** @var list<array{step: string, label: string, error: string}> */
+    private array $matchingFailures = [];
+
     public function handle(): int
     {
         ini_set('memory_limit', '512M');
 
         $source = strtoupper((string) $this->option('source'));
+        if ($this->option('verify-match')) {
+            return $this->runVerifyMatchOnly($source !== '' ? $source : null);
+        }
+
         if ($source !== '') {
             if (!in_array($source, ['LDR', 'PLAW', 'LT'], true)) {
                 $this->error("Unknown source '{$source}'. Use LDR, PLAW, or LT.");
@@ -99,9 +114,17 @@ class SyncContactsData extends Command
             return Command::FAILURE;
         }
 
-        // ── Step 3: Final matching ─────────────────────────────────────────────
+        // ── Step 3: Final matching (or read-only preview in dry-run) ─────────────
         if ($this->option('dry-run')) {
-            $this->info('[DRY RUN] Step 3/3: Final table matching skipped.');
+            $this->info('[DRY RUN] Step 3/3: Previewing final matching (read-only)...');
+            try {
+                $connector = DBConnector::fromEnvironment('ldr');
+                $connector->initializeSqlServer();
+                $this->runFinalMatching($connector);
+            } catch (\Throwable $e) {
+                $this->error('[DRY RUN] Matching preview failed: ' . $e->getMessage());
+                return Command::FAILURE;
+            }
             $this->info('[SUCCESS] Dry run completed; no SQL Server changes were made.');
             return Command::SUCCESS;
         }
@@ -110,9 +133,13 @@ class SyncContactsData extends Command
         try {
             $connector = DBConnector::fromEnvironment('ldr');
             $connector->initializeSqlServer();
-            $this->runFinalMatching($connector);
+            if (!$this->runFinalMatching($connector)) {
+                $this->error('[ERROR] Final matching completed with failures — see summary above.');
+                return Command::FAILURE;
+            }
         } catch (\Throwable $e) {
             $this->error('[ERROR] Final matching failed: ' . $e->getMessage());
+            Log::error('SyncContactsData: final matching exception', ['exception' => $e]);
             return Command::FAILURE;
         }
 
@@ -286,8 +313,17 @@ class SyncContactsData extends Command
 
         // When called from the orchestrator (no --source flag), matching is deferred
         // to handle() so it runs after ALL sources finish. Skip it here in that case.
-        if (!$dryRun && !$this->option('no-match')) {
-            $this->updateRelatedTables($sqlConnector);
+        if (!$this->option('no-match')) {
+            if ($dryRun) {
+                $this->warn('[DRY RUN] Previewing post-sync matching (read-only)...');
+            }
+            if (!$this->updateRelatedTables($sqlConnector)) {
+                $message = $dryRun
+                    ? "[DRY RUN] {$this->source} matching preview failed."
+                    : "[ERROR] {$this->source} post-sync matching completed with failures.";
+                $this->error($message);
+                return Command::FAILURE;
+            }
         }
 
         // Persist the watermark only after a fully successful run
@@ -902,74 +938,296 @@ class SyncContactsData extends Command
         $this->info("[INFO] Target table cleared");
     }
 
-    private function updateRelatedTables(DBConnector $connector): void
+    private function updateRelatedTables(DBConnector $connector): bool
     {
-        // LT inserts into TblContacts directly — no cross-table updates needed
         if ($this->source === 'LT') {
-            return;
+            return true;
         }
 
-        $table = $this->targetTable;
+        if ($this->option('dry-run')) {
+            return $this->previewMatching($connector, [$this->targetTable]);
+        }
 
-        $steps = [
+        $this->resetMatchingStats(7);
+        $this->printMatchingHeader("{$this->source} post-sync matching");
+        $this->matchSourceTableToContacts($connector, $this->targetTable);
+        $this->fillEnrollmentAgents($connector);
+
+        return $this->logMatchingSummary("{$this->source} post-sync");
+    }
+
+    private function runFinalMatching(DBConnector $connector): bool
+    {
+        if ($this->option('dry-run')) {
+            return $this->previewMatching($connector, ['TblContactsLDR', 'TblContactsPLAW']);
+        }
+
+        $this->resetMatchingStats(10);
+        $this->printMatchingHeader('orchestrator final matching (External ID → TblContacts → TblEnrollment)');
+
+        foreach (['TblContactsLDR', 'TblContactsPLAW'] as $table) {
+            $this->info("[MATCH] Processing {$table}...");
+            $this->matchSourceTableToContacts($connector, $table);
+        }
+
+        $this->info('[MATCH] Propagating agents to TblEnrollment...');
+        $this->fillEnrollmentAgents($connector);
+
+        return $this->logMatchingSummary('orchestrator final');
+    }
+
+    /**
+     * Read-only preview: counts rows that matching would touch + Jacob gap queries.
+     * No UPDATE statements are executed.
+     */
+    private function previewMatching(DBConnector $connector, array $tables): bool
+    {
+        // 5 counts per source table + 4 enrollment fix counts + 6 Jacob gap counts
+        $this->resetMatchingStats((\count($tables) * 5) + 4 + 6);
+        $this->printMatchingHeader('DRY RUN — matching verification (read-only, no writes)');
+
+        foreach ($tables as $table) {
+            $this->info("[VERIFY] Preview {$table} → TblContacts...");
+            $this->previewSourceTableMatching($connector, $table);
+        }
+
+        $this->info('[VERIFY] Preview TblEnrollment agent propagation...');
+        $this->previewEnrollmentAgentFixes($connector);
+        $this->previewJacobEnrollmentGaps($connector);
+
+        return $this->logMatchingSummary('dry-run preview');
+    }
+
+    private function previewSourceTableMatching(DBConnector $connector, string $table): void
+    {
+        $agentGap = "COALESCE({$table}.Agent, '') <> '' AND COALESCE(TblContacts.Agent, '') = ''";
+
+        $this->previewCountStep(
+            $connector,
+            "{$table}.llg_id_join",
+            "SELECT COUNT(*) AS cnt FROM TblContacts INNER JOIN {$table} ON TblContacts.LLG_ID = {$table}.LLG_ID",
+            "Rows joined on LLG_ID ({$table})"
+        );
+
+        $this->previewCountStep(
+            $connector,
+            "{$table}.llg_id_agent_gap",
+            "SELECT COUNT(*) AS cnt FROM TblContacts INNER JOIN {$table} ON TblContacts.LLG_ID = {$table}.LLG_ID WHERE {$agentGap}",
+            "Joined on LLG_ID with blank TblContacts.Agent ({$table})"
+        );
+
+        $this->previewCountStep(
+            $connector,
+            "{$table}.external_id_join",
+            "SELECT COUNT(*) AS cnt FROM TblContacts INNER JOIN {$table}
+             ON TblContacts.LLG_ID = 'LLG-' + CAST({$table}.External_ID AS VARCHAR(50))",
+            "Rows joined on External_ID ({$table})"
+        );
+
+        $this->previewCountStep(
+            $connector,
+            "{$table}.external_id_agent_gap",
+            "SELECT COUNT(*) AS cnt FROM TblContacts INNER JOIN {$table}
+             ON TblContacts.LLG_ID = 'LLG-' + CAST({$table}.External_ID AS VARCHAR(50))
+             WHERE {$agentGap}",
+            "External_ID join with blank TblContacts.Agent ({$table})"
+        );
+
+        $this->previewCountStep(
+            $connector,
+            "{$table}.external_id_remap",
+            "SELECT COUNT(*) AS cnt FROM TblContacts
+             INNER JOIN {$table} ON TblContacts.LLG_ID = 'LLG-' + CAST({$table}.External_ID AS VARCHAR(50))
+             LEFT JOIN TblContacts AS taken ON taken.LLG_ID = {$table}.LLG_ID
+             WHERE taken.LLG_ID IS NULL AND TblContacts.LLG_ID <> {$table}.LLG_ID",
+            "Rows eligible for LLG_ID remap ({$table})"
+        );
+    }
+
+    private function previewEnrollmentAgentFixes(DBConnector $connector): void
+    {
+        $this->previewCountStep(
+            $connector,
+            'enrollment.agent_contacts',
+            "SELECT COUNT(*) AS cnt FROM TblEnrollment e
+             JOIN (
+                 SELECT LLG_ID, MIN(Agent) AS Agent FROM TblContacts
+                 WHERE Agent IS NOT NULL AND Agent <> '' GROUP BY LLG_ID
+             ) c ON e.LLG_ID = c.LLG_ID
+             WHERE e.Agent IS NULL OR e.Agent = '' OR e.Agent <> c.Agent",
+            'Enrollments TblContacts.Agent would update'
+        );
+
+        $this->previewCountStep(
+            $connector,
+            'enrollment.agent_ldr_fallback',
+            "SELECT COUNT(*) AS cnt FROM TblEnrollment e
+             JOIN TblContactsLDR l ON e.LLG_ID = l.LLG_ID
+             WHERE (e.Agent IS NULL OR e.Agent = '') AND l.Agent IS NOT NULL AND l.Agent <> ''",
+            'Blank enrollments LDR fallback would fill'
+        );
+
+        $this->previewCountStep(
+            $connector,
+            'enrollment.agent_plaw_fallback',
+            "SELECT COUNT(*) AS cnt FROM TblEnrollment e
+             JOIN TblContactsPLAW p ON e.LLG_ID = p.LLG_ID
+             WHERE (e.Agent IS NULL OR e.Agent = '') AND p.Agent IS NOT NULL AND p.Agent <> ''",
+            'Blank enrollments PLAW fallback would fill'
+        );
+
+        $this->previewCountStep(
+            $connector,
+            'enrollment.drop_name',
+            "SELECT COUNT(*) AS cnt FROM TblEnrollment e
+             JOIN TblContacts c ON e.LLG_ID = c.LLG_ID
+             WHERE COALESCE(c.Campaign, '') <> ''",
+            'Enrollments Drop_Name would update from Campaign'
+        );
+    }
+
+    /** Jacob's gap queries — blank enrollment agent but agent exists on contact table. */
+    private function previewJacobEnrollmentGaps(DBConnector $connector): void
+    {
+        $this->line('');
+        $this->info('[VERIFY] Jacob gap check (blank TblEnrollment.Agent, agent on contact):');
+
+        $gaps = [
+            'ldr.all'          => ['TblContactsLDR',  ''],
+            'plaw.all'         => ['TblContactsPLAW', ''],
+            'contacts.all'     => ['TblContacts',     ''],
+            'ldr.aug2026'      => ['TblContactsLDR',  "AND e.Submitted_Date BETWEEN '8/1/2026' AND '8/31/2026'"],
+            'plaw.aug2026'     => ['TblContactsPLAW', "AND e.Submitted_Date BETWEEN '8/1/2026' AND '8/31/2026'"],
+            'contacts.aug2026' => ['TblContacts',     "AND e.Submitted_Date BETWEEN '8/1/2026' AND '8/31/2026'"],
+        ];
+
+        foreach ($gaps as $step => [$contactTable, $dateFilter]) {
+            $this->previewCountStep(
+                $connector,
+                "gap.{$step}",
+                "SELECT COUNT(*) AS cnt FROM TblEnrollment e
+                 LEFT JOIN {$contactTable} c ON e.LLG_ID = c.LLG_ID
+                 WHERE COALESCE(e.Agent, '') = '' AND c.Agent IS NOT NULL {$dateFilter}",
+                "Gap rows — {$contactTable}" . ($dateFilter !== '' ? ' (Aug 2026)' : ' (all dates)')
+            );
+        }
+    }
+
+    private function previewCountStep(DBConnector $connector, string $step, string $sql, string $label): bool
+    {
+        $this->matchingStepNumber++;
+        $progress = "[VERIFY {$this->matchingStepNumber}/{$this->matchingStepTotal}]";
+
+        $result = $connector->querySqlServer($sql);
+        if (!($result['success'] ?? false)) {
+            $error = (string) ($result['error'] ?? 'unknown SQL Server error');
+            $this->matchingStepsFailed++;
+            $this->matchingFailures[] = ['step' => $step, 'label' => $label, 'error' => $error];
+            $this->error("{$progress} FAILED — {$label}");
+            $this->line("         error: {$error}");
+            return false;
+        }
+
+        $row     = $result['data'][0] ?? [];
+        $count   = (int) ($row['cnt'] ?? $row['CNT'] ?? 0);
+        $this->matchingStepsOk++;
+        $this->info("{$progress} {$label}: {$count}");
+
+        return true;
+    }
+
+    private function printMatchingHeader(string $title): void
+    {
+        $this->line('');
+        $this->info(str_repeat('─', 72));
+        $this->info("[MATCH] {$title} ({$this->matchingStepTotal} checks)");
+        $this->info(str_repeat('─', 72));
+    }
+
+    /** Fast read-only verification — no Snowflake, no writes. */
+    private function runVerifyMatchOnly(?string $source): int
+    {
+        $this->info('[INFO] Verify-match only: read-only SQL counts (no sync, no writes).');
+
+        try {
+            $connector = DBConnector::fromEnvironment('ldr');
+            $connector->initializeSqlServer();
+        } catch (\Throwable $e) {
+            $this->error('Failed to initialize SQL Server: ' . $e->getMessage());
+            return Command::FAILURE;
+        }
+
+        $tables = match ($source) {
+            'LDR'  => ['TblContactsLDR'],
+            'PLAW' => ['TblContactsPLAW'],
+            null   => ['TblContactsLDR', 'TblContactsPLAW'],
+            default => null,
+        };
+
+        if ($tables === null) {
+            $this->error("Unknown source '{$source}' for --verify-match. Use LDR, PLAW, or omit --source.");
+            return Command::FAILURE;
+        }
+
+        if (!$this->previewMatching($connector, $tables)) {
+            $this->error('[ERROR] Verification queries failed — see output above.');
+            return Command::FAILURE;
+        }
+
+        $this->info('[SUCCESS] Verification complete. Re-run without --verify-match to apply fixes.');
+        return Command::SUCCESS;
+    }
+
+    /**
+     * Match LDR/PLAW back to TblContacts by External_ID and copy switched fields.
+     * Field copy is split from LLG_ID remap so a unique-index collision on LLG_ID
+     * cannot block Agent (and related fields) from landing on TblContacts.
+     */
+    private function matchSourceTableToContacts(DBConnector $connector, string $table): void
+    {
+        $fields = $this->matchedFieldsSql($table);
+
+        $this->runMatchingStep(
+            $connector,
+            "{$table}.llg_id_fields",
+            "UPDATE TblContacts
+             SET {$fields}
+             FROM TblContacts
+             INNER JOIN {$table} ON TblContacts.LLG_ID = {$table}.LLG_ID",
+            "Switched fields on TblContacts from {$table} (LLG_ID match)"
+        );
+
+        $this->runMatchingStep(
+            $connector,
+            "{$table}.external_id_fields",
+            "UPDATE TblContacts
+             SET {$fields}
+             FROM TblContacts
+             INNER JOIN {$table}
+               ON TblContacts.LLG_ID = 'LLG-' + CAST({$table}.External_ID AS VARCHAR(50))",
+            "Switched fields on TblContacts from {$table} (External_ID match)"
+        );
+
+        $this->runMatchingStep(
+            $connector,
+            "{$table}.external_id_remap",
             "UPDATE TblContacts
              SET TblContacts.LLG_ID = {$table}.LLG_ID
              FROM TblContacts
              INNER JOIN {$table}
-               ON TblContacts.LLG_ID = 'LLG-' + CAST({$table}.External_ID AS VARCHAR(50))"
-            => '[INFO] Updated TblContacts.LLG_ID',
-
-            "UPDATE TblEnrollment
-             SET TblEnrollment.Agent = TblContacts.Agent
-             FROM TblEnrollment, TblContacts
-             WHERE TblEnrollment.LLG_ID = TblContacts.LLG_ID"
-            => '[INFO] Updated TblEnrollment.Agent',
-
-            // Both LDR and PLAW update Drop_Name
-            "UPDATE TblEnrollment
-             SET TblEnrollment.Drop_Name = TblContacts.Campaign
-             FROM TblEnrollment, TblContacts
-             WHERE TblEnrollment.LLG_ID = TblContacts.LLG_ID
-               AND COALESCE(TblContacts.Campaign, '') <> ''"
-            => '[INFO] Updated TblEnrollment.Drop_Name',
-        ];
-
-        foreach ($steps as $sql => $label) {
-            try {
-                $connector->querySqlServer($sql);
-                $this->info($label);
-            } catch (\Throwable $e) {
-                $this->warn('[WARN] ' . $label . ' failed: ' . $e->getMessage());
-            }
-        }
+               ON TblContacts.LLG_ID = 'LLG-' + CAST({$table}.External_ID AS VARCHAR(50))
+             LEFT JOIN TblContacts AS taken ON taken.LLG_ID = {$table}.LLG_ID
+             WHERE taken.LLG_ID IS NULL
+               AND TblContacts.LLG_ID <> {$table}.LLG_ID",
+            "Remapped TblContacts.LLG_ID from {$table} (External_ID match)"
+        );
     }
 
-    // Runs once after ALL sources complete (LT → LDR+PLAW → this).
-    // Matches TblContactsLDR/PLAW back to TblContacts (now fully populated by LT),
-    // then refreshes TblEnrollment.Agent and Drop_Name from TblContacts.
-    private function runFinalMatching(DBConnector $connector): void
+    private function fillEnrollmentAgents(DBConnector $connector): void
     {
-        foreach (['TblContactsLDR', 'TblContactsPLAW'] as $table) {
-            try {
-                $connector->querySqlServer("
-                    UPDATE TblContacts
-                    SET TblContacts.LLG_ID = {$table}.LLG_ID
-                    FROM TblContacts
-                    INNER JOIN {$table}
-                      ON TblContacts.LLG_ID = 'LLG-' + CAST({$table}.External_ID AS VARCHAR(50))
-                ");
-                $this->info("[INFO] Updated TblContacts.LLG_ID from {$table}");
-            } catch (\Throwable $e) {
-                $this->warn("[WARN] LLG_ID update from {$table} failed: " . $e->getMessage());
-            }
-        }
-
-        // Agent update: use MIN(Agent) per LLG_ID to handle duplicate TblContacts rows
-        // deterministically. LT ownership is authoritative, so correct stale values
-        // as well as blanks, but never write an empty source value.
-        $agentSteps = [
-            // Primary: from TblContacts (LT source)
-            "UPDATE TblEnrollment
+        $steps = [
+            'enrollment.agent_contacts' => [
+                'sql' => "UPDATE TblEnrollment
              SET TblEnrollment.Agent = c.Agent
              FROM TblEnrollment
              JOIN (
@@ -979,44 +1237,116 @@ class SyncContactsData extends Command
                  GROUP BY LLG_ID
              ) c ON TblEnrollment.LLG_ID = c.LLG_ID
              WHERE TblEnrollment.Agent IS NULL OR TblEnrollment.Agent = ''
-                OR TblEnrollment.Agent <> c.Agent"
-            => '[INFO] Updated TblEnrollment.Agent from LT ownership',
-
-            // Fallback: from TblContactsLDR for contacts missing from TblContacts
-            "UPDATE TblEnrollment
+                OR TblEnrollment.Agent <> c.Agent",
+                'label' => 'Updated TblEnrollment.Agent from TblContacts',
+            ],
+            'enrollment.agent_ldr_fallback' => [
+                'sql' => "UPDATE TblEnrollment
              SET TblEnrollment.Agent = l.Agent
              FROM TblEnrollment
              JOIN TblContactsLDR l ON TblEnrollment.LLG_ID = l.LLG_ID
              WHERE (TblEnrollment.Agent IS NULL OR TblEnrollment.Agent = '')
-               AND l.Agent IS NOT NULL AND l.Agent <> ''"
-            => '[INFO] Updated TblEnrollment.Agent from TblContactsLDR (fallback)',
-
-            // Fallback: from TblContactsPLAW for contacts missing from TblContacts
-            "UPDATE TblEnrollment
+               AND l.Agent IS NOT NULL AND l.Agent <> ''",
+                'label' => 'Updated TblEnrollment.Agent from TblContactsLDR (fallback)',
+            ],
+            'enrollment.agent_plaw_fallback' => [
+                'sql' => "UPDATE TblEnrollment
              SET TblEnrollment.Agent = p.Agent
              FROM TblEnrollment
              JOIN TblContactsPLAW p ON TblEnrollment.LLG_ID = p.LLG_ID
              WHERE (TblEnrollment.Agent IS NULL OR TblEnrollment.Agent = '')
-               AND p.Agent IS NOT NULL AND p.Agent <> ''"
-            => '[INFO] Updated TblEnrollment.Agent from TblContactsPLAW (fallback)',
-
-            // Drop_Name: only update when source has a value; never blank it out
-            "UPDATE TblEnrollment
+               AND p.Agent IS NOT NULL AND p.Agent <> ''",
+                'label' => 'Updated TblEnrollment.Agent from TblContactsPLAW (fallback)',
+            ],
+            'enrollment.drop_name' => [
+                'sql' => "UPDATE TblEnrollment
              SET TblEnrollment.Drop_Name = TblContacts.Campaign
              FROM TblEnrollment, TblContacts
              WHERE TblEnrollment.LLG_ID = TblContacts.LLG_ID
-               AND COALESCE(TblContacts.Campaign, '') <> ''"
-            => '[INFO] Updated TblEnrollment.Drop_Name',
+               AND COALESCE(TblContacts.Campaign, '') <> ''",
+                'label' => 'Updated TblEnrollment.Drop_Name from TblContacts.Campaign',
+            ],
         ];
 
-        foreach ($agentSteps as $sql => $label) {
-            try {
-                $connector->querySqlServer($sql);
-                $this->info($label);
-            } catch (\Throwable $e) {
-                $this->warn('[WARN] ' . $label . ' failed: ' . $e->getMessage());
-            }
+        foreach ($steps as $step => $config) {
+            $this->runMatchingStep($connector, $step, $config['sql'], $config['label']);
         }
+    }
+
+    private function matchedFieldsSql(string $src): string
+    {
+        return "TblContacts.Agent = CASE WHEN COALESCE({$src}.Agent, '') <> '' THEN {$src}.Agent ELSE TblContacts.Agent END,
+                TblContacts.Affiliate_Agent = CASE WHEN COALESCE({$src}.Affiliate_Agent, '') <> '' THEN {$src}.Affiliate_Agent ELSE TblContacts.Affiliate_Agent END,
+                TblContacts.Campaign = CASE WHEN COALESCE({$src}.Campaign, '') <> '' THEN {$src}.Campaign ELSE TblContacts.Campaign END,
+                TblContacts.Category = CASE WHEN COALESCE({$src}.Category, '') <> '' THEN {$src}.Category ELSE TblContacts.Category END";
+    }
+
+    private function resetMatchingStats(int $stepTotal): void
+    {
+        $this->matchingStepsOk       = 0;
+        $this->matchingStepsFailed   = 0;
+        $this->matchingRowsAffected  = 0;
+        $this->matchingStepNumber    = 0;
+        $this->matchingStepTotal     = $stepTotal;
+        $this->matchingFailures      = [];
+    }
+
+    private function runMatchingStep(DBConnector $connector, string $step, string $sql, string $label): bool
+    {
+        $this->matchingStepNumber++;
+        $progress = "[MATCH {$this->matchingStepNumber}/{$this->matchingStepTotal}]";
+
+        $result = $connector->querySqlServer($sql);
+        if (!($result['success'] ?? false)) {
+            $error = (string) ($result['error'] ?? 'unknown SQL Server error');
+            $this->matchingStepsFailed++;
+            $this->matchingFailures[] = ['step' => $step, 'label' => $label, 'error' => $error];
+            $this->error("{$progress} FAILED — {$label}");
+            $this->line("         step: {$step}");
+            $this->line("         error: {$error}");
+            return false;
+        }
+
+        $rows = (int) ($result['row_count'] ?? 0);
+        $this->matchingStepsOk++;
+        $this->matchingRowsAffected += $rows;
+        $rowMsg = $rows === 0 ? '0 rows (nothing to update)' : "{$rows} rows affected";
+        $this->info("{$progress} OK — {$label}: {$rowMsg}");
+
+        return true;
+    }
+
+    private function logMatchingSummary(string $context): bool
+    {
+        $total = $this->matchingStepsOk + $this->matchingStepsFailed;
+
+        $this->line('');
+        $this->info(str_repeat('─', 72));
+
+        if ($this->matchingStepsFailed === 0) {
+            $label = str_contains($context, 'preview') ? 'PREVIEW COMPLETE' : 'COMPLETE';
+            $this->info(
+                "[MATCH] {$context} {$label} — {$this->matchingStepsOk}/{$total} steps OK, "
+                . "{$this->matchingRowsAffected} total rows affected"
+            );
+            $this->info(str_repeat('─', 72));
+            return true;
+        }
+
+        $this->error(
+            "[MATCH] {$context} INCOMPLETE — {$this->matchingStepsFailed}/{$total} steps FAILED, "
+            . "{$this->matchingStepsOk} OK, {$this->matchingRowsAffected} rows affected"
+        );
+        $this->line('');
+        $this->error('Failed steps:');
+        foreach ($this->matchingFailures as $failure) {
+            $this->line("  • {$failure['step']}");
+            $this->line("    {$failure['label']}");
+            $this->line("    {$failure['error']}");
+        }
+        $this->info(str_repeat('─', 72));
+
+        return false;
     }
 
     // -------------------------------------------------------------------------
