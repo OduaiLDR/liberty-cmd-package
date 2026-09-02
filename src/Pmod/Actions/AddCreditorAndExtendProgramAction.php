@@ -168,9 +168,42 @@ final class AddCreditorAndExtendProgramAction implements PmodActionHandler
                 'creditor_name'    => $creditorChange['creditor_name'] ?? null,
                 'months_to_extend' => $monthsToExtend,
                 'drafts_created'   => count($extensionResults),
+                // The ids, not just the count. This action moves money, and
+                // without them a run cannot be audited or undone - cleanup after
+                // the first live test meant hunting for drafts by memo text.
+                'draft_ids'        => array_values(array_filter(array_map(
+                    static fn (array $r): ?string => self::extractDraftId($r),
+                    $extensionResults,
+                ))),
                 'extension_errors' => $extensionErrors,
             ],
         );
+    }
+
+    /**
+     * The draft id out of a createDraft() response, whatever shape it comes in.
+     * ForthPay has been seen returning it flat and nested under `response`, and a
+     * dry run returns a `dry_run_...` stub, so every key is tried before giving up.
+     *
+     * @param array<string, mixed> $response
+     */
+    private static function extractDraftId(array $response): ?string
+    {
+        foreach ([$response, $response['response'] ?? []] as $level) {
+            if (! is_array($level)) {
+                continue;
+            }
+
+            foreach (['draft_id', 'id', 'transaction_id'] as $key) {
+                $value = $level[$key] ?? null;
+
+                if (is_scalar($value) && trim((string) $value) !== '') {
+                    return (string) $value;
+                }
+            }
+        }
+
+        return null;
     }
 
     /** @param array<string, mixed> $metadata */
