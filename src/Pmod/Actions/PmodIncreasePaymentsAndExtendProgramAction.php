@@ -9,6 +9,7 @@ use Cmd\Reports\Pmod\Contracts\PmodExecutionGateway;
 use Cmd\Reports\Pmod\Data\PmodResult;
 use Cmd\Reports\Pmod\Data\PmodWorkItem;
 use Cmd\Reports\Pmod\Enums\PmodActionType;
+use Cmd\Reports\Pmod\Support\PmodBusinessDateResolver;
 use Cmd\Reports\Pmod\Support\PmodTransactionMatcher;
 
 final class PmodIncreasePaymentsAndExtendProgramAction implements PmodActionHandler
@@ -16,8 +17,7 @@ final class PmodIncreasePaymentsAndExtendProgramAction implements PmodActionHand
     public function __construct(
         private readonly PmodExecutionGateway $gateway,
         private readonly bool $allowLiveDraftUpdates = false,
-    ) {
-    }
+    ) {}
 
     public function actionType(): PmodActionType
     {
@@ -137,11 +137,13 @@ final class PmodIncreasePaymentsAndExtendProgramAction implements PmodActionHand
     {
         $today = date('Y-m-d');
 
-        return array_values(array_filter($transactions, static fn (array $tx): bool =>
+        return array_values(array_filter(
+            $transactions,
+            static fn(array $tx): bool =>
             strtoupper(trim((string) ($tx['type'] ?? $tx['trans_type'] ?? ''))) === 'D'
-            && trim((string) ($tx['process_date'] ?? '')) >= $today
-            && empty($tx['cancelled'])
-            && empty($tx['completed'])
+                && trim((string) ($tx['process_date'] ?? '')) >= $today
+                && empty($tx['cancelled'])
+                && empty($tx['completed'])
         ));
     }
 
@@ -160,10 +162,11 @@ final class PmodIncreasePaymentsAndExtendProgramAction implements PmodActionHand
             return [];
         }
 
-        $base = new \DateTimeImmutable($last);
+        // addMonths() rather than `+N month`: PHP rolls 31 January into 3 March
+        // (§7.7), so a client drafting on the 31st drifted a month forward.
         $dates = [];
         for ($i = 1; $i <= $months; $i++) {
-            $dates[] = $base->modify("+{$i} month")->format('Y-m-d');
+            $dates[] = PmodBusinessDateResolver::addMonths($last, $i);
         }
 
         return $dates;

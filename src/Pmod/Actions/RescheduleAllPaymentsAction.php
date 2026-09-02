@@ -9,6 +9,7 @@ use Cmd\Reports\Pmod\Contracts\PmodExecutionGateway;
 use Cmd\Reports\Pmod\Data\PmodResult;
 use Cmd\Reports\Pmod\Data\PmodWorkItem;
 use Cmd\Reports\Pmod\Enums\PmodActionType;
+use Cmd\Reports\Pmod\Support\PmodBusinessDateResolver;
 use Cmd\Reports\Pmod\Support\PmodTransactionMatcher;
 
 final class RescheduleAllPaymentsAction implements PmodActionHandler
@@ -16,8 +17,7 @@ final class RescheduleAllPaymentsAction implements PmodActionHandler
     public function __construct(
         private readonly PmodExecutionGateway $gateway,
         private readonly bool $allowLiveDraftUpdates = false,
-    ) {
-    }
+    ) {}
 
     public function actionType(): PmodActionType
     {
@@ -53,8 +53,8 @@ final class RescheduleAllPaymentsAction implements PmodActionHandler
 
         $futureDrafts = array_values(array_filter(
             $transactions,
-            static fn (array $tx): bool =>
-                strtoupper(trim((string) ($tx['type'] ?? $tx['trans_type'] ?? ''))) === 'D' &&
+            static fn(array $tx): bool =>
+            strtoupper(trim((string) ($tx['type'] ?? $tx['trans_type'] ?? ''))) === 'D' &&
                 trim((string) ($tx['process_date'] ?? '')) >= $today &&
                 empty($tx['cancelled']) &&
                 empty($tx['completed']),
@@ -65,6 +65,24 @@ final class RescheduleAllPaymentsAction implements PmodActionHandler
                 $workItem,
                 'Reschedule All Payments found no future draft transactions to reschedule.',
                 ['reason' => 'no_future_drafts', 'start_date' => $startDate, 'frequency' => $frequency],
+            );
+        }
+
+        // Resolved BEFORE the live gate so an unhonourable frequency is caught in a
+        // dry run too, and so the capture below can report the interval it would
+        // have used.
+        $interval = $this->resolveMonthInterval($frequency);
+
+        if ($interval === null) {
+            return $this->captureForManualReview(
+                $workItem,
+                sprintf('Reschedule All Payments cannot honour a frequency of "%s".', $frequency),
+                [
+                    'reason' => 'unsupported_frequency',
+                    'frequency' => $frequency,
+                    'start_date' => $startDate,
+                    'draft_count' => count($futureDrafts),
+                ],
             );
         }
 
@@ -87,10 +105,9 @@ final class RescheduleAllPaymentsAction implements PmodActionHandler
             );
         }
 
-        usort($futureDrafts, static fn (array $a, array $b): int =>
-            strcmp((string) ($a['process_date'] ?? ''), (string) ($b['process_date'] ?? '')));
+        usort($futureDrafts, static fn(array $a, array $b): int =>
+        strcmp((string) ($a['process_date'] ?? ''), (string) ($b['process_date'] ?? '')));
 
-        $interval    = $this->resolveMonthInterval($frequency);
         $updateResults = [];
         $errors        = [];
 
@@ -101,7 +118,10 @@ final class RescheduleAllPaymentsAction implements PmodActionHandler
                 continue;
             }
 
-            $newDate = date('Y-m-d', strtotime($startDate . ' +' . ($idx * $interval) . ' months'));
+            // Clamped month arithmetic: `strtotime('+1 months')` from a 31st rolls
+            // into the following month (§7.7), which on a full reschedule pushed
+            // every subsequent draft off the client's drafting day.
+            $newDate = PmodBusinessDateResolver::addMonths($startDate, $idx * $interval);
 
             try {
                 $response = $this->gateway->updateDraft($workItem, $draftId, [
@@ -119,7 +139,7 @@ final class RescheduleAllPaymentsAction implements PmodActionHandler
         // Calculate estimated graduation based on last draft date
         $lastDraftDate = end($futureDrafts)['process_date'] ?? null;
         $firstOriginalDate = $futureDrafts[0]['process_date'] ?? null;
-        
+
         $noteLines = [
             'Reschedule All Future Payments Request:',
             'Request Status: Successful',
@@ -129,14 +149,14 @@ final class RescheduleAllPaymentsAction implements PmodActionHandler
             'Void Settlement:',
             'Current Frequency: ' . ucfirst($frequency),
         ];
-        
+
         if ($firstOriginalDate) {
             $noteLines[] = 'Original Scheduled Date: ' . date('m/d/Y', strtotime($firstOriginalDate));
         }
         if ($startDate) {
             $noteLines[] = 'New Draft Date: ' . date('m/d/Y', strtotime($startDate));
         }
-        
+
         $noteLines[] = 'New Frequency: ' . ucfirst($frequency);
         // Report the amount the drafts will actually carry: the new one if the
         // request supplied it, otherwise the existing amount. Previously this
@@ -147,10 +167,10 @@ final class RescheduleAllPaymentsAction implements PmodActionHandler
         if ($appliedAmount !== null && trim((string) $appliedAmount) !== '') {
             $noteLines[] = 'New Payment Amount: $' . number_format((float) $appliedAmount, 2);
         }
-        
+
         $noteLines[] = 'User: ' . ($workItem->requestedBy ?? 'Client');
         $noteLines[] = 'Device: ' . ($workItem->normalizedPayload['device'] ?? 'mobile');
-        
+
         $this->gateway->createContactNote($workItem, implode("\n", $noteLines));
 
         return new PmodResult(
@@ -184,14 +204,29 @@ final class RescheduleAllPaymentsAction implements PmodActionHandler
         );
     }
 
-    private function resolveMonthInterval(string $frequency): int
+    /**
+     * Months between drafts, or NULL when the frequency cannot be honoured.
+     *
+     * `bi-monthly` and friends used to return **0**, which put every future draft
+     * on the same date - one client, one day, twenty debits (§7.2). Nothing about
+     * "bi-monthly" justifies that: the word genuinely means either *every two
+     * months* or *twice a month*, and the second cannot be expressed as a whole
+     * number of months at all. Guessing picks a real payment schedule for a real
+     * client, so it returns null and the request goes to a human.
+     *
+     * An unrecognised frequency also returns null rather than quietly becoming
+     * monthly. An ABSENT frequency is different and still defaults to monthly at
+     * the call site - 7 of 13 measured requests send none, and monthly is what
+     * those clients are already on.
+     */
+    private function resolveMonthInterval(string $frequency): ?int
     {
         return match (strtolower(trim($frequency))) {
-            'bi-monthly', 'bi_monthly', 'bimonthly', 'twice-monthly' => 0,
+            'monthly', 'month' => 1,
             'quarterly' => 3,
             'semi-annual', 'semi_annual', 'semiannual' => 6,
             'annual', 'yearly' => 12,
-            default => 1,
+            default => null,
         };
     }
 }

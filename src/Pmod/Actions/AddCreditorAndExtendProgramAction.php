@@ -10,6 +10,7 @@ use Cmd\Reports\Pmod\Contracts\PmodExecutionGateway;
 use Cmd\Reports\Pmod\Data\PmodResult;
 use Cmd\Reports\Pmod\Data\PmodWorkItem;
 use Cmd\Reports\Pmod\Enums\PmodActionType;
+use Cmd\Reports\Pmod\Support\PmodBusinessDateResolver;
 
 final class AddCreditorAndExtendProgramAction implements PmodActionHandler
 {
@@ -125,18 +126,21 @@ final class AddCreditorAndExtendProgramAction implements PmodActionHandler
         $extensionErrors  = [];
 
         if ($lastDate !== null) {
-            $cursor = new \DateTime($lastDate);
-            for ($i = 0; $i < $monthsToExtend; $i++) {
-                $cursor->modify('+1 month');
+            for ($i = 1; $i <= $monthsToExtend; $i++) {
+                // Measured from the anchor each time, with clamped month
+                // arithmetic. The old cursor did `modify('+1 month')` repeatedly,
+                // which both overflows a 31st into the next month and then
+                // COMPOUNDS that drift on every following iteration (§7.7).
+                $processDate = PmodBusinessDateResolver::addMonths($lastDate, $i);
                 try {
                     $extensionResults[] = $this->gateway->createDraft($workItem, [
                         'client_id'    => $workItem->contactId,
                         'amount'       => $amount,
-                        'process_date' => $cursor->format('Y-m-d'),
+                        'process_date' => $processDate,
                         'memo'         => sprintf('Add Creditor Extension - $%s by System Admin', number_format((float) $amount, 2)),
                     ]);
                 } catch (\Throwable $e) {
-                    $extensionErrors[] = ['date' => $cursor->format('Y-m-d'), 'error' => $e->getMessage()];
+                    $extensionErrors[] = ['date' => $processDate, 'error' => $e->getMessage()];
                 }
             }
         }

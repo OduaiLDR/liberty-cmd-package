@@ -9,14 +9,14 @@ use Cmd\Reports\Pmod\Contracts\PmodExecutionGateway;
 use Cmd\Reports\Pmod\Data\PmodResult;
 use Cmd\Reports\Pmod\Data\PmodWorkItem;
 use Cmd\Reports\Pmod\Enums\PmodActionType;
+use Cmd\Reports\Pmod\Support\PmodBusinessDateResolver;
 
 final class PmodExtendProgramAction implements PmodActionHandler
 {
     public function __construct(
         private readonly PmodExecutionGateway $gateway,
         private readonly bool $allowLiveDraftUpdates = false,
-    ) {
-    }
+    ) {}
 
     public function actionType(): PmodActionType
     {
@@ -124,10 +124,11 @@ final class PmodExtendProgramAction implements PmodActionHandler
             return [];
         }
 
-        $base = new \DateTimeImmutable($last);
+        // addMonths() rather than `+N month`: PHP rolls 31 January into 3 March,
+        // so a client drafting on the 31st drifted a month forward (§7.7).
         $dates = [];
         for ($i = 1; $i <= $months; $i++) {
-            $dates[] = $base->modify("+{$i} month")->format('Y-m-d');
+            $dates[] = PmodBusinessDateResolver::addMonths($last, $i);
         }
 
         return $dates;
@@ -140,9 +141,13 @@ final class PmodExtendProgramAction implements PmodActionHandler
         $endDate = new \DateTimeImmutable($end);
         $dates = [];
 
+        // Stepped from the ORIGINAL start each time, not by repeatedly adding a
+        // month to the cursor: compounding `+1 month` from a 31st walks the day of
+        // month forward permanently (31 Jan -> 3 Mar -> 3 Apr ...).
+        $step = 0;
         while ($cursor <= $endDate) {
             $dates[] = $cursor->format('Y-m-d');
-            $cursor = $cursor->modify('+1 month');
+            $cursor = new \DateTimeImmutable(PmodBusinessDateResolver::addMonths($start, ++$step));
         }
 
         return $dates;

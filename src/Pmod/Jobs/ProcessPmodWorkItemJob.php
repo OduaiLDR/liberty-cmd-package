@@ -222,11 +222,24 @@ final class ProcessPmodWorkItemJob implements ShouldQueue, ShouldBeUnique
         }
     }
 
-    /** The `pmod_requests.status` that corresponds to a dispatcher result. */
+    /**
+     * The `pmod_requests.status` that corresponds to a dispatcher result.
+     *
+     * `partial_update` counts as processed. It used to fall through to `failed`,
+     * which stamped `failed_at` and wrote the *success* message ("updated 18 of 20
+     * draft(s)") into `error_message`, so the dashboard reported every partial as
+     * a failure and the error column contained no error (§7.6).
+     *
+     * A partial is still surfaced, just not as a lie: `result_type` records it
+     * exactly, the per-draft errors are in `response_payload`, and
+     * PmodEmailNotificationService already treats anything that is not
+     * updated/success/captured as a Failure, so it goes out as
+     * "HIGH PRIORITY: PMOD Failure" and a human is told.
+     */
     private function statusForResult(string $resultType): string
     {
         return match (true) {
-            in_array($resultType, ['updated', 'success'], true) => 'processed',
+            in_array($resultType, ['updated', 'success', 'partial_update'], true) => 'processed',
             $resultType === 'captured_for_manual_review' => 'captured',
             default => 'failed',
         };
@@ -251,9 +264,13 @@ final class ProcessPmodWorkItemJob implements ShouldQueue, ShouldBeUnique
                     'notification_status' => $notified ? 'sent' : 'not_sent',
                     'notification_sent_at' => $notified ? now() : null,
                     'response_payload' => json_encode(['status' => $status, 'message' => $message, 'metadata' => $metadata]),
-                    'error_message' => in_array($status, ['updated', 'success'], true) ? null : mb_substr($message, 0, 2000),
+                    // Only a genuine failure carries an error. A capture and a
+                    // partial both have a *descriptive* message, and writing it
+                    // here put text like "updated 18 of 20 draft(s)" in the error
+                    // column of the dashboard (§7.6).
+                    'error_message' => $this->statusForResult($status) === 'failed' ? mb_substr($message, 0, 2000) : null,
                     'processed_at' => now(),
-                    'failed_at' => in_array($status, ['updated', 'success'], true) ? null : now(),
+                    'failed_at' => $this->statusForResult($status) === 'failed' ? now() : null,
                     'updated_at' => now(),
                 ]);
         } catch (Throwable $e) {
