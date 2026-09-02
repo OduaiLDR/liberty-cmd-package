@@ -38,6 +38,9 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCr
     /** @var array<string, array<string, list<string>>> in-request memo of the creditor catalogue */
     private array $creditorMapCache = [];
 
+    /** @var array<string, array<string, mixed>|null> in-request memo of single creditor lookups */
+    private array $creditorRecordCache = [];
+
     private function getDbConnector(): DBConnector
     {
         if ($this->dbConnector === null) {
@@ -1346,11 +1349,30 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCr
         $claimedId = trim((string) $claimedId);
 
         if ($claimedId !== '') {
-            if ($this->creditorExists($tenantId, $claimedId)) {
-                return $claimedId;
+            $record = $this->fetchCreditorRecord($tenantId, $claimedId);
+
+            if ($record !== null) {
+                // The id exists. Cross-check it against the name the consumer sent
+                // so a valid id belonging to a DIFFERENT creditor cannot quietly
+                // attach the wrong one - the id and the name are independently
+                // supplied and can disagree.
+                if (self::creditorNamesAgree((string) ($record['company_name'] ?? ''), $creditorName)) {
+                    return $claimedId;
+                }
+
+                Log::warning('PMOD: payload creditor_id names a different creditor than the payload name, refusing to guess', [
+                    'tenant' => $tenantId,
+                    'claimed_creditor_id' => $claimedId,
+                    'creditor_name_sent' => $creditorName,
+                    'creditor_name_in_forth' => $record['company_name'] ?? null,
+                ]);
+
+                // Fail closed. Falling through to name resolution here could pick a
+                // THIRD creditor, which is worse than a manual-review email.
+                return null;
             }
 
-            Log::warning('PMOD: payload creditor_id is not in the Forth catalogue, ignoring it', [
+            Log::warning('PMOD: payload creditor_id does not exist in Forth, ignoring it', [
                 'tenant' => $tenantId,
                 'claimed_creditor_id' => $claimedId,
                 'creditor_name' => $creditorName,
@@ -1360,11 +1382,108 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCr
         return $this->findCreditorId($tenantId, $creditorName);
     }
 
+    /**
+     * Does this creditor exist in Forth?
+     *
+     * Asked of Forth directly, NOT of the cached catalogue. Measured 2026-09-02:
+     * `GET /creditors` on PLAW returns 5,435 rows in the band 25,399,779..28,325,149,
+     * yet contact 462464571 carries a debt whose creditor is id 2435 "Target", and
+     * `GET /creditors/2435` answers **200**. So the catalogue is an incomplete
+     * index of Forth's creditors, and membership of it is the wrong test.
+     *
+     * The cost of getting this wrong was real: LDR id 601 "Citibank" is a valid
+     * creditor that the catalogue does not list, so a consumer sending their own
+     * correct id had it discarded, then "Citibank" failed name resolution (55
+     * ambiguous rows) and the request captured for no reason.
+     *
+     * The catalogue is still right for name -> id lookup; it is only existence
+     * that moves to the direct endpoint. Two of the three suspect ids from §8.3
+     * do 404 here (10016072, 10100974), so this does not weaken validation - it
+     * makes it accurate.
+     */
     public function creditorExists(string $tenantId, string $creditorId): bool
+    {
+        return $this->fetchCreditorRecord($tenantId, $creditorId) !== null;
+    }
+
+    /**
+     * One creditor straight from Forth, or null when it does not exist.
+     *
+     * Cached 24h per id, alongside an in-request memo, because resolveCreditorId()
+     * asks about the same handful of ids repeatedly. A transport failure is NOT
+     * cached and falls back to catalogue membership, so an outage degrades to the
+     * old behaviour rather than rejecting every id.
+     *
+     * @return array<string, mixed>|null
+     */
+    private function fetchCreditorRecord(string $tenantId, string $creditorId): ?array
     {
         $creditorId = trim($creditorId);
 
-        return $creditorId !== '' && isset($this->creditorCatalogue($tenantId)['ids'][$creditorId]);
+        if ($creditorId === '' || preg_match('/^\d+$/', $creditorId) !== 1) {
+            return null;
+        }
+
+        $memoKey = strtolower($tenantId) . ':' . $creditorId;
+
+        if (array_key_exists($memoKey, $this->creditorRecordCache)) {
+            return $this->creditorRecordCache[$memoKey];
+        }
+
+        $cacheKey = 'pmod_creditor_' . $memoKey;
+        $cached = Cache::get($cacheKey);
+
+        if ($cached !== null) {
+            $record = $cached === 'missing' ? null : (is_array($cached) ? $cached : null);
+            $this->creditorRecordCache[$memoKey] = $record;
+
+            return $record;
+        }
+
+        try {
+            $response = $this->crmClient($tenantId)->get("/creditors/{$creditorId}");
+        } catch (\Throwable $e) {
+            Log::warning('PMOD: creditor lookup failed, falling back to the catalogue', [
+                'tenant' => $tenantId,
+                'creditor_id' => $creditorId,
+                'error' => $e->getMessage(),
+            ]);
+
+            return isset($this->creditorCatalogue($tenantId)['ids'][$creditorId])
+                ? ['id' => $creditorId, 'company_name' => $this->creditorCatalogue($tenantId)['ids'][$creditorId]]
+                : null;
+        }
+
+        if ($response->status() === 404) {
+            Cache::put($cacheKey, 'missing', now()->addHours(24));
+            $this->creditorRecordCache[$memoKey] = null;
+
+            return null;
+        }
+
+        if (! $response->successful()) {
+            Log::warning('PMOD: creditor lookup returned an unexpected status, falling back to the catalogue', [
+                'tenant' => $tenantId,
+                'creditor_id' => $creditorId,
+                'status' => $response->status(),
+            ]);
+
+            return isset($this->creditorCatalogue($tenantId)['ids'][$creditorId])
+                ? ['id' => $creditorId, 'company_name' => $this->creditorCatalogue($tenantId)['ids'][$creditorId]]
+                : null;
+        }
+
+        $record = $response->json('response');
+        $record = is_array($record) && array_is_list($record) ? ($record[0] ?? null) : $record;
+
+        if (! is_array($record) || ($record['id'] ?? null) === null) {
+            return null;
+        }
+
+        Cache::put($cacheKey, $record, now()->addHours(24));
+        $this->creditorRecordCache[$memoKey] = $record;
+
+        return $record;
     }
 
     /**
@@ -1572,6 +1691,40 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCr
             is_array($rows) ? array_values($rows) : [],
             is_numeric($total) ? (int) $total : null,
         ];
+    }
+
+    /**
+     * Do a creditor id's real name and the name the consumer sent refer to the
+     * same creditor?
+     *
+     * Deliberately tolerant of the variants Forth actually carries - a payload
+     * saying "Target" against Forth's "TARGET NB" is the same creditor - but not
+     * so loose that two different companies pass. An empty sent name cannot
+     * contradict anything, so a valid id stands on its own.
+     */
+    private static function creditorNamesAgree(string $forthName, string $sentName): bool
+    {
+        $sent = self::normalizeCreditorName($sentName);
+
+        if ($sent === '') {
+            return true;
+        }
+
+        $forth = self::normalizeCreditorName($forthName);
+
+        if ($forth === '') {
+            return false;
+        }
+
+        if ($forth === $sent) {
+            return true;
+        }
+
+        // Same 5-character floor as findCreditorId(), so a short name cannot
+        // swallow an unrelated creditor.
+        return mb_strlen($forth) >= 5
+            && mb_strlen($sent) >= 5
+            && (str_contains($forth, $sent) || str_contains($sent, $forth));
     }
 
     private static function normalizeCreditorName(string $value): string

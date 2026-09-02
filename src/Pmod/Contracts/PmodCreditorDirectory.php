@@ -12,11 +12,14 @@ namespace Cmd\Reports\Pmod\Contracts;
  * three test doubles to grow methods none of them can implement.
  *
  * Why this exists: both Add Creditor actions need a Forth creditor id, and the
- * ids consumers send cannot be trusted. Measured on 2026-08-31, of four creditor
- * ids taken from real payloads only ONE existed in the catalogue - the others
- * (10016072, 10100974, 601) belong to a different id space, while the Forth
- * catalogue runs 25,399,828..28,315,871. The legacy VBA never used an id at all;
- * it typed the creditor name straight into the DPP form.
+ * ids consumers send cannot be trusted. Measured 2026-08-31 against the
+ * catalogue, three of four payload ids looked invalid. Re-measured 2026-09-02
+ * against Forth itself, the picture is sharper: 10016072 and 10100974 really do
+ * 404, but **601 is a real Citibank** and 2435 is a real Target - both simply
+ * absent from `GET /creditors`, which is an incomplete index rather than the
+ * source of truth. So existence is asked of `GET /creditors/{id}`, and the
+ * catalogue is kept only for name -> id lookup. The legacy VBA never used an id
+ * at all; it typed the creditor name straight into the DPP form.
  */
 interface PmodCreditorDirectory
 {
@@ -24,10 +27,11 @@ interface PmodCreditorDirectory
      * Decide which creditor id to use, given whatever the consumer claimed and
      * the name they sent.
      *
-     * A claimed id must be VALIDATED against the catalogue, never trusted. When
-     * it does not exist, fall back to resolving the name. Returns null when
-     * neither yields an unambiguous answer, so the caller can capture for manual
-     * review.
+     * A claimed id must be VALIDATED against Forth, never trusted. When it does
+     * not exist, fall back to resolving the name. When it does exist but names a
+     * different creditor than the payload's name, return null rather than
+     * guessing which of the two is right. Returns null whenever nothing yields an
+     * unambiguous answer, so the caller can capture for manual review.
      */
     public function resolveCreditorId(string $tenantId, ?string $claimedId, string $creditorName): ?string;
 
@@ -39,7 +43,7 @@ interface PmodCreditorDirectory
      */
     public function forgetCreditorCatalogue(string $tenantId): string;
 
-    /** True when this creditor id exists in the tenant's Forth catalogue. */
+    /** True when this creditor id exists in Forth (asked of the API, not the cached catalogue). */
     public function creditorExists(string $tenantId, string $creditorId): bool;
 
     /**
