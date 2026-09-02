@@ -28,7 +28,9 @@ class Formatter
             'Date of Experience',
             'Company Info',
             'Additional Info',
-            'Product Info',
+            'Loan Company',
+            'Loan Amount',
+            'APR',
             'Source',
             'Loan Representative',
         ];
@@ -47,13 +49,13 @@ class Formatter
             $col++;
         }
 
-        $sheet->getStyle('A1:N1')->applyFromArray([
+        $sheet->getStyle('A1:P1')->applyFromArray([
             'font' => ['bold' => true, 'color' => ['argb' => 'FFFFFFFF']],
             'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER],
             'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['argb' => 'FF17853B']],
             'borders' => ['allBorders' => ['borderStyle' => Border::BORDER_THIN, 'color' => ['argb' => 'FF444444']]],
         ]);
-        $sheet->setAutoFilter('A1:N1');
+        $sheet->setAutoFilter('A1:P1');
 
         $sheet->getColumnDimension('A')->setWidth(18);
         $sheet->getColumnDimension('B')->setWidth(30);
@@ -66,9 +68,11 @@ class Formatter
         $sheet->getColumnDimension('I')->setWidth(16);
         $sheet->getColumnDimension('J')->setWidth(18);
         $sheet->getColumnDimension('K')->setWidth(16);
-        $sheet->getColumnDimension('L')->setWidth(40);
-        $sheet->getColumnDimension('M')->setWidth(20);
-        $sheet->getColumnDimension('N')->setWidth(22);
+        $sheet->getColumnDimension('L')->setWidth(22);
+        $sheet->getColumnDimension('M')->setWidth(14);
+        $sheet->getColumnDimension('N')->setWidth(10);
+        $sheet->getColumnDimension('O')->setWidth(20);
+        $sheet->getColumnDimension('P')->setWidth(22);
 
         $pks = [];
         $rowIndex = 2;
@@ -92,6 +96,8 @@ class Formatter
             $source = (string) ($row['Source'] ?? '');
             $source = stripos($source, 'online') !== false ? 'Online Application' : 'Phone Application';
 
+            $product = $this->parseProductInfo((string) ($row['Product_Info'] ?? ''));
+
             $dataRow = [
                 $phone,
                 (string) ($row['Email'] ?? ''),
@@ -104,7 +110,9 @@ class Formatter
                 $this->formatDate($row['Date_of_Experience'] ?? null),
                 'Lending Tower',
                 'Personal Loan',
-                (string) ($row['Product_Info'] ?? ''),
+                $product['loan_company'],
+                $product['loan_amount'],
+                $product['apr'],
                 $source,
                 (string) ($row['Loan_Representative'] ?? ''),
             ];
@@ -116,7 +124,7 @@ class Formatter
             }
 
             if ($rowIndex % 2 === 0) {
-                $sheet->getStyle("A{$rowIndex}:N{$rowIndex}")
+                $sheet->getStyle("A{$rowIndex}:P{$rowIndex}")
                     ->getFill()
                     ->setFillType(Fill::FILL_SOLID)
                     ->getStartColor()
@@ -128,11 +136,11 @@ class Formatter
 
         $lastRow = $rowIndex - 1;
         if ($lastRow >= 2) {
-            $sheet->getStyle("A2:N{$lastRow}")
+            $sheet->getStyle("A2:P{$lastRow}")
                 ->getBorders()
                 ->getAllBorders()
                 ->setBorderStyle(Border::BORDER_THIN);
-            $sheet->getStyle("A2:N{$lastRow}")
+            $sheet->getStyle("A2:P{$lastRow}")
                 ->getAlignment()
                 ->setHorizontal(Alignment::HORIZONTAL_LEFT)
                 ->setVertical(Alignment::VERTICAL_CENTER);
@@ -202,6 +210,51 @@ class Formatter
         } elseif (!$sent) {
             Log::warning('GenerateConsumerAffairsFundedReport: failed to send email.');
         }
+    }
+
+    /**
+     * Notes / Product_Info is one blob with labeled pieces, e.g.
+     * "Loan Company: Acme | Loan Amount: $12,000 | APR: 9.99% | Loan Term: 36 Months".
+     * Split into separate report columns.
+     *
+     * @return array{loan_company: string, loan_amount: string, apr: string}
+     */
+    private function parseProductInfo(string $notes): array
+    {
+        $notes = trim($notes);
+        $parsed = [
+            'loan_company' => '',
+            'loan_amount' => '',
+            'apr' => '',
+        ];
+
+        if ($notes === '') {
+            return $parsed;
+        }
+
+        $parsed['loan_company'] = $this->matchLabeledValue(
+            $notes,
+            '/(?:Loan\s*Company|Lender|Company)\s*:\s*(.+?)(?=\s*(?:\||Loan\s*Amount|Amount|APR|Loan\s*Term|$))/is'
+        );
+        $parsed['loan_amount'] = $this->matchLabeledValue(
+            $notes,
+            '/(?:Loan\s*Amount|Amount)\s*:\s*(.+?)(?=\s*(?:\||APR|Loan\s*Term|Loan\s*Company|Lender|$))/is'
+        );
+        $parsed['apr'] = $this->matchLabeledValue(
+            $notes,
+            '/APR\s*:\s*(.+?)(?=\s*(?:\||Loan\s*Term|Loan\s*Amount|Amount|Loan\s*Company|Lender|$))/is'
+        );
+
+        return $parsed;
+    }
+
+    private function matchLabeledValue(string $text, string $pattern): string
+    {
+        if (!preg_match($pattern, $text, $matches)) {
+            return '';
+        }
+
+        return trim(preg_replace('/\s+/', ' ', (string) ($matches[1] ?? '')));
     }
 
     private function splitName(string $fullName): array
