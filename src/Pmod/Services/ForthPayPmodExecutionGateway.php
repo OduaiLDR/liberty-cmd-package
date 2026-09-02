@@ -1048,7 +1048,34 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCr
             return [];
         }
 
-        return $response->json('response.results', []);
+        // Forth returns the debts as a bare LIST under `response`, not wrapped in
+        // `results`. Measured against production 2026-09-02 on PLAW contact
+        // 462464571: {"response":[{"object":"debt","id":"148442930",...}],"status":...}.
+        //
+        // This read `response.results` and therefore returned [] on EVERY call, so
+        // both Remove Creditor actions reported debt_not_found no matter what the
+        // contact carried. Silent, because an empty list is also what a contact
+        // with no debts looks like.
+        //
+        // `results` is still honoured in case any tenant or a future version wraps
+        // it - preferring the list keeps today's behaviour exact.
+        $payload = $response->json('response');
+
+        if (is_array($payload) && array_is_list($payload)) {
+            return $payload;
+        }
+
+        if (is_array($payload) && is_array($payload['results'] ?? null)) {
+            return array_values($payload['results']);
+        }
+
+        Log::warning('PMOD: contact debts response was not in a recognised shape', [
+            'contact_id' => $workItem->contactId,
+            'type'       => get_debug_type($payload),
+            'keys'       => is_array($payload) ? array_slice(array_keys($payload), 0, 10) : [],
+        ]);
+
+        return [];
     }
 
     public function getContactSummary(PmodWorkItem $workItem): array

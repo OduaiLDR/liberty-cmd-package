@@ -9,6 +9,7 @@ use Cmd\Reports\Pmod\Contracts\PmodExecutionGateway;
 use Cmd\Reports\Pmod\Data\PmodResult;
 use Cmd\Reports\Pmod\Data\PmodWorkItem;
 use Cmd\Reports\Pmod\Enums\PmodActionType;
+use Cmd\Reports\Pmod\Support\PmodDebtMatcher;
 
 final class RemoveCreditorAndDecreaseTermAction implements PmodActionHandler
 {
@@ -41,23 +42,34 @@ final class RemoveCreditorAndDecreaseTermAction implements PmodActionHandler
             ]);
         }
 
+        // Matched BEFORE the live-updates gate so a dry run proves which debt would
+        // be removed; reading debts is read-only. See §8.6 for the same fix on the
+        // Add Creditor pair.
+        $debts = $this->gateway->getContactDebts($workItem);
+        $match = PmodDebtMatcher::match($debts, $creditorChange);
+        $debt  = $match['debt'];
+
+        if ($debt === null) {
+            return $this->capture($workItem, sprintf('Remove Creditor and Decrease Term could not identify a single debt for creditor [%s].', $creditorName ?? $creditorId), [
+                'reason'      => $match['reason'],
+                'creditor'    => $creditorName ?? $creditorId,
+                'debts_found' => count($debts),
+                'candidates'  => $match['candidates'],
+            ]);
+        }
+
         if (!$this->allowLiveDraftUpdates || $workItem->dryRun) {
             return $this->capture($workItem, 'Remove Creditor and Decrease Term matched but live updates are disabled.', [
                 'reason'             => $workItem->dryRun ? 'dry_run_only' : 'live_draft_updates_disabled',
                 'creditor'           => $creditorName,
                 'months_to_decrease' => $monthsToDecrease,
-            ]);
-        }
-
-        // Step 1: find the debt — throws if CRM unreachable
-        $debts = $this->gateway->getContactDebts($workItem);
-        $debt  = $this->findDebt($debts, $creditorName, $creditorId);
-
-        if ($debt === null) {
-            return $this->capture($workItem, sprintf('Remove Creditor and Decrease Term could not find debt for creditor [%s].', $creditorName ?? $creditorId), [
-                'reason'      => 'debt_not_found',
-                'creditor'    => $creditorName ?? $creditorId,
-                'debts_found' => count($debts),
+                'would_remove'       => [
+                    'debt_id'  => $debt['id'] ?? null,
+                    'creditor' => $debt['creditor']['company_name'] ?? null,
+                    'account'  => $debt['og_account_num'] ?? null,
+                    'balance'  => $debt['current_debt_amount'] ?? null,
+                    'enrolled' => $debt['enrolled'] ?? null,
+                ],
             ]);
         }
 
@@ -145,19 +157,4 @@ final class RemoveCreditorAndDecreaseTermAction implements PmodActionHandler
      * @param list<array<string, mixed>> $debts
      * @return array<string, mixed>|null
      */
-    private function findDebt(array $debts, ?string $creditorName, ?string $creditorId): ?array
-    {
-        foreach ($debts as $debt) {
-            if ($creditorId !== null && (string) ($debt['id'] ?? '') === $creditorId) {
-                return $debt;
-            }
-            if ($creditorName !== null) {
-                $name = strtolower(trim((string) ($debt['creditor']['company_name'] ?? $debt['creditor_name'] ?? '')));
-                if ($name === strtolower(trim($creditorName))) {
-                    return $debt;
-                }
-            }
-        }
-        return null;
-    }
 }

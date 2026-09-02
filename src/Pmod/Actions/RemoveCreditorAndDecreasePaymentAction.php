@@ -9,6 +9,7 @@ use Cmd\Reports\Pmod\Contracts\PmodExecutionGateway;
 use Cmd\Reports\Pmod\Data\PmodResult;
 use Cmd\Reports\Pmod\Data\PmodWorkItem;
 use Cmd\Reports\Pmod\Enums\PmodActionType;
+use Cmd\Reports\Pmod\Support\PmodDebtMatcher;
 
 final class RemoveCreditorAndDecreasePaymentAction implements PmodActionHandler
 {
@@ -38,31 +39,46 @@ final class RemoveCreditorAndDecreasePaymentAction implements PmodActionHandler
             return $this->capture($workItem, 'Remove Creditor and Decrease Payment requires a valid new payment amount.', ['reason' => 'invalid_payment_amount', 'amount' => $newPaymentAmount]);
         }
 
+        // Find the debt BEFORE the live-updates gate. Reading the contact's debts
+        // is read-only and safe in a dry run, and doing it here is what makes a
+        // dry run worth running: the capture below reports the debt it WOULD have
+        // removed. With the lookup after the gate a dry run exercised none of the
+        // matching and proved nothing - the same trap fixed for the Add Creditor
+        // pair in §8.6.
+        $debts = $this->gateway->getContactDebts($workItem);
+        $match = PmodDebtMatcher::match($debts, $creditorChange);
+        $debt  = $match['debt'];
+
+        if ($debt === null) {
+            return $this->capture($workItem, sprintf('Remove Creditor and Decrease Payment could not identify a single debt for creditor [%s].', $creditorName ?? $creditorId), [
+                'reason'      => $match['reason'],
+                'creditor'    => $creditorName ?? $creditorId,
+                'debts_found' => count($debts),
+                'candidates'  => $match['candidates'],
+            ]);
+        }
+
+        $debtId = (string) ($debt['id'] ?? '');
+
         if (!$this->allowLiveDraftUpdates || $workItem->dryRun) {
             return $this->capture($workItem, 'Remove Creditor and Decrease Payment matched but live updates are disabled.', [
                 'reason'       => $workItem->dryRun ? 'dry_run_only' : 'live_draft_updates_disabled',
                 'creditor'     => $creditorName,
                 'new_payment'  => $newPaymentAmount,
+                'would_remove' => [
+                    'debt_id'  => $debtId,
+                    'creditor' => $debt['creditor']['company_name'] ?? null,
+                    'account'  => $debt['og_account_num'] ?? null,
+                    'balance'  => $debt['current_debt_amount'] ?? null,
+                    'enrolled' => $debt['enrolled'] ?? null,
+                ],
             ]);
         }
 
-        // Step 1: find the debt on the contact
-        $debts  = $this->gateway->getContactDebts($workItem);
-        $debt   = $this->findDebt($debts, $creditorName, $creditorId);
-
-        if ($debt === null) {
-            return $this->capture($workItem, sprintf('Remove Creditor and Decrease Payment could not find debt for creditor [%s].', $creditorName ?? $creditorId), [
-                'reason'      => 'debt_not_found',
-                'creditor'    => $creditorName ?? $creditorId,
-                'debts_found' => count($debts),
-            ]);
-        }
-
-        // Step 2: cancel the debt — if this throws, nothing else runs
-        $debtId     = (string) ($debt['id'] ?? '');
+        // Cancel the debt — if this throws, nothing else runs
         $cancelResult = $this->gateway->cancelDebt($workItem, $debtId);
 
-        // Step 3: update all future active type-D drafts to the new lower amount
+        // Update all future active type-D drafts to the new lower amount
         $transactions  = $this->gateway->getContactTransactions($workItem);
         $today         = now()->toDateString();
         $updateResults = [];
@@ -136,23 +152,4 @@ final class RemoveCreditorAndDecreasePaymentAction implements PmodActionHandler
         );
     }
 
-    /**
-     * @param list<array<string, mixed>> $debts
-     * @return array<string, mixed>|null
-     */
-    private function findDebt(array $debts, ?string $creditorName, ?string $creditorId): ?array
-    {
-        foreach ($debts as $debt) {
-            if ($creditorId !== null && (string) ($debt['id'] ?? '') === $creditorId) {
-                return $debt;
-            }
-            if ($creditorName !== null) {
-                $name = strtolower(trim((string) ($debt['creditor']['company_name'] ?? $debt['creditor_name'] ?? '')));
-                if ($name === strtolower(trim($creditorName))) {
-                    return $debt;
-                }
-            }
-        }
-        return null;
-    }
 }
