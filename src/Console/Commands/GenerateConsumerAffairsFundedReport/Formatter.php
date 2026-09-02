@@ -213,15 +213,14 @@ class Formatter
     }
 
     /**
-     * Notes / Product_Info is one blob with labeled pieces, e.g.
-     * "Loan Company: Acme | Loan Amount: $12,000 | APR: 9.99% | Loan Term: 36 Months".
-     * Split into separate report columns.
+     * Notes / Product_Info blob, e.g.
+     * "Personal Loan funded by: SoFi Loan Amount: $12,000 APR: 9.99% Loan Term: 36 Months"
      *
      * @return array{loan_company: string, loan_amount: string, apr: string}
      */
     private function parseProductInfo(string $notes): array
     {
-        $notes = trim($notes);
+        $notes = trim(preg_replace('/\s+/', ' ', $notes) ?? '');
         $parsed = [
             'loan_company' => '',
             'loan_amount' => '',
@@ -232,17 +231,18 @@ class Formatter
             return $parsed;
         }
 
+        // Company: "Personal Loan funded by: X" (actual Notes wording) or Loan Company / Lender
         $parsed['loan_company'] = $this->matchLabeledValue(
             $notes,
-            '/(?:Loan\s*Company|Lender|Company)\s*:\s*(.+?)(?=\s*(?:\||Loan\s*Amount|Amount|APR|Loan\s*Term|$))/is'
+            '/(?:funded\s+by|Loan\s*Company|Lender)\s*:\s*(.+?)(?=\s*(?:Loan\s*Amount|Amount\s*:|APR\s*:|Interest\s*Rate\s*:|Loan\s*Term|$))/i'
         );
         $parsed['loan_amount'] = $this->matchLabeledValue(
             $notes,
-            '/(?:Loan\s*Amount|Amount)\s*:\s*(.+?)(?=\s*(?:\||APR|Loan\s*Term|Loan\s*Company|Lender|$))/is'
+            '/(?:Loan\s*Amount|Amount)\s*:\s*(.+?)(?=\s*(?:APR\s*:|Interest\s*Rate\s*:|Loan\s*Term|funded\s+by|Loan\s*Company|Lender|$))/i'
         );
         $parsed['apr'] = $this->matchLabeledValue(
             $notes,
-            '/APR\s*:\s*(.+?)(?=\s*(?:\||Loan\s*Term|Loan\s*Amount|Amount|Loan\s*Company|Lender|$))/is'
+            '/APR\s*:\s*(.+?)(?=\s*(?:Interest\s*Rate\s*:|Loan\s*Term|Loan\s*Amount|Amount\s*:|funded\s+by|Loan\s*Company|Lender|$))/i'
         );
 
         return $parsed;
@@ -254,7 +254,7 @@ class Formatter
             return '';
         }
 
-        return trim(preg_replace('/\s+/', ' ', (string) ($matches[1] ?? '')));
+        return trim((string) ($matches[1] ?? ''), " \t\n\r\0\x0B|,;");
     }
 
     private function splitName(string $fullName): array
