@@ -83,6 +83,8 @@ final class ProcessPmodWorkItemJob implements ShouldQueue, ShouldBeUnique
                     'contact_id'      => $this->workItem->contactId,
                 ]);
 
+                $this->markDuplicateIgnored();
+
                 return;
             }
 
@@ -174,6 +176,63 @@ final class ProcessPmodWorkItemJob implements ShouldQueue, ShouldBeUnique
     }
 
     /**
+     * Put the tracking row back to the outcome the FIRST run reached.
+     *
+     * PmodTrackingWebhookController re-stamps the row `received` then `accepted`
+     * on every delivery, so after a duplicate the row reads `accepted` while
+     * carrying a `result_type` from the original run. `pmod:alert-unprocessed`
+     * scans exactly that status and would email a "PMOD request not processed"
+     * alert for work that was completed and then correctly ignored. Verified live
+     * 2026-09-01: attempts=2, status=accepted, result_type=captured_for_manual_review.
+     *
+     * False alarms are not harmless here - the legacy check-in alarm was silenced
+     * with a 2030 sentinel rather than fixed (§8.8), and that is how nine weeks of
+     * outage went unnoticed.
+     */
+    private function markDuplicateIgnored(): void
+    {
+        try {
+            $schema = DB::getSchemaBuilder();
+
+            if (! $schema->hasTable('pmod_requests') || ! $schema->hasColumn('pmod_requests', 'result_type')) {
+                return;
+            }
+
+            $row = DB::table('pmod_requests')
+                ->where('idempotency_key', $this->workItem->idempotencyKey)
+                ->first();
+
+            $resultType = $row->result_type ?? null;
+
+            if (! is_string($resultType) || $resultType === '') {
+                return;
+            }
+
+            DB::table('pmod_requests')
+                ->where('idempotency_key', $this->workItem->idempotencyKey)
+                ->update([
+                    'status' => $this->statusForResult($resultType),
+                    'updated_at' => now(),
+                ]);
+        } catch (Throwable $e) {
+            Log::warning('Could not restore the tracked status of an ignored duplicate PMOD request.', [
+                'idempotency_key' => $this->workItem->idempotencyKey,
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    /** The `pmod_requests.status` that corresponds to a dispatcher result. */
+    private function statusForResult(string $resultType): string
+    {
+        return match (true) {
+            in_array($resultType, ['updated', 'success'], true) => 'processed',
+            $resultType === 'captured_for_manual_review' => 'captured',
+            default => 'failed',
+        };
+    }
+
+    /**
      * @param array<string, mixed> $metadata
      */
     private function updateTrackedRequest(string $status, string $message, array $metadata, bool $notified): void
@@ -186,7 +245,7 @@ final class ProcessPmodWorkItemJob implements ShouldQueue, ShouldBeUnique
             DB::table('pmod_requests')
                 ->where('idempotency_key', $this->workItem->idempotencyKey)
                 ->update([
-                    'status' => in_array($status, ['updated', 'success'], true) ? 'processed' : ($status === 'captured_for_manual_review' ? 'captured' : 'failed'),
+                    'status' => $this->statusForResult($status),
                     'result_type' => $status,
                     'failure_type' => $metadata['failure_type'] ?? $metadata['reason'] ?? null,
                     'notification_status' => $notified ? 'sent' : 'not_sent',

@@ -9,14 +9,14 @@ use Cmd\Reports\Pmod\Contracts\PmodExecutionGateway;
 use Cmd\Reports\Pmod\Data\PmodResult;
 use Cmd\Reports\Pmod\Data\PmodWorkItem;
 use Cmd\Reports\Pmod\Enums\PmodActionType;
+use Cmd\Reports\Pmod\Support\PmodDebtMatcher;
 
 final class RemoveCreditorAndDecreaseTermAction implements PmodActionHandler
 {
     public function __construct(
         private readonly PmodExecutionGateway $gateway,
         private readonly bool $allowLiveDraftUpdates = false,
-    ) {
-    }
+    ) {}
 
     public function actionType(): PmodActionType
     {
@@ -41,23 +41,34 @@ final class RemoveCreditorAndDecreaseTermAction implements PmodActionHandler
             ]);
         }
 
+        // Matched BEFORE the live-updates gate so a dry run proves which debt would
+        // be removed; reading debts is read-only. See §8.6 for the same fix on the
+        // Add Creditor pair.
+        $debts = $this->gateway->getContactDebts($workItem);
+        $match = PmodDebtMatcher::match($debts, $creditorChange);
+        $debt  = $match['debt'];
+
+        if ($debt === null) {
+            return $this->capture($workItem, sprintf('Remove Creditor and Decrease Term could not identify a single debt for creditor [%s].', $creditorName ?? $creditorId), [
+                'reason'      => $match['reason'],
+                'creditor'    => $creditorName ?? $creditorId,
+                'debts_found' => count($debts),
+                'candidates'  => $match['candidates'],
+            ]);
+        }
+
         if (!$this->allowLiveDraftUpdates || $workItem->dryRun) {
             return $this->capture($workItem, 'Remove Creditor and Decrease Term matched but live updates are disabled.', [
                 'reason'             => $workItem->dryRun ? 'dry_run_only' : 'live_draft_updates_disabled',
                 'creditor'           => $creditorName,
                 'months_to_decrease' => $monthsToDecrease,
-            ]);
-        }
-
-        // Step 1: find the debt — throws if CRM unreachable
-        $debts = $this->gateway->getContactDebts($workItem);
-        $debt  = $this->findDebt($debts, $creditorName, $creditorId);
-
-        if ($debt === null) {
-            return $this->capture($workItem, sprintf('Remove Creditor and Decrease Term could not find debt for creditor [%s].', $creditorName ?? $creditorId), [
-                'reason'      => 'debt_not_found',
-                'creditor'    => $creditorName ?? $creditorId,
-                'debts_found' => count($debts),
+                'would_remove'       => [
+                    'debt_id'  => $debt['id'] ?? null,
+                    'creditor' => $debt['creditor']['company_name'] ?? null,
+                    'account'  => $debt['og_account_num'] ?? null,
+                    'balance'  => $debt['current_debt_amount'] ?? null,
+                    'enrolled' => $debt['enrolled'] ?? null,
+                ],
             ]);
         }
 
@@ -73,10 +84,10 @@ final class RemoveCreditorAndDecreaseTermAction implements PmodActionHandler
             $transactions,
             // Excludes already-cancelled drafts - Forth keeps active = 1 on them, so
             // this would otherwise try to cancel drafts that are already cancelled.
-            fn ($t) => ($t['type'] ?? '') === 'D' && ($t['active'] ?? '') === '1' && empty($t['cancelled']) && ($t['process_date'] ?? '') >= $today,
+            fn($t) => ($t['type'] ?? '') === 'D' && ($t['active'] ?? '') === '1' && empty($t['cancelled']) && ($t['process_date'] ?? '') >= $today,
         ));
 
-        usort($futureDrafts, fn ($a, $b) => strcmp($a['process_date'] ?? '', $b['process_date'] ?? ''));
+        usort($futureDrafts, fn($a, $b) => strcmp($a['process_date'] ?? '', $b['process_date'] ?? ''));
 
         $toCancel     = array_slice($futureDrafts, -min($monthsToDecrease, count($futureDrafts)));
         $cancelResults = [];
@@ -109,8 +120,8 @@ final class RemoveCreditorAndDecreaseTermAction implements PmodActionHandler
         $this->gateway->createContactNote($workItem, implode("\n", $noteLines));
 
         return new PmodResult(
-            status:   empty($cancelErrors) ? 'updated' : 'captured_for_manual_review',
-            message:  sprintf('Remove Creditor and Decrease Term: debt cancelled, %d draft(s) removed for contact [%s].', count($cancelResults), $workItem->contactId),
+            status: empty($cancelErrors) ? 'updated' : 'captured_for_manual_review',
+            message: sprintf('Remove Creditor and Decrease Term: debt cancelled, %d draft(s) removed for contact [%s].', count($cancelResults), $workItem->contactId),
             metadata: [
                 'action_type'       => $workItem->actionType->value,
                 'contact_id'        => $workItem->contactId,
@@ -135,8 +146,8 @@ final class RemoveCreditorAndDecreaseTermAction implements PmodActionHandler
         ]));
 
         return new PmodResult(
-            status:   'captured_for_manual_review',
-            message:  $message,
+            status: 'captured_for_manual_review',
+            message: $message,
             metadata: [...$metadata, 'action_type' => $workItem->actionType->value, 'contact_id' => $workItem->contactId],
         );
     }
@@ -145,19 +156,4 @@ final class RemoveCreditorAndDecreaseTermAction implements PmodActionHandler
      * @param list<array<string, mixed>> $debts
      * @return array<string, mixed>|null
      */
-    private function findDebt(array $debts, ?string $creditorName, ?string $creditorId): ?array
-    {
-        foreach ($debts as $debt) {
-            if ($creditorId !== null && (string) ($debt['id'] ?? '') === $creditorId) {
-                return $debt;
-            }
-            if ($creditorName !== null) {
-                $name = strtolower(trim((string) ($debt['creditor']['company_name'] ?? $debt['creditor_name'] ?? '')));
-                if ($name === strtolower(trim($creditorName))) {
-                    return $debt;
-                }
-            }
-        }
-        return null;
-    }
 }

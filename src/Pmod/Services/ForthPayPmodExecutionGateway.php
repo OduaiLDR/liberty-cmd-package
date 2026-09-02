@@ -706,33 +706,57 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCr
 
         // Token health first: a 404 here means the token is stale
         // (refresh:forth-api-tokens), not that the paths below are wrong.
-        $call('token health', 'GET', '/contact-stages',
-            fn () => $this->crmClient($tenantId)->get('/contact-stages'));
+        $call(
+            'token health',
+            'GET',
+            '/contact-stages',
+            fn() => $this->crmClient($tenantId)->get('/contact-stages')
+        );
 
-        $call('contact resolves', 'GET', "/contacts/{$contactId}",
-            fn () => $this->crmClient($tenantId)->get("/contacts/{$contactId}"));
+        $call(
+            'contact resolves',
+            'GET',
+            "/contacts/{$contactId}",
+            fn() => $this->crmClient($tenantId)->get("/contacts/{$contactId}")
+        );
 
         // Both Remove Creditor actions call this before cancelling a debt.
-        $call('list debts (remove-creditor step 1)', 'GET', "/contacts/{$contactId}/debts",
-            fn () => $this->crmClient($tenantId)->get("/contacts/{$contactId}/debts"));
+        $call(
+            'list debts (remove-creditor step 1)',
+            'GET',
+            "/contacts/{$contactId}/debts",
+            fn() => $this->crmClient($tenantId)->get("/contacts/{$contactId}/debts")
+        );
 
         // Does a creditor catalogue exist? Both Add Creditor actions hard-require
         // a Forth creditor_id and capture without one, so if portals only send a
         // creditor name we need a name -> id lookup before they can go live.
-        $call('creditor catalogue (name -> id lookup)', 'GET', '/creditors',
-            fn () => $this->crmClient($tenantId)->get('/creditors'));
+        $call(
+            'creditor catalogue (name -> id lookup)',
+            'GET',
+            '/creditors',
+            fn() => $this->crmClient($tenantId)->get('/creditors')
+        );
 
         // addBankAccount() targets this resource. A GET establishes whether it
         // exists at all without writing anything.
-        $call('bank account resource', 'GET', "/contacts/{$contactId}/bank-account",
-            fn () => $this->crmClient($tenantId)->get("/contacts/{$contactId}/bank-account"));
+        $call(
+            'bank account resource',
+            'GET',
+            "/contacts/{$contactId}/bank-account",
+            fn() => $this->crmClient($tenantId)->get("/contacts/{$contactId}/bank-account")
+        );
 
         // Void Settlement is note-only too, and voidSettlementOffer() is the
         // same call PmodLumpSumAction and SkipPaymentAction make on their live
         // path when settlement ids are present - so this path matters beyond
         // the note-only action itself, and has never been confirmed either.
-        $settlements = $call('list settlements', 'GET', "/contacts/{$contactId}/settlements",
-            fn () => $this->crmClient($tenantId)->get("/contacts/{$contactId}/settlements"));
+        $settlements = $call(
+            'list settlements',
+            'GET',
+            "/contacts/{$contactId}/settlements",
+            fn() => $this->crmClient($tenantId)->get("/contacts/{$contactId}/settlements")
+        );
 
         // A void cannot be undone, so there is no safe write probe for it.
         // There is no safe read-only substitute: Forth answers 404 for a wrong VERB
@@ -744,8 +768,12 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCr
             ?? null;
 
         if ($settlementId !== null) {
-            $call('void route (GET - inconclusive, see note)', 'GET', "/settlements/{$settlementId}/void",
-                fn () => $this->crmClient($tenantId)->get("/settlements/{$settlementId}/void"));
+            $call(
+                'void route (GET - inconclusive, see note)',
+                'GET',
+                "/settlements/{$settlementId}/void",
+                fn() => $this->crmClient($tenantId)->get("/settlements/{$settlementId}/void")
+            );
         } else {
             $out['checks'][] = [
                 'label'  => 'void route (GET - inconclusive, see note)',
@@ -761,19 +789,27 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCr
             // 'creditor' is omitted on purpose: createDebt() sends it as the Forth
             // creditor id, which we do not have here. If the path is live, Forth's
             // 400 names the fields it wants - which is exactly what we are after.
-            $created = $call('create debt (add-creditor step 1)', 'POST', '/debts',
-                fn () => $this->crmClient($tenantId)->post('/debts', [
+            $created = $call(
+                'create debt (add-creditor step 1)',
+                'POST',
+                '/debts',
+                fn() => $this->crmClient($tenantId)->post('/debts', [
                     'client_id'       => $contactId,
                     'account_number'  => 'PMOD-PROBE',
                     'balance'         => '1.00',
                     'original_amount' => '1.00',
-                ]));
+                ])
+            );
 
             $debtId = $created['response']['id'] ?? $created['id'] ?? $created['debt_id'] ?? null;
 
             if ($debtId !== null) {
-                $call('delete probe debt (cleanup)', 'DELETE', "/debts/{$debtId}",
-                    fn () => $this->crmClient($tenantId)->delete("/debts/{$debtId}"));
+                $call(
+                    'delete probe debt (cleanup)',
+                    'DELETE',
+                    "/debts/{$debtId}",
+                    fn() => $this->crmClient($tenantId)->delete("/debts/{$debtId}")
+                );
             } else {
                 $out['checks'][] = [
                     'label'  => 'delete probe debt (cleanup)',
@@ -787,11 +823,19 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCr
 
         // --- ACTION: banking write paths, empty body so nothing can be set ---
         if ($executeBanking) {
-            $call('bank account write (PUT, empty body)', 'PUT', "/contacts/{$contactId}/bank-account",
-                fn () => $this->crmClient($tenantId)->put("/contacts/{$contactId}/bank-account", []));
+            $call(
+                'bank account write (PUT, empty body)',
+                'PUT',
+                "/contacts/{$contactId}/bank-account",
+                fn() => $this->crmClient($tenantId)->put("/contacts/{$contactId}/bank-account", [])
+            );
 
-            $call('bank account write (POST, empty body)', 'POST', "/contacts/{$contactId}/bank-account",
-                fn () => $this->crmClient($tenantId)->post("/contacts/{$contactId}/bank-account", []));
+            $call(
+                'bank account write (POST, empty body)',
+                'POST',
+                "/contacts/{$contactId}/bank-account",
+                fn() => $this->crmClient($tenantId)->post("/contacts/{$contactId}/bank-account", [])
+            );
         }
 
         Log::info('PMOD: probeCreditorAndBankingEndpoints', $out);
@@ -1048,7 +1092,34 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCr
             return [];
         }
 
-        return $response->json('response.results', []);
+        // Forth returns the debts as a bare LIST under `response`, not wrapped in
+        // `results`. Measured against production 2026-09-02 on PLAW contact
+        // 462464571: {"response":[{"object":"debt","id":"148442930",...}],"status":...}.
+        //
+        // This read `response.results` and therefore returned [] on EVERY call, so
+        // both Remove Creditor actions reported debt_not_found no matter what the
+        // contact carried. Silent, because an empty list is also what a contact
+        // with no debts looks like.
+        //
+        // `results` is still honoured in case any tenant or a future version wraps
+        // it - preferring the list keeps today's behaviour exact.
+        $payload = $response->json('response');
+
+        if (is_array($payload) && array_is_list($payload)) {
+            return $payload;
+        }
+
+        if (is_array($payload) && is_array($payload['results'] ?? null)) {
+            return array_values($payload['results']);
+        }
+
+        Log::warning('PMOD: contact debts response was not in a recognised shape', [
+            'contact_id' => $workItem->contactId,
+            'type'       => get_debug_type($payload),
+            'keys'       => is_array($payload) ? array_slice(array_keys($payload), 0, 10) : [],
+        ]);
+
+        return [];
     }
 
     public function getContactSummary(PmodWorkItem $workItem): array
@@ -1280,7 +1351,9 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCr
             }
 
             Log::warning('PMOD: payload creditor_id is not in the Forth catalogue, ignoring it', [
-                'tenant' => $tenantId, 'claimed_creditor_id' => $claimedId, 'creditor_name' => $creditorName,
+                'tenant' => $tenantId,
+                'claimed_creditor_id' => $claimedId,
+                'creditor_name' => $creditorName,
             ]);
         }
 
@@ -1320,14 +1393,18 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCr
         if (isset($names[$needle])) {
             if (count($names[$needle]) === 1) {
                 Log::info('PMOD: creditor resolved by exact name', [
-                    'tenant' => $tenantId, 'name' => $creditorName, 'creditor_id' => $names[$needle][0],
+                    'tenant' => $tenantId,
+                    'name' => $creditorName,
+                    'creditor_id' => $names[$needle][0],
                 ]);
 
                 return $names[$needle][0];
             }
 
             Log::warning('PMOD: creditor name is ambiguous, refusing to guess', [
-                'tenant' => $tenantId, 'name' => $creditorName, 'candidates' => $names[$needle],
+                'tenant' => $tenantId,
+                'name' => $creditorName,
+                'candidates' => $names[$needle],
             ]);
 
             return null;
@@ -1354,14 +1431,19 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCr
             $id = (string) array_key_first($hits);
 
             Log::info('PMOD: creditor resolved by substring', [
-                'tenant' => $tenantId, 'name' => $creditorName, 'matched' => reset($hits), 'creditor_id' => $id,
+                'tenant' => $tenantId,
+                'name' => $creditorName,
+                'matched' => reset($hits),
+                'creditor_id' => $id,
             ]);
 
             return $id;
         }
 
         Log::warning('PMOD: creditor could not be resolved', [
-            'tenant' => $tenantId, 'name' => $creditorName, 'match_count' => count($hits),
+            'tenant' => $tenantId,
+            'name' => $creditorName,
+            'match_count' => count($hits),
             'candidates' => array_slice($hits, 0, 5, true),
         ]);
 
@@ -1437,13 +1519,17 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCr
 
             if ($expected !== null && count($ids) < $expected) {
                 Log::warning('PMOD: creditor catalogue incomplete - names may fail to resolve', [
-                    'tenant' => $tenantId, 'fetched' => count($ids), 'total_reported' => $expected,
+                    'tenant' => $tenantId,
+                    'fetched' => count($ids),
+                    'total_reported' => $expected,
                 ]);
             }
 
             Log::info('PMOD: creditor catalogue loaded', [
-                'tenant' => $tenantId, 'creditors' => count($ids),
-                'distinct_names' => count($names), 'total_reported' => $expected,
+                'tenant' => $tenantId,
+                'creditors' => count($ids),
+                'distinct_names' => count($names),
+                'total_reported' => $expected,
             ]);
 
             return ['names' => $names, 'ids' => $ids];
@@ -1469,8 +1555,10 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCr
 
         if (! $response->successful()) {
             Log::error('PMOD: Failed to list creditors', [
-                'tenant_id' => $tenantId, 'page_no' => $pageNo,
-                'status' => $response->status(), 'response' => mb_substr($response->body(), 0, 300),
+                'tenant_id' => $tenantId,
+                'page_no' => $pageNo,
+                'status' => $response->status(),
+                'response' => mb_substr($response->body(), 0, 300),
             ]);
 
             return [[], null];
