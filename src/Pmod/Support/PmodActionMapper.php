@@ -14,6 +14,13 @@ final class PmodActionMapper
         $normalized = strtoupper(trim($action));
         $normalized = preg_replace('/^ACTION\s*:\s*/i', '', $normalized) ?? $normalized;
 
+        // Collapse runs of whitespace. The client portal really does send
+        // "Reschedule  Payment" with two spaces - 22 times between 2026-06-28 and
+        // 09-02, measured in READER.CONTACTS_NOTES - and fromLabel() THROWS on an
+        // unknown label, so each of those would have 422'd at the door. A second
+        // space is not a different action.
+        $normalized = trim(preg_replace('/\s+/', ' ', $normalized) ?? $normalized);
+
         return match ($normalized) {
             'MAKE AN ADDITIONAL PAYMENT', 'MAKE ADDITIONAL PAYMENT', 'ADDITIONAL PAYMENT', 'ADDITIONAL_PAYMENT' => PmodActionType::ADDITIONAL_PAYMENT,
             'RESCHEDULE PAYMENT', 'CHANGE PAYMENT', 'CHANGE_PAYMENT' => PmodActionType::CHANGE_PAYMENT,
