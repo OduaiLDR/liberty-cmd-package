@@ -16,8 +16,7 @@ final class RemoveCreditorAndDecreaseTermAction implements PmodActionHandler
     public function __construct(
         private readonly PmodExecutionGateway $gateway,
         private readonly bool $allowLiveDraftUpdates = false,
-    ) {
-    }
+    ) {}
 
     public function actionType(): PmodActionType
     {
@@ -113,8 +112,8 @@ final class RemoveCreditorAndDecreaseTermAction implements PmodActionHandler
         $this->gateway->createContactNote($workItem, implode("\n", $noteLines));
 
         return new PmodResult(
-            status:   'updated',
-            message:  sprintf('Remove Creditor and Decrease Term: creditor excluded from the program for contact [%s]; the draft schedule is unchanged.', $workItem->contactId),
+            status: 'updated',
+            message: sprintf('Remove Creditor and Decrease Term: creditor excluded from the program for contact [%s]; the draft schedule is unchanged.', $workItem->contactId),
             metadata: [
                 'action_type'        => $workItem->actionType->value,
                 'contact_id'         => $workItem->contactId,
@@ -138,14 +137,9 @@ final class RemoveCreditorAndDecreaseTermAction implements PmodActionHandler
         ]));
 
         return new PmodResult(
-            status:   'captured_for_manual_review',
-            message:  $message,
+            status: 'captured_for_manual_review',
+            message: $message,
             metadata: [...$metadata, 'action_type' => $workItem->actionType->value, 'contact_id' => $workItem->contactId],
         );
     }
-
-    /**
-     * @param list<array<string, mixed>> $debts
-     * @return array<string, mixed>|null
-     */
 }
