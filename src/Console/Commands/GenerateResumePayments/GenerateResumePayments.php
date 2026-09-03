@@ -1323,16 +1323,24 @@ final class GenerateResumePayments extends Command
 
         $cidList = implode(',', array_map('intval', $contactIds));
 
+        // Tie-break on s.ID, and exclude soft-deleted rows. Measured 2026-09-03 on the LDR
+        // account: 4,638 contacts have several CONTACTS_STATUS rows sharing their newest STAMP,
+        // and 3,144 of those carry DIFFERENT titles at that stamp. Ordering by STAMP alone left
+        // "the current status" non-deterministic — it could come back differently for two queries
+        // in the SAME run (seen on LLG-1149763361), which in turn flips shouldSkipStatus(), the
+        // "already at this status" guard and cancelRoute() between runs. Highest ID = the
+        // last-inserted row = the real current status.
         $sql = "
             SELECT CONTACT_ID, TITLE
             FROM (
                 SELECT
                     s.CONTACT_ID AS CONTACT_ID,
                     cls.TITLE AS TITLE,
-                    ROW_NUMBER() OVER (PARTITION BY s.CONTACT_ID ORDER BY s.STAMP DESC) AS RN
+                    ROW_NUMBER() OVER (PARTITION BY s.CONTACT_ID ORDER BY s.STAMP DESC, s.ID DESC) AS RN
                 FROM CONTACTS_STATUS s
                 LEFT JOIN CONTACTS_LEAD_STATUS cls ON s.STATUS_ID = cls.ID
                 WHERE s.CONTACT_ID IN ({$cidList})
+                  AND s._FIVETRAN_DELETED = FALSE
             )
             WHERE RN = 1
         ";
