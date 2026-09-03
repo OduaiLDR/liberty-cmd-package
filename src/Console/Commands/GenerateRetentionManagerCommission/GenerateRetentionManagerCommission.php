@@ -50,6 +50,256 @@ class GenerateRetentionManagerCommission extends Command
 
     private bool $hadFailures = false;
 
+    private function reportInfo(string $message): void
+    {
+        try {
+            $this->info($message);
+        } catch (\Throwable) {
+            Log::info($message);
+        }
+    }
+
+    /**
+     * Return the same manager calculations used by the workbook command in a
+     * JSON-safe shape for Payroll Review.
+     *
+     * @return array{periodStart:string,periodEnd:string,reports:array<string,array<string,mixed>>}
+     */
+    public function buildPayrollReviewSnapshots(string $startDate, string $endDate): array
+    {
+        $retentionRows = $this->buildAllData($startDate, $endDate, true);
+        $nsfRows = $this->buildNsfRowsForAnthony($startDate, $endDate, true);
+
+        return [
+            'periodStart' => $startDate,
+            'periodEnd' => $endDate,
+            'reports' => [
+                'retention_manager' => $this->buildRamaPayrollSnapshot($retentionRows),
+                'retention_team_leader' => $this->buildNickPayrollSnapshot($retentionRows, $startDate, $endDate),
+                'nsf_team_leader' => $this->buildAnthonyPayrollSnapshot($nsfRows),
+            ],
+        ];
+    }
+
+    /** @param array<int,array<string,mixed>> $rows */
+    private function buildRamaPayrollSnapshot(array $rows): array
+    {
+        $all = $this->ramaBucket($rows, false);
+        $ngf = $this->ramaBucket($rows, true);
+        $commission = $this->ramaCommission($all['pct'], false);
+        $bonusCommission = $this->ramaCommission($ngf['pct'], true);
+
+        return [
+            'managerName' => 'Rama Davis',
+            'commissionType' => 'Retention & NSF Manager',
+            'company' => 'LDR / Progress Law',
+            'team' => $this->retentionTeamNames($rows),
+            'summary' => [
+                'assignedCount' => $all['assigned'],
+                'retainedCount' => $all['retained'],
+                'retentionRate' => $all['pct'],
+                'bonusAssignedCount' => $ngf['assigned'],
+                'bonusRetainedCount' => $ngf['retained'],
+                'bonusRate' => $ngf['pct'],
+                'commissionRateDisplay' => 'Tiered manager rate',
+                'commission' => $commission,
+                'bonusCommission' => $bonusCommission,
+                'totalCommission' => round($commission + $bonusCommission, 2),
+                'totalPay' => round($commission + $bonusCommission, 2),
+            ],
+            'lines' => $this->retentionTeamLines($rows),
+        ];
+    }
+
+    /** @param array<int,array<string,mixed>> $rows */
+    private function buildNickPayrollSnapshot(array $rows, string $startDate, string $endDate): array
+    {
+        $assigned = count($rows);
+        $retained = $this->retainedCount($rows);
+        $rate = $assigned > 0 ? $retained / $assigned : 0.0;
+        $tier = $this->nickTier($rate);
+        $commission = $this->computeNickCommission($rows);
+
+        return [
+            'managerName' => 'Nick Jones',
+            'commissionType' => 'Retention Team Leader',
+            'company' => 'LDR / Progress Law',
+            'team' => $this->retentionTeamNames($rows),
+            'summary' => [
+                'assignedCount' => $assigned,
+                'retainedCount' => $retained,
+                'retentionRate' => $rate,
+                'tier' => $tier,
+                'commissionRate' => $tier > 0 ? $this->nickRateForTier($tier, 0) : 0,
+                'commissionRateDisplay' => $tier > 0 ? '$' . number_format($this->nickRateForTier($tier, 0), 2) . '+ per retained account' : '$0.00',
+                'totalCommission' => round($commission, 2),
+                'totalPay' => round($commission, 2),
+            ],
+            'lines' => $this->retentionTeamLines($rows, $startDate, $endDate, $rate),
+        ];
+    }
+
+    /** @param array<int,array<string,mixed>> $rows */
+    private function buildAnthonyPayrollSnapshot(array $rows): array
+    {
+        $byAgent = $this->buildAnthonyStats($rows);
+        $rosterKeys = [];
+        foreach (self::ANTHONY_NSF_ROSTER as $name) {
+            $key = $this->anthonyAgentKey($name);
+            if ($key !== '') {
+                $rosterKeys[$key] = true;
+            }
+        }
+
+        $team = [];
+        foreach (self::ANTHONY_NSF_ROSTER as $name) {
+            $key = $this->anthonyAgentKey($name);
+            if ($key === '' || isset($team[$key])) {
+                continue;
+            }
+            $team[$key] = [
+                'employeeName' => $name,
+                'source' => isset($byAgent[$key]['sources']) ? implode(' / ', array_keys($byAgent[$key]['sources'])) : 'LDR / Progress Law',
+                'company' => 'LDR / Progress Law',
+                'assignedCount' => $byAgent[$key]['assignments'] ?? 0,
+                'actionCount' => $byAgent[$key]['actions'] ?? 0,
+                'clearCount' => $byAgent[$key]['clears'] ?? 0,
+            ];
+        }
+
+        $totalAssignments = 0;
+        $totalActions = 0;
+        $totalClears = 0;
+        foreach ($byAgent as $key => $stats) {
+            if (!isset($rosterKeys[$key])) {
+                continue;
+            }
+            $totalAssignments += $stats['assignments'];
+            $totalActions += $stats['actions'];
+            $totalClears += $stats['clears'];
+        }
+        $ratio = $totalAssignments > 0 ? $totalActions / $totalAssignments : 0.0;
+        $rate = $this->anthonyRate($ratio, (float) $totalClears);
+        $commission = round($totalClears * $rate, 2);
+
+        return [
+            'managerName' => 'Anthony Clark',
+            'commissionType' => 'NSF Team Leader',
+            'company' => 'LDR / Progress Law',
+            'team' => array_values($team),
+            'summary' => [
+                'assignedCount' => $totalAssignments,
+                'actionCount' => $totalActions,
+                'clearCount' => $totalClears,
+                'actionRatio' => $ratio,
+                'commissionRate' => $rate,
+                'commissionRateDisplay' => number_format($rate * 100, 2) . '% of valid clears',
+                'totalCommission' => $commission,
+                'totalPay' => $commission,
+            ],
+            'lines' => array_values($team),
+        ];
+    }
+
+    /** @param array<int,array<string,mixed>> $rows */
+    private function retentionTeamNames(array $rows): array
+    {
+        $names = [];
+        foreach ($rows as $row) {
+            $name = trim((string) $this->col($row, 'RETENTION_AGENT', ''));
+            if ($name !== '') {
+                $names[strtoupper($name)] = $name;
+            }
+        }
+
+        return array_values($names);
+    }
+
+    /**
+     * @param array<int,array<string,mixed>> $rows
+     * @return array<int,array<string,mixed>>
+     */
+    private function retentionTeamLines(
+        array $rows,
+        string $startDate = '',
+        string $endDate = '',
+        ?float $nickRateBasis = null
+    ): array {
+        $groups = [];
+        foreach ($rows as $row) {
+            $employeeName = trim((string) $this->col($row, 'RETENTION_AGENT', ''));
+            if ($employeeName === '') {
+                continue;
+            }
+            $source = trim((string) $this->col($row, 'SOURCE', ''));
+            $key = strtoupper($source . '|' . $employeeName);
+            $groups[$key] ??= [
+                'employeeName' => $employeeName,
+                'source' => $source,
+                'company' => $source !== '' ? $source : 'LDR / Progress Law',
+                'location' => $this->col($row, 'LOCATION'),
+                'assignedCount' => 0,
+                'retainedCount' => 0,
+                'commissionTotal' => 0.0,
+            ];
+            $groups[$key]['assignedCount']++;
+            $retained = strtoupper((string) $this->col($row, 'IMMEDIATE_RESULTS', '')) === 'RETAINED';
+            if ($retained) {
+                $groups[$key]['retainedCount']++;
+            }
+            if ($nickRateBasis !== null && $retained) {
+                $paymentDate = $this->toDate($this->col($row, 'RETENTION_PAYMENT_DATE'));
+                if ($paymentDate !== null && $paymentDate >= $startDate && $paymentDate <= $endDate) {
+                    $groups[$key]['commissionTotal'] += $this->nickCommissionRate(
+                        (float) $this->col($row, 'ENROLLED_DEBT', 0),
+                        $nickRateBasis
+                    );
+                }
+            }
+        }
+
+        foreach ($groups as &$group) {
+            $group['commissionTotal'] = round((float) $group['commissionTotal'], 2);
+        }
+        unset($group);
+
+        return array_values($groups);
+    }
+
+    /** @param array<int,array<string,mixed>> $rows */
+    private function buildAnthonyStats(array $rows): array
+    {
+        $byAgent = [];
+        foreach ($rows as $row) {
+            $agent = trim((string) ($row['AGENT'] ?? $row['agent'] ?? ''));
+            if ($agent === '') {
+                continue;
+            }
+            $key = $this->anthonyAgentKey($agent);
+            if ($key === '') {
+                continue;
+            }
+            $byAgent[$key] ??= ['assignments' => 0, 'actions' => 0, 'clears' => 0, 'sources' => []];
+            $byAgent[$key]['assignments']++;
+            $source = trim((string) ($row['SOURCE'] ?? ''));
+            if ($source !== '') {
+                $byAgent[$key]['sources'][$source] = true;
+            }
+            if (trim((string) ($row['NSF_ACTION'] ?? $row['nsf_action'] ?? '')) !== '') {
+                $byAgent[$key]['actions']++;
+            }
+            if ($this->isValidCommission(
+                $row['NSF_RETURNED_DATE'] ?? $row['nsf_returned_date'] ?? null,
+                $row['NSF_RECOUP_DATE'] ?? $row['nsf_recoup_date'] ?? null,
+                $row['CLEARED_DATE'] ?? $row['cleared_date'] ?? null,
+            )) {
+                $byAgent[$key]['clears']++;
+            }
+        }
+
+        return $byAgent;
+    }
+
     private const SOURCE_CONFIG = [
         'ldr' => [
             'display'               => 'LDR',
@@ -147,7 +397,7 @@ class GenerateRetentionManagerCommission extends Command
         $periodArg = (string) ($this->argument('period') ?? '');
         $startDate = $periodArg !== '' ? date('Y-m-01', strtotime($periodArg)) : date('Y-m-01', strtotime('first day of last month'));
         $endDate   = date('Y-m-t', strtotime($startDate));
-        $this->info("[INFO] Period: {$startDate} → {$endDate}");
+        $this->reportInfo("[INFO] Period: {$startDate} → {$endDate}");
 
         if ($report === 'reconcile') {
             return $this->runReconcile($startDate, $endDate);
@@ -184,32 +434,32 @@ class GenerateRetentionManagerCommission extends Command
     }
 
     /** @return array<int,array<string,mixed>> */
-    private function buildAllData(string $startDate, string $endDate): array
+    private function buildAllData(string $startDate, string $endDate, bool $requireSnapshots = false): array
     {
-        $allDataXlsx = (string) ($this->option('all-data-xlsx') ?? '');
+        $allDataXlsx = $requireSnapshots ? '' : (string) ($this->option('all-data-xlsx') ?? '');
         if ($allDataXlsx !== '') {
             $sheetName = (string) ($this->option('all-data-sheet') ?? '');
-            $this->info('[INFO] Loading existing manager first-tab data as All Data test source');
+            $this->reportInfo('[INFO] Loading existing manager first-tab data as All Data test source');
             $all = $this->loadManagerAllDataRowsFromXlsx($allDataXlsx, $sheetName !== '' ? $sheetName : null);
             $all = $this->filterRetentionRowsForPeriod($all, $startDate, $endDate);
             if (!$this->rowsAlreadyHaveBonusData($all)) {
                 $this->applyTrancheAssignments($all);
             }
-            $this->info('[INFO] Existing All Data rows after period filter: ' . count($all));
+            $this->reportInfo('[INFO] Existing All Data rows after period filter: ' . count($all));
 
             return $all;
         }
 
-        $ldrReport = (string) ($this->option('retention-ldr') ?? '');
-        $plawReport = (string) ($this->option('retention-plaw') ?? '');
+        $ldrReport = $requireSnapshots ? '' : (string) ($this->option('retention-ldr') ?? '');
+        $plawReport = $requireSnapshots ? '' : (string) ($this->option('retention-plaw') ?? '');
 
         if ($ldrReport === '' && $plawReport === '') {
             [$autoLdr, $autoPlaw] = $this->defaultRetentionSnapshotPaths($startDate);
             if (is_file($autoLdr) && is_file($autoPlaw)) {
                 $ldrReport = $autoLdr;
                 $plawReport = $autoPlaw;
-                $this->info('[INFO] Using monthly retention commission snapshot files.');
-            } elseif ($this->option('require-snapshots')) {
+                $this->reportInfo('[INFO] Using monthly retention commission snapshot files.');
+            } elseif ($requireSnapshots || $this->option('require-snapshots')) {
                 throw new \RuntimeException("Required retention snapshot files are missing: {$autoLdr} | {$autoPlaw}");
             }
         }
@@ -218,7 +468,7 @@ class GenerateRetentionManagerCommission extends Command
             if ($ldrReport === '' || $plawReport === '') {
                 throw new \InvalidArgumentException('Use both --retention-ldr=path and --retention-plaw=path.');
             }
-            $this->info('[INFO] Loading generated retention report XLSX files as All Data');
+            $this->reportInfo('[INFO] Loading generated retention report XLSX files as All Data');
             $all = array_merge(
                 $this->loadRetentionReportRowsFromXlsx($ldrReport, 'LDR'),
                 $this->loadRetentionReportRowsFromXlsx($plawReport, 'Progress Law')
@@ -231,13 +481,13 @@ class GenerateRetentionManagerCommission extends Command
             return $all;
         }
 
-        $snapshot = (string) ($this->option('snapshot') ?? '');
+        $snapshot = $requireSnapshots ? '' : (string) ($this->option('snapshot') ?? '');
         $builder = new RetentionCommissionReportBuilder();
         $all = $builder->buildAllDataForPeriod(
             $startDate,
             $endDate,
             $snapshot !== '' ? $snapshot : null,
-            fn (string $m) => $this->info($m)
+            fn (string $m) => $this->reportInfo($m)
         );
         $this->applyTrancheAssignments($all);
 
@@ -330,7 +580,7 @@ class GenerateRetentionManagerCommission extends Command
         $title = $sheet->getTitle();
         $spreadsheet->disconnectWorksheets();
         unset($spreadsheet);
-        $this->info("[INFO] Manager All Data rows loaded from '{$title}': " . count($rows));
+        $this->reportInfo("[INFO] Manager All Data rows loaded from '{$title}': " . count($rows));
 
         return $rows;
     }
@@ -400,7 +650,7 @@ class GenerateRetentionManagerCommission extends Command
 
         $spreadsheet->disconnectWorksheets();
         unset($spreadsheet);
-        $this->info("[INFO] {$sourceDisplay} retention report rows loaded: " . count($rows));
+        $this->reportInfo("[INFO] {$sourceDisplay} retention report rows loaded: " . count($rows));
 
         return $rows;
     }
@@ -639,18 +889,18 @@ class GenerateRetentionManagerCommission extends Command
     ];
 
     /** @return array<int,array<string,mixed>> */
-    private function buildNsfRowsForAnthony(string $startDate, string $endDate): array
+    private function buildNsfRowsForAnthony(string $startDate, string $endDate, bool $requireSnapshots = false): array
     {
-        $ldrPath = (string) ($this->option('nsf-ldr') ?? '');
-        $plawPath = (string) ($this->option('nsf-plaw') ?? '');
+        $ldrPath = $requireSnapshots ? '' : (string) ($this->option('nsf-ldr') ?? '');
+        $plawPath = $requireSnapshots ? '' : (string) ($this->option('nsf-plaw') ?? '');
 
         if ($ldrPath === '' && $plawPath === '') {
             [$autoLdr, $autoPlaw] = $this->defaultNsfSnapshotPaths($startDate);
             if (is_file($autoLdr) && is_file($autoPlaw)) {
                 $ldrPath = $autoLdr;
                 $plawPath = $autoPlaw;
-                $this->info('[INFO] Using monthly NSF commission snapshot files.');
-            } elseif ($this->option('require-snapshots')) {
+                $this->reportInfo('[INFO] Using monthly NSF commission snapshot files.');
+            } elseif ($requireSnapshots || $this->option('require-snapshots')) {
                 throw new \RuntimeException("Required NSF snapshot files are missing: {$autoLdr} | {$autoPlaw}");
             }
         }
@@ -659,10 +909,10 @@ class GenerateRetentionManagerCommission extends Command
             if ($ldrPath === '' || $plawPath === '') {
                 throw new \InvalidArgumentException('Use both --nsf-ldr=path and --nsf-plaw=path, or neither.');
             }
-            $this->info('[INFO] Loading generated NSF commission XLSX files for Anthony');
+            $this->reportInfo('[INFO] Loading generated NSF commission XLSX files for Anthony');
             return array_merge(
-                $this->loadNsfCommissionRowsFromXlsx($ldrPath),
-                $this->loadNsfCommissionRowsFromXlsx($plawPath)
+                $this->loadNsfCommissionRowsFromXlsx($ldrPath, 'LDR'),
+                $this->loadNsfCommissionRowsFromXlsx($plawPath, 'Progress Law')
             );
         }
 
@@ -688,7 +938,7 @@ class GenerateRetentionManagerCommission extends Command
     }
 
     /** @return array<int,array<string,mixed>> */
-    private function loadNsfCommissionRowsFromXlsx(string $path): array
+    private function loadNsfCommissionRowsFromXlsx(string $path, string $sourceDisplay): array
     {
         if (!is_file($path)) {
             throw new \RuntimeException("NSF commission report not found: {$path}");
@@ -735,13 +985,14 @@ class GenerateRetentionManagerCommission extends Command
             if (trim((string) ($row['ID'] ?? '')) === '' && trim((string) ($row['AGENT'] ?? '')) === '') {
                 continue;
             }
+            $row['SOURCE'] = $sourceDisplay;
             $rows[] = $row;
         }
 
         $title = $sheet->getTitle();
         $spreadsheet->disconnectWorksheets();
         unset($spreadsheet);
-        $this->info("[INFO] NSF commission rows loaded from '{$title}' ({$path}): " . count($rows));
+        $this->reportInfo("[INFO] NSF commission rows loaded from '{$title}' ({$path}): " . count($rows));
 
         return $rows;
     }
@@ -756,6 +1007,10 @@ class GenerateRetentionManagerCommission extends Command
             $sf = DBConnector::fromEnvironment($source);
             $rows = $this->fetchNsfCommissionRows($sf, $ids, $startDate, $endExclusive);
             $this->info("[INFO] [{$source}] NSF commission rows: " . count($rows));
+            foreach ($rows as &$row) {
+                $row['SOURCE'] = $source === 'plaw' ? 'Progress Law' : 'LDR';
+            }
+            unset($row);
             array_push($all, ...$rows);
         }
         return $all;
