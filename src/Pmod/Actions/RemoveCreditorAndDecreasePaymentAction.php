@@ -131,7 +131,7 @@ final class RemoveCreditorAndDecreasePaymentAction implements PmodActionHandler
 
         return new PmodResult(
             status:   empty($updateErrors) ? 'updated' : 'captured_for_manual_review',
-            message:  sprintf('Remove Creditor and Decrease Payment: debt cancelled, %d draft(s) updated for contact [%s].', count($updateResults), $workItem->contactId),
+            message:  sprintf('Remove Creditor and Decrease Payment: creditor excluded, %d draft(s) updated for contact [%s].', count($updateResults), $workItem->contactId),
             metadata: [
                 'action_type'    => $workItem->actionType->value,
                 'contact_id'     => $workItem->contactId,

@@ -63,8 +63,9 @@ final class RemoveCreditorAndDecreaseTermAction implements PmodActionHandler
                 'creditor'           => $creditorName,
                 'months_to_decrease' => $monthsToDecrease,
                 // Stated explicitly so a dry run cannot be misread as "it will also
-                // shorten the schedule by this many drafts". It will not: the debt
-                // goes, and the CRM recalculates.
+                // shorten the schedule by this many drafts". It will not - and per
+                // §8.22 nothing else shortens it either: Forth recalculates only the
+                // enrolled-debt total, never the program Length or the drafts.
                 'would_cancel_drafts' => 0,
                 'would_remove'       => [
                     'debt_id'  => $debt['id'] ?? null,
@@ -100,7 +101,12 @@ final class RemoveCreditorAndDecreaseTermAction implements PmodActionHandler
             'Action: Remove Creditor and Decrease Term',
             'Creditor Removed: ' . ($creditorName ?? $creditorId ?? 'N/A'),
             'Requested Reduction: ' . ($monthsToDecrease > 0 ? $monthsToDecrease . ' payment(s)' : 'not specified'),
-            'Term: recalculated by the CRM from the remaining enrolled debt',
+            // No claim about the term. It used to read "recalculated by the CRM
+            // from the remaining enrolled debt", which §8.22 disproved: Forth
+            // recalculates only the enrolled-debt total, never the program Length
+            // or the drafts. createContactNote() posts with public = true, so the
+            // client reads this - telling them their term was recalculated when
+            // their payments and dates are unchanged is worse than saying nothing.
             'User: ' . ($workItem->requestedBy ?? 'Client'),
         ];
 
@@ -108,7 +114,7 @@ final class RemoveCreditorAndDecreaseTermAction implements PmodActionHandler
 
         return new PmodResult(
             status:   'updated',
-            message:  sprintf('Remove Creditor and Decrease Term: debt removed for contact [%s]; term recalculates from the remaining enrolled debt.', $workItem->contactId),
+            message:  sprintf('Remove Creditor and Decrease Term: creditor excluded from the program for contact [%s]; the draft schedule is unchanged.', $workItem->contactId),
             metadata: [
                 'action_type'        => $workItem->actionType->value,
                 'contact_id'         => $workItem->contactId,
