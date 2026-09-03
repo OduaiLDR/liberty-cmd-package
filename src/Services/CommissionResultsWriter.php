@@ -46,7 +46,9 @@ class CommissionResultsWriter
 
             $written = 0;
             foreach ($rows as $row) {
-                $agent = trim((string) ($row['agent'] ?? ''));
+                // Collapse whitespace so "Alice  Kennedy" and "Alice Kennedy" MERGE to one row.
+                // Case is left as provided; SQL Server CI collation still matches variants.
+                $agent = preg_replace('/\s+/u', ' ', trim((string) ($row['agent'] ?? ''))) ?? '';
                 if ($agent === '') {
                     continue;
                 }

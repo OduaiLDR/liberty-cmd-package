@@ -313,10 +313,13 @@ class GenerateRetentionCommissionReport extends Command
 
             // Persist the computed per-agent retention commission to Azure for the Commission Review
             // app (best-effort; never blocks the report). $lastSummaryRows is set inside buildWorkbook.
+            // Reset Commission first (same pattern as bonus) so agents who drop off this run
+            // do not keep a stale amount that makes Commission Review / Payroll disagree with the XLSX.
             $retResults = [];
             foreach ($this->lastSummaryRows as $agentName => $sum) {
                 $retResults[] = ['agent' => (string) $agentName, 'amount' => $sum['commission'] ?? 0];
             }
+            CommissionResultsWriter::resetColumn($sql, 'retention', $source, $startDate, 'Commission');
             CommissionResultsWriter::persist($sql, 'retention', $source, $startDate, 'Commission', $retResults);
             RetentionCommissionTierStore::persist(
                 $sql,
