@@ -9,7 +9,6 @@ use Cmd\Reports\Pmod\Contracts\PmodExecutionGateway;
 use Cmd\Reports\Pmod\Data\PmodResult;
 use Cmd\Reports\Pmod\Data\PmodWorkItem;
 use Cmd\Reports\Pmod\Enums\PmodActionType;
-use Cmd\Reports\Pmod\Support\PmodBusinessDateResolver;
 use Cmd\Reports\Pmod\Support\PmodDebtMatcher;
 
 final class RemoveCreditorAndDecreaseTermAction implements PmodActionHandler
@@ -36,12 +35,11 @@ final class RemoveCreditorAndDecreaseTermAction implements PmodActionHandler
             return $this->capture($workItem, 'Remove Creditor and Decrease Term requires creditor information.', ['reason' => 'missing_creditor_info']);
         }
 
-        if ($monthsToDecrease <= 0 || $monthsToDecrease > 120) {
-            return $this->capture($workItem, 'Remove Creditor and Decrease Term requires months_to_decrease between 1 and 120.', [
-                'reason'            => 'invalid_months',
-                'months_to_decrease' => $monthsToDecrease,
-            ]);
-        }
+        // months_to_decrease is recorded, not acted on. This action used to REQUIRE
+        // it (1-120) and capture without it; that requirement is gone along with
+        // the draft cancelling it drove — see the note on Jacob's decision below.
+        // It is still carried into the note and metadata because the client asked
+        // for a specific reduction and a reviewer should be able to see it.
 
         // Matched BEFORE the live-updates gate so a dry run proves which debt would
         // be removed; reading debts is read-only. See §8.6 for the same fix on the
@@ -64,6 +62,10 @@ final class RemoveCreditorAndDecreaseTermAction implements PmodActionHandler
                 'reason'             => $workItem->dryRun ? 'dry_run_only' : 'live_draft_updates_disabled',
                 'creditor'           => $creditorName,
                 'months_to_decrease' => $monthsToDecrease,
+                // Stated explicitly so a dry run cannot be misread as "it will also
+                // shorten the schedule by this many drafts". It will not: the debt
+                // goes, and the CRM recalculates.
+                'would_cancel_drafts' => 0,
                 'would_remove'       => [
                     'debt_id'  => $debt['id'] ?? null,
                     'creditor' => $debt['creditor']['company_name'] ?? null,
@@ -74,70 +76,47 @@ final class RemoveCreditorAndDecreaseTermAction implements PmodActionHandler
             ]);
         }
 
-        // Step 2: cancel the debt — if this throws, no drafts are touched
+        // Remove the debt, and nothing else.
+        //
+        // **Jacob, 2026-09-02, asked directly: "yes it should remove the debt and
+        // recalculate."** This action used to cancel the last N future drafts to
+        // shorten the program itself. That was a divergence from the legacy bot,
+        // which had no month count in this sub at all and never touched a draft —
+        // it removed the debt and left the CRM to recalculate the term (§6, §4.4).
+        // Both produce a shorter program; they produce DIFFERENT schedules, and
+        // this is the one Liberty wants.
+        //
+        // Cancelling drafts here was also the riskiest thing this action did: it
+        // deleted real scheduled payments off the end of a client's plan based on a
+        // number the consumer supplied, with no way back.
         $debtId       = (string) ($debt['id'] ?? '');
         $cancelResult = $this->gateway->cancelDebt($workItem, $debtId);
 
-        // Step 3: cancel the last N future type-D drafts (shorten the program)
-        $transactions = $this->gateway->getContactTransactions($workItem);
-        // Two-day window, as everywhere else a draft is touched: one that close is
-        // already submitted to the bank, and cancelling it in Forth does not recall
-        // the debit. This action takes the LAST N drafts, so the window normally
-        // does not bite - it only matters for a client with almost no term left,
-        // which is exactly when a mistake is least recoverable.
-        $cutoff       = PmodBusinessDateResolver::draftModificationCutoff();
-
-        $futureDrafts = array_values(array_filter(
-            $transactions,
-            // Excludes already-cancelled drafts - Forth keeps active = 1 on them, so
-            // this would otherwise try to cancel drafts that are already cancelled.
-            fn ($t) => ($t['type'] ?? '') === 'D' && ($t['active'] ?? '') === '1' && empty($t['cancelled']) && (string) ($t['process_date'] ?? '') > $cutoff,
-        ));
-
-        usort($futureDrafts, fn ($a, $b) => strcmp($a['process_date'] ?? '', $b['process_date'] ?? ''));
-
-        $toCancel     = array_slice($futureDrafts, -min($monthsToDecrease, count($futureDrafts)));
-        $cancelResults = [];
-        $cancelErrors  = [];
-
-        foreach ($toCancel as $draft) {
-            $draftId = (string) ($draft['transaction_id'] ?? $draft['id'] ?? '');
-            if ($draftId === '') {
-                continue;
-            }
-            try {
-                $cancelResults[] = $this->gateway->cancelDraft($workItem, $draftId);
-            } catch (\Throwable $e) {
-                $cancelErrors[] = ['draft_id' => $draftId, 'error' => $e->getMessage()];
-            }
-        }
-
         $noteLines = [
             'Remove Creditor and Decrease Term Request:',
-            'Request Status: ' . (empty($cancelErrors) ? 'Successful' : 'Partial — see errors'),
+            'Request Status: Successful',
             'Name: ' . ($workItem->normalizedPayload['name'] ?? 'Client'),
             'Customer Id: ' . $workItem->contactId,
             'Action: Remove Creditor and Decrease Term',
             'Creditor Removed: ' . ($creditorName ?? $creditorId ?? 'N/A'),
-            'Months Decreased: ' . $monthsToDecrease,
-            'Drafts Cancelled: ' . count($cancelResults),
+            'Requested Reduction: ' . ($monthsToDecrease > 0 ? $monthsToDecrease . ' payment(s)' : 'not specified'),
+            'Term: recalculated by the CRM from the remaining enrolled debt',
             'User: ' . ($workItem->requestedBy ?? 'Client'),
         ];
 
         $this->gateway->createContactNote($workItem, implode("\n", $noteLines));
 
         return new PmodResult(
-            status:   empty($cancelErrors) ? 'updated' : 'captured_for_manual_review',
-            message:  sprintf('Remove Creditor and Decrease Term: debt cancelled, %d draft(s) removed for contact [%s].', count($cancelResults), $workItem->contactId),
+            status:   'updated',
+            message:  sprintf('Remove Creditor and Decrease Term: debt removed for contact [%s]; term recalculates from the remaining enrolled debt.', $workItem->contactId),
             metadata: [
-                'action_type'       => $workItem->actionType->value,
-                'contact_id'        => $workItem->contactId,
-                'debt_id'           => $debtId,
-                'creditor_name'     => $creditorName,
+                'action_type'        => $workItem->actionType->value,
+                'contact_id'         => $workItem->contactId,
+                'debt_id'            => $debtId,
+                'creditor_name'      => $creditorName,
                 'months_to_decrease' => $monthsToDecrease,
-                'cancel_result'     => $cancelResult,
-                'drafts_cancelled'  => count($cancelResults),
-                'cancel_errors'     => $cancelErrors,
+                'drafts_cancelled'   => 0,
+                'cancel_result'      => $cancelResult,
             ],
         );
     }
