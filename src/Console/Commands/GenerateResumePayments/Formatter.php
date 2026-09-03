@@ -187,6 +187,13 @@ class Formatter
         }
 
         $sorter = static function (array $a, array $b): int {
+            // Jacob 2026-09-03: the Grace Period sheet sorts by the grace day FIRST (Day 1 -> Day 5).
+            // Rows on every other sheet carry grace_day = 0, so this comparison ties there and their
+            // existing order (status, then days, then name) is untouched.
+            $byGrace = ((int) ($a['grace_day'] ?? 0)) <=> ((int) ($b['grace_day'] ?? 0));
+            if ($byGrace !== 0) {
+                return $byGrace;
+            }
             // Jacob 2026-08-11: enrollment status ascending, then days-since-payment descending.
             $byStatus = strcasecmp((string) ($a['enrollment_status'] ?? ''), (string) ($b['enrollment_status'] ?? ''));
             if ($byStatus !== 0) {
