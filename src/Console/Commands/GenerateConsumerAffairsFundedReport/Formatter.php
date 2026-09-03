@@ -27,7 +27,6 @@ class Formatter
             'Customer Service Number',
             'Date of Experience',
             'Company Info',
-            'Additional Info',
             'Loan Company',
             'Loan Amount',
             'APR',
@@ -49,13 +48,13 @@ class Formatter
             $col++;
         }
 
-        $sheet->getStyle('A1:P1')->applyFromArray([
+        $sheet->getStyle('A1:O1')->applyFromArray([
             'font' => ['bold' => true, 'color' => ['argb' => 'FFFFFFFF']],
             'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER],
             'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['argb' => 'FF17853B']],
             'borders' => ['allBorders' => ['borderStyle' => Border::BORDER_THIN, 'color' => ['argb' => 'FF444444']]],
         ]);
-        $sheet->setAutoFilter('A1:P1');
+        $sheet->setAutoFilter('A1:O1');
 
         $sheet->getColumnDimension('A')->setWidth(18);
         $sheet->getColumnDimension('B')->setWidth(30);
@@ -67,12 +66,23 @@ class Formatter
         $sheet->getColumnDimension('H')->setWidth(22);
         $sheet->getColumnDimension('I')->setWidth(16);
         $sheet->getColumnDimension('J')->setWidth(18);
-        $sheet->getColumnDimension('K')->setWidth(16);
-        $sheet->getColumnDimension('L')->setWidth(22);
-        $sheet->getColumnDimension('M')->setWidth(14);
-        $sheet->getColumnDimension('N')->setWidth(10);
-        $sheet->getColumnDimension('O')->setWidth(20);
-        $sheet->getColumnDimension('P')->setWidth(22);
+        $sheet->getColumnDimension('K')->setWidth(22);
+        $sheet->getColumnDimension('L')->setWidth(14);
+        $sheet->getColumnDimension('M')->setWidth(10);
+        $sheet->getColumnDimension('N')->setWidth(20);
+        $sheet->getColumnDimension('O')->setWidth(22);
+
+        usort($rows, function (array $a, array $b): int {
+            [, $lastA] = $this->splitName((string) ($a['Client'] ?? ''));
+            [, $lastB] = $this->splitName((string) ($b['Client'] ?? ''));
+            $cmp = strcasecmp($lastA, $lastB);
+            if ($cmp !== 0) {
+                return $cmp;
+            }
+            [$firstA] = $this->splitName((string) ($a['Client'] ?? ''));
+            [$firstB] = $this->splitName((string) ($b['Client'] ?? ''));
+            return strcasecmp($firstA, $firstB);
+        });
 
         $pks = [];
         $rowIndex = 2;
@@ -97,6 +107,8 @@ class Formatter
             $source = stripos($source, 'online') !== false ? 'Online Application' : 'Phone Application';
 
             $product = $this->parseProductInfo((string) ($row['Product_Info'] ?? ''));
+            $loanAmount = $this->toNumber($product['loan_amount']);
+            $apr = $this->toNumber($product['apr']);
 
             $dataRow = [
                 $phone,
@@ -109,10 +121,9 @@ class Formatter
                 '(800) 481-1821',
                 $this->formatDate($row['Date_of_Experience'] ?? null),
                 'Lending Tower',
-                'Personal Loan',
                 $product['loan_company'],
-                $product['loan_amount'],
-                $product['apr'],
+                $loanAmount,
+                $apr,
                 $source,
                 (string) ($row['Loan_Representative'] ?? ''),
             ];
@@ -124,7 +135,7 @@ class Formatter
             }
 
             if ($rowIndex % 2 === 0) {
-                $sheet->getStyle("A{$rowIndex}:P{$rowIndex}")
+                $sheet->getStyle("A{$rowIndex}:O{$rowIndex}")
                     ->getFill()
                     ->setFillType(Fill::FILL_SOLID)
                     ->getStartColor()
@@ -136,17 +147,23 @@ class Formatter
 
         $lastRow = $rowIndex - 1;
         if ($lastRow >= 2) {
-            $sheet->getStyle("A2:P{$lastRow}")
+            $sheet->getStyle("A2:O{$lastRow}")
                 ->getBorders()
                 ->getAllBorders()
                 ->setBorderStyle(Border::BORDER_THIN);
-            $sheet->getStyle("A2:P{$lastRow}")
+            $sheet->getStyle("A2:O{$lastRow}")
                 ->getAlignment()
                 ->setHorizontal(Alignment::HORIZONTAL_LEFT)
                 ->setVertical(Alignment::VERTICAL_CENTER);
             $sheet->getStyle("I2:I{$lastRow}")
                 ->getNumberFormat()
                 ->setFormatCode('mm/dd/yyyy');
+            $sheet->getStyle("L2:L{$lastRow}")
+                ->getNumberFormat()
+                ->setFormatCode('#,##0.00');
+            $sheet->getStyle("M2:M{$lastRow}")
+                ->getNumberFormat()
+                ->setFormatCode('0.00');
         }
 
         $sheet->setSelectedCells('A1');
@@ -255,6 +272,22 @@ class Formatter
         }
 
         return trim((string) ($matches[1] ?? ''), " \t\n\r\0\x0B|,;");
+    }
+
+    /** Strip $, %, commas etc. and return a float, or '' if empty/unparseable. */
+    private function toNumber(string $value): float|string
+    {
+        $value = trim($value);
+        if ($value === '') {
+            return '';
+        }
+
+        $cleaned = preg_replace('/[^0-9.\-]/', '', $value);
+        if ($cleaned === null || $cleaned === '' || $cleaned === '-' || $cleaned === '.') {
+            return '';
+        }
+
+        return (float) $cleaned;
     }
 
     private function splitName(string $fullName): array

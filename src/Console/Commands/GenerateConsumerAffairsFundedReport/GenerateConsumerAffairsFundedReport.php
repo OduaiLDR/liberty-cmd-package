@@ -70,7 +70,6 @@ class GenerateConsumerAffairsFundedReport extends Command
               {$reviewFilter}
               AND f.Email IN (SELECT Email FROM TblContacts)
               AND f.Funding_Date >= '2022-11-01'
-              AND f.Notes NOT LIKE '%Loan Term:  Months'
               AND f.Client LIKE '% %'
               AND f.Funding_Date >= '{$this->esc($monthStart)}'
               AND f.Funding_Date <= '{$this->esc($monthEnd)}'
