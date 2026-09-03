@@ -57,7 +57,7 @@ class Formatter
     ];
 
     /**
-     * @param list<array{llg_id:string,name:string,stage:string,days:int,debt:float,enrollment_status:string,cleared_payments:int,notes:string}> $statusChanges
+     * @param list<array{llg_id:string,name:string,stage:string,days:int,debt:float,enrollment_status:string,cleared_payments:int,notes:string,grace_day:int}> $statusChanges
      */
     public function sendRecap(DBConnector $connector, array $statusChanges, string $company, bool $dryRun = false, ?Command $console = null, bool $cancelsOnly = false, string $previewTo = ''): bool
     {
@@ -169,8 +169,8 @@ class Formatter
      * (Jacob 2026-08-11). Every stage gets a bucket (possibly empty) so the layout is
      * stable. Rows with an unrecognized stage are dropped (they should not occur).
      *
-     * @param list<array{llg_id:string,name:string,stage:string,days:int,debt:float,enrollment_status:string,cleared_payments:int,notes:string}> $statusChanges
-     * @return array<string, list<array{llg_id:string,name:string,stage:string,days:int,debt:float,enrollment_status:string,cleared_payments:int,notes:string}>>
+     * @param list<array{llg_id:string,name:string,stage:string,days:int,debt:float,enrollment_status:string,cleared_payments:int,notes:string,grace_day:int}> $statusChanges
+     * @return array<string, list<array{llg_id:string,name:string,stage:string,days:int,debt:float,enrollment_status:string,cleared_payments:int,notes:string,grace_day:int}>>
      */
     private function groupByStage(array $statusChanges): array
     {
@@ -234,7 +234,7 @@ class Formatter
      * "give a summary and totals only ... put detail in attachment"). A cancels-only
      * run renders only the Cancels stages (see displayStages).
      *
-     * @param array<string, list<array{llg_id:string,name:string,stage:string,days:int,debt:float,enrollment_status:string,cleared_payments:int,notes:string}>> $grouped
+     * @param array<string, list<array{llg_id:string,name:string,stage:string,days:int,debt:float,enrollment_status:string,cleared_payments:int,notes:string,grace_day:int}>> $grouped
      */
     private function buildSummaryBody(array $grouped, string $label, bool $cancelsOnly = false): string
     {
@@ -343,7 +343,7 @@ class Formatter
      * (desc). Empty stages still get a header-only sheet so the layout is stable
      * run-to-run.
      *
-     * @param array<string, list<array{llg_id:string,name:string,stage:string,days:int,debt:float,enrollment_status:string,cleared_payments:int,notes:string}>> $grouped
+     * @param array<string, list<array{llg_id:string,name:string,stage:string,days:int,debt:float,enrollment_status:string,cleared_payments:int,notes:string,grace_day:int}>> $grouped
      * @return array{filename:string, path:string}
      */
     public function buildWorkbook(array $grouped, string $company, bool $cancelsOnly = false): array
@@ -361,11 +361,15 @@ class Formatter
             // Jacob 2026-08-11: add Enrollment Status + Cleared Payments to every sheet.
             // Jacob 2026-08-17: the Manual Review sheet gets an extra "Notes" column at the end
             // saying why each client isn't being cancelled; the other sheets keep the 6 columns.
+            // Jacob 2026-08-18: the Grace Period sheet gets the grace day (1..5) in that same slot.
             $withNotes = $stage['key'] === 'Cancels - Release Hold Requested';
-            $lastCol = $withNotes ? 'G' : 'F';
+            $withGraceDay = $stage['key'] === 'Cancels - Grace Period';
+            $lastCol = ($withNotes || $withGraceDay) ? 'G' : 'F';
             $headers = ['LLG ID', 'Name', 'Enrollment Status', 'Cleared Payments', 'Debt', 'Days since NSF'];
             if ($withNotes) {
                 $headers[] = 'Notes';
+            } elseif ($withGraceDay) {
+                $headers[] = 'Grace Day';
             }
             $sheet->fromArray($headers, null, 'A1');
             $this->styleHeader($sheet, "A1:{$lastCol}1");
@@ -382,6 +386,8 @@ class Formatter
                 $sheet->setCellValueExplicit("F{$rowIndex}", (int) ($change['days'] ?? 0), DataType::TYPE_NUMERIC);
                 if ($withNotes) {
                     $sheet->setCellValue("G{$rowIndex}", (string) ($change['notes'] ?? ''));
+                } elseif ($withGraceDay) {
+                    $sheet->setCellValueExplicit("G{$rowIndex}", (int) ($change['grace_day'] ?? 0), DataType::TYPE_NUMERIC);
                 }
                 $rowIndex++;
             }
@@ -401,6 +407,8 @@ class Formatter
             if ($withNotes) {
                 $sheet->getColumnDimension('G')->setWidth(60);
                 $sheet->getStyle("G2:G{$lastRow}")->getAlignment()->setWrapText(true);
+            } elseif ($withGraceDay) {
+                $sheet->getColumnDimension('G')->setWidth(12);
             }
             $sheet->freezePane('A2');
             $sheet->setSelectedCells('A1');

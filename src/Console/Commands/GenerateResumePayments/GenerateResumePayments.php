@@ -125,6 +125,14 @@ final class GenerateResumePayments extends Command
     private array $statusByContact = [];
     /** @var array<string, int> */
     private array $clearedByContact = [];
+    /**
+     * The status THIS run writes for a contact (via setClientStatus), held in memory because the
+     * Snowflake status query lags Forth by up to an hour (Jacob 2026-08-18) - a status we set
+     * moments ago is not yet queryable. The recap column AND the Phase 5 cancel routing both prefer
+     * this over the queried snapshot, falling back to the snapshot for contacts we did not touch.
+     * @var array<string, string>
+     */
+    private array $newStatusByContact = [];
 
     /** Statuses whose presence in CurrentStatus causes the contact to be SKIPPED entirely. */
     private const SKIP_STATUS_SUBSTRINGS = [
@@ -223,6 +231,7 @@ final class GenerateResumePayments extends Command
             // Per-company recap enrichment maps (enrollment status + cleared-payment count).
             $this->statusByContact = [];
             $this->clearedByContact = [];
+            $this->newStatusByContact = [];
             $statusChanges = [];
 
             try {
@@ -1213,6 +1222,7 @@ final class GenerateResumePayments extends Command
                     continue;
                 }
 
+                $this->newStatusByContact[$cid] = $target;
                 $this->dppClient->setClientStatus($tenant, $cid, $target, $dryRun);
                 $statusChanges[] = $this->row($cid, $name, self::STAGE_RESOLVED, $age, $debt);
 
@@ -1236,6 +1246,7 @@ final class GenerateResumePayments extends Command
                 if (stripos($currentStatus, $status) !== false) {
                     continue; // already at this status
                 }
+                $this->newStatusByContact[$cid] = $status;
 
                 if ($this->tryResume($tenant, $cid, $dryRun)) {
                     $this->dppClient->addNote($tenant, $cid, 'Payments Resumed. New draft scheduled.', $dryRun);
@@ -1258,6 +1269,7 @@ final class GenerateResumePayments extends Command
             if (stripos($currentStatus, $status) !== false) {
                 continue;
             }
+            $this->newStatusByContact[$cid] = $status;
 
             $this->dppClient->setClientStatus($tenant, $cid, $status, $dryRun);
             // At-Risk sheet, but not once they cross into the cancel funnel (see NSF branch).
@@ -1277,9 +1289,9 @@ final class GenerateResumePayments extends Command
      * $notes (Jacob 2026-08-17) carries the reason a Manual Review client isn't being
      * cancelled; it is only rendered on the Manual Review sheet and is '' elsewhere.
      *
-     * @return array{llg_id:string,name:string,stage:string,days:int,debt:float,enrollment_status:string,cleared_payments:int,notes:string}
+     * @return array{llg_id:string,name:string,stage:string,days:int,debt:float,enrollment_status:string,cleared_payments:int,notes:string,grace_day:int}
      */
-    private function row(string $contactId, string $name, string $stage, int $days, float $debt, string $notes = ''): array
+    private function row(string $contactId, string $name, string $stage, int $days, float $debt, string $notes = '', int $graceDay = 0): array
     {
         return [
             'llg_id' => "LLG-{$contactId}",
@@ -1287,9 +1299,12 @@ final class GenerateResumePayments extends Command
             'stage' => $stage,
             'days' => $days,
             'debt' => $debt,
-            'enrollment_status' => $this->statusByContact[$contactId] ?? '',
+            // Prefer the status THIS run just wrote over the queried snapshot: Snowflake lags Forth
+            // by up to an hour, so the query still returns the pre-run status (Jacob 2026-08-18).
+            'enrollment_status' => $this->newStatusByContact[$contactId] ?? $this->statusByContact[$contactId] ?? '',
             'cleared_payments' => $this->clearedByContact[$contactId] ?? 0,
             'notes' => $notes,
+            'grace_day' => $graceDay,
         ];
     }
 
@@ -1698,13 +1713,17 @@ final class GenerateResumePayments extends Command
             // Pending / any non-cancellable status → Manual Review (Rama), which persists day-to-day;
             // only %NSF% / No Re-Draft / System Cancel% fall through to the grace → queued → cancel
             // flow. Closes the gap where age>105 alone drove the cancel regardless of status.
-            $route = $this->cancelRoute((string) ($queueStatuses[$contactId] ?? ''));
+            // Route on the status THIS run just wrote when we have one. The queried snapshot lags
+            // Forth by up to an hour, so a contact we re-classified moments ago would otherwise
+            // still read with its pre-run status and be mis-routed to Manual Review (Jacob 08-18).
+            $effectiveStatus = (string) ($this->newStatusByContact[$contactId] ?? $queueStatuses[$contactId] ?? '');
+            $route = $this->cancelRoute($effectiveStatus);
             if ($route === 'excluded') {
                 continue;
             }
             if ($route === 'manual') {
                 // Jacob 2026-08-18: the note quotes the status verbatim from Forth (no renaming).
-                $manualStatus = trim((string) ($queueStatuses[$contactId] ?? ''));
+                $manualStatus = trim($effectiveStatus);
                 $note = $manualStatus !== ''
                     ? "Status \"{$manualStatus}\" is not auto-cancellable (not NSF / System Cancel) — needs manual review"
                     : 'Status is not auto-cancellable (not NSF / System Cancel) — needs manual review';
@@ -1720,7 +1739,8 @@ final class GenerateResumePayments extends Command
                 // 2026-08-17: show the NSF age (days since the first NSF in the sequence, ~105+
                 // since these are past the cancel threshold), NOT the 1..5 cooldown index — so the
                 // "Days since NSF" column is consistent with the other cancel sheets.
-                $statusChanges[] = $this->row($contactId, $name, self::STAGE_CANCEL_GRACE, $ageDays, $debt);
+                // Column G on the Grace sheet = the 1-indexed grace day (Jacob 2026-08-18).
+                $statusChanges[] = $this->row($contactId, $name, self::STAGE_CANCEL_GRACE, $ageDays, $debt, '', $day + 1);
                 continue;
             }
 
@@ -1993,6 +2013,7 @@ final class GenerateResumePayments extends Command
         }
 
         if ($status === 'success') {
+            $this->newStatusByContact[$contactId] = $statusTitle;
             $this->dppClient->setClientStatus($tenant, $contactId, $statusTitle, false);
 
             if (($result['balance_branch'] ?? '') === 'negative') {
