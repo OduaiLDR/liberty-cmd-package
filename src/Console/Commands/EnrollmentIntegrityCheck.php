@@ -180,6 +180,36 @@ class EnrollmentIntegrityCheck extends Command
                 ",
                 'reason'   => 'Enrollments (7–90 days old) missing Submitted_Date — status not yet reached in Snowflake',
             ],
+            [
+                // A pure reassignment in the CRM bumps CONTACTS.MODIFIED, so an
+                // incremental Sync:contacts-data normally re-pulls it. But a
+                // reassignment older than the sync watermark (or made before the
+                // agent-source column changed) is never re-fetched, so the
+                // contact tables — and TblEnrollment, which inherits from them —
+                // keep the stale agent forever. --owners-refresh re-pulls every
+                // contact's current ASSIGNED_TO without truncating; matching then
+                // propagates the corrected name down to TblContacts and
+                // TblEnrollment. Recent enrollments only, to keep the retry bounded.
+                'label'    => 'Enrollment Agent Drift (stale ASSIGNED_TO)',
+                'command'  => 'Sync:contacts-data --owners-refresh',
+                'severity' => 'alert',
+                'check'    => "
+                    SELECT TOP 50 e.LLG_ID
+                    FROM TblEnrollment e
+                    JOIN (
+                        SELECT LLG_ID, MIN(Agent) AS Agent
+                        FROM TblContacts
+                        WHERE Agent IS NOT NULL AND Agent <> ''
+                          AND LTRIM(RTRIM(Agent)) NOT IN ('0', 'N/A', 'NULL')
+                        GROUP BY LLG_ID
+                    ) c ON e.LLG_ID = c.LLG_ID
+                    WHERE e.Category IN ('LDR', 'CCS')
+                      AND e.Agent IS NOT NULL AND e.Agent <> ''
+                      AND LTRIM(RTRIM(e.Agent)) <> LTRIM(RTRIM(c.Agent))
+                      AND e.Welcome_Call_Date >= DATEADD(day, -180, GETDATE())
+                ",
+                'reason'   => 'Recent enrollments whose Agent disagrees with the current TblContacts owner — a reassignment the incremental contacts sync never re-pulled',
+            ],
         ];
     }
 

@@ -13,6 +13,7 @@ class SyncContactsData extends Command
     protected $signature = 'Sync:contacts-data
         {--source=   : Run a single source only (LDR, PLAW, or LT)}
         {--full      : Force a full refresh even when a previous sync timestamp exists}
+        {--owners-refresh : Re-pull EVERY contact since 2021-07-01 (current CRM ASSIGNED_TO) without truncating. Non-destructive DELETE+INSERT per chunk. Use to correct agent names that drifted because an incremental sync never re-pulled a reassignment older than the watermark.}
         {--dry-run   : Fetch and report changes without modifying SQL Server or sync watermarks; matching runs as read-only verification}
         {--verify-match : Read-only matching verification only (no Snowflake fetch, no SQL writes)}
         {--reconcile-agents : Reconcile non-blank enrollment agents from unambiguous source contact assignments}
@@ -66,14 +67,15 @@ class SyncContactsData extends Command
         }
         $artisan  = base_path('artisan');
         $fullFlag = $this->option('full') ? ['--full'] : [];
+        $ownersRefreshFlag = $this->option('owners-refresh') ? ['--owners-refresh'] : [];
         $dryRunFlag = $this->option('dry-run') ? ['--dry-run'] : [];
         $reconcileAgentsFlag = $this->option('reconcile-agents') ? ['--reconcile-agents'] : [];
 
         // ── Step 1: LT ────────────────────────────────────────────────────────
         $this->info("[INFO] Step 1/3: Syncing LT (primary contacts)...");
-        $ltPool = Process::pool(function ($pool) use ($php, $artisan, $fullFlag, $dryRunFlag, $reconcileAgentsFlag) {
+        $ltPool = Process::pool(function ($pool) use ($php, $artisan, $fullFlag, $ownersRefreshFlag, $dryRunFlag, $reconcileAgentsFlag) {
             $pool->as('LT')->timeout(7200)->command(
-                array_merge([$php, $artisan, 'Sync:contacts-data', '--source=LT', '--no-match'], $fullFlag, $dryRunFlag, $reconcileAgentsFlag)
+                array_merge([$php, $artisan, 'Sync:contacts-data', '--source=LT', '--no-match'], $fullFlag, $ownersRefreshFlag, $dryRunFlag, $reconcileAgentsFlag)
             );
         })->start(function (string $type, string $output, string $key) {
             foreach (explode("\n", rtrim($output)) as $line) {
@@ -90,10 +92,10 @@ class SyncContactsData extends Command
 
         // ── Step 2: LDR + PLAW (parallel) ────────────────────────────────────
         $this->info("[INFO] Step 2/3: Syncing LDR and PLAW in parallel...");
-        $pool = Process::pool(function ($pool) use ($php, $artisan, $fullFlag, $dryRunFlag, $reconcileAgentsFlag) {
+        $pool = Process::pool(function ($pool) use ($php, $artisan, $fullFlag, $ownersRefreshFlag, $dryRunFlag, $reconcileAgentsFlag) {
             foreach (['LDR', 'PLAW'] as $src) {
                 $pool->as($src)->timeout(7200)->command(
-                    array_merge([$php, $artisan, 'Sync:contacts-data', "--source={$src}", '--no-match'], $fullFlag, $dryRunFlag, $reconcileAgentsFlag)
+                    array_merge([$php, $artisan, 'Sync:contacts-data', "--source={$src}", '--no-match'], $fullFlag, $ownersRefreshFlag, $dryRunFlag, $reconcileAgentsFlag)
                 );
             }
         })->start(function (string $type, string $output, string $key) {
@@ -225,8 +227,14 @@ class SyncContactsData extends Command
         // Determine sync mode.
         // Incremental: fetch only contacts modified since the last successful run,
         //   then DELETE+INSERT per chunk (no truncate — existing unchanged rows stay).
+        // Owners refresh: fetch wide like a full refresh (current ASSIGNED_TO for
+        //   every contact) but DO NOT truncate — the per-chunk DELETE+INSERT is
+        //   idempotent, so this safely corrects agent names that an incremental
+        //   sync never re-pulled (reassignment older than the watermark) without
+        //   the risk/downtime of dropping and rebuilding the table.
         // Full refresh: truncate the table and re-sync everything since 2021-07-01.
-        $lastSyncAt    = $this->option('full') ? null : $this->readLastSyncTime($this->source);
+        $ownersRefresh = (bool) $this->option('owners-refresh');
+        $lastSyncAt    = ($this->option('full') || $ownersRefresh) ? null : $this->readLastSyncTime($this->source);
         $isIncremental = $lastSyncAt !== null;
 
         if ($isIncremental) {
@@ -235,6 +243,12 @@ class SyncContactsData extends Command
             // insertChunk() is an idempotent DELETE+INSERT, so re-pulling a day of overlap is safe.
             $startDate = date('Y-m-d H:i:s', strtotime($lastSyncAt) - 86400);
             $this->info("[INFO] Incremental mode: fetching contacts modified since {$startDate}.");
+        } elseif ($ownersRefresh) {
+            // Wide fetch, DELETE+INSERT per chunk, no truncate. Runs in incremental
+            // insert mode so existing rows are replaced in place rather than wiped.
+            $startDate     = '2021-07-01';
+            $isIncremental = true;
+            $this->info('[INFO] Owners-refresh mode: re-pulling every contact since 2021-07-01 (no truncate).');
         } else {
             $startDate = '2021-07-01';
             $this->info('[INFO] Full refresh mode.' . ($dryRun ? ' Target table will not be truncated.' : ''));
@@ -331,10 +345,15 @@ class SyncContactsData extends Command
             }
         }
 
-        // Persist the watermark only after a fully successful run
-        if (!$dryRun) {
+        // Persist the watermark only after a fully successful run. An owners-refresh
+        // is a wide corrective sweep, not a chronological checkpoint — leave the
+        // incremental watermark untouched so the next scheduled incremental run
+        // still picks up everything modified since the last real incremental.
+        if (!$dryRun && !$ownersRefresh) {
             $this->writeLastSyncTime($this->source, $syncStartedAt);
             $this->info("[INFO] Sync watermark saved: {$syncStartedAt}");
+        } elseif ($ownersRefresh) {
+            $this->info('[INFO] Owners-refresh: incremental watermark left unchanged.');
         }
 
         $this->info("[SUCCESS] {$this->source} sync completed successfully!");
