@@ -54,19 +54,60 @@ class CommissionRosterProvider
                     $agents[] = $name;
                 }
             }
+            // UNION with the built-in list. The Azure mirror (dbo.TblCommissionRoster)
+            // is written by the Commission Review app; when that sync is stale or
+            // partial it must be able to ADD people to a payroll report, never
+            // silently drop them. Merging stops a one-row mirror from shrinking a
+            // nine-agent report to one and failing payroll source validation.
             $agents = array_values(array_unique($agents));
+            $merged = self::mergeUnique($fallback, $agents);
 
-            if (empty($agents)) {
-                Log::info("CommissionRosterProvider: roster empty for {$reportType}/{$source} — using the built-in agent list.");
+            if (empty($merged)) {
+                Log::info("CommissionRosterProvider: no agents for {$reportType}/{$source} from the roster or the built-in list.");
                 return $fallback;
             }
 
-            Log::info('CommissionRosterProvider: using the managed roster for ' . $reportType . '/' . $source . ' (' . count($agents) . ' agents; built-in list has ' . count($fallback) . ').');
+            $addedByRoster = count($merged) - count(self::mergeUnique($fallback, []));
+            Log::info(
+                'CommissionRosterProvider: ' . $reportType . '/' . $source . ' - ' . count($merged)
+                . ' agents (built-in ' . count($fallback) . ', roster mirror ' . count($agents)
+                . ', added by roster ' . max(0, $addedByRoster) . ').'
+            );
 
-            return $agents;
+            return $merged;
         } catch (\Throwable $e) {
             Log::warning('CommissionRosterProvider: lookup failed — using the built-in agent list.', ['ex' => $e->getMessage()]);
             return $fallback;
         }
+    }
+
+    /**
+     * Case/space-insensitive union that keeps the first-seen spelling.
+     *
+     * @param array<int,string> $primary   Names that win on spelling (built-in list).
+     * @param array<int,string> $secondary Additional names (the Azure roster mirror).
+     * @return array<int,string>
+     */
+    private static function mergeUnique(array $primary, array $secondary): array
+    {
+        $out = [];
+        $seen = [];
+        foreach ([$primary, $secondary] as $list) {
+            foreach ($list as $name) {
+                $clean = trim((string) $name);
+                if ($clean === '') {
+                    continue;
+                }
+                $key = strtolower(preg_replace('/\s+/', ' ', $clean));
+                if (isset($seen[$key])) {
+                    continue;
+                }
+                $seen[$key] = true;
+                $out[] = $clean;
+            }
+        }
+        sort($out, SORT_NATURAL | SORT_FLAG_CASE);
+
+        return $out;
     }
 }

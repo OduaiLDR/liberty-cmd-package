@@ -510,8 +510,10 @@ class DBConnector
 
         $this->debugLog('Partitions found: ' . $totalPartitions);
         $this->debugLog('Statement handle: ' . ($statementHandle ?? 'null'));
-
-        // Fetch additional partitions (partition 0 is already in $result['data'])
+        // Fetch additional partitions (partition 0 is already in $result['data']).
+        // Every partition MUST arrive. A silently dropped partition used to return a
+        // short result set, which made SyncContactsData's `while (chunkSize === PAGE_SIZE)`
+        // loop exit early and report success on a partial load. Retry, then fail hard.
         if ($totalPartitions > 1 && $statementHandle) {
             for ($partitionId = 1; $partitionId < $totalPartitions; $partitionId++) {
                 $partitionUrl = sprintf(
@@ -523,22 +525,44 @@ class DBConnector
 
                 $this->debugLog('Fetching partition ' . $partitionId . ': ' . $partitionUrl);
 
-                $partitionResponse = $this->client->get($partitionUrl, [
-                    'headers' => [
-                        'Authorization' => 'Bearer ' . $token,
-                        'Accept' => 'application/json',
-                        'X-Snowflake-Authorization-Token-Type' => 'OAUTH',
-                    ],
-                ]);
-
-                $partitionBody = $partitionResponse->getBody()->getContents();
-                $partition = json_decode($partitionBody, true);
-
-                if (isset($partition['data']) && is_array($partition['data'])) {
-                    $allData = array_merge($allData, $partition['data']);
-                    $rowCount += count($partition['data']);
-                    $this->debugLog('Partition ' . $partitionId . ' fetched: ' . count($partition['data']) . ' rows, total: ' . $rowCount);
+                $partition = null;
+                $lastError = null;
+                for ($attempt = 1; $attempt <= 3; $attempt++) {
+                    try {
+                        $partitionResponse = $this->client->get($partitionUrl, [
+                            'headers' => [
+                                'Authorization' => 'Bearer ' . $token,
+                                'Accept' => 'application/json',
+                                'X-Snowflake-Authorization-Token-Type' => 'OAUTH',
+                            ],
+                        ]);
+                        $partitionBody = $partitionResponse->getBody()->getContents();
+                        $decoded = json_decode($partitionBody, true);
+                        if (isset($decoded['data']) && is_array($decoded['data'])) {
+                            $partition = $decoded;
+                            break;
+                        }
+                        $lastError = 'partition response had no data array';
+                    } catch (\Throwable $e) {
+                        $lastError = $e->getMessage();
+                    }
+                    if ($attempt < 3) {
+                        usleep(500000 * $attempt);
+                        $this->debugLog("Partition {$partitionId} attempt {$attempt} failed ({$lastError}); retrying.");
+                    }
                 }
+
+                if ($partition === null) {
+                    throw new Exception(
+                        "Snowflake partition {$partitionId}/{$totalPartitions} could not be fetched after 3 attempts"
+                        . ($lastError !== null ? ": {$lastError}" : '')
+                        . '. Aborting rather than returning a partial result set.'
+                    );
+                }
+
+                $allData = array_merge($allData, $partition['data']);
+                $rowCount += count($partition['data']);
+                $this->debugLog('Partition ' . $partitionId . ' fetched: ' . count($partition['data']) . ' rows, total: ' . $rowCount);
             }
         }
 
@@ -571,6 +595,17 @@ class DBConnector
         }
 
         $result['data'] = $allData;
+
+        // Cross-check against the row count Snowflake reported. A mismatch means we
+        // assembled fewer rows than the query produced — never return that silently.
+        $reportedRows = $result['resultSetMetaData']['numRows'] ?? null;
+        if ($reportedRows !== null && (int) $reportedRows !== $rowCount) {
+            throw new Exception(
+                'Snowflake result incomplete: expected ' . (int) $reportedRows
+                . ' rows but assembled ' . $rowCount . '. Aborting rather than returning a partial result set.'
+            );
+        }
+
         $result['rowCount'] = $rowCount;
 
         $this->debugLog('Final total rows: ' . $rowCount);

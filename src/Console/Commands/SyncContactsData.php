@@ -301,7 +301,12 @@ class SyncContactsData extends Command
             \gc_collect_cycles();
 
             $this->info("[INFO] Progress: {$totalFetched} fetched, {$totalInserted} upserted...");
-        } while ($chunkSize === self::PAGE_SIZE);
+        // Keep paging until a page comes back empty. The old condition
+        // (chunkSize === PAGE_SIZE) silently ended the sync whenever a page came
+        // back short for any reason, reporting success on a partial load.
+        // DBConnector now throws on an incomplete fetch, so a short-but-non-empty
+        // page here is legitimate and we must continue from the new cursor.
+        } while ($chunkSize > 0);
 
         $this->info("[INFO] Completed: {$totalInserted} records upserted into {$this->targetTable}.");
         $this->info("[INFO] Enrollment updates: " . \count($categoryChanges) . " category, " . \count($affiliateChanges) . " affiliate agent");
