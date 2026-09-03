@@ -374,8 +374,8 @@ class SyncContactsData extends Command
                 c.ID AS LLG_ID,
                 c.TP_ID AS EXTERNAL_ID,
                 ds.NAME AS DATA_SOURCE,
-                NULL AS CREATED_BY,
-                NULL AS ASSIGNED_TO,
+                CONCAT(u1.FIRSTNAME, ' ', u1.LASTNAME) AS CREATED_BY,
+                CONCAT(u2.FIRSTNAME, ' ', u2.LASTNAME) AS ASSIGNED_TO,
                 CONCAT(c.FIRSTNAME, ' ', c.LASTNAME) AS FULLNAME,
                 c.PHONE3 AS CELL_PHONE,
                 c.EMAIL,
@@ -398,6 +398,8 @@ class SyncContactsData extends Command
                 uf_agent.F_SHORTSTRING AS AGENT_CUSTOM
             FROM CONTACTS AS c
             LEFT JOIN DATA_SOURCES AS ds ON c.C_SOURCE = ds.ID
+            LEFT JOIN USERS AS u1 ON c.CREATED_BY = u1.UID
+            LEFT JOIN USERS AS u2 ON c.ASSIGNED_TO = u2.UID
             LEFT JOIN CONTACTS_STATUS AS s ON c.ID = s.CONTACT_ID
             LEFT JOIN CONTACTS_CATEGORIES AS cc ON s.STAGE_ID = cc.ID
             LEFT JOIN CONTACTS_LEAD_STATUS AS cls ON s.STATUS_ID = cls.ID
@@ -654,10 +656,12 @@ class SyncContactsData extends Command
             }
             $planTitle  = $row['PLAN_TITLE'] ?? '';
             $category   = $this->normalizePlanTitle($planTitle);
-            // LT: agent is the assigned user from USERS join; LDR/PLAW: from custom field
-            $agent      = $this->source === 'LT'
-                ? ($row['ASSIGNED_TO'] ?? '')
-                : ($row['AGENT_CUSTOM'] ?? '');
+            // Prefer the authoritative CONTACTS.ASSIGNED_TO -> USERS name for every
+            // source. The legacy custom field remains a fallback for records whose
+            // assigned user is missing from USERS.
+            $assignedAgent = trim((string) ($row['ASSIGNED_TO'] ?? ''));
+            $customAgent   = trim((string) ($row['AGENT_CUSTOM'] ?? ''));
+            $agent         = $assignedAgent !== '' ? $assignedAgent : $customAgent;
             $creditUtil = $this->parseCreditUtilization($row['CREDIT_UTILIZATION'] ?? '');
 
             $campaign = '';
