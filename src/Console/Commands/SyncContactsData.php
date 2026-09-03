@@ -15,6 +15,7 @@ class SyncContactsData extends Command
         {--full      : Force a full refresh even when a previous sync timestamp exists}
         {--dry-run   : Fetch and report changes without modifying SQL Server or sync watermarks; matching runs as read-only verification}
         {--verify-match : Read-only matching verification only (no Snowflake fetch, no SQL writes)}
+        {--reconcile-agents : Reconcile non-blank enrollment agents from unambiguous source contact assignments}
         {--no-match  : Skip post-sync table matching (internal flag used by the orchestrator)}';
 
     protected $description = 'Sync contacts data from Snowflake to SQL Server (TblContactsLDR, TblContactsPLAW, and TblContactsLT)';
@@ -66,12 +67,13 @@ class SyncContactsData extends Command
         $artisan  = base_path('artisan');
         $fullFlag = $this->option('full') ? ['--full'] : [];
         $dryRunFlag = $this->option('dry-run') ? ['--dry-run'] : [];
+        $reconcileAgentsFlag = $this->option('reconcile-agents') ? ['--reconcile-agents'] : [];
 
         // ── Step 1: LT ────────────────────────────────────────────────────────
         $this->info("[INFO] Step 1/3: Syncing LT (primary contacts)...");
-        $ltPool = Process::pool(function ($pool) use ($php, $artisan, $fullFlag, $dryRunFlag) {
+        $ltPool = Process::pool(function ($pool) use ($php, $artisan, $fullFlag, $dryRunFlag, $reconcileAgentsFlag) {
             $pool->as('LT')->timeout(7200)->command(
-                array_merge([$php, $artisan, 'Sync:contacts-data', '--source=LT', '--no-match'], $fullFlag, $dryRunFlag)
+                array_merge([$php, $artisan, 'Sync:contacts-data', '--source=LT', '--no-match'], $fullFlag, $dryRunFlag, $reconcileAgentsFlag)
             );
         })->start(function (string $type, string $output, string $key) {
             foreach (explode("\n", rtrim($output)) as $line) {
@@ -88,10 +90,10 @@ class SyncContactsData extends Command
 
         // ── Step 2: LDR + PLAW (parallel) ────────────────────────────────────
         $this->info("[INFO] Step 2/3: Syncing LDR and PLAW in parallel...");
-        $pool = Process::pool(function ($pool) use ($php, $artisan, $fullFlag, $dryRunFlag) {
+        $pool = Process::pool(function ($pool) use ($php, $artisan, $fullFlag, $dryRunFlag, $reconcileAgentsFlag) {
             foreach (['LDR', 'PLAW'] as $src) {
                 $pool->as($src)->timeout(7200)->command(
-                    array_merge([$php, $artisan, 'Sync:contacts-data', "--source={$src}", '--no-match'], $fullFlag, $dryRunFlag)
+                    array_merge([$php, $artisan, 'Sync:contacts-data', "--source={$src}", '--no-match'], $fullFlag, $dryRunFlag, $reconcileAgentsFlag)
                 );
             }
         })->start(function (string $type, string $output, string $key) {
@@ -247,7 +249,6 @@ class SyncContactsData extends Command
         $syncStartedAt = date('Y-m-d H:i:s');
 
         $lastId           = 0;
-        $seenTpIds        = [];
         $categoryChanges  = [];
         $affiliateChanges = [];
         $totalFetched     = 0;
@@ -270,8 +271,7 @@ class SyncContactsData extends Command
             [$processedChunk, $newCatChanges, $newAffChanges] = $this->processChunk(
                 $chunk,
                 $dropNames,
-                $enrollmentData,
-                $seenTpIds
+                $enrollmentData
             );
 
             foreach ($newCatChanges as $c) {
@@ -615,16 +615,12 @@ class SyncContactsData extends Command
 
     /**
      * Processes one chunk of Snowflake rows.
-     * $seenTpIds is passed by reference so TP_ID deduplication persists across chunks.
-     *
-     * @param  array  $seenTpIds  Mutable dedup map — survives across all chunks in a run.
      * @return array{0: array, 1: array, 2: array}  [processedRows, categoryChanges, affiliateChanges]
      */
     private function processChunk(
         array $chunk,
         array $dropNames,
-        array $enrollmentData,
-        array &$seenTpIds
+        array $enrollmentData
     ): array {
         $processed        = [];
         $categoryChanges  = [];
@@ -647,13 +643,6 @@ class SyncContactsData extends Command
             if (($row['STATUS'] ?? '') === 'Duplicate Lead') {
                 continue;
             }
-            if ($tpId && isset($seenTpIds[$tpId])) {
-                continue;
-            }
-            if ($tpId) {
-                $seenTpIds[$tpId] = true;
-            }
-
             $debtAmountRaw = $row['DEBT_AMOUNT_CUSTOM'] ?? 0;
             $debtAmount = is_numeric($debtAmountRaw) ? (float) $debtAmountRaw : 0.0;
             if ($this->source === 'LT' && ($debtAmount <= 0 || $debtAmount > self::MAX_LT_DEBT_AMOUNT)) {
@@ -956,7 +945,7 @@ class SyncContactsData extends Command
         $this->resetMatchingStats(7);
         $this->printMatchingHeader("{$this->source} post-sync matching");
         $this->matchSourceTableToContacts($connector, $this->targetTable);
-        $this->fillEnrollmentAgents($connector);
+        $this->fillEnrollmentAgents($connector, (bool) $this->option('reconcile-agents'));
 
         return $this->logMatchingSummary("{$this->source} post-sync");
     }
@@ -976,7 +965,7 @@ class SyncContactsData extends Command
         }
 
         $this->info('[MATCH] Propagating agents to TblEnrollment...');
-        $this->fillEnrollmentAgents($connector);
+        $this->fillEnrollmentAgents($connector, (bool) $this->option('reconcile-agents'));
 
         return $this->logMatchingSummary('orchestrator final');
     }
@@ -1051,6 +1040,8 @@ class SyncContactsData extends Command
 
     private function previewEnrollmentAgentFixes(DBConnector $connector): void
     {
+        $reconcileFlag = $this->option('reconcile-agents') ? 1 : 0;
+
         $this->previewCountStep(
             $connector,
             'enrollment.agent_contacts',
@@ -1068,8 +1059,21 @@ class SyncContactsData extends Command
             'enrollment.agent_ldr_fallback',
             "SELECT COUNT(*) AS cnt FROM TblEnrollment e
              JOIN TblContactsLDR l ON e.LLG_ID = l.LLG_ID
-             WHERE (e.Agent IS NULL OR e.Agent = '') AND l.Agent IS NOT NULL AND l.Agent <> ''",
-            'Blank enrollments LDR fallback would fill'
+             WHERE (e.Agent IS NULL OR e.Agent = ''
+                    OR ({$reconcileFlag} = 1 AND e.Agent <> l.Agent))
+               AND l.Agent IS NOT NULL AND l.Agent <> ''
+               AND LTRIM(RTRIM(l.Agent)) NOT IN ('0', 'N/A', 'NULL')
+               AND NOT EXISTS (
+                    SELECT 1
+                    FROM TblContactsPLAW p
+                    WHERE p.LLG_ID = e.LLG_ID
+                      AND p.Agent IS NOT NULL AND p.Agent <> ''
+                      AND LTRIM(RTRIM(p.Agent)) NOT IN ('0', 'N/A', 'NULL')
+                      AND LTRIM(RTRIM(p.Agent)) <> LTRIM(RTRIM(l.Agent))
+               )",
+            $reconcileFlag === 1
+                ? 'LDR fallback agent reconciliations'
+                : 'Blank enrollments LDR fallback would fill'
         );
 
         $this->previewCountStep(
@@ -1077,8 +1081,21 @@ class SyncContactsData extends Command
             'enrollment.agent_plaw_fallback',
             "SELECT COUNT(*) AS cnt FROM TblEnrollment e
              JOIN TblContactsPLAW p ON e.LLG_ID = p.LLG_ID
-             WHERE (e.Agent IS NULL OR e.Agent = '') AND p.Agent IS NOT NULL AND p.Agent <> ''",
-            'Blank enrollments PLAW fallback would fill'
+             WHERE (e.Agent IS NULL OR e.Agent = ''
+                    OR ({$reconcileFlag} = 1 AND e.Agent <> p.Agent))
+               AND p.Agent IS NOT NULL AND p.Agent <> ''
+               AND LTRIM(RTRIM(p.Agent)) NOT IN ('0', 'N/A', 'NULL')
+               AND NOT EXISTS (
+                    SELECT 1
+                    FROM TblContactsLDR l
+                    WHERE l.LLG_ID = e.LLG_ID
+                      AND l.Agent IS NOT NULL AND l.Agent <> ''
+                      AND LTRIM(RTRIM(l.Agent)) NOT IN ('0', 'N/A', 'NULL')
+                      AND LTRIM(RTRIM(l.Agent)) <> LTRIM(RTRIM(p.Agent))
+               )",
+            $reconcileFlag === 1
+                ? 'PLAW fallback agent reconciliations'
+                : 'Blank enrollments PLAW fallback would fill'
         );
 
         $this->previewCountStep(
@@ -1228,8 +1245,9 @@ class SyncContactsData extends Command
         );
     }
 
-    private function fillEnrollmentAgents(DBConnector $connector): void
+    private function fillEnrollmentAgents(DBConnector $connector, bool $reconcileAgents = false): void
     {
+        $reconcileFlag = $reconcileAgents ? 1 : 0;
         $steps = [
             'enrollment.agent_contacts' => [
                 'sql' => "UPDATE TblEnrollment
@@ -1250,8 +1268,18 @@ class SyncContactsData extends Command
              SET TblEnrollment.Agent = l.Agent
              FROM TblEnrollment
              JOIN TblContactsLDR l ON TblEnrollment.LLG_ID = l.LLG_ID
-             WHERE (TblEnrollment.Agent IS NULL OR TblEnrollment.Agent = '')
-               AND l.Agent IS NOT NULL AND l.Agent <> ''",
+             WHERE (TblEnrollment.Agent IS NULL OR TblEnrollment.Agent = ''
+                    OR ({$reconcileFlag} = 1 AND TblEnrollment.Agent <> l.Agent))
+               AND l.Agent IS NOT NULL AND l.Agent <> ''
+               AND LTRIM(RTRIM(l.Agent)) NOT IN ('0', 'N/A', 'NULL')
+               AND NOT EXISTS (
+                    SELECT 1
+                    FROM TblContactsPLAW p
+                    WHERE p.LLG_ID = TblEnrollment.LLG_ID
+                      AND p.Agent IS NOT NULL AND p.Agent <> ''
+                      AND LTRIM(RTRIM(p.Agent)) NOT IN ('0', 'N/A', 'NULL')
+                      AND LTRIM(RTRIM(p.Agent)) <> LTRIM(RTRIM(l.Agent))
+               )",
                 'label' => 'Updated TblEnrollment.Agent from TblContactsLDR (fallback)',
             ],
             'enrollment.agent_plaw_fallback' => [
@@ -1259,8 +1287,18 @@ class SyncContactsData extends Command
              SET TblEnrollment.Agent = p.Agent
              FROM TblEnrollment
              JOIN TblContactsPLAW p ON TblEnrollment.LLG_ID = p.LLG_ID
-             WHERE (TblEnrollment.Agent IS NULL OR TblEnrollment.Agent = '')
-               AND p.Agent IS NOT NULL AND p.Agent <> ''",
+             WHERE (TblEnrollment.Agent IS NULL OR TblEnrollment.Agent = ''
+                    OR ({$reconcileFlag} = 1 AND TblEnrollment.Agent <> p.Agent))
+               AND p.Agent IS NOT NULL AND p.Agent <> ''
+               AND LTRIM(RTRIM(p.Agent)) NOT IN ('0', 'N/A', 'NULL')
+               AND NOT EXISTS (
+                    SELECT 1
+                    FROM TblContactsLDR l
+                    WHERE l.LLG_ID = TblEnrollment.LLG_ID
+                      AND l.Agent IS NOT NULL AND l.Agent <> ''
+                      AND LTRIM(RTRIM(l.Agent)) NOT IN ('0', 'N/A', 'NULL')
+                      AND LTRIM(RTRIM(l.Agent)) <> LTRIM(RTRIM(p.Agent))
+               )",
                 'label' => 'Updated TblEnrollment.Agent from TblContactsPLAW (fallback)',
             ],
             'enrollment.drop_name' => [
