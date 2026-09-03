@@ -62,8 +62,9 @@ final class RemoveCreditorAndDecreaseTermAction implements PmodActionHandler
                 'creditor'           => $creditorName,
                 'months_to_decrease' => $monthsToDecrease,
                 // Stated explicitly so a dry run cannot be misread as "it will also
-                // shorten the schedule by this many drafts". It will not: the debt
-                // goes, and the CRM recalculates.
+                // shorten the schedule by this many drafts". It will not - and per
+                // §8.22 nothing else shortens it either: Forth recalculates only the
+                // enrolled-debt total, never the program Length or the drafts.
                 'would_cancel_drafts' => 0,
                 'would_remove'       => [
                     'debt_id'  => $debt['id'] ?? null,
@@ -141,9 +142,4 @@ final class RemoveCreditorAndDecreaseTermAction implements PmodActionHandler
             metadata: [...$metadata, 'action_type' => $workItem->actionType->value, 'contact_id' => $workItem->contactId],
         );
     }
-
-    /**
-     * @param list<array<string, mixed>> $debts
-     * @return array<string, mixed>|null
-     */
 }
