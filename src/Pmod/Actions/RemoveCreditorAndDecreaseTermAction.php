@@ -99,7 +99,12 @@ final class RemoveCreditorAndDecreaseTermAction implements PmodActionHandler
             'Action: Remove Creditor and Decrease Term',
             'Creditor Removed: ' . ($creditorName ?? $creditorId ?? 'N/A'),
             'Requested Reduction: ' . ($monthsToDecrease > 0 ? $monthsToDecrease . ' payment(s)' : 'not specified'),
-            'Term: recalculated by the CRM from the remaining enrolled debt',
+            // No claim about the term. It used to read "recalculated by the CRM
+            // from the remaining enrolled debt", which §8.22 disproved: Forth
+            // recalculates only the enrolled-debt total, never the program Length
+            // or the drafts. createContactNote() posts with public = true, so the
+            // client reads this - telling them their term was recalculated when
+            // their payments and dates are unchanged is worse than saying nothing.
             'User: ' . ($workItem->requestedBy ?? 'Client'),
         ];
 
@@ -107,7 +112,7 @@ final class RemoveCreditorAndDecreaseTermAction implements PmodActionHandler
 
         return new PmodResult(
             status: 'updated',
-            message: sprintf('Remove Creditor and Decrease Term: debt removed for contact [%s]; term recalculates from the remaining enrolled debt.', $workItem->contactId),
+            message: sprintf('Remove Creditor and Decrease Term: creditor excluded from the program for contact [%s]; the draft schedule is unchanged.', $workItem->contactId),
             metadata: [
                 'action_type'        => $workItem->actionType->value,
                 'contact_id'         => $workItem->contactId,

@@ -1256,9 +1256,34 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCr
         return $data;
     }
 
+    /**
+     * Take a debt out of the client's program.
+     *
+     * **This EXCLUDES the debt, it does not delete it** — `PUT /debts/{id}` with
+     * `enrolled = 0`, verified against production 2026-09-03 (HTTP 200, reads back
+     * `enrolled=0` with the balance intact, logged in Forth's History as
+     * "Debt Updated").
+     *
+     * That is what the legacy actually did. `ProcessRemoveCreditorAndDecreaseTerm`
+     * matched the row on Edit Debts and clicked the **include checkbox**
+     * (`ColCollection(1)`, gated on column 13 reading "Yes") - it never deleted
+     * anything. Jacob confirmed it from his own code on 2026-09-03: *"for this one
+     * we just remove the creditor."*
+     *
+     * It replaced `DELETE /debts/{id}`, which worked but threw the record away
+     * along with its history and any settlement offers attached to it. The two are
+     * **indistinguishable in effect**: measured on 462464571, deleting and
+     * excluding each dropped the Client Snapshot Debt from $35,000 back to
+     * $30,000 and changed neither the program Length nor a single draft (§8.22).
+     * Given identical outcomes, the reversible operation wins.
+     *
+     * One visible consequence, and it matches the bots' era: an excluded debt
+     * still appears on the contact's debt list, marked not-included, rather than
+     * vanishing.
+     */
     public function cancelDebt(PmodWorkItem $workItem, string $debtId): array
     {
-        Log::info('PMOD: Cancelling debt', [
+        Log::info('PMOD: Excluding debt from the program', [
             'debt_id'         => $debtId,
             'contact_id'      => $workItem->contactId,
             'tenant_id'       => $workItem->tenantId,
@@ -1267,28 +1292,38 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCr
         ]);
 
         if ($workItem->dryRun) {
-            Log::info('PMOD: DRY RUN - Would cancel debt', ['debt_id' => $debtId]);
-            return ['debt_id' => $debtId, 'status' => 'dry_run_cancelled'];
+            Log::info('PMOD: DRY RUN - Would exclude debt from the program', ['debt_id' => $debtId]);
+            return ['debt_id' => $debtId, 'status' => 'dry_run_excluded'];
         }
 
-        // Forth deletes a debt with DELETE /debts/{id}. POST /debts/{id}/cancel
-        // answers 404 — verified against production 2026-08-28, which is why both
-        // Remove Creditor actions failed. A success returns
-        // {"code":200,"message":"Successfully deleted object"}.
         $response = $this->crmClient($workItem->tenantId)
-            ->delete("/debts/{$debtId}");
+            ->put("/debts/{$debtId}", ['enrolled' => '0']);
 
         if (!$response->successful()) {
-            Log::error('PMOD: Failed to cancel debt', [
+            Log::error('PMOD: Failed to exclude debt', [
                 'debt_id'  => $debtId,
                 'status'   => $response->status(),
                 'response' => $response->body(),
             ]);
-            throw new \RuntimeException('Failed to cancel debt');
+            throw new \RuntimeException('Failed to exclude debt from the program');
         }
 
-        $data = $response->json('response', []);
-        Log::info('PMOD: Debt cancelled', ['debt_id' => $debtId]);
+        $data = (array) $response->json('response', []);
+
+        // Verify from the response rather than trusting the 200. Forth echoes the
+        // updated debt back, so this costs nothing - and an exclusion that silently
+        // did not take would leave the creditor in the program while we report
+        // success to the client.
+        if (array_key_exists('enrolled', $data) && (string) $data['enrolled'] !== '0') {
+            Log::error('PMOD: Debt still reads as enrolled after exclusion', [
+                'debt_id'  => $debtId,
+                'enrolled' => $data['enrolled'],
+            ]);
+            throw new \RuntimeException('Debt still reads as enrolled after exclusion');
+        }
+
+        Log::info('PMOD: Debt excluded from the program', ['debt_id' => $debtId]);
+
         return $data;
     }
 
