@@ -1716,7 +1716,12 @@ final class GenerateResumePayments extends Command
             // Route on the status THIS run just wrote when we have one. The queried snapshot lags
             // Forth by up to an hour, so a contact we re-classified moments ago would otherwise
             // still read with its pre-run status and be mis-routed to Manual Review (Jacob 08-18).
-            $effectiveStatus = (string) ($this->newStatusByContact[$contactId] ?? $queueStatuses[$contactId] ?? '');
+            // Resolve through the SAME chain row() uses, so the sheet's Enrollment Status column,
+            // this note and the routing decision can never disagree. $statusByContact is the
+            // accumulated snapshot (both the Phase 4 and Phase 5 lookups merge into it); falling
+            // back to $queueStatuses alone let a contact whose two lookups returned different rows
+            // (tied CONTACTS_STATUS stamps) show one status and be routed on another.
+            $effectiveStatus = (string) ($this->newStatusByContact[$contactId] ?? $this->statusByContact[$contactId] ?? $queueStatuses[$contactId] ?? '');
             $route = $this->cancelRoute($effectiveStatus);
             if ($route === 'excluded') {
                 continue;
