@@ -299,13 +299,54 @@ class EnrollmentIntegrityCheck extends Command
         $this->log('─────────────────────────────────────────────────────────');
         $this->log('[DUP] Checking for duplicate LLG_IDs in TblEnrollment...');
 
-        $dupIds = $this->runCheck($sql, "
-            SELECT TOP 50 LLG_ID
+        $duplicateResult = $sql->querySqlServer("
+            SELECT
+                   LLG_ID,
+                   COUNT(*) AS duplicate_rows,
+                   MIN(PK) AS first_pk,
+                   MAX(PK) AS last_pk
             FROM TblEnrollment
             WHERE Category IN ('LDR', 'CCS')
+              AND LLG_ID IS NOT NULL
+              AND LTRIM(RTRIM(LLG_ID)) <> ''
             GROUP BY LLG_ID
             HAVING COUNT(*) > 1
+            ORDER BY COUNT(*) DESC, LLG_ID
         ");
+
+        if (!is_array($duplicateResult) || ($duplicateResult['success'] ?? false) !== true) {
+            $duplicateError = (string) ($duplicateResult['error'] ?? 'duplicate check query failed');
+            $this->log('[DUP] Could not verify duplicate LLG_IDs: ' . $duplicateError, 'error');
+            Log::error('EnrollmentIntegrityCheck: duplicate check failed', ['error' => $duplicateError]);
+            $alerts[] = [
+                'label'   => 'Duplicate LLG_ID check unavailable',
+                'command' => 'manual',
+                'reason'  => 'The duplicate check itself failed; the integrity result is unknown. No data was changed.',
+                'count'   => 0,
+                'ids'     => [],
+            ];
+            $duplicateRows = [];
+        } else {
+            $duplicateRows = $duplicateResult['data'] ?? [];
+        }
+
+        $dupIds = array_values(array_filter(array_map(
+            static function (array $row): ?string {
+                $llgId = trim((string) ($row['LLG_ID'] ?? ''));
+                if ($llgId === '') {
+                    return null;
+                }
+
+                return sprintf(
+                    '%s (rows=%s, PKs=%s-%s)',
+                    $llgId,
+                    (string) ($row['duplicate_rows'] ?? '?'),
+                    (string) ($row['first_pk'] ?? '?'),
+                    (string) ($row['last_pk'] ?? '?')
+                );
+            },
+            $duplicateRows
+        )));
 
         if (empty($dupIds)) {
             $this->log('[DUP] ✓ No duplicates found');
@@ -319,7 +360,7 @@ class EnrollmentIntegrityCheck extends Command
             $alerts[] = [
                 'label'   => 'Duplicate LLG_IDs',
                 'command' => 'manual',
-                'reason'  => 'Same LLG_ID appears more than once in TblEnrollment — no automation can fix this, manual DELETE required',
+                'reason'  => 'Same LLG_ID appears more than once in TblEnrollment. Manual review is required; this check does not delete or merge rows.',
                 'count'   => $dupCount,
                 'ids'     => array_slice($dupIds, 0, 20),
             ];

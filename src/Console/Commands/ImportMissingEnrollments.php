@@ -203,23 +203,58 @@ class ImportMissingEnrollments extends Command
             $freqSql  = $freq !== '' ? "'{$this->esc($freq)}'" : 'NULL';
             $cxlSql   = $cancelDate   !== '' ? "'{$this->esc($cancelDate)}'"   : 'NULL';
 
+            $pdo = $sqlConnector->getSqlServerConnection();
+
             try {
-                $sqlConnector->querySqlServer("
+                // TblEnrollment historically has no unique constraint on LLG_ID.
+                // Keep the existence check and insert in one transaction and hold a
+                // serializable update/range lock so overlapping importer processes
+                // cannot both observe the same LLG_ID as missing.
+                $pdo->beginTransaction();
+
+                $insertResult = $sqlConnector->querySqlServer("
                     INSERT INTO TblEnrollment
                         (LLG_ID, Category, State, Agent, Client, Debt_Amount, Welcome_Call_Date, Payment_Date_1, Payment_Date_2, Payment_Frequency, Cancel_Date)
                     SELECT '{$llgId}', '{$category}', '{$state}', '{$agent}', '{$client}',
                            {$debtSql}, '{$this->esc($enrolledDate)}', {$pay1Sql}, {$pay2Sql}, {$freqSql}, {$cxlSql}
                     WHERE NOT EXISTS (
-                        SELECT 1 FROM TblEnrollment WHERE LLG_ID = '{$llgId}'
+                        SELECT 1
+                        FROM TblEnrollment WITH (UPDLOCK, HOLDLOCK)
+                        WHERE LLG_ID = '{$llgId}'
                     )
                 ");
-                $inserted++;
-                $existingIds[$llgId] = true; // prevent duplicate from PLAW pass
 
-                if ($inserted % 50 === 0) {
+                if (!is_array($insertResult) || ($insertResult['success'] ?? false) !== true) {
+                    throw new \RuntimeException(
+                        'SQL Server insert failed: ' . (string) ($insertResult['error'] ?? 'unknown error')
+                    );
+                }
+
+                $affected = (int) ($insertResult['row_count'] ?? 0);
+                $pdo->commit();
+
+                if ($affected === 1) {
+                    $inserted++;
+                    $existingIds[$llgId] = true; // prevent duplicate from PLAW pass
+                } else {
+                    // Another source/run already inserted it, or it existed when the
+                    // locked check ran. It was not an insertion in this run.
+                    $skipped++;
+                    $existingIds[$llgId] = true;
+                    Log::info('ImportMissingEnrollments: skipped existing enrollment', [
+                        'source' => $source,
+                        'llgId'  => $llgId,
+                    ]);
+                }
+
+                if ($affected === 1 && $inserted % 50 === 0) {
                     $this->info("[INFO] {$source}: {$inserted} inserted so far...");
                 }
             } catch (\Throwable $e) {
+                if ($pdo->inTransaction()) {
+                    $pdo->rollBack();
+                }
+
                 $msg = $e->getMessage();
                 if (
                     stripos($msg, 'duplicate')   !== false ||
