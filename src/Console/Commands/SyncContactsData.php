@@ -385,6 +385,9 @@ class SyncContactsData extends Command
 
     private function buildStandardQuery(string $startDate, int $lastId, int $limit): string
     {
+        // Page by contact ID (keep LIMIT on this query so lastId paging stays correct).
+        // TP_ID dups (latest Modified) are dropped in processChunk — QUALIFY here would
+        // drop higher IDs and make the next page re-fetch the wrong Snowflake row.
         return "
             SELECT
                 TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', c.CREATED), 'YYYY-MM-DD HH24:MI:SS') AS CREATED,
@@ -437,6 +440,7 @@ class SyncContactsData extends Command
                 WHERE CUSTOM_ID = {$this->agentCustomId}
             ) AS uf_agent ON c.ID = uf_agent.CONTACT_ID
             WHERE CONVERT_TIMEZONE('America/Los_Angeles', COALESCE(c.MODIFIED, c.CREATED)) >= '{$this->esc($startDate)}'::TIMESTAMP_NTZ
+              AND c.DEL = 'FALSE'
               AND c.FIRSTNAME IS NOT NULL AND c.FIRSTNAME <> ''
               AND ISCOAPP = 0
               AND c.ID > {$lastId}
@@ -448,9 +452,8 @@ class SyncContactsData extends Command
 
     private function buildLTQuery(string $startDate, int $lastId, int $limit): string
     {
-        // LT uses real ASSIGNED_ON/CREATED_BY/ASSIGNED_TO from joined tables.
-        // Agent = ASSIGNED_TO (u2), no custom-field agent lookup.
-        // Date filter includes a.STAMP. Duplicate leads filtered in Snowflake.
+        // LT: ASSIGNED_TO only. Page by ID (LIMIT stays here). TP_ID dups are
+        // dropped in processChunk by Modified DESC so paging lastId cannot skip.
         return "
             SELECT
                 TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', c.CREATED), 'YYYY-MM-DD HH24:MI:SS') AS CREATED,
@@ -498,6 +501,7 @@ class SyncContactsData extends Command
                 WHERE CUSTOM_ID = {$this->debtAmountCustomId}
             ) AS uf_debt ON c.ID = uf_debt.CONTACT_ID
             WHERE CONVERT_TIMEZONE('America/Los_Angeles', COALESCE(c.MODIFIED, a.STAMP, c.CREATED)) >= '{$this->esc($startDate)}'::TIMESTAMP_NTZ
+              AND c.DEL = 'FALSE'
               AND c.FIRSTNAME IS NOT NULL AND c.FIRSTNAME <> ''
               AND ISCOAPP = 0
               AND cls.TITLE <> 'Duplicate Lead'
@@ -650,20 +654,23 @@ class SyncContactsData extends Command
         $existingCategories = $enrollmentData['categories'];
         $existingAffiliates = $enrollmentData['affiliate_agents'];
 
-        // Ghost Snowflake records that don't exist in LT CRM — excluded permanently
-        // because they share a TP_ID with valid contacts and win the dedup due to lower IDs.
+        // Drop ghosts first, then keep latest Modified per TP_ID. If ghost wins
+        // Modified DESC and we skip it after, the real contact for that TP_ID is lost.
         $ghostIds = [1212313502, 1212314964, 1212315478, 1212329195, 1212342404];
+        $chunk = array_values(array_filter(
+            $chunk,
+            static function (array $row) use ($ghostIds): bool {
+                if (in_array((int) ($row['LLG_ID'] ?? 0), $ghostIds, true)) {
+                    return false;
+                }
+                return ($row['STATUS'] ?? '') !== 'Duplicate Lead';
+            }
+        ));
+        $chunk = $this->dedupeSnowflakeChunkByTpId($chunk);
 
         foreach ($chunk as $row) {
             $contactId = $row['LLG_ID'] ?? '';
-            $tpId      = $row['EXTERNAL_ID'] ?? '';
-
-            if (in_array((int) $contactId, $ghostIds, true)) {
-                continue;
-            }
-            if (($row['STATUS'] ?? '') === 'Duplicate Lead') {
-                continue;
-            }
+            $tpId      = trim((string) ($row['EXTERNAL_ID'] ?? ''));
             $debtAmountRaw = $row['DEBT_AMOUNT_CUSTOM'] ?? 0;
             $debtAmount = is_numeric($debtAmountRaw) ? (float) $debtAmountRaw : 0.0;
             if ($this->source === 'LT' && ($debtAmount <= 0 || $debtAmount > self::MAX_LT_DEBT_AMOUNT)) {
@@ -675,12 +682,13 @@ class SyncContactsData extends Command
             }
             $planTitle  = $row['PLAN_TITLE'] ?? '';
             $category   = $this->normalizePlanTitle($planTitle);
-            // Prefer the authoritative CONTACTS.ASSIGNED_TO -> USERS name for every
-            // source. The legacy custom field remains a fallback for records whose
-            // assigned user is missing from USERS.
-            $assignedAgent = trim((string) ($row['ASSIGNED_TO'] ?? ''));
-            $customAgent   = trim((string) ($row['AGENT_CUSTOM'] ?? ''));
-            $agent         = $assignedAgent !== '' ? $assignedAgent : $customAgent;
+            // Sales agents = LT SF ASSIGNED_TO roster only. Skip portal system accounts
+            // ("ProgressLaw User", "LDR User", etc.). LDR/PLAW Agent always blank.
+            // Affiliate_Agent on LDR/PLAW still comes from ASSIGNED_TO (not Agent).
+            $assignedTo = trim((string) ($row['ASSIGNED_TO'] ?? ''));
+            $agent = $this->source === 'LT'
+                ? $this->rosterAgentName($assignedTo)
+                : '';
             $creditUtil = $this->parseCreditUtilization($row['CREDIT_UTILIZATION'] ?? '');
 
             $campaign = '';
@@ -712,7 +720,7 @@ class SyncContactsData extends Command
                 'credit_score'       => $row['CREDIT_SCORE'] ?? 0,
                 'credit_utilization' => $creditUtil,
                 'category'           => $category,
-                'affiliate_agent'    => \substr($agent, 0, 255),
+                'affiliate_agent'    => \substr($this->source === 'LT' ? $agent : $assignedTo, 0, 255),
             ];
 
             // LT inserts into TblContacts which has no TP_ID column
@@ -766,9 +774,7 @@ class SyncContactsData extends Command
         }
 
         // Deduplicate by LLG_ID within this chunk: keep the row with the most recent
-        // assigned_date and prefer rows with a non-empty agent. Snowflake can return the
-        // same contact multiple times (e.g. from multiple mailer campaigns) and inserting
-        // all copies produces duplicate rows that break agent lookups.
+        // assigned_date and prefer rows with a non-empty agent.
         $deduped = [];
         foreach ($data as $row) {
             $llgId = $row['llg_id'] ?? '';
@@ -785,7 +791,6 @@ class SyncContactsData extends Command
             $rowAgent         = $row['agent'] ?? '';
             $existingAssigned = $existing['assigned_date'] ?? '';
             $rowAssigned      = $row['assigned_date'] ?? '';
-            // Prefer non-empty agent; break ties by latest assigned_date
             $rowBetter = ($existingAgent === '' && $rowAgent !== '')
                 || ($existingAgent === $rowAgent && $rowAssigned > $existingAssigned);
             if ($rowBetter) {
@@ -835,20 +840,28 @@ class SyncContactsData extends Command
     /**
      * LT incremental: rows whose External_ID already exists under a different LLG_ID
      * were remapped by matching — UPDATE that row, do not INSERT the old LT key.
+     * Also detects remaps via LDR/PLAW.External_ID = LT contact id (Amanda-class blank TP_ID).
      *
      * @return array{0: list<array>, 1: list<array>} [toUpdate, toInsert]
      */
     private function splitLtIncrementalUpserts(\PDO $pdo, array $data): array
     {
         $extToExistingLlg = $this->lookupLtExternalIdOwners($pdo, $data);
+        $ltIdToExistingLlg = $this->lookupLtRemappedOwnersByContactId($pdo, $data);
         $toUpdate = [];
         $toInsert = [];
 
         foreach ($data as $row) {
             $ext = (string) ($row['external_id'] ?? '');
             $llg = (string) ($row['llg_id'] ?? '');
+            $ltId = preg_replace('/^LLG-/i', '', $llg);
             $existingLlg = $ext !== '' ? ($extToExistingLlg[$ext] ?? null) : null;
+            if ($existingLlg === null && $ltId !== '') {
+                $existingLlg = $ltIdToExistingLlg[$ltId] ?? null;
+            }
             if ($existingLlg !== null && $existingLlg !== $llg) {
+                // Carry LT contact id so UPDATE can join when TP_ID/External_ID is blank.
+                $row['_lt_contact_id'] = $ltId;
                 $toUpdate[] = $row;
             } else {
                 $toInsert[] = $row;
@@ -856,6 +869,60 @@ class SyncContactsData extends Command
         }
 
         return [$toUpdate, $toInsert];
+    }
+
+    /**
+     * Remapped TblContacts rows: side-table External_ID holds the original LT contact id.
+     *
+     * @return array<string, string> LT contact id => existing TblContacts.LLG_ID
+     */
+    private function lookupLtRemappedOwnersByContactId(\PDO $pdo, array $data): array
+    {
+        $map = [];
+        foreach (\array_chunk($data, 1000) as $batch) {
+            $ltIds = [];
+            foreach ($batch as $row) {
+                $llg = (string) ($row['llg_id'] ?? '');
+                $ltId = preg_replace('/^LLG-/i', '', $llg);
+                if ($ltId !== '' && ctype_digit($ltId)) {
+                    $ltIds[$ltId] = $llg;
+                }
+            }
+            if ($ltIds === []) {
+                continue;
+            }
+            $inList = \implode(', ', \array_map(
+                fn($id) => "'" . $this->escSql($id) . "'",
+                \array_keys($ltIds)
+            ));
+            $sql = "
+                SELECT CAST(src.External_ID AS VARCHAR(50)) AS LtId, c.LLG_ID
+                FROM TblContacts AS c
+                INNER JOIN TblContactsPLAW AS src ON c.LLG_ID = src.LLG_ID
+                WHERE CAST(src.External_ID AS VARCHAR(50)) IN ({$inList})
+                UNION
+                SELECT CAST(src.External_ID AS VARCHAR(50)) AS LtId, c.LLG_ID
+                FROM TblContacts AS c
+                INNER JOIN TblContactsLDR AS src ON c.LLG_ID = src.LLG_ID
+                WHERE CAST(src.External_ID AS VARCHAR(50)) IN ({$inList})
+            ";
+            $stmt = $pdo->query($sql);
+            if ($stmt === false) {
+                $err = $pdo->errorInfo();
+                throw new \RuntimeException('LT remapped contact-id lookup failed: ' . ($err[2] ?? 'unknown PDO error'));
+            }
+            while ($found = $stmt->fetch(\PDO::FETCH_ASSOC)) {
+                $ltId = (string) ($found['LtId'] ?? $found['ltid'] ?? '');
+                $existing = (string) ($found['LLG_ID'] ?? $found['llg_id'] ?? '');
+                $incoming = $ltIds[$ltId] ?? '';
+                if ($ltId === '' || $existing === '' || $existing === $incoming) {
+                    continue;
+                }
+                $map[$ltId] = $existing;
+            }
+        }
+
+        return $map;
     }
 
     /** @return array<string, string> External_ID => preferred existing LLG_ID (prefer non-incoming LT key when both exist) */
@@ -928,7 +995,7 @@ class SyncContactsData extends Command
         }
     }
 
-    /** Refresh fields on remapped TblContacts rows matched by External_ID; LLG_ID unchanged. */
+    /** Refresh fields on remapped TblContacts rows; LLG_ID unchanged. */
     private function updateLtContactsByExternalId(\PDO $pdo, array $rows): void
     {
         if ($rows === []) {
@@ -937,7 +1004,8 @@ class SyncContactsData extends Command
 
         foreach (\array_chunk($rows, 500) as $batch) {
             $pdo->exec('CREATE TABLE #TmpLtExtUpd (
-                External_ID VARCHAR(50) NOT NULL,
+                External_ID VARCHAR(50) NULL,
+                LtContactId VARCHAR(50) NOT NULL,
                 Created_Date DATETIME NULL,
                 Assigned_Date DATETIME NULL,
                 Campaign NVARCHAR(255) NULL,
@@ -969,8 +1037,13 @@ class SyncContactsData extends Command
                 $email        = \strpos($row['email'], '@') !== false
                     ? "'" . $this->escSql($row['email']) . "'"
                     : 'NULL';
+                $ltContactId = (string) ($row['_lt_contact_id'] ?? preg_replace('/^LLG-/i', '', (string) ($row['llg_id'] ?? '')));
+                $extSql = ($row['external_id'] ?? '') !== ''
+                    ? "'" . $this->escSql((string) $row['external_id']) . "'"
+                    : 'NULL';
                 $valuesParts[] = "("
-                    . "'{$this->escSql($row['external_id'])}', "
+                    . "{$extSql}, "
+                    . "'{$this->escSql($ltContactId)}', "
                     . "{$createdDate}, {$assignedDate}, "
                     . "'{$this->escSql($row['campaign'])}', "
                     . "'{$this->escSql($row['data_source'])}', "
@@ -996,7 +1069,7 @@ class SyncContactsData extends Command
             }
 
             $ins = 'INSERT INTO #TmpLtExtUpd (
-                External_ID, Created_Date, Assigned_Date, Campaign, Data_Source, Created_By, Agent, Client,
+                External_ID, LtContactId, Created_Date, Assigned_Date, Campaign, Data_Source, Created_By, Agent, Client,
                 Phone, Email, Address_1, Address_2, City, State, Zip, Stage, Status,
                 Debt_Amount, Debt_Enrolled, Credit_Score, Credit_Utilization, Category, Affiliate_Agent
             ) VALUES ' . \implode(', ', $valuesParts);
@@ -1006,7 +1079,12 @@ class SyncContactsData extends Command
             }
 
             $upd = "UPDATE c
-                SET c.Created_Date = u.Created_Date,
+                SET c.External_ID = CASE
+                        WHEN COALESCE(c.External_ID, '') <> '' THEN c.External_ID
+                        WHEN COALESCE(u.External_ID, '') <> '' THEN u.External_ID
+                        ELSE u.LtContactId
+                    END,
+                    c.Created_Date = u.Created_Date,
                     c.Assigned_Date = u.Assigned_Date,
                     c.Campaign = u.Campaign,
                     c.Data_Source = u.Data_Source,
@@ -1029,7 +1107,18 @@ class SyncContactsData extends Command
                     c.Category = u.Category,
                     c.Affiliate_Agent = u.Affiliate_Agent
                 FROM {$this->targetTable} AS c
-                INNER JOIN #TmpLtExtUpd AS u ON c.External_ID = u.External_ID";
+                INNER JOIN #TmpLtExtUpd AS u ON (
+                    (COALESCE(u.External_ID, '') <> '' AND c.External_ID = u.External_ID)
+                    OR c.External_ID = u.LtContactId
+                    OR EXISTS (
+                        SELECT 1 FROM TblContactsPLAW p
+                        WHERE p.LLG_ID = c.LLG_ID AND CAST(p.External_ID AS VARCHAR(50)) = u.LtContactId
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM TblContactsLDR l
+                        WHERE l.LLG_ID = c.LLG_ID AND CAST(l.External_ID AS VARCHAR(50)) = u.LtContactId
+                    )
+                )";
             if ($pdo->exec($upd) === false) {
                 $err = $pdo->errorInfo();
                 throw new \RuntimeException('LT remapped UPDATE failed: ' . ($err[2] ?? 'unknown PDO error'));
@@ -1181,7 +1270,7 @@ class SyncContactsData extends Command
             return $this->previewMatching($connector, [$this->targetTable]);
         }
 
-        $this->resetMatchingStats(7);
+        $this->resetMatchingStats(9);
         $this->printMatchingHeader("{$this->source} post-sync matching");
         $this->matchSourceTableToContacts($connector, $this->targetTable);
         $this->fillEnrollmentAgents($connector, (bool) $this->option('reconcile-agents'));
@@ -1195,7 +1284,7 @@ class SyncContactsData extends Command
             return $this->previewMatching($connector, ['TblContactsLDR', 'TblContactsPLAW']);
         }
 
-        $this->resetMatchingStats(10);
+        $this->resetMatchingStats(15);
         $this->printMatchingHeader('orchestrator final matching (External ID → TblContacts → TblEnrollment)');
 
         foreach (['TblContactsLDR', 'TblContactsPLAW'] as $table) {
@@ -1215,8 +1304,8 @@ class SyncContactsData extends Command
      */
     private function previewMatching(DBConnector $connector, array $tables): bool
     {
-        // 5 counts per source table + 4 enrollment fix counts + 6 Jacob gap counts
-        $this->resetMatchingStats((\count($tables) * 5) + 4 + 6);
+        // 6 counts per source table + 3 enrollment fix counts + 6 Jacob gap counts
+        $this->resetMatchingStats((\count($tables) * 6) + 3 + 6);
         $this->printMatchingHeader('DRY RUN — matching verification (read-only, no writes)');
 
         foreach ($tables as $table) {
@@ -1275,66 +1364,44 @@ class SyncContactsData extends Command
              WHERE taken.LLG_ID IS NULL AND TblContacts.LLG_ID <> {$table}.LLG_ID",
             "Rows eligible for LLG_ID remap ({$table})"
         );
+
+        $this->previewCountStep(
+            $connector,
+            "{$table}.backfill_external_id",
+            "SELECT COUNT(*) AS cnt FROM TblContacts
+             INNER JOIN {$table} ON TblContacts.LLG_ID = {$table}.LLG_ID
+             WHERE COALESCE(TblContacts.External_ID, '') = ''
+               AND COALESCE(CAST({$table}.External_ID AS VARCHAR(50)), '') <> ''",
+            "Blank External_ID rows {$table} would backfill"
+        );
     }
 
     private function previewEnrollmentAgentFixes(DBConnector $connector): void
     {
-        $reconcileFlag = $this->option('reconcile-agents') ? 1 : 0;
-
         $this->previewCountStep(
             $connector,
             'enrollment.agent_contacts',
             "SELECT COUNT(*) AS cnt FROM TblEnrollment e
              JOIN (
                  SELECT LLG_ID, MIN(Agent) AS Agent FROM TblContacts
-                 WHERE Agent IS NOT NULL AND Agent <> '' GROUP BY LLG_ID
+                 WHERE Agent IS NOT NULL AND Agent <> '' AND Agent NOT LIKE '% User'
+                 GROUP BY LLG_ID
              ) c ON e.LLG_ID = c.LLG_ID
-             WHERE e.Agent IS NULL OR e.Agent = '' OR e.Agent <> c.Agent",
+             WHERE e.Agent IS NULL OR e.Agent = '' OR e.Agent LIKE '% User' OR e.Agent <> c.Agent",
             'Enrollments TblContacts.Agent would update'
         );
 
         $this->previewCountStep(
             $connector,
-            'enrollment.agent_ldr_fallback',
+            'enrollment.clear_system_user_agents',
             "SELECT COUNT(*) AS cnt FROM TblEnrollment e
-             JOIN TblContactsLDR l ON e.LLG_ID = l.LLG_ID
-             WHERE (e.Agent IS NULL OR e.Agent = ''
-                    OR ({$reconcileFlag} = 1 AND e.Agent <> l.Agent))
-               AND l.Agent IS NOT NULL AND l.Agent <> ''
-               AND LTRIM(RTRIM(l.Agent)) NOT IN ('0', 'N/A', 'NULL')
+             WHERE e.Agent LIKE '% User'
                AND NOT EXISTS (
-                    SELECT 1
-                    FROM TblContactsPLAW p
-                    WHERE p.LLG_ID = e.LLG_ID
-                      AND p.Agent IS NOT NULL AND p.Agent <> ''
-                      AND LTRIM(RTRIM(p.Agent)) NOT IN ('0', 'N/A', 'NULL')
-                      AND LTRIM(RTRIM(p.Agent)) <> LTRIM(RTRIM(l.Agent))
+                    SELECT 1 FROM TblContacts c
+                    WHERE c.LLG_ID = e.LLG_ID
+                      AND c.Agent IS NOT NULL AND c.Agent <> '' AND c.Agent NOT LIKE '% User'
                )",
-            $reconcileFlag === 1
-                ? 'LDR fallback agent reconciliations'
-                : 'Blank enrollments LDR fallback would fill'
-        );
-
-        $this->previewCountStep(
-            $connector,
-            'enrollment.agent_plaw_fallback',
-            "SELECT COUNT(*) AS cnt FROM TblEnrollment e
-             JOIN TblContactsPLAW p ON e.LLG_ID = p.LLG_ID
-             WHERE (e.Agent IS NULL OR e.Agent = ''
-                    OR ({$reconcileFlag} = 1 AND e.Agent <> p.Agent))
-               AND p.Agent IS NOT NULL AND p.Agent <> ''
-               AND LTRIM(RTRIM(p.Agent)) NOT IN ('0', 'N/A', 'NULL')
-               AND NOT EXISTS (
-                    SELECT 1
-                    FROM TblContactsLDR l
-                    WHERE l.LLG_ID = e.LLG_ID
-                      AND l.Agent IS NOT NULL AND l.Agent <> ''
-                      AND LTRIM(RTRIM(l.Agent)) NOT IN ('0', 'N/A', 'NULL')
-                      AND LTRIM(RTRIM(l.Agent)) <> LTRIM(RTRIM(p.Agent))
-               )",
-            $reconcileFlag === 1
-                ? 'PLAW fallback agent reconciliations'
-                : 'Blank enrollments PLAW fallback would fill'
+            'Enrollment system-user agents that would clear'
         );
 
         $this->previewCountStep(
@@ -1441,8 +1508,9 @@ class SyncContactsData extends Command
 
     /**
      * Match LDR/PLAW back to TblContacts by External_ID and copy switched fields.
+     * Agent stays from LT (SF ASSIGNED_TO) — Jacob: contacts Agent linked from Assigned_To.
      * Field copy is split from LLG_ID remap so a unique-index collision on LLG_ID
-     * cannot block Agent (and related fields) from landing on TblContacts.
+     * cannot block Campaign/Category from landing on TblContacts.
      */
     private function matchSourceTableToContacts(DBConnector $connector, string $table): void
     {
@@ -1482,11 +1550,61 @@ class SyncContactsData extends Command
                AND TblContacts.LLG_ID <> {$table}.LLG_ID",
             "Remapped TblContacts.LLG_ID from {$table} (External_ID match)"
         );
+
+        // Amanda-class: remapped rows often keep blank External_ID (LT TP_ID null).
+        // Store side-table External_ID (LT contact id) so later LT sync can refresh Agent.
+        $this->runMatchingStep(
+            $connector,
+            "{$table}.backfill_external_id",
+            "UPDATE TblContacts
+             SET TblContacts.External_ID = LEFT(CAST({$table}.External_ID AS VARCHAR(50)), 50)
+             FROM TblContacts
+             INNER JOIN {$table} ON TblContacts.LLG_ID = {$table}.LLG_ID
+             WHERE COALESCE(TblContacts.External_ID, '') = ''
+               AND COALESCE(CAST({$table}.External_ID AS VARCHAR(50)), '') <> ''",
+            "Backfilled blank TblContacts.External_ID from {$table}"
+        );
+
+        $this->runMatchingStep(
+            $connector,
+            "{$table}.enroll_orphan_to_kept",
+            "UPDATE e
+             SET e.LLG_ID = kept.LLG_ID
+             FROM TblEnrollment AS e
+             INNER JOIN TblContacts AS lt ON e.LLG_ID = lt.LLG_ID
+             INNER JOIN {$table} AS src
+               ON lt.LLG_ID = 'LLG-' + CAST(src.External_ID AS VARCHAR(50))
+             INNER JOIN TblContacts AS kept ON kept.LLG_ID = src.LLG_ID
+             WHERE lt.LLG_ID <> src.LLG_ID
+               AND NOT EXISTS (
+                    SELECT 1 FROM TblEnrollment AS e2 WHERE e2.LLG_ID = kept.LLG_ID
+               )",
+            "Moved enrollments from orphan LT key to kept LLG_ID ({$table})"
+        );
+
+        $this->runMatchingStep(
+            $connector,
+            "{$table}.drop_lt_orphans",
+            "DELETE lt
+             FROM TblContacts AS lt
+             INNER JOIN {$table} AS src
+               ON lt.LLG_ID = 'LLG-' + CAST(src.External_ID AS VARCHAR(50))
+             INNER JOIN TblContacts AS kept ON kept.LLG_ID = src.LLG_ID
+             WHERE lt.LLG_ID <> src.LLG_ID
+               AND NOT EXISTS (
+                    SELECT 1 FROM TblEnrollment AS e WHERE e.LLG_ID = lt.LLG_ID
+               )",
+            "Dropped orphan LT-keyed TblContacts rows after {$table} match"
+        );
     }
 
     private function fillEnrollmentAgents(DBConnector $connector, bool $reconcileAgents = false): void
     {
-        $reconcileFlag = $reconcileAgents ? 1 : 0;
+        // Enrollment Agent comes from TblContacts (LT roster) only — never LDR/PLAW
+        // process users ("ProgressLaw User", "LDR User").
+        $badAgent = "(TblEnrollment.Agent IS NULL OR TblEnrollment.Agent = '' OR TblEnrollment.Agent LIKE '% User')";
+        $goodContact = "c.Agent IS NOT NULL AND c.Agent <> '' AND c.Agent NOT LIKE '% User'";
+
         $steps = [
             'enrollment.agent_contacts' => [
                 'sql' => "UPDATE TblEnrollment
@@ -1495,50 +1613,23 @@ class SyncContactsData extends Command
              JOIN (
                  SELECT LLG_ID, MIN(Agent) AS Agent
                  FROM TblContacts
-                 WHERE Agent IS NOT NULL AND Agent <> ''
+                 WHERE Agent IS NOT NULL AND Agent <> '' AND Agent NOT LIKE '% User'
                  GROUP BY LLG_ID
              ) c ON TblEnrollment.LLG_ID = c.LLG_ID
-             WHERE TblEnrollment.Agent IS NULL OR TblEnrollment.Agent = ''
+             WHERE {$badAgent}
                 OR TblEnrollment.Agent <> c.Agent",
                 'label' => 'Updated TblEnrollment.Agent from TblContacts',
             ],
-            'enrollment.agent_ldr_fallback' => [
+            'enrollment.clear_system_user_agents' => [
                 'sql' => "UPDATE TblEnrollment
-             SET TblEnrollment.Agent = l.Agent
-             FROM TblEnrollment
-             JOIN TblContactsLDR l ON TblEnrollment.LLG_ID = l.LLG_ID
-             WHERE (TblEnrollment.Agent IS NULL OR TblEnrollment.Agent = ''
-                    OR ({$reconcileFlag} = 1 AND TblEnrollment.Agent <> l.Agent))
-               AND l.Agent IS NOT NULL AND l.Agent <> ''
-               AND LTRIM(RTRIM(l.Agent)) NOT IN ('0', 'N/A', 'NULL')
+             SET Agent = NULL
+             WHERE Agent LIKE '% User'
                AND NOT EXISTS (
-                    SELECT 1
-                    FROM TblContactsPLAW p
-                    WHERE p.LLG_ID = TblEnrollment.LLG_ID
-                      AND p.Agent IS NOT NULL AND p.Agent <> ''
-                      AND LTRIM(RTRIM(p.Agent)) NOT IN ('0', 'N/A', 'NULL')
-                      AND LTRIM(RTRIM(p.Agent)) <> LTRIM(RTRIM(l.Agent))
+                    SELECT 1 FROM TblContacts c
+                    WHERE c.LLG_ID = TblEnrollment.LLG_ID
+                      AND {$goodContact}
                )",
-                'label' => 'Updated TblEnrollment.Agent from TblContactsLDR (fallback)',
-            ],
-            'enrollment.agent_plaw_fallback' => [
-                'sql' => "UPDATE TblEnrollment
-             SET TblEnrollment.Agent = p.Agent
-             FROM TblEnrollment
-             JOIN TblContactsPLAW p ON TblEnrollment.LLG_ID = p.LLG_ID
-             WHERE (TblEnrollment.Agent IS NULL OR TblEnrollment.Agent = ''
-                    OR ({$reconcileFlag} = 1 AND TblEnrollment.Agent <> p.Agent))
-               AND p.Agent IS NOT NULL AND p.Agent <> ''
-               AND LTRIM(RTRIM(p.Agent)) NOT IN ('0', 'N/A', 'NULL')
-               AND NOT EXISTS (
-                    SELECT 1
-                    FROM TblContactsLDR l
-                    WHERE l.LLG_ID = TblEnrollment.LLG_ID
-                      AND l.Agent IS NOT NULL AND l.Agent <> ''
-                      AND LTRIM(RTRIM(l.Agent)) NOT IN ('0', 'N/A', 'NULL')
-                      AND LTRIM(RTRIM(l.Agent)) <> LTRIM(RTRIM(p.Agent))
-               )",
-                'label' => 'Updated TblEnrollment.Agent from TblContactsPLAW (fallback)',
+                'label' => 'Cleared enrollment system-user agents with no roster contact',
             ],
             'enrollment.drop_name' => [
                 'sql' => "UPDATE TblEnrollment
@@ -1555,10 +1646,46 @@ class SyncContactsData extends Command
         }
     }
 
+    /**
+     * Keep first record per TP_ID ordered by Modified DESC (Jacob).
+     * Blank TP_ID rows are kept individually (keyed by contact ID).
+     */
+    private function dedupeSnowflakeChunkByTpId(array $chunk): array
+    {
+        $best = [];
+        foreach ($chunk as $row) {
+            $tpId = trim((string) ($row['EXTERNAL_ID'] ?? $row['TP_ID'] ?? ''));
+            $id = (string) ($row['LLG_ID'] ?? '');
+            $key = $tpId !== '' ? $tpId : ('ID-' . $id);
+            $modified = (string) ($row['MODIFIED'] ?? '');
+            if (!isset($best[$key])) {
+                $best[$key] = $row;
+                continue;
+            }
+            $existingModified = (string) ($best[$key]['MODIFIED'] ?? '');
+            if ($modified > $existingModified
+                || ($modified === $existingModified && $id > (string) ($best[$key]['LLG_ID'] ?? ''))
+            ) {
+                $best[$key] = $row;
+            }
+        }
+        return array_values($best);
+    }
+
+    /** Real sales roster name — not portal system accounts. */
+    private function rosterAgentName(string $assignedTo): string
+    {
+        $name = trim($assignedTo);
+        if ($name === '' || preg_match('/\bUser$/i', $name)) {
+            return '';
+        }
+        return $name;
+    }
+
     private function matchedFieldsSql(string $src): string
     {
-        return "TblContacts.Agent = CASE WHEN COALESCE({$src}.Agent, '') <> '' THEN {$src}.Agent ELSE TblContacts.Agent END,
-                TblContacts.Affiliate_Agent = CASE WHEN COALESCE({$src}.Affiliate_Agent, '') <> '' THEN {$src}.Affiliate_Agent ELSE TblContacts.Affiliate_Agent END,
+        // Do not overwrite Agent — TblContacts.Agent comes from LT SF ASSIGNED_TO.
+        return "TblContacts.Affiliate_Agent = CASE WHEN COALESCE({$src}.Affiliate_Agent, '') <> '' THEN {$src}.Affiliate_Agent ELSE TblContacts.Affiliate_Agent END,
                 TblContacts.Campaign = CASE WHEN COALESCE({$src}.Campaign, '') <> '' THEN {$src}.Campaign ELSE TblContacts.Campaign END,
                 TblContacts.Category = CASE WHEN COALESCE({$src}.Category, '') <> '' THEN {$src}.Category ELSE TblContacts.Category END";
     }

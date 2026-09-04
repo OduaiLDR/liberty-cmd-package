@@ -397,6 +397,7 @@ class SyncContactsCCS extends Command
             LEFT JOIN (SELECT CONTACT_ID, F_DECIMAL     FROM CONTACTS_USERFIELDS WHERE CUSTOM_ID = {$cfFpa})      AS uf_fpa       ON c.ID = uf_fpa.CONTACT_ID
             LEFT JOIN (SELECT CONTACT_ID, F_SHORTSTRING FROM CONTACTS_USERFIELDS WHERE CUSTOM_ID = {$cfFreq})     AS uf_freq      ON c.ID = uf_freq.CONTACT_ID
             WHERE UPPER(ds.NAME) LIKE 'FF-%'
+              AND c.DEL = 'FALSE'
               AND COALESCE(c.FIRSTNAME, '') <> ''
               AND CONVERT_TIMEZONE('America/Los_Angeles', COALESCE(c.MODIFIED, a.STAMP, c.CREATED)) >= '{$start}'::TIMESTAMP_NTZ
               AND c.ID > {$lastId}
@@ -412,21 +413,13 @@ class SyncContactsCCS extends Command
 
     private function processChunk(PDO $ccsPdo, array $chunk, array &$seenTpIds): array
     {
-        // ── First pass: gather CIDs and apply TP_ID dedup + test-email filter ─────
+        // ── First pass: test-email filter, then 1 row per TP_ID (latest Modified) ─
         $candidates = [];
         $cids       = [];
 
         foreach ($chunk as $row) {
             if (($row['EMAIL'] ?? '') === 'testing@example.com') {
                 continue;
-            }
-
-            $tpId = trim((string) ($row['EXTERNAL_ID'] ?? ''));
-            if ($tpId !== '' && isset($seenTpIds[$tpId])) {
-                continue;
-            }
-            if ($tpId !== '') {
-                $seenTpIds[$tpId] = true;
             }
 
             $cid = (string) ($row['CONTACT_ID'] ?? '');
@@ -437,6 +430,23 @@ class SyncContactsCCS extends Command
             $candidates[] = $row;
             $cids[]       = $cid;
         }
+
+        $candidates = $this->dedupeChunkByTpIdModifiedDesc($candidates);
+        $cids = [];
+        $kept = [];
+        foreach ($candidates as $row) {
+            $tpId = trim((string) ($row['EXTERNAL_ID'] ?? ''));
+            $modified = (string) ($row['MODIFIED'] ?? '');
+            if ($tpId !== '' && isset($seenTpIds[$tpId]) && $seenTpIds[$tpId] >= $modified) {
+                continue;
+            }
+            if ($tpId !== '') {
+                $seenTpIds[$tpId] = $modified;
+            }
+            $kept[] = $row;
+            $cids[] = (string) ($row['CONTACT_ID'] ?? '');
+        }
+        $candidates = $kept;
 
         if (empty($candidates)) {
             return [];
@@ -836,6 +846,29 @@ class SyncContactsCCS extends Command
         } catch (\Throwable $e) {
             return '';
         }
+    }
+
+    /** Keep latest Modified per TP_ID (Jacob). Blank TP_ID rows stay unique by contact. */
+    private function dedupeChunkByTpIdModifiedDesc(array $chunk): array
+    {
+        $best = [];
+        foreach ($chunk as $row) {
+            $tpId = trim((string) ($row['EXTERNAL_ID'] ?? ''));
+            $id = (string) ($row['CONTACT_ID'] ?? '');
+            $key = $tpId !== '' ? $tpId : ('ID-' . $id);
+            $modified = (string) ($row['MODIFIED'] ?? '');
+            if (!isset($best[$key])) {
+                $best[$key] = $row;
+                continue;
+            }
+            $existingModified = (string) ($best[$key]['MODIFIED'] ?? '');
+            if ($modified > $existingModified
+                || ($modified === $existingModified && $id > (string) ($best[$key]['CONTACT_ID'] ?? ''))
+            ) {
+                $best[$key] = $row;
+            }
+        }
+        return array_values($best);
     }
 
     private function parseCreditUtilization(string $value): int

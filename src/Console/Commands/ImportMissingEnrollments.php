@@ -29,14 +29,28 @@ class ImportMissingEnrollments extends Command
             return Command::FAILURE;
         }
 
-        // Load ALL existing LLG_IDs for LDR and CCS rows — used to skip contacts already present
         $existingResult = $sqlConnector->querySqlServer(
-            "SELECT LLG_ID FROM TblEnrollment WHERE Category IN ('LDR', 'CCS')"
+            "SELECT LLG_ID, Client, State, Debt_Amount FROM TblEnrollment WHERE Category IN ('LDR', 'CCS')"
         );
         $existingRows = is_array($existingResult)
             ? ($existingResult['data'] ?? (array_is_list($existingResult) ? $existingResult : []))
             : [];
-        $existingIds = array_flip(array_column($existingRows, 'LLG_ID'));
+        $existingIds = [];
+        $existingPeople = [];
+        foreach ($existingRows as $row) {
+            $llgId = trim((string) ($row['LLG_ID'] ?? ''));
+            if ($llgId !== '') {
+                $existingIds[$llgId] = true;
+            }
+            $personKey = $this->personKey(
+                (string) ($row['Client'] ?? ''),
+                (string) ($row['State'] ?? ''),
+                $row['Debt_Amount'] ?? null
+            );
+            if ($personKey !== '') {
+                $existingPeople[$personKey] = true;
+            }
+        }
         $this->info('[INFO] Existing TblEnrollment rows (LDR + CCS): ' . count($existingIds));
 
         $totalInserted = 0;
@@ -57,7 +71,7 @@ class ImportMissingEnrollments extends Command
                 continue;
             }
 
-            $inserted = $this->importFromSource($snowflake, $sqlConnector, $existingIds, strtoupper($source), $dryRun);
+            $inserted = $this->importFromSource($snowflake, $sqlConnector, $existingIds, $existingPeople, strtoupper($source), $dryRun);
             $totalInserted += $inserted;
         }
 
@@ -74,25 +88,19 @@ class ImportMissingEnrollments extends Command
         DBConnector $snowflake,
         DBConnector $sqlConnector,
         array &$existingIds,
+        array &$existingPeople,
         string $source,
         bool $dryRun = false
     ): int {
-        // Pull enrolled contacts from Snowflake with all fields needed for TblEnrollment.
-        //   - ENROLLED_DATE >= 2022-07-01 (program start)
-        //   - Agent from USERS table (not TblContacts)
-        //   - Debt_Amount = SUM(ORIGINAL_DEBT_AMOUNT) from enrolled DEBTS
-        //   - Payment_Date_1 = 1st deposit PROCESS_DATE (N=1)
-        //   - Payment_Date_2 = 2nd deposit PROCESS_DATE (N=2, populated only when frequency is non-monthly)
-        //   - Payment_Frequency from ENROLLMENT_PLAN.FREQUENCY
-        //   - Cancel_Date from DROPPED_DATE
-        //   - Category = 'CCS' if ed.TITLE contains 'CCS', else 'LDR'
         $sfSql = "
             SELECT
                 c.ID,
+                c.TP_ID,
                 c.STATE,
                 CONCAT(u.FIRSTNAME, ' ', u.LASTNAME)  AS AGENT,
                 CONCAT(c.FIRSTNAME, ' ', c.LASTNAME)  AS CLIENT,
                 d.DEBT,
+                TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', COALESCE(c.MODIFIED, c.CREATED)), 'YYYY-MM-DD HH24:MI:SS') AS MODIFIED,
                 TO_CHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.ENROLLED_DATE) AS DATE), 'YYYY-MM-DD') AS ENROLLED_DATE,
                 TO_CHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.DROPPED_DATE) AS DATE), 'YYYY-MM-DD') AS CANCEL_DATE,
                 ed.TITLE,
@@ -137,6 +145,7 @@ class ImportMissingEnrollments extends Command
                 ON ep.PLAN_ID = ed.ID
             WHERE CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.ENROLLED_DATE) AS DATE) >= '2022-07-01'
               AND c._FIVETRAN_DELETED = FALSE
+              AND c.DEL = 'FALSE'
         ";
 
         $sfResult  = $snowflake->query($sfSql);
@@ -147,15 +156,28 @@ class ImportMissingEnrollments extends Command
             return 0;
         }
 
-        // Filter to contacts not already in TblEnrollment
+        $sfRows = $this->dedupeSnowflakeByTpId($sfRows);
+        $this->info("[INFO] {$source}: " . count($sfRows) . " after 1 per TP_ID (newest Modified)");
+
         $missing = [];
         foreach ($sfRows as $row) {
             $id = trim((string) ($row['ID'] ?? ''));
-            if ($id === '') continue;
-            $llgId = 'LLG-' . $id;
-            if (!isset($existingIds[$llgId])) {
-                $missing[$llgId] = $row;
+            if ($id === '') {
+                continue;
             }
+            $llgId = 'LLG-' . $id;
+            if (isset($existingIds[$llgId])) {
+                continue;
+            }
+            $personKey = $this->personKey(
+                (string) ($row['CLIENT'] ?? ''),
+                (string) ($row['STATE'] ?? ''),
+                $row['DEBT'] ?? null
+            );
+            if ($personKey !== '' && isset($existingPeople[$personKey])) {
+                continue;
+            }
+            $missing[$llgId] = $row;
         }
 
         $this->info("[INFO] {$source}: " . count($missing) . " contacts missing from TblEnrollment");
@@ -197,19 +219,23 @@ class ImportMissingEnrollments extends Command
             // Category: 'CCS' if enrollment plan title contains 'CCS', else 'LDR'
             $category = (stripos($title, 'CCS') !== false) ? 'CCS' : 'LDR';
 
-            $debtSql  = is_numeric($debt) ? (float) $debt : 'NULL';
+            $debtSql = is_numeric($debt) ? $this->normalizeDebt($debt) : 'NULL';
             $pay1Sql  = $paymentDate1 !== '' ? "'{$this->esc($paymentDate1)}'" : 'NULL';
             $pay2Sql  = $paymentDate2 !== '' ? "'{$this->esc($paymentDate2)}'" : 'NULL';
             $freqSql  = $freq !== '' ? "'{$this->esc($freq)}'" : 'NULL';
             $cxlSql   = $cancelDate   !== '' ? "'{$this->esc($cancelDate)}'"   : 'NULL';
+            $personKey = $this->personKey(
+                (string) ($row['CLIENT'] ?? ''),
+                (string) ($row['STATE'] ?? ''),
+                $debt
+            );
+            $personMatchSql = is_numeric($debt)
+                ? "Debt_Amount = {$debtSql}"
+                : 'Debt_Amount IS NULL';
 
             $pdo = $sqlConnector->getSqlServerConnection();
 
             try {
-                // TblEnrollment historically has no unique constraint on LLG_ID.
-                // Keep the existence check and insert in one transaction and hold a
-                // serializable update/range lock so overlapping importer processes
-                // cannot both observe the same LLG_ID as missing.
                 $pdo->beginTransaction();
 
                 $insertResult = $sqlConnector->querySqlServer("
@@ -221,6 +247,7 @@ class ImportMissingEnrollments extends Command
                         SELECT 1
                         FROM TblEnrollment WITH (UPDLOCK, HOLDLOCK)
                         WHERE LLG_ID = '{$llgId}'
+                           OR (Client = '{$client}' AND State = '{$state}' AND {$personMatchSql})
                     )
                 ");
 
@@ -235,12 +262,16 @@ class ImportMissingEnrollments extends Command
 
                 if ($affected === 1) {
                     $inserted++;
-                    $existingIds[$llgId] = true; // prevent duplicate from PLAW pass
+                    $existingIds[$llgId] = true;
+                    if ($personKey !== '') {
+                        $existingPeople[$personKey] = true;
+                    }
                 } else {
-                    // Another source/run already inserted it, or it existed when the
-                    // locked check ran. It was not an insertion in this run.
                     $skipped++;
                     $existingIds[$llgId] = true;
+                    if ($personKey !== '') {
+                        $existingPeople[$personKey] = true;
+                    }
                     Log::info('ImportMissingEnrollments: skipped existing enrollment', [
                         'source' => $source,
                         'llgId'  => $llgId,
@@ -262,6 +293,9 @@ class ImportMissingEnrollments extends Command
                     stripos($msg, 'PRIMARY KEY')  !== false
                 ) {
                     $existingIds[$llgId] = true;
+                    if ($personKey !== '') {
+                        $existingPeople[$personKey] = true;
+                    }
                     $skipped++;
                     continue;
                 }
@@ -321,6 +355,46 @@ class ImportMissingEnrollments extends Command
 
         $this->info("[INFO] Corrected {$fixed} enrollment agents from LT ownership");
         return $fixed;
+    }
+
+    /** Keep newest Modified per TP_ID. Blank TP_ID stays keyed by contact ID. */
+    private function dedupeSnowflakeByTpId(array $rows): array
+    {
+        $best = [];
+        foreach ($rows as $row) {
+            $tpId = trim((string) ($row['TP_ID'] ?? ''));
+            $id = (string) ($row['ID'] ?? '');
+            $key = $tpId !== '' ? $tpId : ('ID-' . $id);
+            $modified = (string) ($row['MODIFIED'] ?? '');
+            if (!isset($best[$key])) {
+                $best[$key] = $row;
+                continue;
+            }
+            $existingModified = (string) ($best[$key]['MODIFIED'] ?? '');
+            if ($modified > $existingModified
+                || ($modified === $existingModified && $id > (string) ($best[$key]['ID'] ?? ''))
+            ) {
+                $best[$key] = $row;
+            }
+        }
+        return array_values($best);
+    }
+
+    private function personKey(string $client, string $state, $debt): string
+    {
+        $client = strtolower(trim($client));
+        if ($client === '') {
+            return '';
+        }
+        return $client . '|' . strtoupper(trim($state)) . '|' . $this->normalizeDebt($debt);
+    }
+
+    private function normalizeDebt($debt): string
+    {
+        if (!is_numeric($debt)) {
+            return '';
+        }
+        return number_format((float) $debt, 2, '.', '');
     }
 
     protected function esc(string $value): string
