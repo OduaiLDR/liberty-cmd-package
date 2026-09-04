@@ -26,8 +26,12 @@ class UnassignedCommissionAgents
     /**
      * Placeholder "agents" the CRM uses for unattributed work. They are not people, so they must
      * never be reported as someone missing from the roster.
+     *
+     * 'Others' was added on 2026-09-04 after the first production NSF run reported "OTHERS",
+     * "Others" and "others" as three separate missing agents at $2.00 each. Matching is
+     * case-insensitive, so one entry covers every spelling.
      */
-    public const IGNORED_AGENTS = ['Sales Rep', 'Other CS Agent'];
+    public const IGNORED_AGENTS = ['Sales Rep', 'Other CS Agent', 'Others', 'Other'];
 
     /**
      * @param array<string,float>    $totalsByAgent Commission earned THIS period, keyed by the agent
@@ -44,6 +48,27 @@ class UnassignedCommissionAgents
         }
 
         $ignored = array_map([self::class, 'key'], self::IGNORED_AGENTS);
+
+        // Collapse case/space variants here as well as in totals(). Callers may build their own
+        // map — NSF prices agents from its own commission rows — and a raw-string key splits one
+        // name into several ("OTHERS" / "Others" / "others" all appeared separately on the first
+        // production run).
+        $collapsed = [];
+        foreach ($totalsByAgent as $rawAgent => $rawAmount) {
+            $name = trim((string) $rawAgent);
+            if ($name === '') {
+                continue;
+            }
+            $key = self::key($name);
+            if (!isset($collapsed[$key])) {
+                $collapsed[$key] = ['name' => $name, 'amount' => 0.0];
+            }
+            $collapsed[$key]['amount'] += (float) $rawAmount;
+        }
+        $totalsByAgent = [];
+        foreach ($collapsed as $entry) {
+            $totalsByAgent[$entry['name']] = $entry['amount'];
+        }
 
         $out = [];
         foreach ($totalsByAgent as $agent => $amount) {
@@ -80,13 +105,27 @@ class UnassignedCommissionAgents
      */
     public static function totals(array $rows, string $agentField, string $amountField): array
     {
-        $totals = [];
+        // Aggregate case- and space-insensitively, keeping the first spelling seen. The CRM holds
+        // the same name several ways, and keying on the raw string split one person into several:
+        // the first production NSF run listed "OTHERS", "Others" and "others" as three separate
+        // missing agents. The same fault would have split a real person across two entries and
+        // understated both.
+        $byKey = [];
         foreach ($rows as $row) {
             $agent = trim((string) ($row[$agentField] ?? ''));
             if ($agent === '') {
                 continue;
             }
-            $totals[$agent] = ($totals[$agent] ?? 0.0) + (float) ($row[$amountField] ?? 0);
+            $key = self::key($agent);
+            if (!isset($byKey[$key])) {
+                $byKey[$key] = ['name' => $agent, 'amount' => 0.0];
+            }
+            $byKey[$key]['amount'] += (float) ($row[$amountField] ?? 0);
+        }
+
+        $totals = [];
+        foreach ($byKey as $entry) {
+            $totals[$entry['name']] = $entry['amount'];
         }
 
         return $totals;

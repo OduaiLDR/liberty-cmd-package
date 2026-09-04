@@ -117,53 +117,12 @@ class CommissionRosterProvider
         }
     }
 
-    /**
-     * Each roster agent's own source, keyed by a normalised name.
-     *
-     * The company-mismatch flag is judged against THIS, not against the report being generated. An
-     * agent rostered to 'both' earns in either brand, so their company cannot contradict the report
-     * they are on; only an agent pinned to 'ldr' or 'plaw' can be contradicted (Monther, 2026-09-04:
-     * "both never flags").
-     *
-     * @return array<string,string> normalised name => 'ldr' | 'plaw' | 'both'
-     */
-    public static function rosterSources(DBConnector $sql, string $reportType, string $source): array
-    {
-        $reportType = strtolower(trim($reportType));
-        $source     = strtolower(trim($source));
-
-        try {
-            $res = $sql->querySqlServer(
-                'SELECT Agent, Source FROM dbo.' . self::TABLE . "
-                 WHERE Report_Type = ? AND (Source = ? OR Source = 'both')",
-                [$reportType, $source]
-            );
-
-            if (($res['success'] ?? false) !== true) {
-                return [];
-            }
-
-            $out = [];
-            foreach ($res['data'] ?? [] as $row) {
-                $name = self::nameKey((string) ($row['Agent'] ?? $row['agent'] ?? ''));
-                if ($name === '') {
-                    continue;
-                }
-                $out[$name] = strtolower(trim((string) ($row['Source'] ?? $row['source'] ?? 'both')));
-            }
-
-            return $out;
-        } catch (\Throwable $e) {
-            Log::warning('CommissionRosterProvider: roster source lookup failed.', ['ex' => $e->getMessage()]);
-            return [];
-        }
-    }
-
-    /** The roster source for one agent, or '' when they are not on the roster / it is unavailable. */
-    public static function sourceFor(array $sourcesByAgent, string $name): string
-    {
-        return $sourcesByAgent[self::nameKey($name)] ?? '';
-    }
+    // NOTE: a rosterSources()/sourceFor() pair briefly lived here to judge the company-mismatch
+    // flag against each agent's own roster source, so that anyone rostered to "both" never flagged.
+    // Removed on 2026-09-04 — it silenced Jacob's own examples (Katherine Caceres with a Progress
+    // Law company on the LDR report, Lucas Wright the other way round; both are rostered "both").
+    // The flag is judged against the report/page brand instead. Do not reintroduce it without
+    // checking those two cases still show.
 
     /**
      * True when $name is on $roster, comparing case- and space-insensitively.

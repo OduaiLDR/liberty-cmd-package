@@ -270,10 +270,6 @@ class GenerateRetentionBonusCommission extends Command
                 $this->info("[INFO] [$display] Roster agents: " . count($rosterAgents));
             }
 
-            // Per-agent roster source, so the company-mismatch flag is judged against the brand each
-            // agent is actually pinned to. An agent rostered to 'both' never flags.
-            $rosterSources = CommissionRosterProvider::rosterSources($sql, 'retention', $source);
-
             // The employee lookup has to cover roster members too, not just people with data —
             // a roster member with no retention activity this month still needs their company
             // checked and still belongs on the summary at $0.
@@ -292,7 +288,7 @@ class GenerateRetentionBonusCommission extends Command
 
             $formatter = new BonusFormatter();
             $allFile = $formatter->buildWorkbook(
-                $rows, $display, $reportStartDate, $endDate, $employeeMap, null, $rosterSources, $rosterAgents, $unassigned
+                $rows, $display, $reportStartDate, $endDate, $employeeMap, null, $source, $rosterAgents, $unassigned
             );
 
             if ($allFile) {
