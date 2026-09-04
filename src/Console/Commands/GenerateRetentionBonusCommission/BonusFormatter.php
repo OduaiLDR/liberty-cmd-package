@@ -4,12 +4,14 @@ declare(strict_types=1);
 
 namespace Cmd\Reports\Console\Commands\GenerateRetentionBonusCommission;
 
+use Cmd\Reports\Services\CommissionCompanyMatch;
 use Illuminate\Support\Facades\Log;
 use PhpOffice\PhpSpreadsheet\Shared\Date as XlDate;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Style\Alignment;
 use PhpOffice\PhpSpreadsheet\Style\Border;
 use PhpOffice\PhpSpreadsheet\Style\Fill;
+use PhpOffice\PhpSpreadsheet\Worksheet\Worksheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 
 class BonusFormatter
@@ -21,14 +23,79 @@ class BonusFormatter
     private const MONEY2_FMT  = '$#,##0.00';
     private const PCT_FMT     = '0%';
 
+    // Two different problems, two different fills, so a reviewer can tell them apart at a glance.
+    // Missing data (pink) is a gap in the employee record; a company mismatch (solid red) means the
+    // person is on the wrong report entirely.
+    private const BLANK_FILL      = 'FFFFC7CE';
+    private const BLANK_FONT      = 'FF9C0006';
+    private const MISMATCH_FILL   = 'FFFF0000';
+    private const MISMATCH_FONT   = 'FFFFFFFF';
+
+    /** Case/space-insensitive key, so CRM and roster spellings of one name line up. */
+    private static function nameKey(string $name): string
+    {
+        return strtolower(trim((string) preg_replace('/\s+/', ' ', trim($name))));
+    }
+
+    /**
+     * Write one Agent Summary row and apply whichever highlight it earns.
+     *
+     * @param array{name:string,commission:float,location:string,company:string} $entry
+     * @return int The next free row.
+     */
+    private function writeSummaryRow(Worksheet $summary, int $sr, array $entry, string $sourceCode): int
+    {
+        $summary->setCellValue("A{$sr}", $entry['name']);
+        $summary->setCellValue("B{$sr}", $entry['commission']);
+        $summary->setCellValue("C{$sr}", $entry['location']);
+        $summary->setCellValue("D{$sr}", $entry['company']);
+
+        $company  = trim((string) $entry['company']);
+        $location = trim((string) $entry['location']);
+
+        if ($sourceCode !== '' && CommissionCompanyMatch::mismatches($sourceCode, $company)) {
+            // Jacob: "If you are in Progress Law and the company is Liberty or vise versa then flag
+            // that red." Checked before the blank rule — a mismatch is the more serious finding,
+            // and a mismatching company is by definition not blank.
+            $summary->getStyle("A{$sr}:D{$sr}")->getFill()
+                ->setFillType(Fill::FILL_SOLID)
+                ->getStartColor()->setARGB(self::MISMATCH_FILL);
+            $summary->getStyle("A{$sr}:D{$sr}")->getFont()->getColor()->setARGB(self::MISMATCH_FONT);
+            $summary->getStyle("A{$sr}:D{$sr}")->getFont()->setBold(true);
+        } elseif ($company === '' || $location === '') {
+            // Call out agents with no company or location — without a company they cannot appear
+            // on the Commission Review page (which is separated per company).
+            $summary->getStyle("A{$sr}:D{$sr}")->getFill()
+                ->setFillType(Fill::FILL_SOLID)
+                ->getStartColor()->setARGB(self::BLANK_FILL);
+            $summary->getStyle("A{$sr}:D{$sr}")->getFont()->getColor()->setARGB(self::BLANK_FONT);
+        }
+
+        return $sr + 1;
+    }
+
     /**
      * @param array<int,array<string,mixed>> $rows
      * @param array<string,array{location:string,company:string}> $employeeMap  UPPER(agent_name) => employee data
      * @param string|null $agentFilter When set, only the agent's rows appear and the
      *                                 filename uses the agent name ("- <Agent Name>")
+     * @param string $sourceCode   'ldr' | 'plaw' — used for the company-mismatch check.
+     * @param array<int,string>|null $rosterAgents The roster that defines the summary. Null when the
+     *                                            roster was unreadable; the summary then falls back
+     *                                            to the CRM agent names, as it always used to.
+     * @param array<int,array{agent:string,amount:float}> $unassigned Earners not on the roster.
      */
-    public function buildWorkbook(array $rows, string $source, string $start, string $end, array $employeeMap = [], ?string $agentFilter = null): ?array
-    {
+    public function buildWorkbook(
+        array $rows,
+        string $source,
+        string $start,
+        string $end,
+        array $employeeMap = [],
+        ?string $agentFilter = null,
+        string $sourceCode = '',
+        ?array $rosterAgents = null,
+        array $unassigned = []
+    ): ?array {
         try {
             $sp    = new Spreadsheet();
             $sheet = $sp->getActiveSheet();
@@ -111,47 +178,84 @@ class BonusFormatter
             $summary->setCellValue('D1', 'Company');
             $this->applyHeaderStyle($summary, 'A1:D1');
 
-            // Aggregate commission per retention agent
-            $agentTotals = [];
+            // Commission earned this period, keyed on the CRM agent name.
+            $commissionByAgent = [];
             foreach ($rows as $row) {
-                $agentName = (string) ($row['RETENTION_AGENT'] ?? '');
-                $comm      = (float)  ($row['RETENTION_COMMISSION'] ?? 0);
-                $key = strtoupper($agentName);
-                $agentTotals[$agentName] = [
-                    'commission' => ($agentTotals[$agentName]['commission'] ?? 0.0) + $comm,
-                    'location' => $employeeMap[$key]['location'] ?? '',
-                    'company' => $employeeMap[$key]['company'] ?? '',
-                ];
+                $agentName = trim((string) ($row['RETENTION_AGENT'] ?? ''));
+                if ($agentName === '') {
+                    continue;
+                }
+                $key = self::nameKey($agentName);
+                $commissionByAgent[$key]['name'] = $commissionByAgent[$key]['name'] ?? $agentName;
+                $commissionByAgent[$key]['commission'] =
+                    ($commissionByAgent[$key]['commission'] ?? 0.0) + (float) ($row['RETENTION_COMMISSION'] ?? 0);
             }
-            uasort($agentTotals, fn ($a, $b) => [$a['location'], $a['company']] <=> [$b['location'], $b['company']]);
-            $agentNames = array_keys($agentTotals);
-            usort($agentNames, fn ($a, $b) => [
-                $agentTotals[$a]['location'],
-                $agentTotals[$a]['company'],
-                $a,
-            ] <=> [
-                $agentTotals[$b]['location'],
-                $agentTotals[$b]['company'],
-                $b,
-            ]);
+
+            // Who gets a summary row. The roster decides when we have one; without it we keep the
+            // old behaviour of listing whoever the CRM named, so a broken roster degrades to the
+            // familiar report rather than to a blank one.
+            $summaryNames = [];
+            if ($rosterAgents !== null) {
+                foreach ($rosterAgents as $rosterName) {
+                    $summaryNames[self::nameKey((string) $rosterName)] = trim((string) $rosterName);
+                }
+                // A per-agent copy is filtered to one person; keep it to that person even when
+                // they are not on the roster, or their own workbook would come out empty.
+                if ($agentFilter !== null) {
+                    $filterKey = self::nameKey($agentFilter);
+                    $summaryNames = isset($summaryNames[$filterKey])
+                        ? [$filterKey => $summaryNames[$filterKey]]
+                        : [$filterKey => trim($agentFilter)];
+                }
+            } else {
+                foreach ($commissionByAgent as $key => $entry) {
+                    $summaryNames[$key] = $entry['name'];
+                }
+            }
+
+            $buildRow = static function (string $key, string $name) use ($commissionByAgent, $employeeMap): array {
+                $lookup = strtoupper($name);
+                return [
+                    'name'       => $name,
+                    'commission' => round((float) ($commissionByAgent[$key]['commission'] ?? 0.0), 2, PHP_ROUND_HALF_EVEN),
+                    'location'   => (string) ($employeeMap[$lookup]['location'] ?? ''),
+                    'company'    => (string) ($employeeMap[$lookup]['company'] ?? ''),
+                ];
+            };
+
+            $summaryRows = [];
+            foreach ($summaryNames as $key => $name) {
+                $summaryRows[] = $buildRow($key, $name);
+            }
+            usort(
+                $summaryRows,
+                fn ($a, $b) => [$a['location'], $a['company'], $a['name']] <=> [$b['location'], $b['company'], $b['name']]
+            );
 
             $sr = 2;
-            foreach ($agentNames as $agentName) {
-                $summary->setCellValue("A{$sr}", $agentName);
-                $summary->setCellValue("B{$sr}", round($agentTotals[$agentName]['commission'], 2, PHP_ROUND_HALF_EVEN));
-                $summary->setCellValue("C{$sr}", $agentTotals[$agentName]['location']);
-                $summary->setCellValue("D{$sr}", $agentTotals[$agentName]['company']);
+            foreach ($summaryRows as $entry) {
+                $sr = $this->writeSummaryRow($summary, $sr, $entry, $sourceCode);
+            }
 
-                // Call out agents with no company or location — without a company they cannot appear
-                // on the Commission Review page (which is separated per company).
-                if (trim((string) ($agentTotals[$agentName]['company'] ?? '')) === ''
-                    || trim((string) ($agentTotals[$agentName]['location'] ?? '')) === '') {
-                    $summary->getStyle("A{$sr}:D{$sr}")->getFill()
-                        ->setFillType(Fill::FILL_SOLID)
-                        ->getStartColor()->setARGB('FFFFC7CE');
-                    $summary->getStyle("A{$sr}:D{$sr}")->getFont()->getColor()->setARGB('FF9C0006');
-                }
+            // Anyone with real commission this period who is not on the roster, listed separately
+            // rather than mixed into the paid list (Jacob, 2026-09-03: "anyone we have data for
+            // that is not on the roster is listed separately"). These are the same names that go
+            // into the email body.
+            if ($unassigned !== []) {
                 $sr++;
+                $summary->setCellValue("A{$sr}", 'Unassigned Agents');
+                $summary->getStyle("A{$sr}")->getFont()->setBold(true);
+                $summary->setCellValue("B{$sr}", 'Not on the retention roster');
+                $summary->getStyle("B{$sr}")->getFont()->getColor()->setARGB('FF9C0006');
+                $sr++;
+                foreach ($unassigned as $entry) {
+                    $sr = $this->writeSummaryRow(
+                        $summary,
+                        $sr,
+                        $buildRow(self::nameKey((string) $entry['agent']), (string) $entry['agent']),
+                        $sourceCode
+                    );
+                }
             }
 
             $lastSr = max($sr - 1, 1);
@@ -163,6 +267,21 @@ class BonusFormatter
                 $summary->getColumnDimension($c)->setAutoSize(true);
             }
             $summary->getStyle("A1:D{$lastSr}")->getFont()->setName('Calibri')->setSize(9);
+
+            // Legend — two fills that mean different things is only useful if the sheet says which
+            // is which.
+            $legendRow = $lastSr + 2;
+            $summary->setCellValue("A{$legendRow}", 'Company does not match this report');
+            $summary->getStyle("A{$legendRow}")->getFill()
+                ->setFillType(Fill::FILL_SOLID)->getStartColor()->setARGB(self::MISMATCH_FILL);
+            $summary->getStyle("A{$legendRow}")->getFont()->getColor()->setARGB(self::MISMATCH_FONT);
+            $summary->getStyle("A{$legendRow}")->getFont()->setBold(true);
+            $summary->setCellValue("A" . ($legendRow + 1), 'Missing location or company');
+            $summary->getStyle('A' . ($legendRow + 1))->getFill()
+                ->setFillType(Fill::FILL_SOLID)->getStartColor()->setARGB(self::BLANK_FILL);
+            $summary->getStyle('A' . ($legendRow + 1))->getFont()->getColor()->setARGB(self::BLANK_FONT);
+            $summary->getStyle("A{$legendRow}:A" . ($legendRow + 1))->getFont()->setName('Calibri')->setSize(9);
+
             $summary->freezePane('A2');
             $summary->setSelectedCells('A1');
 

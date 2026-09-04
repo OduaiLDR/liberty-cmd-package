@@ -5,6 +5,7 @@ namespace Cmd\Reports\Console\Commands\GenerateRetentionBonusCommission;
 use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\CommissionAgentEmailFiles;
 use Cmd\Reports\Services\CommissionResultsWriter;
+use Cmd\Reports\Services\CommissionRosterProvider;
 use Cmd\Reports\Services\EmailSenderService;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
@@ -244,10 +245,50 @@ class GenerateRetentionBonusCommission extends Command
                 array_map(fn ($r) => (string) ($r['RETENTION_AGENT'] ?? ''), $rows)
             )));
             sort($agentNames, SORT_STRING | SORT_FLAG_CASE);
-            $employeeMap = $this->fetchEmployeeMap($sql, $agentNames);
+
+            // Jacob, 2026-09-03: "the summary names come from the roster. And anyone we have data
+            // for that is not on the roster is listed separately."
+            //
+            // Until now the summary was keyed on RETENTION_AGENT — the CRM userfield, verbatim —
+            // so whatever someone typed into the CRM became a summary row. That is how "Andrea
+            // MendozE" appeared as its own agent. The roster decides the summary now.
+            //
+            // fromRoster() returns null when the roster is empty OR unreachable, and the two are
+            // worth separating: this report has no built-in agent list to fall back on, so a broken
+            // roster would otherwise mean emailing a blank summary. Null keeps the previous
+            // CRM-derived behaviour and warns, which is wrong-but-familiar rather than silently empty.
+            $rosterAgents = CommissionRosterProvider::fromRoster($sql, 'retention', $source);
+            if ($rosterAgents === null) {
+                $this->warn(
+                    "[WARN] [$display] The retention roster in Azure (dbo.TblCommissionRoster) is empty or "
+                    . 'unreachable. Falling back to the CRM agent names — the summary is NOT roster-driven '
+                    . 'for this run. Check that the Commission Review roster is mirroring to Azure.'
+                );
+                Log::warning("GenerateRetentionBonusCommission[$display]: retention roster unavailable; summary fell back to CRM names.");
+            } else {
+                $this->info("[INFO] [$display] Roster agents: " . count($rosterAgents));
+            }
+
+            // The employee lookup has to cover roster members too, not just people with data —
+            // a roster member with no retention activity this month still needs their company
+            // checked and still belongs on the summary at $0.
+            $employeeLookupNames = $rosterAgents === null
+                ? $agentNames
+                : array_values(array_unique(array_merge($agentNames, $rosterAgents)));
+            $employeeMap = $this->fetchEmployeeMap($sql, $employeeLookupNames);
+
+            $unassigned = $this->unassignedAgents($rows, $rosterAgents);
+            if ($unassigned !== []) {
+                $this->warn(
+                    "[WARN] [$display] " . count($unassigned) . ' agent(s) earned commission this period but are '
+                    . 'not on the retention roster: ' . implode(', ', array_column($unassigned, 'agent'))
+                );
+            }
 
             $formatter = new BonusFormatter();
-            $allFile = $formatter->buildWorkbook($rows, $display, $reportStartDate, $endDate, $employeeMap);
+            $allFile = $formatter->buildWorkbook(
+                $rows, $display, $reportStartDate, $endDate, $employeeMap, null, $source, $rosterAgents, $unassigned
+            );
 
             if ($allFile) {
                 $this->info("[INFO] [$display] Workbook: {$allFile['filename']}");
@@ -262,7 +303,10 @@ class GenerateRetentionBonusCommission extends Command
                     if ($agentRows === []) {
                         continue;
                     }
-                    $agentFile = $formatter->buildWorkbook($agentRows, $display, $reportStartDate, $endDate, $employeeMap, $agentName);
+                    // A per-agent copy shows only that agent, so it carries no unassigned block.
+                    $agentFile = $formatter->buildWorkbook(
+                        $agentRows, $display, $reportStartDate, $endDate, $employeeMap, $agentName, $source, $rosterAgents, []
+                    );
                     if ($agentFile) {
                         $this->info("[INFO] [$display] Agent workbook built: {$agentFile['filename']}");
                         $files[] = $agentFile;
@@ -272,7 +316,7 @@ class GenerateRetentionBonusCommission extends Command
                 if ($this->option('no-email')) {
                     $this->info("[INFO] [$display] --no-email set; skipping email send.");
                 } else {
-                    $this->sendReport($sql, $files, $display);
+                    $this->sendReport($sql, $files, $display, $unassigned, $rosterAgents === null);
                     foreach ($files as $f) {
                         if (file_exists($f['path'])) {
                             @unlink($f['path']);
@@ -450,14 +494,22 @@ class GenerateRetentionBonusCommission extends Command
     /**
      * Email All to the report distribution list; one email per agent workbook to Rama only.
      *
-     * @param array<int,array{filename:string,path:string}> $files
+     * @param array<int,array{filename:string,path:string}>      $files
+     * @param array<int,array{agent:string,amount:float}>         $unassigned Earners missing from the roster.
+     * @param bool                                                $rosterUnavailable
      */
-    private function sendReport(DBConnector $sql, array $files, string $display): void
-    {
+    private function sendReport(
+        DBConnector $sql,
+        array $files,
+        string $display,
+        array $unassigned = [],
+        bool $rosterUnavailable = false
+    ): void {
         $email = new EmailSenderService();
         $reportNames = ['RetentionBonusCommission', 'Retention Bonus Commission'];
         $baseSubject = "Retention Bonus Commission - $display";
-        $baseBody    = "See attached Retention Bonus Commission - $display.";
+        $baseBody    = "See attached Retention Bonus Commission - $display."
+            . $this->unassignedEmailBlock($unassigned, $rosterUnavailable);
 
         // --test-recipient: redirect EVERY email for this run to one address.
         $testTo = trim((string) ($this->option('test-recipient') ?: ''));
@@ -525,6 +577,113 @@ class GenerateRetentionBonusCommission extends Command
             $dest = $testTo !== '' ? $testTo : 'Rama';
             $this->info("[INFO] [$display] Agent copies emailed to {$dest}: {$agentSent}/" . count($agentFiles) . ".");
         }
+    }
+
+    /**
+     * Placeholder "agents" the CRM uses for unattributed retention work. They are not people, so
+     * they must never be reported as someone missing from the roster.
+     * Jacob, 2026-09-03: "Sales Rep, Other CS Agent can be hard coded to ignore."
+     */
+    private const IGNORED_AGENTS = ['Sales Rep', 'Other CS Agent'];
+
+    /**
+     * Agents who earned commission in this period but are not on the roster.
+     *
+     * Two filters, both from Jacob:
+     *  - "only show names that were missing, and have data that is in the range we are looking for.
+     *    Some are showing with 0 because they only have data from months ago" — so a name only
+     *    qualifies on a NON-ZERO total for this period, not on merely appearing in the base window
+     *    (which reaches back four months to compute retention rates).
+     *  - the IGNORED_AGENTS placeholders above.
+     *
+     * @param array<int,array<string,mixed>> $rows
+     * @param array<int,string>|null         $rosterAgents Null when the roster is unavailable — in
+     *                                                     which case nobody can be called unassigned,
+     *                                                     because there is nothing to be absent from.
+     * @return array<int,array{agent:string,amount:float}> Highest earner first.
+     */
+    private function unassignedAgents(array $rows, ?array $rosterAgents): array
+    {
+        if ($rosterAgents === null) {
+            return [];
+        }
+
+        $ignored = array_map(
+            fn ($n) => strtolower(trim((string) preg_replace('/\s+/', ' ', $n))),
+            self::IGNORED_AGENTS
+        );
+
+        $totals = [];
+        foreach ($rows as $row) {
+            $agent = trim((string) ($row['RETENTION_AGENT'] ?? ''));
+            if ($agent === '') {
+                continue;
+            }
+            $totals[$agent] = ($totals[$agent] ?? 0.0) + (float) ($row['RETENTION_COMMISSION'] ?? 0);
+        }
+
+        $out = [];
+        foreach ($totals as $agent => $amount) {
+            $amount = round($amount, 2);
+            if ($amount <= 0) {
+                continue;
+            }
+            if (in_array(strtolower(trim((string) preg_replace('/\s+/', ' ', $agent))), $ignored, true)) {
+                continue;
+            }
+            if (CommissionRosterProvider::isOnRoster($rosterAgents, $agent)) {
+                continue;
+            }
+            $out[] = ['agent' => $agent, 'amount' => $amount];
+        }
+
+        usort($out, fn ($a, $b) => $b['amount'] <=> $a['amount'] ?: strcasecmp($a['agent'], $b['agent']));
+
+        return $out;
+    }
+
+    /**
+     * The "Unassigned Agents" block appended to the All email body.
+     *
+     * Jacob, 2026-09-04: "for the body of the email after the message to see the attachment, if
+     * there is data for anyone in that month (so not just 0 commission) and they are not in the
+     * roster then add that to the body. Like
+     *
+     *     Unassigned Agents
+     *     Joe Smith     $50
+     *     Jane Doe      $25"
+     *
+     * These emails go out as plain text (sendMailUsingTblReports -> sendMail, contentType Text),
+     * so the columns are padded rather than tabled.
+     *
+     * @param array<int,array{agent:string,amount:float}> $unassigned
+     */
+    private function unassignedEmailBlock(array $unassigned, bool $rosterUnavailable): string
+    {
+        if ($rosterUnavailable) {
+            // Say nothing about who is missing when we could not read the list they would be
+            // missing from — an empty "Unassigned Agents" block would read as "everyone is
+            // accounted for", which is the opposite of what a broken roster means.
+            return "\n\nNOTE: the retention roster could not be read for this run, so the summary "
+                . 'uses the CRM agent names and no unassigned-agent check was performed.';
+        }
+
+        if ($unassigned === []) {
+            return '';
+        }
+
+        $width = 0;
+        foreach ($unassigned as $row) {
+            $width = max($width, strlen((string) $row['agent']));
+        }
+
+        $lines = ['', '', 'Unassigned Agents'];
+        foreach ($unassigned as $row) {
+            $lines[] = str_pad((string) $row['agent'], $width + 5)
+                . '$' . number_format((float) $row['amount'], 2);
+        }
+
+        return implode("\n", $lines);
     }
 
     private function fetchEmployeeMap(DBConnector $sql, array $agents): array

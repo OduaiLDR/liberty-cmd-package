@@ -34,6 +34,57 @@ class CommissionRosterProvider
         $reportType = strtolower(trim($reportType));
         $source     = strtolower(trim($source));
 
+        // The roster is AUTHORITATIVE when it has rows for this report/source: it decides who is
+        // on the report, and it must be able to take someone OFF. This used to UNION with the
+        // built-in list so a stale mirror could never shrink a report — but a union can only ever
+        // add, so removals never took effect. Anthony Clark is a manager and was taken off the NSF
+        // roster; he kept appearing on both NSF reports because he is also in the built-in list.
+        //
+        // The safety net stays where it belongs: an empty or unreachable roster means the mirror is
+        // broken, not that nobody gets paid, so that case falls back and says so loudly.
+        $agents = self::fromRoster($sql, $reportType, $source);
+
+        if ($agents === null) {
+            Log::warning(
+                "CommissionRosterProvider: roster for {$reportType}/{$source} is EMPTY or unreachable — falling back to "
+                . 'the built-in agent list. The Commission Review roster is not reaching Azure (dbo.' . self::TABLE
+                . '); check the payroll-review roster mirror before trusting this report.'
+            );
+            return $fallback;
+        }
+
+        $dropped = array_values(array_diff(
+            array_map([self::class, 'nameKey'], self::mergeUnique($fallback, [])),
+            array_map([self::class, 'nameKey'], $agents)
+        ));
+        Log::info(
+            'CommissionRosterProvider: ' . $reportType . '/' . $source . ' - ' . count($agents)
+            . ' agents from the roster (built-in list has ' . count($fallback) . '; '
+            . count($dropped) . ' built-in name(s) not on the roster and therefore excluded'
+            . ($dropped === [] ? '' : ': ' . implode(', ', $dropped)) . ').'
+        );
+
+        return $agents;
+    }
+
+    /**
+     * The roster names for one report/source, or NULL when the roster is unreachable or has no
+     * rows at all.
+     *
+     * Callers that need to TELL THOSE APART use this instead of agents(). Retention Bonus is the
+     * case in point: it has no built-in agent list to fall back to, so "the roster says nobody"
+     * and "the roster is broken" would otherwise both render as an empty report. Returning null
+     * lets it keep its current CRM-derived behaviour and warn, instead of emailing a blank summary.
+     *
+     * @param string $reportType 'nsf' | 'retention'
+     * @param string $source     'ldr' | 'plaw'
+     * @return array<int,string>|null
+     */
+    public static function fromRoster(DBConnector $sql, string $reportType, string $source): ?array
+    {
+        $reportType = strtolower(trim($reportType));
+        $source     = strtolower(trim($source));
+
         try {
             $res = $sql->querySqlServer(
                 'SELECT Agent FROM dbo.' . self::TABLE . "
@@ -43,8 +94,11 @@ class CommissionRosterProvider
             );
 
             if (($res['success'] ?? false) !== true) {
-                Log::info("CommissionRosterProvider: roster unavailable for {$reportType}/{$source} — using the built-in agent list.", ['error' => $res['error'] ?? '']);
-                return $fallback;
+                Log::info(
+                    "CommissionRosterProvider: roster query failed for {$reportType}/{$source}.",
+                    ['error' => $res['error'] ?? '']
+                );
+                return null;
             }
 
             $agents = [];
@@ -54,31 +108,33 @@ class CommissionRosterProvider
                     $agents[] = $name;
                 }
             }
-            // UNION with the built-in list. The Azure mirror (dbo.TblCommissionRoster)
-            // is written by the Commission Review app; when that sync is stale or
-            // partial it must be able to ADD people to a payroll report, never
-            // silently drop them. Merging stops a one-row mirror from shrinking a
-            // nine-agent report to one and failing payroll source validation.
-            $agents = array_values(array_unique($agents));
-            $merged = self::mergeUnique($fallback, $agents);
+            $agents = self::mergeUnique($agents, []);
 
-            if (empty($merged)) {
-                Log::info("CommissionRosterProvider: no agents for {$reportType}/{$source} from the roster or the built-in list.");
-                return $fallback;
-            }
-
-            $addedByRoster = count($merged) - count(self::mergeUnique($fallback, []));
-            Log::info(
-                'CommissionRosterProvider: ' . $reportType . '/' . $source . ' - ' . count($merged)
-                . ' agents (built-in ' . count($fallback) . ', roster mirror ' . count($agents)
-                . ', added by roster ' . max(0, $addedByRoster) . ').'
-            );
-
-            return $merged;
+            return $agents === [] ? null : $agents;
         } catch (\Throwable $e) {
-            Log::warning('CommissionRosterProvider: lookup failed — using the built-in agent list.', ['ex' => $e->getMessage()]);
-            return $fallback;
+            Log::warning('CommissionRosterProvider: lookup failed.', ['ex' => $e->getMessage()]);
+            return null;
         }
+    }
+
+    /**
+     * True when $name is on $roster, comparing case- and space-insensitively.
+     *
+     * @param array<int,string> $roster
+     */
+    public static function isOnRoster(array $roster, string $name): bool
+    {
+        $key = self::nameKey($name);
+        if ($key === '') {
+            return false;
+        }
+        foreach ($roster as $rosterName) {
+            if (self::nameKey((string) $rosterName) === $key) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -98,7 +154,7 @@ class CommissionRosterProvider
                 if ($clean === '') {
                     continue;
                 }
-                $key = strtolower(preg_replace('/\s+/', ' ', $clean));
+                $key = self::nameKey($clean);
                 if (isset($seen[$key])) {
                     continue;
                 }
@@ -109,5 +165,15 @@ class CommissionRosterProvider
         sort($out, SORT_NATURAL | SORT_FLAG_CASE);
 
         return $out;
+    }
+
+    /**
+     * Comparison key for an agent name. The roster and the built-in lists are maintained by
+     * different people and disagree on casing and spacing, so every name comparison in this
+     * class goes through here.
+     */
+    private static function nameKey(string $name): string
+    {
+        return strtolower(trim((string) preg_replace('/\s+/', ' ', trim($name))));
     }
 }
