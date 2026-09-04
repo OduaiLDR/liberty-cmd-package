@@ -967,8 +967,10 @@ class GenerateRetentionCommissionReport extends Command
         $email = new EmailSenderService();
         $reportNames = ['RetentionCommissionReport', 'Retention Commission Report'];
         $baseSubject = "Retention Commission Report - $display";
-        $baseBody    = "See attached Retention Commission Report - $display"
-            . UnassignedCommissionAgents::emailBlock($unassigned, $rosterUnavailable, 'retention roster');
+        // HTML on both paths — --test-recipient sends HTML and the real send used plain text, so a
+        // padded text block looked right to the list and collapsed onto one line in the test copy.
+        $baseBody    = '<p>See attached Retention Commission Report - ' . htmlspecialchars($display) . '.</p>'
+            . UnassignedCommissionAgents::emailBlockHtml($unassigned, $rosterUnavailable, 'retention roster');
 
         // --test-recipient: redirect EVERY email for this run to one address.
         $testTo = trim((string) ($this->option('test-recipient') ?: ''));
@@ -986,7 +988,7 @@ class GenerateRetentionCommissionReport extends Command
                 $this->info("[INFO] [$display] --test-recipient set — All report only to $testTo");
                 $email->sendMailHtml($baseSubject, $baseBody, [$testTo], [], [], $attachments);
             } else {
-                $sent = $email->sendMailUsingTblReports(
+                $sent = $email->sendMailUsingTblReportsHtml(
                     $sql,
                     $reportNames,
                     [strtoupper($display)],

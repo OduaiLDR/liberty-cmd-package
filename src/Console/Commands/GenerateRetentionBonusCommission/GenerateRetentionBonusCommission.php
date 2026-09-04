@@ -502,8 +502,12 @@ class GenerateRetentionBonusCommission extends Command
         $email = new EmailSenderService();
         $reportNames = ['RetentionBonusCommission', 'Retention Bonus Commission'];
         $baseSubject = "Retention Bonus Commission - $display";
-        $baseBody    = "See attached Retention Bonus Commission - $display."
-            . $this->unassignedEmailBlock($unassigned, $rosterUnavailable);
+        // HTML on BOTH paths. --test-recipient sends via sendMailHtml while the real send used
+        // sendMailUsingTblReports (plain text), so a padded text block rendered correctly to the
+        // list but collapsed onto one line in the test copy — meaning the test never showed what
+        // Jacob would actually receive.
+        $baseBody = '<p>See attached Retention Bonus Commission - ' . htmlspecialchars($display) . '.</p>'
+            . UnassignedCommissionAgents::emailBlockHtml($unassigned, $rosterUnavailable, 'retention roster');
 
         // --test-recipient: redirect EVERY email for this run to one address.
         $testTo = trim((string) ($this->option('test-recipient') ?: ''));
@@ -521,7 +525,7 @@ class GenerateRetentionBonusCommission extends Command
                 $this->info("[INFO] [$display] --test-recipient set — All report only to $testTo");
                 $email->sendMailHtml($baseSubject, $baseBody, [$testTo], [], [], $attachments);
             } else {
-                $sent = $email->sendMailUsingTblReports(
+                $sent = $email->sendMailUsingTblReportsHtml(
                     $sql,
                     $reportNames,
                     [strtoupper($display)],
