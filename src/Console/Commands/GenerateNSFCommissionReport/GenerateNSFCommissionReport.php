@@ -6,6 +6,7 @@ use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\CommissionAgentEmailFiles;
 use Cmd\Reports\Services\CommissionResultsWriter;
 use Cmd\Reports\Services\CommissionRosterProvider;
+use Cmd\Reports\Services\UnassignedCommissionAgents;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
 
@@ -113,15 +114,59 @@ class GenerateNSFCommissionReport extends Command
             }
             unset($row);
 
-            // Agent list comes from the roster Rama manages in the Commission Review app
-            // (falls back to the built-in list if the roster is unavailable/empty).
-            $agents = CommissionRosterProvider::agents($sql, 'nsf', $source, $cfg['agents']);
+            // Agent list comes from the roster Rama manages in the Commission Review app.
+            // fromRoster() returns null when the roster is empty OR unreachable — the two are worth
+            // telling apart, because a broken roster must not be reported as "nobody is missing".
+            $rosterAgents = CommissionRosterProvider::fromRoster($sql, 'nsf', $source);
+            if ($rosterAgents === null) {
+                $this->warn(
+                    "[WARN] [$display] The NSF roster in Azure (dbo.TblCommissionRoster) is empty or "
+                    . 'unreachable. Falling back to the built-in agent list — this run is NOT roster-driven. '
+                    . 'Check that the Commission Review roster is mirroring to Azure.'
+                );
+                Log::warning("GenerateNSFCommissionReport[$display]: NSF roster unavailable; fell back to the built-in agent list.");
+            }
+            $agents = $rosterAgents ?? $cfg['agents'];
 
-            $commissionRows = $this->buildCommissionRows(
-                $dataRows,
-                $agents,
-                $sql
+            // Commission is computed per agent from their row counts, so an agent who is not on the
+            // roster has no amount until we compute one. Jacob, 2026-09-04: "If anyone shows on the
+            // data sheet with commission, then they should be in the email alerting her that there
+            // is someone missing from the roster." Price everyone in the data, then split.
+            $dataAgents = array_values(array_unique(array_filter(
+                array_map(fn (array $r): string => trim((string) ($r['AGENT'] ?? '')), $dataRows)
+            )));
+            $pricedRows = $this->buildCommissionRows($dataRows, array_values(array_unique(array_merge($agents, $dataAgents))), $sql);
+
+            $rosterKeys = array_map(
+                fn ($n) => strtolower((string) preg_replace('/\s+/', ' ', trim((string) $n))),
+                $agents
             );
+            $isOnRoster = fn (string $name): bool => in_array(
+                strtolower((string) preg_replace('/\s+/', ' ', trim($name))),
+                $rosterKeys,
+                true
+            );
+
+            // The report itself only ever shows roster members.
+            $commissionRows = array_values(array_filter(
+                $pricedRows,
+                fn (array $r): bool => $isOnRoster((string) $r['agent'])
+            ));
+
+            $unassigned = UnassignedCommissionAgents::fromTotals(
+                array_column(
+                    array_values(array_filter($pricedRows, fn (array $r): bool => !$isOnRoster((string) $r['agent']))),
+                    'commission',
+                    'agent'
+                ),
+                $rosterAgents
+            );
+            if ($unassigned !== []) {
+                $this->warn(
+                    "[WARN] [$display] " . count($unassigned) . ' agent(s) earned NSF commission this period '
+                    . 'but are not on the roster: ' . implode(', ', array_column($unassigned, 'agent'))
+                );
+            }
 
             // Persist the computed per-agent commission to Azure so the Commission Review app reads
             // the REAL numbers (best-effort; never blocks the report).
@@ -137,46 +182,21 @@ class GenerateNSFCommissionReport extends Command
             $allFile = $formatter->buildWorkbook($dataRows, $commissionRows, $display, $startDate, $endDate);
             $this->info("[INFO] [$display] Workbook: {$allFile['filename']}");
 
-            // Per-agent workbooks: same two sheets, filtered to that agent's data.
-            // Iterate the RESOLVED roster, not $cfg['agents'] — the commission rows above are
-            // built from $agents, so looping the built-in list here gave anyone who is on the
-            // roster but not hard-coded a commission line with no workbook and no email.
+            // Per-agent workbooks are no longer built, snapshotted or emailed.
+            // Jacob, 2026-09-04: "don't sent the individual ones since we can send from Debt Plete"
+            // — Commission Review's Send / Send All delivers each agent their own statement.
+            // Only the " - All" snapshot was ever read back: GenerateRetentionManagerCommission's
+            // defaultNsfSnapshotPaths() looks for "… - All.xlsx" and nothing else.
             $files = [$allFile];
-            foreach ($agents as $agentName) {
-                $agentDataRows = array_values(array_filter(
-                    $dataRows,
-                    fn (array $r): bool => strtoupper((string) ($r['AGENT'] ?? '')) === strtoupper($agentName)
-                ));
-                if ($agentDataRows === []) {
-                    $this->info("[INFO] [$display] No NSF data for agent {$agentName}; skipping per-agent workbook.");
-                    continue;
-                }
-                $agentCommRows = array_values(array_filter(
-                    $commissionRows,
-                    fn (array $r): bool => strtoupper((string) ($r['agent'] ?? '')) === strtoupper($agentName)
-                ));
-                $agentFile = $formatter->buildWorkbook($agentDataRows, $agentCommRows, $display, $startDate, $endDate, $agentName);
-                if ($agentFile) {
-                    $this->info("[INFO] [$display] Agent workbook built: {$agentFile['filename']}");
-                    $files[] = $agentFile;
-                }
-            }
 
             $snapshotPath = $this->saveSnapshotCopy($allFile, $startDate);
             $this->info("[INFO] [$display] Snapshot saved: {$snapshotPath}");
-            foreach ($files as $i => $f) {
-                if ($i === 0) {
-                    continue; // "All" snapshot already saved above
-                }
-                $agentSnapshotPath = $this->saveSnapshotCopy($f, $startDate);
-                $this->info("[INFO] [$display] Agent snapshot saved: {$agentSnapshotPath}");
-            }
             $this->cleanupOldSnapshots($startDate);
 
             if ($this->option('no-email')) {
                 $this->info("[INFO] [$display] --no-email set; skipping email send.");
             } else {
-                $this->sendReport($sql, $files, $display, $startDate, $endDate, $commissionRows);
+                $this->sendReport($sql, $files, $display, $startDate, $endDate, $unassigned, $rosterAgents === null);
             }
 
             foreach ($files as $f) {
@@ -387,12 +407,21 @@ class GenerateNSFCommissionReport extends Command
     }
 
     /**
-     * Email All to the report distribution list; one email per agent workbook to Rama only.
+     * Email the All workbook to the report distribution list. Per-agent copies are not sent from
+     * here — Commission Review in DebtPlete delivers those.
      *
-     * @param array<int,array{filename:string,path:string}> $files
+     * @param array<int,array{filename:string,path:string}>       $files
+     * @param array<int,array{agent:string,amount:float}>          $unassigned Earners missing from the roster.
      */
-    private function sendReport(DBConnector $sql, array $files, string $display, string $start, string $end, array $commissionRows): void
-    {
+    private function sendReport(
+        DBConnector $sql,
+        array $files,
+        string $display,
+        string $start,
+        string $end,
+        array $unassigned = [],
+        bool $rosterUnavailable = false
+    ): void {
         $parts = CommissionAgentEmailFiles::partition($files);
         foreach ($parts['missing'] as $missingName) {
             $this->warn("[WARN] [$display] Attachment missing: {$missingName}");
@@ -402,25 +431,11 @@ class GenerateNSFCommissionReport extends Command
 
         $subject = "NSF Commission Report - $display";
 
-        // Build HTML table body matching VBA (All email only)
-        $body  = '<table border="1">';
-        $body .= '<tr><th>Agent</th><th>Assignments</th><th>Actions</th><th>Ratio</th><th>Commission Rate</th><th>Commission</th><th>Location</th></tr>';
-        foreach ($commissionRows as $row) {
-            if ($row['agent'] === '') continue;
-            $ratio      = $row['assignments'] > 0 ? number_format($row['ratio'] * 100, 2) . '%' : '#DIV/0!';
-            $rate       = '$' . number_format($row['rate'], 2);
-            $commission = '$' . number_format($row['commission'], 2);
-            $body .= '<tr align="right">';
-            $body .= '<td>' . htmlspecialchars($row['agent'])    . '</td>';
-            $body .= '<td>' . $row['assignments']                . '</td>';
-            $body .= '<td>' . $row['actions']                    . '</td>';
-            $body .= '<td>' . $ratio                             . '</td>';
-            $body .= '<td>' . $rate                              . '</td>';
-            $body .= '<td>' . $commission                        . '</td>';
-            $body .= '<td>' . htmlspecialchars($row['location']) . '</td>';
-            $body .= '</tr>';
-        }
-        $body .= '</table>';
+        // Jacob, 2026-09-03: "For the NSF Report, change the email body to be similar to the others,
+        // remove the table and just have a message." The per-agent table used to be duplicated here
+        // from the attached workbook's Commission sheet, which is where it belongs.
+        $body = '<p>See attached NSF Commission Report - ' . htmlspecialchars($display) . '.</p>'
+            . UnassignedCommissionAgents::emailBlockHtml($unassigned, $rosterUnavailable, 'NSF roster');
 
         $email  = new \Cmd\Reports\Services\EmailSenderService();
         // --test-recipient overrides the recipient for this run; NSF_REPORT_TEST_TO
@@ -455,34 +470,15 @@ class GenerateNSFCommissionReport extends Command
             $this->warn("[WARN] [$display] No All workbook to email.");
         }
 
-        // Avoid PHP max_execution_time killing a long per-agent send loop.
-        @set_time_limit(0);
-
-        $agentSent = 0;
-        $agentCount = count($agentFiles);
-        foreach ($agentFiles as $i => $f) {
-            $agentName = CommissionAgentEmailFiles::agentNameFromFilename((string) $f['filename']);
-            $agentSubject = $subject . ' - ' . $agentName;
-            $agentBody = '<p>See attached NSF Commission Report - '
-                . htmlspecialchars($display) . ' - ' . htmlspecialchars($agentName) . '.</p>';
-            $attachments = CommissionAgentEmailFiles::toAttachments([$f]);
-
-            // Agent copies go only to Rama (hardcoded per Jacob — she forwards manually).
-            // NSF_REPORT_TEST_TO still overrides for test runs.
-            $agentTo = $testTo !== '' ? [$testTo] : ['rama@libertydebtrelief.com'];
-            $sent = $email->sendMailHtml($agentSubject, $agentBody, $agentTo, [], [], $attachments);
-            if ($sent) {
-                $agentSent++;
-            } else {
-                $this->warn("[WARN] [$display] Agent copy not sent for {$agentName}.");
-            }
-            if ($i < $agentCount - 1) {
-                usleep(250_000);
-            }
-        }
+        // Per-agent copies are not emailed from here any more — Jacob, 2026-09-04: "don't sent the
+        // individual ones since we can send from Debt Plete". $agentFiles is expected to be empty;
+        // warn rather than send if a caller ever passes one, so a partial revert cannot quietly
+        // resume the old behaviour.
         if ($agentFiles !== []) {
-            $dest = $testTo !== '' ? $testTo : 'Rama';
-            $this->info("[INFO] [$display] Agent copies emailed to {$dest}: {$agentSent}/" . count($agentFiles) . ".");
+            $this->warn(
+                "[WARN] [$display] " . count($agentFiles) . ' per-agent workbook(s) were built but not '
+                . 'emailed. Agent statements are sent from Commission Review in DebtPlete.'
+            );
         }
     }
 

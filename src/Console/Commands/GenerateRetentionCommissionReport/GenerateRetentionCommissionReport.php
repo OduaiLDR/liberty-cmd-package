@@ -6,9 +6,12 @@ namespace Cmd\Reports\Console\Commands\GenerateRetentionCommissionReport;
 
 use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\CommissionAgentEmailFiles;
+use Cmd\Reports\Services\CommissionCompanyMatch;
 use Cmd\Reports\Services\CommissionResultsWriter;
+use Cmd\Reports\Services\CommissionRosterProvider;
 use Cmd\Reports\Services\EmailSenderService;
 use Cmd\Reports\Services\RetentionCommissionTierStore;
+use Cmd\Reports\Services\UnassignedCommissionAgents;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
 use PhpOffice\PhpSpreadsheet\Shared\Date as XlDate;
@@ -283,8 +286,28 @@ class GenerateRetentionCommissionReport extends Command
                 sort($cfg['agents'], SORT_STRING | SORT_FLAG_CASE);
             }
 
-            // ── STEP 6: fetch agent location/company from SQL Server
-            $locationMap = $this->fetchLocationMap($sql, $cfg['agents']);
+            // The roster decides the summary; the data-derived list above stays as the fallback for
+            // when the roster is empty or unreachable, so a broken mirror degrades to the previous
+            // behaviour rather than to an empty report.
+            $rosterAgents = CommissionRosterProvider::fromRoster($sql, 'retention', $source);
+            if ($rosterAgents === null) {
+                $this->warn(
+                    "[WARN] [$display] The retention roster in Azure (dbo.TblCommissionRoster) is empty "
+                    . 'or unreachable. Falling back to the CRM agent names — this run is NOT roster-driven.'
+                );
+                Log::warning("GenerateRetentionCommissionReport[$display]: retention roster unavailable.");
+            } else {
+                $this->info("[INFO] [$display] Roster agents: " . count($rosterAgents));
+            }
+
+            // ── STEP 6: fetch agent location/company from SQL Server.
+            // Roster members with no activity still need their company checked, so look up both sets.
+            $locationMap = $this->fetchLocationMap(
+                $sql,
+                $rosterAgents === null
+                    ? $cfg['agents']
+                    : array_values(array_unique(array_merge($cfg['agents'], $rosterAgents)))
+            );
 
             // Payroll policy: a retained account is paid at the tier earned in
             // its retained month, even when the payment clears in a later month.
@@ -308,8 +331,27 @@ class GenerateRetentionCommissionReport extends Command
                 null,
                 $tierSnapshotMap,
                 $useRetainedMonthTier,
-                true
+                true,
+                $rosterAgents,
+                CommissionRosterProvider::rosterSources($sql, 'retention', $source)
             );
+
+            // Anyone with commission this period who is not on the roster. lastSummaryRows is set
+            // inside buildWorkbook and covers every agent found in the data, so it can price the
+            // unassigned as well as the paid.
+            $unassigned = UnassignedCommissionAgents::fromTotals(
+                array_map(
+                    fn ($sum) => (float) ($sum['commission'] ?? 0),
+                    $this->lastSummaryRows
+                ),
+                $rosterAgents
+            );
+            if ($unassigned !== []) {
+                $this->warn(
+                    "[WARN] [$display] " . count($unassigned) . ' agent(s) earned retention commission this '
+                    . 'period but are not on the roster: ' . implode(', ', array_column($unassigned, 'agent'))
+                );
+            }
 
             // Persist the computed per-agent retention commission to Azure for the Commission Review
             // app (best-effort; never blocks the report). $lastSummaryRows is set inside buildWorkbook.
@@ -341,48 +383,20 @@ class GenerateRetentionCommissionReport extends Command
                 $agentNames = array_values(array_unique($agentNames));
                 sort($agentNames, SORT_STRING | SORT_FLAG_CASE);
 
+                // Per-agent workbooks are no longer built, snapshotted or emailed.
+                // Jacob, 2026-09-04: "don't sent the individual ones since we can send from Debt
+                // Plete" — Commission Review's Send / Send All delivers each agent their own
+                // statement, so this was a second, competing delivery path.
                 $files = [$file];
-                foreach ($agentNames as $agentName) {
-                    $agentRows = array_values(array_filter(
-                        $rows,
-                        fn (array $r): bool => strtoupper((string) $this->col($r, 'RETENTION_AGENT', '')) === strtoupper($agentName)
-                    ));
-                    if ($agentRows === []) {
-                        continue;
-                    }
-                    $agentFile = $this->buildWorkbook(
-                        $agentRows,
-                        $cfg,
-                        $display,
-                        $startDate,
-                        $endDate,
-                        $locationMap,
-                        $agentName,
-                        $tierSnapshotMap,
-                        $useRetainedMonthTier,
-                        false
-                    );
-                    if ($agentFile) {
-                        $this->info("[INFO] [$display] Agent workbook built: {$agentFile['filename']}");
-                        $files[] = $agentFile;
-                    }
-                }
 
                 $snapshotPath = $this->saveSnapshotCopy($file, $display, $startDate);
                 $this->info("[INFO] [$display] Snapshot saved: {$snapshotPath}");
-                foreach ($files as $i => $f) {
-                    if ($i === 0) {
-                        continue; // "All" snapshot already saved above
-                    }
-                    $agentSnapshotPath = $this->saveSnapshotCopy($f, $display, $startDate);
-                    $this->info("[INFO] [$display] Agent snapshot saved: {$agentSnapshotPath}");
-                }
                 $this->cleanupOldSnapshots($startDate);
 
                 if ($this->option('no-email')) {
                     $this->info("[INFO] [$display] --no-email set; skipping email send.");
                 } else {
-                    $this->sendReport($files, $display);
+                    $this->sendReport($files, $display, $unassigned, $rosterAgents === null);
                 }
                 foreach ($files as $f) {
                     if (file_exists($f['path'])) {
@@ -543,7 +557,9 @@ class GenerateRetentionCommissionReport extends Command
         ?string $agentFilter = null,
         array $tierSnapshotMap = [],
         bool $useRetainedMonthTier = false,
-        bool $logShadowCompare = false
+        bool $logShadowCompare = false,
+        ?array $rosterAgents = null,
+        array $rosterSources = []
     ): ?array
     {
         try {
@@ -646,26 +662,74 @@ class GenerateRetentionCommissionReport extends Command
             );
             $this->lastSummaryRows = $summaryRows;
 
-            $r2 = 2;
-            foreach ($summaryRows as $agentName => $sum) {
-                $sheet2->setCellValue("A$r2", $agentName);
-                $sheet2->setCellValue("B$r2", $sum['assigned']);
-                $sheet2->setCellValue("C$r2", $sum['retained']);
-                $sheet2->setCellValue("D$r2", $sum['pct_retained']);
-                $sheet2->setCellValue("E$r2", $sum['tier']);
-                $sheet2->setCellValue("F$r2", $sum['commission']);
-                $sheet2->setCellValue("G$r2", $sum['location']);
-                $sheet2->setCellValue("H$r2", $sum['company']);
+            // The roster decides who is on the paid list; everyone else with commission this period
+            // is listed separately below it (Jacob, 2026-09-03). With no roster we keep the previous
+            // behaviour of listing every agent found in the data, rather than emitting a blank sheet.
+            $onRoster = static fn (string $name): bool => $rosterAgents === null
+                || CommissionRosterProvider::isOnRoster($rosterAgents, $name);
 
-                // Call out agents with no company or location — without a company they cannot appear
-                // on the Commission Review page (which is separated per company).
-                if (trim((string) ($sum['company'] ?? '')) === '' || trim((string) ($sum['location'] ?? '')) === '') {
-                    $sheet2->getStyle("A$r2:H$r2")->getFill()
-                        ->setFillType(Fill::FILL_SOLID)
-                        ->getStartColor()->setARGB('FFFFC7CE');
-                    $sheet2->getStyle("A$r2:H$r2")->getFont()->getColor()->setARGB('FF9C0006');
+            $paid = [];
+            $unassignedRows = [];
+            foreach ($summaryRows as $agentName => $sum) {
+                if ($onRoster((string) $agentName)) {
+                    $paid[(string) $agentName] = $sum;
+                } elseif (round((float) ($sum['commission'] ?? 0), 2) > 0) {
+                    $unassignedRows[(string) $agentName] = $sum;
                 }
+            }
+            // A per-agent copy is filtered to one person; never hide them from their own workbook.
+            if ($agentFilter !== null && $paid === [] && $unassignedRows !== []) {
+                $paid = $unassignedRows;
+                $unassignedRows = [];
+            }
+
+            $writeSummaryRow = function ($agentName, array $sum, int $row) use ($sheet2, $rosterSources): int {
+                $sheet2->setCellValue("A$row", $agentName);
+                $sheet2->setCellValue("B$row", $sum['assigned']);
+                $sheet2->setCellValue("C$row", $sum['retained']);
+                $sheet2->setCellValue("D$row", $sum['pct_retained']);
+                $sheet2->setCellValue("E$row", $sum['tier']);
+                $sheet2->setCellValue("F$row", $sum['commission']);
+                $sheet2->setCellValue("G$row", $sum['location']);
+                $sheet2->setCellValue("H$row", $sum['company']);
+
+                $company  = trim((string) ($sum['company'] ?? ''));
+                $location = trim((string) ($sum['location'] ?? ''));
+
+                // Judged against the agent's OWN roster source, so an agent rostered to 'both' — or
+                // one who is not on the roster at all — never flags. Only a pinned brand can be
+                // contradicted.
+                $pinned = CommissionRosterProvider::sourceFor($rosterSources, (string) $agentName);
+                if ($pinned !== '' && CommissionCompanyMatch::mismatches($pinned, $company)) {
+                    // Jacob: "Add a red highlight if the company does not match."
+                    $sheet2->getStyle("A$row:H$row")->getFill()
+                        ->setFillType(Fill::FILL_SOLID)->getStartColor()->setARGB('FFFF0000');
+                    $sheet2->getStyle("A$row:H$row")->getFont()->getColor()->setARGB('FFFFFFFF');
+                    $sheet2->getStyle("A$row:H$row")->getFont()->setBold(true);
+                } elseif ($company === '' || $location === '') {
+                    // Without a company they cannot appear on the Commission Review page.
+                    $sheet2->getStyle("A$row:H$row")->getFill()
+                        ->setFillType(Fill::FILL_SOLID)->getStartColor()->setARGB('FFFFC7CE');
+                    $sheet2->getStyle("A$row:H$row")->getFont()->getColor()->setARGB('FF9C0006');
+                }
+
+                return $row + 1;
+            };
+
+            $r2 = 2;
+            foreach ($paid as $agentName => $sum) {
+                $r2 = $writeSummaryRow($agentName, $sum, $r2);
+            }
+            if ($unassignedRows !== []) {
                 $r2++;
+                $sheet2->setCellValue("A$r2", 'Unassigned Agents');
+                $sheet2->getStyle("A$r2")->getFont()->setBold(true);
+                $sheet2->setCellValue("B$r2", 'Not on the retention roster');
+                $sheet2->getStyle("B$r2")->getFont()->getColor()->setARGB('FF9C0006');
+                $r2++;
+                foreach ($unassignedRows as $agentName => $sum) {
+                    $r2 = $writeSummaryRow($agentName, $sum, $r2);
+                }
             }
 
             $last2 = max($r2 - 1, 1);
@@ -891,17 +955,20 @@ class GenerateRetentionCommissionReport extends Command
     // ─── Email ────────────────────────────────────────────────────────────────
 
     /**
-     * Email All to the report distribution list; one email per agent workbook to Rama only.
+     * Email the All workbook to the report distribution list. Per-agent copies are not sent from
+     * here — Commission Review in DebtPlete delivers those.
      *
-     * @param array<int,array{filename:string,path:string}> $files
+     * @param array<int,array{filename:string,path:string}>      $files
+     * @param array<int,array{agent:string,amount:float}>         $unassigned Earners missing from the roster.
      */
-    private function sendReport(array $files, string $display): void
+    private function sendReport(array $files, string $display, array $unassigned = [], bool $rosterUnavailable = false): void
     {
         $sql   = $this->initSqlServer('ldr');
         $email = new EmailSenderService();
         $reportNames = ['RetentionCommissionReport', 'Retention Commission Report'];
         $baseSubject = "Retention Commission Report - $display";
-        $baseBody    = "See attached Retention Commission Report - $display";
+        $baseBody    = "See attached Retention Commission Report - $display"
+            . UnassignedCommissionAgents::emailBlock($unassigned, $rosterUnavailable, 'retention roster');
 
         // --test-recipient: redirect EVERY email for this run to one address.
         $testTo = trim((string) ($this->option('test-recipient') ?: ''));
@@ -937,39 +1004,15 @@ class GenerateRetentionCommissionReport extends Command
             $this->warn("[WARN] [$display] No All workbook to email.");
         }
 
-        // Avoid PHP max_execution_time killing a long per-agent send loop.
-        @set_time_limit(0);
-
-        $agentSent = 0;
-        $agentCount = count($agentFiles);
-        foreach ($agentFiles as $i => $f) {
-            $agentName = CommissionAgentEmailFiles::agentNameFromFilename((string) $f['filename']);
-            $subject   = $baseSubject . ' - ' . $agentName;
-            $body      = "See attached Retention Commission Report - $display - $agentName";
-            $attachments = CommissionAgentEmailFiles::toAttachments([$f]);
-            // Agent copies go only to Rama (hardcoded per Jacob — she forwards manually).
-            // --test-recipient overrides that for test runs.
-            $sent = $email->sendMail(
-                $subject,
-                $body,
-                [$testTo !== '' ? $testTo : 'rama@libertydebtrelief.com'],
-                [],
-                [],
-                $attachments
-            );
-            if ($sent) {
-                $agentSent++;
-            } else {
-                $this->warn("[WARN] [$display] Agent copy not sent for {$agentName}.");
-            }
-            // Pace Graph calls so overlapping reports are less likely to throttle each other.
-            if ($i < $agentCount - 1) {
-                usleep(250_000);
-            }
-        }
+        // Per-agent copies are not emailed from here any more — Jacob, 2026-09-04: "don't sent the
+        // individual ones since we can send from Debt Plete". $agentFiles is expected to be empty;
+        // warn rather than send if a caller ever passes one, so a partial revert cannot quietly
+        // resume the old behaviour.
         if ($agentFiles !== []) {
-            $dest = $testTo !== '' ? $testTo : 'Rama';
-            $this->info("[INFO] [$display] Agent copies emailed to {$dest}: {$agentSent}/" . count($agentFiles) . ".");
+            $this->warn(
+                "[WARN] [$display] " . count($agentFiles) . ' per-agent workbook(s) were built but not '
+                . 'emailed. Agent statements are sent from Commission Review in DebtPlete.'
+            );
         }
     }
 

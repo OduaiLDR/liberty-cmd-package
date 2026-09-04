@@ -43,7 +43,7 @@ class BonusFormatter
      * @param array{name:string,commission:float,location:string,company:string} $entry
      * @return int The next free row.
      */
-    private function writeSummaryRow(Worksheet $summary, int $sr, array $entry, string $sourceCode): int
+    private function writeSummaryRow(Worksheet $summary, int $sr, array $entry, string $rosterSource): int
     {
         $summary->setCellValue("A{$sr}", $entry['name']);
         $summary->setCellValue("B{$sr}", $entry['commission']);
@@ -53,7 +53,9 @@ class BonusFormatter
         $company  = trim((string) $entry['company']);
         $location = trim((string) $entry['location']);
 
-        if ($sourceCode !== '' && CommissionCompanyMatch::mismatches($sourceCode, $company)) {
+        // Judged against the agent's OWN roster source. 'both' and unassigned agents never flag —
+        // they are not pinned to a brand, so their company cannot contradict one.
+        if ($rosterSource !== '' && CommissionCompanyMatch::mismatches($rosterSource, $company)) {
             // Jacob: "If you are in Progress Law and the company is Liberty or vise versa then flag
             // that red." Checked before the blank rule — a mismatch is the more serious finding,
             // and a mismatching company is by definition not blank.
@@ -79,7 +81,10 @@ class BonusFormatter
      * @param array<string,array{location:string,company:string}> $employeeMap  UPPER(agent_name) => employee data
      * @param string|null $agentFilter When set, only the agent's rows appear and the
      *                                 filename uses the agent name ("- <Agent Name>")
-     * @param string $sourceCode   'ldr' | 'plaw' — used for the company-mismatch check.
+     * @param array<string,string> $rosterSources Normalised agent name => their roster source
+     *                                            ('ldr' | 'plaw' | 'both'). The company-mismatch
+     *                                            flag is judged per agent against this, so a 'both'
+     *                                            agent never flags.
      * @param array<int,string>|null $rosterAgents The roster that defines the summary. Null when the
      *                                            roster was unreadable; the summary then falls back
      *                                            to the CRM agent names, as it always used to.
@@ -92,7 +97,7 @@ class BonusFormatter
         string $end,
         array $employeeMap = [],
         ?string $agentFilter = null,
-        string $sourceCode = '',
+        array $rosterSources = [],
         ?array $rosterAgents = null,
         array $unassigned = []
     ): ?array {
@@ -234,7 +239,10 @@ class BonusFormatter
 
             $sr = 2;
             foreach ($summaryRows as $entry) {
-                $sr = $this->writeSummaryRow($summary, $sr, $entry, $sourceCode);
+                $sr = $this->writeSummaryRow(
+                    $summary, $sr, $entry,
+                    $rosterSources[self::nameKey((string) $entry['name'])] ?? ''
+                );
             }
 
             // Anyone with real commission this period who is not on the roster, listed separately
@@ -253,7 +261,7 @@ class BonusFormatter
                         $summary,
                         $sr,
                         $buildRow(self::nameKey((string) $entry['agent']), (string) $entry['agent']),
-                        $sourceCode
+                        ''   // not on the roster, so not pinned to a brand — never company-flagged
                     );
                 }
             }
