@@ -753,6 +753,11 @@ class SyncContactsData extends Command
      * Incremental mode:   DELETE matching LLG_IDs first, then INSERT — this
      *                     handles both updated existing contacts and brand-new ones
      *                     without needing a full-table MERGE statement.
+     *
+     * LT special case: after matching remaps TblContacts.LLG_ID to LDR/PLAW,
+     * the LT key no longer exists. Re-INSERT would create a duplicate. Instead
+     * UPDATE the remapped row by External_ID and keep its LLG_ID (Jacob: match
+     * updates IDs; later LT sync must not insert a second row).
      */
     private function insertChunk(DBConnector $connector, array $data, bool $incremental = false): int
     {
@@ -800,65 +805,21 @@ class SyncContactsData extends Command
         $pdo->beginTransaction();
 
         try {
-            // Incremental: remove stale rows for every LLG_ID we are about to re-insert
-            if ($incremental) {
-                foreach (\array_chunk($data, 1000) as $deleteBatch) {
-                    $ids = \implode(', ', \array_map(
-                        fn($row) => "'" . $this->escSql($row['llg_id']) . "'",
-                        $deleteBatch
-                    ));
-                    $sql = "DELETE FROM {$this->targetTable} WHERE LLG_ID IN ({$ids})";
-                    if ($pdo->exec($sql) === false) {
-                        $err = $pdo->errorInfo();
-                        throw new \RuntimeException('DELETE batch failed: ' . ($err[2] ?? 'unknown PDO error'));
-                    }
-                }
+            $toInsert = $data;
+            $toUpdate = [];
+
+            if ($incremental && $this->source === 'LT') {
+                [$toUpdate, $toInsert] = $this->splitLtIncrementalUpserts($pdo, $data);
+                // Remapped row already exists: refresh fields only, keep its LLG_ID (no INSERT of LT key).
+                $this->updateLtContactsByExternalId($pdo, $toUpdate);
             }
 
-            // SQL Server hard-limits INSERT ... VALUES to 1 000 rows per statement
-            foreach (\array_chunk($data, 1000) as $batch) {
-                $valuesParts = [];
+            if ($incremental && !empty($toInsert)) {
+                $this->deleteByLlgIds($pdo, \array_column($toInsert, 'llg_id'));
+            }
 
-                foreach ($batch as $row) {
-                    $createdDate  = $row['created_date'] ? "'{$row['created_date']}'" : 'NULL';
-                    $assignedDate = $row['assigned_date'] ? "'{$row['assigned_date']}'" : 'NULL';
-                    $email        = \strpos($row['email'], '@') !== false
-                        ? "'" . $this->escSql($row['email']) . "'"
-                        : 'NULL';
-
-                    $valuesParts[] = "({$createdDate}, {$assignedDate}, "
-                        . "'{$this->escSql($row['llg_id'])}', "
-                        . "'{$this->escSql($row['external_id'])}', "
-                        . "'{$this->escSql($row['campaign'])}', "
-                        . "'{$this->escSql($row['data_source'])}', "
-                        . "'{$this->escSql($row['created_by'])}', "
-                        . "'{$this->escSql($row['agent'])}', "
-                        . "'{$this->escSql($row['client'])}', "
-                        . "'{$this->escSql($row['phone'])}', "
-                        . "{$email}, "
-                        . "'{$this->escSql($row['address_1'])}', "
-                        . "'{$this->escSql($row['address_2'])}', "
-                        . "'{$this->escSql($row['city'])}', "
-                        . "'{$this->escSql($row['state'])}', "
-                        . "'{$this->escSql($row['zip'])}', "
-                        . "'{$this->escSql($row['stage'])}', "
-                        . "'{$this->escSql($row['status'])}', "
-                        . ((int) $row['debt_amount']) . ", "
-                        . ((float) $row['debt_enrolled']) . ", "
-                        . ((int) $row['credit_score']) . ", "
-                        . ((int) $row['credit_utilization']) . ", "
-                        . "'{$this->escSql($row['category'])}', "
-                        . "'{$this->escSql($row['affiliate_agent'])}'"
-                        . ($this->source !== 'LT' ? ", '{$this->escSql($row['tp_id'])}'" : '')
-                        . ')';
-                }
-
-                $sql = "INSERT INTO {$this->targetTable} ({$fields}) VALUES " . \implode(', ', $valuesParts);
-
-                if ($pdo->exec($sql) === false) {
-                    $err = $pdo->errorInfo();
-                    throw new \RuntimeException('INSERT batch failed: ' . ($err[2] ?? 'unknown PDO error'));
-                }
+            if (!empty($toInsert)) {
+                $this->insertContactRows($pdo, $fields, $toInsert);
             }
 
             $pdo->commit();
@@ -868,6 +829,261 @@ class SyncContactsData extends Command
                 $pdo->rollBack();
             }
             throw $e;
+        }
+    }
+
+    /**
+     * LT incremental: rows whose External_ID already exists under a different LLG_ID
+     * were remapped by matching — UPDATE that row, do not INSERT the old LT key.
+     *
+     * @return array{0: list<array>, 1: list<array>} [toUpdate, toInsert]
+     */
+    private function splitLtIncrementalUpserts(\PDO $pdo, array $data): array
+    {
+        $extToExistingLlg = $this->lookupLtExternalIdOwners($pdo, $data);
+        $toUpdate = [];
+        $toInsert = [];
+
+        foreach ($data as $row) {
+            $ext = (string) ($row['external_id'] ?? '');
+            $llg = (string) ($row['llg_id'] ?? '');
+            $existingLlg = $ext !== '' ? ($extToExistingLlg[$ext] ?? null) : null;
+            if ($existingLlg !== null && $existingLlg !== $llg) {
+                $toUpdate[] = $row;
+            } else {
+                $toInsert[] = $row;
+            }
+        }
+
+        return [$toUpdate, $toInsert];
+    }
+
+    /** @return array<string, string> External_ID => preferred existing LLG_ID (prefer non-incoming LT key when both exist) */
+    private function lookupLtExternalIdOwners(\PDO $pdo, array $data): array
+    {
+        $map = [];
+        foreach (\array_chunk($data, 1000) as $batch) {
+            $extIds = [];
+            foreach ($batch as $row) {
+                $ext = (string) ($row['external_id'] ?? '');
+                if ($ext !== '') {
+                    $extIds[$ext] = (string) ($row['llg_id'] ?? '');
+                }
+            }
+            if ($extIds === []) {
+                continue;
+            }
+            $inList = \implode(', ', \array_map(
+                fn($id) => "'" . $this->escSql($id) . "'",
+                \array_keys($extIds)
+            ));
+            $stmt = $pdo->query(
+                "SELECT LLG_ID, External_ID FROM {$this->targetTable} WHERE External_ID IN ({$inList})"
+            );
+            if ($stmt === false) {
+                $err = $pdo->errorInfo();
+                throw new \RuntimeException('LT External_ID lookup failed: ' . ($err[2] ?? 'unknown PDO error'));
+            }
+            $byExt = [];
+            while ($found = $stmt->fetch(\PDO::FETCH_ASSOC)) {
+                $ext = (string) ($found['External_ID'] ?? $found['external_id'] ?? '');
+                $llg = (string) ($found['LLG_ID'] ?? $found['llg_id'] ?? '');
+                if ($ext === '' || $llg === '') {
+                    continue;
+                }
+                $byExt[$ext][] = $llg;
+            }
+            foreach ($byExt as $ext => $llgs) {
+                $incoming = $extIds[$ext] ?? '';
+                $preferred = null;
+                foreach ($llgs as $llg) {
+                    if ($llg !== $incoming) {
+                        $preferred = $llg;
+                        break;
+                    }
+                }
+                $map[$ext] = $preferred ?? $llgs[0];
+            }
+        }
+
+        return $map;
+    }
+
+    private function deleteByLlgIds(\PDO $pdo, array $llgIds): void
+    {
+        $llgIds = \array_values(\array_filter($llgIds, fn($id) => $id !== null && $id !== ''));
+        if ($llgIds === []) {
+            return;
+        }
+        foreach (\array_chunk($llgIds, 1000) as $deleteBatch) {
+            $ids = \implode(', ', \array_map(
+                fn($id) => "'" . $this->escSql((string) $id) . "'",
+                $deleteBatch
+            ));
+            $sql = "DELETE FROM {$this->targetTable} WHERE LLG_ID IN ({$ids})";
+            if ($pdo->exec($sql) === false) {
+                $err = $pdo->errorInfo();
+                throw new \RuntimeException('DELETE batch failed: ' . ($err[2] ?? 'unknown PDO error'));
+            }
+        }
+    }
+
+    /** Refresh fields on remapped TblContacts rows matched by External_ID; LLG_ID unchanged. */
+    private function updateLtContactsByExternalId(\PDO $pdo, array $rows): void
+    {
+        if ($rows === []) {
+            return;
+        }
+
+        foreach (\array_chunk($rows, 500) as $batch) {
+            $pdo->exec('CREATE TABLE #TmpLtExtUpd (
+                External_ID VARCHAR(50) NOT NULL,
+                Created_Date DATETIME NULL,
+                Assigned_Date DATETIME NULL,
+                Campaign NVARCHAR(255) NULL,
+                Data_Source NVARCHAR(255) NULL,
+                Created_By NVARCHAR(255) NULL,
+                Agent NVARCHAR(255) NULL,
+                Client NVARCHAR(255) NULL,
+                Phone VARCHAR(50) NULL,
+                Email NVARCHAR(255) NULL,
+                Address_1 NVARCHAR(255) NULL,
+                Address_2 NVARCHAR(255) NULL,
+                City NVARCHAR(100) NULL,
+                State VARCHAR(20) NULL,
+                Zip VARCHAR(20) NULL,
+                Stage NVARCHAR(255) NULL,
+                Status NVARCHAR(255) NULL,
+                Debt_Amount INT NULL,
+                Debt_Enrolled FLOAT NULL,
+                Credit_Score INT NULL,
+                Credit_Utilization INT NULL,
+                Category NVARCHAR(255) NULL,
+                Affiliate_Agent NVARCHAR(255) NULL
+            )');
+
+            $valuesParts = [];
+            foreach ($batch as $row) {
+                $createdDate  = $row['created_date'] ? "'{$row['created_date']}'" : 'NULL';
+                $assignedDate = $row['assigned_date'] ? "'{$row['assigned_date']}'" : 'NULL';
+                $email        = \strpos($row['email'], '@') !== false
+                    ? "'" . $this->escSql($row['email']) . "'"
+                    : 'NULL';
+                $valuesParts[] = "("
+                    . "'{$this->escSql($row['external_id'])}', "
+                    . "{$createdDate}, {$assignedDate}, "
+                    . "'{$this->escSql($row['campaign'])}', "
+                    . "'{$this->escSql($row['data_source'])}', "
+                    . "'{$this->escSql($row['created_by'])}', "
+                    . "'{$this->escSql($row['agent'])}', "
+                    . "'{$this->escSql($row['client'])}', "
+                    . "'{$this->escSql($row['phone'])}', "
+                    . "{$email}, "
+                    . "'{$this->escSql($row['address_1'])}', "
+                    . "'{$this->escSql($row['address_2'])}', "
+                    . "'{$this->escSql($row['city'])}', "
+                    . "'{$this->escSql($row['state'])}', "
+                    . "'{$this->escSql($row['zip'])}', "
+                    . "'{$this->escSql($row['stage'])}', "
+                    . "'{$this->escSql($row['status'])}', "
+                    . ((int) $row['debt_amount']) . ", "
+                    . ((float) $row['debt_enrolled']) . ", "
+                    . ((int) $row['credit_score']) . ", "
+                    . ((int) $row['credit_utilization']) . ", "
+                    . "'{$this->escSql($row['category'])}', "
+                    . "'{$this->escSql($row['affiliate_agent'])}'"
+                    . ')';
+            }
+
+            $ins = 'INSERT INTO #TmpLtExtUpd (
+                External_ID, Created_Date, Assigned_Date, Campaign, Data_Source, Created_By, Agent, Client,
+                Phone, Email, Address_1, Address_2, City, State, Zip, Stage, Status,
+                Debt_Amount, Debt_Enrolled, Credit_Score, Credit_Utilization, Category, Affiliate_Agent
+            ) VALUES ' . \implode(', ', $valuesParts);
+            if ($pdo->exec($ins) === false) {
+                $err = $pdo->errorInfo();
+                throw new \RuntimeException('LT remapped UPDATE staging failed: ' . ($err[2] ?? 'unknown PDO error'));
+            }
+
+            $upd = "UPDATE c
+                SET c.Created_Date = u.Created_Date,
+                    c.Assigned_Date = u.Assigned_Date,
+                    c.Campaign = u.Campaign,
+                    c.Data_Source = u.Data_Source,
+                    c.Created_By = u.Created_By,
+                    c.Agent = u.Agent,
+                    c.Client = u.Client,
+                    c.Phone = u.Phone,
+                    c.Email = u.Email,
+                    c.Address_1 = u.Address_1,
+                    c.Address_2 = u.Address_2,
+                    c.City = u.City,
+                    c.State = u.State,
+                    c.Zip = u.Zip,
+                    c.Stage = u.Stage,
+                    c.Status = u.Status,
+                    c.Debt_Amount = u.Debt_Amount,
+                    c.Debt_Enrolled = u.Debt_Enrolled,
+                    c.Credit_Score = u.Credit_Score,
+                    c.Credit_Utilization = u.Credit_Utilization,
+                    c.Category = u.Category,
+                    c.Affiliate_Agent = u.Affiliate_Agent
+                FROM {$this->targetTable} AS c
+                INNER JOIN #TmpLtExtUpd AS u ON c.External_ID = u.External_ID";
+            if ($pdo->exec($upd) === false) {
+                $err = $pdo->errorInfo();
+                throw new \RuntimeException('LT remapped UPDATE failed: ' . ($err[2] ?? 'unknown PDO error'));
+            }
+
+            $pdo->exec('DROP TABLE #TmpLtExtUpd');
+        }
+    }
+
+    private function insertContactRows(\PDO $pdo, string $fields, array $data): void
+    {
+        foreach (\array_chunk($data, 1000) as $batch) {
+            $valuesParts = [];
+
+            foreach ($batch as $row) {
+                $createdDate  = $row['created_date'] ? "'{$row['created_date']}'" : 'NULL';
+                $assignedDate = $row['assigned_date'] ? "'{$row['assigned_date']}'" : 'NULL';
+                $email        = \strpos($row['email'], '@') !== false
+                    ? "'" . $this->escSql($row['email']) . "'"
+                    : 'NULL';
+
+                $valuesParts[] = "({$createdDate}, {$assignedDate}, "
+                    . "'{$this->escSql($row['llg_id'])}', "
+                    . "'{$this->escSql($row['external_id'])}', "
+                    . "'{$this->escSql($row['campaign'])}', "
+                    . "'{$this->escSql($row['data_source'])}', "
+                    . "'{$this->escSql($row['created_by'])}', "
+                    . "'{$this->escSql($row['agent'])}', "
+                    . "'{$this->escSql($row['client'])}', "
+                    . "'{$this->escSql($row['phone'])}', "
+                    . "{$email}, "
+                    . "'{$this->escSql($row['address_1'])}', "
+                    . "'{$this->escSql($row['address_2'])}', "
+                    . "'{$this->escSql($row['city'])}', "
+                    . "'{$this->escSql($row['state'])}', "
+                    . "'{$this->escSql($row['zip'])}', "
+                    . "'{$this->escSql($row['stage'])}', "
+                    . "'{$this->escSql($row['status'])}', "
+                    . ((int) $row['debt_amount']) . ", "
+                    . ((float) $row['debt_enrolled']) . ", "
+                    . ((int) $row['credit_score']) . ", "
+                    . ((int) $row['credit_utilization']) . ", "
+                    . "'{$this->escSql($row['category'])}', "
+                    . "'{$this->escSql($row['affiliate_agent'])}'"
+                    . ($this->source !== 'LT' ? ", '{$this->escSql($row['tp_id'])}'" : '')
+                    . ')';
+            }
+
+            $sql = "INSERT INTO {$this->targetTable} ({$fields}) VALUES " . \implode(', ', $valuesParts);
+
+            if ($pdo->exec($sql) === false) {
+                $err = $pdo->errorInfo();
+                throw new \RuntimeException('INSERT batch failed: ' . ($err[2] ?? 'unknown PDO error'));
+            }
         }
     }
 
