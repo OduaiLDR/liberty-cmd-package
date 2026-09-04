@@ -333,7 +333,7 @@ class GenerateRetentionCommissionReport extends Command
                 $useRetainedMonthTier,
                 true,
                 $rosterAgents,
-                CommissionRosterProvider::rosterSources($sql, 'retention', $source)
+                $source
             );
 
             // Anyone with commission this period who is not on the roster. lastSummaryRows is set
@@ -559,7 +559,7 @@ class GenerateRetentionCommissionReport extends Command
         bool $useRetainedMonthTier = false,
         bool $logShadowCompare = false,
         ?array $rosterAgents = null,
-        array $rosterSources = []
+        string $sourceCode = ''
     ): ?array
     {
         try {
@@ -683,7 +683,10 @@ class GenerateRetentionCommissionReport extends Command
                 $unassignedRows = [];
             }
 
-            $writeSummaryRow = function ($agentName, array $sum, int $row) use ($sheet2, $rosterSources): int {
+            // $brand is the report's own source for paid rows, and '' for the unassigned block —
+            // those are already called out under their own heading, so a second red flag adds
+            // nothing.
+            $writeSummaryRow = function ($agentName, array $sum, int $row, string $brand = '') use ($sheet2): int {
                 $sheet2->setCellValue("A$row", $agentName);
                 $sheet2->setCellValue("B$row", $sum['assigned']);
                 $sheet2->setCellValue("C$row", $sum['retained']);
@@ -696,11 +699,11 @@ class GenerateRetentionCommissionReport extends Command
                 $company  = trim((string) ($sum['company'] ?? ''));
                 $location = trim((string) ($sum['location'] ?? ''));
 
-                // Judged against the agent's OWN roster source, so an agent rostered to 'both' — or
-                // one who is not on the roster at all — never flags. Only a pinned brand can be
-                // contradicted.
-                $pinned = CommissionRosterProvider::sourceFor($rosterSources, (string) $agentName);
-                if ($pinned !== '' && CommissionCompanyMatch::mismatches($pinned, $company)) {
+                // Judged against THIS REPORT's brand, so an agent rostered to "both" is still
+                // flagged on the report whose company they disagree with — that is where Jacob's
+                // own examples live (Katherine Caceres, Lucas Wright). Judging it against the
+                // agent's own roster source was tried on 2026-09-04 and reverted: it silenced them.
+                if ($brand !== '' && CommissionCompanyMatch::mismatches($brand, $company)) {
                     // Jacob: "Add a red highlight if the company does not match."
                     $sheet2->getStyle("A$row:H$row")->getFill()
                         ->setFillType(Fill::FILL_SOLID)->getStartColor()->setARGB('FFFF0000');
@@ -718,7 +721,7 @@ class GenerateRetentionCommissionReport extends Command
 
             $r2 = 2;
             foreach ($paid as $agentName => $sum) {
-                $r2 = $writeSummaryRow($agentName, $sum, $r2);
+                $r2 = $writeSummaryRow($agentName, $sum, $r2, $sourceCode);
             }
             if ($unassignedRows !== []) {
                 $r2++;
@@ -967,8 +970,10 @@ class GenerateRetentionCommissionReport extends Command
         $email = new EmailSenderService();
         $reportNames = ['RetentionCommissionReport', 'Retention Commission Report'];
         $baseSubject = "Retention Commission Report - $display";
-        $baseBody    = "See attached Retention Commission Report - $display"
-            . UnassignedCommissionAgents::emailBlock($unassigned, $rosterUnavailable, 'retention roster');
+        // HTML on both paths — --test-recipient sends HTML and the real send used plain text, so a
+        // padded text block looked right to the list and collapsed onto one line in the test copy.
+        $baseBody    = '<p>See attached Retention Commission Report - ' . htmlspecialchars($display) . '.</p>'
+            . UnassignedCommissionAgents::emailBlockHtml($unassigned, $rosterUnavailable, 'retention roster');
 
         // --test-recipient: redirect EVERY email for this run to one address.
         $testTo = trim((string) ($this->option('test-recipient') ?: ''));
@@ -986,7 +991,7 @@ class GenerateRetentionCommissionReport extends Command
                 $this->info("[INFO] [$display] --test-recipient set — All report only to $testTo");
                 $email->sendMailHtml($baseSubject, $baseBody, [$testTo], [], [], $attachments);
             } else {
-                $sent = $email->sendMailUsingTblReports(
+                $sent = $email->sendMailUsingTblReportsHtml(
                     $sql,
                     $reportNames,
                     [strtoupper($display)],

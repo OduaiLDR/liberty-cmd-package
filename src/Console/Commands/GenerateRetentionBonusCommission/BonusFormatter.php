@@ -43,7 +43,7 @@ class BonusFormatter
      * @param array{name:string,commission:float,location:string,company:string} $entry
      * @return int The next free row.
      */
-    private function writeSummaryRow(Worksheet $summary, int $sr, array $entry, string $rosterSource): int
+    private function writeSummaryRow(Worksheet $summary, int $sr, array $entry, string $sourceCode): int
     {
         $summary->setCellValue("A{$sr}", $entry['name']);
         $summary->setCellValue("B{$sr}", $entry['commission']);
@@ -53,9 +53,10 @@ class BonusFormatter
         $company  = trim((string) $entry['company']);
         $location = trim((string) $entry['location']);
 
-        // Judged against the agent's OWN roster source. 'both' and unassigned agents never flag —
-        // they are not pinned to a brand, so their company cannot contradict one.
-        if ($rosterSource !== '' && CommissionCompanyMatch::mismatches($rosterSource, $company)) {
+        // Judged against THIS REPORT's brand, so an agent rostered to "both" is still flagged on
+        // the report their company disagrees with. Judging it against the agent's own roster source
+        // was tried and reverted — it hid Jacob's own examples.
+        if ($sourceCode !== '' && CommissionCompanyMatch::mismatches($sourceCode, $company)) {
             // Jacob: "If you are in Progress Law and the company is Liberty or vise versa then flag
             // that red." Checked before the blank rule — a mismatch is the more serious finding,
             // and a mismatching company is by definition not blank.
@@ -81,10 +82,9 @@ class BonusFormatter
      * @param array<string,array{location:string,company:string}> $employeeMap  UPPER(agent_name) => employee data
      * @param string|null $agentFilter When set, only the agent's rows appear and the
      *                                 filename uses the agent name ("- <Agent Name>")
-     * @param array<string,string> $rosterSources Normalised agent name => their roster source
-     *                                            ('ldr' | 'plaw' | 'both'). The company-mismatch
-     *                                            flag is judged per agent against this, so a 'both'
-     *                                            agent never flags.
+     * @param string $sourceCode 'ldr' | 'plaw' — the brand this report is for. The company-mismatch
+     *                           flag is judged against it, so anyone whose company disagrees with
+     *                           this report is flagged regardless of their roster source.
      * @param array<int,string>|null $rosterAgents The roster that defines the summary. Null when the
      *                                            roster was unreadable; the summary then falls back
      *                                            to the CRM agent names, as it always used to.
@@ -97,7 +97,7 @@ class BonusFormatter
         string $end,
         array $employeeMap = [],
         ?string $agentFilter = null,
-        array $rosterSources = [],
+        string $sourceCode = '',
         ?array $rosterAgents = null,
         array $unassigned = []
     ): ?array {
@@ -239,10 +239,7 @@ class BonusFormatter
 
             $sr = 2;
             foreach ($summaryRows as $entry) {
-                $sr = $this->writeSummaryRow(
-                    $summary, $sr, $entry,
-                    $rosterSources[self::nameKey((string) $entry['name'])] ?? ''
-                );
+                $sr = $this->writeSummaryRow($summary, $sr, $entry, $sourceCode);
             }
 
             // Anyone with real commission this period who is not on the roster, listed separately
@@ -261,7 +258,7 @@ class BonusFormatter
                         $summary,
                         $sr,
                         $buildRow(self::nameKey((string) $entry['agent']), (string) $entry['agent']),
-                        ''   // not on the roster, so not pinned to a brand — never company-flagged
+                        ''   // already called out as unassigned; a second red flag adds nothing
                     );
                 }
             }
