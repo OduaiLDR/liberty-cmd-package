@@ -269,6 +269,11 @@ class SyncContactsData extends Command
         // ensuring a failed/partial run never advances the watermark.
         $syncStartedAt = date('Y-m-d H:i:s');
 
+        $lastId           = 0;
+        $categoryChanges  = [];
+        $affiliateChanges = [];
+        $totalFetched     = 0;
+        $totalInserted    = 0;
         $pageNum          = 0;
         $syncLoopStarted  = microtime(true);
 
