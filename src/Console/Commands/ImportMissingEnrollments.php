@@ -15,6 +15,7 @@ class ImportMissingEnrollments extends Command
 
     public function handle(): int
     {
+        ini_set('memory_limit', '512M');
         $this->info('[INFO] ImportMissingEnrollments: starting.');
         $dryRun = (bool) $this->option('dry-run');
         if ($dryRun) {
