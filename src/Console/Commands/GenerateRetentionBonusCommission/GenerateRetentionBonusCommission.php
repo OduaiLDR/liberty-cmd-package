@@ -7,6 +7,7 @@ use Cmd\Reports\Services\CommissionAgentEmailFiles;
 use Cmd\Reports\Services\CommissionResultsWriter;
 use Cmd\Reports\Services\CommissionRosterProvider;
 use Cmd\Reports\Services\EmailSenderService;
+use Cmd\Reports\Services\UnassignedCommissionAgents;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
 
@@ -269,6 +270,10 @@ class GenerateRetentionBonusCommission extends Command
                 $this->info("[INFO] [$display] Roster agents: " . count($rosterAgents));
             }
 
+            // Per-agent roster source, so the company-mismatch flag is judged against the brand each
+            // agent is actually pinned to. An agent rostered to 'both' never flags.
+            $rosterSources = CommissionRosterProvider::rosterSources($sql, 'retention', $source);
+
             // The employee lookup has to cover roster members too, not just people with data —
             // a roster member with no retention activity this month still needs their company
             // checked and still belongs on the summary at $0.
@@ -287,31 +292,20 @@ class GenerateRetentionBonusCommission extends Command
 
             $formatter = new BonusFormatter();
             $allFile = $formatter->buildWorkbook(
-                $rows, $display, $reportStartDate, $endDate, $employeeMap, null, $source, $rosterAgents, $unassigned
+                $rows, $display, $reportStartDate, $endDate, $employeeMap, null, $rosterSources, $rosterAgents, $unassigned
             );
 
             if ($allFile) {
                 $this->info("[INFO] [$display] Workbook: {$allFile['filename']}");
 
-                // Per-agent workbooks: same sheets, filtered to that agent's rows.
+                // Per-agent workbooks are no longer built or emailed.
+                // Jacob, 2026-09-04: "don't sent the individual ones since we can send from Debt
+                // Plete" — Commission Review's Send / Send All emails each agent their own statement,
+                // so this loop was a second, competing delivery path. It also produced a workbook per
+                // CRM name, which meant a file titled after the "ANDREA MENDOZE" typo.
+                // Nothing else consumed them: GenerateRetentionManagerCommission reads only the
+                // " - All.xlsx" snapshot.
                 $files = [$allFile];
-                foreach ($agentNames as $agentName) {
-                    $agentRows = array_values(array_filter(
-                        $rows,
-                        fn ($r) => strtoupper((string) ($r['RETENTION_AGENT'] ?? '')) === strtoupper($agentName)
-                    ));
-                    if ($agentRows === []) {
-                        continue;
-                    }
-                    // A per-agent copy shows only that agent, so it carries no unassigned block.
-                    $agentFile = $formatter->buildWorkbook(
-                        $agentRows, $display, $reportStartDate, $endDate, $employeeMap, $agentName, $source, $rosterAgents, []
-                    );
-                    if ($agentFile) {
-                        $this->info("[INFO] [$display] Agent workbook built: {$agentFile['filename']}");
-                        $files[] = $agentFile;
-                    }
-                }
 
                 if ($this->option('no-email')) {
                     $this->info("[INFO] [$display] --no-email set; skipping email send.");
@@ -545,145 +539,44 @@ class GenerateRetentionBonusCommission extends Command
             $this->warn("[WARN] [$display] No All workbook to email.");
         }
 
-        // Avoid PHP max_execution_time killing a long per-agent send loop.
-        @set_time_limit(0);
-
-        $agentSent = 0;
-        $agentCount = count($agentFiles);
-        foreach ($agentFiles as $i => $f) {
-            $agentName = CommissionAgentEmailFiles::agentNameFromFilename((string) $f['filename']);
-            $subject   = $baseSubject . ' - ' . $agentName;
-            $body      = "See attached Retention Bonus Commission - $display - $agentName.";
-            $attachments = CommissionAgentEmailFiles::toAttachments([$f]);
-            // Agent copies go only to Rama (hardcoded per Jacob). --test-recipient overrides.
-            $sent = $email->sendMail(
-                $subject,
-                $body,
-                [$testTo !== '' ? $testTo : 'rama@libertydebtrelief.com'],
-                [],
-                [],
-                $attachments
-            );
-            if ($sent) {
-                $agentSent++;
-            } else {
-                $this->warn("[WARN] [$display] Agent copy not sent for {$agentName}.");
-            }
-            if ($i < $agentCount - 1) {
-                usleep(250_000);
-            }
-        }
+        // Per-agent copies are not emailed from here any more — Jacob, 2026-09-04: "don't sent the
+        // individual ones since we can send from Debt Plete". Commission Review's Send / Send All
+        // delivers each agent their own statement, so mailing them here as well was a second,
+        // competing delivery path. $agentFiles is expected to be empty; warn rather than send if a
+        // caller ever passes one, so a partial revert cannot quietly resume the old behaviour.
         if ($agentFiles !== []) {
-            $dest = $testTo !== '' ? $testTo : 'Rama';
-            $this->info("[INFO] [$display] Agent copies emailed to {$dest}: {$agentSent}/" . count($agentFiles) . ".");
+            $this->warn(
+                "[WARN] [$display] " . count($agentFiles) . ' per-agent workbook(s) were built but not '
+                . 'emailed. Agent statements are sent from Commission Review in DebtPlete.'
+            );
         }
     }
 
     /**
-     * Placeholder "agents" the CRM uses for unattributed retention work. They are not people, so
-     * they must never be reported as someone missing from the roster.
-     * Jacob, 2026-09-03: "Sales Rep, Other CS Agent can be hard coded to ignore."
-     */
-    private const IGNORED_AGENTS = ['Sales Rep', 'Other CS Agent'];
-
-    /**
-     * Agents who earned commission in this period but are not on the roster.
-     *
-     * Two filters, both from Jacob:
-     *  - "only show names that were missing, and have data that is in the range we are looking for.
-     *    Some are showing with 0 because they only have data from months ago" — so a name only
-     *    qualifies on a NON-ZERO total for this period, not on merely appearing in the base window
-     *    (which reaches back four months to compute retention rates).
-     *  - the IGNORED_AGENTS placeholders above.
+     * Agents who earned retention commission this period but are not on the roster.
+     * The rule itself lives in UnassignedCommissionAgents so all three agent reports share it.
      *
      * @param array<int,array<string,mixed>> $rows
-     * @param array<int,string>|null         $rosterAgents Null when the roster is unavailable — in
-     *                                                     which case nobody can be called unassigned,
-     *                                                     because there is nothing to be absent from.
+     * @param array<int,string>|null         $rosterAgents Null when the roster is unavailable.
      * @return array<int,array{agent:string,amount:float}> Highest earner first.
      */
     private function unassignedAgents(array $rows, ?array $rosterAgents): array
     {
-        if ($rosterAgents === null) {
-            return [];
-        }
-
-        $ignored = array_map(
-            fn ($n) => strtolower(trim((string) preg_replace('/\s+/', ' ', $n))),
-            self::IGNORED_AGENTS
+        return UnassignedCommissionAgents::fromTotals(
+            UnassignedCommissionAgents::totals($rows, 'RETENTION_AGENT', 'RETENTION_COMMISSION'),
+            $rosterAgents
         );
-
-        $totals = [];
-        foreach ($rows as $row) {
-            $agent = trim((string) ($row['RETENTION_AGENT'] ?? ''));
-            if ($agent === '') {
-                continue;
-            }
-            $totals[$agent] = ($totals[$agent] ?? 0.0) + (float) ($row['RETENTION_COMMISSION'] ?? 0);
-        }
-
-        $out = [];
-        foreach ($totals as $agent => $amount) {
-            $amount = round($amount, 2);
-            if ($amount <= 0) {
-                continue;
-            }
-            if (in_array(strtolower(trim((string) preg_replace('/\s+/', ' ', $agent))), $ignored, true)) {
-                continue;
-            }
-            if (CommissionRosterProvider::isOnRoster($rosterAgents, $agent)) {
-                continue;
-            }
-            $out[] = ['agent' => $agent, 'amount' => $amount];
-        }
-
-        usort($out, fn ($a, $b) => $b['amount'] <=> $a['amount'] ?: strcasecmp($a['agent'], $b['agent']));
-
-        return $out;
     }
 
     /**
-     * The "Unassigned Agents" block appended to the All email body.
-     *
-     * Jacob, 2026-09-04: "for the body of the email after the message to see the attachment, if
-     * there is data for anyone in that month (so not just 0 commission) and they are not in the
-     * roster then add that to the body. Like
-     *
-     *     Unassigned Agents
-     *     Joe Smith     $50
-     *     Jane Doe      $25"
-     *
-     * These emails go out as plain text (sendMailUsingTblReports -> sendMail, contentType Text),
-     * so the columns are padded rather than tabled.
+     * The "Unassigned Agents" block appended to the All email body. These emails go out as plain
+     * text (sendMailUsingTblReports -> sendMail, contentType Text), so columns are padded.
      *
      * @param array<int,array{agent:string,amount:float}> $unassigned
      */
     private function unassignedEmailBlock(array $unassigned, bool $rosterUnavailable): string
     {
-        if ($rosterUnavailable) {
-            // Say nothing about who is missing when we could not read the list they would be
-            // missing from — an empty "Unassigned Agents" block would read as "everyone is
-            // accounted for", which is the opposite of what a broken roster means.
-            return "\n\nNOTE: the retention roster could not be read for this run, so the summary "
-                . 'uses the CRM agent names and no unassigned-agent check was performed.';
-        }
-
-        if ($unassigned === []) {
-            return '';
-        }
-
-        $width = 0;
-        foreach ($unassigned as $row) {
-            $width = max($width, strlen((string) $row['agent']));
-        }
-
-        $lines = ['', '', 'Unassigned Agents'];
-        foreach ($unassigned as $row) {
-            $lines[] = str_pad((string) $row['agent'], $width + 5)
-                . '$' . number_format((float) $row['amount'], 2);
-        }
-
-        return implode("\n", $lines);
+        return UnassignedCommissionAgents::emailBlock($unassigned, $rosterUnavailable, 'retention roster');
     }
 
     private function fetchEmployeeMap(DBConnector $sql, array $agents): array
