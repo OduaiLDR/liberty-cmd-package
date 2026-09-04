@@ -72,7 +72,8 @@ class SyncContactsData extends Command
         $reconcileAgentsFlag = $this->option('reconcile-agents') ? ['--reconcile-agents'] : [];
 
         // ── Step 1: LT ────────────────────────────────────────────────────────
-        $this->info("[INFO] Step 1/3: Syncing LT (primary contacts)...");
+        $orchStarted = microtime(true);
+        $this->logStep('Step 1/3: Syncing LT (primary contacts)...');
         $ltPool = Process::pool(function ($pool) use ($php, $artisan, $fullFlag, $ownersRefreshFlag, $dryRunFlag, $reconcileAgentsFlag) {
             $pool->as('LT')->timeout(7200)->command(
                 array_merge([$php, $artisan, 'Sync:contacts-data', '--source=LT', '--no-match'], $fullFlag, $ownersRefreshFlag, $dryRunFlag, $reconcileAgentsFlag)
@@ -82,7 +83,9 @@ class SyncContactsData extends Command
                 if ($line !== '') $this->line("[{$key}] {$line}");
             }
         });
+        $ltStarted = microtime(true);
         $ltProcesses = $ltPool->wait();
+        $this->logStep('Step 1/3: LT child process finished', $ltStarted);
 
         if ($ltProcesses['LT']->exitCode() !== 0) {
             $this->info("\n" . str_repeat('=', 80));
@@ -91,7 +94,7 @@ class SyncContactsData extends Command
         }
 
         // ── Step 2: LDR + PLAW (parallel) ────────────────────────────────────
-        $this->info("[INFO] Step 2/3: Syncing LDR and PLAW in parallel...");
+        $this->logStep('Step 2/3: Syncing LDR and PLAW in parallel...');
         $pool = Process::pool(function ($pool) use ($php, $artisan, $fullFlag, $ownersRefreshFlag, $dryRunFlag, $reconcileAgentsFlag) {
             foreach (['LDR', 'PLAW'] as $src) {
                 $pool->as($src)->timeout(7200)->command(
@@ -103,7 +106,9 @@ class SyncContactsData extends Command
                 if ($line !== '') $this->line("[{$key}] {$line}");
             }
         });
+        $sideStarted = microtime(true);
         $processes = $pool->wait();
+        $this->logStep('Step 2/3: LDR + PLAW child processes finished', $sideStarted);
 
         $allOk = true;
         foreach (['LDR', 'PLAW'] as $src) {
@@ -133,7 +138,8 @@ class SyncContactsData extends Command
             return Command::SUCCESS;
         }
 
-        $this->info("[INFO] Step 3/3: Running final table matching...");
+        $this->logStep('Step 3/3: Running final table matching...');
+        $matchStarted = microtime(true);
         try {
             $connector = DBConnector::fromEnvironment('ldr');
             $connector->initializeSqlServer();
@@ -147,8 +153,9 @@ class SyncContactsData extends Command
             return Command::FAILURE;
         }
 
+        $this->logStep('Step 3/3: matching done', $matchStarted);
         $this->info("\n" . str_repeat('=', 80));
-        $this->info('[SUCCESS] All syncs (LT → LDR, PLAW → matching) completed successfully!');
+        $this->logStep('All syncs (LT → LDR, PLAW → matching) completed successfully', $orchStarted);
         return Command::SUCCESS;
     }
 
@@ -262,30 +269,56 @@ class SyncContactsData extends Command
         // ensuring a failed/partial run never advances the watermark.
         $syncStartedAt = date('Y-m-d H:i:s');
 
-        $lastId           = 0;
-        $categoryChanges  = [];
-        $affiliateChanges = [];
-        $totalFetched     = 0;
-        $totalInserted    = 0;
+        $pageNum          = 0;
+        $syncLoopStarted  = microtime(true);
 
         do {
+            $pageNum++;
+            $pageStarted = microtime(true);
+            $this->logStep("Page {$pageNum}: querying Snowflake (source={$this->source}, afterId={$lastId}, limit=" . self::PAGE_SIZE . ", since={$startDate})");
+
+            $fetchStarted = microtime(true);
             $chunk     = $this->fetchContactsPage($snowflake, $startDate, $lastId, self::PAGE_SIZE);
             $chunkSize = \count($chunk);
+            $this->logStep("Page {$pageNum}: Snowflake returned {$chunkSize} row(s)", $fetchStarted);
 
             if ($chunkSize === 0) {
+                $this->logStep("Page {$pageNum}: empty page — done paging", $pageStarted);
                 break;
             }
 
             $totalFetched += $chunkSize;
-            $lastId        = (int) end($chunk)['LLG_ID'];
+            $firstId = (int) ($chunk[0]['LLG_ID'] ?? 0);
+            $lastId  = (int) end($chunk)['LLG_ID'];
+            $this->logStep("Page {$pageNum}: ID range {$firstId} → {$lastId}");
 
+            $enrollStarted = microtime(true);
+            $this->logStep("Page {$pageNum}: loading enrollment filters...");
             $enrollmentData = $this->loadEnrollmentDataFiltered($sqlConnector, $chunk);
-            $dropNames      = $this->fetchDropNamesFiltered($sqlConnector, $chunk);
+            $this->logStep(
+                'Page ' . $pageNum . ': enrollment filters loaded ('
+                . count($enrollmentData['categories'] ?? []) . ' enrolled matches)',
+                $enrollStarted
+            );
 
+            $dropStarted = microtime(true);
+            $this->logStep("Page {$pageNum}: loading drop names...");
+            $dropNames = $this->fetchDropNamesFiltered($sqlConnector, $chunk);
+            $this->logStep('Page ' . $pageNum . ': drop names loaded (' . count($dropNames) . ' matches)', $dropStarted);
+
+            $processStarted = microtime(true);
+            $this->logStep("Page {$pageNum}: processing chunk (ghost/dup-lead filter + TP_ID dedupe)...");
+            $beforeProcess = $chunkSize;
             [$processedChunk, $newCatChanges, $newAffChanges] = $this->processChunk(
                 $chunk,
                 $dropNames,
                 $enrollmentData
+            );
+            $this->logStep(
+                'Page ' . $pageNum . ': processed ' . count($processedChunk)
+                . ' row(s) from ' . $beforeProcess
+                . ' (dropped ' . ($beforeProcess - count($processedChunk)) . ')',
+                $processStarted
             );
 
             foreach ($newCatChanges as $c) {
@@ -297,9 +330,13 @@ class SyncContactsData extends Command
 
             if ($dryRun) {
                 $totalInserted += count($processedChunk);
+                $this->logStep('Page ' . $pageNum . ': dry-run skip write (' . count($processedChunk) . ' would upsert)');
             } else {
                 try {
+                    $writeStarted = microtime(true);
+                    $this->logStep('Page ' . $pageNum . ': writing ' . count($processedChunk) . ' row(s) to ' . $this->targetTable . '...');
                     $totalInserted += $this->insertChunk($sqlConnector, $processedChunk, $isIncremental);
+                    $this->logStep('Page ' . $pageNum . ': SQL write done', $writeStarted);
                 } catch (\Throwable $e) {
                     $this->error("[ERROR] Insert failed on chunk ending at ID {$lastId}: " . $e->getMessage());
                     Log::error('SyncContactsData: chunk insert failed', [
@@ -314,7 +351,11 @@ class SyncContactsData extends Command
             unset($chunk, $enrollmentData, $dropNames, $processedChunk, $newCatChanges, $newAffChanges);
             \gc_collect_cycles();
 
-            $this->info("[INFO] Progress: {$totalFetched} fetched, {$totalInserted} upserted...");
+            $elapsed = number_format(microtime(true) - $syncLoopStarted, 1);
+            $this->logStep(
+                "Page {$pageNum} complete — totals: {$totalFetched} fetched, {$totalInserted} upserted | elapsed {$elapsed}s",
+                $pageStarted
+            );
         // Keep paging until a page comes back empty. The old condition
         // (chunkSize === PAGE_SIZE) silently ended the sync whenever a page came
         // back short for any reason, reporting success on a partial load.
@@ -500,7 +541,7 @@ class SyncContactsData extends Command
                 FROM CONTACTS_USERFIELDS
                 WHERE CUSTOM_ID = {$this->debtAmountCustomId}
             ) AS uf_debt ON c.ID = uf_debt.CONTACT_ID
-            WHERE CONVERT_TIMEZONE('America/Los_Angeles', COALESCE(c.MODIFIED, a.STAMP, c.CREATED)) >= '{$this->esc($startDate)}'::TIMESTAMP_NTZ
+            WHERE CONVERT_TIMEZONE('America/Los_Angeles', COALESCE(c.MODIFIED, c.CREATED)) >= '{$this->esc($startDate)}'::TIMESTAMP_NTZ
               AND c.DEL = 'FALSE'
               AND c.FIRSTNAME IS NOT NULL AND c.FIRSTNAME <> ''
               AND ISCOAPP = 0
@@ -814,17 +855,34 @@ class SyncContactsData extends Command
             $toUpdate = [];
 
             if ($incremental && $this->source === 'LT') {
+                $splitStarted = microtime(true);
+                $this->logStep('SQL: splitting LT upserts (External_ID + remapped LDR/PLAW lookup)...');
                 [$toUpdate, $toInsert] = $this->splitLtIncrementalUpserts($pdo, $data);
-                // Remapped row already exists: refresh fields only, keep its LLG_ID (no INSERT of LT key).
-                $this->updateLtContactsByExternalId($pdo, $toUpdate);
+                $this->logStep(
+                    'SQL: split done — update=' . count($toUpdate) . ', insert=' . count($toInsert),
+                    $splitStarted
+                );
+
+                if ($toUpdate !== []) {
+                    $updStarted = microtime(true);
+                    $this->logStep('SQL: updating ' . count($toUpdate) . ' remapped TblContacts row(s)...');
+                    $this->updateLtContactsByExternalId($pdo, $toUpdate);
+                    $this->logStep('SQL: remapped updates done', $updStarted);
+                }
             }
 
             if ($incremental && !empty($toInsert)) {
+                $delStarted = microtime(true);
+                $this->logStep('SQL: deleting ' . count($toInsert) . ' existing LLG_ID(s) before re-insert...');
                 $this->deleteByLlgIds($pdo, \array_column($toInsert, 'llg_id'));
+                $this->logStep('SQL: deletes done', $delStarted);
             }
 
             if (!empty($toInsert)) {
+                $insStarted = microtime(true);
+                $this->logStep('SQL: inserting ' . count($toInsert) . ' row(s) into ' . $this->targetTable . '...');
                 $this->insertContactRows($pdo, $fields, $toInsert);
+                $this->logStep('SQL: inserts done', $insStarted);
             }
 
             $pdo->commit();
@@ -846,8 +904,16 @@ class SyncContactsData extends Command
      */
     private function splitLtIncrementalUpserts(\PDO $pdo, array $data): array
     {
+        $extStarted = microtime(true);
+        $this->logStep('SQL: looking up existing External_ID owners (' . count($data) . ' rows)...');
         $extToExistingLlg = $this->lookupLtExternalIdOwners($pdo, $data);
+        $this->logStep('SQL: External_ID owners found=' . count($extToExistingLlg), $extStarted);
+
+        $remapStarted = microtime(true);
+        $this->logStep('SQL: looking up remapped owners via LDR/PLAW External_ID...');
         $ltIdToExistingLlg = $this->lookupLtRemappedOwnersByContactId($pdo, $data);
+        $this->logStep('SQL: remapped owners found=' . count($ltIdToExistingLlg), $remapStarted);
+
         $toUpdate = [];
         $toInsert = [];
 
@@ -878,39 +944,49 @@ class SyncContactsData extends Command
      */
     private function lookupLtRemappedOwnersByContactId(\PDO $pdo, array $data): array
     {
-        $map = [];
-        foreach (\array_chunk($data, 1000) as $batch) {
-            $ltIds = [];
-            foreach ($batch as $row) {
-                $llg = (string) ($row['llg_id'] ?? '');
-                $ltId = preg_replace('/^LLG-/i', '', $llg);
-                if ($ltId !== '' && ctype_digit($ltId)) {
-                    $ltIds[$ltId] = $llg;
+        $ltIds = [];
+        foreach ($data as $row) {
+            $llg = (string) ($row['llg_id'] ?? '');
+            $ltId = preg_replace('/^LLG-/i', '', $llg);
+            if ($ltId !== '' && ctype_digit($ltId)) {
+                $ltIds[$ltId] = $llg;
+            }
+        }
+        if ($ltIds === []) {
+            return [];
+        }
+
+        $pdo->exec('CREATE TABLE #TmpLtRemapIds (LtId VARCHAR(50) NOT NULL PRIMARY KEY)');
+        try {
+            foreach (\array_chunk(\array_keys($ltIds), 1000) as $batch) {
+                $values = \implode(', ', \array_map(
+                    fn($id) => "('" . $this->escSql($id) . "')",
+                    $batch
+                ));
+                if ($pdo->exec("INSERT INTO #TmpLtRemapIds (LtId) VALUES {$values}") === false) {
+                    $err = $pdo->errorInfo();
+                    throw new \RuntimeException('LT remapped id temp insert failed: ' . ($err[2] ?? 'unknown PDO error'));
                 }
             }
-            if ($ltIds === []) {
-                continue;
-            }
-            $inList = \implode(', ', \array_map(
-                fn($id) => "'" . $this->escSql($id) . "'",
-                \array_keys($ltIds)
-            ));
+
             $sql = "
-                SELECT CAST(src.External_ID AS VARCHAR(50)) AS LtId, c.LLG_ID
-                FROM TblContacts AS c
-                INNER JOIN TblContactsPLAW AS src ON c.LLG_ID = src.LLG_ID
-                WHERE CAST(src.External_ID AS VARCHAR(50)) IN ({$inList})
+                SELECT t.LtId, c.LLG_ID
+                FROM #TmpLtRemapIds AS t
+                INNER JOIN TblContactsPLAW AS src ON src.External_ID = t.LtId
+                INNER JOIN TblContacts AS c ON c.LLG_ID = src.LLG_ID
                 UNION
-                SELECT CAST(src.External_ID AS VARCHAR(50)) AS LtId, c.LLG_ID
-                FROM TblContacts AS c
-                INNER JOIN TblContactsLDR AS src ON c.LLG_ID = src.LLG_ID
-                WHERE CAST(src.External_ID AS VARCHAR(50)) IN ({$inList})
+                SELECT t.LtId, c.LLG_ID
+                FROM #TmpLtRemapIds AS t
+                INNER JOIN TblContactsLDR AS src ON src.External_ID = t.LtId
+                INNER JOIN TblContacts AS c ON c.LLG_ID = src.LLG_ID
             ";
             $stmt = $pdo->query($sql);
             if ($stmt === false) {
                 $err = $pdo->errorInfo();
                 throw new \RuntimeException('LT remapped contact-id lookup failed: ' . ($err[2] ?? 'unknown PDO error'));
             }
+
+            $map = [];
             while ($found = $stmt->fetch(\PDO::FETCH_ASSOC)) {
                 $ltId = (string) ($found['LtId'] ?? $found['ltid'] ?? '');
                 $existing = (string) ($found['LLG_ID'] ?? $found['llg_id'] ?? '');
@@ -920,9 +996,10 @@ class SyncContactsData extends Command
                 }
                 $map[$ltId] = $existing;
             }
+            return $map;
+        } finally {
+            $pdo->exec('DROP TABLE IF EXISTS #TmpLtRemapIds');
         }
-
-        return $map;
     }
 
     /** @return array<string, string> External_ID => preferred existing LLG_ID (prefer non-incoming LT key when both exist) */
@@ -1871,5 +1948,17 @@ class SyncContactsData extends Command
     protected function escSql(string $value): string
     {
         return str_replace("'", "''", $value);
+    }
+
+    /** Timestamped console line; optional elapsed seconds from $startedAt. */
+    private function logStep(string $message, ?float $startedAt = null): void
+    {
+        $suffix = $startedAt !== null
+            ? ' (' . number_format(microtime(true) - $startedAt, 1) . 's)'
+            : '';
+        $this->info('[INFO] ' . date('H:i:s') . ' ' . $message . $suffix);
+        if (\defined('STDOUT')) {
+            @\fflush(STDOUT);
+        }
     }
 }
