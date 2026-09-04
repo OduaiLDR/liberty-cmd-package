@@ -931,8 +931,8 @@ class SyncContactsData extends Command
                 $existingLlg = $ltIdToExistingLlg[$ltId] ?? null;
             }
             if ($existingLlg !== null && $existingLlg !== $llg) {
-                // Carry LT contact id so UPDATE can join when TP_ID/External_ID is blank.
                 $row['_lt_contact_id'] = $ltId;
+                $row['_existing_llg_id'] = $existingLlg;
                 $toUpdate[] = $row;
             } else {
                 $toInsert[] = $row;
@@ -1084,8 +1084,14 @@ class SyncContactsData extends Command
             return;
         }
 
-        foreach (\array_chunk($rows, 500) as $batch) {
+        $batches = \array_chunk($rows, 500);
+        $totalBatches = \count($batches);
+        foreach ($batches as $batchIndex => $batch) {
+            $batchStarted = microtime(true);
+            $this->logStep('SQL: remapped update batch ' . ($batchIndex + 1) . '/' . $totalBatches . ' (' . count($batch) . ' rows)...');
+
             $pdo->exec('CREATE TABLE #TmpLtExtUpd (
+                ExistingLlgId VARCHAR(50) NOT NULL,
                 External_ID VARCHAR(50) NULL,
                 LtContactId VARCHAR(50) NOT NULL,
                 Created_Date DATETIME NULL,
@@ -1120,10 +1126,15 @@ class SyncContactsData extends Command
                     ? "'" . $this->escSql($row['email']) . "'"
                     : 'NULL';
                 $ltContactId = (string) ($row['_lt_contact_id'] ?? preg_replace('/^LLG-/i', '', (string) ($row['llg_id'] ?? '')));
+                $existingLlg = (string) ($row['_existing_llg_id'] ?? '');
+                if ($existingLlg === '') {
+                    continue;
+                }
                 $extSql = ($row['external_id'] ?? '') !== ''
                     ? "'" . $this->escSql((string) $row['external_id']) . "'"
                     : 'NULL';
                 $valuesParts[] = "("
+                    . "'{$this->escSql($existingLlg)}', "
                     . "{$extSql}, "
                     . "'{$this->escSql($ltContactId)}', "
                     . "{$createdDate}, {$assignedDate}, "
@@ -1150,8 +1161,13 @@ class SyncContactsData extends Command
                     . ')';
             }
 
+            if ($valuesParts === []) {
+                $pdo->exec('DROP TABLE IF EXISTS #TmpLtExtUpd');
+                continue;
+            }
+
             $ins = 'INSERT INTO #TmpLtExtUpd (
-                External_ID, LtContactId, Created_Date, Assigned_Date, Campaign, Data_Source, Created_By, Agent, Client,
+                ExistingLlgId, External_ID, LtContactId, Created_Date, Assigned_Date, Campaign, Data_Source, Created_By, Agent, Client,
                 Phone, Email, Address_1, Address_2, City, State, Zip, Stage, Status,
                 Debt_Amount, Debt_Enrolled, Credit_Score, Credit_Utilization, Category, Affiliate_Agent
             ) VALUES ' . \implode(', ', $valuesParts);
@@ -1160,6 +1176,7 @@ class SyncContactsData extends Command
                 throw new \RuntimeException('LT remapped UPDATE staging failed: ' . ($err[2] ?? 'unknown PDO error'));
             }
 
+            // Join on the remapped LLG_ID we already found — no LDR/PLAW EXISTS scans.
             $upd = "UPDATE c
                 SET c.External_ID = CASE
                         WHEN COALESCE(c.External_ID, '') <> '' THEN c.External_ID
@@ -1189,24 +1206,14 @@ class SyncContactsData extends Command
                     c.Category = u.Category,
                     c.Affiliate_Agent = u.Affiliate_Agent
                 FROM {$this->targetTable} AS c
-                INNER JOIN #TmpLtExtUpd AS u ON (
-                    (COALESCE(u.External_ID, '') <> '' AND c.External_ID = u.External_ID)
-                    OR c.External_ID = u.LtContactId
-                    OR EXISTS (
-                        SELECT 1 FROM TblContactsPLAW p
-                        WHERE p.LLG_ID = c.LLG_ID AND CAST(p.External_ID AS VARCHAR(50)) = u.LtContactId
-                    )
-                    OR EXISTS (
-                        SELECT 1 FROM TblContactsLDR l
-                        WHERE l.LLG_ID = c.LLG_ID AND CAST(l.External_ID AS VARCHAR(50)) = u.LtContactId
-                    )
-                )";
+                INNER JOIN #TmpLtExtUpd AS u ON c.LLG_ID = u.ExistingLlgId";
             if ($pdo->exec($upd) === false) {
                 $err = $pdo->errorInfo();
                 throw new \RuntimeException('LT remapped UPDATE failed: ' . ($err[2] ?? 'unknown PDO error'));
             }
 
             $pdo->exec('DROP TABLE #TmpLtExtUpd');
+            $this->logStep('SQL: remapped update batch ' . ($batchIndex + 1) . '/' . $totalBatches . ' done', $batchStarted);
         }
     }
 
