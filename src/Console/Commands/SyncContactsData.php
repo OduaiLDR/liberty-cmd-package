@@ -716,7 +716,10 @@ class SyncContactsData extends Command
 
         foreach ($chunk as $row) {
             $contactId = $row['LLG_ID'] ?? '';
-            $tpId      = trim((string) ($row['EXTERNAL_ID'] ?? ''));
+            $tpId = trim((string) ($row['EXTERNAL_ID'] ?? ''));
+            if ($this->isFakeExternalId($tpId)) {
+                $tpId = '';
+            }
             $debtAmountRaw = $row['DEBT_AMOUNT_CUSTOM'] ?? 0;
             $debtAmount = is_numeric($debtAmountRaw) ? (float) $debtAmountRaw : 0.0;
             if ($this->source === 'LT' && ($debtAmount <= 0 || $debtAmount > self::MAX_LT_DEBT_AMOUNT)) {
@@ -1736,8 +1739,8 @@ class SyncContactsData extends Command
     }
 
     /**
-     * Keep first record per TP_ID ordered by Modified DESC (Jacob).
-     * Blank TP_ID rows are kept individually (keyed by contact ID).
+     * Keep one record per TP_ID (Jacob). Prefer the richest contact row, then newest Modified.
+     * Blank / fake shared TP_IDs are kept individually (keyed by contact ID).
      */
     private function dedupeSnowflakeChunkByTpId(array $chunk): array
     {
@@ -1745,20 +1748,53 @@ class SyncContactsData extends Command
         foreach ($chunk as $row) {
             $tpId = trim((string) ($row['EXTERNAL_ID'] ?? $row['TP_ID'] ?? ''));
             $id = (string) ($row['LLG_ID'] ?? '');
-            $key = $tpId !== '' ? $tpId : ('ID-' . $id);
-            $modified = (string) ($row['MODIFIED'] ?? '');
-            if (!isset($best[$key])) {
-                $best[$key] = $row;
-                continue;
-            }
-            $existingModified = (string) ($best[$key]['MODIFIED'] ?? '');
-            if ($modified > $existingModified
-                || ($modified === $existingModified && $id > (string) ($best[$key]['LLG_ID'] ?? ''))
-            ) {
+            // Fake shared Ext (1234567840, 0) must not collapse unrelated spam into one key.
+            $key = ($tpId !== '' && !$this->isFakeExternalId($tpId)) ? $tpId : ('ID-' . $id);
+            if (!isset($best[$key]) || $this->snowflakeRowBetterThan($row, $best[$key])) {
                 $best[$key] = $row;
             }
         }
         return array_values($best);
+    }
+
+    /** Prefer phone/email/address completeness, then newer Modified, then higher ID. */
+    private function snowflakeRowBetterThan(array $candidate, array $existing): bool
+    {
+        $cScore = $this->snowflakeRowRichnessScore($candidate);
+        $eScore = $this->snowflakeRowRichnessScore($existing);
+        if ($cScore !== $eScore) {
+            return $cScore > $eScore;
+        }
+        $cMod = (string) ($candidate['MODIFIED'] ?? '');
+        $eMod = (string) ($existing['MODIFIED'] ?? '');
+        if ($cMod !== $eMod) {
+            return $cMod > $eMod;
+        }
+        return (string) ($candidate['LLG_ID'] ?? '') > (string) ($existing['LLG_ID'] ?? '');
+    }
+
+    private function snowflakeRowRichnessScore(array $row): int
+    {
+        $score = 0;
+        if (trim((string) ($row['CELL_PHONE'] ?? $row['PHONE3'] ?? '')) !== '') {
+            $score += 4;
+        }
+        if (trim((string) ($row['EMAIL'] ?? '')) !== '') {
+            $score += 4;
+        }
+        if (trim((string) ($row['ADDRESS1'] ?? $row['ADDRESS'] ?? '')) !== '') {
+            $score += 1;
+        }
+        if (trim((string) ($row['ASSIGNED_TO'] ?? '')) !== '') {
+            $score += 1;
+        }
+        return $score;
+    }
+
+    /** Shared junk TP_IDs from Forth test/mailer spam — not real External IDs. */
+    private function isFakeExternalId(string $tpId): bool
+    {
+        return in_array($tpId, ['0', '1234567840'], true);
     }
 
     /** Real sales roster name — not portal system accounts. */
