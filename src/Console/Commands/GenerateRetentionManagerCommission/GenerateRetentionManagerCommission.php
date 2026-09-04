@@ -1132,55 +1132,43 @@ class GenerateRetentionManagerCommission extends Command
 
         $sp = new Spreadsheet();
         $sheet = $sp->getActiveSheet();
-        $sheet->setTitle('Anthony');
+        // Jacob, 2026-09-03: "Sheet names change to the title like NSF Team Leader".
+        $sheet->setTitle($this->managerSheetTitle('anthony'));
         $sheet->setShowGridlines(false);
 
         $sheet->fromArray([['NGO', 'Assignments', 'Actions', 'Ratio', 'Clears']], null, 'A1');
         $this->headerStyle($sheet, 'A1:E1');
 
+        // One row per roster member, in roster order, with no padding.
+        // Jacob: "For the NSF Team Leader, data sheet put the totals right below the table."
+        // The sheet used to run to a fixed row 21 — blank names in rows 17-21 and zero-filled
+        // placeholder rows — which left the Total floating below a gap.
         $rosterSeen = [];
-        $dataRowEnd = 21;
-        for ($r = 2; $r <= $dataRowEnd; $r++) {
-            $agent = self::ANTHONY_NSF_ROSTER[$r - 2] ?? '';
-            $sheet->setCellValue("A{$r}", $agent);
+        $r = 2;
+        foreach (self::ANTHONY_NSF_ROSTER as $agent) {
             $key = $this->anthonyAgentKey($agent);
-            if ($key !== '' && !isset($rosterSeen[$key])) {
-                $rosterSeen[$key] = true;
-                $stats = $byAgent[$key] ?? null;
-            } else {
-                $stats = null;
+            if ($key === '' || isset($rosterSeen[$key])) {
+                continue;   // drops the duplicate Lucas Wright placeholder from the old template
             }
-            if ($stats !== null) {
-                $sheet->setCellValue("B{$r}", $stats['assignments']);
-                $sheet->setCellValue("C{$r}", $stats['actions']);
-                $sheet->setCellValue("D{$r}", $stats['assignments'] > 0 ? $stats['actions'] / $stats['assignments'] : 0);
-                $sheet->setCellValue("E{$r}", $stats['clears']);
-            } elseif ($agent !== '') {
-                // Placeholder roster rows (e.g. Anthony Clark, duplicate Lucas Wright)
-                $sheet->setCellValue("B{$r}", 0);
-                $sheet->setCellValue("C{$r}", 0);
-                $sheet->setCellValue("D{$r}", 0);
-                $sheet->setCellValue("E{$r}", 0);
-            }
-            // Rows 17–21: name blank in template — leave B:E empty like Jacob
+            $rosterSeen[$key] = true;
+            $stats = $byAgent[$key] ?? null;
+
+            $sheet->setCellValue("A{$r}", $agent);
+            $sheet->setCellValue("B{$r}", $stats['assignments'] ?? 0);
+            $sheet->setCellValue("C{$r}", $stats['actions'] ?? 0);
+            $sheet->setCellValue("D{$r}", ($stats && $stats['assignments'] > 0) ? $stats['actions'] / $stats['assignments'] : 0);
+            $sheet->setCellValue("E{$r}", $stats['clears'] ?? 0);
+            $r++;
         }
 
-        $totalRow = 22;
+        $lastDataRow = $r - 1;
+        $totalRow = $r;
         $sheet->setCellValue("A{$totalRow}", 'Total');
-        $sheet->setCellValue("B{$totalRow}", '=SUM(B2:B21)');
-        $sheet->setCellValue("C{$totalRow}", '=SUM(C2:C21)');
-        $sheet->setCellValue("D{$totalRow}", '=C22/B22');
-        $sheet->setCellValue("E{$totalRow}", '=SUM(E2:E21)');
+        $sheet->setCellValue("B{$totalRow}", "=SUM(B2:B{$lastDataRow})");
+        $sheet->setCellValue("C{$totalRow}", "=SUM(C2:C{$lastDataRow})");
+        $sheet->setCellValue("D{$totalRow}", "=IF(B{$totalRow}=0,0,C{$totalRow}/B{$totalRow})");
+        $sheet->setCellValue("E{$totalRow}", "=SUM(E2:E{$lastDataRow})");
         $sheet->getStyle("A{$totalRow}:E{$totalRow}")->getFont()->setBold(true);
-
-        // Tier table - matches Jacob's current workbook (NSF Team Leader sheet)
-        // Ratio thresholds across columns I/J/K = 0.40 / 0.55 / 0.65
-        // Clears thresholds down rows H8/H9/H10 = 200 / 300 / 500
-        $sheet->setCellValue('H6', 'Commission Tiers');
-        $sheet->fromArray([['', 0.40, 0.55, 0.65]], null, 'H7');
-        $sheet->fromArray([[200, 0.0, 0.07, 0.40]], null, 'H8');
-        $sheet->fromArray([[300, 0.0, 0.10, 0.50]], null, 'H9');
-        $sheet->fromArray([[500, 0.0, 0.30, 0.70]], null, 'H10');
 
         $rosterKeys = [];
         foreach (self::ANTHONY_NSF_ROSTER as $name) {
@@ -1205,22 +1193,60 @@ class GenerateRetentionManagerCommission extends Command
         $rate = $this->anthonyRate($ratioTotal, $clearsTotal);
         $commission = round($clearsTotal * $rate, 2);
 
-        $sheet->setCellValue('H14', 'Clears');
-        $sheet->setCellValue("I14", $clearsTotal);
-        $sheet->setCellValue('H15', 'Rate');
-        $sheet->setCellValue('I15', $rate);
-        $sheet->setCellValue('H16', 'Commission');
-        $sheet->setCellValue('I16', $commission);
-
+        // Data sheet formatting: percentages as percentages, whole counts as counts, and borders
+        // over the whole table including the Total row.
         $sheet->getStyle("D2:D{$totalRow}")->getNumberFormat()->setFormatCode('0.00%');
-        $sheet->getStyle("I14")->getNumberFormat()->setFormatCode('0');
-        $sheet->getStyle("I16")->getNumberFormat()->setFormatCode('$#,##0.00');
-        $this->highlightFinalCommissionCell($sheet, 'I16');
+        $sheet->getStyle("B2:C{$totalRow}")->getNumberFormat()->setFormatCode('#,##0');
+        $sheet->getStyle("E2:E{$totalRow}")->getNumberFormat()->setFormatCode('#,##0');
+        $this->tableBorders($sheet, "A1:E{$totalRow}");
 
-        foreach (range('A', 'J') as $col) {
+        foreach (range('A', 'E') as $col) {
             $sheet->getColumnDimension($col)->setAutoSize(true);
         }
         $sheet->freezePane('A2');
+
+        // ── Sheet 2: Commission ───────────────────────────────────────────────
+        // Jacob: "commission add to a second sheet and format it… commission to second sheet."
+        // The tier table and the commission calculation used to sit in columns H-I of the data
+        // sheet, alongside the agent rows.
+        $comm = $sp->createSheet();
+        $comm->setTitle('Commission');
+        $comm->setShowGridlines(false);
+
+        $comm->setCellValue('A1', 'Commission Tiers');
+        $comm->getStyle('A1')->getFont()->setBold(true);
+        $comm->fromArray([['Clears \\ Action ratio', 0.40, 0.55, 0.65]], null, 'A2');
+        $comm->fromArray([[200, 0.0, 0.07, 0.40]], null, 'A3');
+        $comm->fromArray([[300, 0.0, 0.10, 0.50]], null, 'A4');
+        $comm->fromArray([[500, 0.0, 0.30, 0.70]], null, 'A5');
+        $this->headerStyle($comm, 'A2:D2');
+        $comm->getStyle('B3:D5')->getNumberFormat()->setFormatCode('0.00%');
+        $comm->getStyle('A3:A5')->getNumberFormat()->setFormatCode('#,##0');
+        $this->tableBorders($comm, 'A2:D5');
+
+        $comm->setCellValue('A7', 'Calculation');
+        $comm->getStyle('A7')->getFont()->setBold(true);
+        $comm->fromArray([
+            ['Assignments', $totalAssignments],
+            ['Actions', $totalActions],
+            ['Action ratio', $ratioTotal],
+            ['Clears', $clearsTotal],
+            ['Rate', $rate],
+            ['Commission', $commission],
+        ], null, 'A8');
+        $comm->getStyle('B8:B9')->getNumberFormat()->setFormatCode('#,##0');
+        $comm->getStyle('B10')->getNumberFormat()->setFormatCode('0.00%');
+        $comm->getStyle('B11')->getNumberFormat()->setFormatCode('#,##0');
+        $comm->getStyle('B12')->getNumberFormat()->setFormatCode('0.00%');
+        $comm->getStyle('B13')->getNumberFormat()->setFormatCode('$#,##0.00');
+        $comm->getStyle('A13:B13')->getFont()->setBold(true);
+        $this->tableBorders($comm, 'A8:B13');
+        $this->highlightFinalCommissionCell($comm, 'B13');
+        foreach (['A', 'B', 'C', 'D'] as $col) {
+            $comm->getColumnDimension($col)->setAutoSize(true);
+        }
+
+        $sp->setActiveSheetIndex(0);
 
         $folder = $this->downloadReportFolder($reportName);
         if (!is_dir($folder)) {
@@ -1301,7 +1327,7 @@ class GenerateRetentionManagerCommission extends Command
     {
         $sp = new Spreadsheet();
         $sheet = $sp->getActiveSheet();
-        $sheet->setTitle($key === 'rama' ? 'Rama' : 'Nick');
+        $sheet->setTitle($this->managerSheetTitle($key));
         $sheet->setShowGridlines(false);
 
         $headers = $key === 'rama'
@@ -1354,17 +1380,22 @@ class GenerateRetentionManagerCommission extends Command
         }
         $sheet->getStyle("F2:F{$last}")->getNumberFormat()->setFormatCode('$#,##0');
         $sheet->getStyle("L2:O{$last}")->getNumberFormat()->setFormatCode('$#,##0.00');
-        $sheet->getStyle("A1:{$lastHeaderCol}1")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
-        $sheet->getStyle("A1:{$lastHeaderCol}1")->getFont()->setName('Calibri')->setSize(9);
+        // Borders over the whole table, not just the header row (Jacob: "data sheet add borders").
+        $this->tableBorders($sheet, "A1:{$lastHeaderCol}{$last}");
         foreach (range('A', $lastHeaderCol) as $col) {
             $sheet->getColumnDimension($col)->setWidth(16);
         }
         $sheet->freezePane('A2');
 
+        // Commission goes on its own sheet rather than in columns W-AC beside the data
+        // (Jacob: "commission add to a second sheet and format it").
+        $comm = $sp->createSheet();
+        $comm->setTitle('Commission');
+        $comm->setShowGridlines(false);
         if ($key === 'rama') {
-            $this->buildRamaSummary($sheet, $rows, $startDate, $endDate);
+            $this->buildRamaSummary($comm, $rows, $startDate, $endDate);
         } else {
-            $this->buildNickSummary($sheet, $rows, $startDate, $endDate);
+            $this->buildNickSummary($comm, $rows, $startDate, $endDate);
         }
 
         $sp->setActiveSheetIndex(0);
@@ -1386,31 +1417,45 @@ class GenerateRetentionManagerCommission extends Command
         $c1 = $this->ramaCommission($all['pct'], false);
         $c2 = $this->ramaCommission($ngf['pct'], true);
 
-        $sheet->setCellValue('W2', 'Rama');
-        $sheet->setCellValue('W3', 'Summary');
-        $sheet->setCellValue('W4', 'Reconsideration Pending');
-        $sheet->setCellValue('X4', $all['assigned']);
-        $sheet->setCellValue('W5', 'Retained');
-        $sheet->setCellValue('X5', $all['retained']);
-        $sheet->setCellValue('W6', 'Rate');
-        $sheet->setCellValue('X6', $all['pct']);
-        $sheet->setCellValue('W7', 'Commission 1');
-        $sheet->setCellValue('X7', $c1);
-        $sheet->setCellValue('W9', 'Bonus Reconsideration');
-        $sheet->setCellValue('X9', $ngf['assigned']);
-        $sheet->setCellValue('W10', 'Bonus Retained');
-        $sheet->setCellValue('X10', $ngf['retained']);
-        $sheet->setCellValue('W11', 'Rate');
-        $sheet->setCellValue('X11', $ngf['pct']);
-        $sheet->setCellValue('W12', 'Commission 2');
-        $sheet->setCellValue('X12', $c2);
-        $sheet->setCellValue('W14', 'Commission Total');
-        $sheet->setCellValue('X14', $c1 + $c2);
-        $sheet->getStyle('X6:X11')->getNumberFormat()->setFormatCode('0%');
-        $sheet->getStyle('X7:X14')->getNumberFormat()->setFormatCode('$#,##0');
-        $this->highlightFinalCommissionCell($sheet, 'X14');
-        foreach (range('W', 'X') as $col) {
-            $sheet->getColumnDimension($col)->setWidth(22);
+        // Written to its own sheet from A1, rather than into columns W-X of the data sheet.
+        $sheet->setCellValue('A1', 'Retention & NSF Manager — Commission');
+        $sheet->getStyle('A1')->getFont()->setBold(true)->setSize(12);
+
+        $sheet->fromArray([['Retention', '']], null, 'A3');
+        $this->headerStyle($sheet, 'A3:B3');
+        $sheet->fromArray([
+            ['Reconsideration Pending', $all['assigned']],
+            ['Retained', $all['retained']],
+            ['Rate', $all['pct']],
+            ['Commission 1', $c1],
+        ], null, 'A4');
+        $sheet->getStyle('B4:B5')->getNumberFormat()->setFormatCode('#,##0');
+        $sheet->getStyle('B6')->getNumberFormat()->setFormatCode('0.00%');
+        $sheet->getStyle('B7')->getNumberFormat()->setFormatCode('$#,##0.00');
+        $this->tableBorders($sheet, 'A3:B7');
+
+        $sheet->fromArray([['Bonus (NGF)', '']], null, 'A9');
+        $this->headerStyle($sheet, 'A9:B9');
+        $sheet->fromArray([
+            ['Bonus Reconsideration', $ngf['assigned']],
+            ['Bonus Retained', $ngf['retained']],
+            ['Rate', $ngf['pct']],
+            ['Commission 2', $c2],
+        ], null, 'A10');
+        $sheet->getStyle('B10:B11')->getNumberFormat()->setFormatCode('#,##0');
+        $sheet->getStyle('B12')->getNumberFormat()->setFormatCode('0.00%');
+        $sheet->getStyle('B13')->getNumberFormat()->setFormatCode('$#,##0.00');
+        $this->tableBorders($sheet, 'A9:B13');
+
+        $sheet->setCellValue('A15', 'Commission Total');
+        $sheet->setCellValue('B15', $c1 + $c2);
+        $sheet->getStyle('B15')->getNumberFormat()->setFormatCode('$#,##0.00');
+        $sheet->getStyle('A15:B15')->getFont()->setBold(true);
+        $this->tableBorders($sheet, 'A15:B15');
+        $this->highlightFinalCommissionCell($sheet, 'B15');
+
+        foreach (['A', 'B'] as $col) {
+            $sheet->getColumnDimension($col)->setWidth(26);
         }
     }
 
@@ -1422,24 +1467,43 @@ class GenerateRetentionManagerCommission extends Command
         $tier = $this->nickTier($pct);
         $commission = $this->computeNickCommission($rows);
 
-        $sheet->setCellValue('W2', 'Nick');
-        $sheet->setCellValue('W3', 'Reconsideration Pending');
-        $sheet->setCellValue('X3', $assigned);
-        $sheet->setCellValue('W4', 'Retained');
-        $sheet->setCellValue('X4', $retained);
-        $sheet->setCellValue('W5', 'Rate');
-        $sheet->setCellValue('X5', $pct);
-        $sheet->setCellValue('W6', 'Tier');
-        $sheet->setCellValue('X6', $tier);
+        // Written to its own sheet from A1, rather than into columns W-AC of the data sheet.
+        $sheet->setCellValue('A1', 'Retention Team Leader — Commission');
+        $sheet->getStyle('A1')->getFont()->setBold(true)->setSize(12);
 
-        $sheet->setCellValue('W7', 'Commission');
-        $sheet->setCellValue('X7', $commission);
-        $sheet->fromArray([['Rate 1', 'Rate 2', 'Rate 3', 'Rate 4']], null, 'Z5');
-        $sheet->fromArray([[$this->nickRateForTier($tier, 0), $this->nickRateForTier($tier, 1), $this->nickRateForTier($tier, 2), $this->nickRateForTier($tier, 3)]], null, 'Z6');
-        $sheet->getStyle('X5')->getNumberFormat()->setFormatCode('0%');
-        $sheet->getStyle('X7')->getNumberFormat()->setFormatCode('$#,##0');
-        $this->highlightFinalCommissionCell($sheet, 'X7');
-        foreach (['W', 'X', 'Z', 'AA', 'AB', 'AC'] as $col) {
+        $sheet->fromArray([['Summary', '']], null, 'A3');
+        $this->headerStyle($sheet, 'A3:B3');
+        $sheet->fromArray([
+            ['Reconsideration Pending', $assigned],
+            ['Retained', $retained],
+            ['Rate', $pct],
+            ['Tier', $tier],
+            ['Commission', $commission],
+        ], null, 'A4');
+        $sheet->getStyle('B4:B5')->getNumberFormat()->setFormatCode('#,##0');
+        $sheet->getStyle('B6')->getNumberFormat()->setFormatCode('0.00%');
+        $sheet->getStyle('B7')->getNumberFormat()->setFormatCode('0');
+        $sheet->getStyle('B8')->getNumberFormat()->setFormatCode('$#,##0.00');
+        $sheet->getStyle('A8:B8')->getFont()->setBold(true);
+        $this->tableBorders($sheet, 'A3:B8');
+        $this->highlightFinalCommissionCell($sheet, 'B8');
+
+        // The per-debt-bracket rates that apply at the tier reached above.
+        $sheet->setCellValue('A10', "Rates at tier {$tier}");
+        $sheet->getStyle('A10')->getFont()->setBold(true);
+        $sheet->fromArray([['Rate 1', 'Rate 2', 'Rate 3', 'Rate 4']], null, 'A11');
+        $this->headerStyle($sheet, 'A11:D11');
+        $sheet->fromArray([[
+            $this->nickRateForTier($tier, 0),
+            $this->nickRateForTier($tier, 1),
+            $this->nickRateForTier($tier, 2),
+            $this->nickRateForTier($tier, 3),
+        ]], null, 'A12');
+        $sheet->getStyle('A12:D12')->getNumberFormat()->setFormatCode('$#,##0.00');
+        $this->tableBorders($sheet, 'A11:D12');
+
+        $sheet->getColumnDimension('A')->setWidth(26);
+        foreach (['B', 'C', 'D'] as $col) {
             $sheet->getColumnDimension($col)->setWidth(16);
         }
     }
@@ -1691,6 +1755,31 @@ class GenerateRetentionManagerCommission extends Command
             'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['argb' => 'FF17853B']],
             'borders' => ['allBorders' => ['borderStyle' => Border::BORDER_THIN]],
         ]);
+    }
+
+    /**
+     * Thin borders over a whole range. Jacob, 2026-09-03: "data sheet add borders" — previously
+     * only the header row was bordered on these workbooks.
+     */
+    private function tableBorders(\PhpOffice\PhpSpreadsheet\Worksheet\Worksheet $sheet, string $range): void
+    {
+        $sheet->getStyle($range)->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
+        $sheet->getStyle($range)->getFont()->setName('Calibri')->setSize(9);
+    }
+
+    /**
+     * The worksheet name for a manager report — the report title on its own, without the person's
+     * name. Jacob, 2026-09-03: "Sheet names change to the title like NSF Team Leader."
+     * Excel caps sheet names at 31 characters; all three are comfortably inside that.
+     */
+    private function managerSheetTitle(string $key): string
+    {
+        return match ($key) {
+            'rama'    => 'Retention & NSF Manager',
+            'nick'    => 'Retention Team Leader',
+            'anthony' => 'NSF Team Leader',
+            default   => ucfirst($key),
+        };
     }
 
     /** @param array<int,array<string,mixed>> $rows */
