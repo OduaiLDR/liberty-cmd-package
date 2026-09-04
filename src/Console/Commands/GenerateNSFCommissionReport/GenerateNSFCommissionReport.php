@@ -138,8 +138,11 @@ class GenerateNSFCommissionReport extends Command
             $this->info("[INFO] [$display] Workbook: {$allFile['filename']}");
 
             // Per-agent workbooks: same two sheets, filtered to that agent's data.
+            // Iterate the RESOLVED roster, not $cfg['agents'] — the commission rows above are
+            // built from $agents, so looping the built-in list here gave anyone who is on the
+            // roster but not hard-coded a commission line with no workbook and no email.
             $files = [$allFile];
-            foreach ($cfg['agents'] as $agentName) {
+            foreach ($agents as $agentName) {
                 $agentDataRows = array_values(array_filter(
                     $dataRows,
                     fn (array $r): bool => strtoupper((string) ($r['AGENT'] ?? '')) === strtoupper($agentName)
