@@ -1136,7 +1136,7 @@ class GenerateRetentionManagerCommission extends Command
         $sheet->setTitle($this->managerSheetTitle('anthony'));
         $sheet->setShowGridlines(false);
 
-        $sheet->fromArray([['NGO', 'Assignments', 'Actions', 'Ratio', 'Clears']], null, 'A1');
+        $sheet->fromArray([['NGO', 'Assignments', 'Actions', 'Ratio', 'Clears']], null, 'A1', true);
         $this->headerStyle($sheet, 'A1:E1');
 
         // One row per roster member, in roster order, with no padding.
@@ -1215,11 +1215,14 @@ class GenerateRetentionManagerCommission extends Command
 
         $comm->setCellValue('A1', 'Commission Tiers');
         $comm->getStyle('A1')->getFont()->setBold(true);
-        $comm->fromArray([['Clears \\ Action ratio', 0.40, 0.55, 0.65]], null, 'A2');
-        $comm->fromArray([[200, 0.0, 0.07, 0.40]], null, 'A3');
-        $comm->fromArray([[300, 0.0, 0.10, 0.50]], null, 'A4');
-        $comm->fromArray([[500, 0.0, 0.30, 0.70]], null, 'A5');
+        $comm->fromArray([['Clears \\ Action ratio', 0.40, 0.55, 0.65]], null, 'A2', true);
+        $comm->fromArray([[200, 0.0, 0.07, 0.40]], null, 'A3', true);
+        $comm->fromArray([[300, 0.0, 0.10, 0.50]], null, 'A4', true);
+        $comm->fromArray([[500, 0.0, 0.30, 0.70]], null, 'A5', true);
         $this->headerStyle($comm, 'A2:D2');
+        // The header carries the ratio thresholds themselves, so format them as percentages too —
+        // otherwise the column headings read 0.4 / 0.55 / 0.65 above a body of percentages.
+        $comm->getStyle('B2:D2')->getNumberFormat()->setFormatCode('0%');
         $comm->getStyle('B3:D5')->getNumberFormat()->setFormatCode('0.00%');
         $comm->getStyle('A3:A5')->getNumberFormat()->setFormatCode('#,##0');
         $this->tableBorders($comm, 'A2:D5');
@@ -1233,7 +1236,7 @@ class GenerateRetentionManagerCommission extends Command
             ['Clears', $clearsTotal],
             ['Rate', $rate],
             ['Commission', $commission],
-        ], null, 'A8');
+        ], null, 'A8', true);
         $comm->getStyle('B8:B9')->getNumberFormat()->setFormatCode('#,##0');
         $comm->getStyle('B10')->getNumberFormat()->setFormatCode('0.00%');
         $comm->getStyle('B11')->getNumberFormat()->setFormatCode('#,##0');
@@ -1421,27 +1424,27 @@ class GenerateRetentionManagerCommission extends Command
         $sheet->setCellValue('A1', 'Retention & NSF Manager — Commission');
         $sheet->getStyle('A1')->getFont()->setBold(true)->setSize(12);
 
-        $sheet->fromArray([['Retention', '']], null, 'A3');
+        $sheet->fromArray([['Retention', '']], null, 'A3', true);
         $this->headerStyle($sheet, 'A3:B3');
         $sheet->fromArray([
             ['Reconsideration Pending', $all['assigned']],
             ['Retained', $all['retained']],
             ['Rate', $all['pct']],
             ['Commission 1', $c1],
-        ], null, 'A4');
+        ], null, 'A4', true);
         $sheet->getStyle('B4:B5')->getNumberFormat()->setFormatCode('#,##0');
         $sheet->getStyle('B6')->getNumberFormat()->setFormatCode('0.00%');
         $sheet->getStyle('B7')->getNumberFormat()->setFormatCode('$#,##0.00');
         $this->tableBorders($sheet, 'A3:B7');
 
-        $sheet->fromArray([['Bonus (NGF)', '']], null, 'A9');
+        $sheet->fromArray([['Bonus (NGF)', '']], null, 'A9', true);
         $this->headerStyle($sheet, 'A9:B9');
         $sheet->fromArray([
             ['Bonus Reconsideration', $ngf['assigned']],
             ['Bonus Retained', $ngf['retained']],
             ['Rate', $ngf['pct']],
             ['Commission 2', $c2],
-        ], null, 'A10');
+        ], null, 'A10', true);
         $sheet->getStyle('B10:B11')->getNumberFormat()->setFormatCode('#,##0');
         $sheet->getStyle('B12')->getNumberFormat()->setFormatCode('0.00%');
         $sheet->getStyle('B13')->getNumberFormat()->setFormatCode('$#,##0.00');
@@ -1471,7 +1474,7 @@ class GenerateRetentionManagerCommission extends Command
         $sheet->setCellValue('A1', 'Retention Team Leader — Commission');
         $sheet->getStyle('A1')->getFont()->setBold(true)->setSize(12);
 
-        $sheet->fromArray([['Summary', '']], null, 'A3');
+        $sheet->fromArray([['Summary', '']], null, 'A3', true);
         $this->headerStyle($sheet, 'A3:B3');
         $sheet->fromArray([
             ['Reconsideration Pending', $assigned],
@@ -1479,7 +1482,7 @@ class GenerateRetentionManagerCommission extends Command
             ['Rate', $pct],
             ['Tier', $tier],
             ['Commission', $commission],
-        ], null, 'A4');
+        ], null, 'A4', true);
         $sheet->getStyle('B4:B5')->getNumberFormat()->setFormatCode('#,##0');
         $sheet->getStyle('B6')->getNumberFormat()->setFormatCode('0.00%');
         $sheet->getStyle('B7')->getNumberFormat()->setFormatCode('0');
@@ -1491,14 +1494,14 @@ class GenerateRetentionManagerCommission extends Command
         // The per-debt-bracket rates that apply at the tier reached above.
         $sheet->setCellValue('A10', "Rates at tier {$tier}");
         $sheet->getStyle('A10')->getFont()->setBold(true);
-        $sheet->fromArray([['Rate 1', 'Rate 2', 'Rate 3', 'Rate 4']], null, 'A11');
+        $sheet->fromArray([['Rate 1', 'Rate 2', 'Rate 3', 'Rate 4']], null, 'A11', true);
         $this->headerStyle($sheet, 'A11:D11');
         $sheet->fromArray([[
             $this->nickRateForTier($tier, 0),
             $this->nickRateForTier($tier, 1),
             $this->nickRateForTier($tier, 2),
             $this->nickRateForTier($tier, 3),
-        ]], null, 'A12');
+        ]], null, 'A12', true);
         $sheet->getStyle('A12:D12')->getNumberFormat()->setFormatCode('$#,##0.00');
         $this->tableBorders($sheet, 'A11:D12');
 
