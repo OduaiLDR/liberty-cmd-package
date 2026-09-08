@@ -1171,11 +1171,28 @@ class GenerateRetentionManagerCommission extends Command
 
         $lastDataRow = $r - 1;
         $totalRow = $r;
+
+        // Literal totals, not =SUM() formulas. A formula anywhere on this sheet makes the Xlsx
+        // writer emit the formula cell as the selected range, so the file opened with the whole
+        // table highlighted on E{$totalRow} — exactly what Jacob asked us to stop doing, and it
+        // survived even with pre-calculation disabled. The figures are already computed in PHP
+        // below, and a payroll sheet is better off showing the number that was actually paid than
+        // one Excel recalculates later.
+        $sumCol = static function (string $col) use ($sheet, $lastDataRow): float {
+            $total = 0.0;
+            for ($row = 2; $row <= $lastDataRow; $row++) {
+                $total += (float) $sheet->getCell($col . $row)->getValue();
+            }
+            return $total;
+        };
+        $bTotal = $sumCol('B');
+        $cTotal = $sumCol('C');
+
         $sheet->setCellValue("A{$totalRow}", 'Total');
-        $sheet->setCellValue("B{$totalRow}", "=SUM(B2:B{$lastDataRow})");
-        $sheet->setCellValue("C{$totalRow}", "=SUM(C2:C{$lastDataRow})");
-        $sheet->setCellValue("D{$totalRow}", "=IF(B{$totalRow}=0,0,C{$totalRow}/B{$totalRow})");
-        $sheet->setCellValue("E{$totalRow}", "=SUM(E2:E{$lastDataRow})");
+        $sheet->setCellValue("B{$totalRow}", $bTotal);
+        $sheet->setCellValue("C{$totalRow}", $cTotal);
+        $sheet->setCellValue("D{$totalRow}", $bTotal > 0 ? $cTotal / $bTotal : 0);
+        $sheet->setCellValue("E{$totalRow}", $sumCol('E'));
         $sheet->getStyle("A{$totalRow}:E{$totalRow}")->getFont()->setBold(true);
 
         $rosterKeys = [];
@@ -1271,6 +1288,7 @@ class GenerateRetentionManagerCommission extends Command
         // Jacob, 2026-09-04: "Remove Anthony from the filename."
         $filename = $this->managerSheetTitle('anthony') . '.xlsx';
         $path = $folder . DIRECTORY_SEPARATOR . $filename;
+
         (new Xlsx($sp))->save($path);
 
         return ['filename' => $filename, 'path' => $path];
