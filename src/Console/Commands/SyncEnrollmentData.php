@@ -303,19 +303,12 @@ class SyncEnrollmentData extends Command
             if (isset($paymentsMap[$contactId])) {
                 $rawPaymentCount = $paymentsMap[$contactId];
                 
-                // Adjust payment count based on Payment_Frequency
-                // Note: Check Bi-Weekly/Semi-Monthly BEFORE Weekly to avoid substring matching issue
-                if (stripos($paymentFrequency, 'Bi-Weekly') !== false || stripos($paymentFrequency, 'Semi-Monthly') !== false) {
-                    $adjustedPaymentCount = (int) round($rawPaymentCount / 2);
-                } elseif (stripos($paymentFrequency, 'Weekly') !== false) {
-                    $adjustedPaymentCount = (int) round($rawPaymentCount / 4);
-                } else {
-                    $adjustedPaymentCount = $rawPaymentCount;
-                }
+                // Store actual count of cleared payments
+                $paymentCount = (int) $rawPaymentCount;
 
                 // Only add to updates if different
-                if ((int) $currentPayments !== $adjustedPaymentCount) {
-                    $updates[$llgId] = $adjustedPaymentCount;
+                if ((int) $currentPayments !== $paymentCount) {
+                    $updates[$llgId] = $paymentCount;
                 }
             }
         }
