@@ -567,7 +567,8 @@ class GenerateRetentionCommissionReport extends Command
 
             // ── Sheet 1: Retention Commission Report
             $sheet1 = $sp->getActiveSheet();
-            $sheet1->setTitle('Retention Commission Report');
+            // Jacob, 2026-09-04: "Retention Commission Report = Retention Data".
+            $sheet1->setTitle('Retention Data');
             $sheet1->setShowGridlines(false);
 
             $hasT4 = (bool) ($cfg['has_t4'] ?? false);
@@ -575,10 +576,11 @@ class GenerateRetentionCommissionReport extends Command
                 'ID', 'Client', 'Retention Agent', 'Retention Date', 'Immediate Results',
                 'Enrolled Debt', 'Cleared Payments', 'Reconsideration Date', 'Dropped Date',
                 'Retained Date', 'Retention Payment Date',
-                'Retention Commission T1', 'Retention Commission T2', 'Retention Commission T3',
+                // Jacob, 2026-09-04: "L:O: Change headers to T1 Rate and T2 Rate."
+                'T1 Rate', 'T2 Rate', 'T3 Rate',
             ];
             if ($hasT4) {
-                $headers1[] = 'Retention Commission T4';
+                $headers1[] = 'T4 Rate';
             }
             $headers1[] = 'Cancel Request Date';
             $lastDataCol = $hasT4 ? 'P' : 'O';
@@ -616,12 +618,12 @@ class GenerateRetentionCommissionReport extends Command
             }
 
             $last1 = max($r - 1, 1);
-            // Date-only fields (VBA formats D,H,I). Cancel/payment keep datetime for period math.
-            foreach (['D', 'H', 'I', 'J'] as $c) {
+            // Every date column is date-only. K (Retention Payment Date) and the cancel column used
+            // to carry "mm/dd/yyyy hh:mm:ss" — Jacob, 2026-09-04: "K: Date format only; no time…
+            // P: Date format only; no time." The underlying values are untouched, so any period
+            // arithmetic that relied on the time part still works; only the display changes.
+            foreach (['D', 'H', 'I', 'J', 'K', $cancelCol] as $c) {
                 $sheet1->getStyle("{$c}2:{$c}{$last1}")->getNumberFormat()->setFormatCode('mm/dd/yyyy');
-            }
-            foreach (['K', $cancelCol] as $c) {
-                $sheet1->getStyle("{$c}2:{$c}{$last1}")->getNumberFormat()->setFormatCode('mm/dd/yyyy hh:mm:ss');
             }
             $sheet1->getStyle("F2:F{$last1}")->getNumberFormat()->setFormatCode('$#,##0');
             $tierRange = $hasT4 ? "L2:O{$last1}" : "L2:N{$last1}";
@@ -629,9 +631,9 @@ class GenerateRetentionCommissionReport extends Command
             if ($last1 > 1) {
                 $sheet1->getStyle("A1:{$lastDataCol}{$last1}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
             }
-            foreach (range('A', $lastDataCol) as $c) {
-                $sheet1->getColumnDimension($c)->setAutoSize(true);
-            }
+            // Jacob, 2026-09-04: widths 17, except B (Client), C (Retention Agent) and
+            // E (Immediate Results) at 28.
+            $this->applyColumnWidths($sheet1, 'A', $lastDataCol, ['B', 'C', 'E']);
             $sheet1->getStyle("A1:{$lastDataCol}{$last1}")->getFont()->setName('Calibri')->setSize(9);
             $sheet1->freezePane('A2');
             $sheet1->setSelectedCells('A1');
@@ -703,21 +705,44 @@ class GenerateRetentionCommissionReport extends Command
                 // flagged on the report whose company they disagree with — that is where Jacob's
                 // own examples live (Katherine Caceres, Lucas Wright). Judging it against the
                 // agent's own roster source was tried on 2026-09-04 and reverted: it silenced them.
-                if ($brand !== '' && CommissionCompanyMatch::mismatches($brand, $company)) {
-                    // Jacob: "Add a red highlight if the company does not match."
-                    $sheet2->getStyle("A$row:H$row")->getFill()
-                        ->setFillType(Fill::FILL_SOLID)->getStartColor()->setARGB('FFFF0000');
-                    $sheet2->getStyle("A$row:H$row")->getFont()->getColor()->setARGB('FFFFFFFF');
-                    $sheet2->getStyle("A$row:H$row")->getFont()->setBold(true);
-                } elseif ($company === '' || $location === '') {
-                    // Without a company they cannot appear on the Commission Review page.
-                    $sheet2->getStyle("A$row:H$row")->getFill()
-                        ->setFillType(Fill::FILL_SOLID)->getStartColor()->setARGB('FFFFC7CE');
-                    $sheet2->getStyle("A$row:H$row")->getFont()->getColor()->setARGB('FF9C0006');
+                // Only the offending CELL is highlighted, not the whole row — Jacob, 2026-09-04:
+                // "only the blank cells should be highlighted… If a company is incorrect, that cell
+                // should be red." G = Location, H = Company.
+                $paint = static function (string $cell, string $fill, string $font, bool $bold = false) use ($sheet2): void {
+                    $sheet2->getStyle($cell)->getFill()
+                        ->setFillType(Fill::FILL_SOLID)->getStartColor()->setARGB($fill);
+                    $sheet2->getStyle($cell)->getFont()->getColor()->setARGB($font);
+                    if ($bold) {
+                        $sheet2->getStyle($cell)->getFont()->setBold(true);
+                    }
+                };
+
+                if ($location === '') {
+                    $paint("G$row", 'FFFFC7CE', 'FF9C0006');
+                }
+                if ($company === '') {
+                    $paint("H$row", 'FFFFC7CE', 'FF9C0006');
+                } elseif ($brand !== '' && CommissionCompanyMatch::mismatches($brand, $company)) {
+                    $paint("H$row", 'FFFF0000', 'FFFFFFFF', true);
                 }
 
                 return $row + 1;
             };
+
+            // Location, Company, Agent — the same order the sheet and the email use everywhere
+            // else (Jacob, 2026-09-04). Blank location/company sorts last so the rows that need
+            // attention group together at the end rather than heading the sheet.
+            $sortSummary = static function (array $set): array {
+                uksort($set, static function ($a, $b) use ($set): int {
+                    $rank = static fn (string $v): array => [$v === '' ? 1 : 0, strtolower($v)];
+                    $ka = [...$rank(trim((string) ($set[$a]['location'] ?? ''))), ...$rank(trim((string) ($set[$a]['company'] ?? ''))), strtolower((string) $a)];
+                    $kb = [...$rank(trim((string) ($set[$b]['location'] ?? ''))), ...$rank(trim((string) ($set[$b]['company'] ?? ''))), strtolower((string) $b)];
+                    return $ka <=> $kb;
+                });
+                return $set;
+            };
+            $paid = $sortSummary($paid);
+            $unassignedRows = $sortSummary($unassignedRows);
 
             $r2 = 2;
             foreach ($paid as $agentName => $sum) {
@@ -725,10 +750,10 @@ class GenerateRetentionCommissionReport extends Command
             }
             if ($unassignedRows !== []) {
                 $r2++;
+                // Merged header, no sub-caption (Jacob, 2026-09-04).
                 $sheet2->setCellValue("A$r2", 'Unassigned Agents');
+                $sheet2->mergeCells("A$r2:H$r2");
                 $sheet2->getStyle("A$r2")->getFont()->setBold(true);
-                $sheet2->setCellValue("B$r2", 'Not on the retention roster');
-                $sheet2->getStyle("B$r2")->getFont()->getColor()->setARGB('FF9C0006');
                 $r2++;
                 foreach ($unassignedRows as $agentName => $sum) {
                     $r2 = $writeSummaryRow($agentName, $sum, $r2);
@@ -741,9 +766,8 @@ class GenerateRetentionCommissionReport extends Command
             if ($last2 > 1) {
                 $sheet2->getStyle("A1:H{$last2}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
             }
-            foreach (range('A', 'H') as $c) {
-                $sheet2->getColumnDimension($c)->setAutoSize(true);
-            }
+            // A = Retention Agent, so it takes the wide setting like the other name columns.
+            $this->applyColumnWidths($sheet2, 'A', 'H', ['A']);
             $sheet2->getStyle("A1:H{$last2}")->getFont()->setName('Calibri')->setSize(9);
             $sheet2->freezePane('A2');
             $sheet2->setSelectedCells('A1');
@@ -1175,6 +1199,23 @@ class GenerateRetentionCommissionReport extends Command
         }
         $ts = strtotime((string) $value);
         return $ts === false ? null : date('Y-m-d', $ts);
+    }
+
+    /**
+     * Consistent column widths. Jacob, 2026-09-04: "Make columns the same width: 17, except B, C,
+     * and E, which should be 28."
+     *
+     * @param array<int,string> $wideColumns
+     */
+    private function applyColumnWidths(
+        \PhpOffice\PhpSpreadsheet\Worksheet\Worksheet $sheet,
+        string $firstCol,
+        string $lastCol,
+        array $wideColumns = []
+    ): void {
+        foreach (range($firstCol, $lastCol) as $col) {
+            $sheet->getColumnDimension($col)->setWidth(in_array($col, $wideColumns, true) ? 28 : 17);
+        }
     }
 
     private function headerStyle(\PhpOffice\PhpSpreadsheet\Worksheet\Worksheet $sheet, string $range): void

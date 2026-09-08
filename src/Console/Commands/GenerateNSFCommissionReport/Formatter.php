@@ -2,6 +2,7 @@
 
 namespace Cmd\Reports\Console\Commands\GenerateNSFCommissionReport;
 
+use Cmd\Reports\Services\CommissionCompanyMatch;
 use PhpOffice\PhpSpreadsheet\Cell\DataType;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Style\Alignment;
@@ -29,7 +30,9 @@ class Formatter
         string $source,
         string $startDate,
         string $endDate,
-        ?string $agentFilter = null
+        ?string $agentFilter = null,
+        string $sourceCode = '',
+        array $unassigned = []
     ): array {
         $spreadsheet = new Spreadsheet();
 
@@ -42,7 +45,7 @@ class Formatter
         $commSheet = $spreadsheet->getSheet(1);
         $commSheet->setTitle('Agent Summary');
         $commSheet->setShowGridlines(false);
-        $this->buildCommissionSheet($commSheet, $commissionRows);
+        $this->buildCommissionSheet($commSheet, $commissionRows, $sourceCode, $unassigned);
 
         $spreadsheet->setActiveSheetIndex(0);
 
@@ -89,7 +92,8 @@ class Formatter
         $s->getStyle("F2:F{$last}")->getNumberFormat()->setFormatCode(self::DATE_FORMAT);
         $this->applyBorders($s, "A1:G{$last}");
         $this->applyFont($s, "A1:G{$last}");
-        $this->autoWidths($s, 7);
+        // Widths 17, with Agent (B) and NSF Action (D) at 28 (Jacob, 2026-09-04).
+        $this->applyColumnWidths($s, 'A', 'G', ['B', 'D']);
         $s->freezePane('A2');
         $s->setSelectedCells('A1');
     }
@@ -98,14 +102,18 @@ class Formatter
     // Commission sheet — mirrors VBA Commission sheet layout
     // ─────────────────────────────────────────────────────────────────────────
 
-    private function buildCommissionSheet(Worksheet $s, array $rows): void
+    private function buildCommissionSheet(Worksheet $s, array $rows, string $sourceCode = '', array $unassigned = []): void
     {
-        // Main table headers A1:K1
-        $headers = ['NGO', 'Assignments', 'Actions', 'Ratio', 'Actions Tier', 'Cleared Tier', 'Rate', 'Clears', 'Commission', 'Location', 'Company'];
+        // Main table headers A1:K1. Jacob, 2026-09-04: "A1: NSF Agent" — it read "NGO".
+        $headers = ['NSF Agent', 'Assignments', 'Actions', 'Ratio', 'Actions Tier', 'Cleared Tier', 'Rate', 'Clears', 'Commission', 'Location', 'Company'];
         foreach ($headers as $i => $h) {
             $s->setCellValueByColumnAndRow($i + 1, 1, $h);
         }
         $this->styleHeader($s, 'A1:K1');
+
+        // Location, Company, Agent — the same order the other two reports use. Jacob: "Check the
+        // sorting order… Progress Law appears to be sorting by Agent instead."
+        $rows = self::sortByLocationCompanyAgent($rows);
 
         $r = 2;
         foreach ($rows as $row) {
@@ -121,16 +129,36 @@ class Formatter
             $s->setCellValue("J$r", $row['location'] ?? '');
             $s->setCellValue("K$r", $row['company']  ?? '');
 
-            // Call out agents with no company or location: an agent with no company cannot be shown
-            // on the Commission Review page (which is separated per company), so these need fixing
-            // in the employee directory or they drop off payroll review entirely.
-            if (trim((string) ($row['company'] ?? '')) === '' || trim((string) ($row['location'] ?? '')) === '') {
-                $s->getStyle("A$r:K$r")->getFill()
-                    ->setFillType(Fill::FILL_SOLID)
-                    ->getStartColor()->setARGB('FFFFC7CE');       // light red
-                $s->getStyle("A$r:K$r")->getFont()->getColor()->setARGB('FF9C0006');
+            // Only the offending CELL is highlighted, not the whole row (Jacob, 2026-09-04).
+            // J = Location, K = Company. A company that contradicts this report goes red —
+            // "LDR: There is one listed as Progress Law; this should be red."
+            $company  = trim((string) ($row['company'] ?? ''));
+            $location = trim((string) ($row['location'] ?? ''));
+            if ($location === '') {
+                $this->fillCell($s, "J$r", 'FFFFC7CE', 'FF9C0006');
+            }
+            if ($company === '') {
+                $this->fillCell($s, "K$r", 'FFFFC7CE', 'FF9C0006');
+            } elseif ($sourceCode !== '' && CommissionCompanyMatch::mismatches($sourceCode, $company)) {
+                $this->fillCell($s, "K$r", 'FFFF0000', 'FFFFFFFF', true);
             }
             $r++;
+        }
+
+        // Anyone with commission this period who is not on the roster, listed the way Retention
+        // Bonus does it (Jacob: "Missing agents should be listed like they are in the above
+        // report, if there are any").
+        if ($unassigned !== []) {
+            $r++;
+            $s->setCellValue("A$r", 'Unassigned Agents');
+            $s->mergeCells("A$r:K$r");
+            $s->getStyle("A$r")->getFont()->setBold(true);
+            $r++;
+            foreach ($unassigned as $entry) {
+                $s->setCellValue("A$r", $entry['agent']);
+                $s->setCellValue("I$r", $entry['amount']);
+                $r++;
+            }
         }
 
         $last = max(2, $r - 1);
@@ -144,8 +172,54 @@ class Formatter
         // Commission tier reference table (columns M–P)
         $this->buildTierTable($s);
 
-        $this->autoWidths($s, 16);
+        // A = NSF Agent, so it takes the wide setting like the name columns elsewhere.
+        $this->applyColumnWidths($s, 'A', 'K', ['A']);
         $s->setSelectedCells('A1');
+    }
+
+    /** Fill and colour a single cell — the highlight granularity Jacob asked for. */
+    private function fillCell(Worksheet $s, string $cell, string $fill, string $font, bool $bold = false): void
+    {
+        $s->getStyle($cell)->getFill()->setFillType(Fill::FILL_SOLID)->getStartColor()->setARGB($fill);
+        $s->getStyle($cell)->getFont()->getColor()->setARGB($font);
+        if ($bold) {
+            $s->getStyle($cell)->getFont()->setBold(true);
+        }
+    }
+
+    /**
+     * Consistent widths: 17, with named text columns at 28 (Jacob, 2026-09-04).
+     *
+     * @param array<int,string> $wideColumns
+     */
+    private function applyColumnWidths(Worksheet $s, string $firstCol, string $lastCol, array $wideColumns = []): void
+    {
+        foreach (range($firstCol, $lastCol) as $col) {
+            $s->getColumnDimension($col)->setWidth(in_array($col, $wideColumns, true) ? 28 : 17);
+        }
+    }
+
+    /**
+     * Location, then Company, then Agent — blanks last so the rows needing attention group at the
+     * end rather than heading the sheet.
+     *
+     * @param array<int,array<string,mixed>> $rows
+     * @return array<int,array<string,mixed>>
+     */
+    private static function sortByLocationCompanyAgent(array $rows): array
+    {
+        usort($rows, static function (array $a, array $b): int {
+            $rank = static fn (string $v): array => [$v === '' ? 1 : 0, strtolower($v)];
+            $key  = static fn (array $row): array => [
+                ...$rank(trim((string) ($row['location'] ?? ''))),
+                ...$rank(trim((string) ($row['company'] ?? ''))),
+                strtolower((string) ($row['agent'] ?? '')),
+            ];
+
+            return $key($a) <=> $key($b);
+        });
+
+        return $rows;
     }
 
     /**
@@ -165,13 +239,14 @@ class Formatter
         $s->getStyle('M1')->getAlignment()->setHorizontal(Alignment::HORIZONTAL_CENTER);
         $s->getStyle('M1')->getFont()->setBold(true);
 
-        $s->setCellValue('M2', '');
+        // Jacob, 2026-09-04: "On the rate table, only M2 should be gray." The ratio headings in
+        // N2:P2 used to carry the same grey fill, which read as though the whole row were a header.
+        $s->setCellValue('M2', 'Clears');
         $s->getStyle('M2')->getFill()->setFillType(Fill::FILL_SOLID)->getStartColor()->setARGB(self::TIER_FILL);
         $ratios = [0.2, 0.4, 0.6];
         foreach ($ratios as $i => $v) {
             $col = chr(78 + $i); // N, O, P
             $s->setCellValue("{$col}2", $v);
-            $s->getStyle("{$col}2")->getFill()->setFillType(Fill::FILL_SOLID)->getStartColor()->setARGB(self::TIER_FILL);
             $s->getStyle("{$col}2")->getNumberFormat()->setFormatCode(self::PCT_FORMAT);
         }
 

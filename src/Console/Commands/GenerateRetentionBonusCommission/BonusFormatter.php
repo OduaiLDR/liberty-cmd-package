@@ -38,6 +38,25 @@ class BonusFormatter
     }
 
     /**
+     * The one sort order for everything this report emits — the summary sheet, the unassigned
+     * block, and the email body. Jacob, 2026-09-04: "sort by Location, Company, Agent… The email
+     * body should follow the same sorting order."
+     *
+     * Blank location or company sorts last rather than first: those rows are the ones needing
+     * attention and they read better grouped at the end than heading the sheet.
+     *
+     * @param array{name:string,location:string,company:string} $a
+     * @param array{name:string,location:string,company:string} $b
+     */
+    public static function compareSummaryRows(array $a, array $b): int
+    {
+        $rank = static fn (string $v): array => [$v === '' ? 1 : 0, strtolower($v)];
+
+        return [...$rank((string) $a['location']), ...$rank((string) $a['company']), strtolower((string) $a['name'])]
+           <=> [...$rank((string) $b['location']), ...$rank((string) $b['company']), strtolower((string) $b['name'])];
+    }
+
+    /**
      * Write one Agent Summary row and apply whichever highlight it earns.
      *
      * @param array{name:string,commission:float,location:string,company:string} $entry
@@ -53,28 +72,48 @@ class BonusFormatter
         $company  = trim((string) $entry['company']);
         $location = trim((string) $entry['location']);
 
-        // Judged against THIS REPORT's brand, so an agent rostered to "both" is still flagged on
-        // the report their company disagrees with. Judging it against the agent's own roster source
-        // was tried and reverted — it hid Jacob's own examples.
-        if ($sourceCode !== '' && CommissionCompanyMatch::mismatches($sourceCode, $company)) {
-            // Jacob: "If you are in Progress Law and the company is Liberty or vise versa then flag
-            // that red." Checked before the blank rule — a mismatch is the more serious finding,
-            // and a mismatching company is by definition not blank.
-            $summary->getStyle("A{$sr}:D{$sr}")->getFill()
-                ->setFillType(Fill::FILL_SOLID)
-                ->getStartColor()->setARGB(self::MISMATCH_FILL);
-            $summary->getStyle("A{$sr}:D{$sr}")->getFont()->getColor()->setARGB(self::MISMATCH_FONT);
-            $summary->getStyle("A{$sr}:D{$sr}")->getFont()->setBold(true);
-        } elseif ($company === '' || $location === '') {
-            // Call out agents with no company or location — without a company they cannot appear
-            // on the Commission Review page (which is separated per company).
-            $summary->getStyle("A{$sr}:D{$sr}")->getFill()
-                ->setFillType(Fill::FILL_SOLID)
-                ->getStartColor()->setARGB(self::BLANK_FILL);
-            $summary->getStyle("A{$sr}:D{$sr}")->getFont()->getColor()->setARGB(self::BLANK_FONT);
+        // Jacob, 2026-09-04: "only the blank cells should be highlighted… If a company is
+        // incorrect, that cell should be red." The whole A:D row used to be filled, which made one
+        // missing field look like the entire row was wrong.
+        //
+        // Location (C) can only be blank-flagged. Company (D) can be blank OR contradict the report.
+        if ($location === '') {
+            $this->fillCell($summary, "C{$sr}", self::BLANK_FILL, self::BLANK_FONT);
+        }
+        if ($company === '') {
+            $this->fillCell($summary, "D{$sr}", self::BLANK_FILL, self::BLANK_FONT);
+        } elseif ($sourceCode !== '' && CommissionCompanyMatch::mismatches($sourceCode, $company)) {
+            // Judged against THIS REPORT's brand, so an agent rostered to "both" is still flagged
+            // on the report their company disagrees with.
+            $this->fillCell($summary, "D{$sr}", self::MISMATCH_FILL, self::MISMATCH_FONT, true);
         }
 
         return $sr + 1;
+    }
+
+    /** Fill and colour a single cell — the highlight granularity Jacob asked for. */
+    private function fillCell(Worksheet $sheet, string $cell, string $fill, string $font, bool $bold = false): void
+    {
+        $sheet->getStyle($cell)->getFill()
+            ->setFillType(Fill::FILL_SOLID)
+            ->getStartColor()->setARGB($fill);
+        $sheet->getStyle($cell)->getFont()->getColor()->setARGB($font);
+        if ($bold) {
+            $sheet->getStyle($cell)->getFont()->setBold(true);
+        }
+    }
+
+    /**
+     * Consistent column widths. Jacob, 2026-09-04: "Make the columns a consistent width of 17,
+     * except for Client and Agent, which should be 28."
+     *
+     * @param array<int,string> $wideColumns
+     */
+    private function applyColumnWidths(Worksheet $sheet, string $firstCol, string $lastCol, array $wideColumns = []): void
+    {
+        foreach (range($firstCol, $lastCol) as $col) {
+            $sheet->getColumnDimension($col)->setWidth(in_array($col, $wideColumns, true) ? 28 : 17);
+        }
     }
 
     /**
@@ -165,9 +204,9 @@ class BonusFormatter
             if ($last > 1) {
                 $sheet->getStyle("A1:Q{$last}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
             }
-            foreach (range('A', 'Q') as $c) {
-                $sheet->getColumnDimension($c)->setAutoSize(true);
-            }
+            // Jacob, 2026-09-04: consistent width 17, with Client (B), Retention Agent (C) and
+            // Agent (M) at 28 — auto-size gave every report a different shape.
+            $this->applyColumnWidths($sheet, 'A', 'Q', ['B', 'C', 'M']);
             $sheet->getStyle("A1:Q{$last}")->getFont()->setName('Calibri')->setSize(9);
             $sheet->freezePane('A2');
             $sheet->setSelectedCells('A1');
@@ -232,10 +271,7 @@ class BonusFormatter
             foreach ($summaryNames as $key => $name) {
                 $summaryRows[] = $buildRow($key, $name);
             }
-            usort(
-                $summaryRows,
-                fn ($a, $b) => [$a['location'], $a['company'], $a['name']] <=> [$b['location'], $b['company'], $b['name']]
-            );
+            usort($summaryRows, [self::class, 'compareSummaryRows']);
 
             $sr = 2;
             foreach ($summaryRows as $entry) {
@@ -248,16 +284,24 @@ class BonusFormatter
             // into the email body.
             if ($unassigned !== []) {
                 $sr++;
+                // Jacob, 2026-09-04: "Unassigned Agents: Merge header A:D. Remove 'Not on the
+                // retention roster.'"
                 $summary->setCellValue("A{$sr}", 'Unassigned Agents');
+                $summary->mergeCells("A{$sr}:D{$sr}");
                 $summary->getStyle("A{$sr}")->getFont()->setBold(true);
-                $summary->setCellValue("B{$sr}", 'Not on the retention roster');
-                $summary->getStyle("B{$sr}")->getFont()->getColor()->setARGB('FF9C0006');
                 $sr++;
-                foreach ($unassigned as $entry) {
+                // Same order as the paid block — Jacob: "Unassigned Agents are not currently
+                // sorting by Company."
+                $unassignedRows = array_map(
+                    fn ($entry) => $buildRow(self::nameKey((string) $entry['agent']), (string) $entry['agent']),
+                    $unassigned
+                );
+                usort($unassignedRows, [self::class, 'compareSummaryRows']);
+                foreach ($unassignedRows as $entry) {
                     $sr = $this->writeSummaryRow(
                         $summary,
                         $sr,
-                        $buildRow(self::nameKey((string) $entry['agent']), (string) $entry['agent']),
+                        $entry,
                         ''   // already called out as unassigned; a second red flag adds nothing
                     );
                 }
@@ -268,24 +312,12 @@ class BonusFormatter
             if ($lastSr > 1) {
                 $summary->getStyle("A1:D{$lastSr}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
             }
-            foreach (['A', 'B', 'C', 'D'] as $c) {
-                $summary->getColumnDimension($c)->setAutoSize(true);
-            }
+            $this->applyColumnWidths($summary, 'A', 'D', ['A']);
             $summary->getStyle("A1:D{$lastSr}")->getFont()->setName('Calibri')->setSize(9);
 
-            // Legend — two fills that mean different things is only useful if the sheet says which
-            // is which.
-            $legendRow = $lastSr + 2;
-            $summary->setCellValue("A{$legendRow}", 'Company does not match this report');
-            $summary->getStyle("A{$legendRow}")->getFill()
-                ->setFillType(Fill::FILL_SOLID)->getStartColor()->setARGB(self::MISMATCH_FILL);
-            $summary->getStyle("A{$legendRow}")->getFont()->getColor()->setARGB(self::MISMATCH_FONT);
-            $summary->getStyle("A{$legendRow}")->getFont()->setBold(true);
-            $summary->setCellValue("A" . ($legendRow + 1), 'Missing location or company');
-            $summary->getStyle('A' . ($legendRow + 1))->getFill()
-                ->setFillType(Fill::FILL_SOLID)->getStartColor()->setARGB(self::BLANK_FILL);
-            $summary->getStyle('A' . ($legendRow + 1))->getFont()->getColor()->setARGB(self::BLANK_FONT);
-            $summary->getStyle("A{$legendRow}:A" . ($legendRow + 1))->getFont()->setName('Calibri')->setSize(9);
+            // The legend that used to sit here was removed on Jacob's instruction (2026-09-04:
+            // "Remove the legend at the bottom") — the highlighted cell speaks for itself now that
+            // only the offending cell is coloured rather than the whole row.
 
             $summary->freezePane('A2');
             $summary->setSelectedCells('A1');

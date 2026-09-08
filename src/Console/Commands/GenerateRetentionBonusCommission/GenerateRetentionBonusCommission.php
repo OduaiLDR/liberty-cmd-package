@@ -278,7 +278,13 @@ class GenerateRetentionBonusCommission extends Command
                 : array_values(array_unique(array_merge($agentNames, $rosterAgents)));
             $employeeMap = $this->fetchEmployeeMap($sql, $employeeLookupNames);
 
-            $unassigned = $this->unassignedAgents($rows, $rosterAgents);
+            // Jacob, 2026-09-04: "The email body should follow the same sorting order" —
+            // Location, Company, Agent. Attach each earner's location/company so the shared
+            // comparator can order them exactly as the sheet does.
+            $unassigned = $this->sortByLocationCompanyAgent(
+                $this->unassignedAgents($rows, $rosterAgents),
+                $employeeMap
+            );
             if ($unassigned !== []) {
                 $this->warn(
                     "[WARN] [$display] " . count($unassigned) . ' agent(s) earned commission this period but are '
@@ -577,6 +583,29 @@ class GenerateRetentionBonusCommission extends Command
     private function unassignedEmailBlock(array $unassigned, bool $rosterUnavailable): string
     {
         return UnassignedCommissionAgents::emailBlock($unassigned, $rosterUnavailable, 'retention roster');
+    }
+
+    /**
+     * Order unassigned earners the way the sheet orders everyone: Location, Company, Agent.
+     * Uses the same comparator as the workbook so the two can never drift apart.
+     *
+     * @param array<int,array{agent:string,amount:float}>          $unassigned
+     * @param array<string,array{location:string,company:string}>  $employeeMap
+     * @return array<int,array{agent:string,amount:float}>
+     */
+    private function sortByLocationCompanyAgent(array $unassigned, array $employeeMap): array
+    {
+        usort($unassigned, function (array $a, array $b) use ($employeeMap): int {
+            $shape = static fn (array $row): array => [
+                'name'     => (string) $row['agent'],
+                'location' => (string) ($employeeMap[strtoupper((string) $row['agent'])]['location'] ?? ''),
+                'company'  => (string) ($employeeMap[strtoupper((string) $row['agent'])]['company'] ?? ''),
+            ];
+
+            return BonusFormatter::compareSummaryRows($shape($a), $shape($b));
+        });
+
+        return $unassigned;
     }
 
     private function fetchEmployeeMap(DBConnector $sql, array $agents): array

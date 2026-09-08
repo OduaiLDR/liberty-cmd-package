@@ -179,7 +179,9 @@ class GenerateNSFCommissionReport extends Command
             );
 
             $formatter = new Formatter();
-            $allFile = $formatter->buildWorkbook($dataRows, $commissionRows, $display, $startDate, $endDate);
+            $allFile = $formatter->buildWorkbook(
+                $dataRows, $commissionRows, $display, $startDate, $endDate, null, $source, $unassigned
+            );
             $this->info("[INFO] [$display] Workbook: {$allFile['filename']}");
 
             // Per-agent workbooks are no longer built, snapshotted or emailed.
