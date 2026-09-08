@@ -638,46 +638,80 @@ class SyncContactsData extends Command
         }
 
         $externalIds = \array_keys($externalIds);
-
-        $connector->querySqlServer("CREATE TABLE #TmpMailerFilter (ExtId VARCHAR(50))");
-        foreach (\array_chunk($externalIds, 1000) as $batch) {
-            $values = \implode(', ', \array_map(
-                fn($id) => "('" . \str_replace("'", "''", \substr($id, 0, 50)) . "')",
-                $batch
-            ));
-            $connector->querySqlServer("INSERT INTO #TmpMailerFilter VALUES {$values}");
-        }
-
-        $result = $connector->querySqlServer("
-            SELECT m.External_ID, m.Drop_Name
-            FROM TblMailers m
-            WHERE m.External_ID IS NOT NULL
-              AND m.Drop_Name IS NOT NULL
-              AND (
-                  m.External_ID IN (SELECT ExtId FROM #TmpMailerFilter)
-                  OR (LEN(m.External_ID) > 9 AND RIGHT(m.External_ID, 9) IN (
-                      SELECT RIGHT(ExtId, 9) FROM #TmpMailerFilter WHERE LEN(ExtId) > 9
-                  ))
-              )
-        ");
-        $connector->querySqlServer("DROP TABLE #TmpMailerFilter");
-
         $lookup = [];
-        foreach ($result['data'] ?? [] as $row) {
-            $externalId = $row['External_ID'] ?? '';
-            $dropName   = $row['Drop_Name'] ?? '';
-            if ($externalId && $dropName) {
-                $lookup[$externalId] = $dropName;
-                if (\strlen($externalId) > 9) {
-                    $last9 = \substr($externalId, -9);
-                    if (!isset($lookup[$last9])) {
-                        $lookup[$last9] = $dropName;
+
+        // Exact Ext match first (index-friendly). Last-9 fallback only for misses —
+        // the old OR RIGHT(...) scan over all TblMailers was ~60s per page.
+        $connector->querySqlServer("CREATE TABLE #TmpMailerFilter (ExtId VARCHAR(50) NOT NULL)");
+        try {
+            foreach (\array_chunk($externalIds, 1000) as $batch) {
+                $values = \implode(', ', \array_map(
+                    fn($id) => "('" . \str_replace("'", "''", \substr($id, 0, 50)) . "')",
+                    $batch
+                ));
+                $connector->querySqlServer("INSERT INTO #TmpMailerFilter (ExtId) VALUES {$values}");
+            }
+
+            $exact = $connector->querySqlServer("
+                SELECT m.External_ID, m.Drop_Name
+                FROM TblMailers m
+                INNER JOIN #TmpMailerFilter f ON m.External_ID = f.ExtId
+                WHERE m.Drop_Name IS NOT NULL
+            ");
+            $this->mergeDropNameLookup($lookup, $exact['data'] ?? []);
+
+            $missTails = [];
+            foreach ($externalIds as $extId) {
+                if (isset($lookup[$extId])) {
+                    continue;
+                }
+                if (\strlen($extId) > 9) {
+                    $tail = \substr($extId, -9);
+                    if (!isset($lookup[$tail])) {
+                        $missTails[$tail] = true;
                     }
                 }
             }
+
+            foreach (\array_chunk(\array_keys($missTails), 500) as $tailBatch) {
+                $inList = \implode(', ', \array_map(
+                    fn($t) => "'" . \str_replace("'", "''", $t) . "'",
+                    $tailBatch
+                ));
+                $fallback = $connector->querySqlServer("
+                    SELECT m.External_ID, m.Drop_Name
+                    FROM TblMailers m
+                    WHERE m.External_ID IS NOT NULL
+                      AND m.Drop_Name IS NOT NULL
+                      AND LEN(m.External_ID) > 9
+                      AND RIGHT(m.External_ID, 9) IN ({$inList})
+                ");
+                $this->mergeDropNameLookup($lookup, $fallback['data'] ?? []);
+            }
+        } finally {
+            $connector->querySqlServer("DROP TABLE IF EXISTS #TmpMailerFilter");
         }
 
         return $lookup;
+    }
+
+    /** @param array<string, string> $lookup */
+    private function mergeDropNameLookup(array &$lookup, array $rows): void
+    {
+        foreach ($rows as $row) {
+            $externalId = (string) ($row['External_ID'] ?? '');
+            $dropName   = (string) ($row['Drop_Name'] ?? '');
+            if ($externalId === '' || $dropName === '') {
+                continue;
+            }
+            $lookup[$externalId] = $dropName;
+            if (\strlen($externalId) > 9) {
+                $last9 = \substr($externalId, -9);
+                if (!isset($lookup[$last9])) {
+                    $lookup[$last9] = $dropName;
+                }
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -1362,7 +1396,7 @@ class SyncContactsData extends Command
             return $this->previewMatching($connector, [$this->targetTable]);
         }
 
-        $this->resetMatchingStats(9);
+        $this->resetMatchingStats(10);
         $this->printMatchingHeader("{$this->source} post-sync matching");
         $this->matchSourceTableToContacts($connector, $this->targetTable);
         $this->fillEnrollmentAgents($connector, (bool) $this->option('reconcile-agents'));
@@ -1376,7 +1410,7 @@ class SyncContactsData extends Command
             return $this->previewMatching($connector, ['TblContactsLDR', 'TblContactsPLAW']);
         }
 
-        $this->resetMatchingStats(15);
+        $this->resetMatchingStats(17);
         $this->printMatchingHeader('orchestrator final matching (External ID → TblContacts → TblEnrollment)');
 
         foreach (['TblContactsLDR', 'TblContactsPLAW'] as $table) {
@@ -1397,7 +1431,7 @@ class SyncContactsData extends Command
     private function previewMatching(DBConnector $connector, array $tables): bool
     {
         // 6 counts per source table + 3 enrollment fix counts + 6 Jacob gap counts
-        $this->resetMatchingStats((\count($tables) * 6) + 3 + 6);
+        $this->resetMatchingStats((\count($tables) * 7) + 3 + 6);
         $this->printMatchingHeader('DRY RUN — matching verification (read-only, no writes)');
 
         foreach ($tables as $table) {
@@ -1653,8 +1687,27 @@ class SyncContactsData extends Command
              FROM TblContacts
              INNER JOIN {$table} ON TblContacts.LLG_ID = {$table}.LLG_ID
              WHERE COALESCE(TblContacts.External_ID, '') = ''
-               AND COALESCE(CAST({$table}.External_ID AS VARCHAR(50)), '') <> ''",
+               AND COALESCE(CAST({$table}.External_ID AS VARCHAR(50)), '') <> ''
+               AND CAST({$table}.External_ID AS VARCHAR(50)) NOT IN ('0', '1234567840', 'UNKNOWN')",
             "Backfilled blank TblContacts.External_ID from {$table}"
+        );
+
+        // If kept already has enrollment, drop orphan enroll keyed by side-table External_ID
+        // (LT contact id). Does NOT require orphan contact row — contact cleanup often
+        // deletes that first and used to leave enroll person-dups behind.
+        $this->runMatchingStep(
+            $connector,
+            "{$table}.drop_enroll_orphans",
+            "DELETE e
+             FROM TblEnrollment AS e
+             INNER JOIN {$table} AS src
+               ON e.LLG_ID = 'LLG-' + CAST(src.External_ID AS VARCHAR(50))
+             INNER JOIN TblContacts AS kept ON kept.LLG_ID = src.LLG_ID
+             WHERE e.LLG_ID <> src.LLG_ID
+               AND EXISTS (
+                    SELECT 1 FROM TblEnrollment AS e2 WHERE e2.LLG_ID = kept.LLG_ID
+               )",
+            "Dropped orphan LT-keyed TblEnrollment rows when kept LLG already enrolled ({$table})"
         );
 
         $this->runMatchingStep(
@@ -1663,11 +1716,10 @@ class SyncContactsData extends Command
             "UPDATE e
              SET e.LLG_ID = kept.LLG_ID
              FROM TblEnrollment AS e
-             INNER JOIN TblContacts AS lt ON e.LLG_ID = lt.LLG_ID
              INNER JOIN {$table} AS src
-               ON lt.LLG_ID = 'LLG-' + CAST(src.External_ID AS VARCHAR(50))
+               ON e.LLG_ID = 'LLG-' + CAST(src.External_ID AS VARCHAR(50))
              INNER JOIN TblContacts AS kept ON kept.LLG_ID = src.LLG_ID
-             WHERE lt.LLG_ID <> src.LLG_ID
+             WHERE e.LLG_ID <> src.LLG_ID
                AND NOT EXISTS (
                     SELECT 1 FROM TblEnrollment AS e2 WHERE e2.LLG_ID = kept.LLG_ID
                )",
@@ -1794,7 +1846,7 @@ class SyncContactsData extends Command
     /** Shared junk TP_IDs from Forth test/mailer spam — not real External IDs. */
     private function isFakeExternalId(string $tpId): bool
     {
-        return in_array($tpId, ['0', '1234567840'], true);
+        return in_array($tpId, ['0', '1234567840', 'UNKNOWN'], true);
     }
 
     /** Real sales roster name — not portal system accounts. */

@@ -30,8 +30,10 @@ class ImportMissingEnrollments extends Command
             return Command::FAILURE;
         }
 
+        // Load ALL enrollments for person-dup prevention (not only LDR/CCS).
+        // Restricting to LDR/CCS let twin SF contact IDs re-insert when Category differed/null.
         $existingResult = $sqlConnector->querySqlServer(
-            "SELECT LLG_ID, Client, State, Debt_Amount FROM TblEnrollment WHERE Category IN ('LDR', 'CCS')"
+            "SELECT LLG_ID, Client, State, Debt_Amount FROM TblEnrollment"
         );
         $existingRows = is_array($existingResult)
             ? ($existingResult['data'] ?? (array_is_list($existingResult) ? $existingResult : []))
@@ -52,7 +54,7 @@ class ImportMissingEnrollments extends Command
                 $existingPeople[$personKey] = true;
             }
         }
-        $this->info('[INFO] Existing TblEnrollment rows (LDR + CCS): ' . count($existingIds));
+        $this->info('[INFO] Existing TblEnrollment rows: ' . count($existingIds));
 
         $totalInserted = 0;
 
@@ -181,6 +183,12 @@ class ImportMissingEnrollments extends Command
             $missing[$llgId] = $row;
         }
 
+        // Twin SF contact IDs: if this ID is already External_ID on a remapped
+        // TblContacts row that has enrollment, do not insert a second enroll.
+        if ($missing !== []) {
+            $missing = $this->excludeAlreadyEnrolledViaRemap($sqlConnector, $missing, $existingIds, $existingPeople);
+        }
+
         $this->info("[INFO] {$source}: " . count($missing) . " contacts missing from TblEnrollment");
 
         if (empty($missing)) {
@@ -194,92 +202,98 @@ class ImportMissingEnrollments extends Command
 
         $inserted = 0;
         $skipped  = 0;
+        $pdo = $sqlConnector->getSqlServerConnection();
+        $contactAgents = $this->lookupContactAgents($sqlConnector, array_keys($missing));
 
-        foreach ($missing as $llgId => $row) {
-            $state        = $this->esc(trim((string) ($row['STATE']        ?? '')));
-            $agent        = $this->esc(trim((string) ($row['AGENT']        ?? '')));
-            $client       = $this->esc(trim((string) ($row['CLIENT']       ?? '')));
-            $enrolledDate = trim((string) ($row['ENROLLED_DATE'] ?? ''));
-            $cancelDate   = trim((string) ($row['CANCEL_DATE']   ?? ''));
-            $title        = trim((string) ($row['TITLE']         ?? ''));
-            $freq         = trim((string) ($row['PAYMENT_FREQUENCY'] ?? ''));
-            $debt         = $row['DEBT'] ?? null;
-
-            $normalizedFreq = strtoupper($freq);
-            $isMonthly = ($normalizedFreq === 'MONTHLY' || $normalizedFreq === 'M' || $normalizedFreq === '' || $normalizedFreq === 'NULL');
-
-            $paymentDate1 = trim((string) ($row['PAYMENT_DATE_1'] ?? ''));
-            // If not monthly, populate Payment_Date_2; if monthly, keep null.
-            $paymentDate2 = (!$isMonthly) ? trim((string) ($row['PAYMENT_DATE_2'] ?? '')) : '';
-
-            if ($enrolledDate === '') {
-                $skipped++;
-                continue;
-            }
-
-            // Category: 'CCS' if enrollment plan title contains 'CCS', else 'LDR'
-            $category = (stripos($title, 'CCS') !== false) ? 'CCS' : 'LDR';
-
-            $debtSql = is_numeric($debt) ? $this->normalizeDebt($debt) : 'NULL';
-            $pay1Sql  = $paymentDate1 !== '' ? "'{$this->esc($paymentDate1)}'" : 'NULL';
-            $pay2Sql  = $paymentDate2 !== '' ? "'{$this->esc($paymentDate2)}'" : 'NULL';
-            $freqSql  = $freq !== '' ? "'{$this->esc($freq)}'" : 'NULL';
-            $cxlSql   = $cancelDate   !== '' ? "'{$this->esc($cancelDate)}'"   : 'NULL';
-            $personKey = $this->personKey(
-                (string) ($row['CLIENT'] ?? ''),
-                (string) ($row['STATE'] ?? ''),
-                $debt
-            );
-            $personMatchSql = is_numeric($debt)
-                ? "Debt_Amount = {$debtSql}"
-                : 'Debt_Amount IS NULL';
-
-            $pdo = $sqlConnector->getSqlServerConnection();
-
+        // One transaction per chunk — fewer commits than per-row, still NOT EXISTS safe.
+        foreach (array_chunk($missing, 50, true) as $chunk) {
             try {
                 $pdo->beginTransaction();
 
-                $insertResult = $sqlConnector->querySqlServer("
-                    INSERT INTO TblEnrollment
-                        (LLG_ID, Category, State, Agent, Client, Debt_Amount, Welcome_Call_Date, Payment_Date_1, Payment_Date_2, Payment_Frequency, Cancel_Date)
-                    SELECT '{$llgId}', '{$category}', '{$state}', '{$agent}', '{$client}',
-                           {$debtSql}, '{$this->esc($enrolledDate)}', {$pay1Sql}, {$pay2Sql}, {$freqSql}, {$cxlSql}
-                    WHERE NOT EXISTS (
-                        SELECT 1
-                        FROM TblEnrollment WITH (UPDLOCK, HOLDLOCK)
-                        WHERE LLG_ID = '{$llgId}'
-                           OR (Client = '{$client}' AND State = '{$state}' AND {$personMatchSql})
-                    )
-                ");
+                foreach ($chunk as $llgId => $row) {
+                    $state        = $this->esc(trim((string) ($row['STATE']        ?? '')));
+                    $client       = $this->esc(trim((string) ($row['CLIENT']       ?? '')));
+                    $enrolledDate = trim((string) ($row['ENROLLED_DATE'] ?? ''));
+                    $cancelDate   = trim((string) ($row['CANCEL_DATE']   ?? ''));
+                    $title        = trim((string) ($row['TITLE']         ?? ''));
+                    $freq         = trim((string) ($row['PAYMENT_FREQUENCY'] ?? ''));
+                    $debt         = $row['DEBT'] ?? null;
+                    $contactId    = preg_replace('/^LLG-/i', '', $llgId);
 
-                if (!is_array($insertResult) || ($insertResult['success'] ?? false) !== true) {
-                    throw new \RuntimeException(
-                        'SQL Server insert failed: ' . (string) ($insertResult['error'] ?? 'unknown error')
+                    $agent = $this->rosterAgentName((string) ($row['AGENT'] ?? ''));
+                    if ($agent === '' && isset($contactAgents[$llgId])) {
+                        $agent = $contactAgents[$llgId];
+                    }
+                    $agent = $this->esc($agent);
+
+                    $normalizedFreq = strtoupper($freq);
+                    $isMonthly = ($normalizedFreq === 'MONTHLY' || $normalizedFreq === 'M' || $normalizedFreq === '' || $normalizedFreq === 'NULL');
+
+                    $paymentDate1 = trim((string) ($row['PAYMENT_DATE_1'] ?? ''));
+                    $paymentDate2 = (!$isMonthly) ? trim((string) ($row['PAYMENT_DATE_2'] ?? '')) : '';
+
+                    if ($enrolledDate === '') {
+                        $skipped++;
+                        continue;
+                    }
+
+                    $category = (stripos($title, 'CCS') !== false) ? 'CCS' : 'LDR';
+
+                    $debtSql = is_numeric($debt) ? $this->normalizeDebt($debt) : 'NULL';
+                    $pay1Sql  = $paymentDate1 !== '' ? "'{$this->esc($paymentDate1)}'" : 'NULL';
+                    $pay2Sql  = $paymentDate2 !== '' ? "'{$this->esc($paymentDate2)}'" : 'NULL';
+                    $freqSql  = $freq !== '' ? "'{$this->esc($freq)}'" : 'NULL';
+                    $cxlSql   = $cancelDate   !== '' ? "'{$this->esc($cancelDate)}'"   : 'NULL';
+                    $personKey = $this->personKey(
+                        (string) ($row['CLIENT'] ?? ''),
+                        (string) ($row['STATE'] ?? ''),
+                        $debt
                     );
+                    $personMatchSql = is_numeric($debt)
+                        ? "Debt_Amount = {$debtSql}"
+                        : 'Debt_Amount IS NULL';
+
+                    $insertResult = $sqlConnector->querySqlServer("
+                        INSERT INTO TblEnrollment
+                            (LLG_ID, Category, State, Agent, Client, Debt_Amount, Welcome_Call_Date, Payment_Date_1, Payment_Date_2, Payment_Frequency, Cancel_Date)
+                        SELECT '{$llgId}', '{$category}', '{$state}', '{$agent}', '{$client}',
+                               {$debtSql}, '{$this->esc($enrolledDate)}', {$pay1Sql}, {$pay2Sql}, {$freqSql}, {$cxlSql}
+                        WHERE NOT EXISTS (
+                            SELECT 1
+                            FROM TblEnrollment WITH (UPDLOCK, HOLDLOCK)
+                            WHERE LLG_ID = '{$llgId}'
+                               OR (Client = '{$client}' AND State = '{$state}' AND {$personMatchSql})
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1
+                            FROM TblContacts AS c WITH (UPDLOCK, HOLDLOCK)
+                            INNER JOIN TblEnrollment AS e ON e.LLG_ID = c.LLG_ID
+                            WHERE c.External_ID = '{$this->esc($contactId)}'
+                              AND c.LLG_ID <> '{$llgId}'
+                        )
+                    ");
+
+                    if (!is_array($insertResult) || ($insertResult['success'] ?? false) !== true) {
+                        throw new \RuntimeException(
+                            'SQL Server insert failed: ' . (string) ($insertResult['error'] ?? 'unknown error')
+                        );
+                    }
+
+                    $affected = (int) ($insertResult['row_count'] ?? 0);
+                    $existingIds[$llgId] = true;
+                    if ($personKey !== '') {
+                        $existingPeople[$personKey] = true;
+                    }
+
+                    if ($affected === 1) {
+                        $inserted++;
+                    } else {
+                        $skipped++;
+                    }
                 }
 
-                $affected = (int) ($insertResult['row_count'] ?? 0);
                 $pdo->commit();
-
-                if ($affected === 1) {
-                    $inserted++;
-                    $existingIds[$llgId] = true;
-                    if ($personKey !== '') {
-                        $existingPeople[$personKey] = true;
-                    }
-                } else {
-                    $skipped++;
-                    $existingIds[$llgId] = true;
-                    if ($personKey !== '') {
-                        $existingPeople[$personKey] = true;
-                    }
-                    Log::info('ImportMissingEnrollments: skipped existing enrollment', [
-                        'source' => $source,
-                        'llgId'  => $llgId,
-                    ]);
-                }
-
-                if ($affected === 1 && $inserted % 50 === 0) {
+                if ($inserted > 0) {
                     $this->info("[INFO] {$source}: {$inserted} inserted so far...");
                 }
             } catch (\Throwable $e) {
@@ -289,21 +303,19 @@ class ImportMissingEnrollments extends Command
 
                 $msg = $e->getMessage();
                 if (
-                    stripos($msg, 'duplicate')   !== false ||
-                    stripos($msg, 'UNIQUE')       !== false ||
-                    stripos($msg, 'PRIMARY KEY')  !== false
+                    stripos($msg, 'duplicate') !== false ||
+                    stripos($msg, 'UNIQUE') !== false ||
+                    stripos($msg, 'PRIMARY KEY') !== false
                 ) {
-                    $existingIds[$llgId] = true;
-                    if ($personKey !== '') {
-                        $existingPeople[$personKey] = true;
+                    foreach (array_keys($chunk) as $llgId) {
+                        $existingIds[$llgId] = true;
                     }
-                    $skipped++;
+                    $skipped += count($chunk);
                     continue;
                 }
-                $this->warn("[WARN] Failed to insert {$llgId}: {$msg}");
-                Log::warning('ImportMissingEnrollments: INSERT failed', [
+                $this->warn("[WARN] Chunk insert failed: {$msg}");
+                Log::warning('ImportMissingEnrollments: chunk INSERT failed', [
                     'source' => $source,
-                    'llgId'  => $llgId,
                     'error'  => $msg,
                 ]);
             }
@@ -311,6 +323,98 @@ class ImportMissingEnrollments extends Command
 
         $this->info("[INFO] {$source}: inserted {$inserted}, skipped/duplicate {$skipped}");
         return $inserted;
+    }
+
+    /**
+     * Drop candidates whose SF contact id is already External_ID on a remapped
+     * contact that has enrollment (prevents twin-ID person dups).
+     *
+     * @param array<string, array> $missing
+     * @return array<string, array>
+     */
+    private function excludeAlreadyEnrolledViaRemap(
+        DBConnector $sqlConnector,
+        array $missing,
+        array &$existingIds,
+        array &$existingPeople
+    ): array {
+        $extIds = [];
+        foreach (array_keys($missing) as $llgId) {
+            $extIds[] = preg_replace('/^LLG-/i', '', $llgId);
+        }
+        $blocked = [];
+        foreach (array_chunk($extIds, 500) as $batch) {
+            $inList = implode(', ', array_map(fn($id) => "'" . $this->esc($id) . "'", $batch));
+            $r = $sqlConnector->querySqlServer("
+                SELECT c.External_ID, c.LLG_ID, e.Client, e.State, e.Debt_Amount
+                FROM TblContacts AS c
+                INNER JOIN TblEnrollment AS e ON e.LLG_ID = c.LLG_ID
+                WHERE c.External_ID IN ({$inList})
+                  AND c.LLG_ID <> 'LLG-' + CAST(c.External_ID AS VARCHAR(50))
+            ");
+            foreach ($r['data'] ?? [] as $row) {
+                $ext = trim((string) ($row['External_ID'] ?? ''));
+                if ($ext === '') {
+                    continue;
+                }
+                $blocked['LLG-' . $ext] = true;
+                $existingIds['LLG-' . $ext] = true;
+                $pk = $this->personKey(
+                    (string) ($row['Client'] ?? ''),
+                    (string) ($row['State'] ?? ''),
+                    $row['Debt_Amount'] ?? null
+                );
+                if ($pk !== '') {
+                    $existingPeople[$pk] = true;
+                }
+            }
+        }
+        if ($blocked === []) {
+            return $missing;
+        }
+        $kept = [];
+        foreach ($missing as $llgId => $row) {
+            if (isset($blocked[$llgId])) {
+                continue;
+            }
+            $kept[$llgId] = $row;
+        }
+        $skipped = count($missing) - count($kept);
+        if ($skipped > 0) {
+            $this->info("[INFO] Skipped {$skipped} already enrolled via remapped External_ID");
+        }
+        return $kept;
+    }
+
+    /** @param list<string> $llgIds @return array<string, string> */
+    private function lookupContactAgents(DBConnector $sqlConnector, array $llgIds): array
+    {
+        $map = [];
+        foreach (array_chunk($llgIds, 500) as $batch) {
+            $inList = implode(', ', array_map(fn($id) => "'" . $this->esc($id) . "'", $batch));
+            $r = $sqlConnector->querySqlServer("
+                SELECT LLG_ID, Agent FROM TblContacts
+                WHERE LLG_ID IN ({$inList})
+                  AND Agent IS NOT NULL AND Agent <> '' AND Agent NOT LIKE '% User'
+            ");
+            foreach ($r['data'] ?? [] as $row) {
+                $llg = trim((string) ($row['LLG_ID'] ?? ''));
+                $agent = $this->rosterAgentName((string) ($row['Agent'] ?? ''));
+                if ($llg !== '' && $agent !== '') {
+                    $map[$llg] = $agent;
+                }
+            }
+        }
+        return $map;
+    }
+
+    private function rosterAgentName(string $assignedTo): string
+    {
+        $name = trim($assignedTo);
+        if ($name === '' || preg_match('/\bUser$/i', $name)) {
+            return '';
+        }
+        return $name;
     }
 
     private function fixUserAgents(DBConnector $sqlConnector, bool $dryRun = false): int
@@ -322,7 +426,8 @@ class ImportMissingEnrollments extends Command
             LEFT JOIN TblContacts AS c ON e.LLG_ID = c.LLG_ID
             WHERE c.Agent IS NOT NULL
               AND c.Agent <> ''
-              AND (e.Agent IS NULL OR e.Agent = '' OR e.Agent <> c.Agent)
+              AND c.Agent NOT LIKE '% User'
+              AND (e.Agent IS NULL OR e.Agent = '' OR e.Agent LIKE '% User' OR e.Agent <> c.Agent)
         ";
 
         $result = $sqlConnector->querySqlServer($sql);
@@ -341,29 +446,44 @@ class ImportMissingEnrollments extends Command
         }
 
         $fixed = 0;
-        foreach ($rows as $row) {
-            $llgId        = trim((string) ($row['LLG_ID']       ?? ''));
-            $correctAgent = trim((string) ($row['CorrectAgent'] ?? ''));
-            if ($llgId === '' || $correctAgent === '') continue;
-
+        foreach (array_chunk($rows, 500) as $chunk) {
+            $cases = [];
+            $ids = [];
+            foreach ($chunk as $row) {
+                $llgId = trim((string) ($row['LLG_ID'] ?? ''));
+                $correctAgent = $this->rosterAgentName((string) ($row['CorrectAgent'] ?? ''));
+                if ($llgId === '' || $correctAgent === '') {
+                    continue;
+                }
+                $llgEsc = $this->esc($llgId);
+                $agentEsc = $this->esc($correctAgent);
+                $cases[] = "WHEN '{$llgEsc}' THEN '{$agentEsc}'";
+                $ids[] = "'{$llgEsc}'";
+            }
+            if ($cases === []) {
+                continue;
+            }
             $sqlConnector->querySqlServer("
                 UPDATE TblEnrollment
-                SET    Agent = '{$this->esc($correctAgent)}'
-                WHERE  LLG_ID = '{$this->esc($llgId)}'
+                SET Agent = CASE LLG_ID " . implode(' ', $cases) . " END
+                WHERE LLG_ID IN (" . implode(', ', $ids) . ")
             ");
-            $fixed++;
+            $fixed += count($ids);
         }
 
         $this->info("[INFO] Corrected {$fixed} enrollment agents from LT ownership");
         return $fixed;
     }
 
-    /** Keep newest Modified per TP_ID. Blank TP_ID stays keyed by contact ID. */
+    /** Keep newest Modified per TP_ID. Blank/fake TP_ID stays keyed by contact ID. */
     private function dedupeSnowflakeByTpId(array $rows): array
     {
         $best = [];
         foreach ($rows as $row) {
             $tpId = trim((string) ($row['TP_ID'] ?? ''));
+            if ($this->isFakeExternalId($tpId)) {
+                $tpId = '';
+            }
             $id = (string) ($row['ID'] ?? '');
             $key = $tpId !== '' ? $tpId : ('ID-' . $id);
             $modified = (string) ($row['MODIFIED'] ?? '');
@@ -379,6 +499,11 @@ class ImportMissingEnrollments extends Command
             }
         }
         return array_values($best);
+    }
+
+    private function isFakeExternalId(string $tpId): bool
+    {
+        return in_array($tpId, ['0', '1234567840', 'UNKNOWN'], true);
     }
 
     private function personKey(string $client, string $state, $debt): string
