@@ -236,19 +236,22 @@ class Formatter
         // Placed at M1:P5 (columns M–P) to leave room for Location (J) and Company (K)
         $s->setCellValue('M1', 'Commission Tiers');
         $s->mergeCells('M1:P1');
+        // Title row green too, matching every other header on the sheet (Jacob, 2026-09-08).
+        $this->styleHeader($s, 'M1:P1');
         $s->getStyle('M1')->getAlignment()->setHorizontal(Alignment::HORIZONTAL_CENTER);
-        $s->getStyle('M1')->getFont()->setBold(true);
 
-        // Jacob, 2026-09-04: "On the rate table, only M2 should be gray." The ratio headings in
-        // N2:P2 used to carry the same grey fill, which read as though the whole row were a header.
+        // Jacob, 2026-09-08: "center and bold Clears and make it green and the top row green like
+        // the other headers." This row is a header, so it now uses the same green header style as
+        // every other table on the sheet — replacing the grey that used to sit on M2 alone.
         $s->setCellValue('M2', 'Clears');
-        $s->getStyle('M2')->getFill()->setFillType(Fill::FILL_SOLID)->getStartColor()->setARGB(self::TIER_FILL);
         $ratios = [0.2, 0.4, 0.6];
         foreach ($ratios as $i => $v) {
             $col = chr(78 + $i); // N, O, P
             $s->setCellValue("{$col}2", $v);
             $s->getStyle("{$col}2")->getNumberFormat()->setFormatCode(self::PCT_FORMAT);
         }
+        $this->styleHeader($s, 'M2:P2');
+        $s->getStyle('M2:P2')->getAlignment()->setHorizontal(Alignment::HORIZONTAL_CENTER);
 
         $thresholds = [1, 51, 101];
         $rates = [

@@ -1419,8 +1419,11 @@ class GenerateRetentionManagerCommission extends Command
         $sheet->getStyle("L2:O{$last}")->getNumberFormat()->setFormatCode('$#,##0.00');
         // Borders over the whole table, not just the header row (Jacob: "data sheet add borders").
         $this->tableBorders($sheet, "A1:{$lastHeaderCol}{$last}");
-        // Widths 17, with the client and agent name columns at 28.
-        $this->applyColumnWidths($sheet, 'A', $lastHeaderCol, ['B', 'C']);
+        // Widths 17, with Client (B), Retention Agent (C) and Immediate Results (E) at 28.
+        // E was added on Jacob's 2026-09-08 note ("NSF/Retention Manager, make E wider") — applied
+        // to both this report and the Team Leader one, since it is the same column holding the same
+        // values and a different width on each would be arbitrary.
+        $this->applyColumnWidths($sheet, 'A', $lastHeaderCol, ['B', 'C', 'E']);
 
         // Rama only — colour each row by bonus status (Jacob, 2026-09-04):
         // Bonus green, No Bonus yellow, and rows that did not qualify (no "x" in Made Cut Off)
