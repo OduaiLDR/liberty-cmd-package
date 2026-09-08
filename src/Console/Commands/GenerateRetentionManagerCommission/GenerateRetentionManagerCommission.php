@@ -1556,7 +1556,8 @@ class GenerateRetentionManagerCommission extends Command
         $this->highlightFinalCommissionCell($sheet, 'B8');
 
         // Tier table to the TOP RIGHT of the summary, not underneath it (Jacob, 2026-09-04).
-        $sheet->setCellValue('D1', "Rates at tier {$tier}");
+        // Label is just "Tier x" — not "Rates at tier x" (Jacob, 2026-09-08).
+        $sheet->setCellValue('D1', "Tier {$tier}");
         $sheet->getStyle('D1')->getFont()->setBold(true);
         $sheet->fromArray([['Rate 1', 'Rate 2', 'Rate 3', 'Rate 4']], null, 'D2', true);
         $this->headerStyle($sheet, 'D2:G2');
