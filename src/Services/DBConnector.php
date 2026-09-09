@@ -899,18 +899,56 @@ class DBConnector
                 }
             }
 
+            $options = [
+                PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            ];
+
+            // Cap how long a single statement may run. Azure SQL's default LOCK_TIMEOUT
+            // is infinite, so without this a lock-blocked DELETE/INSERT waits forever.
+            // That is how the nightly EPF sync hung silently until the queue worker
+            // SIGKILLed it: the process died before AutomationExecutor could capture
+            // Artisan::output(), so the run surfaced 4h later as an opaque "attempted
+            // too many times" with no output at all. With a cap the statement raises a
+            // normal PDOException, the command's own catch logs it, and the failure
+            // becomes diagnosable. Guarded: the constant only exists with pdo_sqlsrv.
+            if (defined('PDO::SQLSRV_ATTR_QUERY_TIMEOUT')) {
+                $options[PDO::SQLSRV_ATTR_QUERY_TIMEOUT] = $this->sqlServerQueryTimeout();
+            }
+
             $this->sqlServerConnection = new PDO(
                 $dsn,
                 $this->sqlServerConfig['username'],
                 $this->sqlServerConfig['password'],
-                [
-                    PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-                    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-                ]
+                $options
             );
         }
 
         return $this->sqlServerConnection;
+    }
+
+    /**
+     * Seconds a single SQL Server statement may run before it is aborted.
+     *
+     * Overridable per-connection via a `query_timeout` config key, or globally via
+     * SQLSRV_QUERY_TIMEOUT. The 5-minute default is deliberately generous: the EPF
+     * sync's batched statements finish in ~1.5s, so anything approaching this is
+     * pathological rather than merely slow, and report queries still have headroom.
+     *
+     * Note this is separate from the existing `timeout` config key, which is only
+     * surfaced by getSqlServerInfo() and has never been applied to the connection.
+     */
+    private function sqlServerQueryTimeout(): int
+    {
+        $configured = $this->sqlServerConfig['query_timeout'] ?? null;
+
+        if ($configured === null && function_exists('env')) {
+            $configured = env('SQLSRV_QUERY_TIMEOUT');
+        }
+
+        $seconds = (int) ($configured ?? 300);
+
+        return $seconds > 0 ? $seconds : 300;
     }
 
     /**
