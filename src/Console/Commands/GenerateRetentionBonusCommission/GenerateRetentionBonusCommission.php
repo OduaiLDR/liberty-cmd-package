@@ -239,7 +239,10 @@ class GenerateRetentionBonusCommission extends Command
             // who earned a bonus this run — so stale bonuses are cleared without
             // needing a separate roster list.
             CommissionResultsWriter::resetColumn($sql, 'retention', $source, $reportStartDate, 'Bonus_Commission');
-            CommissionResultsWriter::persist($sql, 'retention', $source, $reportStartDate, 'Bonus_Commission', $bonusResults);
+            $persisted = CommissionResultsWriter::persist($sql, 'retention', $source, $reportStartDate, 'Bonus_Commission', $bonusResults);
+            if ($notice = CommissionResultsWriter::failureNotice($persisted, $display)) {
+                $this->warn($notice);
+            }
 
             // Build and send workbooks
             $agentNames  = array_values(array_unique(array_filter(

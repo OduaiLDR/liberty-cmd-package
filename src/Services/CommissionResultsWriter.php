@@ -30,12 +30,17 @@ class CommissionResultsWriter
      * @param string      $periodStart 'Y-m-01' (first day of the report month)
      * @param string      $column      'Commission' | 'Bonus_Commission'
      * @param array       $rows        [['agent' => string, 'amount' => float], ...]
+     *
+     * @return array{attempted:int,written:int,failed:int} So the caller can tell the operator that
+     *         the figures never reached Commission Review. This used to be logged and nothing else,
+     *         which meant a whole report could persist zero rows while the console still reported
+     *         success — and the review page would quietly show stale or missing commission.
      */
-    public static function persist(DBConnector $sql, string $reportType, string $source, string $periodStart, string $column, array $rows): void
+    public static function persist(DBConnector $sql, string $reportType, string $source, string $periodStart, string $column, array $rows): array
     {
         if (!in_array($column, self::COLUMNS, true)) {
             Log::warning("CommissionResultsWriter: unknown column '{$column}' — skipped.");
-            return;
+            return ['attempted' => count($rows), 'written' => 0, 'failed' => count($rows)];
         }
 
         $reportType = strtolower(trim($reportType));
@@ -55,12 +60,22 @@ class CommissionResultsWriter
                 $amount = round((float) ($row['amount'] ?? 0), 2);
 
                 // Upsert only this component; the sibling generator owns the other column.
+                //
+                // On INSERT the sibling column is written as an explicit 0 rather than left to the
+                // table's DEFAULT. Both amount columns are NOT NULL, so omitting one only works
+                // where the DEFAULT survived — and it does not everywhere (local clones drop
+                // defaults, and a hand-created table may never have had them). When it is missing
+                // every insert fails with "Cannot insert the value NULL", and because persist()
+                // swallows errors that means a whole report's commission silently never reaches
+                // Commission Review. $column is whitelisted against COLUMNS above, so both names
+                // are safe to interpolate.
+                $sibling = $column === 'Commission' ? 'Bonus_Commission' : 'Commission';
                 $merge = 'MERGE dbo.' . self::TABLE . ' AS t
                     USING (SELECT ? AS Report_Type, ? AS Source, CAST(? AS DATE) AS Period_Start, ? AS Agent, CAST(? AS DECIMAL(12,2)) AS Amount) AS s
                     ON t.Report_Type = s.Report_Type AND t.Source = s.Source AND t.Period_Start = s.Period_Start AND t.Agent = s.Agent
                     WHEN MATCHED THEN UPDATE SET t.' . $column . ' = s.Amount, t.Updated_At = GETDATE()
-                    WHEN NOT MATCHED THEN INSERT (Report_Type, Source, Period_Start, Agent, ' . $column . ', Updated_At)
-                        VALUES (s.Report_Type, s.Source, s.Period_Start, s.Agent, s.Amount, GETDATE());';
+                    WHEN NOT MATCHED THEN INSERT (Report_Type, Source, Period_Start, Agent, ' . $column . ', ' . $sibling . ', Updated_At)
+                        VALUES (s.Report_Type, s.Source, s.Period_Start, s.Agent, s.Amount, 0, GETDATE());';
 
                 $res = $sql->querySqlServer($merge, [$reportType, $source, $periodStart, $agent, $amount]);
                 if (($res['success'] ?? false) === true) {
@@ -71,9 +86,34 @@ class CommissionResultsWriter
             }
 
             Log::info("CommissionResultsWriter: {$reportType}/{$source} {$periodStart} {$column} — {$written}/" . count($rows) . ' rows written to Azure.');
+
+            return ['attempted' => count($rows), 'written' => $written, 'failed' => count($rows) - $written];
         } catch (\Throwable $e) {
             Log::warning('CommissionResultsWriter: persist skipped', ['ex' => $e->getMessage()]);
         }
+
+        return ['attempted' => count($rows), 'written' => 0, 'failed' => count($rows)];
+    }
+
+    /**
+     * A console warning for a persist() result that did not fully land, or null when it did.
+     *
+     * Commission Review and Payroll Review read ONLY what reached Azure, so rows that failed to
+     * write are not a logging detail — they are figures the reviewer will never see, on a page
+     * that gives no hint anything went wrong.
+     *
+     * @param array{attempted:int,written:int,failed:int} $result
+     */
+    public static function failureNotice(array $result, string $label): ?string
+    {
+        $failed = (int) ($result['failed'] ?? 0);
+        if ($failed <= 0) {
+            return null;
+        }
+
+        return "[WARN] [{$label}] {$failed}/" . (int) ($result['attempted'] ?? 0)
+            . ' commission row(s) did NOT reach Azure (dbo.' . self::TABLE . '). Commission Review'
+            . ' will show stale or missing figures for this period — see the log for the SQL error.';
     }
 
     /**

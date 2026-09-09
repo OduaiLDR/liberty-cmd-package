@@ -362,7 +362,10 @@ class GenerateRetentionCommissionReport extends Command
                 $retResults[] = ['agent' => (string) $agentName, 'amount' => $sum['commission'] ?? 0];
             }
             CommissionResultsWriter::resetColumn($sql, 'retention', $source, $startDate, 'Commission');
-            CommissionResultsWriter::persist($sql, 'retention', $source, $startDate, 'Commission', $retResults);
+            $persisted = CommissionResultsWriter::persist($sql, 'retention', $source, $startDate, 'Commission', $retResults);
+            if ($notice = CommissionResultsWriter::failureNotice($persisted, $display)) {
+                $this->warn($notice);
+            }
             RetentionCommissionTierStore::persist(
                 $sql,
                 $source,

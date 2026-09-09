@@ -170,13 +170,28 @@ class GenerateNSFCommissionReport extends Command
 
             // Persist the computed per-agent commission to Azure so the Commission Review app reads
             // the REAL numbers (best-effort; never blocks the report).
-            CommissionResultsWriter::persist(
+            //
+            // Zero the column for the whole period first. persist() is an upsert and never deletes,
+            // so without this an agent the report STOPS pricing — dropped from the roster, renamed,
+            // or no longer earning — keeps their last commission in TblCommissionReviewResults
+            // forever, and no amount of re-running clears it. Commission Review and Payroll Review
+            // both read that table, so the stale figure becomes a payroll item.
+            //
+            // Both retention generators have always done this; NSF was the one that did not, which
+            // is why every stale row found in production on 2026-09-09 was an NSF row (Anthony Clark
+            // ldr+plaw, Lucas Wright ldr — left behind by the 09-03 run and untouched on 09-08).
+            // They happened to hold $0.00; the next one will hold whatever that agent last earned.
+            CommissionResultsWriter::resetColumn($sql, 'nsf', $source, $startDate, 'Commission');
+            $persisted = CommissionResultsWriter::persist(
                 $sql, 'nsf', $source, $startDate, 'Commission',
                 array_map(
                     fn ($r) => ['agent' => $r['agent'], 'amount' => $r['commission']],
                     $commissionRows
                 )
             );
+            if ($notice = CommissionResultsWriter::failureNotice($persisted, $display)) {
+                $this->warn($notice);
+            }
 
             $formatter = new Formatter();
             $allFile = $formatter->buildWorkbook(
