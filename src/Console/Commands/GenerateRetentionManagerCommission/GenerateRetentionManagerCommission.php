@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Cmd\Reports\Console\Commands\GenerateRetentionManagerCommission;
 
+use Cmd\Reports\Services\CommissionRosterProvider;
 use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\EmailSenderService;
 use Cmd\Reports\Services\RetentionCommissionReportBuilder;
@@ -56,6 +57,16 @@ class GenerateRetentionManagerCommission extends Command
             $this->info($message);
         } catch (\Throwable) {
             Log::info($message);
+        }
+    }
+
+    /** Same guard as reportInfo — buildPayrollReviewSnapshots() runs outside a console context. */
+    private function reportWarn(string $message): void
+    {
+        try {
+            $this->warn($message);
+        } catch (\Throwable) {
+            Log::warning($message);
         }
     }
 
@@ -143,8 +154,9 @@ class GenerateRetentionManagerCommission extends Command
     private function buildAnthonyPayrollSnapshot(array $rows): array
     {
         $byAgent = $this->buildAnthonyStats($rows);
+        $roster = $this->anthonyNsfRoster();
         $rosterKeys = [];
-        foreach (self::ANTHONY_NSF_ROSTER as $name) {
+        foreach ($roster as $name) {
             $key = $this->anthonyAgentKey($name);
             if ($key !== '') {
                 $rosterKeys[$key] = true;
@@ -152,7 +164,7 @@ class GenerateRetentionManagerCommission extends Command
         }
 
         $team = [];
-        foreach (self::ANTHONY_NSF_ROSTER as $name) {
+        foreach ($roster as $name) {
             $key = $this->anthonyAgentKey($name);
             if ($key === '' || isset($team[$key])) {
                 continue;
@@ -355,6 +367,11 @@ class GenerateRetentionManagerCommission extends Command
     /**
      * NSF Team Leader sheet roster order (Jacob workbook NSF Team Leader - Anthony).
      * Row 13 is a second Lucas Wright placeholder (0/0/0) in the template.
+     *
+     * This is the ORDER and the offline fallback only — membership comes from the Azure
+     * commission roster via {@see anthonyNsfRoster()}. Anthony is paid `totalClears * rate`,
+     * so a hardcoded membership list silently underpays him the moment payroll adds an NSF
+     * agent, and keeps paying for one they removed.
      */
     private const ANTHONY_NSF_ROSTER = [
         'Anthony Clark',
@@ -373,6 +390,78 @@ class GenerateRetentionManagerCommission extends Command
         'Timothy Phillips',
         'Katherine Caceres',
     ];
+
+    /** @var array<int,string>|null Resolved once per run — the roster is read over the network. */
+    private ?array $anthonyRosterCache = null;
+
+    /**
+     * The NSF agents Anthony is paid on, taken from the same Azure roster the NSF Commission
+     * reports read (dbo.TblCommissionRoster, report type 'nsf').
+     *
+     * His sheet spans LDR and Progress Law, so both sources are queried and merged.
+     * fromRoster()'s filter is `Source = ? OR Source = 'both'` — passing 'both' as the source
+     * therefore matches ONLY rows literally tagged 'both', not "either brand", which would drop
+     * every per-brand agent and pay him on a handful of names.
+     *
+     * Order is preserved from the template Jacob signed off: names already in
+     * ANTHONY_NSF_ROSTER keep their position, anyone the roster has since added is appended.
+     * On an empty or unreachable roster this falls back to the template and says so loudly —
+     * a silent fallback would look like a valid short roster and underpay him.
+     *
+     * @return array<int,string>
+     */
+    private function anthonyNsfRoster(): array
+    {
+        if ($this->anthonyRosterCache !== null) {
+            return $this->anthonyRosterCache;
+        }
+
+        $roster = null;
+        try {
+            $sql = $this->initSqlServer('ldr');
+            foreach (['ldr', 'plaw'] as $source) {
+                $names = CommissionRosterProvider::fromRoster($sql, 'nsf', $source);
+                if ($names !== null) {
+                    $roster = array_merge($roster ?? [], $names);
+                }
+            }
+        } catch (\Throwable $e) {
+            Log::warning('GenerateRetentionManagerCommission: NSF roster lookup failed: ' . $e->getMessage());
+        }
+
+        if ($roster === null || $roster === []) {
+            $this->reportWarn(
+                '[WARN] [Anthony - NSF Team Leader] The NSF roster in Azure (dbo.TblCommissionRoster) '
+                . 'is empty or unreachable. Falling back to the built-in agent list — this run is NOT '
+                . 'roster-driven and the commission total may be wrong.'
+            );
+            Log::warning('GenerateRetentionManagerCommission: NSF roster unavailable; fell back to the built-in agent list.');
+
+            return $this->anthonyRosterCache = self::ANTHONY_NSF_ROSTER;
+        }
+
+        $remaining = [];
+        foreach ($roster as $name) {
+            $key = $this->anthonyAgentKey((string) $name);
+            if ($key !== '' && !isset($remaining[$key])) {
+                $remaining[$key] = (string) $name;
+            }
+        }
+
+        $ordered = [];
+        foreach (self::ANTHONY_NSF_ROSTER as $name) {
+            $key = $this->anthonyAgentKey($name);
+            if ($key !== '' && isset($remaining[$key])) {
+                $ordered[] = $remaining[$key];
+                unset($remaining[$key]);
+            }
+        }
+        foreach ($remaining as $name) {
+            $ordered[] = $name;
+        }
+
+        return $this->anthonyRosterCache = $ordered;
+    }
 
     private const RAMA_TRANCHE_ASSIGNMENTS = [
         'ALFRED BROWN' => 'NGF',
@@ -1153,7 +1242,7 @@ class GenerateRetentionManagerCommission extends Command
         // placeholder rows — which left the Total floating below a gap.
         $rosterSeen = [];
         $r = 2;
-        foreach (self::ANTHONY_NSF_ROSTER as $agent) {
+        foreach ($this->anthonyNsfRoster() as $agent) {
             $key = $this->anthonyAgentKey($agent);
             if ($key === '' || isset($rosterSeen[$key])) {
                 continue;   // drops the duplicate Lucas Wright placeholder from the old template
@@ -1196,7 +1285,7 @@ class GenerateRetentionManagerCommission extends Command
         $sheet->getStyle("A{$totalRow}:E{$totalRow}")->getFont()->setBold(true);
 
         $rosterKeys = [];
-        foreach (self::ANTHONY_NSF_ROSTER as $name) {
+        foreach ($this->anthonyNsfRoster() as $name) {
             $k = $this->anthonyAgentKey($name);
             if ($k !== '') {
                 $rosterKeys[$k] = true;
