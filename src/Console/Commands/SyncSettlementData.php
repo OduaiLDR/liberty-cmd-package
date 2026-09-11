@@ -411,9 +411,9 @@ SQL;
                 $values .= ", '" . $this->escapeSqlString($row['creditor']) . "'";
                 $values .= ", '" . $this->escapeSqlString($row['debt_buyer']) . "'";
                 $values .= ", '" . $this->escapeSqlString($row['account_number']) . "'";
-                $values .= ", '" . $this->escapeSqlString((string) $row['original_debt_amount']) . "'";
-                $values .= ", '" . $this->escapeSqlString((string) $row['current_amount']) . "'";
-                $values .= ", '" . $this->escapeSqlString((string) $row['settlement_amount']) . "'";
+                $values .= ', ' . $this->numericLiteral($row['original_debt_amount'], $row['llg_id'], 'Original_Debt_Amount');
+                $values .= ', ' . $this->numericLiteral($row['current_amount'], $row['llg_id'], 'Current_Amount');
+                $values .= ', ' . $this->numericLiteral($row['settlement_amount'], $row['llg_id'], 'Settlement_Amount');
                 $values .= ", '" . $this->escapeSqlString((string) $row['status']) . "'";
 
                 if ($row['settlement_date'] === null || $row['settlement_date'] === '') {
@@ -442,6 +442,89 @@ SQL;
         }
 
         return $inserted;
+    }
+
+    /**
+     * Ceiling for the money columns on TblSettlementsNGF.
+     *
+     * They are DECIMAL(18,2), which holds 16 integer digits - i.e. just under 1e16.
+     * Anything at or beyond this cannot be stored at all, so it is logged and written
+     * as NULL rather than aborting the batch.
+     */
+    private const MONEY_MAX = 1.0e16;
+
+    /**
+     * Plausibility ceiling for a SINGLE debt account, in dollars.
+     *
+     * A data-quality guard, not a storage limit - it sits far below MONEY_MAX. Forth
+     * occasionally carries placeholder rows (2026-09-10: CONTACT_ID 462464571,
+     * ACCOUNT_NUM 67676767, ORIGINAL and CURRENT both exactly 999999999.99, no
+     * settlement amount). Widening the column alone would let that land as a real $1bn
+     * debt and quietly inflate every report summing these columns, so anything above
+     * this ceiling is logged and stored as NULL instead.
+     *
+     * $10m is deliberately generous: observed settlements top out near $64k and
+     * per-contact enrolled debt near $128k, so it cannot reach real data.
+     */
+    private const MONEY_SANITY_CEILING = 10000000.0;
+
+    /**
+     * Render a money value as an UNQUOTED SQL numeric literal.
+     *
+     * These fields used to be written as quoted strings, which forced SQL Server into an
+     * implicit varchar->numeric conversion. That is why an out-of-range value surfaced as
+     * "Arithmetic overflow error converting varchar to data type numeric" - naming the
+     * conversion rather than the column, and aborting the whole insert. An unquoted
+     * literal also avoids PHP's float-to-string switching to scientific notation
+     * ("1.0E+17") past ~15 digits, which SQL Server cannot parse at all.
+     *
+     * Out-of-range values become NULL and are logged with their LLG_ID, so one bad source
+     * row costs a single field instead of the remaining batches. (2026-09-10: a PLAW debt
+     * carrying 999999999.99 overflowed the then-DECIMAL(10,2) column and stranded
+     * TblSettlementsNGF at 67,000 of 71,252 PLAW rows.)
+     */
+    protected function numericLiteral($value, string $llgId, string $column): string
+    {
+        if ($value === null || $value === '') {
+            return 'NULL';
+        }
+
+        $number = (float) $value;
+
+        if (is_nan($number) || is_infinite($number)) {
+            Log::warning('SyncSettlementData: non-finite money value; storing NULL.', [
+                'llg_id' => $llgId,
+                'column' => $column,
+                'value'  => (string) $value,
+            ]);
+
+            return 'NULL';
+        }
+
+        if (abs($number) >= self::MONEY_SANITY_CEILING) {
+            Log::warning('SyncSettlementData: implausible money value; storing NULL.', [
+                'llg_id'  => $llgId,
+                'column'  => $column,
+                'value'   => sprintf('%.2f', $number),
+                'ceiling' => sprintf('%.2f', self::MONEY_SANITY_CEILING),
+            ]);
+
+            return 'NULL';
+        }
+
+        if (abs($number) >= self::MONEY_MAX) {
+            Log::warning('SyncSettlementData: money value exceeds column capacity; storing NULL.', [
+                'llg_id' => $llgId,
+                'column' => $column,
+                'value'  => sprintf('%.2f', $number),
+                'max'    => sprintf('%.2f', self::MONEY_MAX),
+            ]);
+
+            return 'NULL';
+        }
+
+        // Fixed-point, no thousands separator, never scientific notation.
+        return number_format($number, 2, '.', '');
     }
 
     protected function containsLaw(string $value): bool
