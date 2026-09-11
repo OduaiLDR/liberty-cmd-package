@@ -34,6 +34,12 @@ class SyncContactsCCS extends Command
     private const PAGE_SIZE      = 50000;
     private const COPY_PAGE_SIZE = 5000;
 
+    /** Matches the timeout DBConnector sends with each Snowflake statement. */
+    private const SNOWFLAKE_STATEMENT_TIMEOUT = 300;
+
+    /** Warn once a page passes two-thirds of that budget, while headroom remains. */
+    private const SLOW_PAGE_WARN_SECONDS = 200;
+
     // CONTACTS_USERFIELDS custom field IDs on the CCS Snowflake account
     private const CF_LOAN_AMOUNT_NEEDED      = 671993;
     private const CF_ENROLLMENT_DATE         = 682517;
@@ -106,7 +112,20 @@ class SyncContactsCCS extends Command
 
         // ── Fetch + insert loop ───────────────────────────────────────────────
         do {
-            $chunk     = $this->fetchPage($snowflake, $startDate, $lastId);
+            try {
+                $chunk = $this->fetchPage($snowflake, $startDate, $lastId);
+            } catch (\Throwable $e) {
+                $this->error("[ERROR] Snowflake fetch failed after CONTACT_ID {$lastId}: " . $e->getMessage());
+                Log::error('SyncContactsCCS: page fetch failed', [
+                    'last_id'       => $lastId,
+                    'total_fetched' => $totalFetched,
+                    'page_size'     => self::PAGE_SIZE,
+                    'error'         => $e->getMessage(),
+                ]);
+
+                return Command::FAILURE;
+            }
+
             $chunkSize = count($chunk);
 
             if ($chunkSize === 0) {
@@ -317,10 +336,55 @@ class SyncContactsCCS extends Command
     // Snowflake fetch
     // -------------------------------------------------------------------------
 
+    /**
+     * Fetch one page, recording how long Snowflake took.
+     *
+     * DBConnector sends a 300s statement timeout with every request. On 2026-09-11 a page
+     * exceeded it and Snowflake cancelled the statement (408, code 000630), which killed
+     * the whole sync. These timings are what tell us whether the answer is a smaller
+     * PAGE_SIZE or a cheaper query - and the warning below gives advance notice while
+     * there is still headroom, instead of only finding out when a page finally tips over.
+     */
     private function fetchPage(DBConnector $snowflake, string $startDate, int $lastId): array
     {
+        $startedAt = microtime(true);
+
         $result = $snowflake->query($this->buildQuery($startDate, $lastId, self::PAGE_SIZE));
-        return $result['data'] ?? [];
+
+        $rows    = $result['data'] ?? [];
+        $elapsed = microtime(true) - $startedAt;
+
+        $this->info(sprintf(
+            '[INFO] Page fetched in %.1fs (%d rows, after CONTACT_ID %d).',
+            $elapsed,
+            count($rows),
+            $lastId
+        ));
+
+        Log::info('SyncContactsCCS: page fetched', [
+            'seconds' => round($elapsed, 1),
+            'rows'    => count($rows),
+            'last_id' => $lastId,
+        ]);
+
+        if ($elapsed >= self::SLOW_PAGE_WARN_SECONDS) {
+            $this->warn(sprintf(
+                '[WARN] Page took %.1fs, within reach of the %ds Snowflake statement timeout. '
+                    . 'Consider reducing PAGE_SIZE (currently %d).',
+                $elapsed,
+                self::SNOWFLAKE_STATEMENT_TIMEOUT,
+                self::PAGE_SIZE
+            ));
+
+            Log::warning('SyncContactsCCS: page approaching statement timeout', [
+                'seconds'    => round($elapsed, 1),
+                'timeout'    => self::SNOWFLAKE_STATEMENT_TIMEOUT,
+                'page_size'  => self::PAGE_SIZE,
+                'last_id'    => $lastId,
+            ]);
+        }
+
+        return $rows;
     }
 
     private function buildQuery(string $startDate, int $lastId, int $limit): string
