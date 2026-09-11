@@ -423,7 +423,7 @@ class DBConnector
     /**
      * Execute a SQL query
      */
-    public function query(string $sql, array $bindings = []): array
+    public function query(string $sql, array $bindings = [], ?int $timeoutSeconds = null): array
     {
         $token = $this->getAccessToken();
         $url = sprintf(
@@ -433,7 +433,7 @@ class DBConnector
 
         $requestBody = [
             'statement' => $sql,
-            'timeout' => 300,
+            'timeout' => $timeoutSeconds ?? $this->statementTimeout(),
             'database' => $this->database,
             'schema' => $this->schema,
             'warehouse' => $this->warehouse,
@@ -465,7 +465,14 @@ class DBConnector
                 $statusUrl = 'https://' . strtolower($this->account) . '.snowflakecomputing.com' . $statusUrl;
             }
 
-            for ($i = 0; $i < 300; $i++) {
+            // Poll for at least as long as Snowflake will keep running the statement, plus
+            // a margin, so the SERVER's timeout is what fires. A 408 naming the limit is far
+            // more useful than our own "Invalid query response" after giving up early. This
+            // was hardcoded to 300 to match the old fixed timeout - raising one without the
+            // other would make the client stop waiting before the server stops working.
+            $pollBudget = ($timeoutSeconds ?? $this->statementTimeout()) + 30;
+
+            for ($i = 0; $i < $pollBudget; $i++) {
                 // Small delay between polls
                 sleep(1);
 
@@ -616,6 +623,27 @@ class DBConnector
     /**
      * Format Snowflake result into associative array
      */
+
+    /**
+     * Seconds Snowflake may spend on a single statement before cancelling it.
+     *
+     * Sent with every request; exceeding it returns 408 with code 000630. Overridable
+     * globally via SNOWFLAKE_STATEMENT_TIMEOUT, or per call via query()'s third argument
+     * - useful for diagnosing a query that exceeds the default without changing it for
+     * every other command sharing this connector.
+     *
+     * Raising this is a stopgap, not a fix: a query that needs more than 300s is usually
+     * doing work that could be avoided (2026-09-11: SyncContactsCCS took the same 301s at
+     * LIMIT 1000 as at LIMIT 50000, so its cost was structural, not volume).
+     */
+    private function statementTimeout(): int
+    {
+        $seconds = function_exists('env')
+            ? (int) env('SNOWFLAKE_STATEMENT_TIMEOUT', 300)
+            : 300;
+
+        return $seconds > 0 ? $seconds : 300;
+    }
     private function formatResult(array $result): array
     {
         $columns = array_column($result['resultSetMetaData']['rowType'], 'name');
