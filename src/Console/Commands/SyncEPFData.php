@@ -87,6 +87,7 @@ class SyncEPFData extends Command
 
                 $this->info("[$source] Inserting EPF rows to SQL Server...");
                 $inserted = $this->insertEpfRows($connector, $rows, $source);
+                $this->assertRowCount($connector, $source, count($rows));
 
                 $this->info("[$source] Inserted {$inserted} EPF rows.");
                 if (env('EPF_DEBUG', false)) {
@@ -658,6 +659,56 @@ SQL,
      * @param  array<int, array<string, mixed>>  $rows
      * @return array<int, array<string, mixed>>
      */
+    /**
+     * Confirm TblEPFs actually holds what we believe we inserted.
+     *
+     * insertEpfRows() counts optimistically - SET NOCOUNT ON means no affected-row count
+     * comes back, so it adds count($batch) for any statement that did not throw. That
+     * cannot detect rows rejected downstream or a batch that only partially applied, so
+     * this asks the table directly.
+     *
+     * A mismatch fails the run: a short table is wrong NOW and reporting success over it
+     * hides the problem. A failed verification QUERY only warns - the insert itself
+     * already succeeded, and a transient blip should not manufacture a failure.
+     *
+     * $source already carries its DP_ prefix (see sourceLabelForConnection), and matches
+     * the value written into the Source column by insertEpfRows().
+     */
+    protected function assertRowCount(DBConnector $connector, string $source, int $expected): void
+    {
+        $sourceEsc = $this->escapeSqlString($source);
+
+        $result = $connector->querySqlServer(
+            "SELECT COUNT(*) AS n FROM TblEPFs WHERE Source = '{$sourceEsc}'"
+        );
+
+        if (!is_array($result) || ($result['success'] ?? null) !== true) {
+            Log::warning('SyncEPFData: could not verify row count after insert.', [
+                'source' => $source,
+                'error'  => is_array($result) ? ($result['error'] ?? 'unknown') : 'non-array response',
+            ]);
+
+            return;
+        }
+
+        $actual = (int) ($result['data'][0]['n'] ?? -1);
+
+        if ($actual === $expected) {
+            $this->info("[{$source}] Verified {$actual} rows in TblEPFs.");
+
+            return;
+        }
+
+        throw new \RuntimeException(sprintf(
+            'Row count mismatch for %s: expected %d rows in TblEPFs, found %d. '
+                . 'The table is incomplete - reports built on it will be wrong until the next '
+                . 'successful run.',
+            $source,
+            $expected,
+            $actual
+        ));
+    }
+
     protected function sanitizeRows(DBConnector $connector, array $rows, string $source): array
     {
         if (empty($rows)) {

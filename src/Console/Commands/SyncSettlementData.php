@@ -81,6 +81,7 @@ class SyncSettlementData extends Command
 
                 $this->info("[$source] Inserting settlement rows to SQL Server...");
                 $inserted = $this->insertSettlements($connector, $rows, $source);
+                $this->assertRowCount($connector, $source, count($rows));
 
                 $this->info("[$source] Inserted {$inserted} settlement rows.");
                 $this->insertLogRow(
@@ -409,6 +410,54 @@ SQL;
      * @param  array<int, array<string, mixed>>  $rows
      * @return array<int, array<string, mixed>>
      */
+    /**
+     * Confirm the table actually holds what we believe we inserted.
+     *
+     * insertSettlements() counts optimistically - it adds count($batch) for every
+     * statement that did not throw - so it cannot notice rows rejected downstream or a
+     * batch that only partially applied. This asks the table directly.
+     *
+     * A mismatch fails the run, because a short table is wrong NOW and silently
+     * reporting success over it is exactly how 67,000 of 71,252 PLAW rows went unnoticed
+     * for two days (2026-09-10). A failed verification QUERY only warns: the insert
+     * itself already succeeded, so a transient blip here should not manufacture a
+     * failure - but it must stay visible.
+     */
+    protected function assertRowCount(DBConnector $connector, string $source, int $expected): void
+    {
+        $sourceEsc = $this->escapeSqlString('DP_' . strtoupper($source));
+
+        $result = $connector->querySqlServer(
+            "SELECT COUNT(*) AS n FROM TblSettlementsNGF WHERE Source = '{$sourceEsc}'"
+        );
+
+        if (!is_array($result) || ($result['success'] ?? null) !== true) {
+            Log::warning('SyncSettlementData: could not verify row count after insert.', [
+                'source' => $source,
+                'error'  => is_array($result) ? ($result['error'] ?? 'unknown') : 'non-array response',
+            ]);
+
+            return;
+        }
+
+        $actual = (int) ($result['data'][0]['n'] ?? -1);
+
+        if ($actual === $expected) {
+            $this->info("[{$source}] Verified {$actual} rows in TblSettlementsNGF.");
+
+            return;
+        }
+
+        throw new \RuntimeException(sprintf(
+            'Row count mismatch for %s: expected %d rows in TblSettlementsNGF, found %d. '
+                . 'The table is incomplete - reports built on it will be wrong until the next '
+                . 'successful run.',
+            $source,
+            $expected,
+            $actual
+        ));
+    }
+
     protected function sanitizeRows(DBConnector $connector, array $rows, string $source): array
     {
         if (empty($rows)) {
