@@ -3,6 +3,7 @@
 namespace Cmd\Reports\Console\Commands;
 
 use Cmd\Reports\Services\DBConnector;
+use Cmd\Reports\Services\SqlServerRowSanitizer;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
 
@@ -55,6 +56,11 @@ class SyncSettlementData extends Command
 
                 $this->info("[$source] Fetching settlements from Snowflake...");
                 $rows = $this->fetchSettlementsFromSnowflake($connector, $llgIds, $creditorMap);
+
+                // Repair anything that cannot survive the INSERT, and abort here if the
+                // damage is structural. Must run BEFORE the delete below: discovering a
+                // bad value mid-insert is what left this table half-written on 2026-09-10.
+                $rows = $this->sanitizeRows($connector, $rows, $source);
 
                 $this->info("[$source] Deleting existing settlements for source...");
                 $deleted = $this->deleteSettlementsBySource($connector, $source);
@@ -389,6 +395,58 @@ SQL;
         }
 
         return 0;
+    }
+
+    /**
+     * Repair values that TblSettlementsNGF would reject, BEFORE anything destructive runs.
+     *
+     * Division of responsibility: SqlServerRowSanitizer enforces the table's physical
+     * constraints (string widths, DECIMAL capacity) read live from INFORMATION_SCHEMA,
+     * while numericLiteral() enforces the business plausibility ceiling. The former is a
+     * storage fact, the latter a judgement about what a real debt can be — keeping them
+     * apart means a schema change updates one and a policy change the other.
+     *
+     * @param  array<int, array<string, mixed>>  $rows
+     * @return array<int, array<string, mixed>>
+     */
+    protected function sanitizeRows(DBConnector $connector, array $rows, string $source): array
+    {
+        if (empty($rows)) {
+            return $rows;
+        }
+
+        $sanitizer = SqlServerRowSanitizer::forTable($connector, 'TblSettlementsNGF', 'SyncSettlementData');
+
+        $map = [
+            'creditor'             => 'Creditor',
+            'debt_buyer'           => 'Debt_Buyer',
+            'account_number'       => 'Account_Number',
+            'status'               => 'Status',
+            'settlement_id'        => 'Settlement_ID',
+            'original_debt_amount' => 'Original_Debt_Amount',
+            'current_amount'       => 'Current_Amount',
+            'settlement_amount'    => 'Settlement_Amount',
+        ];
+
+        foreach ($rows as &$row) {
+            $id = (string) ($row['llg_id'] ?? 'unknown');
+
+            foreach ($map as $key => $column) {
+                if (array_key_exists($key, $row)) {
+                    $row[$key] = $sanitizer->clean($column, $row[$key], $id);
+                }
+            }
+        }
+        unset($row);
+
+        // Throws if the damage looks structural, so the caller never reaches the DELETE.
+        $sanitizer->assertWithinTolerance(count($rows));
+
+        if ($sanitizer->violations() > 0) {
+            $this->warn("[{$source}] Pre-flight: " . $sanitizer->summary() . '.');
+        }
+
+        return $rows;
     }
 
     protected function insertSettlements(DBConnector $connector, array $rows, string $source): int

@@ -3,6 +3,7 @@
 namespace Cmd\Reports\Console\Commands;
 
 use Cmd\Reports\Services\DBConnector;
+use Cmd\Reports\Services\SqlServerRowSanitizer;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
@@ -61,6 +62,11 @@ class SyncEPFData extends Command
 
                 $this->info("[$source] Fetching EPF rows from Snowflake...");
                 $rows = $this->fetchEpfRowsFromSnowflake($connector);
+
+                // Repair anything that cannot survive the INSERT, and abort here if the
+                // damage is structural. Must run BEFORE the delete below, or a bad value
+                // is only found mid-insert and leaves TblEPFs half-written.
+                $rows = $this->sanitizeRows($connector, $rows, $source);
 
                 $this->info("[$source] Deleting existing EPF rows for source...");
                 $deleted = $this->deleteEpfBySource($connector, $source);
@@ -639,6 +645,57 @@ SQL,
     {
         // Source already has DP_ prefix from sourceLabelForConnection
         return $source;
+    }
+
+    /**
+     * Repair values that TblEPFs would reject, BEFORE anything destructive runs.
+     *
+     * Column widths and DECIMAL capacity are read live from INFORMATION_SCHEMA by
+     * SqlServerRowSanitizer, so an ALTER cannot silently desynchronise this check.
+     * Date fields are omitted deliberately - sqlNullableDateTime() already normalises
+     * them and emits NULL for anything unparseable.
+     *
+     * @param  array<int, array<string, mixed>>  $rows
+     * @return array<int, array<string, mixed>>
+     */
+    protected function sanitizeRows(DBConnector $connector, array $rows, string $source): array
+    {
+        if (empty($rows)) {
+            return $rows;
+        }
+
+        $sanitizer = SqlServerRowSanitizer::forTable($connector, 'TblEPFs', 'SyncEPFData');
+
+        $map = [
+            'paid_to'           => 'Paid_To',
+            'amount'            => 'Amount',
+            'settlement_id'     => 'Settlement_ID',
+            'original_amount'   => 'Original_Amount',
+            'settlement_amount' => 'Settlement_Amount',
+            'creditor_name'     => 'Creditor_Name',
+            'offer_id'          => 'Offer_ID',
+            'payment_number'    => 'Payment_Number',
+        ];
+
+        foreach ($rows as &$row) {
+            $id = (string) ($row['llg_id'] ?? 'unknown');
+
+            foreach ($map as $key => $column) {
+                if (array_key_exists($key, $row)) {
+                    $row[$key] = $sanitizer->clean($column, $row[$key], $id);
+                }
+            }
+        }
+        unset($row);
+
+        // Throws if the damage looks structural, so the caller never reaches the DELETE.
+        $sanitizer->assertWithinTolerance(count($rows));
+
+        if ($sanitizer->violations() > 0) {
+            $this->warn("[{$source}] Pre-flight: " . $sanitizer->summary() . '.');
+        }
+
+        return $rows;
     }
 
     protected function insertEpfRows(DBConnector $connector, array $rows, string $source): int
