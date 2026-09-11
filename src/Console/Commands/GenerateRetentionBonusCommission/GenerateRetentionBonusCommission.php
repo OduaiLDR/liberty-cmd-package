@@ -12,7 +12,9 @@ use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
 
 /**
- * Retention Bonus Commission Report – both LDR and PLAW.
+ * Retention Lookback Commission Report – both LDR and PLAW. (Jacob, 2026-09-09: renamed from
+ * "Retention Bonus" to "Retention Lookback". Display text only — the command, class and the
+ * Bonus_Commission column keep their existing names.)
  *
  * Faithful port of VBA GenerateRetentionBonusCommission.
  * Queries Snowflake for retained clients in the previous month,
@@ -30,7 +32,7 @@ class GenerateRetentionBonusCommission extends Command
                             {--no-email : Build workbooks only, skip email}
                             {--test-recipient= : Send EVERY email (All + agent copies) only to this address}';
 
-    protected $description = 'Generate Retention Bonus Commission report for LDR and/or PLAW.';
+    protected $description = 'Generate Retention Lookback Commission report for LDR and/or PLAW.';
 
     private const SOURCE_CONFIG = [
         'ldr' => [
@@ -505,13 +507,15 @@ class GenerateRetentionBonusCommission extends Command
         bool $rosterUnavailable = false
     ): void {
         $email = new EmailSenderService();
+        // Recipient lookup key into tbl_reports — NOT display text. Renaming these would match no
+        // row and silently drop every recipient, falling back to the single oduai@ address below.
         $reportNames = ['RetentionBonusCommission', 'Retention Bonus Commission'];
-        $baseSubject = "Retention Bonus Commission - $display";
+        $baseSubject = "Retention Lookback Commission - $display";
         // HTML on BOTH paths. --test-recipient sends via sendMailHtml while the real send used
         // sendMailUsingTblReports (plain text), so a padded text block rendered correctly to the
         // list but collapsed onto one line in the test copy — meaning the test never showed what
         // Jacob would actually receive.
-        $baseBody = '<p>See attached Retention Bonus Commission - ' . htmlspecialchars($display) . '.</p>'
+        $baseBody = '<p>See attached Retention Lookback Commission - ' . htmlspecialchars($display) . '.</p>'
             . UnassignedCommissionAgents::emailBlockHtml($unassigned, $rosterUnavailable, 'retention roster');
 
         // --test-recipient: redirect EVERY email for this run to one address.

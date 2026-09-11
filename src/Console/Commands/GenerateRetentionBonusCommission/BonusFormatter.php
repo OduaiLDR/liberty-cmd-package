@@ -326,7 +326,7 @@ class BonusFormatter
             $sp->setActiveSheetIndex(0);
 
             $suffix   = $agentFilter !== null ? $this->safeFilenamePart($agentFilter) : 'All';
-            $filename = "Retention Bonus Commission - {$source} - {$suffix}.xlsx";
+            $filename = "Retention Lookback Commission - {$source} - {$suffix}.xlsx";
             $path     = storage_path("app/{$filename}");
             (new Xlsx($sp))->save($path);
 
