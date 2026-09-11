@@ -349,7 +349,29 @@ class SyncContactsCCS extends Command
     {
         $startedAt = microtime(true);
 
-        $result = $snowflake->query($this->buildQuery($startDate, $lastId, self::PAGE_SIZE));
+        try {
+            $result = $snowflake->query($this->buildQuery($startDate, $lastId, self::PAGE_SIZE));
+        } catch (\Throwable $e) {
+            // Time the FAILURE too. A page that times out is the one we most need measured,
+            // and the success path below never runs for it.
+            $failedAfter = microtime(true) - $startedAt;
+
+            $this->error(sprintf(
+                '[ERROR] Page FAILED after %.1fs (PAGE_SIZE %d, after CONTACT_ID %d).',
+                $failedAfter,
+                self::PAGE_SIZE,
+                $lastId
+            ));
+
+            Log::error('SyncContactsCCS: page fetch failed', [
+                'seconds'   => round($failedAfter, 1),
+                'page_size' => self::PAGE_SIZE,
+                'last_id'   => $lastId,
+                'error'     => $e->getMessage(),
+            ]);
+
+            throw $e;
+        }
 
         $rows    = $result['data'] ?? [];
         $elapsed = microtime(true) - $startedAt;
