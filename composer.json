@@ -17,6 +17,11 @@
       "Cmd\\Reports\\": "src/"
     }
   },
+  "autoload-dev": {
+    "psr-4": {
+      "Cmd\\Reports\\Tests\\": "tests/"
+    }
+  },
   "extra": {
     "laravel": {
       "providers": [

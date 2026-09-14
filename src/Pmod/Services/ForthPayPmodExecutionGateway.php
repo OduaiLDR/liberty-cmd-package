@@ -468,6 +468,87 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCr
         return $settlementData;
     }
 
+    public function getSettlementOffer(PmodWorkItem $workItem, string $settlementId): array
+    {
+        Log::info('PMOD: Fetching settlement offer', [
+            'settlement_id' => $settlementId,
+            'contact_id' => $workItem->contactId,
+            'tenant_id' => $workItem->tenantId,
+        ]);
+
+        $response = $this->crmClient($workItem->tenantId)
+            ->get("/settlement_offers/{$settlementId}");
+
+        if (! $response->successful()) {
+            Log::error('PMOD: Failed to fetch settlement offer', [
+                'settlement_id' => $settlementId,
+                'tenant_id' => $workItem->tenantId,
+                'status' => $response->status(),
+                'response' => $response->body(),
+            ]);
+
+            throw new \RuntimeException('Failed to fetch settlement offer');
+        }
+
+        return $this->unwrapCrmRecord($response->json());
+    }
+
+    public function updateSettlementOfferStatus(PmodWorkItem $workItem, string $settlementId, string $statusId): array
+    {
+        Log::info('PMOD: Updating settlement offer status', [
+            'settlement_id' => $settlementId,
+            'status_id' => $statusId,
+            'contact_id' => $workItem->contactId,
+            'tenant_id' => $workItem->tenantId,
+            'dry_run' => $workItem->dryRun,
+        ]);
+
+        if ($workItem->dryRun) {
+            return [
+                'settlement_id' => $settlementId,
+                'status_id' => $statusId,
+                'status' => 'dry_run',
+            ];
+        }
+
+        $response = $this->crmClient($workItem->tenantId)
+            ->put("/settlement_offers/{$settlementId}/status", [
+                'status_id' => (int) $statusId,
+            ]);
+
+        if (! $response->successful()) {
+            Log::error('PMOD: Failed to update settlement offer status', [
+                'settlement_id' => $settlementId,
+                'status_id' => $statusId,
+                'tenant_id' => $workItem->tenantId,
+                'status' => $response->status(),
+                'response' => $response->body(),
+            ]);
+
+            throw new \RuntimeException('Failed to update settlement offer status');
+        }
+
+        return $this->unwrapCrmRecord($response->json());
+    }
+
+    /**
+     * @param mixed $payload
+     * @return array<string, mixed>
+     */
+    private function unwrapCrmRecord(mixed $payload): array
+    {
+        if (! is_array($payload)) {
+            return [];
+        }
+
+        $data = $payload['response'] ?? $payload;
+        if (is_array($data) && array_is_list($data) && isset($data[0]) && is_array($data[0])) {
+            return $data[0];
+        }
+
+        return is_array($data) ? $data : [];
+    }
+
     public function resumePayments(PmodWorkItem $workItem): array
     {
         Log::info('PMOD: Resuming payments', [

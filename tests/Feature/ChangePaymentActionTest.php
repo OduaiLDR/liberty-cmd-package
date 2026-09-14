@@ -136,6 +136,16 @@ final class ChangePaymentGatewayFake implements PmodExecutionGateway
         return ['status' => 'voided', 'settlement_id' => $settlementId];
     }
 
+    public function getSettlementOffer(PmodWorkItem $workItem, string $settlementId): array
+    {
+        return ['settlement_id' => $settlementId];
+    }
+
+    public function updateSettlementOfferStatus(PmodWorkItem $workItem, string $settlementId, string $statusId): array
+    {
+        return ['settlement_id' => $settlementId, 'status_id' => $statusId];
+    }
+
     public function cancelDraft(PmodWorkItem $workItem, string $draftId): array
     {
         return ['draft_id' => $draftId, 'status' => 'cancelled'];
