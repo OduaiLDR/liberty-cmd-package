@@ -28,52 +28,89 @@ final class SettlementApprovalAction implements PmodActionHandler
 
     public function handle(PmodWorkItem $workItem): PmodResult
     {
+        $settlementId = $workItem->settlementIds[0] ?? null;
+        $trace = [
+            'contact_id' => $workItem->contactId,
+            'settlement_id' => $settlementId,
+            'company' => $workItem->company->value,
+            'tenant_id' => $workItem->tenantId,
+            'requested_by' => $workItem->requestedBy,
+            'source' => $workItem->source,
+            'idempotency_key' => $workItem->idempotencyKey,
+            'received_at' => $workItem->receivedAt,
+            'dry_run' => $workItem->dryRun,
+            'live_allowed' => $this->allowLiveDraftUpdates,
+            'eligible_status_ids' => SettlementApprovalRules::LDR_ELIGIBLE_STATUS_IDS,
+            'accepted_status_id' => SettlementApprovalRules::ACCEPTED_STATUS_ID,
+            'out_of_timestamp_status_id' => SettlementApprovalRules::LDR_OUT_OF_TIMESTAMP_STATUS_ID,
+        ];
+
         if ($workItem->company !== PmodCompany::LDR) {
             return $this->capture($workItem, 'Settlement Approval live completion is LDR only.', [
                 'reason' => 'company_not_ldr',
                 'company' => $workItem->company->value,
+                'trace' => $trace,
             ]);
         }
 
-        $settlementId = $workItem->settlementIds[0] ?? null;
         if ($settlementId === null || $settlementId === '') {
             return $this->capture($workItem, 'Settlement Approval requires a settlement ID.', [
                 'reason' => 'missing_settlement_id',
+                'trace' => $trace,
             ]);
         }
 
         $offer = $this->gateway->getSettlementOffer($workItem, $settlementId);
         $statusId = $this->statusId($offer);
+        $approvalYmd = $this->approvalDate($workItem);
+        $validUntil = $this->ymd($offer['offer_valid_date'] ?? $offer['valid_until'] ?? $offer['valid_until_date'] ?? null);
+        $startDate = $this->startDate($offer);
+        $path = SettlementApprovalRules::path($approvalYmd, $validUntil, $startDate);
+        $failedCheck = SettlementApprovalRules::failedCheck($approvalYmd, $validUntil, $startDate);
+        $targetStatus = $path === 'A'
+            ? SettlementApprovalRules::ACCEPTED_STATUS_ID
+            : ($path === 'B' ? SettlementApprovalRules::LDR_OUT_OF_TIMESTAMP_STATUS_ID : null);
+
+        $trace = array_merge($trace, [
+            'offer_status_id' => $statusId,
+            'offer_status_raw' => $offer['offer_status'] ?? $offer['offer_status_id'] ?? $offer['status_id'] ?? $offer['status'] ?? null,
+            'status_is_eligible' => SettlementApprovalRules::isLdrEligibleStatus($statusId),
+            'approval_date_pt' => $approvalYmd,
+            'valid_until' => $validUntil,
+            'start_date' => $startDate,
+            'path' => $path,
+            'failed_check' => $failedCheck,
+            'target_status_id' => $targetStatus,
+            'forth_offer' => $offer,
+        ]);
+
         if (! SettlementApprovalRules::isLdrEligibleStatus($statusId)) {
+            $trace['forth_write'] = 'none';
             return new PmodResult(
                 status: 'captured_for_manual_review',
                 message: 'Settlement Approval rejected: offer is not in a portal-eligible status.',
                 metadata: [
                     'reason' => 'ineligible_status',
                     'offer_status_id' => $statusId,
+                    'trace' => $trace,
                 ],
             );
         }
 
-        $approvalYmd = $this->approvalDate($workItem);
-        $validUntil = $this->ymd($offer['offer_valid_date'] ?? $offer['valid_until'] ?? $offer['valid_until_date'] ?? null);
-        $startDate = $this->startDate($offer);
-        $path = SettlementApprovalRules::path($approvalYmd, $validUntil, $startDate);
-        $failedCheck = SettlementApprovalRules::failedCheck($approvalYmd, $validUntil, $startDate);
-
         if ($path === null) {
+            $trace['forth_write'] = 'none';
             return $this->capture($workItem, 'Settlement Approval cannot compare Valid Until / Start Date.', [
                 'reason' => 'missing_dates',
                 'valid_until' => $validUntil,
                 'start_date' => $startDate,
+                'trace' => $trace,
             ]);
         }
 
-        $targetStatus = $path === 'A'
-            ? SettlementApprovalRules::ACCEPTED_STATUS_ID
-            : SettlementApprovalRules::LDR_OUT_OF_TIMESTAMP_STATUS_ID;
-
         if (! $this->allowLiveDraftUpdates || $workItem->dryRun) {
+            $trace['forth_write'] = 'none (dry run / live off)';
+            $trace['would_put_status_id'] = $targetStatus;
+            $trace['would_write_note'] = true;
             return new PmodResult(
                 status: 'captured_for_manual_review',
                 message: $path === 'A'
@@ -84,12 +121,16 @@ final class SettlementApprovalAction implements PmodActionHandler
                     'path' => $path,
                     'target_status_id' => $targetStatus,
                     'failed_check' => $failedCheck,
+                    'trace' => $trace,
                 ],
             );
         }
 
-        $this->gateway->updateSettlementOfferStatus($workItem, $settlementId, $targetStatus);
+        $this->gateway->updateSettlementOfferStatus($workItem, $settlementId, (string) $targetStatus);
         $this->gateway->createContactNote($workItem, $this->note($workItem, $offer, $path, $approvalYmd, $validUntil, $startDate, $failedCheck, dryRun: false));
+        $trace['forth_write'] = 'PUT status + contact note';
+        $trace['wrote_status_id'] = $targetStatus;
+        $trace['wrote_note'] = true;
 
         if ($path === 'A') {
             return new PmodResult(
@@ -99,6 +140,7 @@ final class SettlementApprovalAction implements PmodActionHandler
                     'path' => 'A',
                     'settlement_id' => $settlementId,
                     'status_id' => $targetStatus,
+                    'trace' => $trace,
                 ],
             );
         }
@@ -116,6 +158,7 @@ final class SettlementApprovalAction implements PmodActionHandler
                 'days_past' => ($approvalYmd !== null && $compared !== null)
                     ? SettlementApprovalRules::daysPast($approvalYmd, $compared)
                     : 0,
+                'trace' => $trace,
             ],
         );
     }
