@@ -139,6 +139,16 @@ final class DebtPletePmodExecutionGateway implements PmodExecutionGateway
         ];
     }
 
+    public function getSettlementOffer(PmodWorkItem $workItem, string $settlementId): array
+    {
+        throw new \RuntimeException('Settlement offer lookup is not implemented in the DebtPlete PMOD gateway.');
+    }
+
+    public function updateSettlementOfferStatus(PmodWorkItem $workItem, string $settlementId, string $statusId): array
+    {
+        throw new \RuntimeException('Settlement offer status updates are not implemented in the DebtPlete PMOD gateway.');
+    }
+
     /**
      * @param array<string, mixed> $payload
      * @return array<string, mixed>

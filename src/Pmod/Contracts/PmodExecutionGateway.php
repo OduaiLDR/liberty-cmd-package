@@ -38,6 +38,12 @@ interface PmodExecutionGateway
     /** @return array<string, mixed> */
     public function voidSettlementOffer(PmodWorkItem $workItem, string $settlementId): array;
 
+    /** @return array<string, mixed> */
+    public function getSettlementOffer(PmodWorkItem $workItem, string $settlementId): array;
+
+    /** @return array<string, mixed> */
+    public function updateSettlementOfferStatus(PmodWorkItem $workItem, string $settlementId, string $statusId): array;
+
     /** @param array<string, mixed> $payload @return array<string, mixed> */
     public function addBankAccount(PmodWorkItem $workItem, array $payload): array;
 

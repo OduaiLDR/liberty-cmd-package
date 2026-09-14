@@ -51,6 +51,16 @@ final class FakePmodExecutionGateway implements PmodExecutionGateway
     public array $voidSettlementResponses = [];
 
     /**
+     * @var array<string, array<string, mixed>>
+     */
+    public array $settlementOffers = [];
+
+    /**
+     * @var list<array<string, mixed>>
+     */
+    public array $settlementStatusUpdates = [];
+
+    /**
      * @var array<string, string>
      */
     public array $updateDraftExceptions = [];
@@ -151,6 +161,22 @@ final class FakePmodExecutionGateway implements PmodExecutionGateway
         ];
 
         return $this->voidSettlementResponses[$settlementId] ?? ['settlement_id' => $settlementId, 'status' => 'voided'];
+    }
+
+    public function getSettlementOffer(PmodWorkItem $workItem, string $settlementId): array
+    {
+        return $this->settlementOffers[$settlementId] ?? [];
+    }
+
+    public function updateSettlementOfferStatus(PmodWorkItem $workItem, string $settlementId, string $statusId): array
+    {
+        $this->settlementStatusUpdates[] = [
+            'work_item' => $workItem,
+            'settlement_id' => $settlementId,
+            'status_id' => $statusId,
+        ];
+
+        return ['settlement_id' => $settlementId, 'status_id' => $statusId];
     }
 
     public function cancelDraft(PmodWorkItem $workItem, string $draftId): array
