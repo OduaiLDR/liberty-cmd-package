@@ -876,6 +876,29 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCr
 
             $call('bank account write (POST, empty body)', 'POST', "/contacts/{$contactId}/bank-account",
                 fn () => $this->crmClient($tenantId)->post("/contacts/{$contactId}/bank-account", []));
+
+            // --- Does a sponsor need to exist as its own Forth contact first? ---
+            //
+            // This decides how much of the legacy VBA we have to rebuild. AddSponsorContact
+            // (stage 2) creates the sponsor as a separate CRM contact purely so AddSponsor
+            // (stage 3) has a Sponsor_CID to link. If Forth will take the sponsor's details
+            // inline on the bank-account write, stage 2 is unnecessary and the migration is
+            // a fraction of the size.
+            //
+            // The routing number is deliberately invalid (Forth enforces a 9-digit ABA), so
+            // this CANNOT succeed and nothing can be set on the contact. What we are reading
+            // is WHICH complaint comes back:
+            //   "sponsor_id required"  -> the sponsor must pre-exist; stage 2 is needed
+            //   a routing-number error -> the sponsor fields were accepted; stage 2 is not
+            $call('sponsor inline vs sponsor_id (PUT, invalid routing so it cannot apply)',
+                'PUT', "/contacts/{$contactId}/bank-account",
+                fn () => $this->crmClient($tenantId)->put("/contacts/{$contactId}/bank-account", [
+                    'sponsor'             => true,
+                    'account_holder_name' => 'PROBE ONLY DO NOT USE',
+                    'account_type'        => 'checking',
+                    'routing_number'      => '000000000',
+                    'account_number'      => '000000000',
+                ]));
         }
 
         Log::info('PMOD: probeCreditorAndBankingEndpoints', $out);

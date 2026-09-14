@@ -95,14 +95,39 @@ class Formatter
     private const CAPITAL_REPORT_MONTH_YEAR = ['Tranche Date'];
     private const CAPITAL_REPORT_TEXT = ['Tranche'];
 
+    /** Peel Offs sheet: table titles in the order the PRD lists them, keyed by PeelOffsBuilder type. */
+    private const PEEL_OFF_TABLES = [
+        'nsf' => 'NSF Peel Offs',
+        'cancel' => 'Cancel Peel Offs',
+        'unprocessed' => 'Unprocessed Peel Offs',
+    ];
+
+    /** PRD §4: the fields, in this order. Key => header. */
+    private const PEEL_OFF_COLUMNS = [
+        'LLG_ID' => 'LLG_ID',
+        'Client' => 'Client',
+        'Agent' => 'Agent',
+        'Debt_Amount' => 'Debt_Amount',
+        'First_Payment_Date' => 'First_Payment_Date',
+        'Cancel_Date' => 'Cancel_Date',
+        'NSF_Date' => 'NSF_Date',
+        'Company' => 'Company',
+    ];
+
+    private const PEEL_OFF_DATE_COLUMNS = ['First_Payment_Date', 'Cancel_Date', 'NSF_Date'];
+
+    /** PRD §6: subtotal / summary order — Progress Law, then LDR, then the grand total. */
+    private const PEEL_OFF_COMPANIES = [PeelOffsBuilder::COMPANY_PROGRESS_LAW, PeelOffsBuilder::COMPANY_LDR];
+
     /**
-     * Builds the combined workbook: Enrollment Summary, Tranche Summary, Capital Report.
+     * Builds the combined workbook: Enrollment Summary, Peel Offs, Tranche Summary, Capital Report.
      *
      * @param array<int, array<string, mixed>> $enrollmentRows Ordered row definitions from the command.
      * @param string[] $columnKeys e.g. ['Total', 'LDR', 'Legal']
      * @param array<int, array<string, mixed>>|null $trancheRows
      * @param array{rows: array<int, array<string, mixed>>, totals: array<string, mixed>}|null $capitalReport
      * @param array<int, array{label: string, contacts: int, fee: ?float, residual: float, projection: float, bold: bool}>|null $monthlyResiduals
+     * @param array{nsf: array<int, array<string, mixed>>, cancel: array<int, array<string, mixed>>, unprocessed: array<int, array<string, mixed>>}|null $peelOffs
      */
     public function buildWorkbook(
         array $enrollmentRows,
@@ -110,7 +135,8 @@ class Formatter
         string $reportDate,
         ?array $trancheRows = null,
         ?array $capitalReport = null,
-        ?array $monthlyResiduals = null
+        ?array $monthlyResiduals = null,
+        ?array $peelOffs = null
     ): ?array {
         if (empty($enrollmentRows)) {
             return null;
@@ -123,6 +149,10 @@ class Formatter
         $spreadsheet->removeSheetByIndex(0);
 
         $this->buildEnrollmentSummarySheet($spreadsheet, $enrollmentRows, $columnKeys, $reportDate);
+
+        if ($peelOffs !== null) {
+            $this->buildPeelOffsSheet($spreadsheet, $peelOffs, $reportDate);
+        }
 
         if ($trancheRows !== null) {
             $this->buildTrancheSummarySheet($spreadsheet, $trancheRows);
@@ -194,7 +224,7 @@ class Formatter
         }
 
         $html .= '</table>';
-        $html .= '<p style="margin-top:12px;font-size:11px;color:#888;">Full workbook attached (Enrollment Summary, Tranche Summary, Capital Report).</p>';
+        $html .= '<p style="margin-top:12px;font-size:11px;color:#888;">Full workbook attached (Enrollment Summary, Peel Offs, Tranche Summary, Capital Report).</p>';
 
         return $html;
     }
@@ -282,6 +312,168 @@ class Formatter
         $sheet->getStyle("A3:{$lastColLetter}{$lastRow}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
         $sheet->getStyle("A1:{$lastColLetter}{$lastRow}")->getFont()->setName('Calibri')->setSize(9);
         $sheet->setSelectedCells('B1');
+    }
+
+    /**
+     * "Peel Offs" sheet (PRD 2026-09-10 §3–§6): three tables — NSF, Cancel, Unprocessed — each with
+     * the eight PRD fields, rows grouped Progress Law then LDR, a subtotal per company and a grand
+     * total; then a combined summary by company at the bottom.
+     *
+     * @param array{nsf: array<int, array<string, mixed>>, cancel: array<int, array<string, mixed>>, unprocessed: array<int, array<string, mixed>>} $peelOffs
+     */
+    private function buildPeelOffsSheet(Spreadsheet $spreadsheet, array $peelOffs, string $reportDate): void
+    {
+        $sheet = $spreadsheet->createSheet();
+        $sheet->setTitle('Peel Offs');
+        $sheet->setShowGridlines(false);
+
+        $columnKeys = array_keys(self::PEEL_OFF_COLUMNS);
+        $lastColLetter = $this->columnLetter(count($columnKeys));
+        $debtCol = $this->columnLetter(array_search('Debt_Amount', $columnKeys, true) + 1);
+
+        foreach (['A' => 16, 'B' => 28, 'C' => 24, 'D' => 15, 'E' => 18, 'F' => 14, 'G' => 14, 'H' => 14] as $letter => $width) {
+            $sheet->getColumnDimension($letter)->setWidth($width);
+        }
+
+        $sheet->setCellValue('A1', 'Peel Offs For ' . date('n/j/Y', strtotime($reportDate)));
+        $sheet->getStyle('A1')->getFont()->setBold(true);
+
+        $rowIndex = 3;
+        /** @var array<string, array<string, array{count: int, debt: float}>> $summary type => company => totals */
+        $summary = [];
+
+        foreach (self::PEEL_OFF_TABLES as $type => $title) {
+            $rows = $peelOffs[$type] ?? [];
+
+            $sheet->setCellValue("A{$rowIndex}", $title);
+            $sheet->getStyle("A{$rowIndex}")->getFont()->setBold(true);
+            $rowIndex++;
+
+            $col = 'A';
+            foreach (self::PEEL_OFF_COLUMNS as $header) {
+                $sheet->setCellValue("{$col}{$rowIndex}", $header);
+                $col++;
+            }
+            $sheet->getStyle("A{$rowIndex}:{$lastColLetter}{$rowIndex}")->applyFromArray([
+                'font' => ['bold' => true],
+                'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER, 'wrapText' => true],
+                'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['argb' => 'FF8EA9DB']],
+            ]);
+            $tableTop = $rowIndex;
+            $rowIndex++;
+
+            $grand = ['count' => 0, 'debt' => 0.0];
+            foreach (self::PEEL_OFF_COMPANIES as $company) {
+                $subtotal = ['count' => 0, 'debt' => 0.0];
+                foreach ($rows as $row) {
+                    if (($row['Company'] ?? '') !== $company) {
+                        continue;
+                    }
+                    $this->writePeelOffRow($sheet, $columnKeys, $row, $rowIndex);
+                    $subtotal['count']++;
+                    $subtotal['debt'] += (float) $row['Debt_Amount'];
+                    $rowIndex++;
+                }
+
+                $this->writePeelOffTotalRow($sheet, $lastColLetter, $debtCol, "{$company} Subtotal ({$subtotal['count']})", $subtotal['debt'], $rowIndex);
+                $rowIndex++;
+
+                $summary[$type][$company] = $subtotal;
+                $grand['count'] += $subtotal['count'];
+                $grand['debt'] += $subtotal['debt'];
+            }
+
+            $this->writePeelOffTotalRow($sheet, $lastColLetter, $debtCol, "Grand Total ({$grand['count']})", $grand['debt'], $rowIndex);
+            $sheet->getStyle("A{$tableTop}:{$lastColLetter}{$rowIndex}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
+            $rowIndex += 2;
+        }
+
+        // Combined summary: Category | Progress Law | LDR | Grand Total, one row per table plus All.
+        $sheet->setCellValue("A{$rowIndex}", 'Peel Offs Summary');
+        $sheet->getStyle("A{$rowIndex}")->getFont()->setBold(true);
+        $rowIndex++;
+
+        $summaryTop = $rowIndex;
+        $summaryHeaders = array_merge(['Category'], self::PEEL_OFF_COMPANIES, ['Grand Total']);
+        $col = 'A';
+        foreach ($summaryHeaders as $header) {
+            $sheet->setCellValue("{$col}{$rowIndex}", $header);
+            $col++;
+        }
+        $sheet->getStyle("A{$rowIndex}:D{$rowIndex}")->applyFromArray([
+            'font' => ['bold' => true],
+            'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER],
+            'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['argb' => 'FF8EA9DB']],
+        ]);
+        $rowIndex++;
+
+        $all = array_fill_keys(self::PEEL_OFF_COMPANIES, 0.0);
+        foreach (self::PEEL_OFF_TABLES as $type => $title) {
+            $sheet->setCellValue("A{$rowIndex}", $title);
+            $col = 'B';
+            $rowTotal = 0.0;
+            foreach (self::PEEL_OFF_COMPANIES as $company) {
+                $debt = $summary[$type][$company]['debt'] ?? 0.0;
+                $sheet->setCellValue("{$col}{$rowIndex}", $debt);
+                $all[$company] += $debt;
+                $rowTotal += $debt;
+                $col++;
+            }
+            $sheet->setCellValue("{$col}{$rowIndex}", $rowTotal);
+            $rowIndex++;
+        }
+
+        $sheet->setCellValue("A{$rowIndex}", 'All Peel Offs');
+        $col = 'B';
+        foreach (self::PEEL_OFF_COMPANIES as $company) {
+            $sheet->setCellValue("{$col}{$rowIndex}", $all[$company]);
+            $col++;
+        }
+        $sheet->setCellValue("{$col}{$rowIndex}", array_sum($all));
+        $sheet->getStyle("A{$rowIndex}:D{$rowIndex}")->getFont()->setBold(true);
+
+        $sheet->getStyle("B" . ($summaryTop + 1) . ":D{$rowIndex}")->getNumberFormat()->setFormatCode('$#,##0.00');
+        $sheet->getStyle("A{$summaryTop}:D{$rowIndex}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
+
+        $sheet->getStyle("A1:{$lastColLetter}{$rowIndex}")->getFont()->setName('Calibri')->setSize(9);
+        $sheet->setSelectedCells('A1');
+    }
+
+    /**
+     * @param string[] $columnKeys
+     * @param array<string, mixed> $row
+     */
+    private function writePeelOffRow($sheet, array $columnKeys, array $row, int $rowIndex): void
+    {
+        $col = 'A';
+        foreach ($columnKeys as $key) {
+            $value = $row[$key] ?? null;
+            $cell = "{$col}{$rowIndex}";
+
+            if (in_array($key, self::PEEL_OFF_DATE_COLUMNS, true)) {
+                if ($value !== null && $value !== '') {
+                    $sheet->setCellValue($cell, ExcelDate::dateTimeToExcel(new \DateTimeImmutable((string) $value)));
+                    $sheet->getStyle($cell)->getNumberFormat()->setFormatCode('m/d/yyyy');
+                }
+            } elseif ($key === 'Debt_Amount') {
+                $sheet->setCellValue($cell, (float) $value);
+                $sheet->getStyle($cell)->getNumberFormat()->setFormatCode('$#,##0.00');
+            } else {
+                $sheet->setCellValue($cell, (string) $value);
+            }
+            $col++;
+        }
+    }
+
+    private function writePeelOffTotalRow($sheet, string $lastColLetter, string $debtCol, string $label, float $debt, int $rowIndex): void
+    {
+        $sheet->setCellValue("A{$rowIndex}", $label);
+        $sheet->setCellValue("{$debtCol}{$rowIndex}", $debt);
+        $sheet->getStyle("{$debtCol}{$rowIndex}")->getNumberFormat()->setFormatCode('$#,##0.00');
+        $sheet->getStyle("A{$rowIndex}:{$lastColLetter}{$rowIndex}")->applyFromArray([
+            'font' => ['bold' => true],
+            'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => 'D9D9D9']],
+        ]);
     }
 
     /**
