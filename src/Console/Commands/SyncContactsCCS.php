@@ -409,6 +409,26 @@ class SyncContactsCCS extends Command
         return $rows;
     }
 
+    /**
+     * Build one page of the CCS contact feed.
+     *
+     * Shape: narrow first, then enrich.
+     *
+     * The previous version joined every relation against the whole of CONTACTS and only
+     * applied LIMIT at the very end, after QUALIFY had collapsed the fan-out. That made
+     * LIMIT meaningless as a cost control — a LIMIT 1000 page measured 301.8s against a
+     * LIMIT 50000 page at ~301s, i.e. the cost was structural, not volume-driven, and both
+     * tripped Snowflake's 300s statement timeout.
+     *
+     * Now a `candidates` CTE resolves the page's contact IDs using only the cheap
+     * predicates, and every expensive relation is joined to that small set:
+     *
+     *   - DEBTS is aggregated over the page's contacts instead of the entire table.
+     *   - The eight CONTACTS_USERFIELDS subqueries collapse into one scan with conditional
+     *     aggregation, so the table is read once per page rather than eight times.
+     *   - CONTACTS_STATUS is deduplicated to one row per contact before the join, so the
+     *     one-to-many explosion never reaches the outer query.
+     */
     private function buildQuery(string $startDate, int $lastId, int $limit): string
     {
         $cfLoan     = self::CF_LOAN_AMOUNT_NEEDED;
@@ -421,7 +441,72 @@ class SyncContactsCCS extends Command
         $cfFreq     = self::CF_PAYMENT_FREQUENCY;
         $start      = $this->esc($startDate);
 
+        $customIds = implode(', ', [
+            $cfLoan, $cfEnrolled, $cfDropped, $cfPayments,
+            $cfFpc, $cfFpr, $cfFpa, $cfFreq,
+        ]);
+
         return "
+            WITH candidates AS (
+                -- The page's contact IDs, resolved with the cheap predicates only.
+                -- GROUP BY collapses the CONTACTS_ASSIGNED fan-out: a contact qualifies if
+                -- any of its assignment rows satisfies the watermark, which is what the old
+                -- row-level WHERE did before QUALIFY reduced it back to one row.
+                SELECT c.ID
+                FROM CONTACTS AS c
+                JOIN DATA_SOURCES AS ds                ON c.C_SOURCE = ds.ID
+                LEFT JOIN CONTACTS_ASSIGNED AS a       ON c.ID = a.CONTACT_ID
+                WHERE UPPER(ds.NAME) LIKE 'FF-%'
+                  AND c.DEL = 'FALSE'
+                  AND COALESCE(c.FIRSTNAME, '') <> ''
+                  AND CONVERT_TIMEZONE('America/Los_Angeles', COALESCE(c.MODIFIED, a.STAMP, c.CREATED)) >= '{$start}'::TIMESTAMP_NTZ
+                  AND c.ID > {$lastId}
+                GROUP BY c.ID
+                ORDER BY c.ID
+                LIMIT {$limit}
+            ),
+            assigned AS (
+                -- Most recent assignment per contact. The old query left the fan-out in
+                -- place and let QUALIFY pick arbitrarily among the rows; MAX makes
+                -- ASSIGNED_ON deterministic and matches the column's intent.
+                SELECT a.CONTACT_ID, MAX(a.STAMP) AS STAMP
+                FROM CONTACTS_ASSIGNED AS a
+                JOIN candidates AS k ON a.CONTACT_ID = k.ID
+                GROUP BY a.CONTACT_ID
+            ),
+            status AS (
+                -- Current status per contact. STAMP ties are common (4,638 contacts, many
+                -- with conflicting titles), so ID breaks them; without it 'current status'
+                -- is not reproducible between runs.
+                SELECT s.CONTACT_ID, s.STAGE_ID, s.STATUS_ID, s.STAMP
+                FROM CONTACTS_STATUS AS s
+                JOIN candidates AS k ON s.CONTACT_ID = k.ID
+                QUALIFY ROW_NUMBER() OVER (PARTITION BY s.CONTACT_ID ORDER BY s.STAMP DESC, s.ID DESC) = 1
+            ),
+            debts AS (
+                SELECT d.CONTACT_ID, SUM(d.ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT
+                FROM DEBTS AS d
+                JOIN candidates AS k ON d.CONTACT_ID = k.ID
+                WHERE d.ENROLLED = 1
+                GROUP BY d.CONTACT_ID
+            ),
+            userfields AS (
+                -- One scan instead of eight self-joins over the same table.
+                SELECT
+                    uf.CONTACT_ID,
+                    MAX(CASE WHEN uf.CUSTOM_ID = {$cfLoan}     THEN uf.F_DECIMAL     END) AS LOAN_AMOUNT_NEEDED,
+                    MAX(CASE WHEN uf.CUSTOM_ID = {$cfEnrolled} THEN uf.F_DATE        END) AS ENROLLMENT_DATE,
+                    MAX(CASE WHEN uf.CUSTOM_ID = {$cfDropped}  THEN uf.F_DATE        END) AS DROPPED_DATE,
+                    MAX(CASE WHEN uf.CUSTOM_ID = {$cfPayments} THEN uf.F_NUMERIC     END) AS PAYMENTS,
+                    MAX(CASE WHEN uf.CUSTOM_ID = {$cfFpc}      THEN uf.F_DATE        END) AS FPC_DATE,
+                    MAX(CASE WHEN uf.CUSTOM_ID = {$cfFpr}      THEN uf.F_DATE        END) AS FPR_DATE,
+                    MAX(CASE WHEN uf.CUSTOM_ID = {$cfFpa}      THEN uf.F_DECIMAL     END) AS FIRST_PAYMENT_AMOUNT,
+                    MAX(CASE WHEN uf.CUSTOM_ID = {$cfFreq}     THEN uf.F_SHORTSTRING END) AS PAYMENT_FREQUENCY
+                FROM CONTACTS_USERFIELDS AS uf
+                JOIN candidates AS k ON uf.CONTACT_ID = k.ID
+                WHERE uf.CUSTOM_ID IN ({$customIds})
+                GROUP BY uf.CONTACT_ID
+            )
             SELECT
                 TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', c.CREATED), 'YYYY-MM-DD HH24:MI:SS')             AS CREATED,
                 TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', a.STAMP), 'YYYY-MM-DD HH24:MI:SS')               AS ASSIGNED_ON,
@@ -447,49 +532,35 @@ class SyncContactsCCS extends Command
                     CHARINDEX('Day30', cr.METADATA) - CHARINDEX('RevolvingCreditUtilization', cr.METADATA) - 32
                 )                                                                                                 AS CREDIT_UTILIZATION,
                 d.ENROLLED_DEBT,
-                uf_loan.F_DECIMAL                                                                                 AS LOAN_AMOUNT_NEEDED,
-                TO_CHAR(uf_enrolled.F_DATE, 'YYYY-MM-DD HH24:MI:SS')                                            AS ENROLLMENT_DATE,
-                TO_CHAR(uf_dropped.F_DATE, 'YYYY-MM-DD HH24:MI:SS')                                             AS DROPPED_DATE,
-                uf_payments.F_NUMERIC                                                                             AS PAYMENTS,
-                TO_CHAR(uf_fpc.F_DATE, 'YYYY-MM-DD HH24:MI:SS')                                                 AS FPC_DATE,
-                TO_CHAR(uf_fpr.F_DATE, 'YYYY-MM-DD HH24:MI:SS')                                                 AS FPR_DATE,
-                uf_fpa.F_DECIMAL                                                                                  AS FIRST_PAYMENT_AMOUNT,
-                uf_freq.F_SHORTSTRING                                                                             AS PAYMENT_FREQUENCY,
+                uf.LOAN_AMOUNT_NEEDED,
+                TO_CHAR(uf.ENROLLMENT_DATE, 'YYYY-MM-DD HH24:MI:SS')                                            AS ENROLLMENT_DATE,
+                TO_CHAR(uf.DROPPED_DATE, 'YYYY-MM-DD HH24:MI:SS')                                               AS DROPPED_DATE,
+                uf.PAYMENTS,
+                TO_CHAR(uf.FPC_DATE, 'YYYY-MM-DD HH24:MI:SS')                                                   AS FPC_DATE,
+                TO_CHAR(uf.FPR_DATE, 'YYYY-MM-DD HH24:MI:SS')                                                   AS FPR_DATE,
+                uf.FIRST_PAYMENT_AMOUNT,
+                uf.PAYMENT_FREQUENCY,
                 ed.TITLE                                                                                          AS PLAN_TITLE
-            FROM CONTACTS AS c
-            LEFT JOIN CONTACTS_ASSIGNED AS a       ON c.ID = a.CONTACT_ID
+            FROM candidates AS k
+            JOIN CONTACTS AS c                     ON c.ID = k.ID
+            LEFT JOIN assigned AS a                ON c.ID = a.CONTACT_ID
             LEFT JOIN DATA_SOURCES AS ds           ON c.C_SOURCE = ds.ID
             LEFT JOIN USERS AS u1                  ON c.CREATED_BY = u1.UID
             LEFT JOIN USERS AS u2                  ON c.ASSIGNED_TO = u2.UID
-            LEFT JOIN CONTACTS_STATUS AS s         ON c.ID = s.CONTACT_ID
+            LEFT JOIN status AS s                  ON c.ID = s.CONTACT_ID
             LEFT JOIN CONTACTS_CATEGORIES AS cc    ON s.STAGE_ID = cc.ID
             LEFT JOIN CONTACTS_LEAD_STATUS AS cls  ON s.STATUS_ID = cls.ID
             LEFT JOIN CREDIT_SCORES AS cs          ON c.ID = cs.CONTACT_ID
             LEFT JOIN CREDIT_REPORT_REQUEST AS cr  ON c.ID = cr.CONTACT_ID
-            LEFT JOIN (
-                SELECT CONTACT_ID, SUM(ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT
-                FROM DEBTS
-                WHERE ENROLLED = 1
-                GROUP BY CONTACT_ID
-            ) AS d ON c.ID = d.CONTACT_ID
+            LEFT JOIN debts AS d                   ON c.ID = d.CONTACT_ID
             LEFT JOIN ENROLLMENT_PLAN AS ep        ON c.ID = ep.CONTACT_ID
             LEFT JOIN ENROLLMENT_DEFAULTS2 AS ed   ON ep.PLAN_ID = ed.ID
-            LEFT JOIN (SELECT CONTACT_ID, F_DECIMAL     FROM CONTACTS_USERFIELDS WHERE CUSTOM_ID = {$cfLoan})     AS uf_loan     ON c.ID = uf_loan.CONTACT_ID
-            LEFT JOIN (SELECT CONTACT_ID, F_DATE        FROM CONTACTS_USERFIELDS WHERE CUSTOM_ID = {$cfEnrolled}) AS uf_enrolled  ON c.ID = uf_enrolled.CONTACT_ID
-            LEFT JOIN (SELECT CONTACT_ID, F_DATE        FROM CONTACTS_USERFIELDS WHERE CUSTOM_ID = {$cfDropped})  AS uf_dropped   ON c.ID = uf_dropped.CONTACT_ID
-            LEFT JOIN (SELECT CONTACT_ID, F_NUMERIC     FROM CONTACTS_USERFIELDS WHERE CUSTOM_ID = {$cfPayments}) AS uf_payments  ON c.ID = uf_payments.CONTACT_ID
-            LEFT JOIN (SELECT CONTACT_ID, F_DATE        FROM CONTACTS_USERFIELDS WHERE CUSTOM_ID = {$cfFpc})      AS uf_fpc       ON c.ID = uf_fpc.CONTACT_ID
-            LEFT JOIN (SELECT CONTACT_ID, F_DATE        FROM CONTACTS_USERFIELDS WHERE CUSTOM_ID = {$cfFpr})      AS uf_fpr       ON c.ID = uf_fpr.CONTACT_ID
-            LEFT JOIN (SELECT CONTACT_ID, F_DECIMAL     FROM CONTACTS_USERFIELDS WHERE CUSTOM_ID = {$cfFpa})      AS uf_fpa       ON c.ID = uf_fpa.CONTACT_ID
-            LEFT JOIN (SELECT CONTACT_ID, F_SHORTSTRING FROM CONTACTS_USERFIELDS WHERE CUSTOM_ID = {$cfFreq})     AS uf_freq      ON c.ID = uf_freq.CONTACT_ID
-            WHERE UPPER(ds.NAME) LIKE 'FF-%'
-              AND c.DEL = 'FALSE'
-              AND COALESCE(c.FIRSTNAME, '') <> ''
-              AND CONVERT_TIMEZONE('America/Los_Angeles', COALESCE(c.MODIFIED, a.STAMP, c.CREATED)) >= '{$start}'::TIMESTAMP_NTZ
-              AND c.ID > {$lastId}
-            QUALIFY ROW_NUMBER() OVER(PARTITION BY c.ID ORDER BY s.STAMP DESC) = 1
+            LEFT JOIN userfields AS uf             ON c.ID = uf.CONTACT_ID
+            -- CREDIT_SCORES, CREDIT_REPORT_REQUEST and ENROLLMENT_PLAN can still return
+            -- more than one row per contact. This collapses them exactly as the old query
+            -- did, but over the page's rows rather than the whole table.
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY c.ID ORDER BY s.STAMP DESC) = 1
             ORDER BY c.ID
-            LIMIT {$limit}
         ";
     }
 
