@@ -4,6 +4,7 @@ namespace Cmd\Reports\Console\Commands;
 
 use Cmd\Reports\Services\DBConnector;
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Log;
 
 class ImportMissingEnrollments extends Command
@@ -83,6 +84,25 @@ class ImportMissingEnrollments extends Command
 
         $this->info("\n" . str_repeat('=', 60));
         $this->info("[DONE] Total inserted: {$totalInserted} | Agent fixes applied: {$fixed}");
+
+        $this->info('[INFO] Running Sync Submitted Dates...');
+        $syncExitCode = Artisan::call('sync:submitted-date', $dryRun ? ['--dry-run' => true] : []);
+        $syncOutput = Artisan::output();
+
+        if ($syncOutput !== '') {
+            $this->line($syncOutput);
+        }
+
+        if ($syncExitCode !== Command::SUCCESS) {
+            $this->error('[ERROR] Sync Submitted Dates failed.');
+            Log::error('ImportMissingEnrollments: submitted date sync failed', [
+                'exit_code' => $syncExitCode,
+                'dry_run' => $dryRun,
+            ]);
+            return Command::FAILURE;
+        }
+
+        $this->info('[INFO] Sync Submitted Dates completed successfully.');
 
         return Command::SUCCESS;
     }
