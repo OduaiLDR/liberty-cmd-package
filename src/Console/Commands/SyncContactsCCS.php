@@ -420,7 +420,7 @@ class SyncContactsCCS extends Command
      * LIMIT 50000 page at ~301s, i.e. the cost was structural, not volume-driven, and both
      * tripped Snowflake's 300s statement timeout.
      *
-     * Now a `candidates` CTE resolves the page's contact IDs using only the cheap
+     * Now a `page_ids` CTE resolves the page's contact IDs using only the cheap
      * predicates, and every expensive relation is joined to that small set:
      *
      *   - DEBTS is aggregated over the page's contacts instead of the entire table.
@@ -447,7 +447,7 @@ class SyncContactsCCS extends Command
         ]);
 
         return "
-            WITH candidates AS (
+            WITH page_ids AS (
                 -- The page's contact IDs, resolved with the cheap predicates only.
                 -- GROUP BY collapses the CONTACTS_ASSIGNED fan-out: a contact qualifies if
                 -- any of its assignment rows satisfies the watermark, which is what the old
@@ -465,32 +465,32 @@ class SyncContactsCCS extends Command
                 ORDER BY c.ID
                 LIMIT {$limit}
             ),
-            assigned AS (
+            page_assigned AS (
                 -- Most recent assignment per contact. The old query left the fan-out in
                 -- place and let QUALIFY pick arbitrarily among the rows; MAX makes
                 -- ASSIGNED_ON deterministic and matches the column's intent.
                 SELECT a.CONTACT_ID, MAX(a.STAMP) AS STAMP
                 FROM CONTACTS_ASSIGNED AS a
-                JOIN candidates AS k ON a.CONTACT_ID = k.ID
+                JOIN page_ids AS k ON a.CONTACT_ID = k.ID
                 GROUP BY a.CONTACT_ID
             ),
-            status AS (
+            page_status AS (
                 -- Current status per contact. STAMP ties are common (4,638 contacts, many
                 -- with conflicting titles), so ID breaks them; without it 'current status'
                 -- is not reproducible between runs.
                 SELECT s.CONTACT_ID, s.STAGE_ID, s.STATUS_ID, s.STAMP
                 FROM CONTACTS_STATUS AS s
-                JOIN candidates AS k ON s.CONTACT_ID = k.ID
+                JOIN page_ids AS k ON s.CONTACT_ID = k.ID
                 QUALIFY ROW_NUMBER() OVER (PARTITION BY s.CONTACT_ID ORDER BY s.STAMP DESC, s.ID DESC) = 1
             ),
-            debts AS (
+            page_debts AS (
                 SELECT d.CONTACT_ID, SUM(d.ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT
                 FROM DEBTS AS d
-                JOIN candidates AS k ON d.CONTACT_ID = k.ID
+                JOIN page_ids AS k ON d.CONTACT_ID = k.ID
                 WHERE d.ENROLLED = 1
                 GROUP BY d.CONTACT_ID
             ),
-            userfields AS (
+            page_userfields AS (
                 -- One scan instead of eight self-joins over the same table.
                 SELECT
                     uf.CONTACT_ID,
@@ -503,7 +503,7 @@ class SyncContactsCCS extends Command
                     MAX(CASE WHEN uf.CUSTOM_ID = {$cfFpa}      THEN uf.F_DECIMAL     END) AS FIRST_PAYMENT_AMOUNT,
                     MAX(CASE WHEN uf.CUSTOM_ID = {$cfFreq}     THEN uf.F_SHORTSTRING END) AS PAYMENT_FREQUENCY
                 FROM CONTACTS_USERFIELDS AS uf
-                JOIN candidates AS k ON uf.CONTACT_ID = k.ID
+                JOIN page_ids AS k ON uf.CONTACT_ID = k.ID
                 WHERE uf.CUSTOM_ID IN ({$customIds})
                 GROUP BY uf.CONTACT_ID
             )
@@ -541,21 +541,21 @@ class SyncContactsCCS extends Command
                 uf.FIRST_PAYMENT_AMOUNT,
                 uf.PAYMENT_FREQUENCY,
                 ed.TITLE                                                                                          AS PLAN_TITLE
-            FROM candidates AS k
-            JOIN CONTACTS AS c                     ON c.ID = k.ID
-            LEFT JOIN assigned AS a                ON c.ID = a.CONTACT_ID
-            LEFT JOIN DATA_SOURCES AS ds           ON c.C_SOURCE = ds.ID
-            LEFT JOIN USERS AS u1                  ON c.CREATED_BY = u1.UID
-            LEFT JOIN USERS AS u2                  ON c.ASSIGNED_TO = u2.UID
-            LEFT JOIN status AS s                  ON c.ID = s.CONTACT_ID
-            LEFT JOIN CONTACTS_CATEGORIES AS cc    ON s.STAGE_ID = cc.ID
-            LEFT JOIN CONTACTS_LEAD_STATUS AS cls  ON s.STATUS_ID = cls.ID
-            LEFT JOIN CREDIT_SCORES AS cs          ON c.ID = cs.CONTACT_ID
-            LEFT JOIN CREDIT_REPORT_REQUEST AS cr  ON c.ID = cr.CONTACT_ID
-            LEFT JOIN debts AS d                   ON c.ID = d.CONTACT_ID
-            LEFT JOIN ENROLLMENT_PLAN AS ep        ON c.ID = ep.CONTACT_ID
-            LEFT JOIN ENROLLMENT_DEFAULTS2 AS ed   ON ep.PLAN_ID = ed.ID
-            LEFT JOIN userfields AS uf             ON c.ID = uf.CONTACT_ID
+            FROM page_ids AS k
+            JOIN CONTACTS AS c                        ON c.ID = k.ID
+            LEFT JOIN page_assigned AS a              ON c.ID = a.CONTACT_ID
+            LEFT JOIN DATA_SOURCES AS ds              ON c.C_SOURCE = ds.ID
+            LEFT JOIN USERS AS u1                     ON c.CREATED_BY = u1.UID
+            LEFT JOIN USERS AS u2                     ON c.ASSIGNED_TO = u2.UID
+            LEFT JOIN page_status AS s                ON c.ID = s.CONTACT_ID
+            LEFT JOIN CONTACTS_CATEGORIES AS cc       ON s.STAGE_ID = cc.ID
+            LEFT JOIN CONTACTS_LEAD_STATUS AS cls     ON s.STATUS_ID = cls.ID
+            LEFT JOIN CREDIT_SCORES AS cs             ON c.ID = cs.CONTACT_ID
+            LEFT JOIN CREDIT_REPORT_REQUEST AS cr     ON c.ID = cr.CONTACT_ID
+            LEFT JOIN page_debts AS d                 ON c.ID = d.CONTACT_ID
+            LEFT JOIN ENROLLMENT_PLAN AS ep           ON c.ID = ep.CONTACT_ID
+            LEFT JOIN ENROLLMENT_DEFAULTS2 AS ed      ON ep.PLAN_ID = ed.ID
+            LEFT JOIN page_userfields AS uf           ON c.ID = uf.CONTACT_ID
             -- CREDIT_SCORES, CREDIT_REPORT_REQUEST and ENROLLMENT_PLAN can still return
             -- more than one row per contact. This collapses them exactly as the old query
             -- did, but over the page's rows rather than the whole table.
