@@ -65,10 +65,10 @@ class EnrollmentSummaryPeelOffsSheetTest extends TestCase
         $this->assertSame(['NSF Peel Offs', 'Cancel Peel Offs', 'Unprocessed Peel Offs', 'Peel Offs Summary'], array_keys($titles));
 
         // PRD §4 field order on every table header row.
-        $expectedHeaders = ['LLG_ID', 'Client', 'Agent', 'Debt_Amount', 'First_Payment_Date', 'Cancel_Date', 'NSF_Date', 'Company'];
+        $expectedHeaders = ['LLG_ID', 'Client', 'Agent', 'Debt_Amount', 'First_Payment_Date', 'Cancel_Date', 'NSF_Date', 'Company', 'Paying In'];
         foreach (['NSF Peel Offs', 'Cancel Peel Offs', 'Unprocessed Peel Offs'] as $title) {
             $headerRow = $titles[$title] + 1;
-            $this->assertSame($expectedHeaders, $this->rowValues($sheet, $headerRow, 8), $title);
+            $this->assertSame($expectedHeaders, $this->rowValues($sheet, $headerRow, 9), $title);
         }
     }
 
@@ -78,7 +78,7 @@ class EnrollmentSummaryPeelOffsSheetTest extends TestCase
         $start = $this->cellsInColumnA($sheet, ['Unprocessed Peel Offs'])['Unprocessed Peel Offs'] + 2;
 
         // Data rows arrive pre-sorted from the builder; the sheet groups them by company.
-        $this->assertSame(['LLG-U3', 'Ursula', 'Agent U', 1000.0, null, null, null, 'Progress Law'], $this->rowValues($sheet, $start, 8));
+        $this->assertSame(['LLG-U3', 'Ursula', 'Agent U', 1000.0, null, null, null, 'Progress Law', 'August'], $this->rowValues($sheet, $start, 9));
         $this->assertSame('Progress Law Subtotal (1)', $sheet->getCell('A' . ($start + 1))->getValue());
         $this->assertSame(1000.0, $sheet->getCell('D' . ($start + 1))->getValue());
 
@@ -144,7 +144,7 @@ class EnrollmentSummaryPeelOffsSheetTest extends TestCase
             'LLG_ID' => $llg, 'Client' => $client, 'Agent' => 'Agent ' . substr($llg, 4, 1), 'Debt_Amount' => $debt,
             'First_Payment_Date' => '2026-08-05', 'Cancel_Date' => null, 'NSF_Date' => null,
             'Enrollment_Plan' => $company === 'Progress Law' ? 'Progress Law 29%' : 'LDR 29%',
-            'Payment_Date' => '2026-08-05', 'Unprocessed_Date' => '2026-08-09', 'Company' => $company,
+            'Payment_Date' => '2026-08-05', 'Unprocessed_Date' => '2026-08-09', 'Company' => $company, 'Paying_In' => '2026-08', 'Paying_In_Label' => 'August',
         ], $extra);
 
         $peelOffs = [

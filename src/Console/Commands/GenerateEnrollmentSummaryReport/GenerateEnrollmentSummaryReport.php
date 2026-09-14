@@ -77,23 +77,30 @@ class GenerateEnrollmentSummaryReport extends Command
                     : round($this->trailing6SellableRatio * 100) . '%'
             ));
 
-            // Peel offs (PRD 2026-09-10) are scoped to the window's FIRST month only; the future
-            // months are unchanged. Collected once here on the Total population (the column split
-            // is applied in PHP) so the summary rows and the Peel Offs sheet come from one query.
-            [$firstMonthStart, $firstMonthEnd] = $this->windowFirstMonthBounds($windowDate);
-            $this->peelOffs = new PeelOffsBuilder($connector, $snapshotDate, $firstMonthStart, $firstMonthEnd, self::COLUMNS['Total']);
+            // Peel offs (PRD 2026-09-10; every window month since Jacob's 2026-09-14 12:08 ask).
+            // Collected once here on the Total population for the whole window (the column and
+            // month splits are applied in PHP) so the summary rows and the Peel Offs sheet come
+            // from one query.
+            [$windowStart, $windowEnd] = $this->windowBounds($windowDate);
+            $this->peelOffs = new PeelOffsBuilder($connector, $snapshotDate, $windowStart, $windowEnd, self::COLUMNS['Total']);
             $peelOffRows = $this->peelOffs->collect();
             foreach ($this->peelOffs->warnings() as $warning) {
                 $this->warn('[WARN] ' . $warning);
             }
+            $byMonth = [];
+            foreach ($peelOffRows['unprocessed'] as $row) {
+                $byMonth[$row['Paying_In_Label']] = ($byMonth[$row['Paying_In_Label']] ?? 0) + 1;
+            }
             $this->info(sprintf(
-                '[INFO] Peel offs for %s (paying %s): NSF %d, Cancel %d, Unprocessed %d (newly since %s).',
+                '[INFO] Peel offs for %s (window %s to %s): NSF %d, Cancel %d, Unprocessed %d (newly since %s%s).',
                 $snapshotDate,
-                date('F', strtotime($firstMonthStart)),
+                $windowStart,
+                $windowEnd,
                 count($peelOffRows['nsf']),
                 count($peelOffRows['cancel']),
                 count($peelOffRows['unprocessed']),
-                PeelOffsBuilder::previousReportDate($snapshotDate)
+                PeelOffsBuilder::previousReportDate($snapshotDate),
+                $byMonth === [] ? '' : '; ' . implode(', ', array_map(fn ($m, $n) => "{$m}: {$n}", array_keys($byMonth), $byMonth))
             ));
 
             foreach (self::COLUMNS as $columnKey => $criteria) {
@@ -313,11 +320,9 @@ class GenerateEnrollmentSummaryReport extends Command
     {
         // VBA: StartDate = first day of ReportDate's month (no offset); EndDate = last day of the
         // month containing ReportDate + 45 days.
-        $start = new \DateTime($this->windowFirstMonthBounds($windowDate)[0]);
-
-        $end = new \DateTime($windowDate);
-        $end->modify('+45 days');
-        $end->modify('last day of this month');
+        [$windowStart, $windowEnd] = $this->windowBounds($windowDate);
+        $start = new \DateTime($windowStart);
+        $end = new \DateTime($windowEnd);
 
         $cursor = clone $start;
         $monthIndex = 0;
@@ -347,14 +352,13 @@ class GenerateEnrollmentSummaryReport extends Command
             // PRD 2026-09-10 §2: a client already recorded as an Unprocessed Peel Off on an earlier
             // report is not counted again as an NSF or Cancel peel off. Applied to the count rows as
             // well as the debt rows so each block stays internally consistent, and to EVERY month:
-            // Jacob's 2026-09-14 answer ("only the current month is needed, the first payment date
-            // no longer moves") is not what the syncs do — sync:first-payment-date still recomputes
-            // First_Payment_Date to the first cleared-or-returned draft, so a client whose first
-            // draft never processed and whose new draft bounces moves into the NEXT month's bucket.
-            // Excluding there too is what keeps "peeled off only once" true either way; the
-            // Unprocessed rows themselves stay first-month-only as the PRD asks.
-            $isFirstMonth = $monthIndex === 1 && $this->peelOffs !== null;
-            $peelOffExclusion = $this->peelOffs !== null ? $this->peelOffs->ledgerExclusionSql() : '';
+            // sync:first-payment-date still recomputes First_Payment_Date to the first
+            // cleared-or-returned draft, so a client whose first draft never processed and whose new
+            // draft bounces moves into the NEXT month's bucket. The Unprocessed rows are on every
+            // month too (Jacob 2026-09-14 12:08): while the report is anchored a month behind, the
+            // newly-unprocessed payments are the second month's; the third month is always 0.
+            $hasPeelOffs = $this->peelOffs !== null;
+            $peelOffExclusion = $hasPeelOffs ? $this->peelOffs->ledgerExclusionSql() : '';
 
             $grossNew = (int) $this->scalar($connector, "
                 SELECT COUNT(*) FROM TblEnrollment
@@ -377,11 +381,10 @@ class GenerateEnrollmentSummaryReport extends Command
             ", [$snapshotDate, $monthStart, $monthEnd]);
             $this->setRow("NSFs of Client's Paying in {$monthLabel}", $columnKey, $nsfs, 'count');
 
-            // PRD §1.1: Unprocessed Peel Offs — count here, debt below — first month only. The Net
-            // rows subtract them like the other two peel-off types; leaving Net untouched would put
-            // a peel-off row inside the block that the block's own arithmetic ignores.
-            $unprocessed = $isFirstMonth ? $this->peelOffs->aggregate('unprocessed', $columnKey) : ['count' => 0, 'debt' => 0.0];
-            if ($isFirstMonth) {
+            // PRD §1.1: Unprocessed Peel Offs — count here, debt below — for this month's payers.
+            // The Net rows subtract them like the other two peel-off types (Jacob 2026-09-14 10:54).
+            $unprocessed = $hasPeelOffs ? $this->peelOffs->aggregate('unprocessed', $columnKey, $monthStart) : ['count' => 0, 'debt' => 0.0];
+            if ($hasPeelOffs) {
                 $this->setRow("Unprocessed Payments of Client's Paying in {$monthLabel}", $columnKey, $unprocessed['count'], 'count');
             }
 
@@ -408,7 +411,7 @@ class GenerateEnrollmentSummaryReport extends Command
             ", [$snapshotDate, $monthStart, $monthEnd]);
             $this->setRow("NSF Peel Offs Paying in {$monthLabel}", $columnKey, $debtNsf, 'currency');
 
-            if ($isFirstMonth) {
+            if ($hasPeelOffs) {
                 $this->setRow("Unprocessed Peel Offs Paying in {$monthLabel}", $columnKey, $unprocessed['debt'], 'currency');
             }
 
@@ -690,16 +693,20 @@ class GenerateEnrollmentSummaryReport extends Command
     }
 
     /**
-     * First and last day of the window's first month — the month being tranched, and the only month
-     * the peel-off changes apply to. Mirrors the VBA's StartDate (first day of ReportDate's month).
+     * First day of the window's first month and last day of its last month — the VBA's StartDate
+     * (first day of ReportDate's month) and EndDate (last day of the month containing
+     * ReportDate + 45 days). One place, so the month buckets and the peel offs cannot drift.
      *
      * @return array{0: string, 1: string}
      */
-    private function windowFirstMonthBounds(string $windowDate): array
+    private function windowBounds(string $windowDate): array
     {
-        $start = (new \DateTimeImmutable($windowDate))->modify('first day of this month');
+        $date = new \DateTimeImmutable($windowDate);
 
-        return [$start->format('Y-m-d'), $start->modify('last day of this month')->format('Y-m-d')];
+        return [
+            $date->modify('first day of this month')->format('Y-m-d'),
+            $date->modify('+45 days')->modify('last day of this month')->format('Y-m-d'),
+        ];
     }
 
     /**

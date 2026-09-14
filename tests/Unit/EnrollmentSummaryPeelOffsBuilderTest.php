@@ -16,7 +16,7 @@ use Illuminate\Support\Facades\Facade;
  */
 class EnrollmentSummaryPeelOffsBuilderTest extends TestCase
 {
-    private const AUG = ['2026-08-01', '2026-08-31'];
+    private const WINDOW = ['2026-08-01', '2026-10-31'];   // Aug (tranche month), Sep, Oct
     private const CRITERIA = "AND State NOT IN ('WI') ";
 
     protected function setUp(): void
@@ -103,7 +103,7 @@ class EnrollmentSummaryPeelOffsBuilderTest extends TestCase
         $this->assertSame($fridayUpper, $lower);
     }
 
-    public function test_unprocessed_query_requires_no_clear_no_cancel_no_nsf_and_the_first_month(): void
+    public function test_unprocessed_query_requires_no_clear_no_cancel_no_nsf_and_the_window(): void
     {
         $connector = $this->connector();
         $this->builder($connector, '2026-08-19')->collect();
@@ -114,7 +114,7 @@ class EnrollmentSummaryPeelOffsBuilderTest extends TestCase
         $this->assertStringContainsString('Cancel_Date IS NULL AND NSF_Date IS NULL', $sql);
         $this->assertStringContainsString(self::CRITERIA, $sql);
         $this->assertStringContainsString('NOT EXISTS', $sql);
-        $this->assertSame(['2026-08-01', '2026-08-31', '2026-08-16', '2026-08-15'], $calls[0]['params']);
+        $this->assertSame(['2026-08-01', '2026-10-31', '2026-08-16', '2026-08-15'], $calls[0]['params']);
     }
 
     public function test_nsf_and_cancel_queries_exclude_clients_ledgered_before_the_report_date(): void
@@ -127,7 +127,7 @@ class EnrollmentSummaryPeelOffsBuilderTest extends TestCase
             $this->assertCount(1, $calls, $pattern);
             $this->assertStringContainsString("l.Peel_Off_Type = 'Unprocessed'", $calls[0]['sql']);
             $this->assertStringContainsString("l.Report_Date < '2026-08-19'", $calls[0]['sql']);
-            $this->assertSame(['2026-08-19', '2026-08-01', '2026-08-31'], $calls[0]['params']);
+            $this->assertSame(['2026-08-19', '2026-08-01', '2026-10-31'], $calls[0]['params']);
         }
     }
 
@@ -177,7 +177,7 @@ class EnrollmentSummaryPeelOffsBuilderTest extends TestCase
             $this->assertStringNotContainsString('NOT EXISTS', $call['sql']);
         }
         $this->assertSame(['nsf', 'cancel', 'unprocessed'], array_keys($rows));
-        $this->assertSame(['attempted' => 3, 'written' => 0, 'failed' => 0], $builder->writeLedger(), 'nothing is written without a ledger');
+        $this->assertSame(['attempted' => 4, 'written' => 0, 'failed' => 0], $builder->writeLedger(), 'nothing is written without a ledger');
     }
 
     public function test_rows_are_normalised_grouped_progress_law_first_and_sorted_by_debt_desc(): void
@@ -185,9 +185,9 @@ class EnrollmentSummaryPeelOffsBuilderTest extends TestCase
         $rows = $this->builder($this->connector(), '2026-08-19')->collect();
 
         $this->assertSame(
-            ['LLG-3', 'LLG-1', 'LLG-2'],
+            ['LLG-3', 'LLG-1', 'LLG-2', 'LLG-4'],
             array_column($rows['unprocessed'], 'LLG_ID'),
-            'Progress Law first, then LDR, largest debt first within each'
+            'Progress Law first, then LDR, largest debt first within each (months interleave; Paying In tells them apart)'
         );
         $progress = $rows['unprocessed'][0];
         $this->assertSame('Progress Law', $progress['Company']);
@@ -212,11 +212,31 @@ class EnrollmentSummaryPeelOffsBuilderTest extends TestCase
     {
         $builder = $this->builder($this->connector(), '2026-08-19');
 
-        $this->assertSame(['count' => 3, 'debt' => 6500.5], $builder->aggregate('unprocessed', 'Total'));
-        $this->assertSame(['count' => 2, 'debt' => 4000.0], $builder->aggregate('unprocessed', 'LDR'));
+        // Whole window.
+        $this->assertSame(['count' => 4, 'debt' => 7200.5], $builder->aggregate('unprocessed', 'Total'));
+        $this->assertSame(['count' => 3, 'debt' => 4700.0], $builder->aggregate('unprocessed', 'LDR'));
         $this->assertSame(['count' => 1, 'debt' => 2500.5], $builder->aggregate('unprocessed', 'Legal'));
         $this->assertSame(['count' => 1, 'debt' => 800.0], $builder->aggregate('nsf', 'Total'));
         $this->assertSame(['count' => 0, 'debt' => 0.0], $builder->aggregate('cancel', 'Legal'));
+    }
+
+    /**
+     * Jacob 2026-09-14 12:08: the Unprocessed rows go on every month block. Each block takes only
+     * the clients paying in its month; a month with nobody (the third, always) reads 0.
+     */
+    public function test_aggregate_can_be_narrowed_to_one_paying_month(): void
+    {
+        $builder = $this->builder($this->connector(), '2026-08-19');
+
+        $this->assertSame(['count' => 3, 'debt' => 6500.5], $builder->aggregate('unprocessed', 'Total', '2026-08-01'));
+        $this->assertSame(['count' => 1, 'debt' => 700.0], $builder->aggregate('unprocessed', 'Total', '2026-09-01'));
+        $this->assertSame(['count' => 1, 'debt' => 700.0], $builder->aggregate('unprocessed', 'LDR', '2026-09-15'), 'any day of the month selects it');
+        $this->assertSame(['count' => 0, 'debt' => 0.0], $builder->aggregate('unprocessed', 'Total', '2026-10-01'));
+
+        $september = array_values(array_filter($builder->collect()['unprocessed'], static fn (array $r): bool => $r['LLG_ID'] === 'LLG-4'))[0];
+        $this->assertSame('2026-09', $september['Paying_In']);
+        $this->assertSame('September', $september['Paying_In_Label']);
+        $this->assertSame('2026-09-07', $september['Unprocessed_Date']);
     }
 
     public function test_write_ledger_inserts_each_newly_unprocessed_row_once(): void
@@ -233,8 +253,8 @@ class EnrollmentSummaryPeelOffsBuilderTest extends TestCase
         ]);
         $builder = $this->builder($connector, '2026-08-19');
 
-        $this->assertSame(['attempted' => 3, 'written' => 3, 'failed' => 0], $builder->writeLedger());
-        $this->assertSame(['attempted' => 3, 'written' => 0, 'failed' => 0], $builder->writeLedger(), 'a same-day re-run records nothing new');
+        $this->assertSame(['attempted' => 4, 'written' => 4, 'failed' => 0], $builder->writeLedger());
+        $this->assertSame(['attempted' => 4, 'written' => 0, 'failed' => 0], $builder->writeLedger(), 'a same-day re-run records nothing new');
 
         $first = $connector->callsMatching('/INSERT INTO dbo\.TblEnrollmentPeelOffs/')[0];
         $this->assertStringContainsString('WHERE NOT EXISTS', $first['sql']);
@@ -248,13 +268,13 @@ class EnrollmentSummaryPeelOffsBuilderTest extends TestCase
             '/INSERT INTO dbo\.TblEnrollmentPeelOffs/' => ['success' => false, 'error' => 'deadlock', 'data' => []],
         ]);
 
-        $this->assertSame(['attempted' => 3, 'written' => 0, 'failed' => 3], $this->builder($connector, '2026-08-19')->writeLedger());
+        $this->assertSame(['attempted' => 4, 'written' => 0, 'failed' => 4], $this->builder($connector, '2026-08-19')->writeLedger());
     }
 
     public function test_dates_must_be_iso_because_they_are_inlined_into_sql(): void
     {
         $this->expectException(\InvalidArgumentException::class);
-        new PeelOffsBuilder($this->connector(), "2026-08-19' OR 1=1 --", self::AUG[0], self::AUG[1], self::CRITERIA);
+        new PeelOffsBuilder($this->connector(), "2026-08-19' OR 1=1 --", self::WINDOW[0], self::WINDOW[1], self::CRITERIA);
     }
 
     /**
@@ -271,7 +291,7 @@ class EnrollmentSummaryPeelOffsBuilderTest extends TestCase
 
     private function builder(RecordingSqlServerConnector $connector, string $reportDate): PeelOffsBuilder
     {
-        return new PeelOffsBuilder($connector, $reportDate, self::AUG[0], self::AUG[1], self::CRITERIA);
+        return new PeelOffsBuilder($connector, $reportDate, self::WINDOW[0], self::WINDOW[1], self::CRITERIA);
     }
 
     /**
@@ -297,6 +317,7 @@ class EnrollmentSummaryPeelOffsBuilderTest extends TestCase
                 $row('LLG-1', 'Ada', 3000.0, 'LDR 29% - with PLAW legal $17.95', ['First_Payment_Date' => '2026-08-14 00:00:00.000']),
                 $row('LLG-2', 'Bob', 1000.0, 'LDR 29%'),
                 $row('LLG-3', 'Cy', 2500.5, 'Progress Law 29% with ProLaw'),
+                $row('LLG-4', 'Dan', 700.0, 'LDR 29%', ['Payment_Date' => '2026-09-03']),   // a September payer
             ]],
             '/WHERE NSF_Date = \?/' => ['success' => true, 'data' => [
                 $row('LLG-9', 'Dee', 800.0, 'LDR 29%', ['NSF_Date' => '2026-08-19']),

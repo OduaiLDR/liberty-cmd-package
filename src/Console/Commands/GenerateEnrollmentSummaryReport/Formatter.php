@@ -102,7 +102,11 @@ class Formatter
         'unprocessed' => 'Unprocessed Peel Offs',
     ];
 
-    /** PRD §4: the fields, in this order. Key => header. */
+    /**
+     * PRD §4: the eight fields, in this order. Key => header. "Paying In" was appended on 2026-09-14
+     * when the sheet grew from the tranche month to every window month — it names the month block
+     * each row belongs to, which First_Payment_Date alone cannot when that column is blank.
+     */
     private const PEEL_OFF_COLUMNS = [
         'LLG_ID' => 'LLG_ID',
         'Client' => 'Client',
@@ -112,6 +116,7 @@ class Formatter
         'Cancel_Date' => 'Cancel_Date',
         'NSF_Date' => 'NSF_Date',
         'Company' => 'Company',
+        'Paying_In_Label' => 'Paying In',
     ];
 
     private const PEEL_OFF_DATE_COLUMNS = ['First_Payment_Date', 'Cancel_Date', 'NSF_Date'];
@@ -331,7 +336,7 @@ class Formatter
         $lastColLetter = $this->columnLetter(count($columnKeys));
         $debtCol = $this->columnLetter(array_search('Debt_Amount', $columnKeys, true) + 1);
 
-        foreach (['A' => 16, 'B' => 28, 'C' => 24, 'D' => 15, 'E' => 18, 'F' => 14, 'G' => 14, 'H' => 14] as $letter => $width) {
+        foreach (['A' => 16, 'B' => 28, 'C' => 24, 'D' => 15, 'E' => 18, 'F' => 14, 'G' => 14, 'H' => 14, 'I' => 12] as $letter => $width) {
             $sheet->getColumnDimension($letter)->setWidth($width);
         }
 

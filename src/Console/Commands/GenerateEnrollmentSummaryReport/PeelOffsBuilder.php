@@ -6,10 +6,13 @@ use Cmd\Reports\Services\DBConnector;
 use Illuminate\Support\Facades\Log;
 
 /**
- * Peel-off detail for the report window's FIRST month (the month being tranched) — Jacob's
- * "Enrollment Summary Report — Peel Offs Update" PRD, 2026-09-10.
+ * Peel-off detail for the report window (the tranche month plus the following months) — Jacob's
+ * "Enrollment Summary Report — Peel Offs Update" PRD, 2026-09-10, widened on 2026-09-14 12:08 from
+ * the first month to every month in the window ("since we have the report stay a month behind for
+ * a while … add the unprocessed to the second month and for consistency … the 3rd").
  *
- * Three populations, all restricted to clients whose coalesced payment date falls in month 1:
+ * Three populations, all restricted to clients whose coalesced payment date falls in the window;
+ * each row carries the month it is paying in so the summary rows can be split per month:
  *
  *   nsf          NSF_Date    = report date
  *   cancel       Cancel_Date = report date
@@ -18,6 +21,9 @@ use Illuminate\Support\Facades\Log;
  *
  * "Newly" is a date window ending on the report date and starting after the previous weekday, so a
  * Monday report picks up Saturday and Sunday (PRD §1.3). The report does not run on weekends.
+ * Because a payment only becomes unprocessed GRACE + 1 days after its date, the newly-unprocessed
+ * rows always sit in the calendar month of "a few days ago" — the tranche month while it is still
+ * running, the following month once the report is anchored a month behind, and never the third.
  *
  * The NSF and Cancel sets EXCLUDE any client already recorded as an unprocessed peel off on an
  * earlier report date (PRD §2) — that record lives in the ledger table below, because it cannot be
@@ -55,14 +61,18 @@ class PeelOffsBuilder
     /** @var list<string> */
     private array $warnings = [];
 
+    /**
+     * @param string $windowStart First day of the window's first month (Y-m-d)
+     * @param string $windowEnd   Last day of the window's last month (Y-m-d)
+     */
     public function __construct(
         private readonly DBConnector $connector,
         private readonly string $reportDate,
-        private readonly string $monthStart,
-        private readonly string $monthEnd,
+        private readonly string $windowStart,
+        private readonly string $windowEnd,
         private readonly string $criteria,
     ) {
-        foreach (['reportDate' => $reportDate, 'monthStart' => $monthStart, 'monthEnd' => $monthEnd] as $name => $value) {
+        foreach (['reportDate' => $reportDate, 'windowStart' => $windowStart, 'windowEnd' => $windowEnd] as $name => $value) {
             if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $value)) {
                 throw new \InvalidArgumentException("PeelOffsBuilder: {$name} must be Y-m-d, got '{$value}'.");
             }
@@ -153,12 +163,12 @@ class PeelOffsBuilder
         $nsf = $this->fetch("{$select}
             WHERE NSF_Date = ?
               AND {$paid} >= ? AND {$paid} <= ? {$this->criteria} {$exclusion}
-        ", [$this->reportDate, $this->monthStart, $this->monthEnd]);
+        ", [$this->reportDate, $this->windowStart, $this->windowEnd]);
 
         $cancel = $this->fetch("{$select}
             WHERE Cancel_Date = ?
               AND {$paid} >= ? AND {$paid} <= ? {$this->criteria} {$exclusion}
-        ", [$this->reportDate, $this->monthStart, $this->monthEnd]);
+        ", [$this->reportDate, $this->windowStart, $this->windowEnd]);
 
         // Newly unprocessed = unprocessed on the report date but NOT on the previous report date:
         //   paid <  cutoff(reportDate)      (unprocessed today)
@@ -172,8 +182,8 @@ class PeelOffsBuilder
               AND {$paid} <  ?
               AND {$paid} >= ? {$this->criteria} {$exclusion}
         ", [
-            $this->monthStart,
-            $this->monthEnd,
+            $this->windowStart,
+            $this->windowEnd,
             self::unprocessedCutoff($this->reportDate),
             self::unprocessedCutoff(self::previousReportDate($this->reportDate)),
         ]);
@@ -189,16 +199,18 @@ class PeelOffsBuilder
 
     /**
      * Count and debt for one peel-off type as seen from one report column (Total / LDR / Legal),
-     * using the same Enrollment_Plan split as the column criteria.
+     * using the same Enrollment_Plan split as the column criteria — for one "paying in" month when
+     * $monthStart (Y-m-d, any day of the month) is given, otherwise across the whole window.
      *
      * @return array{count: int, debt: float}
      */
-    public function aggregate(string $type, string $columnKey): array
+    public function aggregate(string $type, string $columnKey, ?string $monthStart = null): array
     {
+        $month = $monthStart === null ? null : substr($monthStart, 0, 7);
         $count = 0;
         $debt = 0.0;
         foreach ($this->collect()[$type] ?? [] as $row) {
-            if (!$this->rowInColumn($row, $columnKey)) {
+            if (!$this->rowInColumn($row, $columnKey) || ($month !== null && $row['Paying_In'] !== $month)) {
                 continue;
             }
             $count++;
@@ -241,7 +253,7 @@ class PeelOffsBuilder
                 $row['Payment_Date'],
                 $row['Unprocessed_Date'],
                 $row['Debt_Amount'],
-                $this->monthStart,
+                $row['Paying_In'] === null ? null : $row['Paying_In'] . '-01',   // Window_Month = the month the payment is in
                 $row['LLG_ID'],
                 $type,
             ]);
@@ -345,6 +357,10 @@ class PeelOffsBuilder
                     ->modify('+' . (self::UNPROCESSED_GRACE_DAYS + 1) . ' days')
                     ->format('Y-m-d'),
                 'Company' => self::companyFor($row['Enrollment_Plan'] ?? null),
+                // The month bucket this client's payment falls in: 'Y-m' for matching the summary
+                // rows, and the month name the sheet prints ("Paying in August" uses the same).
+                'Paying_In' => $paymentDate === null ? null : substr($paymentDate, 0, 7),
+                'Paying_In_Label' => $paymentDate === null ? '' : (new \DateTimeImmutable($paymentDate))->format('F'),
             ];
         }
 

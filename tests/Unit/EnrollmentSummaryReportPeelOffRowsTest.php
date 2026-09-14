@@ -14,9 +14,9 @@ use ReflectionMethod;
 use ReflectionProperty;
 
 /**
- * The month-bucket rows of the Enrollment Summary sheet after the 2026-09-10 PRD: the first month
- * gains the Unprocessed rows and the ledger exclusion; the future months are byte-for-byte the old
- * behaviour.
+ * The month-bucket rows of the Enrollment Summary sheet after the 2026-09-10 PRD and Jacob's 14 Sep
+ * widening: every month block gains the Unprocessed rows (each month its own payers) and the
+ * ledger exclusion; everything else in the blocks is the old behaviour.
  */
 class EnrollmentSummaryReportPeelOffRowsTest extends TestCase
 {
@@ -45,7 +45,7 @@ class EnrollmentSummaryReportPeelOffRowsTest extends TestCase
         parent::tearDown();
     }
 
-    public function test_first_month_gets_unprocessed_rows_and_the_exclusion_and_future_months_do_not(): void
+    public function test_every_month_gets_unprocessed_rows_and_the_exclusion(): void
     {
         [$rows, $connector] = $this->buildTotalColumn();
         $labels = array_column($rows, 'label');
@@ -71,16 +71,29 @@ class EnrollmentSummaryReportPeelOffRowsTest extends TestCase
         $this->assertSame(150.0, $this->value($rows, 'Unprocessed Peel Offs Paying in August'));
         $this->assertSame(1000.0 - 300.0 - 200.0 - 150.0, $this->value($rows, 'Total Net Debt Enrolled Paying in August'));
 
-        // Future months: no Unprocessed rows, but the NSF / Cancel exclusion applies there too — a
-        // client whose first draft never processed moves into a later bucket when the new draft
-        // bounces (First_Payment_Date is recomputed), and must not be peeled a second time there.
+        // Jacob 2026-09-14 12:08: the Unprocessed rows are on every month block, each holding only
+        // its own month's payers — September has one client ($70), October (a future month) is 0.
+        // The NSF / Cancel exclusion applies to every month too: a client whose first draft never
+        // processed moves into a later bucket when the new draft bounces (First_Payment_Date is
+        // recomputed) and must not be peeled a second time there.
+        $this->assertSame(1, $this->value($rows, "Unprocessed Payments of Client's Paying in September"));
+        $this->assertSame(70.0, $this->value($rows, 'Unprocessed Peel Offs Paying in September'));
+        $this->assertSame(10 - 3 - 2 - 1, $this->value($rows, 'Net New Clients Paying in September'));
+        $this->assertSame(1000.0 - 300.0 - 200.0 - 70.0, $this->value($rows, 'Total Net Debt Enrolled Paying in September'));
+
+        $this->assertSame(0, $this->value($rows, "Unprocessed Payments of Client's Paying in October"));
+        $this->assertSame(0.0, $this->value($rows, 'Unprocessed Peel Offs Paying in October'));
+        $this->assertSame(10 - 3 - 2, $this->value($rows, 'Net New Clients Paying in October'));
+        $this->assertSame(1000.0 - 300.0 - 200.0, $this->value($rows, 'Total Net Debt Enrolled Paying in October'));
+
         foreach (['September', 'October'] as $month) {
-            $this->assertNotContains("Unprocessed Payments of Client's Paying in {$month}", $labels);
-            $this->assertNotContains("Unprocessed Peel Offs Paying in {$month}", $labels);
+            $this->assertSame(
+                ["NSFs of Client's Paying in {$month}", "Unprocessed Payments of Client's Paying in {$month}", "Net New Clients Paying in {$month}"],
+                array_slice($labels, array_search("NSFs of Client's Paying in {$month}", $labels, true), 3),
+                "{$month}: same placement as the first month"
+            );
             $this->assertSame(3, $this->value($rows, "Cancels of Client's Paying in {$month}"));
             $this->assertSame(2, $this->value($rows, "NSFs of Client's Paying in {$month}"));
-            $this->assertSame(10 - 3 - 2, $this->value($rows, "Net New Clients Paying in {$month}"));
-            $this->assertSame(1000.0 - 300.0 - 200.0, $this->value($rows, "Total Net Debt Enrolled Paying in {$month}"));
         }
 
         // The exclusion clause reached the four NSF / Cancel statements of every month (3 months)
@@ -125,10 +138,10 @@ class EnrollmentSummaryReportPeelOffRowsTest extends TestCase
             return ['success' => true, 'data' => [['v' => $value]], 'row_count' => 1];
         };
 
-        $peelOffRow = static fn (string $llg, float $debt, string $plan): array => [
+        $peelOffRow = static fn (string $llg, float $debt, string $plan, string $paid = '2026-08-05'): array => [
             'LLG_ID' => $llg, 'Client' => 'C', 'Agent' => 'A', 'Debt_Amount' => (string) $debt,
             'First_Payment_Date' => null, 'Cancel_Date' => null, 'NSF_Date' => null,
-            'Enrollment_Plan' => $plan, 'Payment_Date' => '2026-08-05',
+            'Enrollment_Plan' => $plan, 'Payment_Date' => $paid,
         ];
 
         $connector = new RecordingSqlServerConnector([
@@ -136,13 +149,14 @@ class EnrollmentSummaryReportPeelOffRowsTest extends TestCase
             '/First_Payment_Cleared_Date IS NULL/' => ['success' => true, 'data' => [
                 $peelOffRow('LLG-1', 100.0, 'LDR 29%'),
                 $peelOffRow('LLG-2', 50.0, 'Progress Law 29%'),
+                $peelOffRow('LLG-3', 70.0, 'LDR 29%', '2026-09-03'),   // a September payer
             ]],
             '/SELECT LLG_ID, Client, Agent/' => ['success' => true, 'data' => [], 'row_count' => 0],
             '/^\s*SELECT (COUNT|SUM)/' => $scalar,
         ]);
 
         $command = new GenerateEnrollmentSummaryReport();
-        $builder = new PeelOffsBuilder($connector, self::SNAPSHOT, '2026-08-01', '2026-08-31', self::CRITERIA);
+        $builder = new PeelOffsBuilder($connector, self::SNAPSHOT, '2026-08-01', '2026-10-31', self::CRITERIA);
         $builder->collect();
 
         $property = new ReflectionProperty($command, 'peelOffs');
