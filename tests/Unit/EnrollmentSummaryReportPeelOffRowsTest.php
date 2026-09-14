@@ -156,7 +156,7 @@ class EnrollmentSummaryReportPeelOffRowsTest extends TestCase
         ]);
 
         $command = new GenerateEnrollmentSummaryReport();
-        $builder = new PeelOffsBuilder($connector, self::SNAPSHOT, '2026-08-01', '2026-10-31', self::CRITERIA);
+        $builder = new PeelOffsBuilder($connector, self::SNAPSHOT, '2026-08-01', '2026-10-31', self::CRITERIA, static fn (): array => []);
         $builder->collect();
 
         $property = new ReflectionProperty($command, 'peelOffs');

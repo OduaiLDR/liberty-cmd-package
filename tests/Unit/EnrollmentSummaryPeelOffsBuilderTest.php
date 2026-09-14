@@ -271,6 +271,67 @@ class EnrollmentSummaryPeelOffsBuilderTest extends TestCase
         $this->assertSame(['attempted' => 4, 'written' => 0, 'failed' => 4], $this->builder($connector, '2026-08-19')->writeLedger());
     }
 
+    /**
+     * Jacob 2026-09-14 13:07 — Cancel > NSF > Unprocessed, and "we don't want to over count".
+     * TblEnrollment learns of a bounce days late, so a candidate whose draft Forth shows as returned
+     * is an NSF in transit, not unprocessed; a cleared one is a payment in transit. Neither is
+     * reported (nor ledgered), so the NSF row picks the bounce up untouched once NSF_Date lands.
+     */
+    public function test_candidates_forth_shows_as_returned_or_cleared_are_not_unprocessed(): void
+    {
+        $calls = [];
+        $forth = static function (string $source, array $ids, string $date) use (&$calls): array {
+            $calls[] = [$source, $ids, $date];
+
+            return match ($source) {
+                'ldr' => [
+                    '1' => ['cleared' => false, 'returned' => true],    // LLG-1: bounced -> NSF in transit
+                    '2' => ['cleared' => true, 'returned' => false],    // LLG-2: cleared -> payment in transit
+                    // LLG-4: no draft on record at all -> stays unprocessed
+                ],
+                'plaw' => [
+                    '3' => ['cleared' => false, 'returned' => false],   // LLG-3: a draft with no activity -> stays
+                ],
+            };
+        };
+
+        $builder = $this->builder($this->connector(), '2026-08-19', $forth);
+        $rows = $builder->collect();
+
+        $this->assertSame(['LLG-3', 'LLG-4'], array_column($rows['unprocessed'], 'LLG_ID'));
+        $this->assertSame(['returned' => 1, 'cleared' => 1], $builder->forthDropped());
+        $this->assertSame(['count' => 2, 'debt' => 3200.5], $builder->aggregate('unprocessed', 'Total'));
+        $this->assertSame(['attempted' => 2, 'written' => 0, 'failed' => 0], $builder->writeLedger(), 'only the survivors would be ledgered');
+
+        // One lookup per Forth account, with only that account's contacts, bare ids, report date.
+        usort($calls, static fn (array $a, array $b): int => strcmp($a[0], $b[0]));
+        $this->assertSame(['ldr', ['1', '2', '4'], '2026-08-19'], [$calls[0][0], array_map('strval', $calls[0][1]), $calls[0][2]]);
+        $this->assertSame(['plaw', ['3'], '2026-08-19'], [$calls[1][0], array_map('strval', $calls[1][1]), $calls[1][2]]);
+    }
+
+    public function test_a_failed_forth_lookup_fails_the_run_rather_than_guessing(): void
+    {
+        $builder = $this->builder($this->connector(), '2026-08-19', static function (): array {
+            throw new \RuntimeException('Peel-off Forth check failed for LDR: Snowflake 503');
+        });
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('Forth check failed');
+        $builder->collect();
+    }
+
+    public function test_a_cancelled_client_is_never_an_nsf_peel_off(): void
+    {
+        $connector = $this->connector();
+        $this->builder($connector, '2026-08-19')->collect();
+
+        $nsf = $connector->callsMatching('/WHERE NSF_Date = \?/')[0]['sql'];
+        $this->assertStringContainsString('WHERE NSF_Date = ? AND Cancel_Date IS NULL', $nsf);
+
+        $cancel = $connector->callsMatching('/WHERE Cancel_Date = \?/')[0]['sql'];
+        $this->assertStringNotContainsString('NSF_Date IS NULL', $cancel, 'a cancel counts regardless of any NSF');
+    }
+
     public function test_dates_must_be_iso_because_they_are_inlined_into_sql(): void
     {
         $this->expectException(\InvalidArgumentException::class);
@@ -289,9 +350,19 @@ class EnrollmentSummaryPeelOffsBuilderTest extends TestCase
         return [$params[3], $params[2]];
     }
 
-    private function builder(RecordingSqlServerConnector $connector, string $reportDate): PeelOffsBuilder
+    /**
+     * @param callable|null $forth draft-activity lookup; default = Forth knows nothing, every candidate stays
+     */
+    private function builder(RecordingSqlServerConnector $connector, string $reportDate, ?callable $forth = null): PeelOffsBuilder
     {
-        return new PeelOffsBuilder($connector, $reportDate, self::WINDOW[0], self::WINDOW[1], self::CRITERIA);
+        return new PeelOffsBuilder(
+            $connector,
+            $reportDate,
+            self::WINDOW[0],
+            self::WINDOW[1],
+            self::CRITERIA,
+            $forth ?? static fn (string $source, array $ids, string $date): array => []
+        );
     }
 
     /**

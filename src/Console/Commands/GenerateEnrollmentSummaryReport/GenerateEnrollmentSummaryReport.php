@@ -91,8 +91,9 @@ class GenerateEnrollmentSummaryReport extends Command
             foreach ($peelOffRows['unprocessed'] as $row) {
                 $byMonth[$row['Paying_In_Label']] = ($byMonth[$row['Paying_In_Label']] ?? 0) + 1;
             }
+            $forthDropped = $this->peelOffs->forthDropped();
             $this->info(sprintf(
-                '[INFO] Peel offs for %s (window %s to %s): NSF %d, Cancel %d, Unprocessed %d (newly since %s%s).',
+                '[INFO] Peel offs for %s (window %s to %s): NSF %d, Cancel %d, Unprocessed %d (newly since %s%s; Forth check removed %d returned, %d cleared).',
                 $snapshotDate,
                 $windowStart,
                 $windowEnd,
@@ -100,7 +101,9 @@ class GenerateEnrollmentSummaryReport extends Command
                 count($peelOffRows['cancel']),
                 count($peelOffRows['unprocessed']),
                 PeelOffsBuilder::previousReportDate($snapshotDate),
-                $byMonth === [] ? '' : '; ' . implode(', ', array_map(fn ($m, $n) => "{$m}: {$n}", array_keys($byMonth), $byMonth))
+                $byMonth === [] ? '' : '; ' . implode(', ', array_map(fn ($m, $n) => "{$m}: {$n}", array_keys($byMonth), $byMonth)),
+                $forthDropped['returned'],
+                $forthDropped['cleared']
             ));
 
             foreach (self::COLUMNS as $columnKey => $criteria) {
@@ -374,9 +377,10 @@ class GenerateEnrollmentSummaryReport extends Command
             ", [$snapshotDate, $monthStart, $monthEnd]);
             $this->setRow("Cancels of Client's Paying in {$monthLabel}", $columnKey, $cancels, 'count');
 
+            // Cancel outranks NSF (Jacob 2026-09-14 13:07): a cancelled client is reported as a Cancel only.
             $nsfs = (int) $this->scalar($connector, "
                 SELECT COUNT(*) FROM TblEnrollment
-                WHERE NSF_Date = ?
+                WHERE NSF_Date = ? AND Cancel_Date IS NULL
                   AND {$paidCoalesce} >= ? AND {$paidCoalesce} <= ? {$criteria} {$peelOffExclusion}
             ", [$snapshotDate, $monthStart, $monthEnd]);
             $this->setRow("NSFs of Client's Paying in {$monthLabel}", $columnKey, $nsfs, 'count');
@@ -406,7 +410,7 @@ class GenerateEnrollmentSummaryReport extends Command
 
             $debtNsf = (float) $this->scalar($connector, "
                 SELECT SUM(Debt_Amount) FROM TblEnrollment
-                WHERE NSF_Date = ?
+                WHERE NSF_Date = ? AND Cancel_Date IS NULL
                   AND {$paidCoalesce} >= ? AND {$paidCoalesce} <= ? {$criteria} {$peelOffExclusion}
             ", [$snapshotDate, $monthStart, $monthEnd]);
             $this->setRow("NSF Peel Offs Paying in {$monthLabel}", $columnKey, $debtNsf, 'currency');

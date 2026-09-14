@@ -14,16 +14,25 @@ use Illuminate\Support\Facades\Log;
  * Three populations, all restricted to clients whose coalesced payment date falls in the window;
  * each row carries the month it is paying in so the summary rows can be split per month:
  *
- *   nsf          NSF_Date    = report date
  *   cancel       Cancel_Date = report date
- *   unprocessed  the payment NEWLY became "unprocessed" since the previous report date — not cleared,
- *                no cancel, no NSF, and the grace period has run out (see UNPROCESSED_GRACE_DAYS).
+ *   nsf          NSF_Date    = report date, and no Cancel_Date — a cancel outranks an NSF
+ *   unprocessed  the payment NEWLY became "unprocessed" since the previous report date — no cancel,
+ *                no NSF, not cleared, the grace period has run out (see UNPROCESSED_GRACE_DAYS),
+ *                AND Forth shows no draft that cleared or returned (see dropResolvedInForth()).
+ *
+ * The priority is Jacob's (2026-09-14 13:07): "If someone Cancels then the Cancel takes priority …
+ * If they NSF then it counts there, and if neither then we would show as unprocessed." The Forth
+ * check exists because TblEnrollment learns of a bounce days after Forth does (ACH returns post 2–4
+ * business days after the draft, then resume-payments and sync:enrollment-status have to run):
+ * measured on 14 Sep, 40 of 72 "unprocessed" candidates had in fact returned and 1 had cleared.
+ * Without the check those 40 would be peeled as Unprocessed and never as NSF.
  *
  * "Newly" is a date window ending on the report date and starting after the previous weekday, so a
  * Monday report picks up Saturday and Sunday (PRD §1.3). The report does not run on weekends.
  * Because a payment only becomes unprocessed GRACE + 1 days after its date, the newly-unprocessed
  * rows always sit in the calendar month of "a few days ago" — the tranche month while it is still
  * running, the following month once the report is anchored a month behind, and never the third.
+ * It is not a rolling total: each day shows only what that day removed from the sellable amount.
  *
  * The NSF and Cancel sets EXCLUDE any client already recorded as an unprocessed peel off on an
  * earlier report date (PRD §2) — that record lives in the ledger table below, because it cannot be
@@ -62,6 +71,20 @@ class PeelOffsBuilder
     private array $warnings = [];
 
     /**
+     * Looks up, per Forth account, whether each contact has any draft up to the report date that
+     * cleared or returned. Signature:
+     *   fn (string $source /* 'ldr' | 'plaw' *\/, list<string> $contactIds, string $reportDate)
+     *     : array<string, array{cleared: bool, returned: bool}>   keyed by contact id; absent = no draft
+     * Defaults to a Snowflake query; injectable so tests need no Snowflake.
+     *
+     * @var callable
+     */
+    private $draftActivityLookup;
+
+    /** @var array{returned: int, cleared: int} Candidates the Forth check removed on this run. */
+    private array $forthDropped = ['returned' => 0, 'cleared' => 0];
+
+    /**
      * @param string $windowStart First day of the window's first month (Y-m-d)
      * @param string $windowEnd   Last day of the window's last month (Y-m-d)
      */
@@ -71,12 +94,20 @@ class PeelOffsBuilder
         private readonly string $windowStart,
         private readonly string $windowEnd,
         private readonly string $criteria,
+        ?callable $draftActivityLookup = null,
     ) {
         foreach (['reportDate' => $reportDate, 'windowStart' => $windowStart, 'windowEnd' => $windowEnd] as $name => $value) {
             if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $value)) {
                 throw new \InvalidArgumentException("PeelOffsBuilder: {$name} must be Y-m-d, got '{$value}'.");
             }
         }
+        $this->draftActivityLookup = $draftActivityLookup ?? \Closure::fromCallable([$this, 'lookupDraftActivityInForth']);
+    }
+
+    /** @return array{returned: int, cleared: int} */
+    public function forthDropped(): array
+    {
+        return $this->forthDropped;
     }
 
     /**
@@ -160,8 +191,9 @@ class PeelOffsBuilder
                           Enrollment_Plan, {$paid} AS Payment_Date
                    FROM TblEnrollment ";
 
+        // Cancel outranks NSF (Jacob 2026-09-14 13:07): a cancelled client is a Cancel peel off only.
         $nsf = $this->fetch("{$select}
-            WHERE NSF_Date = ?
+            WHERE NSF_Date = ? AND Cancel_Date IS NULL
               AND {$paid} >= ? AND {$paid} <= ? {$this->criteria} {$exclusion}
         ", [$this->reportDate, $this->windowStart, $this->windowEnd]);
 
@@ -191,7 +223,7 @@ class PeelOffsBuilder
         $this->rows = [
             'nsf' => $this->normalize($nsf),
             'cancel' => $this->normalize($cancel),
-            'unprocessed' => $this->normalize($newlyUnprocessed),
+            'unprocessed' => $this->dropResolvedInForth($this->normalize($newlyUnprocessed)),
         ];
 
         return $this->rows;
@@ -271,6 +303,104 @@ class PeelOffsBuilder
         }
 
         return $result;
+    }
+
+    /**
+     * Keeps only candidates whose payment really never processed: Forth (Snowflake, the client's
+     * own account) must show no draft up to the report date that cleared or returned. A returned
+     * draft is an NSF that TblEnrollment has not caught up with — it is reported as NSF once
+     * NSF_Date lands, and since it is never ledgered nothing suppresses it then. A cleared draft
+     * is a payment First_Payment_Cleared_Date has not caught up with. A cancelled/rescheduled draft
+     * with nothing else still counts as "didn't process".
+     *
+     * A lookup failure throws: guessing here is exactly the over-count Jacob does not want, and a
+     * failed run is recoverable with --snapshot-date=<day> --ledger-write=on.
+     *
+     * @param array<int, array<string, mixed>> $rows normalised candidates
+     * @return array<int, array<string, mixed>>
+     */
+    private function dropResolvedInForth(array $rows): array
+    {
+        $this->forthDropped = ['returned' => 0, 'cleared' => 0];
+        if ($rows === []) {
+            return $rows;
+        }
+
+        $bySource = [];
+        foreach ($rows as $index => $row) {
+            $contactId = preg_replace('/^LLG-/i', '', $row['LLG_ID']);
+            if (!preg_match('/^\d+$/', $contactId)) {
+                continue;   // not a Forth id; nothing to check, stays unprocessed
+            }
+            $source = $row['Company'] === self::COMPANY_PROGRESS_LAW ? 'plaw' : 'ldr';
+            $bySource[$source][$contactId] = $index;
+        }
+
+        $keep = $rows;
+        foreach ($bySource as $source => $indexByContact) {
+            $activity = ($this->draftActivityLookup)($source, array_keys($indexByContact), $this->reportDate);
+            foreach ($indexByContact as $contactId => $index) {
+                $draft = $activity[(string) $contactId] ?? null;
+                if ($draft === null) {
+                    continue;
+                }
+                if (!empty($draft['cleared'])) {
+                    $this->forthDropped['cleared']++;
+                    unset($keep[$index]);
+                } elseif (!empty($draft['returned'])) {
+                    $this->forthDropped['returned']++;
+                    unset($keep[$index]);
+                }
+            }
+        }
+
+        return array_values($keep);
+    }
+
+    /**
+     * Default draft-activity lookup: one Snowflake aggregate per account, chunked. The same
+     * cleared / returned test SyncFirstPaymentDate uses (RETURN_CODE = '' is not a return).
+     *
+     * @param list<string> $contactIds
+     * @return array<string, array{cleared: bool, returned: bool}>
+     */
+    private function lookupDraftActivityInForth(string $source, array $contactIds, string $reportDate): array
+    {
+        $connector = DBConnector::fromEnvironment($source);
+        $out = [];
+
+        foreach (array_chunk($contactIds, 500) as $chunk) {
+            $in = implode(',', array_map('intval', $chunk));
+            // "As of the report date": a clear or return dated after it does not count, so a review
+            // copy of a past day sees what that day's run would have seen.
+            $sql = "SELECT TO_VARCHAR(CONTACT_ID) AS CONTACT_ID,
+                           MAX(CASE WHEN CLEARED_DATE IS NOT NULL AND CAST(CLEARED_DATE AS DATE) <= '{$reportDate}' THEN 1 ELSE 0 END) AS CLEARED,
+                           MAX(CASE WHEN (RETURNED_DATE IS NOT NULL AND CAST(RETURNED_DATE AS DATE) <= '{$reportDate}')
+                                      OR (RETURNED_DATE IS NULL AND RETURN_CODE IS NOT NULL AND RETURN_CODE <> '') THEN 1 ELSE 0 END) AS RETURNED
+                    FROM TRANSACTIONS
+                    WHERE TRANS_TYPE = 'D' AND _FIVETRAN_DELETED = FALSE
+                      AND CONTACT_ID IN ({$in})
+                      AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', PROCESS_DATE) AS DATE) <= '{$reportDate}'
+                    GROUP BY CONTACT_ID";
+
+            $result = $connector->query($sql);
+            if (!is_array($result) || (($result['success'] ?? true) === false)) {
+                throw new \RuntimeException(sprintf(
+                    'Peel-off Forth check failed for %s: %s',
+                    strtoupper($source),
+                    is_array($result) ? ($result['error'] ?? 'unknown error') : 'no response'
+                ));
+            }
+
+            foreach ($result['data'] ?? [] as $row) {
+                $out[(string) $row['CONTACT_ID']] = [
+                    'cleared' => (int) ($row['CLEARED'] ?? 0) === 1,
+                    'returned' => (int) ($row['RETURNED'] ?? 0) === 1,
+                ];
+            }
+        }
+
+        return $out;
     }
 
     public static function companyFor(?string $enrollmentPlan): string
