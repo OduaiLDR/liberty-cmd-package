@@ -18,7 +18,7 @@ class GenerateAdvanceRequest extends Command
 
     private const TEST_RECIPIENT = 'oduai@libertydebtrelief.com';
     private const LDR_SENDER = 'NGF@libertydebtrelief.com';
-    private const PROGRESS_LAW_SENDER = 'NGR@progresslaw.com';
+    private const PROGRESS_LAW_SENDER = 'NGF@progresslaw.com';
     private const ADVANCE_TOTAL = 1000000.0;
 
     public function handle(): int
