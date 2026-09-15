@@ -3,6 +3,7 @@
 namespace Cmd\Reports;
 
 use Illuminate\Support\ServiceProvider;
+use Cmd\Reports\Console\Commands\ImportCompanyHolidays;
 use Cmd\Reports\Console\Commands\TestDatabaseConnections;
 use Cmd\Reports\Console\Commands\SyncBalances;
 use Cmd\Reports\Console\Commands\SyncBalancesHistory;
@@ -189,6 +190,7 @@ class ReportsServiceProvider extends ServiceProvider
                 GenerateRetentionBonusCommission::class,
                 GenerateNSFCommissionReport::class,
                 GenerateEnrollmentBonusReport::class,
+                ImportCompanyHolidays::class,
                 SyncContactsData::class,
                 SyncCollectionCompanies::class,
                 SyncLastDepositDate::class,

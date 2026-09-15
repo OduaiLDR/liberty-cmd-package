@@ -6,7 +6,10 @@ namespace Cmd\Reports\Tests\Unit;
 
 use Cmd\Reports\Console\Commands\GenerateEnrollmentBonusReport\BusinessDayCalendar;
 use Cmd\Reports\Console\Commands\GenerateEnrollmentBonusReport\GenerateEnrollmentBonusReport;
+use Cmd\Reports\Tests\Support\RecordingSqlServerConnector;
 use Cmd\Reports\Tests\TestCase;
+use Illuminate\Container\Container;
+use Illuminate\Support\Facades\Facade;
 use ReflectionMethod;
 
 /**
@@ -16,6 +19,31 @@ use ReflectionMethod;
  */
 class EnrollmentStatusReportEomProjectionTest extends TestCase
 {
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        // The calendar holds its loaded dates statically, so one test must never leak into the next.
+        BusinessDayCalendar::reset();
+
+        $app = new Container();
+        $app->instance('log', new class {
+            public function __call(string $method, array $arguments): void
+            {
+            }
+        });
+        Facade::setFacadeApplication($app);
+    }
+
+    protected function tearDown(): void
+    {
+        BusinessDayCalendar::reset();
+        Facade::clearResolvedInstances();
+        Facade::setFacadeApplication(null);
+
+        parent::tearDown();
+    }
+
     public function test_jacobs_september_2026_example_is_8_of_21(): void
     {
         $this->assertSame(8, BusinessDayCalendar::countBetween('2026-09-01', '2026-09-13'));
@@ -46,6 +74,72 @@ class EnrollmentStatusReportEomProjectionTest extends TestCase
 
         // January 1 2027 is a Friday: a real holiday that month.
         $this->assertSame(20, BusinessDayCalendar::countInMonth('2027-01-01'));
+    }
+
+    /**
+     * Jacob 2026-09-15: CT keep the company's own closure calendar, several years out. When the
+     * table covers a year it is the authority for that year — including days the built-in rule
+     * never knew about (Christmas, the day after Thanksgiving, a company shutdown week).
+     */
+    public function test_the_company_calendar_replaces_the_built_in_rule_for_the_years_it_covers(): void
+    {
+        $loaded = BusinessDayCalendar::loadFromDatabase($this->connectorWith([
+            ['Holiday_Date' => '2026-11-26'],   // Thanksgiving
+            ['Holiday_Date' => '2026-11-27'],   // day after — the built-in rule does not have this
+            ['Holiday_Date' => '2026-12-25'],   // Christmas — nor this
+        ]));
+
+        $this->assertSame(3, $loaded['loaded']);
+        $this->assertSame([2026], $loaded['years']);
+        $this->assertNull($loaded['error']);
+
+        $holiday = static fn (string $d): bool => BusinessDayCalendar::isHoliday(new \DateTimeImmutable($d));
+        $this->assertTrue($holiday('2026-11-27'), 'a CT holiday the built-in rule does not know');
+        $this->assertTrue($holiday('2026-12-25'));
+        $this->assertFalse($holiday('2026-09-07'), 'Labor Day is NOT in this calendar, so 2026 no longer treats it as one');
+
+        // November 2026: 21 weekdays, minus Thanksgiving and the day after.
+        $this->assertSame(19, BusinessDayCalendar::countInMonth('2026-11-01'));
+    }
+
+    public function test_a_year_the_calendar_does_not_cover_falls_back_to_the_built_in_rule(): void
+    {
+        BusinessDayCalendar::loadFromDatabase($this->connectorWith([['Holiday_Date' => '2026-12-25']]));
+
+        $this->assertSame([2026], BusinessDayCalendar::loadedYears());
+        // 2027 has no rows: the built-in four still apply, so the divisor is never silently inflated.
+        $this->assertTrue(BusinessDayCalendar::isHoliday(new \DateTimeImmutable('2027-01-01')));
+        $this->assertTrue(BusinessDayCalendar::isHoliday(new \DateTimeImmutable('2027-09-06')), 'Labor Day 2027');
+        $this->assertSame(20, BusinessDayCalendar::countInMonth('2027-01-01'));
+        // …while 2026 uses the table, which does not list New Year's Day.
+        $this->assertFalse(BusinessDayCalendar::isHoliday(new \DateTimeImmutable('2026-01-01')));
+    }
+
+    public function test_an_empty_or_unreadable_table_keeps_the_built_in_rule(): void
+    {
+        $empty = BusinessDayCalendar::loadFromDatabase($this->connectorWith([]));
+        $this->assertSame(['loaded' => 0, 'years' => [], 'error' => null], $empty);
+        $this->assertTrue(BusinessDayCalendar::isHoliday(new \DateTimeImmutable('2026-09-07')), 'empty table must not mean "no holidays"');
+        $this->assertSame(21, BusinessDayCalendar::countInMonth('2026-09-01'));
+
+        $broken = BusinessDayCalendar::loadFromDatabase(new RecordingSqlServerConnector([
+            '/TblCompanyHolidays/' => ['success' => false, 'error' => 'Invalid object name', 'data' => []],
+        ]));
+        $this->assertSame('Invalid object name', $broken['error']);
+        $this->assertTrue(BusinessDayCalendar::isHoliday(new \DateTimeImmutable('2026-09-07')));
+    }
+
+    public function test_the_calendar_is_read_from_the_named_table_and_reset_forgets_it(): void
+    {
+        $connector = $this->connectorWith([['Holiday_Date' => '2026-12-25']]);
+        BusinessDayCalendar::loadFromDatabase($connector);
+
+        $this->assertSame('dbo.TblCompanyHolidays', BusinessDayCalendar::TABLE);
+        $this->assertStringContainsString('FROM dbo.TblCompanyHolidays', $connector->calls[0]['sql']);
+
+        BusinessDayCalendar::reset();
+        $this->assertSame([], BusinessDayCalendar::loadedYears());
+        $this->assertFalse(BusinessDayCalendar::isHoliday(new \DateTimeImmutable('2026-12-25')), 'back to the built-in rule');
     }
 
     public function test_count_between_is_inclusive_and_zero_when_reversed(): void
@@ -98,6 +192,16 @@ class EnrollmentStatusReportEomProjectionTest extends TestCase
         $summary = $this->buildSummary([$this->enrolled('LDR', 1000.0)], [], '2026-09-05', '2026-09-06');
 
         $this->assertSame(0.0, $summary['Combined']['EOM Projection (Net)']);
+    }
+
+    /**
+     * @param list<array{Holiday_Date: string}> $rows
+     */
+    private function connectorWith(array $rows): RecordingSqlServerConnector
+    {
+        return new RecordingSqlServerConnector([
+            '/TblCompanyHolidays/' => ['success' => true, 'data' => $rows, 'row_count' => count($rows)],
+        ]);
     }
 
     /** @return array<string, mixed> */

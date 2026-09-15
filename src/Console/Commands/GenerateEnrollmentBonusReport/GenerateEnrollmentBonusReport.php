@@ -42,6 +42,7 @@ class GenerateEnrollmentBonusReport extends Command
 
             $sql = DBConnector::fromEnvironment('ldr');
             $sql->initializeSqlServer();
+            $this->loadHolidayCalendar($sql, $from);
             $azureRows = $this->fetchAzureRows($sql, $from, $exclusiveTo);
             $enrollmentRows = $this->attachSnowflakeStatuses($azureRows, $from, $to);
             $enrolledContactIds = $this->contactIdsFromEnrollmentRows($enrollmentRows);
@@ -391,6 +392,41 @@ SELECT CONTACT_ID, TITLE, STAMP_PT, CLIENT, EXTERNAL_ID FROM latest WHERE rn = 1
     }
 
     /**
+     * Loads the company holiday calendar the EOM projection counts around (Jacob 2026-09-15, from
+     * CT). Never fatal: an absent or empty table leaves the built-in four holidays in place, and the
+     * run says which it used — silently treating "no rows" as "no holidays" would inflate the
+     * month's business-day count and understate the projection.
+     */
+    private function loadHolidayCalendar(DBConnector $sql, string $from): void
+    {
+        $calendar = BusinessDayCalendar::loadFromDatabase($sql);
+        $reportYear = (int) substr($from, 0, 4);
+
+        if ($calendar['error'] !== null) {
+            $this->warn('[WARN] Company holiday calendar unavailable (' . $calendar['error'] . '); using the built-in holidays.');
+
+            return;
+        }
+
+        if ($calendar['loaded'] === 0) {
+            $this->warn('[WARN] ' . BusinessDayCalendar::TABLE . ' is empty; using the built-in holidays. Load CT\'s calendar with: php artisan holidays:import <file.csv>');
+
+            return;
+        }
+
+        $this->info(sprintf(
+            '[INFO] Holiday calendar: %d date(s) from %s covering %s.',
+            $calendar['loaded'],
+            BusinessDayCalendar::TABLE,
+            implode(', ', $calendar['years'])
+        ));
+
+        if (!in_array($reportYear, $calendar['years'], true)) {
+            $this->warn("[WARN] The calendar has no dates for {$reportYear}; that year falls back to the built-in holidays.");
+        }
+    }
+
+    /**
      * @param string $from Period start (Y-m-d)
      * @param string $to   Period end (Y-m-d) — the "Sales data through" date
      */
@@ -424,7 +460,8 @@ SELECT CONTACT_ID, TITLE, STAMP_PT, CLIENT, EXTERNAL_ID FROM latest WHERE rn = 1
         }
 
         // Jacob 2026-09-14: EOM Projection (Net) = total / business days in the report * business
-        // days in the month, skipping weekends and the four holidays in BusinessDayCalendar. His
+        // days in the month, skipping weekends and the holidays in BusinessDayCalendar (CT's company
+        // calendar in TblCompanyHolidays when it covers the year, else the built-in four). His
         // example, 14 Sep: 9 weekdays in 1–13 Sep minus Labor Day = 8; September has 21 => x / 8 * 21.
         // "Total" is read as Projected (Net), the row directly above it.
         $daysInReport = BusinessDayCalendar::countBetween($from, $to);
