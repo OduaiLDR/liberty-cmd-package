@@ -74,9 +74,10 @@ class EmailSenderService
         }
     }
 
-    public function sendMailHtml(string $subject, string $body, array $to, array $cc = [], array $bcc = [], array $attachments = []): bool
+    public function sendMailHtml(string $subject, string $body, array $to, array $cc = [], array $bcc = [], array $attachments = [], ?string $fromAddress = null): bool
     {
-        if (!$this->tenantId || !$this->clientId || !$this->clientSecret || !$this->fromAddress) {
+        $sender = trim((string) ($fromAddress ?: $this->fromAddress));
+        if (!$this->tenantId || !$this->clientId || !$this->clientSecret || !$sender) {
             Log::error('EmailSenderService: missing Graph configuration.');
             return false;
         }
@@ -90,7 +91,7 @@ class EmailSenderService
         Log::info('EmailSenderService: Sending HTML email', [
             'subject' => $subject,
             'to' => $to,
-            'from' => $this->fromAddress,
+            'from' => $sender,
         ]);
 
         $recipients = $this->formatRecipients($to);
@@ -114,7 +115,7 @@ class EmailSenderService
 
         try {
             $response = $this->client->post(
-                "https://graph.microsoft.com/v1.0/users/{$this->fromAddress}/sendMail",
+                "https://graph.microsoft.com/v1.0/users/{$sender}/sendMail",
                 [
                     'headers' => [
                         'Authorization' => 'Bearer ' . $token,
