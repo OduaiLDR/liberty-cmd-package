@@ -16,7 +16,7 @@ class GenerateAdvanceRequest extends Command
 
     protected $description = 'Calculate and email the monthly LDR and Progress Law advance request.';
 
-    private const TEST_RECIPIENT = 'oduai@libertydebtrelief.com';
+    private const TEST_RECIPIENT = 'jacob@libertydebtrelief.com';
     private const LDR_SENDER = 'NGF@libertydebtrelief.com';
     private const PROGRESS_LAW_SENDER = 'NGF@progresslaw.com';
     private const ADVANCE_TOTAL = 1000000.0;
@@ -104,28 +104,50 @@ class GenerateAdvanceRequest extends Command
                 'name' => 'LDR',
                 'subject' => 'LDR Advance Request',
                 'amount' => $allocation['ldr'],
-                'to' => ['sam@libertydebtrelief.com', 'omar@libertydebtrelief.com', 'james@nexgenfi.com'],
-                'cc' => ['Jacob@libertydebtrelief.com'],
+                'report' => 'AdvanceRequest',
+                'company' => 'LDR',
                 'sender' => self::LDR_SENDER,
             ],
             [
                 'name' => 'Progress Law',
                 'subject' => 'Progress Law Advance Request',
                 'amount' => $allocation['progress_law'],
-                'to' => ['aaron@progresslaw.com', 'eric@progresslaw.com', 'james@nexgenfi.com'],
-                'cc' => ['jacob@progresslaw.com'],
+                'report' => 'AdvanceRequest',
+                'company' => 'PLAW',
                 'sender' => self::PROGRESS_LAW_SENDER,
             ],
         ] as $request) {
             $subject = ($isLive ? '' : '[TEST] ') . $request['subject'];
             $body = $this->buildEmailBody($request['name'], $request['amount'], $tranche, $monthLabel);
-            $to = $isLive ? $request['to'] : [self::TEST_RECIPIENT];
-            $cc = $isLive ? $request['cc'] : [];
-            $wasSent = $email->sendMailHtml($subject, $body, $to, $cc, [], [], $request['sender']);
+            if ($isLive) {
+                $wasSent = $email->sendMailUsingTblReportsHtml(
+                    $azure,
+                    [$request['report']],
+                    [$request['company']],
+                    $subject,
+                    $body,
+                    [],
+                    false,
+                    true,
+                    $request['sender']
+                );
+                $recipientDescription = 'TblReports recipients';
+            } else {
+                $wasSent = $email->sendMailHtml(
+                    $subject,
+                    $body,
+                    [self::TEST_RECIPIENT],
+                    [],
+                    [],
+                    [],
+                    $request['sender']
+                );
+                $recipientDescription = self::TEST_RECIPIENT;
+            }
             $sent = $sent && $wasSent;
 
             if ($wasSent) {
-                $this->info(sprintf('[INFO] %s advance request sent to %s.', $request['name'], implode(', ', $to)));
+                $this->info(sprintf('[INFO] %s advance request sent to %s.', $request['name'], $recipientDescription));
             } else {
                 $this->error("[ERROR] {$request['name']} advance request email failed.");
             }
