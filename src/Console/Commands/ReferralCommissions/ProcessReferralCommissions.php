@@ -60,7 +60,7 @@ class ProcessReferralCommissions extends Command
     protected $signature = 'referral-commissions:process
         {--file= : Process a saved "Monevo US Partner Fund Details.xlsx" instead of polling the mailboxes}
         {--passes=lt,ccs : Passes to run for --file: lt (ProcessReferralCommissions) and/or ccs (ProcessReferralCommissionsCCS). When polling, each mailbox runs the passes its Outlook rule did}
-        {--mailbox= : Poll only this automation mailbox (default: both)}
+        {--mailbox= : Poll only this automation mailbox (default: every one in MAILBOXES)}
         {--keep-in-inbox : After processing a message, do not mark it read or move it to Inbox\Archive}
         {--dry-run : Read the file and every lookup, write nothing (no SQL, no CRM, mail left where it is)}';
 
@@ -74,10 +74,16 @@ class ProcessReferralCommissions extends Command
     /** The flat commission a USA agent earns per funded referral (VBA: `Commission = 50`). */
     public const USA_COMMISSION = 50.0;
 
-    /** Which passes each automation mailbox ran in the workbook. */
+    /**
+     * The mailboxes polled, the passes each runs, and the Graph credentials prefix that reaches it.
+     *
+     * The workbook watched both automation mailboxes, but since the company split only Lending
+     * Tower's still receives Monevo's mail (LDR's last one is Nov 2025), and Jacob asked on
+     * 16 Sep 2026 to monitor LT only. It is in a separate Microsoft tenant — kept separate on
+     * purpose — so it has its own app registration under `GRAPH_LT_*`.
+     */
     public const MAILBOXES = [
-        'automation@libertydebtrelief.com' => ['lt'],
-        'automation@lendingtower.com' => ['lt', 'ccs'],
+        'automation@lendingtower.com' => ['passes' => ['lt', 'ccs'], 'graph' => 'GRAPH_LT'],
     ];
 
     private const PASSES = [
@@ -90,7 +96,8 @@ class ProcessReferralCommissions extends Command
     protected ?DBConnector $ldr = null;
     protected ?PDO $ccs = null;
     protected ?DppDataClient $dpp = null;
-    protected ?GraphMailboxClient $mail = null;
+    /** @var array<string, GraphMailboxClient> keyed by credentials prefix */
+    protected array $mail = [];
 
     /** @var array<string, int> */
     protected array $counts = [];
@@ -134,9 +141,15 @@ class ProcessReferralCommissions extends Command
 
         $failed = false;
         $processedMessages = 0;
-        foreach ($mailboxes as $mailbox => $passes) {
+        foreach ($mailboxes as $mailbox => $config) {
+            $passes = $config['passes'];
+            $prefix = $config['graph'];
+            if (!GraphMailboxClient::isConfigured($prefix)) {
+                $this->warn("[WARN] {$mailbox}: skipped — {$prefix}_TENANT_ID / {$prefix}_CLIENT_ID / {$prefix}_CLIENT_SECRET are not set.");
+                continue;
+            }
             $this->info("[INFO] {$mailbox}: looking for \"" . self::SUBJECT . '" with ' . self::ATTACHMENT);
-            $messages = $this->mail()->listInboxMessages($mailbox, self::SUBJECT);
+            $messages = $this->mail($prefix)->listInboxMessages($mailbox, self::SUBJECT);
             if ($messages === []) {
                 $this->line('  nothing waiting.');
                 continue;
@@ -146,7 +159,7 @@ class ProcessReferralCommissions extends Command
                 $received = substr($message['receivedDateTime'], 0, 19);
                 $attachment = null;
                 if ($message['hasAttachments']) {
-                    foreach ($this->mail()->listAttachments($mailbox, $message['id']) as $candidate) {
+                    foreach ($this->mail($prefix)->listAttachments($mailbox, $message['id']) as $candidate) {
                         if (strcasecmp($candidate['name'], self::ATTACHMENT) === 0) {
                             $attachment = $candidate;
                             break;
@@ -161,7 +174,7 @@ class ProcessReferralCommissions extends Command
                 }
 
                 $path = $this->downloadPath($mailbox, $received);
-                $this->mail()->downloadAttachment($mailbox, $message['id'], $attachment['id'], $path);
+                $this->mail($prefix)->downloadAttachment($mailbox, $message['id'], $attachment['id'], $path);
                 $this->info("  {$received} \"{$message['subject']}\" -> {$path}");
 
                 $result = $this->processFile($path, $passes, "{$mailbox} message received {$received}");
@@ -176,8 +189,8 @@ class ProcessReferralCommissions extends Command
                     $this->line('  message left in the Inbox (' . ($this->dryRun ? '--dry-run' : '--keep-in-inbox') . ').');
                     continue;
                 }
-                $this->mail()->markRead($mailbox, $message['id']);
-                $this->mail()->moveToInboxSubfolder($mailbox, $message['id'], self::ARCHIVE_FOLDER);
+                $this->mail($prefix)->markRead($mailbox, $message['id']);
+                $this->mail($prefix)->moveToInboxSubfolder($mailbox, $message['id'], self::ARCHIVE_FOLDER);
                 $this->line('  marked read and moved to Inbox\\' . self::ARCHIVE_FOLDER . '.');
             }
         }
@@ -574,9 +587,9 @@ class ProcessReferralCommissions extends Command
         return $this->dpp ??= DppDataClient::fromConfig();
     }
 
-    protected function mail(): GraphMailboxClient
+    protected function mail(string $prefix): GraphMailboxClient
     {
-        return $this->mail ??= GraphMailboxClient::fromEnvironment();
+        return $this->mail[$prefix] ??= GraphMailboxClient::fromEnvironment($prefix);
     }
 
     /** @return list<string> */

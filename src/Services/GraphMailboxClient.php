@@ -33,18 +33,34 @@ class GraphMailboxClient
         $this->http ??= new Client(['timeout' => 60]);
     }
 
-    public static function fromEnvironment(): self
+    /**
+     * Credentials from `<prefix>_TENANT_ID` / `<prefix>_CLIENT_ID` / `<prefix>_CLIENT_SECRET`. The
+     * default prefix is the Liberty tenant's `GRAPH_*` (shared with EmailSenderService); a mailbox in
+     * another tenant — Lending Tower is one — has its own app registration under its own prefix,
+     * e.g. `GRAPH_LT_*`.
+     */
+    public static function fromEnvironment(string $prefix = 'GRAPH'): self
     {
-        $client = new self(
-            (string) env('GRAPH_TENANT_ID', ''),
-            (string) env('GRAPH_CLIENT_ID', ''),
-            (string) env('GRAPH_CLIENT_SECRET', ''),
-        );
-        if ($client->tenantId === '' || $client->clientId === '' || $client->clientSecret === '') {
-            throw new RuntimeException('Microsoft Graph is not configured: set GRAPH_TENANT_ID, GRAPH_CLIENT_ID and GRAPH_CLIENT_SECRET in .env.');
+        if (!self::isConfigured($prefix)) {
+            throw new RuntimeException("Microsoft Graph is not configured: set {$prefix}_TENANT_ID, {$prefix}_CLIENT_ID and {$prefix}_CLIENT_SECRET in .env.");
         }
 
-        return $client;
+        return new self(
+            (string) env("{$prefix}_TENANT_ID", ''),
+            (string) env("{$prefix}_CLIENT_ID", ''),
+            (string) env("{$prefix}_CLIENT_SECRET", ''),
+        );
+    }
+
+    public static function isConfigured(string $prefix = 'GRAPH'): bool
+    {
+        foreach (['TENANT_ID', 'CLIENT_ID', 'CLIENT_SECRET'] as $key) {
+            if (trim((string) env("{$prefix}_{$key}", '')) === '') {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /**
