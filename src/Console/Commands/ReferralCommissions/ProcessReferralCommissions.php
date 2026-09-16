@@ -66,8 +66,15 @@ class ProcessReferralCommissions extends Command
 
     protected $description = 'Import Monevo funded-loan referrals: payroll commission rows, TblFundings and CRM funding fields (replaces the ProcessReferralCommissions VBA and its Outlook rules).';
 
-    public const SUBJECT = 'MONEVO US PARTNER FUND DETAILS LIBERTY LENDING';
-    public const ATTACHMENT = 'Monevo US Partner Fund Details.xlsx';
+    /**
+     * Subject prefix. The suffix is the company the mailbox belongs to — "… Liberty Lending" on the
+     * LDR mailbox, "… Lending Tower" on LT (seen 16 Sep 2026) — so only the common part is matched.
+     * Monevo also sends "Monevo US Offer Detail …" and "Monevo US Affiliate Lead Data …" daily;
+     * the prefix keeps those out.
+     */
+    public const SUBJECT = 'Monevo US Partner Fund Details';
+    /** Attachment name prefix; matched case-insensitively with an .xlsx extension. */
+    public const ATTACHMENT = 'Monevo US Partner Fund Details';
     public const ARCHIVE_FOLDER = 'Archive';
     public const SOURCE = 'Monevo';
 
@@ -148,7 +155,7 @@ class ProcessReferralCommissions extends Command
                 $this->warn("[WARN] {$mailbox}: skipped — {$prefix}_TENANT_ID / {$prefix}_CLIENT_ID / {$prefix}_CLIENT_SECRET are not set.");
                 continue;
             }
-            $this->info("[INFO] {$mailbox}: looking for \"" . self::SUBJECT . '" with ' . self::ATTACHMENT);
+            $this->info("[INFO] {$mailbox}: looking for \"" . self::SUBJECT . '…" with ' . self::ATTACHMENT . '*.xlsx');
             $messages = $this->mail($prefix)->listInboxMessages($mailbox, self::SUBJECT);
             if ($messages === []) {
                 $this->line('  nothing waiting.');
@@ -160,7 +167,7 @@ class ProcessReferralCommissions extends Command
                 $attachment = null;
                 if ($message['hasAttachments']) {
                     foreach ($this->mail($prefix)->listAttachments($mailbox, $message['id']) as $candidate) {
-                        if (strcasecmp($candidate['name'], self::ATTACHMENT) === 0) {
+                        if (self::isFundDetailsWorkbook($candidate['name'])) {
                             $attachment = $candidate;
                             break;
                         }
@@ -169,7 +176,7 @@ class ProcessReferralCommissions extends Command
                 if ($attachment === null) {
                     // The VBA left such a message in the Inbox untouched (its loop found nothing to save
                     // and never reached Item.Move). Same here.
-                    $this->warn("  [WARN] {$received} \"{$message['subject']}\" has no " . self::ATTACHMENT . ' — left in the Inbox.');
+                    $this->warn("  [WARN] {$received} \"{$message['subject']}\" has no " . self::ATTACHMENT . '*.xlsx — left in the Inbox.');
                     continue;
                 }
 
@@ -200,12 +207,19 @@ class ProcessReferralCommissions extends Command
         return $failed ? Command::FAILURE : Command::SUCCESS;
     }
 
+    public static function isFundDetailsWorkbook(string $name): bool
+    {
+        $name = trim($name);
+
+        return stripos($name, self::ATTACHMENT) === 0 && strtolower(pathinfo($name, PATHINFO_EXTENSION)) === 'xlsx';
+    }
+
     protected function downloadPath(string $mailbox, string $received): string
     {
         $stamp = preg_replace('/[^0-9]/', '', $received) ?: date('YmdHis');
         $box = substr($mailbox, 0, (int) strpos($mailbox, '@'));
 
-        return storage_path('app/referral-commissions/' . date('Y-m') . "/{$stamp}_{$box}_" . self::ATTACHMENT);
+        return storage_path('app/referral-commissions/' . date('Y-m') . "/{$stamp}_{$box}_" . self::ATTACHMENT . '.xlsx');
     }
 
     // ─── A file, through each pass ────────────────────────────────────────

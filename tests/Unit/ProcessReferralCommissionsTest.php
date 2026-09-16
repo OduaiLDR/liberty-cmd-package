@@ -52,6 +52,16 @@ class ProcessReferralCommissionsTest extends TestCase
         $this->assertSame('8037433974', ProcessReferralCommissions::numericOnly('(803) 743-3974'));
     }
 
+    public function test_attachment_match_takes_the_partner_fund_workbook_only(): void
+    {
+        // Seen 16 Sep 2026 in the Lending Tower mailbox: three daily Monevo mails, one of them ours.
+        $this->assertTrue(ProcessReferralCommissions::isFundDetailsWorkbook('Monevo US Partner Fund Details.xlsx'));
+        $this->assertTrue(ProcessReferralCommissions::isFundDetailsWorkbook('monevo us partner fund details lending tower.XLSX'));
+        $this->assertFalse(ProcessReferralCommissions::isFundDetailsWorkbook('Monevo US Offer Detail.xlsx'));
+        $this->assertFalse(ProcessReferralCommissions::isFundDetailsWorkbook('Monevo US Affiliate Lead Data.xlsx'));
+        $this->assertFalse(ProcessReferralCommissions::isFundDetailsWorkbook('Monevo US Partner Fund Details.csv'));
+    }
+
     // ── Flow ───────────────────────────────────────────────────────────────
 
     public function test_lt_pass_for_a_usa_agent_writes_payroll_fundings_and_crm_in_the_vba_order(): void
