@@ -15,7 +15,9 @@ use Illuminate\Support\Facades\Log;
  * block off and it is extended several years out. See if you can get that and add that to a table
  * and use it for the EOM calculation."*
  *
- * Input is a CSV of `date[,name]`, one holiday per line, header optional:
+ * Input is a CSV, one holiday per line. Without a header the first column is the date and the second
+ * the name; with a header the columns are found by name, so CT's raw portal export
+ * (`id,holiday_date,holiday_name,created_at,updated_at`) loads as sent:
  *
  *     2026-11-26,Thanksgiving
  *     12/25/2026,Christmas Day
@@ -23,6 +25,10 @@ use Illuminate\Support\Facades\Log;
  * Dates parse in ISO or US order (a 4-digit first field is read as ISO). Existing rows for the same
  * date are updated rather than duplicated, so re-importing a corrected file is safe, and nothing is
  * deleted unless --replace-years is given.
+ *
+ * Once a year is in the table it is the authority for that year — the built-in rule no longer
+ * applies to it — so the command warns when a year in the file lacks a weekday holiday the built-in
+ * rule would have skipped (CT's first file had no 1 Jan 2027).
  */
 class ImportCompanyHolidays extends Command
 {
@@ -64,6 +70,10 @@ class ImportCompanyHolidays extends Command
         foreach ($holidays as $holiday) {
             $weekend = (int) (new \DateTimeImmutable($holiday['date']))->format('N') >= 6;
             $this->line(sprintf('  %s  %-40s%s', $holiday['date'], $holiday['name'], $weekend ? '  (weekend — no effect on business days)' : ''));
+        }
+
+        foreach ($this->builtInGaps($holidays, $years) as $gap) {
+            $this->warn("[WARN] {$gap}");
         }
 
         if ($this->option('dry-run')) {
@@ -136,16 +146,31 @@ class ImportCompanyHolidays extends Command
 
         $holidays = [];
         try {
-            while (($row = fgetcsv($handle)) !== false) {
-                $raw = trim((string) ($row[0] ?? ''));
+            $first = fgetcsv($handle, null, ",", "\"", "");
+            if ($first === false) {
+                return [];
+            }
+            [$dateColumn, $nameColumn, $isHeader] = $this->detectColumns($first);
+            if ($isHeader) {
+                $this->info(sprintf(
+                    '[INFO] Header found: dates from "%s", names from %s.',
+                    trim((string) $first[$dateColumn]),
+                    $nameColumn === null ? '(no name column)' : '"' . trim((string) $first[$nameColumn]) . '"'
+                ));
+            } else {
+                rewind($handle);
+            }
+
+            while (($row = fgetcsv($handle, null, ",", "\"", "")) !== false) {
+                $raw = trim((string) ($row[$dateColumn] ?? ''));
                 if ($raw === '') {
                     continue;
                 }
                 $date = $this->normalizeDate($raw);
                 if ($date === null) {
-                    continue;   // header line, or a stray note
+                    continue;   // a stray note
                 }
-                $holidays[$date] = ['date' => $date, 'name' => trim((string) ($row[1] ?? ''))];
+                $holidays[$date] = ['date' => $date, 'name' => $nameColumn === null ? '' : trim((string) ($row[$nameColumn] ?? ''))];
             }
         } finally {
             fclose($handle);
@@ -154,6 +179,82 @@ class ImportCompanyHolidays extends Command
         ksort($holidays);
 
         return array_values($holidays);
+    }
+
+    /**
+     * Works out which columns hold the date and the name. A first row containing a parseable date
+     * is data, not a header, and the file is positional (`date[,name]`). Otherwise the row is a
+     * header and the columns are picked by name — `holiday_date`/`date` before any other "…date"
+     * column that is not an audit timestamp; `holiday_name`/`name`/`holiday` for the label.
+     *
+     * @param list<string|null> $first
+     * @return array{0: int, 1: int|null, 2: bool} [date column, name column, first row was a header]
+     */
+    private function detectColumns(array $first): array
+    {
+        foreach ($first as $cell) {
+            if ($this->normalizeDate(trim((string) $cell)) !== null) {
+                return [0, count($first) > 1 ? 1 : null, false];
+            }
+        }
+
+        $headers = array_map(static fn ($h): string => strtolower(trim((string) $h, " \t\n\r\0\x0B\xEF\xBB\xBF\"'")), $first);
+
+        $dateColumn = $this->firstMatching($headers, ['/^holiday_?date$/', '/^date$/', '/date/'], static fn (string $h): bool => !preg_match('/created|updated|modified/', $h)) ?? 0;
+        $nameColumn = $this->firstMatching($headers, ['/^holiday_?name$/', '/^name$/', '/^holiday$/', '/name|title|description/'], static fn (string $h): bool => true);
+        if ($nameColumn === $dateColumn) {
+            $nameColumn = null;
+        }
+
+        return [$dateColumn, $nameColumn, true];
+    }
+
+    /**
+     * @param list<string> $headers
+     * @param list<string> $patterns   tried in order; the first pattern with any hit wins
+     * @param callable(string): bool $allowed
+     */
+    private function firstMatching(array $headers, array $patterns, callable $allowed): ?int
+    {
+        foreach ($patterns as $pattern) {
+            foreach ($headers as $index => $header) {
+                if (preg_match($pattern, $header) && $allowed($header)) {
+                    return $index;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Weekday holidays the built-in rule would have skipped that the file does not list, for each
+     * year it covers. Those years take their holidays from the table alone, so a gap here silently
+     * turns a closed day into a business day.
+     *
+     * @param list<array{date: string, name: string}> $holidays
+     * @param list<int> $years
+     * @return list<string>
+     */
+    private function builtInGaps(array $holidays, array $years): array
+    {
+        $listed = array_column($holidays, 'date', 'date');
+        $gaps = [];
+        foreach ($years as $year) {
+            $day = new \DateTimeImmutable("{$year}-01-01");
+            $end = new \DateTimeImmutable("{$year}-12-31");
+            while ($day <= $end) {
+                if ((int) $day->format('N') < 6 && BusinessDayCalendar::isBuiltInHoliday($day) && !isset($listed[$day->format('Y-m-d')])) {
+                    $gaps[] = sprintf(
+                        '%d: %s (%s) is not in the file. The table becomes the only holiday source for %d, so that day would count as a business day — add it, or confirm the company is open.',
+                        $year, $day->format('Y-m-d'), $day->format('l'), $year
+                    );
+                }
+                $day = $day->modify('+1 day');
+            }
+        }
+
+        return $gaps;
     }
 
     /** ISO when the first field is 4 digits, otherwise US month-first. Null when it is not a date. */
