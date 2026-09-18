@@ -109,6 +109,15 @@ class ProcessReferralCommissions extends Command
     /** @var array<string, int> */
     protected array $counts = [];
 
+    /**
+     * Per-pass batched lookups (see preload()); null = look each row up on its own, which is what
+     * the tests drive. A 260-row file times five round-trips a row times two passes was taking
+     * minutes against Azure (18 Sep 2026); batched it is a handful of queries per pass.
+     *
+     * @var array{contacts: array<string, array<string, mixed>>, employeeByName: array<string, int>, employeeLocation: array<int, string>, enrollment: array<string, string>, processed: array<int, array<string, true>>}|null
+     */
+    protected ?array $cache = null;
+
     public function handle(): int
     {
         $this->dryRun = (bool) $this->option('dry-run');
@@ -278,7 +287,8 @@ class ProcessReferralCommissions extends Command
                 $this->dpp()->assertConfigured(self::PASSES[$pass]['tenant']);
             }
 
-            $this->counts =['processed' => 0, 'already' => 0, 'not_in_contacts' => 0, 'invalid' => 0, 'errors' => 0];
+            $this->counts = ['processed' => 0, 'already' => 0, 'not_in_contacts' => 0, 'invalid' => 0, 'errors' => 0];
+            $this->preload($pass, $rows);
             foreach ($rows as $row) {
                 try {
                     $outcome = $this->processRow($pass, $row, $today);
@@ -289,6 +299,7 @@ class ProcessReferralCommissions extends Command
                 }
                 $this->counts[$outcome]++;
             }
+            $this->cache = null;
 
             $this->info(sprintf(
                 '[%s] %s: %d processed, %d already processed, %d not in TblContacts, %d invalid, %d error(s).',
@@ -466,6 +477,9 @@ class ProcessReferralCommissions extends Command
     /** @return array<string, mixed>|null */
     protected function ldrContact(string $llg): ?array
     {
+        if ($this->cache !== null) {
+            return $this->cache['contacts'][$llg] ?? null;
+        }
         // TblContacts has carried duplicate LLG_IDs; the VBA took whichever row came back first.
         $rows = $this->ldrSelect(
             'SELECT TOP 1 Client, Agent, Status, LLG_ID, Email, City, State, Phone FROM TblContacts WHERE LLG_ID = ? ORDER BY PK',
@@ -478,6 +492,9 @@ class ProcessReferralCommissions extends Command
     /** @return array<string, mixed>|null */
     protected function ccsContact(string $cid): ?array
     {
+        if ($this->cache !== null) {
+            return $this->cache['contacts'][$cid] ?? null;
+        }
         $rows = $this->ccsSelect(
             'SELECT TOP 1 Client, Agent, Status, CID, Email, City, State, Phone FROM TblContacts WHERE CID = ?',
             [$cid]
@@ -488,6 +505,9 @@ class ProcessReferralCommissions extends Command
 
     protected function ldrEmployeePk(string $employeeName): int
     {
+        if ($this->cache !== null) {
+            return $this->cache['employeeByName'][self::nameKey($employeeName)] ?? 0;
+        }
         $rows = $this->ldrSelect('SELECT TOP 1 PK FROM TblEmployees WHERE Employee_Name = ? ORDER BY PK', [$employeeName]);
 
         return (int) ($rows[0]['PK'] ?? 0);
@@ -495,6 +515,9 @@ class ProcessReferralCommissions extends Command
 
     protected function ccsEmployeePk(string $employeeName): int
     {
+        if ($this->cache !== null) {
+            return $this->cache['employeeByName'][self::nameKey($employeeName)] ?? 0;
+        }
         $rows = $this->ccsSelect('SELECT TOP 1 PK FROM TblEmployees WHERE Employee_Name = ? ORDER BY PK', [$employeeName]);
 
         return (int) ($rows[0]['PK'] ?? 0);
@@ -503,6 +526,9 @@ class ProcessReferralCommissions extends Command
     /** Always LDR's TblEmployees — also on the CCS pass, exactly as the VBA did it. */
     protected function ldrEmployeeLocation(int $pk): string
     {
+        if ($this->cache !== null) {
+            return $this->cache['employeeLocation'][$pk] ?? '';
+        }
         $rows = $this->ldrSelect('SELECT Location FROM TblEmployees WHERE PK = ?', [$pk]);
 
         return trim((string) ($rows[0]['Location'] ?? ''));
@@ -510,6 +536,9 @@ class ProcessReferralCommissions extends Command
 
     protected function ldrEnrollmentStatus(string $llg): string
     {
+        if ($this->cache !== null) {
+            return $this->cache['enrollment'][$llg] ?? '';
+        }
         $rows = $this->ldrSelect('SELECT TOP 1 Enrollment_Status FROM TblEnrollment WHERE LLG_ID = ?', [$llg]);
 
         return (string) ($rows[0]['Enrollment_Status'] ?? '');
@@ -517,12 +546,85 @@ class ProcessReferralCommissions extends Command
 
     protected function alreadyProcessed(int $agentId, string $llg): bool
     {
+        if ($this->cache !== null) {
+            return isset($this->cache['processed'][$agentId][$llg]);
+        }
         $rows = $this->ldrSelect(
             "SELECT COUNT(*) AS n FROM TblPayrollAdjustments WHERE Agent_ID = ? AND Category = 'Commission' AND Notes LIKE ?",
             [$agentId, "%{$llg}%"]
         );
 
         return (int) ($rows[0]['n'] ?? 0) > 0;
+    }
+
+    /**
+     * Loads everything processRow() will ask for, for every row of the file, in a few queries.
+     * Semantics are those of the per-row lookups: first contact by PK, first employee PK by name
+     * (SQL Server's case-insensitive match), the USA test always on LDR's TblEmployees, and
+     * "already processed" as the VBA's `Notes LIKE '%LLG-<id>%'` per Agent_ID.
+     *
+     * @param list<array{client_id: string}> $rows
+     */
+    protected function preload(string $pass, array $rows): void
+    {
+        $ids = array_values(array_unique(array_column($rows, 'client_id')));
+        $llgs = array_map(static fn (string $id): string => 'LLG-' . $id, $ids);
+        $cache = ['contacts' => [], 'employeeByName' => [], 'employeeLocation' => [], 'enrollment' => [], 'processed' => []];
+
+        foreach (array_chunk($pass === 'ccs' ? $ids : $llgs, 500) as $chunk) {
+            $in = implode(',', array_fill(0, count($chunk), '?'));
+            if ($pass === 'ccs') {
+                foreach ($this->ccsSelect("SELECT Client, Agent, Status, CID, Email, City, State, Phone FROM TblContacts WHERE CID IN ({$in})", $chunk) as $contact) {
+                    $cache['contacts'][(string) $contact['CID']] ??= $contact;
+                }
+            } else {
+                foreach ($this->ldrSelect("SELECT Client, Agent, Status, LLG_ID, Email, City, State, Phone FROM TblContacts WHERE LLG_ID IN ({$in}) ORDER BY PK", $chunk) as $contact) {
+                    $cache['contacts'][(string) $contact['LLG_ID']] ??= $contact;
+                }
+            }
+        }
+
+        $employees = $pass === 'ccs'
+            ? $this->ccsSelect('SELECT PK, Employee_Name FROM TblEmployees ORDER BY PK', [])
+            : $this->ldrSelect('SELECT PK, Employee_Name FROM TblEmployees ORDER BY PK', []);
+        foreach ($employees as $employee) {
+            $cache['employeeByName'][self::nameKey((string) $employee['Employee_Name'])] ??= (int) $employee['PK'];
+        }
+        foreach ($this->ldrSelect('SELECT PK, Location FROM TblEmployees', []) as $employee) {
+            $cache['employeeLocation'][(int) $employee['PK']] = trim((string) $employee['Location']);
+        }
+
+        foreach (array_chunk($llgs, 500) as $chunk) {
+            $in = implode(',', array_fill(0, count($chunk), '?'));
+            foreach ($this->ldrSelect("SELECT LLG_ID, Enrollment_Status FROM TblEnrollment WHERE LLG_ID IN ({$in})", $chunk) as $enrollment) {
+                $cache['enrollment'][(string) $enrollment['LLG_ID']] ??= (string) $enrollment['Enrollment_Status'];
+            }
+        }
+
+        $wanted = array_flip($llgs);
+        $rowsProcessed = $this->ldrSelect("SELECT Agent_ID, Notes FROM TblPayrollAdjustments WHERE Category = 'Commission' AND Notes LIKE 'Funded - LLG-%'", []);
+        foreach ($rowsProcessed as $payroll) {
+            $notes = (string) $payroll['Notes'];
+            $agentId = (int) $payroll['Agent_ID'];
+            // LIKE '%LLG-<id>%' is a substring test, so every id the note contains counts.
+            if (preg_match_all('/LLG-\d+/', $notes, $m)) {
+                foreach ($m[0] as $token) {
+                    foreach ($wanted as $llg => $_) {
+                        if (str_starts_with($token, $llg)) {
+                            $cache['processed'][$agentId][$llg] = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        $this->cache = $cache;
+    }
+
+    /** SQL Server compares Employee_Name case-insensitively and ignores trailing spaces. */
+    private static function nameKey(string $name): string
+    {
+        return mb_strtolower(rtrim($name));
     }
 
     // ─── I/O seams (overridden in tests) ──────────────────────────────────
