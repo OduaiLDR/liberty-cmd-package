@@ -253,13 +253,15 @@ class SyncEnrollmentData extends Command
         // Query the OTHER source's Snowflake too
         $otherSource = $this->source === 'LDR' ? 'plaw' : 'ldr';
         $otherPaymentCounts = [];
+        $bothSourcesLoaded = false;
         try {
             $otherSnowflake = DBConnector::fromEnvironment($otherSource);
             $otherResult = $otherSnowflake->query($snowflakeSql);
             $otherPaymentCounts = $otherResult['data'] ?? [];
+            $bothSourcesLoaded = true;
             $this->info("[INFO] Fetched payment counts for " . count($otherPaymentCounts) . " contacts from " . strtoupper($otherSource) . " Snowflake");
         } catch (\Throwable $e) {
-            $this->warn("[WARN] Could not query " . strtoupper($otherSource) . " Snowflake: " . $e->getMessage());
+            $this->warn("[WARN] Could not query " . strtoupper($otherSource) . " Snowflake: " . $e->getMessage() . " — stale counts will not be reset to 0 this run.");
         }
 
         // Create lookup map - merge both sources, take the max count per contact
@@ -300,16 +302,22 @@ class SyncEnrollmentData extends Command
             // Remove LLG- prefix to get contact ID
             $contactId = str_replace('LLG-', '', $llgId);
 
+            // A contact with no cleared-and-not-returned draft has no row in the GROUP BY at all, so
+            // "absent" must mean 0 — not "keep the old count". Jacob, 17 Sep 2026: LLG-1223838618's
+            // only draft cleared on 8 Sep and returned on 10 Sep; the sync ran in between, wrote
+            // Payments = 1, and nothing ever put it back. Reset only when both Snowflake sources
+            // answered, or an outage on one side would zero the other side's clients.
             if (isset($paymentsMap[$contactId])) {
-                $rawPaymentCount = $paymentsMap[$contactId];
-                
-                // Store actual count of cleared payments
-                $paymentCount = (int) $rawPaymentCount;
+                $paymentCount = (int) $paymentsMap[$contactId];
+            } elseif ($bothSourcesLoaded) {
+                $paymentCount = 0;
+            } else {
+                continue;
+            }
 
-                // Only add to updates if different
-                if ((int) $currentPayments !== $paymentCount) {
-                    $updates[$llgId] = $paymentCount;
-                }
+            // Only add to updates if different
+            if ((int) $currentPayments !== $paymentCount) {
+                $updates[$llgId] = $paymentCount;
             }
         }
 
