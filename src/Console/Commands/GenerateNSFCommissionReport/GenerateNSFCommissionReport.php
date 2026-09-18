@@ -160,7 +160,7 @@ class GenerateNSFCommissionReport extends Command
                     'agent'
                 ),
                 $rosterAgents
-            );
+            ); 
             if ($unassigned !== []) {
                 $this->warn(
                     "[WARN] [$display] " . count($unassigned) . ' agent(s) earned NSF commission this period '

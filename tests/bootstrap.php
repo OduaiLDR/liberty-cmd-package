@@ -41,3 +41,16 @@ if (!function_exists('now')) {
         return \Illuminate\Support\Carbon::now($tz);
     }
 }
+
+if (!function_exists('storage_path')) {
+    /** Report formatters save workbooks under storage_path('app/...'); point that at a temp dir. */
+    function storage_path(string $path = ''): string
+    {
+        $base = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'liberty-cmd-package-tests';
+        if (!is_dir($base . DIRECTORY_SEPARATOR . 'app')) {
+            mkdir($base . DIRECTORY_SEPARATOR . 'app', 0777, true);
+        }
+
+        return $path === '' ? $base : $base . DIRECTORY_SEPARATOR . ltrim($path, '/\\');
+    }
+}

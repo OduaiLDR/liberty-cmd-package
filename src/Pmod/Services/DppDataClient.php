@@ -42,6 +42,10 @@ final class DppDataClient
             tenantKeys: [
                 'ldr' => (string) config('services.dpp_post.ldr', ''),
                 'plaw' => (string) config('services.dpp_post.plaw', ''),
+                // Lending Tower and CCS: the keys behind the workbook's UpdateCRMDataLT / UpdateCRMDataCCS
+                // (referral-commissions:process). Same endpoint, per-org key.
+                'lt' => (string) config('services.dpp_post.lt', ''),
+                'ccs' => (string) config('services.dpp_post.ccs', ''),
             ],
         );
     }

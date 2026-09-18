@@ -3,6 +3,8 @@
 namespace Cmd\Reports;
 
 use Illuminate\Support\ServiceProvider;
+use Cmd\Reports\Console\Commands\ImportCompanyHolidays;
+use Cmd\Reports\Console\Commands\ReferralCommissions\ProcessReferralCommissions;
 use Cmd\Reports\Console\Commands\TestDatabaseConnections;
 use Cmd\Reports\Console\Commands\SyncBalances;
 use Cmd\Reports\Console\Commands\SyncBalancesHistory;
@@ -93,6 +95,7 @@ use Cmd\Reports\Console\Commands\SyncDroppedStatus\SyncDroppedStatus;
 use Cmd\Reports\Console\Commands\SyncDroppedStatus\SyncDroppedStatusPreview;
 use Cmd\Reports\Console\Commands\GenerateAdvanceRecoupReport\GenerateAdvanceRecoupReport;
 use Cmd\Reports\Console\Commands\GenerateParamountEpfSummary\GenerateParamountEpfSummary;
+use Cmd\Reports\Console\Commands\GenerateAdvanceRequest;
 
 class ReportsServiceProvider extends ServiceProvider
 {
@@ -189,6 +192,8 @@ class ReportsServiceProvider extends ServiceProvider
                 GenerateRetentionBonusCommission::class,
                 GenerateNSFCommissionReport::class,
                 GenerateEnrollmentBonusReport::class,
+                ImportCompanyHolidays::class,
+                ProcessReferralCommissions::class,
                 SyncContactsData::class,
                 SyncCollectionCompanies::class,
                 SyncLastDepositDate::class,
@@ -213,6 +218,7 @@ class ReportsServiceProvider extends ServiceProvider
                 SyncEmployeeSfUids::class,
                 GenerateAdvanceRecoupReport::class,
                 GenerateParamountEpfSummary::class,
+                GenerateAdvanceRequest::class,
             ]);
         }
 

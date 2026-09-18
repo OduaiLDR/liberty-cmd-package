@@ -2,6 +2,7 @@
 
 namespace Cmd\Reports\Console\Commands\GenerateEnrollmentBonusReport;
 
+use PhpOffice\PhpSpreadsheet\Cell\DataType;
 use PhpOffice\PhpSpreadsheet\Shared\Date as XlDate;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Style\Alignment;
@@ -50,10 +51,12 @@ class Formatter
     private function buildEnrollmentSheet($sheet, array $rows, array $pending): void
     {
         $sheet->setTitle('Enrollment Data');
+        $sheet->setShowGridlines(false);
         $data = [];
         foreach ($rows as $row) {
             $data[] = [
                 $row['SNOWFLAKE_CONTACT_ID'],
+                $row['EXTERNAL_ID'] ?? '',
                 $row['CLIENT'],
                 $row['SUBMITTED_DATE'],
                 $row['DEBT_AMOUNT'],
@@ -65,6 +68,7 @@ class Formatter
         foreach ($pending as $row) {
             $data[] = [
                 $row['CONTACT_ID'],
+                $row['EXTERNAL_ID'] ?? '',
                 $row['CLIENT'],
                 '',
                 $row['ENROLLED_DEBT'],
@@ -73,18 +77,22 @@ class Formatter
                 'Pending',
             ];
         }
+        // Jacob 2026-09-14: External ID sits directly after the CID.
+        // External IDs are long digit strings; written as text so Excel keeps leading zeros and
+        // does not round them past 15 digits.
         $this->writeSheet($sheet, [
-            'CID', 'Client', 'Submitted Date', 'Debt Amount',
+            'CID', 'External ID', 'Client', 'Submitted Date', 'Debt Amount',
             'Current Status', 'Cut Off Status', 'Relevant Status',
-        ], $data);
-        $this->formatDate($sheet, 3, count($data) + 1, 'mm/dd/yyyy');
-        $this->formatCurrency($sheet, 4, count($data) + 1);
+        ], $data, textColumns: [2]);
+        $this->formatDate($sheet, 4, count($data) + 1, 'mm/dd/yyyy');
+        $this->formatCurrency($sheet, 5, count($data) + 1);
         $this->selectTopLeft($sheet);
     }
 
     private function buildStatusSheet($sheet, array $rows, array $pending): void
     {
         $sheet->setTitle('Status Data');
+        $sheet->setShowGridlines(false);
         $data = [];
         foreach ($rows as $row) {
             if ($row['STATUS_STAMP_PT'] !== '') {
@@ -101,7 +109,10 @@ class Formatter
         $this->selectTopLeft($sheet);
     }
 
-    private function writeSheet($sheet, array $headers, array $rows): void
+    /**
+     * @param int[] $textColumns 1-based columns whose values are always stored as text.
+     */
+    private function writeSheet($sheet, array $headers, array $rows, array $textColumns = []): void
     {
         foreach ($headers as $index => $header) {
             $sheet->setCellValueByColumnAndRow($index + 1, 1, $header);
@@ -109,7 +120,11 @@ class Formatter
         $this->headerStyle($sheet, 'A1:' . $this->columnName(count($headers)) . '1');
         foreach ($rows as $rowIndex => $row) {
             foreach ($row as $columnIndex => $value) {
-                $sheet->setCellValueByColumnAndRow($columnIndex + 1, $rowIndex + 2, $value);
+                if (in_array($columnIndex + 1, $textColumns, true)) {
+                    $sheet->setCellValueExplicitByColumnAndRow($columnIndex + 1, $rowIndex + 2, (string) $value, DataType::TYPE_STRING);
+                } else {
+                    $sheet->setCellValueByColumnAndRow($columnIndex + 1, $rowIndex + 2, $value);
+                }
             }
         }
         $lastColumn = $this->columnName(count($headers));

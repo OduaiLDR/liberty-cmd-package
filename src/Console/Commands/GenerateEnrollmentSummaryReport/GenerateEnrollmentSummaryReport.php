@@ -14,7 +14,8 @@ class GenerateEnrollmentSummaryReport extends Command
         {--date= : Window date (Y-m-d), drives which month the "Paying in X" projection window starts from. If omitted, resolved automatically via SoldTranche() (see resolveDefaultWindowDate).}
         {--snapshot-date= : TESTING ONLY. Overrides today\'s date for snapshot metrics (Gross Enrollments, Cancels, NSFs, etc). The VBA always uses today for these regardless of --date.}
         {--no-email : Skip sending the email, just build the file}
-        {--output= : Save the workbook to this path instead of the temp storage path (implies --no-email unless combined with normal flow)}';
+        {--output= : Save the workbook to this path instead of the temp storage path (implies --no-email unless combined with normal flow)}
+        {--ledger-write=auto : Record today\'s Unprocessed Peel Offs in TblEnrollmentPeelOffs so later runs exclude them from NSF/Cancel. auto = only on a real run (no --snapshot-date, no --output); on / off force it.}';
 
     protected $description = 'Generate the Enrollment Summary Report (Total/LDR/Legal breakdown from TblEnrollment) and email it.';
 
@@ -33,6 +34,9 @@ class GenerateEnrollmentSummaryReport extends Command
 
     /** Trailing-6 sellable ratio for the report month (Total column only); computed once per run. */
     private ?float $trailing6SellableRatio = null;
+
+    /** Peel-off detail for the window's first month; built once per run, read by every column pass. */
+    private ?PeelOffsBuilder $peelOffs = null;
 
     public function handle(): int
     {
@@ -73,6 +77,35 @@ class GenerateEnrollmentSummaryReport extends Command
                     : round($this->trailing6SellableRatio * 100) . '%'
             ));
 
+            // Peel offs (PRD 2026-09-10; every window month since Jacob's 2026-09-14 12:08 ask).
+            // Collected once here on the Total population for the whole window (the column and
+            // month splits are applied in PHP) so the summary rows and the Peel Offs sheet come
+            // from one query.
+            [$windowStart, $windowEnd] = $this->windowBounds($windowDate);
+            $this->peelOffs = new PeelOffsBuilder($connector, $snapshotDate, $windowStart, $windowEnd, self::COLUMNS['Total']);
+            $peelOffRows = $this->peelOffs->collect();
+            foreach ($this->peelOffs->warnings() as $warning) {
+                $this->warn('[WARN] ' . $warning);
+            }
+            $byMonth = [];
+            foreach ($peelOffRows['unprocessed'] as $row) {
+                $byMonth[$row['Paying_In_Label']] = ($byMonth[$row['Paying_In_Label']] ?? 0) + 1;
+            }
+            $forthDropped = $this->peelOffs->forthDropped();
+            $this->info(sprintf(
+                '[INFO] Peel offs for %s (window %s to %s): NSF %d, Cancel %d, Unprocessed %d (newly since %s%s; Forth check removed %d returned, %d cleared).',
+                $snapshotDate,
+                $windowStart,
+                $windowEnd,
+                count($peelOffRows['nsf']),
+                count($peelOffRows['cancel']),
+                count($peelOffRows['unprocessed']),
+                PeelOffsBuilder::previousReportDate($snapshotDate),
+                $byMonth === [] ? '' : '; ' . implode(', ', array_map(fn ($m, $n) => "{$m}: {$n}", array_keys($byMonth), $byMonth)),
+                $forthDropped['returned'],
+                $forthDropped['cleared']
+            ));
+
             foreach (self::COLUMNS as $columnKey => $criteria) {
                 $this->info("[INFO] Building column: {$columnKey}");
                 $this->buildColumn($connector, $columnKey, $criteria, $windowDate, $snapshotDate);
@@ -82,6 +115,8 @@ class GenerateEnrollmentSummaryReport extends Command
             Log::error('GenerateEnrollmentSummaryReport: build failed', ['exception' => $e]);
             return Command::FAILURE;
         }
+
+        $this->writePeelOffLedger($snapshotDate);
 
         $trancheRows = null;
         try {
@@ -113,7 +148,7 @@ class GenerateEnrollmentSummaryReport extends Command
         }
 
         $formatter = new Formatter();
-        $workbook = $formatter->buildWorkbook($this->rows, array_keys(self::COLUMNS), $snapshotDate, $trancheRows, $capitalReport, $monthlyResiduals);
+        $workbook = $formatter->buildWorkbook($this->rows, array_keys(self::COLUMNS), $snapshotDate, $trancheRows, $capitalReport, $monthlyResiduals, $peelOffRows);
         $emailHtml = $formatter->buildEnrollmentSummaryEmailHtml($this->rows, array_keys(self::COLUMNS), $snapshotDate);
 
         $outputPath = $this->option('output');
@@ -288,12 +323,9 @@ class GenerateEnrollmentSummaryReport extends Command
     {
         // VBA: StartDate = first day of ReportDate's month (no offset); EndDate = last day of the
         // month containing ReportDate + 45 days.
-        $start = new \DateTime($windowDate);
-        $start->modify('first day of this month');
-
-        $end = new \DateTime($windowDate);
-        $end->modify('+45 days');
-        $end->modify('last day of this month');
+        [$windowStart, $windowEnd] = $this->windowBounds($windowDate);
+        $start = new \DateTime($windowStart);
+        $end = new \DateTime($windowEnd);
 
         $cursor = clone $start;
         $monthIndex = 0;
@@ -306,7 +338,7 @@ class GenerateEnrollmentSummaryReport extends Command
 
             $this->setRow('', $columnKey, null, 'blank', blank: true);
 
-            $paidCoalesce = 'COALESCE(First_Payment_Date, Payment_Date_2, Payment_Date_1)';
+            $paidCoalesce = PeelOffsBuilder::PAID_COALESCE;
 
             // Jacob 2026-08-17 (#4): on the currently-paying PROJECTION totals (Total Deals/Debt,
             // Sellable, Reconsideration — the ones already scoped to Cancel_Date IS NULL AND
@@ -315,8 +347,21 @@ class GenerateEnrollmentSummaryReport extends Command
             // is already excluded by NSF_Date IS NULL. No-op for future months (their dates are
             // always >= the cutoff). The Gross/day-based rows above are left as-is per Jacob ("the
             // new debt and clients is only for that particular day so that is the same").
-            $threeDayCutoff = date('Y-m-d', strtotime($snapshotDate . ' -3 days'));
+            // The grace period itself lives in PeelOffsBuilder so the Unprocessed Peel Offs row
+            // (PRD 2026-09-10) is derived from the same number.
+            $threeDayCutoff = PeelOffsBuilder::unprocessedCutoff($snapshotDate);
             $payingClause = "AND (First_Payment_Cleared_Date IS NOT NULL OR {$paidCoalesce} >= '{$threeDayCutoff}')";
+
+            // PRD 2026-09-10 §2: a client already recorded as an Unprocessed Peel Off on an earlier
+            // report is not counted again as an NSF or Cancel peel off. Applied to the count rows as
+            // well as the debt rows so each block stays internally consistent, and to EVERY month:
+            // sync:first-payment-date still recomputes First_Payment_Date to the first
+            // cleared-or-returned draft, so a client whose first draft never processed and whose new
+            // draft bounces moves into the NEXT month's bucket. The Unprocessed rows are on every
+            // month too (Jacob 2026-09-14 12:08): while the report is anchored a month behind, the
+            // newly-unprocessed payments are the second month's; the third month is always 0.
+            $hasPeelOffs = $this->peelOffs !== null;
+            $peelOffExclusion = $hasPeelOffs ? $this->peelOffs->ledgerExclusionSql() : '';
 
             $grossNew = (int) $this->scalar($connector, "
                 SELECT COUNT(*) FROM TblEnrollment
@@ -328,18 +373,26 @@ class GenerateEnrollmentSummaryReport extends Command
             $cancels = (int) $this->scalar($connector, "
                 SELECT COUNT(*) FROM TblEnrollment
                 WHERE Cancel_Date = ?
-                  AND {$paidCoalesce} >= ? AND {$paidCoalesce} <= ? {$criteria}
+                  AND {$paidCoalesce} >= ? AND {$paidCoalesce} <= ? {$criteria} {$peelOffExclusion}
             ", [$snapshotDate, $monthStart, $monthEnd]);
             $this->setRow("Cancels of Client's Paying in {$monthLabel}", $columnKey, $cancels, 'count');
 
+            // Cancel outranks NSF (Jacob 2026-09-14 13:07): a cancelled client is reported as a Cancel only.
             $nsfs = (int) $this->scalar($connector, "
                 SELECT COUNT(*) FROM TblEnrollment
-                WHERE NSF_Date = ?
-                  AND {$paidCoalesce} >= ? AND {$paidCoalesce} <= ? {$criteria}
+                WHERE NSF_Date = ? AND Cancel_Date IS NULL
+                  AND {$paidCoalesce} >= ? AND {$paidCoalesce} <= ? {$criteria} {$peelOffExclusion}
             ", [$snapshotDate, $monthStart, $monthEnd]);
             $this->setRow("NSFs of Client's Paying in {$monthLabel}", $columnKey, $nsfs, 'count');
 
-            $this->setRow("Net New Clients Paying in {$monthLabel}", $columnKey, $grossNew - $cancels - $nsfs, 'count');
+            // PRD §1.1: Unprocessed Peel Offs — count here, debt below — for this month's payers.
+            // The Net rows subtract them like the other two peel-off types (Jacob 2026-09-14 10:54).
+            $unprocessed = $hasPeelOffs ? $this->peelOffs->aggregate('unprocessed', $columnKey, $monthStart) : ['count' => 0, 'debt' => 0.0];
+            if ($hasPeelOffs) {
+                $this->setRow("Unprocessed Payments of Client's Paying in {$monthLabel}", $columnKey, $unprocessed['count'], 'count');
+            }
+
+            $this->setRow("Net New Clients Paying in {$monthLabel}", $columnKey, $grossNew - $cancels - $nsfs - $unprocessed['count'], 'count');
 
             $grossDebt = (float) $this->scalar($connector, "
                 SELECT SUM(Debt_Amount) FROM TblEnrollment
@@ -351,18 +404,22 @@ class GenerateEnrollmentSummaryReport extends Command
             $debtCancel = (float) $this->scalar($connector, "
                 SELECT SUM(Debt_Amount) FROM TblEnrollment
                 WHERE Cancel_Date = ?
-                  AND {$paidCoalesce} >= ? AND {$paidCoalesce} <= ? {$criteria}
+                  AND {$paidCoalesce} >= ? AND {$paidCoalesce} <= ? {$criteria} {$peelOffExclusion}
             ", [$snapshotDate, $monthStart, $monthEnd]);
             $this->setRow("Cancel Peel Offs Paying in {$monthLabel}", $columnKey, $debtCancel, 'currency');
 
             $debtNsf = (float) $this->scalar($connector, "
                 SELECT SUM(Debt_Amount) FROM TblEnrollment
-                WHERE NSF_Date = ?
-                  AND {$paidCoalesce} >= ? AND {$paidCoalesce} <= ? {$criteria}
+                WHERE NSF_Date = ? AND Cancel_Date IS NULL
+                  AND {$paidCoalesce} >= ? AND {$paidCoalesce} <= ? {$criteria} {$peelOffExclusion}
             ", [$snapshotDate, $monthStart, $monthEnd]);
             $this->setRow("NSF Peel Offs Paying in {$monthLabel}", $columnKey, $debtNsf, 'currency');
 
-            $this->setRow("Total Net Debt Enrolled Paying in {$monthLabel}", $columnKey, $grossDebt - $debtCancel - $debtNsf, 'currency');
+            if ($hasPeelOffs) {
+                $this->setRow("Unprocessed Peel Offs Paying in {$monthLabel}", $columnKey, $unprocessed['debt'], 'currency');
+            }
+
+            $this->setRow("Total Net Debt Enrolled Paying in {$monthLabel}", $columnKey, $grossDebt - $debtCancel - $debtNsf - $unprocessed['debt'], 'currency');
 
             $deals = (int) $this->scalar($connector, "
                 SELECT COUNT(*) FROM TblEnrollment
@@ -637,6 +694,67 @@ class GenerateEnrollmentSummaryReport extends Command
 
         // VBA: DateSerial(Year(Date), Month(Date), 0) = day 0 of this month = last day of last month.
         return (new \DateTimeImmutable($today))->modify('last day of last month')->format('Y-m-d');
+    }
+
+    /**
+     * First day of the window's first month and last day of its last month — the VBA's StartDate
+     * (first day of ReportDate's month) and EndDate (last day of the month containing
+     * ReportDate + 45 days). One place, so the month buckets and the peel offs cannot drift.
+     *
+     * @return array{0: string, 1: string}
+     */
+    private function windowBounds(string $windowDate): array
+    {
+        $date = new \DateTimeImmutable($windowDate);
+
+        return [
+            $date->modify('first day of this month')->format('Y-m-d'),
+            $date->modify('+45 days')->modify('last day of this month')->format('Y-m-d'),
+        ];
+    }
+
+    /**
+     * Records today's Unprocessed Peel Offs so later runs exclude them from NSF / Cancel (PRD §2).
+     * `auto` writes only on a real run: a --snapshot-date or --output run is a review copy and must
+     * not stamp the ledger with a date the report did not actually run for.
+     */
+    private function writePeelOffLedger(string $snapshotDate): void
+    {
+        if ($this->peelOffs === null) {
+            return;
+        }
+
+        $mode = strtolower((string) $this->option('ledger-write'));
+        if (!in_array($mode, ['auto', 'on', 'off'], true)) {
+            $this->warn("[WARN] Unknown --ledger-write value '{$mode}'; treating it as 'off'.");
+            $mode = 'off';
+        }
+
+        $isReviewRun = $this->option('snapshot-date') !== null || $this->option('output') !== null;
+        $shouldWrite = $mode === 'on' || ($mode === 'auto' && !$isReviewRun);
+
+        if (!$shouldWrite) {
+            $this->info('[INFO] Peel-off ledger: write skipped (' . ($mode === 'off' ? '--ledger-write=off' : 'review run; pass --ledger-write=on to record it') . ').');
+            return;
+        }
+
+        $result = $this->peelOffs->writeLedger();
+        if ($result['failed'] > 0) {
+            $this->warn(sprintf(
+                '[WARN] Peel-off ledger: %d of %d unprocessed row(s) FAILED to record for %s — tomorrow\'s NSF/Cancel peel offs may count them again. See the log.',
+                $result['failed'],
+                $result['attempted'],
+                $snapshotDate
+            ));
+            return;
+        }
+
+        $this->info(sprintf(
+            '[INFO] Peel-off ledger: %d new unprocessed row(s) recorded for %s (%d already present).',
+            $result['written'],
+            $snapshotDate,
+            $result['attempted'] - $result['written']
+        ));
     }
 
     private function soldTranche(DBConnector $connector, string $reportDate): bool

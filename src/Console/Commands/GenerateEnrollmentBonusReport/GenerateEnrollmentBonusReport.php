@@ -13,13 +13,23 @@ class GenerateEnrollmentBonusReport extends Command
 
     private const PENDING_STATUS_TITLES = ['Submitted', 'Approved', 'Attorney Approved CFLN'];
 
+    /** Summary row labels (Jacob 2026-09-14 renames). Also the array keys, so the sheet and email follow. */
+    public const LABEL_GROSS = 'All Enrollments (Gross)';
+    public const LABEL_PROJECTED = 'Projected (Net)';
+    public const LABEL_EOM = 'EOM Projection (Net)';
+
+    /** @var array{report: int, month: int} Business-day counts behind the EOM projection, for the email body. */
+    private array $businessDays = ['report' => 0, 'month' => 0];
+
     protected $signature = 'reports:generate-enrollment-bonus-report
                             {from? : Submitted date start YYYY-MM-DD (defaults to report period)}
                             {to? : Submitted date end YYYY-MM-DD (defaults to report period)}
                             {--download : Copy the workbook to Downloads}
                             {--no-email : Build workbook only, skip email}';
 
-    protected $description = 'Generate the Enrollment Bonus Report (LDR / Progress Law enrollment summary).';
+    // Jacob 2026-09-14: the report is the "Enrollment Status Report" again. Display text only — the
+    // artisan command name and this class keep their names so the automation entry keeps firing.
+    protected $description = 'Generate the Enrollment Status Report (LDR / Progress Law enrollment summary; formerly the Enrollment Bonus Report).';
 
     public function handle(): int
     {
@@ -32,13 +42,14 @@ class GenerateEnrollmentBonusReport extends Command
 
             $sql = DBConnector::fromEnvironment('ldr');
             $sql->initializeSqlServer();
+            $this->loadHolidayCalendar($sql, $from);
             $azureRows = $this->fetchAzureRows($sql, $from, $exclusiveTo);
             $enrollmentRows = $this->attachSnowflakeStatuses($azureRows, $from, $to);
             $enrolledContactIds = $this->contactIdsFromEnrollmentRows($enrollmentRows);
             $pendingRows = $this->fetchPendingRows($from, $to, $enrolledContactIds);
-            $summary = $this->buildSummary($enrollmentRows, $pendingRows);
+            $summary = $this->buildSummary($enrollmentRows, $pendingRows, $from, $to);
 
-            $filename = "Enrollment Bonus Report - {$to}.xlsx";
+            $filename = "Enrollment Status Report - {$to}.xlsx";
             $path = storage_path("app/{$filename}");
             (new Formatter())->buildWorkbook($enrollmentRows, $pendingRows, $summary, $path);
             $this->info('Workbook created: ' . $path);
@@ -54,7 +65,7 @@ class GenerateEnrollmentBonusReport extends Command
 
             return self::SUCCESS;
         } catch (\Throwable $e) {
-            $this->error('Enrollment Bonus Report failed: ' . $e->getMessage());
+            $this->error('Enrollment Status Report failed: ' . $e->getMessage());
             Log::error('GenerateEnrollmentBonusReport failed', ['exception' => $e]);
             return self::FAILURE;
         }
@@ -62,11 +73,19 @@ class GenerateEnrollmentBonusReport extends Command
 
     private function fetchAzureRows(DBConnector $sql, string $from, string $exclusiveTo): array
     {
+        // External_ID (Jacob 2026-09-14) is the CMD's contact-level mailer id (Forth TP_ID with the
+        // TblEnrollmentOverrides / TblMailers corrections applied by Sync:contacts-data). It lives in
+        // the per-source contact tables — TblContactsLDR / TblContactsPLAW cover every enrolment;
+        // TblContacts holds only the Lending Tower-sourced leads (measured on the clone for Aug 2026:
+        // 1,595 + 804 of 2,401 vs 466). Read through aggregates rather than joins: the contact tables
+        // have carried duplicate LLG_IDs before, and a join would multiply enrolment rows.
+        $externalId = static fn (string $table): string => "(SELECT MAX(NULLIF(c.External_ID, '')) FROM {$table} c WHERE c.LLG_ID = e.LLG_ID)";
         $result = $sql->querySqlServer(
-            "SELECT LLG_ID, Client, Debt_Amount, Enrollment_Status, Enrollment_Plan, Submitted_Date
-             FROM TblEnrollment
-             WHERE Submitted_Date >= ? AND Submitted_Date < ? AND LLG_ID IS NOT NULL
-             ORDER BY Submitted_Date ASC, LLG_ID ASC",
+            "SELECT e.LLG_ID, e.Client, e.Debt_Amount, e.Enrollment_Status, e.Enrollment_Plan, e.Submitted_Date,
+                    COALESCE({$externalId('TblContactsLDR')}, {$externalId('TblContactsPLAW')}, {$externalId('TblContacts')}) AS External_ID
+             FROM TblEnrollment e
+             WHERE e.Submitted_Date >= ? AND e.Submitted_Date < ? AND e.LLG_ID IS NOT NULL
+             ORDER BY e.Submitted_Date ASC, e.LLG_ID ASC",
             [$from, $exclusiveTo]
         );
 
@@ -150,6 +169,7 @@ class GenerateEnrollmentBonusReport extends Command
             $source = stripos($plan, 'Progress') !== false ? 'plaw' : 'ldr';
             $rows[$contactId] = [
                 'LLG_ID' => $llg,
+                'EXTERNAL_ID' => trim((string) $this->value($azure, 'External_ID', '')),
                 'CLIENT' => (string) $this->value($azure, 'Client', ''),
                 'DEBT_AMOUNT' => (float) $this->value($azure, 'Debt_Amount', 0),
                 'AZURE_STATUS' => (string) $this->value($azure, 'Enrollment_Status', ''),
@@ -255,6 +275,7 @@ LEFT JOIN (SELECT CONTACT_ID, STAMP_PT_STR, TITLE FROM statuses WHERE asof_rn = 
             $plan = $plans[$id] ?? '';
             $pending[] = [
                 'CONTACT_ID' => $id,
+                'EXTERNAL_ID' => $status['external_id'] ?? '',
                 'CLIENT' => $status['client'],
                 'STATUS_TITLE' => $status['title'],
                 'STATUS_STAMP_PT' => $status['stamp_pt'],
@@ -291,18 +312,20 @@ LEFT JOIN (SELECT CONTACT_ID, STAMP_PT_STR, TITLE FROM statuses WHERE asof_rn = 
             if ($values === '') {
                 continue;
             }
+            // TP_ID is the Forth field Sync:contacts-data stores as TblContacts.External_ID.
             $sql = "
 WITH requested AS (SELECT column1 AS CONTACT_ID_STR FROM VALUES {$values}), latest AS (
  SELECT cs.CONTACT_ID, cls.TITLE,
         TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP), 'YYYY-MM-DD HH24:MI:SS') AS STAMP_PT,
         CONCAT(c.FIRSTNAME, ' ', c.LASTNAME) AS CLIENT,
+        c.TP_ID AS EXTERNAL_ID,
         ROW_NUMBER() OVER (PARTITION BY cs.CONTACT_ID ORDER BY cs.STAMP DESC) AS rn
  FROM CONTACTS_STATUS cs
  LEFT JOIN CONTACTS_LEAD_STATUS cls ON cs.STATUS_ID = cls.ID
  JOIN CONTACTS c ON c.ID = cs.CONTACT_ID
  INNER JOIN requested r ON TO_VARCHAR(cs.CONTACT_ID) = r.CONTACT_ID_STR
 )
-SELECT CONTACT_ID, TITLE, STAMP_PT, CLIENT FROM latest WHERE rn = 1";
+SELECT CONTACT_ID, TITLE, STAMP_PT, CLIENT, EXTERNAL_ID FROM latest WHERE rn = 1";
             foreach (($connector->query($sql)['data'] ?? []) as $row) {
                 $id = (string) $this->value($row, 'CONTACT_ID', '');
                 if ($id !== '') {
@@ -310,6 +333,7 @@ SELECT CONTACT_ID, TITLE, STAMP_PT, CLIENT FROM latest WHERE rn = 1";
                         'title' => (string) $this->value($row, 'TITLE', ''),
                         'stamp_pt' => $this->normalizeSnowflakeStamp((string) $this->value($row, 'STAMP_PT', '')),
                         'client' => (string) $this->value($row, 'CLIENT', ''),
+                        'external_id' => trim((string) $this->value($row, 'EXTERNAL_ID', '')),
                     ];
                 }
             }
@@ -367,9 +391,48 @@ SELECT CONTACT_ID, TITLE, STAMP_PT, CLIENT FROM latest WHERE rn = 1";
         return $map;
     }
 
-    private function buildSummary(array $rows, array $pending): array
+    /**
+     * Loads the company holiday calendar the EOM projection counts around (Jacob 2026-09-15, from
+     * CT). Never fatal: an absent or empty table leaves the built-in four holidays in place, and the
+     * run says which it used — silently treating "no rows" as "no holidays" would inflate the
+     * month's business-day count and understate the projection.
+     */
+    private function loadHolidayCalendar(DBConnector $sql, string $from): void
     {
-        $categories = ['All Enrollments', 'Enrolled', 'Cancels', 'Reconsideration Pending', 'At-Risk', 'Pending'];
+        $calendar = BusinessDayCalendar::loadFromDatabase($sql);
+        $reportYear = (int) substr($from, 0, 4);
+
+        if ($calendar['error'] !== null) {
+            $this->warn('[WARN] Company holiday calendar unavailable (' . $calendar['error'] . '); using the built-in holidays.');
+
+            return;
+        }
+
+        if ($calendar['loaded'] === 0) {
+            $this->warn('[WARN] ' . BusinessDayCalendar::TABLE . ' is empty; using the built-in holidays. Load CT\'s calendar with: php artisan holidays:import <file.csv>');
+
+            return;
+        }
+
+        $this->info(sprintf(
+            '[INFO] Holiday calendar: %d date(s) from %s covering %s.',
+            $calendar['loaded'],
+            BusinessDayCalendar::TABLE,
+            implode(', ', $calendar['years'])
+        ));
+
+        if (!in_array($reportYear, $calendar['years'], true)) {
+            $this->warn("[WARN] The calendar has no dates for {$reportYear}; that year falls back to the built-in holidays.");
+        }
+    }
+
+    /**
+     * @param string $from Period start (Y-m-d)
+     * @param string $to   Period end (Y-m-d) — the "Sales data through" date
+     */
+    private function buildSummary(array $rows, array $pending, string $from, string $to): array
+    {
+        $categories = [self::LABEL_GROSS, 'Enrolled', 'Cancels', 'Reconsideration Pending', 'At-Risk', 'Pending'];
         $summary = [];
         foreach (['LDR', 'Progress Law', 'Combined'] as $column) {
             $summary[$column] = array_fill_keys($categories, 0.0);
@@ -383,7 +446,7 @@ SELECT CONTACT_ID, TITLE, STAMP_PT, CLIENT FROM latest WHERE rn = 1";
                 $category = 'Enrolled';
             }
             foreach ([$source, 'Combined'] as $column) {
-                $summary[$column]['All Enrollments'] += $debt;
+                $summary[$column][self::LABEL_GROSS] += $debt;
                 $summary[$column][$category] += $debt;
             }
         }
@@ -396,9 +459,21 @@ SELECT CONTACT_ID, TITLE, STAMP_PT, CLIENT FROM latest WHERE rn = 1";
             }
         }
 
+        // Jacob 2026-09-14: EOM Projection (Net) = total / business days in the report * business
+        // days in the month, skipping weekends and the holidays in BusinessDayCalendar (CT's company
+        // calendar in TblCompanyHolidays when it covers the year, else the built-in four). His
+        // example, 14 Sep: 9 weekdays in 1–13 Sep minus Labor Day = 8; September has 21 => x / 8 * 21.
+        // "Total" is read as Projected (Net), the row directly above it.
+        $daysInReport = BusinessDayCalendar::countBetween($from, $to);
+        $daysInMonth = BusinessDayCalendar::countInMonth($from);
+        $factor = $daysInReport > 0 ? $daysInMonth / $daysInReport : null;
+
         foreach (['LDR', 'Progress Law', 'Combined'] as $column) {
-            $summary[$column]['Projected'] = $summary[$column]['Enrolled'] + $summary[$column]['Pending'];
+            $summary[$column][self::LABEL_PROJECTED] = $summary[$column]['Enrolled'] + $summary[$column]['Pending'];
+            $summary[$column][self::LABEL_EOM] = $factor === null ? 0.0 : $summary[$column][self::LABEL_PROJECTED] * $factor;
         }
+
+        $this->businessDays = ['report' => $daysInReport, 'month' => $daysInMonth];
 
         return $summary;
     }
@@ -424,8 +499,9 @@ SELECT CONTACT_ID, TITLE, STAMP_PT, CLIENT FROM latest WHERE rn = 1";
 
     private function sendReport(DBConnector $sql, string $path, string $filename, array $summary, string $to): void
     {
-        $subject = 'Enrollment Bonus Report - ' . date('m/d/Y', strtotime($to));
-        $body = '<p>Sales data through ' . $this->dataThroughLabel($to) . '</p>';
+        $subject = 'Enrollment Status Report - ' . date('m/d/Y', strtotime($to));
+        $body = '<p>Sales data through ' . $this->dataThroughLabel($to)
+            . sprintf(' (%d of %d business days)', $this->businessDays['report'], $this->businessDays['month']) . '</p>';
         $body .= '<table border="1"><tr><th>Enrollment Status</th><th>LDR</th><th>Progress Law</th><th>Combined</th></tr>';
         foreach (array_keys($summary['Combined'] ?? []) as $category) {
             $cells = '<td>' . htmlspecialchars($category) . '</td>';
@@ -442,7 +518,9 @@ SELECT CONTACT_ID, TITLE, STAMP_PT, CLIENT FROM latest WHERE rn = 1";
         ];
         $sent = (new EmailSenderService())->sendMailUsingTblReportsHtml(
             $sql,
-            ['Enrollment Bonus Report', 'EnrollmentBonusReport'],
+            // TblReports lookup keys, NOT display text: the existing rows keep matching, and a row
+            // filed under the new name (Jacob 2026-09-14) matches too.
+            ['Enrollment Bonus Report', 'EnrollmentBonusReport', 'Enrollment Status Report', 'EnrollmentStatusReport'],
             ['LDR', 'PLAW'],
             $subject,
             $body,
@@ -451,7 +529,7 @@ SELECT CONTACT_ID, TITLE, STAMP_PT, CLIENT FROM latest WHERE rn = 1";
             true
         );
         if (! $sent) {
-            $this->warn('Enrollment Bonus Report email was not sent.');
+            $this->warn('Enrollment Status Report email was not sent.');
         }
     }
 
