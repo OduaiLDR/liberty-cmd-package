@@ -196,9 +196,19 @@ class ProcessReferralCommissions extends Command
                     $this->line('  message left in the Inbox (' . ($this->dryRun ? '--dry-run' : '--keep-in-inbox') . ').');
                     continue;
                 }
-                $this->mail($prefix)->markRead($mailbox, $message['id']);
-                $this->mail($prefix)->moveToInboxSubfolder($mailbox, $message['id'], self::ARCHIVE_FOLDER);
-                $this->line('  marked read and moved to Inbox\\' . self::ARCHIVE_FOLDER . '.');
+                // The rows are written by now; failing to archive must not abort the remaining
+                // messages (18 Sep 2026: a 403 here — the LT app had Mail.Read, not ReadWrite —
+                // stopped the run after the first of five files). Left in the Inbox, the message is
+                // re-read next run and every row is skipped as already processed.
+                try {
+                    $this->mail($prefix)->markRead($mailbox, $message['id']);
+                    $this->mail($prefix)->moveToInboxSubfolder($mailbox, $message['id'], self::ARCHIVE_FOLDER);
+                    $this->line('  marked read and moved to Inbox\\' . self::ARCHIVE_FOLDER . '.');
+                } catch (Throwable $e) {
+                    $failed = true;
+                    $this->error('  [ERROR] processed, but could not archive the message (it stays in the Inbox): ' . $e->getMessage());
+                    Log::error('ProcessReferralCommissions: archive failed', ['mailbox' => $mailbox, 'message' => $message['id'], 'exception' => $e]);
+                }
             }
         }
 
