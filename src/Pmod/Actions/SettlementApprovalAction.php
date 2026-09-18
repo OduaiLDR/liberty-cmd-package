@@ -81,7 +81,14 @@ final class SettlementApprovalAction implements PmodActionHandler
             'path' => $path,
             'failed_check' => $failedCheck,
             'target_status_id' => $targetStatus,
-            'forth_offer' => $offer,
+            'offer_summary' => [
+                'id' => is_scalar($offer['id'] ?? null) ? (string) $offer['id'] : $settlementId,
+                'contact_id' => is_scalar($offer['contact_id'] ?? null) ? (string) $offer['contact_id'] : $workItem->contactId,
+                'debt_id' => is_scalar($offer['debt_id'] ?? null) ? (string) $offer['debt_id'] : null,
+                'offer_status' => $statusId,
+                'offer_valid_date' => $validUntil,
+                'start_date' => $startDate,
+            ],
         ]);
 
         if (! SettlementApprovalRules::isLdrEligibleStatus($statusId)) {

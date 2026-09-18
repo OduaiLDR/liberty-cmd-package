@@ -513,7 +513,7 @@ final class ForthPayPmodExecutionGateway implements PmodExecutionGateway, PmodCr
 
         $response = $this->crmClient($workItem->tenantId)
             ->put("/settlement_offers/{$settlementId}/status", [
-                'status_id' => (int) $statusId,
+                'status_id' => (string) $statusId,
             ]);
 
         if (! $response->successful()) {
