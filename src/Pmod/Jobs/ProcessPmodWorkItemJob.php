@@ -55,7 +55,9 @@ final class ProcessPmodWorkItemJob implements ShouldQueue, ShouldBeUnique
      */
     public int $timeout = 300;
 
-    public function __construct(public readonly PmodWorkItem $workItem) {}
+    public function __construct(public readonly PmodWorkItem $workItem)
+    {
+    }
 
     public function uniqueId(): string
     {

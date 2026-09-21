@@ -16,7 +16,8 @@ final class PmodExtendProgramAction implements PmodActionHandler
     public function __construct(
         private readonly PmodExecutionGateway $gateway,
         private readonly bool $allowLiveDraftUpdates = false,
-    ) {}
+    ) {
+    }
 
     public function actionType(): PmodActionType
     {

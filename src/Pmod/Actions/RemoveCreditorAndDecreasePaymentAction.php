@@ -17,7 +17,8 @@ final class RemoveCreditorAndDecreasePaymentAction implements PmodActionHandler
     public function __construct(
         private readonly PmodExecutionGateway $gateway,
         private readonly bool $allowLiveDraftUpdates = false,
-    ) {}
+    ) {
+    }
 
     public function actionType(): PmodActionType
     {
@@ -129,8 +130,8 @@ final class RemoveCreditorAndDecreasePaymentAction implements PmodActionHandler
         $this->gateway->createContactNote($workItem, implode("\n", $noteLines));
 
         return new PmodResult(
-            status: empty($updateErrors) ? 'updated' : 'captured_for_manual_review',
-            message: sprintf('Remove Creditor and Decrease Payment: creditor excluded, %d draft(s) updated for contact [%s].', count($updateResults), $workItem->contactId),
+            status:   empty($updateErrors) ? 'updated' : 'captured_for_manual_review',
+            message:  sprintf('Remove Creditor and Decrease Payment: creditor excluded, %d draft(s) updated for contact [%s].', count($updateResults), $workItem->contactId),
             metadata: [
                 'action_type'    => $workItem->actionType->value,
                 'contact_id'     => $workItem->contactId,
@@ -156,9 +157,10 @@ final class RemoveCreditorAndDecreasePaymentAction implements PmodActionHandler
         ]));
 
         return new PmodResult(
-            status: 'captured_for_manual_review',
-            message: $message,
+            status:   'captured_for_manual_review',
+            message:  $message,
             metadata: [...$metadata, 'action_type' => $workItem->actionType->value, 'contact_id' => $workItem->contactId],
         );
     }
+
 }

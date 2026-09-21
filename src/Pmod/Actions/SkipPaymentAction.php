@@ -17,7 +17,8 @@ final class SkipPaymentAction implements PmodActionHandler
     public function __construct(
         private readonly PmodExecutionGateway $gateway,
         private readonly bool $allowLiveDraftUpdates = false,
-    ) {}
+    ) {
+    }
 
     public function actionType(): PmodActionType
     {
@@ -150,19 +151,19 @@ final class SkipPaymentAction implements PmodActionHandler
             'Customer Id: ' . $workItem->contactId,
             'Action: Skip Payment',
         ];
-
+        
         foreach ($updates as $index => $update) {
             $noteLines[] = 'Original Scheduled Date: ' . date('m/d/Y', strtotime($update['original_date']));
             $noteLines[] = 'Payment Amount: $' . number_format((float) $update['amount'], 2);
             $noteLines[] = 'Add Payment Date: ' . date('m/d/Y', strtotime($update['target_date']));
             $noteLines[] = 'Add Payment Amount: $' . number_format((float) $update['amount'], 2);
         }
-
+        
         $noteLines[] = 'Dedicated Account Balance:';
         $noteLines[] = 'Total Fees Schedule:';
         $noteLines[] = 'User: ' . ($workItem->requestedBy ?? 'Client');
         $noteLines[] = 'Device: ' . ($workItem->normalizedPayload['device'] ?? 'mobile');
-
+        
         $this->gateway->createContactNote($workItem, implode("\n", $noteLines));
 
         return new PmodResult(
