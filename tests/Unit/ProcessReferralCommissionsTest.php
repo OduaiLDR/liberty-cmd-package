@@ -125,6 +125,29 @@ class ProcessReferralCommissionsTest extends TestCase
         $this->assertSame([], $command->writes);
     }
 
+    public function test_a_payroll_row_without_a_funding_row_is_partial_and_can_be_finished(): void
+    {
+        // The old workbook died between the payroll insert and the note on its last run (21 Sep 2026).
+        $ldr = [
+            'TblContacts' => ['LLG-1246800345' => ['Client' => 'Rieco Owens', 'Agent' => 'Jane Doe', 'Phone' => '', 'Email' => '', 'City' => '', 'State' => '']],
+            'TblEmployees' => ['Jane Doe' => ['PK' => 682, 'Location' => 'USA']],
+            'TblEnrollment' => [],
+            'processed' => [['agent' => 682, 'llg' => 'LLG-1246800345']],
+            'fundings' => [],
+        ];
+
+        $command = $this->command(ldr: $ldr);
+        $this->assertSame('partial', $this->processRow($command, 'lt', $this->row()));
+        $this->assertSame([], $command->writes, 'nothing is written without --finish-partial');
+
+        $command = $this->command(ldr: $ldr);
+        $command->finishPartial = true;
+        $this->assertSame('finished', $this->processRow($command, 'lt', $this->row()));
+        $this->assertStringStartsWith('CRM lt 1246800345 client_status = Funded', $command->writes[0], 'no second payroll row: it starts at the CRM status');
+        $this->assertStringStartsWith('INSERT TblFundings [', $command->writes[2]);
+        $this->assertCount(8, $command->writes);
+    }
+
     public function test_a_row_whose_contact_is_missing_is_dropped(): void
     {
         $command = $this->command(ldr: ['TblContacts' => [], 'TblEmployees' => [], 'TblEnrollment' => [], 'processed' => []]);
@@ -190,6 +213,8 @@ class ProcessReferralCommissionsTest extends TestCase
  */
 final class FakeReferralCommissions extends ProcessReferralCommissions
 {
+    public bool $finishPartial = false;
+
     /** @var list<string> */
     public array $writes = [];
 
@@ -230,6 +255,13 @@ final class FakeReferralCommissions extends ProcessReferralCommissions
             $status = $this->ldrData['TblEnrollment'][$params[0]] ?? null;
 
             return $status === null ? [] : [['Enrollment_Status' => $status]];
+        }
+        if (str_contains($sql, 'FROM TblFundings')) {
+            $this->lookups[] = "ldr TblFundings LLG_ID={$params[0]}";
+            // Unless a test says otherwise, a processed client also has its funding row.
+            $fundings = $this->ldrData['fundings'] ?? array_column($this->ldrData['processed'], 'llg');
+
+            return [['n' => in_array($params[0], $fundings, true) ? 1 : 0]];
         }
         if (str_contains($sql, 'FROM TblPayrollAdjustments')) {
             $this->lookups[] = "ldr TblPayrollAdjustments Agent_ID={$params[0]} Notes LIKE {$params[1]}";

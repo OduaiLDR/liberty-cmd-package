@@ -62,6 +62,7 @@ class ProcessReferralCommissions extends Command
         {--passes=lt,ccs : Passes to run for --file: lt (ProcessReferralCommissions) and/or ccs (ProcessReferralCommissionsCCS). When polling, each mailbox runs the passes its Outlook rule did}
         {--mailbox= : Poll only this automation mailbox (default: every one in MAILBOXES)}
         {--keep-in-inbox : After processing a message, do not mark it read or move it to Inbox\Archive}
+        {--finish-partial : Also complete rows that have a payroll row but no TblFundings row (a run that died between the two, e.g. the last workbook run): CRM status/note, TblFundings and the loan fields, no second payroll row}
         {--dry-run : Read the file and every lookup, write nothing (no SQL, no CRM, mail left where it is)}';
 
     protected $description = 'Import Monevo funded-loan referrals: payroll commission rows, TblFundings and CRM funding fields (replaces the ProcessReferralCommissions VBA and its Outlook rules).';
@@ -99,6 +100,7 @@ class ProcessReferralCommissions extends Command
     ];
 
     protected bool $dryRun = false;
+    protected bool $finishPartial = false;
 
     protected ?DBConnector $ldr = null;
     protected ?PDO $ccs = null;
@@ -114,13 +116,14 @@ class ProcessReferralCommissions extends Command
      * the tests drive. A 260-row file times five round-trips a row times two passes was taking
      * minutes against Azure (18 Sep 2026); batched it is a handful of queries per pass.
      *
-     * @var array{contacts: array<string, array<string, mixed>>, employeeByName: array<string, int>, employeeLocation: array<int, string>, enrollment: array<string, string>, processed: array<int, array<string, true>>}|null
+     * @var array{contacts: array<string, array<string, mixed>>, employeeByName: array<string, int>, employeeLocation: array<int, string>, enrollment: array<string, string>, processed: array<int, array<string, true>>, fundings: array<string, true>}|null
      */
     protected ?array $cache = null;
 
     public function handle(): int
     {
         $this->dryRun = (bool) $this->option('dry-run');
+        $this->finishPartial = (bool) $this->option('finish-partial');
         if ($this->dryRun) {
             $this->warn('[WARN] --dry-run: nothing will be written and no mail will be moved.');
         }
@@ -287,7 +290,7 @@ class ProcessReferralCommissions extends Command
                 $this->dpp()->assertConfigured(self::PASSES[$pass]['tenant']);
             }
 
-            $this->counts = ['processed' => 0, 'already' => 0, 'not_in_contacts' => 0, 'invalid' => 0, 'errors' => 0];
+            $this->counts = ['processed' => 0, 'finished' => 0, 'already' => 0, 'partial' => 0, 'not_in_contacts' => 0, 'invalid' => 0, 'errors' => 0];
             $this->preload($pass, $rows);
             foreach ($rows as $row) {
                 try {
@@ -302,14 +305,16 @@ class ProcessReferralCommissions extends Command
             $this->cache = null;
 
             $this->info(sprintf(
-                '[%s] %s: %d processed, %d already processed, %d not in TblContacts, %d invalid, %d error(s).',
+                '[%s] %s: %d processed, %d already processed, %d not in TblContacts, %d invalid, %d error(s)%s%s.',
                 $this->counts['errors'] > 0 ? 'WARN' : 'SUCCESS',
                 $pass,
                 $this->counts['processed'],
                 $this->counts['already'],
                 $this->counts['not_in_contacts'],
                 $this->counts['invalid'],
-                $this->counts['errors']
+                $this->counts['errors'],
+                $this->counts['finished'] > 0 ? ", {$this->counts['finished']} partial row(s) finished" : '',
+                $this->counts['partial'] > 0 ? ", {$this->counts['partial']} partial (payroll row, no funding — use --finish-partial)" : ''
             ));
             Log::info('ProcessReferralCommissions: pass finished.', ['pass' => $pass, 'origin' => $origin, 'dry_run' => $this->dryRun] + $this->counts);
             $failed = $failed || $this->counts['errors'] > 0;
@@ -322,7 +327,7 @@ class ProcessReferralCommissions extends Command
 
     /**
      * @param array{row: int, client_id: string, funding_date: ?string, commission: float, loan_amount: ?float, loan_amount_text: string, rate: ?float, rate_text: string, term: ?int, term_text: string, lender: string} $row
-     * @return 'processed'|'already'|'not_in_contacts'|'invalid'
+     * @return 'processed'|'finished'|'already'|'partial'|'not_in_contacts'|'invalid'
      */
     protected function processRow(string $pass, array $row, string $today): string
     {
@@ -350,11 +355,22 @@ class ProcessReferralCommissions extends Command
         $enrollmentStatus = $this->ldrEnrollmentStatus($llg);
         $payrollAgentId = $pass === 'ccs' ? 0 : $agentPk;
 
-        // 3. Already processed?
+        // 3. Already processed? A payroll row without a TblFundings row is a run that died between
+        //    the two (the workbook's last run left six such clients, 21 Sep 2026): status set, no note,
+        //    no funding, no loan fields. --finish-partial completes them from step 5 on.
+        $finishing = false;
         if ($this->alreadyProcessed($payrollAgentId, $llg)) {
-            $this->line("{$tag}: already processed (TblPayrollAdjustments, Agent_ID {$payrollAgentId}) — skipped.");
+            if ($this->fundingExists($llg)) {
+                $this->line("{$tag}: already processed (TblPayrollAdjustments, Agent_ID {$payrollAgentId}) — skipped.");
 
-            return 'already';
+                return 'already';
+            }
+            if (!$this->finishPartial) {
+                $this->warn("{$tag}: payroll row exists but no TblFundings row — partial; run with --finish-partial to complete it.");
+
+                return 'partial';
+            }
+            $finishing = true;
         }
 
         $client = trim((string) ($contact['Client'] ?? ''));
@@ -379,12 +395,16 @@ class ProcessReferralCommissions extends Command
             $this->dryRun ? '  [DRY-RUN]' : ''
         ));
 
-        // 4. Payroll adjustment.
-        $this->ldrExecute(
-            'INSERT INTO TblPayrollAdjustments (Agent_ID, Category, Payroll_Date, Amount, Notes) VALUES (?, ?, ?, ?, ?)',
-            [$payrollAgentId, 'Commission', $payrollDate, $amount, $payrollNotes],
-            "INSERT TblPayrollAdjustments Agent_ID={$payrollAgentId} Payroll_Date={$payrollDate} Amount={$amount}"
-        );
+        // 4. Payroll adjustment (already there when finishing a partial row).
+        if ($finishing) {
+            $this->line('    payroll row already exists — finishing the rest');
+        } else {
+            $this->ldrExecute(
+                'INSERT INTO TblPayrollAdjustments (Agent_ID, Category, Payroll_Date, Amount, Notes) VALUES (?, ?, ?, ?, ?)',
+                [$payrollAgentId, 'Commission', $payrollDate, $amount, $payrollNotes],
+                "INSERT TblPayrollAdjustments Agent_ID={$payrollAgentId} Payroll_Date={$payrollDate} Amount={$amount}"
+            );
+        }
 
         // 5. CRM status (unless enrolled) and the note. VBA `Like` is case-sensitive.
         if (!str_starts_with($enrollmentStatus, 'LDR Enrolled') && !str_starts_with($enrollmentStatus, 'PLAW Enrolled')) {
@@ -426,7 +446,7 @@ class ProcessReferralCommissions extends Command
         $this->crmUpdate($tenant, $id, 'interest_rate', $row['rate_text'] . '%');
         $this->crmUpdate($tenant, $id, 'loan_term', $row['term_text']);
 
-        return 'processed';
+        return $finishing ? 'finished' : 'processed';
     }
 
     // ─── The rules, as pure functions ─────────────────────────────────────
@@ -544,6 +564,16 @@ class ProcessReferralCommissions extends Command
         return (string) ($rows[0]['Enrollment_Status'] ?? '');
     }
 
+    protected function fundingExists(string $llg): bool
+    {
+        if ($this->cache !== null) {
+            return isset($this->cache['fundings'][$llg]);
+        }
+        $rows = $this->ldrSelect('SELECT COUNT(*) AS n FROM TblFundings WHERE LLG_ID = ?', [$llg]);
+
+        return (int) ($rows[0]['n'] ?? 0) > 0;
+    }
+
     protected function alreadyProcessed(int $agentId, string $llg): bool
     {
         if ($this->cache !== null) {
@@ -569,7 +599,7 @@ class ProcessReferralCommissions extends Command
     {
         $ids = array_values(array_unique(array_column($rows, 'client_id')));
         $llgs = array_map(static fn (string $id): string => 'LLG-' . $id, $ids);
-        $cache = ['contacts' => [], 'employeeByName' => [], 'employeeLocation' => [], 'enrollment' => [], 'processed' => []];
+        $cache = ['contacts' => [], 'employeeByName' => [], 'employeeLocation' => [], 'enrollment' => [], 'processed' => [], 'fundings' => []];
 
         foreach (array_chunk($pass === 'ccs' ? $ids : $llgs, 500) as $chunk) {
             $in = implode(',', array_fill(0, count($chunk), '?'));
@@ -598,6 +628,13 @@ class ProcessReferralCommissions extends Command
             $in = implode(',', array_fill(0, count($chunk), '?'));
             foreach ($this->ldrSelect("SELECT LLG_ID, Enrollment_Status FROM TblEnrollment WHERE LLG_ID IN ({$in})", $chunk) as $enrollment) {
                 $cache['enrollment'][(string) $enrollment['LLG_ID']] ??= (string) $enrollment['Enrollment_Status'];
+            }
+        }
+
+        foreach (array_chunk($llgs, 500) as $chunk) {
+            $in = implode(',', array_fill(0, count($chunk), '?'));
+            foreach ($this->ldrSelect("SELECT LLG_ID FROM TblFundings WHERE LLG_ID IN ({$in})", $chunk) as $funding) {
+                $cache['fundings'][(string) $funding['LLG_ID']] = true;
             }
         }
 
