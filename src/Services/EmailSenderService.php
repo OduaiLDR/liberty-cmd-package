@@ -196,7 +196,8 @@ class EmailSenderService
         string $body,
         array $attachments = [],
         bool $includeEnvExtras = true,
-        bool $strictCompany = false
+        bool $strictCompany = false,
+        ?string $fromAddress = null
         ): bool {
         $recipients = $this->fetchRecipientGroupsFromTblReports($connector, $reportNames, $companies, $strictCompany);
         if ($includeEnvExtras) {
@@ -216,7 +217,8 @@ class EmailSenderService
             $recipients['to'],
             $recipients['cc'],
             $recipients['bcc'],
-            $attachments
+            $attachments,
+            $fromAddress
         );
         
         // Log to TblLog after successful send

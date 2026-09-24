@@ -7,6 +7,7 @@
     "firebase/php-jwt": "^6.0 || ^7.0",
     "guzzlehttp/guzzle": "^7.10",
     "phpoffice/phpspreadsheet": "^1.29",
+    "dompdf/dompdf": "^3.0",
     "phpseclib/phpseclib": "^3.0",
     "symfony/panther": "^2.1",
     "ext-sqlsrv": "*",
