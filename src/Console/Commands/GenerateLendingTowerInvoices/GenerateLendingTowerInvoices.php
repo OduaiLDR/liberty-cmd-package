@@ -26,9 +26,10 @@ use RuntimeException;
  * LDR is billed on enrollments: 7% of the debt basis (Sold_Debt, else Debt_Amount) of LDR clients
  * whose first payment cleared in the month. TblEnrollment holds both firms' enrollments, so LDR is
  * scoped by TblContactsLDR; Progress Law's clients are billed per lead on their own invoice. A
- * Lookback Deduction then comes off for clients already billed whose first lookback or cancel date
- * falls in the month. Each client is deducted once, in the month of whichever came first, and
- * clients who cancelled before any payment cleared are left out because they were never billed.
+ * Lookback Deduction then comes off for clients Lending Tower actually billed (from its first invoice
+ * on, see billingStart()) whose first lookback or cancel date falls in the month. Each client is
+ * deducted once, and clients who cancelled before any payment cleared are left out because they
+ * were never billed.
  *
  * Money is carried as integer cents. The fee is taken once from the total debt basis, so the
  * per-client debt rows always add up to the figure the fee is computed on.
@@ -113,13 +114,16 @@ class GenerateLendingTowerInvoices extends Command
         SQL;
 
     /**
-     * LDR clients deducted in the month. Parameters: period end; start and end for the lookback
-     * window; start and end for the cancel window; start twice for the first-event rule.
+     * LDR clients deducted in the month. Parameters, in order: period end; billing start; start and
+     * end of the lookback window; start and end of the cancel window; then (start, billing start)
+     * for the lookback and again for the cancel first-event rule.
      *
-     * "Billed" means the first payment cleared before the period ended. The last two conditions
-     * leave out a client whose other event fell in an earlier month, which is the month that
-     * deducts them. The explanation lives here rather than in SQL comments because PDO's
-     * placeholder scan does not reliably skip comments, and a stray quote in one would break it.
+     * A client can only come off if Lending Tower actually billed them: first payment cleared on or
+     * after the billing start (see billingStart()) and before the period ended. The last two
+     * conditions leave out a client whose other event fell in an earlier invoiced month, because
+     * that month's invoice already deducted them; events before the billing start never triggered
+     * a deduction, so they do not block one. The explanation lives here rather than in SQL comments
+     * because PDO's placeholder scan does not reliably skip comments.
      */
     private const LDR_DEDUCTIONS_SQL = <<<'SQL'
         SELECT e.LLG_ID,
@@ -132,9 +136,10 @@ class GenerateLendingTowerInvoices extends Command
         WHERE EXISTS (SELECT 1 FROM TblContactsLDR l WHERE l.LLG_ID = e.LLG_ID)
           AND e.First_Payment_Cleared_Date IS NOT NULL
           AND e.First_Payment_Cleared_Date < ?
+          AND e.First_Payment_Cleared_Date >= ?
           AND ((e.Lookback_Date >= ? AND e.Lookback_Date < ?) OR (e.Cancel_Date >= ? AND e.Cancel_Date < ?))
-          AND (e.Lookback_Date IS NULL OR e.Lookback_Date >= ?)
-          AND (e.Cancel_Date IS NULL OR e.Cancel_Date >= ?)
+          AND (e.Lookback_Date IS NULL OR e.Lookback_Date >= ? OR e.Lookback_Date < ?)
+          AND (e.Cancel_Date IS NULL OR e.Cancel_Date >= ? OR e.Cancel_Date < ?)
         ORDER BY e.LLG_ID
         SQL;
 
@@ -424,14 +429,49 @@ class GenerateLendingTowerInvoices extends Command
 
     private function ldrInvoice(DBConnector $azure, string $start, string $end): array
     {
+        $billingStart = $this->billingStart($start);
+
         $enrollments = $this->sqlServerRows($azure, self::LDR_ENROLLMENTS_SQL, [$start, $end]);
         $deductions = $this->sqlServerRows(
             $azure,
             self::LDR_DEDUCTIONS_SQL,
-            [$end, $start, $end, $start, $end, $start, $start]
+            [$end, $billingStart, $start, $end, $start, $end, $start, $billingStart, $start, $billingStart]
         );
 
-        return $this->summarizeLdr($enrollments, $deductions, $start, $end);
+        return $this->summarizeLdr($enrollments, $deductions, $start, $end) + ['billing_start' => $billingStart];
+    }
+
+    /**
+     * First day of the first month Lending Tower actually invoiced LDR. Only clients billed from
+     * then on can come off as a Lookback Deduction. Jacob 2026-09-24: "The invoice is new so we
+     * only will be dealing with the prior month", so nothing billed before the first invoice counts.
+     *
+     * LENDING_TOWER_BILLING_START (YYYY-MM) pins it. Otherwise it is the earliest month with a live
+     * LDR invoice in the archive, or the month being invoiced when none has been sent yet: the first
+     * invoice deducts only its own month's clients, and later invoices pick up earlier ones.
+     */
+    private function billingStart(string $start): string
+    {
+        $pinned = trim((string) env('LENDING_TOWER_BILLING_START', ''));
+
+        if ($pinned !== '') {
+            if (preg_match('/^\d{4}-(0[1-9]|1[0-2])$/', $pinned) !== 1) {
+                throw new RuntimeException("LENDING_TOWER_BILLING_START must be YYYY-MM, got '{$pinned}'.");
+            }
+
+            return min($pinned . '-01', $start);
+        }
+
+        $earliest = $start;
+        $marker = '#/(\d{4}-\d{2})/' . preg_quote(self::INVOICE_PREFIX['LDR'], '#') . '-\d{4}-\d{2}\.sent\.json$#';
+
+        foreach (Storage::disk('local')->allFiles(self::ARCHIVE_PREFIX) as $path) {
+            if (preg_match($marker, $path, $m) === 1) {
+                $earliest = min($earliest, $m[1] . '-01');
+            }
+        }
+
+        return $earliest;
     }
 
     /**
@@ -498,6 +538,8 @@ class GenerateLendingTowerInvoices extends Command
             $events['both']
         ));
         $this->row('Total due', $this->money($invoice['total_cents']));
+        $this->row('', 'Deductions count clients billed since '
+            . (new DateTimeImmutable($invoice['billing_start']))->format('F Y'));
 
         if ($invoice['repeated_enrollments'] !== []) {
             $this->warn(sprintf(
@@ -553,7 +595,7 @@ class GenerateLendingTowerInvoices extends Command
                     'label' => 'Lookback Deduction',
                     'amount' => $this->money(-$invoice['deduction_cents']),
                     'detail' => sprintf(
-                        '%s of %s for %s previously billed clients with a lookback or cancellation in %s',
+                        '%s of %s for %s billed clients with a lookback or cancellation in %s',
                         $rate,
                         $this->money($invoice['deduction_basis_cents']),
                         number_format(count($invoice['deductions'])),
