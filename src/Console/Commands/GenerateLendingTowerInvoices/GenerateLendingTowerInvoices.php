@@ -4,6 +4,7 @@ namespace Cmd\Reports\Console\Commands\GenerateLendingTowerInvoices;
 
 use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\EmailSenderService;
+use Cmd\Reports\Services\GraphMailboxClient;
 use DateTimeImmutable;
 use DateTimeZone;
 use Illuminate\Console\Command;
@@ -733,19 +734,19 @@ class GenerateLendingTowerInvoices extends Command
     private function sendTest(string $company, array $document, array $files, array $period, string $to): bool
     {
         $notice = sprintf(
-            'Review copy sent only to %s. The real invoice goes to the recipients in TblReports under "%s", from %s.',
+            'Review copy sent only to %s, from the same mailbox as the real invoice. The real one goes to the recipients in TblReports under "%s".',
             $to,
-            self::REPORT_NAMES[$company],
-            $this->liveSender()
+            self::REPORT_NAMES[$company]
         );
 
-        $sent = (new EmailSenderService())->sendMailHtml(
+        $sent = $this->mailer()->sendMailHtml(
             '[TEST] ' . $this->subject($company, $document, $period),
             $this->emailBody($company, $document, $period, $notice),
             [$to],
             [],
             [],
-            $this->attachments($files)
+            $this->attachments($files),
+            $this->liveSender()
         );
 
         $sent
@@ -769,7 +770,7 @@ class GenerateLendingTowerInvoices extends Command
             return true;
         }
 
-        $sent = (new EmailSenderService())->sendMailUsingTblReportsHtml(
+        $sent = $this->mailer()->sendMailUsingTblReportsHtml(
             $azure,
             [self::REPORT_NAMES[$company]],
             [],
@@ -876,6 +877,23 @@ class GenerateLendingTowerInvoices extends Command
     private function liveSender(): string
     {
         return (string) env('LENDING_TOWER_INVOICE_FROM', self::INVOICE_CONTACT);
+    }
+
+    /**
+     * The Graph app to send through. A lendingtower.com mailbox lives in Lending Tower's own
+     * Microsoft 365 tenant, which only its app registration can send from (GRAPH_LT_*, the one the
+     * Monevo reader already uses); any other sender goes through the Liberty app (GRAPH_*).
+     */
+    private function mailer(): EmailSenderService
+    {
+        $prefix = str_ends_with(strtolower($this->liveSender()), '@lendingtower.com') ? 'GRAPH_LT' : 'GRAPH';
+
+        if (! GraphMailboxClient::isConfigured($prefix)) {
+            throw new RuntimeException("{$prefix}_TENANT_ID / _CLIENT_ID / _CLIENT_SECRET are not all set, so "
+                . $this->liveSender() . ' cannot be sent from.');
+        }
+
+        return new EmailSenderService($prefix);
     }
 
     private function logoDataUri(): ?string

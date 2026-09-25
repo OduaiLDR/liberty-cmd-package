@@ -14,13 +14,18 @@ class EmailSenderService
     private string $clientSecret;
     private string $fromAddress;
 
-    public function __construct()
+    /**
+     * @param  string  $prefix  Env prefix of the app registration to send through: GRAPH for the
+     *                          Liberty tenant (the default), or another tenant's, e.g. GRAPH_LT for
+     *                          Lending Tower. Same convention as GraphMailboxClient::fromEnvironment().
+     */
+    public function __construct(string $prefix = 'GRAPH')
     {
         $this->client = new Client(['timeout' => 30]);
-        $this->tenantId = (string) env('GRAPH_TENANT_ID', '');
-        $this->clientId = (string) env('GRAPH_CLIENT_ID', '');
-        $this->clientSecret = (string) env('GRAPH_CLIENT_SECRET', '');
-        $this->fromAddress = (string) env('GRAPH_FROM_ADDRESS', '');
+        $this->tenantId = (string) env("{$prefix}_TENANT_ID", '');
+        $this->clientId = (string) env("{$prefix}_CLIENT_ID", '');
+        $this->clientSecret = (string) env("{$prefix}_CLIENT_SECRET", '');
+        $this->fromAddress = (string) env("{$prefix}_FROM_ADDRESS", '');
     }
 
     public function sendMail(string $subject, string $body, array $to, array $cc = [], array $bcc = [], array $attachments = []): bool
