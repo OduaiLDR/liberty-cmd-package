@@ -22,7 +22,7 @@ class SyncContactsData extends Command
 
     protected $description = 'Sync contacts data from Snowflake to SQL Server (TblContactsLDR, TblContactsPLAW, and TblContactsLT)';
 
-    private const PAGE_SIZE = 50000;
+    private const PAGE_SIZE = 5000;
     private const MAX_LOAN_AMOUNT = 999999;
 
     private string $source;
@@ -31,6 +31,9 @@ class SyncContactsData extends Command
     private string $targetTable;
 
     private array $debtPreview = [];
+    private ?\PDO $refreshPdo = null;
+    private ?string $refreshStage = null;
+    private bool $refreshPublished = false;
 
     /** Matching-step counters reset at the start of each matching run. */
     private int $matchingStepsOk = 0;
@@ -226,6 +229,31 @@ class SyncContactsData extends Command
      */
     private function runSourceSync(): int
     {
+        try {
+            return $this->performSourceSync();
+        } catch (\Throwable $e) {
+            $this->error('[ERROR] ' . $this->source . ' sync failed: ' . $e->getMessage());
+            if ($this->refreshStage !== null) {
+                $this->error($this->refreshPublished
+                    ? '[FULL REFRESH] Contacts were committed, but cleanup failed; watermark was not advanced.'
+                    : '[FULL REFRESH] Did not complete. Staging does not clear the target; replacement errors trigger transaction rollback.');
+            }
+            return Command::FAILURE;
+        } finally {
+            if ($this->refreshStage !== null && $this->refreshPdo !== null) {
+                try {
+                    $this->checkedExec($this->refreshPdo, "DROP TABLE IF EXISTS {$this->refreshStage}");
+                } catch (\Throwable $e) {
+                    $this->warn('[WARN] Could not drop the session-local refresh table; it will be removed when the connection closes.');
+                }
+            }
+            $this->refreshStage = null;
+            $this->refreshPdo = null;
+        }
+    }
+
+    private function performSourceSync(): int
+    {
         $dryRun = (bool) $this->option('dry-run');
         if ($dryRun) {
             $this->warn('[DRY RUN] Read-only preview: no SQL Server writes or watermark updates. Debt samples show at most 10 changed IDs per source.');
@@ -259,7 +287,7 @@ class SyncContactsData extends Command
         //   idempotent, so this safely corrects agent names that an incremental
         //   sync never re-pulled (reassignment older than the watermark) without
         //   the risk/downtime of dropping and rebuilding the table.
-        // Full refresh: truncate the table and re-sync everything since 2021-07-01.
+        // Full refresh: stage every page before replacing the target in one transaction.
         $ownersRefresh = (bool) $this->option('owners-refresh');
         $lastSyncAt    = ($this->option('full') || $ownersRefresh) ? null : $this->readLastSyncTime($this->source);
         $isIncremental = $lastSyncAt !== null;
@@ -278,9 +306,11 @@ class SyncContactsData extends Command
             $this->info('[INFO] Owners-refresh mode: re-pulling every contact since 2021-07-01 (no truncate).');
         } else {
             $startDate = '2021-07-01';
-            $this->info('[INFO] Full refresh mode.' . ($dryRun ? ' Target table will not be truncated.' : ''));
+            $this->info('[INFO] Full refresh mode.' . ($dryRun
+                ? ' Read-only preview; target table will not be changed.'
+                : ' Existing contacts remain in place while every page is staged.'));
             if (!$dryRun) {
-                $this->clearTargetTable($sqlConnector);
+                $this->beginFullRefresh($sqlConnector);
             }
         }
 
@@ -314,7 +344,11 @@ class SyncContactsData extends Command
 
             $totalFetched += $chunkSize;
             $firstId = (int) ($chunk[0]['LLG_ID'] ?? 0);
-            $lastId  = (int) end($chunk)['LLG_ID'];
+            $nextId = (int) (end($chunk)['LLG_ID'] ?? 0);
+            if ($nextId <= $lastId) {
+                throw new \RuntimeException('Snowflake cursor did not advance; refusing an incomplete refresh.');
+            }
+            $lastId = $nextId;
             $this->logStep("Page {$pageNum}: ID range {$firstId} → {$lastId}");
 
             if ($this->option('debt-only')) {
@@ -367,8 +401,11 @@ class SyncContactsData extends Command
             } else {
                 try {
                     $writeStarted = microtime(true);
-                    $this->logStep('Page ' . $pageNum . ': writing ' . count($processedChunk) . ' row(s) to ' . $this->targetTable . '...');
-                    $totalInserted += $this->insertChunk($sqlConnector, $processedChunk, $isIncremental);
+                    $destination = $this->refreshStage !== null ? 'temporary staging' : $this->targetTable;
+                    $this->logStep('Page ' . $pageNum . ': writing ' . count($processedChunk) . ' row(s) to ' . $destination . '...');
+                    $totalInserted += $this->refreshStage !== null
+                        ? $this->stageFullRefreshChunk($sqlConnector, $processedChunk)
+                        : $this->insertChunk($sqlConnector, $processedChunk, $isIncremental);
                     $this->logStep('Page ' . $pageNum . ': SQL write done', $writeStarted);
                 } catch (\Throwable $e) {
                     $this->error("[ERROR] Insert failed on chunk ending at ID {$lastId}: " . $e->getMessage());
@@ -384,7 +421,7 @@ class SyncContactsData extends Command
             unset($chunk, $enrollmentData, $dropNames, $processedChunk, $newCatChanges, $newAffChanges);
             \gc_collect_cycles();
 
-            $action = $dryRun ? 'would be upserted' : 'upserted';
+            $action = $dryRun ? 'would be upserted' : ($this->refreshStage !== null ? 'staged' : 'upserted');
             $elapsed = number_format(microtime(true) - $syncLoopStarted, 1);
             $this->logStep(
                 "Page {$pageNum} complete — totals: {$totalFetched} fetched, {$totalInserted} {$action} | elapsed {$elapsed}s",
@@ -397,6 +434,9 @@ class SyncContactsData extends Command
         // page here is legitimate and we must continue from the new cursor.
         } while ($chunkSize > 0);
 
+        if ($this->refreshStage !== null) {
+            $this->publishFullRefresh($totalInserted);
+        }
         $action = $dryRun ? 'would be upserted' : 'upserted';
         $this->info("[INFO] Completed: {$totalInserted} records {$action} into {$this->targetTable}.");
         if ($dryRun) {
@@ -465,7 +505,13 @@ class SyncContactsData extends Command
             : $this->buildStandardQuery($startDate, $lastId, $limit);
 
         $result = $snowflake->query($sql);
-        return $result['data'] ?? [];
+        if (($result['success'] ?? true) === false || !isset($result['data']) || !is_array($result['data'])) {
+            throw new \RuntimeException('Snowflake did not return a valid contact page.');
+        }
+        if (isset($result['rowCount']) && (int) $result['rowCount'] !== count($result['data'])) {
+            throw new \RuntimeException('Snowflake contact page is incomplete; aborting the refresh.');
+        }
+        return $result['data'];
     }
 
     private function buildStandardQuery(string $startDate, int $lastId, int $limit): string
@@ -544,9 +590,27 @@ class SyncContactsData extends Command
 
     private function buildLTQuery(string $startDate, int $lastId, int $limit): string
     {
-        // LT: ASSIGNED_TO only. Page by ID (LIMIT stays here). TP_ID dups are
-        // dropped in processChunk by Modified DESC so paging lastId cannot skip.
+        // Bound the contacts before expanding assignment/status history joins.
+        // EXISTS preserves the old non-Duplicate-Lead eligibility before LIMIT,
+        // so an all-filtered candidate page cannot terminate pagination early.
         return "
+            WITH contact_page AS (
+                SELECT c.*
+                FROM CONTACTS c
+                WHERE CONVERT_TIMEZONE('America/Los_Angeles', COALESCE(c.MODIFIED, c.CREATED)) >= '{$this->esc($startDate)}'::TIMESTAMP_NTZ
+                  AND c.DEL = 'FALSE'
+                  AND c.FIRSTNAME IS NOT NULL AND c.FIRSTNAME <> ''
+                  AND c.ISCOAPP = 0
+                  AND c.ID > {$lastId}
+                  AND EXISTS (
+                      SELECT 1 FROM CONTACTS_STATUS eligible_status
+                      JOIN CONTACTS_LEAD_STATUS eligible_lead ON eligible_status.STATUS_ID = eligible_lead.ID
+                      WHERE eligible_status.CONTACT_ID = c.ID
+                        AND eligible_lead.TITLE <> 'Duplicate Lead'
+                  )
+                ORDER BY c.ID
+                LIMIT {$limit}
+            )
             SELECT
                 TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', c.CREATED), 'YYYY-MM-DD HH24:MI:SS') AS CREATED,
                 TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', a.STAMP), 'YYYY-MM-DD HH24:MI:SS') AS ASSIGNED_ON,
@@ -576,7 +640,7 @@ class SyncContactsData extends Command
                 uf_debt.F_SHORTSTRING AS DEBT_AMOUNT_CUSTOM,
                 NULL AS PLAN_TITLE,
                 NULL AS AGENT_CUSTOM
-            FROM CONTACTS AS c
+            FROM contact_page AS c
             LEFT JOIN CONTACTS_ASSIGNED AS a ON c.ID = a.CONTACT_ID
             LEFT JOIN DATA_SOURCES AS ds ON c.C_SOURCE = ds.ID
             LEFT JOIN USERS AS u1 ON c.CREATED_BY = u1.UID
@@ -1065,12 +1129,7 @@ class SyncContactsData extends Command
         }
         $data = \array_values($deduped);
 
-        // TblContacts (LT) has 24 columns — no TP_ID. TblContactsLDR/PLAW have 25.
-        $fields = 'Created_Date, Assigned_Date, LLG_ID, External_ID, Campaign, Data_Source, '
-            . 'Created_By, Agent, Client, Phone, Email, Address_1, Address_2, City, State, '
-            . 'Zip, Stage, Status, Debt_Amount, Debt_Enrolled, Credit_Score, Credit_Utilization, '
-            . 'Category, Affiliate_Agent'
-            . ($this->source !== 'LT' ? ', TP_ID' : '');
+        $fields = $this->contactFields();
 
         $pdo = $connector->getSqlServerConnection();
         $pdo->beginTransaction();
@@ -1548,25 +1607,94 @@ class SyncContactsData extends Command
     // Table maintenance
     // -------------------------------------------------------------------------
 
-    private function clearTargetTable(DBConnector $connector): void
+    private function contactFields(): string
     {
-        $truncateResult = $connector->querySqlServer("TRUNCATE TABLE {$this->targetTable}");
-        if ($truncateResult['success'] ?? false) {
-            $this->info("[INFO] Target table truncated instantly.");
-            return;
+        return 'Created_Date, Assigned_Date, LLG_ID, External_ID, Campaign, Data_Source, '
+            . 'Created_By, Agent, Client, Phone, Email, Address_1, Address_2, City, State, '
+            . 'Zip, Stage, Status, Debt_Amount, Debt_Enrolled, Credit_Score, Credit_Utilization, '
+            . 'Category, Affiliate_Agent'
+            . ($this->source !== 'LT' ? ', TP_ID' : '');
+    }
+
+    private function checkedExec(\PDO $pdo, string $sql): void
+    {
+        if ($pdo->exec($sql) === false) {
+            throw new \RuntimeException('SQL operation failed: ' . ($pdo->errorInfo()[2] ?? 'unknown error'));
         }
-        $this->info("[INFO] TRUNCATE failed ({$truncateResult['error']}), falling back to batch DELETE.");
+    }
 
-        do {
-            $connector->querySqlServer("DELETE TOP (50000) FROM {$this->targetTable}");
-            $result = $connector->querySqlServer("SELECT COUNT(*) AS cnt FROM {$this->targetTable}");
-            $count  = $result['data'][0]['cnt'] ?? 0;
-            if ($count > 0) {
-                $this->info("[INFO] Deleted batch, {$count} rows remaining...");
+    private function refreshRowCount(\PDO $pdo, string $table): int
+    {
+        $statement = $pdo->query("SELECT COUNT_BIG(*) FROM {$table}");
+        if ($statement === false || ($count = $statement->fetchColumn()) === false) {
+            throw new \RuntimeException('Unable to verify full-refresh row count.');
+        }
+        return (int) $count;
+    }
+
+    private function beginFullRefresh(DBConnector $connector): void
+    {
+        $this->refreshPublished = false;
+        $this->refreshPdo = $connector->getSqlServerConnection();
+        $this->refreshStage = '#ContactsRefresh_' . bin2hex(random_bytes(8));
+        $fields = $this->contactFields();
+        $this->checkedExec($this->refreshPdo,
+            "SELECT TOP (0) {$fields} INTO {$this->refreshStage} FROM {$this->targetTable}");
+        $this->checkedExec($this->refreshPdo,
+            "CREATE UNIQUE INDEX RefreshContactId ON {$this->refreshStage} (LLG_ID)");
+        $this->info("[FULL REFRESH] Staging {$this->source}; {$this->targetTable} is unchanged until all pages succeed.");
+    }
+
+    private function stageFullRefreshChunk(DBConnector $connector, array $rows): int
+    {
+        $target = $this->targetTable;
+        try {
+            $this->targetTable = $this->refreshStage;
+            return $this->insertChunk($connector, $rows, false);
+        } finally {
+            $this->targetTable = $target;
+        }
+    }
+
+    private function publishFullRefresh(int $expectedRows): void
+    {
+        $pdo = $this->refreshPdo;
+        $stage = $this->refreshStage;
+        if ($pdo === null || $stage === null || $expectedRows < 1) {
+            throw new \RuntimeException('Full refresh returned no contacts; refusing to clear the target.');
+        }
+        if ($this->refreshRowCount($pdo, $stage) !== $expectedRows) {
+            throw new \RuntimeException('Staged contact count mismatch; target left unchanged.');
+        }
+        $this->info("[FULL REFRESH] All pages staged ({$expectedRows} rows). Replacing {$this->targetTable} in one transaction...");
+        if ($pdo->inTransaction() || !$pdo->beginTransaction()) {
+            throw new \RuntimeException('Could not start the full-refresh replacement transaction.');
+        }
+        try {
+            // DELETE is transactional and works when TRUNCATE is disallowed.
+            $this->checkedExec($pdo, "DELETE FROM {$this->targetTable} WITH (TABLOCKX)");
+            $fields = $this->contactFields();
+            $this->checkedExec($pdo,
+                "INSERT INTO {$this->targetTable} ({$fields}) SELECT {$fields} FROM {$stage}");
+            if ($this->refreshRowCount($pdo, $this->targetTable) !== $expectedRows) {
+                throw new \RuntimeException('Replacement row count mismatch.');
             }
-        } while ($count > 0);
-
-        $this->info("[INFO] Target table cleared");
+            if (!$pdo->commit()) {
+                throw new \RuntimeException('Full-refresh commit failed.');
+            }
+        } catch (\Throwable $e) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            throw $e;
+        }
+        $this->refreshPublished = true;
+        $this->info("[FULL REFRESH] Committed {$expectedRows} contacts to {$this->targetTable}.");
+        // Drop staging before enrollment/matching. A later failure must not claim
+        // the contact replacement was rolled back after it has committed.
+        $this->checkedExec($pdo, "DROP TABLE {$stage}");
+        $this->refreshStage = null;
+        $this->refreshPdo = null;
     }
 
     private function updateRelatedTables(DBConnector $connector): bool
