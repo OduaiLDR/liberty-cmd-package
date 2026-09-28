@@ -13,6 +13,7 @@ class SyncContactsData extends Command
     protected $signature = 'Sync:contacts-data
         {--source=   : Run a single source only (LDR, PLAW, or LT)}
         {--full      : Force a full refresh even when a previous sync timestamp exists}
+        {--debt-only : Compare debt columns only; requires --dry-run and --source=LDR or PLAW}
         {--owners-refresh : Re-pull EVERY contact since 2021-07-01 (current CRM ASSIGNED_TO) without truncating. Non-destructive DELETE+INSERT per chunk. Use to correct agent names that drifted because an incremental sync never re-pulled a reassignment older than the watermark.}
         {--dry-run   : Fetch and report changes without modifying SQL Server or sync watermarks; matching runs as read-only verification}
         {--verify-match : Read-only matching verification only (no Snowflake fetch, no SQL writes)}
@@ -22,12 +23,14 @@ class SyncContactsData extends Command
     protected $description = 'Sync contacts data from Snowflake to SQL Server (TblContactsLDR, TblContactsPLAW, and TblContactsLT)';
 
     private const PAGE_SIZE = 50000;
-    private const MAX_LT_DEBT_AMOUNT = 999999;
+    private const MAX_LOAN_AMOUNT = 999999;
 
     private string $source;
     private int $debtAmountCustomId;
     private int $agentCustomId;
     private string $targetTable;
+
+    private array $debtPreview = [];
 
     /** Matching-step counters reset at the start of each matching run. */
     private int $matchingStepsOk = 0;
@@ -44,6 +47,10 @@ class SyncContactsData extends Command
         ini_set('memory_limit', '512M');
 
         $source = strtoupper((string) $this->option('source'));
+        if ($this->option('debt-only') && (!$this->option('dry-run') || !in_array($source, ['LDR', 'PLAW'], true))) {
+            $this->error('--debt-only requires --dry-run and --source=LDR or --source=PLAW.');
+            return Command::FAILURE;
+        }
         if ($this->option('verify-match')) {
             return $this->runVerifyMatchOnly($source !== '' ? $source : null);
         }
@@ -179,6 +186,19 @@ class SyncContactsData extends Command
             $this->targetTable        = 'TblContactsLDR';
         }
 
+        $this->debtPreview = array_fill_keys(['processed', 'loan', 'enrolled_fallback', 'no_debt',
+            'changed', 'amount_changed', 'enrolled_changed', 'unchanged', 'new', 'samples'], 0);
+
+        // A dry run must not write to a database-backed cache lock.
+        if ($this->option('dry-run')) {
+            try {
+                return $this->runSourceSync();
+            } catch (\Throwable $e) {
+                $this->error('[DRY RUN FAILED] ' . $e->getMessage());
+                return Command::FAILURE;
+            }
+        }
+
         // Prevent two syncs of the SAME source from running concurrently. Overlapping
         // runs race each other's DELETE+INSERT and silently create duplicate rows
         // (this is how TblContacts accumulated its historical duplicate backlog).
@@ -208,7 +228,7 @@ class SyncContactsData extends Command
     {
         $dryRun = (bool) $this->option('dry-run');
         if ($dryRun) {
-            $this->warn('[DRY RUN] No SQL Server writes or watermark updates will be performed.');
+            $this->warn('[DRY RUN] Read-only preview: no SQL Server writes or watermark updates. Debt samples show at most 10 changed IDs per source.');
         }
 
         $this->info("[DEBUG] Initializing Snowflake connector...");
@@ -297,19 +317,25 @@ class SyncContactsData extends Command
             $lastId  = (int) end($chunk)['LLG_ID'];
             $this->logStep("Page {$pageNum}: ID range {$firstId} → {$lastId}");
 
-            $enrollStarted = microtime(true);
-            $this->logStep("Page {$pageNum}: loading enrollment filters...");
-            $enrollmentData = $this->loadEnrollmentDataFiltered($sqlConnector, $chunk);
-            $this->logStep(
-                'Page ' . $pageNum . ': enrollment filters loaded ('
-                . count($enrollmentData['categories'] ?? []) . ' enrolled matches)',
-                $enrollStarted
-            );
+            if ($this->option('debt-only')) {
+                $enrollmentData = ['categories' => [], 'assigned_agents' => [], 'affiliate_agents' => []];
+                $dropNames = [];
+                $this->info('[DRY RUN] Debt-only preview: enrollment and mailer lookups skipped.');
+            } else {
+                $enrollStarted = microtime(true);
+                $this->logStep("Page {$pageNum}: loading enrollment filters...");
+                $enrollmentData = $this->loadEnrollmentDataFiltered($sqlConnector, $chunk);
+                $this->logStep(
+                    'Page ' . $pageNum . ': enrollment filters loaded ('
+                    . count($enrollmentData['categories'] ?? []) . ' enrolled matches)',
+                    $enrollStarted
+                );
 
-            $dropStarted = microtime(true);
-            $this->logStep("Page {$pageNum}: loading drop names...");
-            $dropNames = $this->fetchDropNamesFiltered($sqlConnector, $chunk);
-            $this->logStep('Page ' . $pageNum . ': drop names loaded (' . count($dropNames) . ' matches)', $dropStarted);
+                $dropStarted = microtime(true);
+                $this->logStep("Page {$pageNum}: loading drop names...");
+                $dropNames = $this->fetchDropNamesFiltered($sqlConnector, $chunk);
+                $this->logStep('Page ' . $pageNum . ': drop names loaded (' . count($dropNames) . ' matches)', $dropStarted);
+            }
 
             $processStarted = microtime(true);
             $this->logStep("Page {$pageNum}: processing chunk (ghost/dup-lead filter + TP_ID dedupe)...");
@@ -334,6 +360,8 @@ class SyncContactsData extends Command
             }
 
             if ($dryRun) {
+                $this->info("[DRY RUN][{$this->source}] Comparing proposed debt columns with {$this->targetTable}...");
+                $this->previewDebtChunk($sqlConnector, $processedChunk);
                 $totalInserted += count($processedChunk);
                 $this->logStep('Page ' . $pageNum . ': dry-run skip write (' . count($processedChunk) . ' would upsert)');
             } else {
@@ -356,9 +384,10 @@ class SyncContactsData extends Command
             unset($chunk, $enrollmentData, $dropNames, $processedChunk, $newCatChanges, $newAffChanges);
             \gc_collect_cycles();
 
+            $action = $dryRun ? 'would be upserted' : 'upserted';
             $elapsed = number_format(microtime(true) - $syncLoopStarted, 1);
             $this->logStep(
-                "Page {$pageNum} complete — totals: {$totalFetched} fetched, {$totalInserted} upserted | elapsed {$elapsed}s",
+                "Page {$pageNum} complete — totals: {$totalFetched} fetched, {$totalInserted} {$action} | elapsed {$elapsed}s",
                 $pageStarted
             );
         // Keep paging until a page comes back empty. The old condition
@@ -368,8 +397,16 @@ class SyncContactsData extends Command
         // page here is legitimate and we must continue from the new cursor.
         } while ($chunkSize > 0);
 
-        $this->info("[INFO] Completed: {$totalInserted} records upserted into {$this->targetTable}.");
-        $this->info("[INFO] Enrollment updates: " . \count($categoryChanges) . " category, " . \count($affiliateChanges) . " affiliate agent");
+        $action = $dryRun ? 'would be upserted' : 'upserted';
+        $this->info("[INFO] Completed: {$totalInserted} records {$action} into {$this->targetTable}.");
+        if ($dryRun) {
+            $this->printDebtPreviewSummary();
+        }
+        if ($this->option('debt-only')) {
+            $this->info('[DRY RUN] Enrollment changes and post-sync matching were not evaluated in debt-only mode.');
+        } else {
+            $this->info("[INFO] Enrollment updates: " . \count($categoryChanges) . " category, " . \count($affiliateChanges) . " affiliate agent");
+        }
 
         if (!$dryRun) {
             $this->applyEnrollmentCategoryUpdates($sqlConnector, $categoryChanges);
@@ -378,7 +415,7 @@ class SyncContactsData extends Command
 
         // When called from the orchestrator (no --source flag), matching is deferred
         // to handle() so it runs after ALL sources finish. Skip it here in that case.
-        if (!$this->option('no-match')) {
+        if (!$this->option('no-match') && !$this->option('debt-only')) {
             if ($dryRun) {
                 $this->warn('[DRY RUN] Previewing post-sync matching (read-only)...');
             }
@@ -402,7 +439,9 @@ class SyncContactsData extends Command
             $this->info('[INFO] Owners-refresh: incremental watermark left unchanged.');
         }
 
-        $this->info("[SUCCESS] {$this->source} sync completed successfully!");
+        $this->info($dryRun
+            ? "[SUCCESS] {$this->source} dry run completed; no changes applied."
+            : "[SUCCESS] {$this->source} sync completed successfully!");
         return Command::SUCCESS;
     }
 
@@ -462,6 +501,7 @@ class SyncContactsData extends Command
                 c.TP_ID AS TP_ID_COPY,
                 TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', c.ENROLLED_DATE), 'YYYY-MM-DD HH24:MI:SS') AS ENROLLED_DATE,
                 uf_debt.F_DECIMAL AS DEBT_AMOUNT_CUSTOM,
+                d.ENROLLED_DEBT,
                 ed.TITLE AS PLAN_TITLE,
                 uf_agent.F_SHORTSTRING AS AGENT_CUSTOM
             FROM CONTACTS AS c
@@ -473,6 +513,12 @@ class SyncContactsData extends Command
             LEFT JOIN CONTACTS_LEAD_STATUS AS cls ON s.STATUS_ID = cls.ID
             LEFT JOIN CREDIT_SCORES AS cs ON c.ID = cs.CONTACT_ID
             LEFT JOIN CREDIT_REPORT_REQUEST AS cr ON c.ID = cr.CONTACT_ID
+            LEFT JOIN (
+                SELECT CONTACT_ID, SUM(ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT
+                FROM DEBTS
+                WHERE ENROLLED = 1 AND _FIVETRAN_DELETED = FALSE
+                GROUP BY CONTACT_ID
+            ) AS d ON c.ID = d.CONTACT_ID
             LEFT JOIN ENROLLMENT_PLAN AS ep ON c.ID = ep.CONTACT_ID
             LEFT JOIN ENROLLMENT_DEFAULTS2 AS ed ON ep.PLAN_ID = ed.ID
             LEFT JOIN (
@@ -580,22 +626,33 @@ class SyncContactsData extends Command
             return $empty;
         }
 
-        $connector->querySqlServer("CREATE TABLE #TmpEnrollFilter (ContactId VARCHAR(20))");
-        foreach (\array_chunk($enrolledIds, 1000) as $batch) {
-            $values = \implode(', ', \array_map(
-                fn($id) => "('" . \str_replace("'", "''", $id) . "')",
-                $batch
-            ));
-            $connector->querySqlServer("INSERT INTO #TmpEnrollFilter VALUES {$values}");
-        }
+        if ($this->option('dry-run')) {
+            $result = ['data' => []];
+            foreach (array_chunk(array_unique($enrolledIds), 1000) as $batch) {
+                $ids = $this->sqlStringList(array_map(fn($id) => 'LLG-' . $id, $batch));
+                $rows = $this->selectPreviewRows($connector,
+                    "SELECT LLG_ID, Category, Agent, Affiliate_Agent FROM TblEnrollment
+                     WHERE LLG_ID IN ({$ids}) AND Category NOT IN ('', 'FDR', 'CSS', 'CNI')");
+                array_push($result['data'], ...$rows);
+            }
+        } else {
+            $connector->querySqlServer("CREATE TABLE #TmpEnrollFilter (ContactId VARCHAR(20))");
+            foreach (\array_chunk($enrolledIds, 1000) as $batch) {
+                $values = \implode(', ', \array_map(
+                    fn($id) => "('" . \str_replace("'", "''", $id) . "')",
+                    $batch
+                ));
+                $connector->querySqlServer("INSERT INTO #TmpEnrollFilter VALUES {$values}");
+            }
 
-        $result = $connector->querySqlServer("
-            SELECT e.LLG_ID, e.Category, e.Agent, e.Affiliate_Agent
-            FROM TblEnrollment e
-            JOIN #TmpEnrollFilter f ON e.LLG_ID = 'LLG-' + f.ContactId
-            WHERE e.Category NOT IN ('', 'FDR', 'CSS', 'CNI')
-        ");
-        $connector->querySqlServer("DROP TABLE #TmpEnrollFilter");
+            $result = $connector->querySqlServer("
+                SELECT e.LLG_ID, e.Category, e.Agent, e.Affiliate_Agent
+                FROM TblEnrollment e
+                JOIN #TmpEnrollFilter f ON e.LLG_ID = 'LLG-' + f.ContactId
+                WHERE e.Category NOT IN ('', 'FDR', 'CSS', 'CNI')
+            ");
+            $connector->querySqlServer("DROP TABLE #TmpEnrollFilter");
+        }
 
         $categories      = [];
         $assignedAgents  = [];
@@ -639,6 +696,32 @@ class SyncContactsData extends Command
 
         $externalIds = \array_keys($externalIds);
         $lookup = [];
+
+        if ($this->option('dry-run')) {
+            foreach (array_chunk($externalIds, 1000) as $batch) {
+                $ids = $this->sqlStringList(array_map(fn($id) => substr((string) $id, 0, 50), $batch));
+                $rows = $this->selectPreviewRows($connector,
+                    "SELECT External_ID, Drop_Name FROM TblMailers WHERE External_ID IN ({$ids}) AND Drop_Name IS NOT NULL");
+                $this->mergeDropNameLookup($lookup, $rows);
+            }
+            $missTails = [];
+            foreach ($externalIds as $extId) {
+                if (!isset($lookup[$extId]) && strlen((string) $extId) > 9) {
+                    $tail = substr((string) $extId, -9);
+                    if (!isset($lookup[$tail])) {
+                        $missTails[$tail] = true;
+                    }
+                }
+            }
+            foreach (array_chunk(array_keys($missTails), 500) as $batch) {
+                $tails = $this->sqlStringList($batch);
+                $rows = $this->selectPreviewRows($connector,
+                    "SELECT External_ID, Drop_Name FROM TblMailers WHERE External_ID IS NOT NULL
+                     AND Drop_Name IS NOT NULL AND LEN(External_ID) > 9 AND RIGHT(External_ID, 9) IN ({$tails})");
+                $this->mergeDropNameLookup($lookup, $rows);
+            }
+            return $lookup;
+        }
 
         // Exact Ext match first (index-friendly). Last-9 fallback only for misses —
         // the old OR RIGHT(...) scan over all TblMailers was ~60s per page.
@@ -718,6 +801,113 @@ class SyncContactsData extends Command
     // Processing
     // -------------------------------------------------------------------------
 
+    /** Loan/requested amount and enrolled debt are deliberately separate. */
+    private function resolveDebtValues(array $row): array
+    {
+        $raw = $row['DEBT_AMOUNT_CUSTOM'] ?? null;
+        $loan = is_numeric($raw) ? (float) $raw : 0.0;
+        $validLoan = is_finite($loan) && $loan > 0 && $loan <= self::MAX_LOAN_AMOUNT;
+
+        if ($this->source === 'LT') {
+            if (!$validLoan) {
+                Log::warning('SyncContactsData: ignored invalid LT loan amount', [
+                    'contact_id' => $row['LLG_ID'] ?? '',
+                    'value' => $raw ?? 0,
+                ]);
+            }
+            $amount = $validLoan ? $loan : 0.0;
+            return ['amount' => floor($amount / 1000) * 1000, 'enrolled' => $amount,
+                'basis' => $validLoan ? 'loan' : 'no_debt'];
+        }
+
+        // A missing SELECT alias must fail instead of silently recreating the zero-debt bug.
+        if (!array_key_exists('ENROLLED_DEBT', $row)) {
+            throw new \RuntimeException('Snowflake result is missing ENROLLED_DEBT; debt mapping aborted.');
+        }
+        $rawEnrolled = $row['ENROLLED_DEBT'];
+        if ($rawEnrolled !== null && (!is_numeric($rawEnrolled) || !is_finite((float) $rawEnrolled))) {
+            throw new \RuntimeException('Snowflake returned a nonnumeric ENROLLED_DEBT value.');
+        }
+        $enrolled = (float) ($rawEnrolled ?? 0);
+        $amount = $validLoan ? $loan : $enrolled;
+
+        return ['amount' => floor($amount / 1000) * 1000, 'enrolled' => $enrolled,
+            'basis' => $validLoan ? 'loan' : ($enrolled > 0 ? 'enrolled_fallback' : 'no_debt')];
+    }
+
+    /** Only SELECTs, including when the normal sync uses temporary lookup tables. */
+    private function selectPreviewRows(DBConnector $connector, string $sql): array
+    {
+        $result = $connector->querySqlServer($sql);
+        if (!($result['success'] ?? false)) {
+            throw new \RuntimeException('Dry-run SQL read failed: ' . ($result['error'] ?? 'unknown error'));
+        }
+        return $result['data'] ?? [];
+    }
+
+    private function sqlStringList(array $values): string
+    {
+        return implode(', ', array_map(fn($value) => "'" . $this->escSql((string) $value) . "'", $values));
+    }
+
+    private function previewDebtChunk(DBConnector $connector, array $rows): void
+    {
+        foreach (array_chunk($rows, 1000) as $batch) {
+            $ids = $this->sqlStringList(array_column($batch, 'llg_id'));
+            $existing = $this->selectPreviewRows($connector,
+                "SELECT LLG_ID, Debt_Amount, Debt_Enrolled FROM {$this->targetTable} WHERE LLG_ID IN ({$ids})");
+            $lookup = [];
+            foreach ($existing as $old) {
+                $id = (string) $old['LLG_ID'];
+                if (isset($lookup[$id])) {
+                    throw new \RuntimeException("Duplicate target LLG_ID {$id}; debt comparison is ambiguous.");
+                }
+                $lookup[$id] = $old;
+            }
+            foreach ($batch as $row) {
+                $this->debtPreview['processed']++;
+                $this->debtPreview[$row['debt_basis']]++;
+                $old = $lookup[$row['llg_id']] ?? null;
+                if ($old === null) {
+                    $this->debtPreview['new']++;
+                    continue;
+                }
+                $amountChanged = $old['Debt_Amount'] === null
+                    || round((float) $old['Debt_Amount'], 2) !== round((float) $row['debt_amount'], 2);
+                $enrolledChanged = $old['Debt_Enrolled'] === null
+                    || round((float) $old['Debt_Enrolled'], 2) !== round((float) $row['debt_enrolled'], 2);
+                $this->debtPreview['amount_changed'] += (int) $amountChanged;
+                $this->debtPreview['enrolled_changed'] += (int) $enrolledChanged;
+                $this->debtPreview[$amountChanged || $enrolledChanged ? 'changed' : 'unchanged']++;
+                if (($amountChanged || $enrolledChanged) && $this->debtPreview['samples'] < 10) {
+                    $this->debtPreview['samples']++;
+                    $format = fn($value) => $value === null ? 'NULL' : number_format((float) $value, 2, '.', '');
+                    $this->line(sprintf('[DEBT CHANGE] %s Debt_Amount %s => %s; Debt_Enrolled %s => %s; basis=%s',
+                        $row['llg_id'], $format($old['Debt_Amount']), $format($row['debt_amount']),
+                        $format($old['Debt_Enrolled']), $format($row['debt_enrolled']), $row['debt_basis']));
+                }
+            }
+        }
+        $this->info(sprintf('[DRY RUN][%s] Debt comparison: %d processed, %d existing changed, %d unchanged, %d new.',
+            $this->source, $this->debtPreview['processed'], $this->debtPreview['changed'],
+            $this->debtPreview['unchanged'], $this->debtPreview['new']));
+    }
+
+    private function printDebtPreviewSummary(): void
+    {
+        $this->info("[DRY RUN][{$this->source}] FINAL DEBT SUMMARY (selected source rows only)");
+        $labels = ['processed' => 'Proposed source rows', 'loan' => 'Valid loan amount used',
+            'enrolled_fallback' => 'Enrolled-debt fallback used', 'no_debt' => 'No positive fallback debt',
+            'changed' => 'Existing rows with either debt column changed',
+            'amount_changed' => 'Existing Debt_Amount values changed',
+            'enrolled_changed' => 'Existing Debt_Enrolled values changed',
+            'unchanged' => 'Existing rows with both debt columns unchanged', 'new' => 'New target IDs'];
+        foreach ($labels as $key => $label) {
+            $this->line(sprintf('  %-51s %s', $label, number_format($this->debtPreview[$key])));
+        }
+        $this->line('[DRY RUN] Comparisons are live snapshots. New IDs are excluded from changed counts; target rows outside this source selection are not compared.');
+        $this->info('[DRY RUN] Writes performed: 0. No cache lock, temp tables, target/enrollment updates, or watermark changes.');
+    }
     /**
      * Processes one chunk of Snowflake rows.
      * @return array{0: array, 1: array, 2: array}  [processedRows, categoryChanges, affiliateChanges]
@@ -754,15 +944,7 @@ class SyncContactsData extends Command
             if ($this->isFakeExternalId($tpId)) {
                 $tpId = '';
             }
-            $debtAmountRaw = $row['DEBT_AMOUNT_CUSTOM'] ?? 0;
-            $debtAmount = is_numeric($debtAmountRaw) ? (float) $debtAmountRaw : 0.0;
-            if ($this->source === 'LT' && ($debtAmount <= 0 || $debtAmount > self::MAX_LT_DEBT_AMOUNT)) {
-                Log::warning('SyncContactsData: ignored invalid LT loan amount', [
-                    'contact_id' => $contactId,
-                    'value'      => $debtAmountRaw,
-                ]);
-                $debtAmount = 0.0;
-            }
+            $debt = $this->resolveDebtValues($row);
             $planTitle  = $row['PLAN_TITLE'] ?? '';
             $category   = $this->normalizePlanTitle($planTitle);
             // Sales agents = LT SF ASSIGNED_TO roster only. Skip portal system accounts
@@ -798,8 +980,9 @@ class SyncContactsData extends Command
                 'zip'                => \substr($row['ZIP'] ?? '', 0, 20),
                 'stage'              => $row['STAGE'] ?? '',
                 'status'             => $row['STATUS'] ?? '',
-                'debt_amount'        => \floor($debtAmount / 1000) * 1000,
-                'debt_enrolled'      => $debtAmount,
+                'debt_amount'        => $debt['amount'],
+                'debt_enrolled'      => $debt['enrolled'],
+                'debt_basis'         => $debt['basis'],
                 'credit_score'       => $row['CREDIT_SCORE'] ?? 0,
                 'credit_utilization' => $creditUtil,
                 'category'           => $category,
