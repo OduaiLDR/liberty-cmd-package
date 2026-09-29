@@ -23,6 +23,7 @@ class SyncContactsData extends Command
     protected $description = 'Sync contacts data from Snowflake to SQL Server (TblContactsLDR, TblContactsPLAW, and TblContactsLT)';
 
     private const PAGE_SIZE = 5000;
+    private const MIN_PAGE_SIZE = 200;
     private const MAX_LOAN_AMOUNT = 999999;
 
     private string $source;
@@ -34,6 +35,7 @@ class SyncContactsData extends Command
     private ?\PDO $refreshPdo = null;
     private ?string $refreshStage = null;
     private bool $refreshPublished = false;
+    private int $pageSize = self::PAGE_SIZE;
 
     /** Matching-step counters reset at the start of each matching run. */
     private int $matchingStepsOk = 0;
@@ -330,10 +332,10 @@ class SyncContactsData extends Command
         do {
             $pageNum++;
             $pageStarted = microtime(true);
-            $this->logStep("Page {$pageNum}: querying Snowflake (source={$this->source}, afterId={$lastId}, limit=" . self::PAGE_SIZE . ", since={$startDate})");
+            $this->logStep("Page {$pageNum}: querying Snowflake (source={$this->source}, afterId={$lastId}, limit={$this->pageSize}, since={$startDate})");
 
             $fetchStarted = microtime(true);
-            $chunk     = $this->fetchContactsPage($snowflake, $startDate, $lastId, self::PAGE_SIZE);
+            $chunk     = $this->fetchContactsPage($snowflake, $startDate, $lastId, $this->pageSize);
             $chunkSize = \count($chunk);
             $this->logStep("Page {$pageNum}: Snowflake returned {$chunkSize} row(s)", $fetchStarted);
 
@@ -500,18 +502,35 @@ class SyncContactsData extends Command
         int $lastId,
         int $limit
     ): array {
-        $sql = $this->source === 'LT'
-            ? $this->buildLTQuery($startDate, $lastId, $limit)
-            : $this->buildStandardQuery($startDate, $lastId, $limit);
+        while (true) {
+            $sql = $this->source === 'LT'
+                ? $this->buildLTQuery($startDate, $lastId, $limit)
+                : $this->buildStandardQuery($startDate, $lastId, $limit);
 
-        $result = $snowflake->query($sql);
-        if (($result['success'] ?? true) === false || !isset($result['data']) || !is_array($result['data'])) {
-            throw new \RuntimeException('Snowflake did not return a valid contact page.');
+            try {
+                $result = $snowflake->query($sql);
+            } catch (\GuzzleHttp\Exception\RequestException $e) {
+                $response = $e->getResponse();
+                if ($response === null || $response->getStatusCode() !== 408
+                    || !str_contains((string) $response->getBody(), '000630')
+                    || $limit <= self::MIN_PAGE_SIZE) {
+                    throw $e;
+                }
+                $nextLimit = max(self::MIN_PAGE_SIZE, intdiv($limit, 5));
+                $this->warn("[WARN] Snowflake statement timed out at afterId={$lastId}, limit={$limit}; retrying the same cursor with limit={$nextLimit}.");
+                $limit = $nextLimit;
+                continue;
+            }
+
+            if (($result['success'] ?? true) === false || !isset($result['data']) || !is_array($result['data'])) {
+                throw new \RuntimeException('Snowflake did not return a valid contact page.');
+            }
+            if (isset($result['rowCount']) && (int) $result['rowCount'] !== count($result['data'])) {
+                throw new \RuntimeException('Snowflake contact page is incomplete; aborting the refresh.');
+            }
+            $this->pageSize = $limit;
+            return $result['data'];
         }
-        if (isset($result['rowCount']) && (int) $result['rowCount'] !== count($result['data'])) {
-            throw new \RuntimeException('Snowflake contact page is incomplete; aborting the refresh.');
-        }
-        return $result['data'];
     }
 
     private function buildStandardQuery(string $startDate, int $lastId, int $limit): string

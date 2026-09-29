@@ -4,6 +4,9 @@ namespace Cmd\Reports\Tests\Unit;
 
 use Cmd\Reports\Console\Commands\SyncContactsData;
 use Cmd\Reports\Services\DBConnector;
+use GuzzleHttp\Exception\ClientException;
+use GuzzleHttp\Psr7\Request;
+use GuzzleHttp\Psr7\Response;
 use Illuminate\Console\OutputStyle;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Console\Input\ArrayInput;
@@ -177,5 +180,73 @@ class SyncContactsFullRefreshTest extends TestCase
         self::assertStringContainsString('AND c.ID > 100', $sql);
         self::assertLessThan(strpos($sql, 'LEFT JOIN CONTACTS_ASSIGNED'), strpos($sql, 'LIMIT 5000'));
         self::assertStringContainsString('FROM contact_page AS c', $sql);
+    }
+
+    public function test_statement_timeout_retries_same_cursor_and_keeps_smaller_pages(): void
+    {
+        $queries = [];
+        $snowflake = $this->getMockBuilder(DBConnector::class)->disableOriginalConstructor()->onlyMethods(['query'])->getMock();
+        $snowflake->method('query')->willReturnCallback(function (string $sql) use (&$queries) {
+            $queries[] = $sql;
+            if (count($queries) === 1) {
+                throw new ClientException('Snowflake timeout', new Request('GET', 'https://snowflake.test/statement'),
+                    new Response(408, [], '{"code":"000630"}'));
+            }
+            return ['data' => [['LLG_ID' => count($queries) === 2 ? 949838090 : 949838091]], 'rowCount' => 1];
+        });
+        $command = new SyncContactsData();
+        $this->property($command, 'source', 'LT');
+        $this->property($command, 'debtAmountCustomId', 595171);
+        $input = new ArrayInput([], $command->getDefinition());
+        $output = new BufferedOutput();
+        $command->setOutput(new OutputStyle($input, $output));
+        $fetch = new \ReflectionMethod($command, 'fetchContactsPage');
+
+        $first = $fetch->invoke($command, $snowflake, '2021-07-01', 949837816, 5000);
+        $nextLimit = (new \ReflectionProperty($command, 'pageSize'))->getValue($command);
+        $second = $fetch->invoke($command, $snowflake, '2021-07-01', 949838090, $nextLimit);
+
+        self::assertSame(949838090, $first[0]['LLG_ID']);
+        self::assertSame(949838091, $second[0]['LLG_ID']);
+        self::assertSame(1000, $nextLimit);
+        self::assertCount(3, $queries);
+        self::assertStringContainsString('c.ID > 949837816', $queries[0]);
+        self::assertStringContainsString('c.ID > 949837816', $queries[1]);
+        self::assertStringContainsString('LIMIT 5000', $queries[0]);
+        self::assertStringContainsString('LIMIT 1000', $queries[1]);
+        self::assertStringContainsString('c.ID > 949838090', $queries[2]);
+        self::assertStringContainsString('LIMIT 1000', $queries[2]);
+        self::assertStringContainsString('retrying the same cursor', $output->fetch());
+    }
+
+    public function test_statement_timeout_at_minimum_page_size_still_fails(): void
+    {
+        $queries = [];
+        $snowflake = $this->getMockBuilder(DBConnector::class)->disableOriginalConstructor()->onlyMethods(['query'])->getMock();
+        $snowflake->method('query')->willReturnCallback(function (string $sql) use (&$queries) {
+            $queries[] = $sql;
+            throw new ClientException('Snowflake timeout', new Request('GET', 'https://snowflake.test/statement'),
+                new Response(408, [], '{"code":"000630"}'));
+        });
+        $command = new SyncContactsData();
+        $this->property($command, 'source', 'LT');
+        $this->property($command, 'debtAmountCustomId', 595171);
+        $input = new ArrayInput([], $command->getDefinition());
+        $command->setOutput(new OutputStyle($input, new BufferedOutput()));
+
+        try {
+            (new \ReflectionMethod($command, 'fetchContactsPage'))->invoke($command, $snowflake, '2021-07-01', 949837816, 5000);
+            self::fail('A page that still times out at the minimum size must abort the refresh.');
+        } catch (ClientException $e) {
+            self::assertSame(408, $e->getResponse()->getStatusCode());
+        }
+
+        self::assertCount(3, $queries);
+        foreach ($queries as $sql) {
+            self::assertStringContainsString('c.ID > 949837816', $sql);
+        }
+        self::assertStringContainsString('LIMIT 5000', $queries[0]);
+        self::assertStringContainsString('LIMIT 1000', $queries[1]);
+        self::assertStringContainsString('LIMIT 200', $queries[2]);
     }
 }
