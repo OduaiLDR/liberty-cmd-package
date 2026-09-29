@@ -22,8 +22,9 @@ class SyncContactsData extends Command
 
     protected $description = 'Sync contacts data from Snowflake to SQL Server (TblContactsLDR, TblContactsPLAW, and TblContactsLT)';
 
-    private const PAGE_SIZE = 5000;
+    private const PAGE_SIZE = 1000;
     private const MIN_PAGE_SIZE = 200;
+    private const PROCESS_TIMEOUT_SECONDS = 21600;
     private const MAX_LOAN_AMOUNT = 999999;
 
     private string $source;
@@ -87,7 +88,7 @@ class SyncContactsData extends Command
         $orchStarted = microtime(true);
         $this->logStep('Step 1/3: Syncing LT (primary contacts)...');
         $ltPool = Process::pool(function ($pool) use ($php, $artisan, $fullFlag, $ownersRefreshFlag, $dryRunFlag, $reconcileAgentsFlag) {
-            $pool->as('LT')->timeout(7200)->command(
+            $pool->as('LT')->timeout(self::PROCESS_TIMEOUT_SECONDS)->command(
                 array_merge([$php, $artisan, 'Sync:contacts-data', '--source=LT', '--no-match'], $fullFlag, $ownersRefreshFlag, $dryRunFlag, $reconcileAgentsFlag)
             );
         })->start(function (string $type, string $output, string $key) {
@@ -109,7 +110,7 @@ class SyncContactsData extends Command
         $this->logStep('Step 2/3: Syncing LDR and PLAW in parallel...');
         $pool = Process::pool(function ($pool) use ($php, $artisan, $fullFlag, $ownersRefreshFlag, $dryRunFlag, $reconcileAgentsFlag) {
             foreach (['LDR', 'PLAW'] as $src) {
-                $pool->as($src)->timeout(7200)->command(
+                $pool->as($src)->timeout(self::PROCESS_TIMEOUT_SECONDS)->command(
                     array_merge([$php, $artisan, 'Sync:contacts-data', "--source={$src}", '--no-match'], $fullFlag, $ownersRefreshFlag, $dryRunFlag, $reconcileAgentsFlag)
                 );
             }
@@ -209,8 +210,8 @@ class SyncContactsData extends Command
         // (this is how TblContacts accumulated its historical duplicate backlog).
         // The lock is DB-backed (CACHE_STORE=database), so it serializes across the
         // orchestrator's subprocess and any manual/scheduled run on this host. It
-        // auto-expires after 2h so a crashed run can never wedge future syncs.
-        $lock = Cache::lock("sync-contacts-data:{$this->source}", 7200);
+        // auto-expires after 6h so a crashed run can never wedge future syncs.
+        $lock = Cache::lock("sync-contacts-data:{$this->source}", self::PROCESS_TIMEOUT_SECONDS);
         if (! $lock->get()) {
             $this->warn("[WARN] Another {$this->source} sync is already running; skipping this run to avoid duplicate rows.");
             Log::warning('SyncContactsData: overlapping run skipped', ['source' => $this->source]);
@@ -535,10 +536,66 @@ class SyncContactsData extends Command
 
     private function buildStandardQuery(string $startDate, int $lastId, int $limit): string
     {
-        // Page by contact ID (keep LIMIT on this query so lastId paging stays correct).
-        // TP_ID dups (latest Modified) are dropped in processChunk — QUALIFY here would
-        // drop higher IDs and make the next page re-fetch the wrong Snowflake row.
+        // Page contacts first, then reduce every one-to-many source independently.
+        // Joining history tables together before deduplication multiplies their rows
+        // (for example, 8 statuses × 4 scores × 3 reports = 96 rows for one contact).
         return "
+            WITH contact_page AS (
+                SELECT c.*
+                FROM CONTACTS AS c
+                WHERE CONVERT_TIMEZONE('America/Los_Angeles', COALESCE(c.MODIFIED, c.CREATED)) >= '{$this->esc($startDate)}'::TIMESTAMP_NTZ
+                  AND c.DEL = 'FALSE'
+                  AND c.FIRSTNAME IS NOT NULL AND c.FIRSTNAME <> ''
+                  AND c.ISCOAPP = 0
+                  AND c.ID > {$lastId}
+                ORDER BY c.ID
+                LIMIT {$limit}
+            ),
+            page_status AS (
+                SELECT s.CONTACT_ID, s.STAGE_ID, s.STATUS_ID, s.STAMP
+                FROM CONTACTS_STATUS AS s
+                JOIN contact_page AS p ON p.ID = s.CONTACT_ID
+                QUALIFY ROW_NUMBER() OVER (PARTITION BY s.CONTACT_ID ORDER BY s.STAMP DESC, s.ID DESC) = 1
+            ),
+            page_scores AS (
+                SELECT cs.CONTACT_ID, cs.TRANSUNION
+                FROM CREDIT_SCORES AS cs
+                JOIN contact_page AS p ON p.ID = cs.CONTACT_ID
+                QUALIFY ROW_NUMBER() OVER (PARTITION BY cs.CONTACT_ID ORDER BY cs.CREATED_AT DESC, cs.ID DESC) = 1
+            ),
+            page_credit_reports AS (
+                SELECT cr.CONTACT_ID, cr.METADATA
+                FROM CREDIT_REPORT_REQUEST AS cr
+                JOIN contact_page AS p ON p.ID = cr.CONTACT_ID
+                QUALIFY ROW_NUMBER() OVER (PARTITION BY cr.CONTACT_ID ORDER BY cr.CREATED_AT DESC, cr.ID DESC) = 1
+            ),
+            page_enrollment_plans AS (
+                SELECT ep.CONTACT_ID, ep.PLAN_ID, ep.FEE1
+                FROM ENROLLMENT_PLAN AS ep
+                JOIN contact_page AS p ON p.ID = ep.CONTACT_ID
+                QUALIFY ROW_NUMBER() OVER (PARTITION BY ep.CONTACT_ID ORDER BY ep.CREATED_AT DESC, ep.ID DESC) = 1
+            ),
+            page_enrolled_debt AS (
+                SELECT d.CONTACT_ID, SUM(d.ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT
+                FROM DEBTS AS d
+                JOIN contact_page AS p ON p.ID = d.CONTACT_ID
+                WHERE d.ENROLLED = 1 AND d._FIVETRAN_DELETED = FALSE
+                GROUP BY d.CONTACT_ID
+            ),
+            page_debt_field AS (
+                SELECT uf.CONTACT_ID, uf.F_DECIMAL
+                FROM CONTACTS_USERFIELDS AS uf
+                JOIN contact_page AS p ON p.ID = uf.CONTACT_ID
+                WHERE uf.CUSTOM_ID = {$this->debtAmountCustomId}
+                QUALIFY ROW_NUMBER() OVER (PARTITION BY uf.CONTACT_ID ORDER BY uf.ID DESC) = 1
+            ),
+            page_agent_field AS (
+                SELECT uf.CONTACT_ID, uf.F_SHORTSTRING
+                FROM CONTACTS_USERFIELDS AS uf
+                JOIN contact_page AS p ON p.ID = uf.CONTACT_ID
+                WHERE uf.CUSTOM_ID = {$this->agentCustomId}
+                QUALIFY ROW_NUMBER() OVER (PARTITION BY uf.CONTACT_ID ORDER BY uf.ID DESC) = 1
+            )
             SELECT
                 TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', c.CREATED), 'YYYY-MM-DD HH24:MI:SS') AS CREATED,
                 NULL AS ASSIGNED_ON,
@@ -569,49 +626,29 @@ class SyncContactsData extends Command
                 d.ENROLLED_DEBT,
                 ed.TITLE AS PLAN_TITLE,
                 uf_agent.F_SHORTSTRING AS AGENT_CUSTOM
-            FROM CONTACTS AS c
+            FROM contact_page AS c
             LEFT JOIN DATA_SOURCES AS ds ON c.C_SOURCE = ds.ID
             LEFT JOIN USERS AS u1 ON c.CREATED_BY = u1.UID
             LEFT JOIN USERS AS u2 ON c.ASSIGNED_TO = u2.UID
-            LEFT JOIN CONTACTS_STATUS AS s ON c.ID = s.CONTACT_ID
+            LEFT JOIN page_status AS s ON c.ID = s.CONTACT_ID
             LEFT JOIN CONTACTS_CATEGORIES AS cc ON s.STAGE_ID = cc.ID
             LEFT JOIN CONTACTS_LEAD_STATUS AS cls ON s.STATUS_ID = cls.ID
-            LEFT JOIN CREDIT_SCORES AS cs ON c.ID = cs.CONTACT_ID
-            LEFT JOIN CREDIT_REPORT_REQUEST AS cr ON c.ID = cr.CONTACT_ID
-            LEFT JOIN (
-                SELECT CONTACT_ID, SUM(ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT
-                FROM DEBTS
-                WHERE ENROLLED = 1 AND _FIVETRAN_DELETED = FALSE
-                GROUP BY CONTACT_ID
-            ) AS d ON c.ID = d.CONTACT_ID
-            LEFT JOIN ENROLLMENT_PLAN AS ep ON c.ID = ep.CONTACT_ID
+            LEFT JOIN page_scores AS cs ON c.ID = cs.CONTACT_ID
+            LEFT JOIN page_credit_reports AS cr ON c.ID = cr.CONTACT_ID
+            LEFT JOIN page_enrolled_debt AS d ON c.ID = d.CONTACT_ID
+            LEFT JOIN page_enrollment_plans AS ep ON c.ID = ep.CONTACT_ID
             LEFT JOIN ENROLLMENT_DEFAULTS2 AS ed ON ep.PLAN_ID = ed.ID
-            LEFT JOIN (
-                SELECT CONTACT_ID, F_DECIMAL
-                FROM CONTACTS_USERFIELDS
-                WHERE CUSTOM_ID = {$this->debtAmountCustomId}
-            ) AS uf_debt ON c.ID = uf_debt.CONTACT_ID
-            LEFT JOIN (
-                SELECT CONTACT_ID, F_SHORTSTRING
-                FROM CONTACTS_USERFIELDS
-                WHERE CUSTOM_ID = {$this->agentCustomId}
-            ) AS uf_agent ON c.ID = uf_agent.CONTACT_ID
-            WHERE CONVERT_TIMEZONE('America/Los_Angeles', COALESCE(c.MODIFIED, c.CREATED)) >= '{$this->esc($startDate)}'::TIMESTAMP_NTZ
-              AND c.DEL = 'FALSE'
-              AND c.FIRSTNAME IS NOT NULL AND c.FIRSTNAME <> ''
-              AND ISCOAPP = 0
-              AND c.ID > {$lastId}
-            QUALIFY ROW_NUMBER() OVER(PARTITION BY c.ID ORDER BY s.STAMP DESC) = 1
+            LEFT JOIN page_debt_field AS uf_debt ON c.ID = uf_debt.CONTACT_ID
+            LEFT JOIN page_agent_field AS uf_agent ON c.ID = uf_agent.CONTACT_ID
             ORDER BY c.ID
-            LIMIT {$limit}
         ";
     }
 
     private function buildLTQuery(string $startDate, int $lastId, int $limit): string
     {
-        // Bound the contacts before expanding assignment/status history joins.
-        // EXISTS preserves the old non-Duplicate-Lead eligibility before LIMIT,
-        // so an all-filtered candidate page cannot terminate pagination early.
+        // Apply the keyset page before reading histories and reduce each history
+        // independently. EXISTS keeps pages full of duplicate leads from hiding
+        // later eligible contacts. Every joined CTE returns at most one row/contact.
         return "
             WITH contact_page AS (
                 SELECT c.*
@@ -629,6 +666,45 @@ class SyncContactsData extends Command
                   )
                 ORDER BY c.ID
                 LIMIT {$limit}
+            ),
+            page_assignment AS (
+                SELECT a.CONTACT_ID, a.STAMP
+                FROM CONTACTS_ASSIGNED AS a
+                JOIN contact_page AS p ON p.ID = a.CONTACT_ID
+                QUALIFY ROW_NUMBER() OVER (PARTITION BY a.CONTACT_ID ORDER BY a.STAMP DESC, a.ID DESC) = 1
+            ),
+            page_status AS (
+                SELECT s.CONTACT_ID, s.STAGE_ID, s.STATUS_ID, s.STAMP
+                FROM CONTACTS_STATUS AS s
+                JOIN contact_page AS p ON p.ID = s.CONTACT_ID
+                JOIN CONTACTS_LEAD_STATUS AS eligible_cls ON eligible_cls.ID = s.STATUS_ID
+                WHERE eligible_cls.TITLE <> 'Duplicate Lead'
+                QUALIFY ROW_NUMBER() OVER (PARTITION BY s.CONTACT_ID ORDER BY s.STAMP DESC, s.ID DESC) = 1
+            ),
+            page_scores AS (
+                SELECT cs.CONTACT_ID, cs.TRANSUNION
+                FROM CREDIT_SCORES AS cs
+                JOIN contact_page AS p ON p.ID = cs.CONTACT_ID
+                QUALIFY ROW_NUMBER() OVER (PARTITION BY cs.CONTACT_ID ORDER BY cs.CREATED_AT DESC, cs.ID DESC) = 1
+            ),
+            page_credit_reports AS (
+                SELECT cr.CONTACT_ID, cr.METADATA
+                FROM CREDIT_REPORT_REQUEST AS cr
+                JOIN contact_page AS p ON p.ID = cr.CONTACT_ID
+                QUALIFY ROW_NUMBER() OVER (PARTITION BY cr.CONTACT_ID ORDER BY cr.CREATED_AT DESC, cr.ID DESC) = 1
+            ),
+            page_enrollment_plans AS (
+                SELECT ep.CONTACT_ID, ep.PLAN_ID, ep.FEE1
+                FROM ENROLLMENT_PLAN AS ep
+                JOIN contact_page AS p ON p.ID = ep.CONTACT_ID
+                QUALIFY ROW_NUMBER() OVER (PARTITION BY ep.CONTACT_ID ORDER BY ep.CREATED_AT DESC, ep.ID DESC) = 1
+            ),
+            page_debt_field AS (
+                SELECT uf.CONTACT_ID, uf.F_SHORTSTRING
+                FROM CONTACTS_USERFIELDS AS uf
+                JOIN contact_page AS p ON p.ID = uf.CONTACT_ID
+                WHERE uf.CUSTOM_ID = {$this->debtAmountCustomId}
+                QUALIFY ROW_NUMBER() OVER (PARTITION BY uf.CONTACT_ID ORDER BY uf.ID DESC) = 1
             )
             SELECT
                 TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', c.CREATED), 'YYYY-MM-DD HH24:MI:SS') AS CREATED,
@@ -660,30 +736,18 @@ class SyncContactsData extends Command
                 NULL AS PLAN_TITLE,
                 NULL AS AGENT_CUSTOM
             FROM contact_page AS c
-            LEFT JOIN CONTACTS_ASSIGNED AS a ON c.ID = a.CONTACT_ID
+            LEFT JOIN page_assignment AS a ON c.ID = a.CONTACT_ID
             LEFT JOIN DATA_SOURCES AS ds ON c.C_SOURCE = ds.ID
             LEFT JOIN USERS AS u1 ON c.CREATED_BY = u1.UID
             LEFT JOIN USERS AS u2 ON c.ASSIGNED_TO = u2.UID
-            LEFT JOIN CONTACTS_STATUS AS s ON c.ID = s.CONTACT_ID
+            JOIN page_status AS s ON c.ID = s.CONTACT_ID
             LEFT JOIN CONTACTS_CATEGORIES AS cc ON s.STAGE_ID = cc.ID
             LEFT JOIN CONTACTS_LEAD_STATUS AS cls ON s.STATUS_ID = cls.ID
-            LEFT JOIN CREDIT_SCORES AS cs ON c.ID = cs.CONTACT_ID
-            LEFT JOIN CREDIT_REPORT_REQUEST AS cr ON c.ID = cr.CONTACT_ID
-            LEFT JOIN ENROLLMENT_PLAN AS ep ON c.ID = ep.CONTACT_ID
-            LEFT JOIN (
-                SELECT CONTACT_ID, F_SHORTSTRING
-                FROM CONTACTS_USERFIELDS
-                WHERE CUSTOM_ID = {$this->debtAmountCustomId}
-            ) AS uf_debt ON c.ID = uf_debt.CONTACT_ID
-            WHERE CONVERT_TIMEZONE('America/Los_Angeles', COALESCE(c.MODIFIED, c.CREATED)) >= '{$this->esc($startDate)}'::TIMESTAMP_NTZ
-              AND c.DEL = 'FALSE'
-              AND c.FIRSTNAME IS NOT NULL AND c.FIRSTNAME <> ''
-              AND ISCOAPP = 0
-              AND cls.TITLE <> 'Duplicate Lead'
-              AND c.ID > {$lastId}
-            QUALIFY ROW_NUMBER() OVER(PARTITION BY c.ID ORDER BY s.STAMP DESC) = 1
+            LEFT JOIN page_scores AS cs ON c.ID = cs.CONTACT_ID
+            LEFT JOIN page_credit_reports AS cr ON c.ID = cr.CONTACT_ID
+            LEFT JOIN page_enrollment_plans AS ep ON c.ID = ep.CONTACT_ID
+            LEFT JOIN page_debt_field AS uf_debt ON c.ID = uf_debt.CONTACT_ID
             ORDER BY c.ID
-            LIMIT {$limit}
         ";
     }
 

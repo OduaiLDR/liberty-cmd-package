@@ -83,7 +83,7 @@ class SyncContactsFullRefreshTest extends TestCase
         $snowflake->method('query')->willReturnCallback(function (string $sql) use (&$page, &$events, $failure) {
             $page++;
             $events[] = 'fetch:' . $page;
-            self::assertStringContainsString('LIMIT 5000', $sql);
+            self::assertStringContainsString('LIMIT 1000', $sql);
             if (($failure === 'first_fetch' && $page === 1) || ($failure === 'later_fetch' && $page === 2)) {
                 throw new \RuntimeException('simulated Snowflake timeout');
             }
@@ -174,12 +174,42 @@ class SyncContactsFullRefreshTest extends TestCase
     {
         $command = new SyncContactsData();
         $this->property($command, 'debtAmountCustomId', 595171);
-        $sql = (new \ReflectionMethod($command, 'buildLTQuery'))->invoke($command, '2021-07-01', 100, 5000);
+        $sql = (new \ReflectionMethod($command, 'buildLTQuery'))->invoke($command, '2021-07-01', 100, 1000);
         self::assertStringContainsString('WITH contact_page AS', $sql);
         self::assertStringContainsString('eligible_lead.TITLE <> \'Duplicate Lead\'', $sql);
+        self::assertStringContainsString('eligible_cls.TITLE <> \'Duplicate Lead\'', $sql);
         self::assertStringContainsString('AND c.ID > 100', $sql);
-        self::assertLessThan(strpos($sql, 'LEFT JOIN CONTACTS_ASSIGNED'), strpos($sql, 'LIMIT 5000'));
+        self::assertLessThan(strpos($sql, 'page_assignment AS ('), strpos($sql, 'LIMIT 1000'));
         self::assertStringContainsString('FROM contact_page AS c', $sql);
+        self::assertStringContainsString('page_assignment AS', $sql);
+        self::assertStringContainsString('page_status AS', $sql);
+        self::assertStringContainsString('page_scores AS', $sql);
+        self::assertStringContainsString('page_credit_reports AS', $sql);
+        self::assertStringContainsString('page_enrollment_plans AS', $sql);
+        self::assertStringContainsString('page_debt_field AS', $sql);
+        self::assertStringNotContainsString('QUALIFY ROW_NUMBER() OVER(PARTITION BY c.ID', $sql);
+    }
+
+    public function test_standard_sources_page_before_independently_deduping_history_joins(): void
+    {
+        foreach (['LDR' => 745839, 'PLAW' => 743019] as $source => $customId) {
+            $command = new SyncContactsData();
+            $this->property($command, 'source', $source);
+            $this->property($command, 'debtAmountCustomId', $customId);
+            $this->property($command, 'agentCustomId', $source === 'LDR' ? 742152 : 742153);
+            $sql = (new \ReflectionMethod($command, 'buildStandardQuery'))->invoke($command, '2021-07-01', 123, 1000);
+
+            self::assertStringContainsString('WITH contact_page AS', $sql, $source);
+            self::assertStringContainsString('AND c.ID > 123', $sql, $source);
+            self::assertStringContainsString('LIMIT 1000', $sql, $source);
+            self::assertStringContainsString('page_status AS', $sql, $source);
+            self::assertStringContainsString('page_scores AS', $sql, $source);
+            self::assertStringContainsString('page_credit_reports AS', $sql, $source);
+            self::assertStringContainsString('page_enrollment_plans AS', $sql, $source);
+            self::assertStringContainsString('page_debt_field AS', $sql, $source);
+            self::assertStringContainsString('page_agent_field AS', $sql, $source);
+            self::assertStringNotContainsString('QUALIFY ROW_NUMBER() OVER(PARTITION BY c.ID', $sql, $source);
+        }
     }
 
     public function test_statement_timeout_retries_same_cursor_and_keeps_smaller_pages(): void
