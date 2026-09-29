@@ -89,9 +89,9 @@ class SyncContactsDebtTest extends TestCase
         (new ReflectionProperty(SyncContactsData::class, 'debtAmountCustomId'))->setValue($command, 743019);
         (new ReflectionProperty(SyncContactsData::class, 'agentCustomId'))->setValue($command, 742153);
         $sql = (new ReflectionMethod(SyncContactsData::class, 'buildStandardQuery'))->invoke($command, '2021-07-01', 0, 10);
-        self::assertStringContainsString('SUM(ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT', $sql);
-        self::assertStringContainsString('WHERE ENROLLED = 1 AND _FIVETRAN_DELETED = FALSE', $sql);
-        self::assertStringContainsString('GROUP BY CONTACT_ID', $sql);
+        self::assertStringContainsString('SUM(d.ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT', $sql);
+        self::assertStringContainsString('WHERE d.ENROLLED = 1 AND d._FIVETRAN_DELETED = FALSE', $sql);
+        self::assertStringContainsString('GROUP BY d.CONTACT_ID', $sql);
         self::assertStringContainsString('d.ENROLLED_DEBT,', $sql);
         $lt = (new ReflectionMethod(SyncContactsData::class, 'buildLTQuery'))->invoke($command, '2021-07-01', 0, 10);
         self::assertStringNotContainsString('FROM DEBTS', $lt);
@@ -105,7 +105,7 @@ class SyncContactsDebtTest extends TestCase
         $snowflake = $this->getMockBuilder(DBConnector::class)->disableOriginalConstructor()->onlyMethods(['query'])->getMock();
         $calls = 0;
         $snowflake->method('query')->willReturnCallback(function (string $sql) use (&$calls): array {
-            self::assertStringStartsWith('SELECT', ltrim($sql));
+            self::assertMatchesRegularExpression('/^(WITH|SELECT)\b/i', ltrim($sql));
             return ['data' => $calls++ ? [] : [
                 ['LLG_ID' => '123', 'EXTERNAL_ID' => '12345678900', 'ENROLLED_DATE' => '2026-09-01', 'ENROLLED_DEBT' => '13920.00', 'DEBT_AMOUNT_CUSTOM' => null],
                 ['LLG_ID' => '124', 'EXTERNAL_ID' => '12345678901', 'ENROLLED_DEBT' => '50000.25', 'DEBT_AMOUNT_CUSTOM' => '30000'],
