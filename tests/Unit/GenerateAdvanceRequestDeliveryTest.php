@@ -39,4 +39,19 @@ class GenerateAdvanceRequestDeliveryTest extends TestCase
         self::assertStringNotContainsString('REVIEW', strtoupper($body));
         self::assertStringNotContainsString('SAMPLE', strtoupper($body));
     }
+
+    public function test_progress_law_verification_uses_the_valid_ldr_sender_only_for_self_delivery(): void
+    {
+        $command = new GenerateAdvanceRequest();
+        $method = (new ReflectionClass($command))->getMethod('resolveVerificationSender');
+
+        self::assertSame('NGF@libertydebtrelief.com', $method->invoke($command, [
+            'company' => 'PLAW',
+            'sender' => 'NGF@progresslaw.com',
+        ]));
+        self::assertSame('NGF@libertydebtrelief.com', $method->invoke($command, [
+            'company' => 'LDR',
+            'sender' => 'NGF@libertydebtrelief.com',
+        ]));
+    }
 }
