@@ -2,6 +2,7 @@
 
 namespace Cmd\Reports\Console\Commands;
 
+use Cmd\Reports\Services\AdvanceRequestInvoiceBuilder;
 use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\EmailSenderService;
 use Illuminate\Console\Command;
@@ -12,11 +13,11 @@ class GenerateAdvanceRequest extends Command
     protected $signature = 'Generate:advance-request
                             {--month= : Reporting month as YYYY-MM (defaults to previous calendar month)}
                             {--dry-run : Calculate and display results without sending email}
-                            {--send-live : Send to the production recipients instead of the test recipient}';
+                            {--send-to-me : Send only to oduai@libertydebtrelief.com instead of TblReports recipients}';
 
     protected $description = 'Calculate and email the monthly LDR and Progress Law advance request.';
 
-    private const TEST_RECIPIENT = 'oduai@libertydebtrelief.com';
+    private const VERIFICATION_RECIPIENT = 'oduai@libertydebtrelief.com';
     private const LDR_SENDER = 'NGF@libertydebtrelief.com';
     private const PROGRESS_LAW_SENDER = 'NGF@progresslaw.com';
     private const ADVANCE_TOTAL = 1000000.0;
@@ -25,6 +26,9 @@ class GenerateAdvanceRequest extends Command
     {
         $window = $this->resolveMonthWindow();
         $this->info("[INFO] Advance request period: {$window['label']} ({$window['start']} through {$window['end_exclusive']})");
+
+        $sendToMe = (bool) $this->option('send-to-me');
+        $isDryRun = (bool) $this->option('dry-run');
 
         try {
             $azure = DBConnector::fromEnvironment('ldr');
@@ -86,16 +90,12 @@ class GenerateAdvanceRequest extends Command
 
         $allocation = $this->calculateAllocation($amounts['LDR'], $amounts['Progress Law']);
         $this->info(sprintf('[INFO] Final debt: LDR $%0.2f | Progress Law $%0.2f', $amounts['LDR'], $amounts['Progress Law']));
+
         $this->info(sprintf('[INFO] Allocation: LDR $%0.2f | Progress Law $%0.2f | Tranche %s',
             $allocation['ldr'], $allocation['progress_law'], $tranche));
 
-        if ((bool) $this->option('dry-run')) {
-            $this->info('[DRY RUN] No email sent.');
-            return Command::SUCCESS;
-        }
-
-        $isLive = (bool) $this->option('send-live');
         $email = new EmailSenderService();
+        $invoiceBuilder = new AdvanceRequestInvoiceBuilder();
         $monthLabel = $window['label'];
         $sent = true;
 
@@ -104,31 +104,76 @@ class GenerateAdvanceRequest extends Command
                 'name' => 'LDR',
                 'subject' => 'LDR Advance Request',
                 'amount' => $allocation['ldr'],
-                'to' => ['sam@libertydebtrelief.com', 'omar@libertydebtrelief.com', 'james@nexgenfi.com'],
-                'cc' => ['Jacob@libertydebtrelief.com'],
+                'report' => 'AdvanceRequest',
+                'company' => 'LDR',
                 'sender' => self::LDR_SENDER,
             ],
             [
                 'name' => 'Progress Law',
                 'subject' => 'Progress Law Advance Request',
                 'amount' => $allocation['progress_law'],
-                'to' => ['aaron@progresslaw.com', 'eric@progresslaw.com', 'james@nexgenfi.com'],
-                'cc' => ['jacob@progresslaw.com'],
+                'report' => 'AdvanceRequest',
+                'company' => 'PLAW',
                 'sender' => self::PROGRESS_LAW_SENDER,
             ],
         ] as $request) {
-            $subject = ($isLive ? '' : '[TEST] ') . $request['subject'];
+            $subject = $request['subject'];
             $body = $this->buildEmailBody($request['name'], $request['amount'], $tranche, $monthLabel);
-            $to = $isLive ? $request['to'] : [self::TEST_RECIPIENT];
-            $cc = $isLive ? $request['cc'] : [];
-            $wasSent = $email->sendMailHtml($subject, $body, $to, $cc, [], [], $request['sender']);
+            $invoice = $this->buildInvoiceData($request['name'], $request['amount'], $tranche, $window);
+            $pdfBytes = $invoiceBuilder->build($invoice);
+            $filename = $invoice['invoice_number'] . '.pdf';
+            $attachments = [[
+                'name' => $filename,
+                'contentType' => 'application/pdf',
+                'contentBytes' => base64_encode($pdfBytes),
+            ]];
+
+            if ($isDryRun || $sendToMe) {
+                $path = $this->writeInvoicePreview($filename, $pdfBytes);
+                $this->info("[INFO] Invoice PDF written to {$path}");
+            }
+
+            if ($isDryRun) {
+                continue;
+            }
+
+            if ($sendToMe) {
+                $wasSent = $email->sendMailHtml(
+                    $subject,
+                    $body,
+                    [self::VERIFICATION_RECIPIENT],
+                    [],
+                    [],
+                    $attachments,
+                    $request['sender']
+                );
+                $recipientDescription = self::VERIFICATION_RECIPIENT;
+            } else {
+                $wasSent = $email->sendMailUsingTblReportsHtml(
+                    $azure,
+                    [$request['report']],
+                    [$request['company']],
+                    $subject,
+                    $body,
+                    $attachments,
+                    false,
+                    true,
+                    $request['sender']
+                );
+                $recipientDescription = 'TblReports recipients';
+            }
             $sent = $sent && $wasSent;
 
             if ($wasSent) {
-                $this->info(sprintf('[INFO] %s advance request sent to %s.', $request['name'], implode(', ', $to)));
+                $this->info(sprintf('[INFO] %s advance request sent to %s.', $request['name'], $recipientDescription));
             } else {
                 $this->error("[ERROR] {$request['name']} advance request email failed.");
             }
+        }
+
+        if ($isDryRun) {
+            $this->info('[DRY RUN] Invoice PDFs generated; no email sent.');
+            return Command::SUCCESS;
         }
 
         return $sent ? Command::SUCCESS : Command::FAILURE;
@@ -253,8 +298,40 @@ class GenerateAdvanceRequest extends Command
             . '<p style="margin: 0 0 18px 0;">'
             . 'Please process this request and wire the funds at your earliest convenience.'
             . '</p>'
+            . '<p style="margin: 0 0 18px 0;">Please refer to the attached invoice for the request summary and wire instructions.</p>'
             . '<p style="margin: 0;">Thanks</p>'
             . '</div>';
+    }
+
+    private function buildInvoiceData(string $program, float $amount, string $tranche, array $window): array
+    {
+        $prefix = $program === 'Progress Law' ? 'PLAW' : 'LDR';
+        $trancheToken = preg_replace('/[^A-Za-z0-9]+/', '-', strtoupper($tranche)) ?: 'UNKNOWN';
+
+        return [
+            'program' => $program,
+            'amount' => $amount,
+            'tranche' => $tranche,
+            'month' => $window['label'],
+            'invoice_number' => sprintf('%s-ADV-%s-%s', $prefix, str_replace('-', '', $window['start']), $trancheToken),
+            'issue_date' => now()->format('F j, Y'),
+            'sample' => false,
+        ];
+    }
+
+    private function writeInvoicePreview(string $filename, string $pdfBytes): string
+    {
+        $directory = storage_path('app/advance-request-invoices');
+        if (!is_dir($directory) && !mkdir($directory, 0775, true) && !is_dir($directory)) {
+            throw new \RuntimeException("Unable to create invoice preview directory: {$directory}");
+        }
+
+        $path = $directory . DIRECTORY_SEPARATOR . $filename;
+        if (file_put_contents($path, $pdfBytes) === false) {
+            throw new \RuntimeException("Unable to write invoice preview: {$path}");
+        }
+
+        return $path;
     }
 
     private function normalizeLlgId(mixed $value): string
