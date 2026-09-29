@@ -145,7 +145,7 @@ class GenerateAdvanceRequest extends Command
                     [],
                     [],
                     $attachments,
-                    $request['sender']
+                    $this->resolveVerificationSender($request)
                 );
                 $recipientDescription = self::VERIFICATION_RECIPIENT;
             } else {
@@ -177,6 +177,15 @@ class GenerateAdvanceRequest extends Command
         }
 
         return $sent ? Command::SUCCESS : Command::FAILURE;
+    }
+
+    private function resolveVerificationSender(array $request): string
+    {
+        // Graph rejected the Progress Law mailbox as an invalid user. Use the verified
+        // LDR sender only for the restricted verification path; production is unchanged.
+        return ($request['company'] ?? '') === 'PLAW'
+            ? self::LDR_SENDER
+            : (string) $request['sender'];
     }
 
     private function resolveMonthWindow(): array
