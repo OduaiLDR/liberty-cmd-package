@@ -943,8 +943,10 @@ class SyncContactsData extends Command
         }
 
         $create = $connector->querySqlServer(
-            "SELECT TOP (0) CAST(RIGHT(External_ID, 9) AS varchar(9)) AS Suffix, Drop_Name
-             INTO #TmpMailerSuffixCache FROM TblMailers"
+            "SET NOCOUNT ON;
+             SELECT TOP (0) CAST(RIGHT(External_ID, 9) AS varchar(9)) AS Suffix, Drop_Name
+             INTO #TmpMailerSuffixCache FROM TblMailers;
+             SET NOCOUNT OFF;"
         );
         if (! ($create['success'] ?? false)) {
             throw new \RuntimeException('Unable to create temporary mailer suffix cache: ' . ($create['error'] ?? 'unknown SQL Server error'));
