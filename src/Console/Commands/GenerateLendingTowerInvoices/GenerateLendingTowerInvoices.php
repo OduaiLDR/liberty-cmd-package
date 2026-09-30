@@ -18,11 +18,9 @@ use RuntimeException;
  *
  * Both invoices cover one calendar month in Los Angeles time, by default the previous one.
  *
- * Progress Law is billed per lead: contacts created in the month on the Progress Law Forth account,
- * excluding deleted records, co-applicants, 'Duplicate Lead' status and records with no first name
- * (four junk records in August 2026 had no name or email). TblContactsPLAW is counted alongside as
- * a cross-check. It is a synced copy of the same contacts, so a difference means the contact sync
- * has not caught up, and the Snowflake count is the one billed.
+ * Progress Law is billed for Lending Tower contacts in a PLAW-classified state, once in the month of
+ * its first qualifying status (Pacific Time). Current status is shown separately in the backup.
+ * Deleted contacts and co-applicants are excluded.
  *
  * LDR is billed on enrollments: 7% of the debt basis (Sold_Debt, else Debt_Amount) of LDR clients
  * whose first payment cleared in the month. TblEnrollment holds both firms' enrollments, so LDR is
@@ -50,6 +48,7 @@ class GenerateLendingTowerInvoices extends Command
                             {--company=all : PLAW, LDR or all}
                             {--dry-run : Calculate and print the figures without creating or sending anything}
                             {--save= : Write the invoice PDFs and backup workbooks to this folder instead of emailing}
+                            {--send-to-me : Send test copies only to oduai@libertydebtrelief.com, with no CC or BCC}
                             {--test-to= : Email the invoices only to this address, from the normal report sender, marked TEST}
                             {--force : Send even if this invoice number was already sent}';
 
@@ -62,9 +61,6 @@ class GenerateLendingTowerInvoices extends Command
     /** 7%, in basis points so the fee stays in integer arithmetic. */
     private const LDR_FEE_BASIS_POINTS = 700;
 
-    private const DUPLICATE_LEAD_STATUS = 'Duplicate Lead';
-
-    private const TERMS_DAYS = 30;
 
     /**
      * Issuer and bill-to blocks, from cmd-runner's ExpenseInvoiceService::BILL_TO (confirmed by Bryan
@@ -149,6 +145,12 @@ class GenerateLendingTowerInvoices extends Command
         $dryRun = (bool) $this->option('dry-run');
         $saveDir = trim((string) $this->option('save'));
         $testTo = trim((string) $this->option('test-to'));
+        if ($this->option('send-to-me')) {
+            if ($testTo !== '' && strcasecmp($testTo, 'oduai@libertydebtrelief.com') !== 0) {
+                throw new \InvalidArgumentException('--send-to-me cannot be combined with a different --test-to recipient.');
+            }
+            $testTo = 'oduai@libertydebtrelief.com';
+        }
         $live = ! $dryRun && $saveDir === '' && $testTo === '';
 
         if ($testTo !== '' && filter_var($testTo, FILTER_VALIDATE_EMAIL) === false) {
@@ -194,7 +196,7 @@ class GenerateLendingTowerInvoices extends Command
             $invoices = [];
 
             if (in_array('PLAW', $companies, true)) {
-                $invoices['PLAW'] = $this->progressLawInvoice($azure, $start, $end);
+                $invoices['PLAW'] = $this->progressLawInvoice($start, $end);
                 $this->printProgressLaw($invoices['PLAW']);
             }
 
@@ -258,11 +260,11 @@ class GenerateLendingTowerInvoices extends Command
 
         return [
             'month' => $first->format('F Y'),
-            'range' => $first->format('F j') . '–' . $last->format('j, Y'),
+            'range' => $first->format('F j') . 'â€“' . $last->format('j, Y'),
             'last_day' => $last->format('Y-m-d'),
             'suffix' => $first->format('Y-m'),
             'issue_date' => $issue->format('F j, Y'),
-            'due_date' => $issue->modify('+' . self::TERMS_DAYS . ' days')->format('F j, Y'),
+            'due_date' => 'Upon Receipt',
         ];
     }
 
@@ -282,99 +284,40 @@ class GenerateLendingTowerInvoices extends Command
     // Progress Law
     // -------------------------------------------------------------------------
 
-    /**
-     * @return array{leads: array<int, array<string, mixed>>, lead_count: int, total_cents: int, azure_count: int}
-     */
-    private function progressLawInvoice(DBConnector $azure, string $start, string $end): array
+    /** @return array{leads: array, lead_count: int, total_cents: int} */
+    private function progressLawInvoice(string $start, string $end): array
     {
+        $states = UsStateClassification::progressLawStates();
         $leads = $this->snowflakeRows(
-            DBConnector::fromEnvironment('plaw'),
-            $this->progressLawLeadsSql($start, $end)
+            DBConnector::fromEnvironment(ProgressLawLeadQuery::SOURCE),
+            ProgressLawLeadQuery::sql($start, $end, $states)
         );
 
-        // One row per contact by construction, so a repeat is a query bug, not a data problem.
+        return $this->summarizeProgressLaw($leads);
+    }
+
+    private function summarizeProgressLaw(array $leads): array
+    {
         $repeated = $this->duplicateValues(array_column($leads, 'CONTACT_ID'));
         if ($repeated !== []) {
             throw new RuntimeException('Progress Law lead query returned a contact more than once: '
                 . implode(', ', array_slice($repeated, 0, 10)));
         }
 
-        $azureCount = (int) ($this->sqlServerRows(
-            $azure,
-            'SELECT COUNT(*) AS n FROM TblContactsPLAW
-             WHERE Created_Date >= ? AND Created_Date < ? AND COALESCE(Status, ?) <> ?',
-            [$start, $end, '', self::DUPLICATE_LEAD_STATUS]
-        )[0]['n'] ?? 0);
-
         return [
             'leads' => $leads,
             'lead_count' => count($leads),
             'total_cents' => count($leads) * self::PLAW_RATE_PER_LEAD_CENTS,
-            'azure_count' => $azureCount,
         ];
-    }
-
-    /**
-     * Contacts created in the month on the Progress Law account, less the invalid ones.
-     *
-     * CREATED is TIMESTAMP_TZ. Converting it to LA and casting to NTZ gives LA wall-clock time,
-     * which compares with the NTZ month boundaries without depending on the session time zone.
-     * Status is the latest CONTACTS_STATUS row, with ID breaking STAMP ties.
-     */
-    private function progressLawLeadsSql(string $start, string $end): string
-    {
-        $tz = self::TIMEZONE;
-        $duplicate = self::DUPLICATE_LEAD_STATUS;
-
-        return "
-            WITH period_contacts AS (
-                SELECT c.ID, c.FIRSTNAME, c.LASTNAME,
-                       CONVERT_TIMEZONE('{$tz}', c.CREATED)::TIMESTAMP_NTZ AS CREATED_LOCAL
-                FROM CONTACTS AS c
-                WHERE CONVERT_TIMEZONE('{$tz}', c.CREATED)::TIMESTAMP_NTZ >= '{$start}'::TIMESTAMP_NTZ
-                  AND CONVERT_TIMEZONE('{$tz}', c.CREATED)::TIMESTAMP_NTZ <  '{$end}'::TIMESTAMP_NTZ
-                  AND c.DEL = 'FALSE'
-                  AND c.ISCOAPP = 0
-                  AND COALESCE(c.FIRSTNAME, '') <> ''
-            ),
-            period_status AS (
-                SELECT s.CONTACT_ID, cls.TITLE AS STATUS
-                FROM CONTACTS_STATUS AS s
-                JOIN period_contacts AS p             ON s.CONTACT_ID = p.ID
-                LEFT JOIN CONTACTS_LEAD_STATUS AS cls ON s.STATUS_ID = cls.ID
-                QUALIFY ROW_NUMBER() OVER (PARTITION BY s.CONTACT_ID ORDER BY s.STAMP DESC, s.ID DESC) = 1
-            )
-            SELECT p.ID AS CONTACT_ID,
-                   CONCAT(p.FIRSTNAME, ' ', COALESCE(p.LASTNAME, '')) AS CLIENT,
-                   TO_CHAR(p.CREATED_LOCAL, 'YYYY-MM-DD HH24:MI:SS') AS CREATED_LOCAL,
-                   ps.STATUS
-            FROM period_contacts AS p
-            LEFT JOIN period_status AS ps ON ps.CONTACT_ID = p.ID
-            WHERE COALESCE(ps.STATUS, '') <> '{$duplicate}'
-            ORDER BY p.ID
-        ";
     }
 
     private function printProgressLaw(array $invoice): void
     {
         $this->newLine();
         $this->line('<options=bold>Progress Law</>');
-        $this->row('Leads', number_format($invoice['lead_count']));
+        $this->row('Leads (first qualifying status)', number_format($invoice['lead_count']));
         $this->row('Rate per lead', $this->money(self::PLAW_RATE_PER_LEAD_CENTS));
         $this->row('Total due', $this->money($invoice['total_cents']));
-
-        if ($invoice['azure_count'] === $invoice['lead_count']) {
-            $this->row('Cross-check', 'TblContactsPLAW has ' . number_format($invoice['azure_count']) . ', matches');
-
-            return;
-        }
-
-        $this->warn(sprintf(
-            '  [WARN] TblContactsPLAW has %s leads against %s in Snowflake. The contact sync may not have '
-                . 'caught up; the Snowflake figure is the one billed.',
-            number_format($invoice['azure_count']),
-            number_format($invoice['lead_count'])
-        ));
     }
 
     /** @return array<string, mixed> The invoice as InvoicePdf expects it. */
@@ -386,7 +329,7 @@ class GenerateLendingTowerInvoices extends Command
             'columns' => ['quantity' => 'Leads', 'rate' => 'Rate'],
             'lines' => [[
                 'description' => 'Lead generation',
-                'detail' => "Leads created {$period['range']} (Pacific Time)",
+                'detail' => "First qualifying status in {$period['range']} (Pacific Time)",
                 'quantity' => number_format($invoice['lead_count']),
                 'rate' => $this->money(self::PLAW_RATE_PER_LEAD_CENTS),
                 'amount' => $this->money($invoice['total_cents']),
@@ -394,7 +337,7 @@ class GenerateLendingTowerInvoices extends Command
             'totals' => [],
             'total_due' => $this->money($invoice['total_cents']),
             'notes' => [
-                'Lead count excludes deleted, co-applicant, duplicate and incomplete records.',
+                'Each contact in a PLAW-classified state is counted once, using its first qualifying status. Deleted contacts and co-applicants are excluded.',
                 "Please include invoice number {$number} with your payment. Questions: " . $this->liveSender(),
             ],
         ];
@@ -412,12 +355,14 @@ class GenerateLendingTowerInvoices extends Command
                 $this->money(self::PLAW_RATE_PER_LEAD_CENTS),
                 $this->money($invoice['total_cents'])
             ),
-            ['Contact ID', 'Client', 'Created (Pacific)', 'Status'],
+            ['Contact ID', 'Client', 'State', 'Qualifying Status Date', 'Billable Status', 'Current Status'],
             array_map(static fn (array $lead): array => [
                 (string) ($lead['CONTACT_ID'] ?? ''),
                 (string) ($lead['CLIENT'] ?? ''),
-                (string) ($lead['CREATED_LOCAL'] ?? ''),
-                (string) ($lead['STATUS'] ?? ''),
+                (string) ($lead['STATE'] ?? ''),
+                substr((string) ($lead['STATUS_LOCAL'] ?? ''), 0, 10),
+                (string) ($lead['BILLABLE_STATUS'] ?? ''),
+                (string) ($lead['CURRENT_STATUS'] ?? ''),
             ], $invoice['leads'])
         );
 
@@ -679,7 +624,7 @@ class GenerateLendingTowerInvoices extends Command
             'number' => $number,
             'issue_date' => $period['issue_date'],
             'due_date' => $period['due_date'],
-            'terms' => 'Net ' . self::TERMS_DAYS,
+            'terms' => 'Upon Receipt',
             'period' => $period['range'],
             'from' => self::LENDING_TOWER + ['email' => $this->liveSender()],
             'bill_to' => self::BILL_TO[$company],

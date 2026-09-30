@@ -2,22 +2,19 @@
 
 namespace Cmd\Reports\Console\Commands\GenerateLendingTowerInvoices;
 
+use PhpOffice\PhpSpreadsheet\Cell\Coordinate;
+use PhpOffice\PhpSpreadsheet\Cell\DataType;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
-use PhpOffice\PhpSpreadsheet\Style\NumberFormat;
+use PhpOffice\PhpSpreadsheet\Style\Alignment;
+use PhpOffice\PhpSpreadsheet\Style\Border;
+use PhpOffice\PhpSpreadsheet\Style\Fill;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 use RuntimeException;
 
-/**
- * The client-level backup that travels with an invoice, so the recipient can reconcile the total
- * line by line.
- *
- * Each sheet is a title, a one-line summary quoting the invoice figures, a header row and the
- * rows. Money columns get a SUM row whose result must equal the debt basis on the invoice; the
- * summary line states that figure so a mismatch is visible to whoever opens the file.
- */
+/** Client-level invoice backup, shared by PLAW and both LDR worksheets. */
 final class InvoiceBackupWorkbook
 {
-    private const MONEY_FORMAT = '"$"#,##0.00';
+    private const MONEY_FORMAT = '"$"#,##0.00;[Red]("$"#,##0.00)';
 
     private Spreadsheet $spreadsheet;
 
@@ -26,92 +23,123 @@ final class InvoiceBackupWorkbook
     public function __construct()
     {
         $this->spreadsheet = new Spreadsheet();
+        $this->spreadsheet->getDefaultStyle()->getFont()->setName('Arial')->setSize(10);
     }
 
     /**
-     * @param  list<string>  $headers
-     * @param  list<list<mixed>>  $rows
-     * @param  list<int>  $moneyColumns  zero-based indexes of columns holding dollar amounts
+     * @param list<string> $headers
+     * @param list<list<mixed>> $rows
+     * @param list<int> $moneyColumns Zero-based columns with numeric dollar amounts.
      */
     public function addSheet(string $name, string $title, string $summary, array $headers, array $rows, array $moneyColumns = []): void
     {
         $sheet = $this->hasSheet ? $this->spreadsheet->createSheet() : $this->spreadsheet->getActiveSheet();
         $this->hasSheet = true;
         $sheet->setTitle(mb_substr($name, 0, 31));
-
-        $sheet->setCellValue('A1', $title);
-        $sheet->getStyle('A1')->getFont()->setBold(true)->setSize(13);
-        $sheet->setCellValue('A2', $summary);
-
-        $headerRow = 4;
+        $sheet->setShowGridlines(false);
+        $sheet->setPrintGridlines(false);
+        $sheet->getDefaultRowDimension()->setRowHeight(21);
         $lastColumn = count($headers);
+        $lastLetter = Coordinate::stringFromColumnIndex($lastColumn);
+
+        // Titles span the report instead of forcing the ID column to fit the full sentence.
+        $sheet->mergeCells("A1:{$lastLetter}1");
+        $sheet->mergeCells("A2:{$lastLetter}2");
+        $sheet->setCellValueExplicit('A1', $title, DataType::TYPE_STRING);
+        $sheet->setCellValueExplicit('A2', $summary, DataType::TYPE_STRING);
+        $sheet->getStyle('A1')->getFont()->setBold(true)->setSize(14)->getColor()->setARGB('FF2F383D');
+        $sheet->getStyle('A2')->getFont()->getColor()->setARGB('FF53605B');
+        $sheet->getStyle("A1:{$lastLetter}2")->getAlignment()->setWrapText(true)->setVertical(Alignment::VERTICAL_CENTER);
+        $sheet->getRowDimension(1)->setRowHeight(40);
+        $sheet->getRowDimension(2)->setRowHeight(32);
+        $sheet->getRowDimension(3)->setRowHeight(9);
 
         foreach ($headers as $i => $header) {
-            $sheet->setCellValue([$i + 1, $headerRow], $header);
+            $column = $i + 1;
+            $sheet->setCellValueExplicit([$column, 4], $header, DataType::TYPE_STRING);
+            $width = match (true) {
+                $i === 0 => 19,
+                $header === 'Client' => 34,
+                $header === 'State' => 9,
+                $header === 'Qualifying Status Date' => 26,
+                str_contains($header, 'Status') && ! str_contains($header, 'Pacific') => 36,
+                str_contains($header, 'Pacific') => 29,
+                str_contains($header, 'Cleared') => 24,
+                str_contains($header, 'Date') => 19,
+                default => 21,
+            };
+            $sheet->getColumnDimensionByColumn($column)->setAutoSize(false)->setWidth($width);
         }
+        $sheet->getRowDimension(4)->setRowHeight(34);
+        $sheet->getStyle("A4:{$lastLetter}4")->applyFromArray([
+            'font' => ['bold' => true, 'color' => ['argb' => 'FFFFFFFF']],
+            'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['argb' => 'FF2F383D']],
+            'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER, 'vertical' => Alignment::VERTICAL_CENTER, 'wrapText' => true],
+            'borders' => ['allBorders' => ['borderStyle' => Border::BORDER_THIN, 'color' => ['argb' => 'FFFFFFFF']]],
+        ]);
 
-        $headerRange = [1, $headerRow, $lastColumn, $headerRow];
-        $sheet->getStyle($headerRange)->getFont()->setBold(true)->getColor()->setARGB('FFFFFFFF');
-        $sheet->getStyle($headerRange)->getFill()->setFillType('solid')->getStartColor()->setARGB('FF2F383D');
-
-        $row = $headerRow;
+        $row = 4;
         foreach ($rows as $values) {
             $row++;
             foreach (array_values($values) as $i => $value) {
-                $sheet->setCellValue([$i + 1, $row], $value);
+                // IDs and source text stay literal (including leading zeros and '=' prefixes).
+                $sheet->setCellValueExplicit([$i + 1, $row], $value,
+                    is_int($value) || is_float($value) ? DataType::TYPE_NUMERIC : DataType::TYPE_STRING);
+            }
+            $sheet->getStyle("A{$row}:{$lastLetter}{$row}")->applyFromArray([
+                'alignment' => ['vertical' => Alignment::VERTICAL_CENTER, 'wrapText' => true],
+                'borders' => ['bottom' => ['borderStyle' => Border::BORDER_HAIR, 'color' => ['argb' => 'FFDCE3DF']]],
+            ]);
+            $sheet->getRowDimension($row)->setRowHeight(-1);
+            if ($row % 2 === 0) {
+                $sheet->getStyle("A{$row}:{$lastLetter}{$row}")->getFill()
+                    ->setFillType(Fill::FILL_SOLID)->getStartColor()->setARGB('FFF2F6F0');
             }
         }
-
-        $firstDataRow = $headerRow + 1;
         $lastDataRow = $row;
-
-        if ($moneyColumns !== [] && $lastDataRow >= $firstDataRow) {
-            $totalRow = $lastDataRow + 1;
-            $sheet->setCellValue([1, $totalRow], 'Total');
-            $sheet->getStyle([1, $totalRow, $lastColumn, $totalRow])->getFont()->setBold(true);
-
+        if ($moneyColumns !== [] && $lastDataRow >= 5) {
+            $row++;
+            $sheet->setCellValue("A{$row}", 'Total');
+            $sheet->getStyle("A{$row}:{$lastLetter}{$row}")->applyFromArray([
+                'font' => ['bold' => true],
+                'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['argb' => 'FFBCDB90']],
+                'borders' => ['top' => ['borderStyle' => Border::BORDER_THIN, 'color' => ['argb' => 'FF2F383D']]],
+            ]);
             foreach ($moneyColumns as $index) {
-                $column = $index + 1;
-                $letter = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($column);
-                $sheet->setCellValue([$column, $totalRow], "=SUM({$letter}{$firstDataRow}:{$letter}{$lastDataRow})");
-                $sheet->getStyle([$column, $firstDataRow, $column, $totalRow])
-                    ->getNumberFormat()->setFormatCode(self::MONEY_FORMAT);
+                $letter = Coordinate::stringFromColumnIndex($index + 1);
+                $sheet->setCellValue("{$letter}{$row}", "=SUM({$letter}5:{$letter}{$lastDataRow})");
+                $sheet->getStyle("{$letter}5:{$letter}{$row}")->getNumberFormat()->setFormatCode(self::MONEY_FORMAT);
+                $sheet->getStyle("{$letter}5:{$letter}{$row}")->getAlignment()->setHorizontal(Alignment::HORIZONTAL_RIGHT);
             }
         }
-
-        foreach (range(1, $lastColumn) as $column) {
-            $sheet->getColumnDimensionByColumn($column)->setAutoSize(true);
-        }
-
-        $sheet->freezePane([1, $firstDataRow]);
+        $sheet->getStyle("A4:{$lastLetter}{$row}")->getBorders()->getOutline()
+            ->setBorderStyle(Border::BORDER_THIN)->getColor()->setARGB('FFD0D8D2');
+        $sheet->setAutoFilter("A4:{$lastLetter}{$lastDataRow}");
+        $sheet->freezePane('A5');
+        $sheet->getPageSetup()->setOrientation('landscape')->setFitToWidth(1)->setFitToHeight(0);
+        $sheet->getPageSetup()->setRowsToRepeatAtTopByStartAndEnd(1, 4);
+        $sheet->getPageSetup()->setPrintArea("A1:{$lastLetter}{$row}");
     }
 
-    /** The finished workbook as .xlsx bytes. */
     public function toBytes(): string
     {
         if (! $this->hasSheet) {
             throw new RuntimeException('Backup workbook has no sheets.');
         }
-
         $this->spreadsheet->setActiveSheetIndex(0);
-
-        // The xlsx writer needs a real path to build its zip in.
         $path = tempnam(sys_get_temp_dir(), 'lt-invoice-');
         if ($path === false) {
             throw new RuntimeException('Could not create a temporary file for the backup workbook.');
         }
-
         try {
             (new Xlsx($this->spreadsheet))->save($path);
             $bytes = file_get_contents($path);
         } finally {
             @unlink($path);
         }
-
         if (! is_string($bytes) || $bytes === '') {
             throw new RuntimeException('Backup workbook came out empty.');
         }
-
         return $bytes;
     }
 }

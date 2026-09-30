@@ -63,6 +63,14 @@ final class InvoicePdf
         $e = static fn ($value): string => htmlspecialchars((string) $value, ENT_QUOTES, 'UTF-8');
         $dark = self::BRAND_DARK;
         $green = self::BRAND_GREEN;
+        $band = $invoice['brand']['accent'] ?? $dark;
+        $rule = $invoice['brand']['accent'] ?? $green;
+        $dueBackground = $invoice['brand']['light'] ?? $green;
+        foreach ([$band, $rule, $dueBackground] as $color) {
+            if (!is_string($color) || !preg_match('/^#[0-9a-fA-F]{6}$/', $color)) {
+                throw new RuntimeException('Invoice brand colors must be six-digit hex colors.');
+            }
+        }
 
         $from = $invoice['from'];
         $billTo = $invoice['bill_to'];
@@ -127,13 +135,13 @@ final class InvoicePdf
     .meta td { padding: 2px 0; font-size: 9.5pt; }
     .meta-label { color: #6b7378; text-align: right; padding-right: 14px; width: 58%; }
     .meta-value { text-align: right; font-weight: bold; white-space: nowrap; }
-    .rule { border-top: 3px solid {$green}; margin-top: 16px; }
+    .rule { border-top: 3px solid {$rule}; margin-top: 16px; }
     .label { font-size: 7.5pt; font-weight: bold; letter-spacing: 1.5px; color: #6b7378; text-transform: uppercase; margin-bottom: 5px; }
     .party { font-size: 9.5pt; color: #4a5358; }
     .party strong { font-size: 11pt; color: {$dark}; }
     /* Bands are one background behind transparent cells. Painting each cell separately leaves
        hairline seams at the joins in most PDF viewers. */
-    .band { background: {$dark}; margin-top: 28px; }
+    .band { background: {$band}; margin-top: 28px; }
     .band th { color: #ffffff; font-size: 7.5pt; font-weight: bold; letter-spacing: 1.2px;
                text-transform: uppercase; text-align: left; padding: 8px; }
     .items td { padding: 11px 8px; border-bottom: 1px solid #e3e7e1; }
@@ -144,7 +152,7 @@ final class InvoicePdf
     .totals td { padding: 7px 8px; }
     .total-label { color: #4a5358; }
     .total-amount { font-size: 10.5pt; }
-    .due { background: {$green}; margin-top: 2px; }
+    .due { background: {$dueBackground}; margin-top: 2px; }
     .due td { color: {$dark}; font-size: 13.5pt; font-weight: bold; padding: 10px 8px; }
     .totals-label { width: 62%; }
     .notes { margin-top: 40px; padding-top: 10px; border-top: 1px solid #e3e7e1; font-size: 8.5pt; color: #6b7378; }
