@@ -48,6 +48,7 @@ final class ParamountInvoiceTest extends TestCase
         file_put_contents($pdf, '%PDF-test');
         try {
             $mailer = Mockery::mock('overload:Cmd\\Reports\\Services\\EmailSenderService');
+            $mailer->shouldReceive('__construct')->once()->with('GRAPH_LT');
             $mailer->shouldReceive('sendMailHtml')->once()->withArgs(function ($subject, $body, $to, $cc, $bcc, $attachments, $from) {
                 self::assertSame(['oduai@libertydebtrelief.com'], $to);
                 self::assertSame([], $cc);
