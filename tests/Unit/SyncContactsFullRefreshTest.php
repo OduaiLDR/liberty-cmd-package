@@ -279,4 +279,64 @@ class SyncContactsFullRefreshTest extends TestCase
         self::assertStringContainsString('LIMIT 1000', $queries[1]);
         self::assertStringContainsString('LIMIT 200', $queries[2]);
     }
+
+    public function test_drop_name_suffix_fallback_uses_the_indexed_mailer_column(): void
+    {
+        $queries = [];
+        $connector = $this->getMockBuilder(DBConnector::class)->disableOriginalConstructor()
+            ->onlyMethods(['querySqlServer'])->getMock();
+        $connector->method('querySqlServer')->willReturnCallback(function (string $sql) use (&$queries) {
+            $queries[] = $sql;
+            if (str_contains($sql, 'sys.indexes')) {
+                return ['success' => true, 'data' => [['available' => 1]]];
+            }
+            if (str_contains($sql, 'External_ID_Last9 IN')) {
+                return ['success' => true, 'data' => [['External_ID' => 'TP-123456789', 'Drop_Name' => 'Spring Drop']]];
+            }
+            return ['success' => true, 'data' => []];
+        });
+
+        $command = new SyncContactsData();
+        $input = new ArrayInput([], $command->getDefinition());
+        $command->setInput($input);
+        $command->setOutput(new OutputStyle($input, new BufferedOutput()));
+        $lookup = (new \ReflectionMethod($command, 'fetchDropNamesFiltered'))
+            ->invoke($command, $connector, [['EXTERNAL_ID' => 'LDR-123456789']]);
+
+        self::assertSame('Spring Drop', $lookup['TP-123456789']);
+        self::assertSame('Spring Drop', $lookup['123456789']);
+        self::assertCount(1, array_filter($queries, fn($sql) => str_contains($sql, 'External_ID_Last9 IN')));
+        self::assertStringNotContainsString('RIGHT(m.External_ID, 9)', implode("\n", $queries));
+    }
+
+    public function test_drop_name_suffix_fallback_fails_clearly_without_the_index(): void
+    {
+        $queries = [];
+        $connector = $this->getMockBuilder(DBConnector::class)->disableOriginalConstructor()
+            ->onlyMethods(['querySqlServer'])->getMock();
+        $connector->method('querySqlServer')->willReturnCallback(function (string $sql) use (&$queries) {
+            $queries[] = $sql;
+            if (str_contains($sql, 'sys.indexes')) {
+                return ['success' => true, 'data' => [['available' => 0]]];
+            }
+            return ['success' => true, 'data' => []];
+        });
+
+        $command = new SyncContactsData();
+        $input = new ArrayInput([], $command->getDefinition());
+        $command->setInput($input);
+        $command->setOutput(new OutputStyle($input, new BufferedOutput()));
+
+        try {
+            (new \ReflectionMethod($command, 'fetchDropNamesFiltered'))
+                ->invoke($command, $connector, [['EXTERNAL_ID' => 'LDR-123456789']]);
+            self::fail('Missing suffix index must stop the unsafe table scan.');
+        } catch (\ReflectionException $e) {
+            throw $e;
+        } catch (\RuntimeException $e) {
+            self::assertStringContainsString('External_ID_Last9 is missing', $e->getMessage());
+        }
+
+        self::assertFalse((bool) array_filter($queries, fn($sql) => str_contains($sql, 'RIGHT(External_ID, 9)')));
+    }
 }

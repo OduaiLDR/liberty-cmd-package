@@ -36,6 +36,7 @@ class SyncContactsData extends Command
     private ?\PDO $refreshPdo = null;
     private ?string $refreshStage = null;
     private bool $refreshPublished = false;
+    private ?bool $mailerSuffixIndexAvailable = null;
     private int $pageSize = self::PAGE_SIZE;
 
     /** Matching-step counters reset at the start of each matching run. */
@@ -861,17 +862,24 @@ class SyncContactsData extends Command
                 }
             }
             foreach (array_chunk(array_keys($missTails), 500) as $batch) {
+                if (! $this->hasIndexedMailerSuffix($connector)) {
+                    throw new \RuntimeException(
+                        'TblMailers.External_ID_Last9 is missing. Apply '
+                        . 'database/sql/index-tblmailers-external-id-last9.sql before syncing; '
+                        . 'the unindexed suffix lookup can scan TblMailers until the SQL Server connection fails.'
+                    );
+                }
                 $tails = $this->sqlStringList($batch);
                 $rows = $this->selectPreviewRows($connector,
                     "SELECT External_ID, Drop_Name FROM TblMailers WHERE External_ID IS NOT NULL
-                     AND Drop_Name IS NOT NULL AND LEN(External_ID) > 9 AND RIGHT(External_ID, 9) IN ({$tails})");
+                     AND Drop_Name IS NOT NULL AND LEN(External_ID) > 9 AND External_ID_Last9 IN ({$tails})");
                 $this->mergeDropNameLookup($lookup, $rows);
             }
             return $lookup;
         }
 
-        // Exact Ext match first (index-friendly). Last-9 fallback only for misses —
-        // the old OR RIGHT(...) scan over all TblMailers was ~60s per page.
+        // Exact Ext match first (index-friendly). Last-9 fallback uses a computed
+        // indexed column; RIGHT(External_ID, 9) scans TblMailers and can time out.
         $connector->querySqlServer("CREATE TABLE #TmpMailerFilter (ExtId VARCHAR(50) NOT NULL)");
         try {
             foreach (\array_chunk($externalIds, 1000) as $batch) {
@@ -903,6 +911,14 @@ class SyncContactsData extends Command
                 }
             }
 
+            if ($missTails !== [] && ! $this->hasIndexedMailerSuffix($connector)) {
+                throw new \RuntimeException(
+                    'TblMailers.External_ID_Last9 is missing. Apply '
+                    . 'database/sql/index-tblmailers-external-id-last9.sql before syncing; '
+                    . 'the unindexed suffix lookup can scan TblMailers until the SQL Server connection fails.'
+                );
+            }
+
             foreach (\array_chunk(\array_keys($missTails), 500) as $tailBatch) {
                 $inList = \implode(', ', \array_map(
                     fn($t) => "'" . \str_replace("'", "''", $t) . "'",
@@ -914,8 +930,11 @@ class SyncContactsData extends Command
                     WHERE m.External_ID IS NOT NULL
                       AND m.Drop_Name IS NOT NULL
                       AND LEN(m.External_ID) > 9
-                      AND RIGHT(m.External_ID, 9) IN ({$inList})
+                      AND m.External_ID_Last9 IN ({$inList})
                 ");
+                if (! ($fallback['success'] ?? false)) {
+                    throw new \RuntimeException('Indexed TblMailers suffix lookup failed: ' . ($fallback['error'] ?? 'unknown SQL Server error'));
+                }
                 $this->mergeDropNameLookup($lookup, $fallback['data'] ?? []);
             }
         } finally {
@@ -923,6 +942,27 @@ class SyncContactsData extends Command
         }
 
         return $lookup;
+    }
+
+    private function hasIndexedMailerSuffix(DBConnector $connector): bool
+    {
+        if ($this->mailerSuffixIndexAvailable !== null) {
+            return $this->mailerSuffixIndexAvailable;
+        }
+
+        $result = $connector->querySqlServer(
+            "SELECT CASE WHEN EXISTS (
+                SELECT 1 FROM sys.indexes
+                WHERE object_id = OBJECT_ID('dbo.TblMailers')
+                  AND name = 'IX_TblMailers_External_ID_Last9'
+            ) THEN 1 ELSE 0 END AS available"
+        );
+        if (! ($result['success'] ?? false)) {
+            throw new \RuntimeException('Unable to check the TblMailers suffix index prerequisite: ' . ($result['error'] ?? 'unknown SQL Server error'));
+        }
+
+        $this->mailerSuffixIndexAvailable = (int) ($result['data'][0]['available'] ?? 0) === 1;
+        return $this->mailerSuffixIndexAvailable;
     }
 
     /** @param array<string, string> $lookup */
