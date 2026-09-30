@@ -40,6 +40,8 @@ class Formatter
         $debtTable->setTitle('Debt Table');
         $this->buildDebtTableSheet($debtTable, $debtRows, $tier);
 
+        $this->applyBranding($spreadsheet, $monthLabel);
+
         $spreadsheet->setActiveSheetIndex(0);
         $summary->setSelectedCells('A1');
 
@@ -166,7 +168,7 @@ class Formatter
                     'font' => ['bold' => true],
                     'fill' => [
                         'fillType' => Fill::FILL_SOLID,
-                        'startColor' => ['argb' => 'FFFFF3CD'],
+                        'startColor' => ['argb' => 'FFEBF7FC'],
                     ],
                 ]);
             }
@@ -195,8 +197,68 @@ class Formatter
         $sheet->getStyle($range)->applyFromArray([
             'font' => ['bold' => true, 'color' => ['argb' => 'FFFFFFFF']],
             'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER],
-            'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['argb' => 'FF17853B']],
+            'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['argb' => 'FF1F82B8']],
         ]);
+    }
+
+    public function applyBranding(Spreadsheet $book, string $monthLabel): void
+    {
+        $book->getDefaultStyle()->getFont()->setName('Calibri')->setSize(11);
+        $book->getProperties()->setCreator('Liberty Debt Relief')->setTitle('Paramount Law EPF Summary - ' . $monthLabel);
+        foreach ($book->getAllSheets() as $sheet) {
+            $lastColumn = $sheet->getHighestDataColumn();
+            $sheet->insertNewRowBefore(1, 6);
+            $lastRow = $sheet->getHighestDataRow();
+            $sheet->getTabColor()->setRGB('1F82B8');
+            $sheet->setShowGridlines(false);
+            $sheet->setPrintGridlines(false);
+            $sheet->freezePane('A8');
+            $sheet->getRowDimension(1)->setRowHeight(26);
+            $sheet->getRowDimension(2)->setRowHeight(26);
+            $sheet->getRowDimension(3)->setRowHeight(24);
+            $sheet->getRowDimension(4)->setRowHeight(21);
+            $sheet->getRowDimension(5)->setRowHeight(9);
+            $sheet->getRowDimension(6)->setRowHeight(9);
+            $sheet->getRowDimension(7)->setRowHeight(32);
+            foreach ([1, 2, 3, 4] as $row) { $sheet->mergeCells("B{$row}:{$lastColumn}{$row}"); }
+            $sheet->setCellValue('B1', 'LIBERTY DEBT RELIEF');
+            $sheet->setCellValue('B2', 'Paramount Law EPF Summary');
+            $sheet->setCellValue('B3', $monthLabel . ' - ' . $sheet->getTitle());
+            $sheet->setCellValue('B4', 'invoices@libertydebtrelief.com');
+            $sheet->getStyle('B1')->getFont()->setBold(true)->setSize(18)->getColor()->setRGB('1F82B8');
+            $sheet->getStyle('B2')->getFont()->setBold(true)->setSize(14);
+            $sheet->getStyle('B3:B4')->getFont()->setSize(10)->getColor()->setRGB('596973');
+            $sheet->getStyle("A6:{$lastColumn}6")->getBorders()->getBottom()->setBorderStyle(Border::BORDER_MEDIUM)->getColor()->setRGB('1F82B8');
+            $sheet->getStyle("A7:{$lastColumn}7")->getAlignment()->setWrapText(true)->setVertical(Alignment::VERTICAL_CENTER);
+            $sheet->getStyle("A7:{$lastColumn}7")->getFill()->setFillType(Fill::FILL_SOLID)->getStartColor()->setRGB('1F82B8');
+            $sheet->getStyle("A7:{$lastColumn}7")->getFont()->setBold(true)->getColor()->setRGB('FFFFFF');
+            if ($sheet->getTitle() === 'Debt Table') {
+                for ($r = 8; $r <= $lastRow; $r++) {
+                    if ($sheet->getStyle('A' . $r)->getFont()->getBold()) {
+                        $sheet->getStyle("A{$r}:D{$r}")->getFill()->setFillType(Fill::FILL_SOLID)->getStartColor()->setRGB('EBF7FC');
+                    }
+                }
+            }
+            $sheet->getStyle("A8:{$lastColumn}{$lastRow}")->getBorders()->getAllBorders()->getColor()->setRGB('DCE6EC');
+            $logo = dirname(__DIR__, 4) . '/resources/images/advance-request/ldr-logo.jpg';
+            if (is_file($logo)) {
+                $drawing = new \PhpOffice\PhpSpreadsheet\Worksheet\Drawing();
+                $drawing->setName('Liberty Debt Relief');
+                $drawing->setPath($logo);
+                $drawing->setHeight(85);
+                $drawing->setCoordinates('A1');
+                $drawing->setOffsetX(6);
+                $drawing->setOffsetY(5);
+                $drawing->setWorksheet($sheet);
+            }
+            $sheet->getColumnDimension('A')->setWidth(max(20, $sheet->getColumnDimension('A')->getWidth()));
+            $sheet->getPageSetup()->setRowsToRepeatAtTopByStartAndEnd(7, 7)->setFitToWidth(1)->setFitToHeight(0);
+            $sheet->getHeaderFooter()->setOddFooter('&LLiberty Debt Relief&RPage &P of &N');
+            if ($sheet->getTitle() === 'Summary') {
+                $sheet->getStyle('D10:E10')->getFill()->setFillType(Fill::FILL_SOLID)->getStartColor()->setRGB('EBF7FC');
+                $sheet->getStyle('D10:E10')->getFont()->setBold(true)->getColor()->setRGB('1F82B8');
+            }
+        }
     }
 
     private function columnLetter(int $index): string

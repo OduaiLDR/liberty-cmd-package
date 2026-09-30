@@ -4,25 +4,74 @@ namespace Cmd\Reports\Console\Commands\GenerateParamountEpfSummary;
 
 use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\EmailSenderService;
+use Cmd\Reports\Console\Commands\GenerateLendingTowerInvoices\InvoicePdf;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Cache;
 
 class GenerateParamountEpfSummary extends Command
 {
     protected $signature = 'Generate:paramount-epf-summary
                             {--month= : Month to report as YYYY-MM (defaults to last full calendar month)}
                             {--output= : Copy the workbook to this path}
+                            {--invoice : Also generate an LDR invoice PDF beside the workbook}
+                            {--send-to-me : Send test copies only to oduai@libertydebtrelief.com, with no CC or BCC}
+                            {--test-to= : Send only to this review email address, with no CC or BCC}
                             {--jacob-only : Send only to Jacob Wuydts}
                             {--send : Send the report email to the configured Paramount recipients}';
 
     protected $description = 'Generate the monthly Paramount Law EPF Summary workbook.';
 
-    private const REPORT_NAME = 'ParamountEpfSummary';
+    private const REPORT_NAME = 'LT Invoices ParamountLaw';
 
     public function handle(): int
     {
+        $lock = null;
         try {
             $window = $this->resolveMonthWindow();
+            $testTo = trim((string) $this->option('test-to'));
+            if ($this->option('send-to-me')) {
+                if ($testTo !== '' && strcasecmp($testTo, 'oduai@libertydebtrelief.com') !== 0) {
+                    throw new \InvalidArgumentException('--send-to-me cannot be combined with a different --test-to recipient.');
+                }
+                $testTo = 'oduai@libertydebtrelief.com';
+            }
+            if ($testTo !== '' && !filter_var($testTo, FILTER_VALIDATE_EMAIL)) {
+                throw new \InvalidArgumentException('--test-to must be a valid email address.');
+            }
+            if ($this->option('send') && ($testTo !== '' || $this->option('jacob-only'))) {
+                throw new \InvalidArgumentException('Choose either a review recipient or --send, not both.');
+            }
+            if ($testTo !== '' && $this->option('jacob-only')) {
+                throw new \InvalidArgumentException('Choose one review recipient option.');
+            }
+            $invoiceMode = (bool) $this->option('invoice');
+            $billTo = [
+                'name' => (string) env('PARAMOUNT_INVOICE_BILL_TO_NAME', 'Paramount Law'),
+                'lines' => array_values(array_filter(array_map('trim', explode('|', (string) env('PARAMOUNT_INVOICE_BILL_TO_ADDRESS', ParamountInvoice::BILL_TO_ADDRESS))))),
+            ];
+            $marker = storage_path('app/private/cmd/paramount-invoices/' . substr($window['start'], 0, 7) . '.sent.json');
+            if ($invoiceMode && $this->option('send')) {
+                $lock = Cache::lock('paramount-invoice-' . substr($window['start'], 0, 7), 1800);
+                if (!$lock->get()) {
+                    throw new \RuntimeException('Another Paramount invoice send is in progress.');
+                }
+                if ($billTo['lines'] === []) {
+                    throw new \RuntimeException('Confirm PARAMOUNT_INVOICE_BILL_TO_ADDRESS before sending a live invoice. Local drafts and private reviews are available.');
+                }
+                if ($window['endExclusive'] > now('America/Los_Angeles')->format('Y-m-d')) {
+                    throw new \RuntimeException('Cannot send a live invoice before the billing month ends.');
+                }
+                if (is_file($marker)) {
+                    throw new \RuntimeException('This Paramount invoice has already been sent; review the existing send record.');
+                }
+                if (!is_dir(dirname($marker)) && !mkdir(dirname($marker), 0775, true) && !is_dir(dirname($marker))) {
+                    throw new \RuntimeException('Could not create the invoice send-record directory.');
+                }
+                if (!is_writable(dirname($marker))) {
+                    throw new \RuntimeException('Invoice send-record directory is not writable.');
+                }
+            }
             $snowflake = DBConnector::fromEnvironment('ldr');
             $rows = $this->fetchRows($snowflake, $window);
             $debtRows = $this->debtTable();
@@ -40,18 +89,37 @@ class GenerateParamountEpfSummary extends Command
                 $window['label']
             );
             $output = $this->copyOutput($report['path']);
+            $invoicePath = null;
+            if ($invoiceMode) {
+                $document = ParamountInvoice::document($window, $totalDebt, $tier, $payment, $billTo);
+                $invoicePath = dirname($output ?? $report['path']) . '/' . $document['number'] . '.pdf';
+                $pdf = (new InvoicePdf(sys_get_temp_dir() . '/paramount-invoice-pdf'))->render($document);
+                if (file_put_contents($invoicePath, $pdf) === false) {
+                    throw new \RuntimeException('Could not save the Paramount invoice PDF.');
+                }
+                $this->info('[INFO] Invoice written to: ' . $invoicePath);
+            }
             $this->info('[INFO] Workbook written to: ' . ($output ?? $report['path']));
             $this->info(sprintf('[INFO] EPF debt: $%s; tier: T%d; payment: $%s', number_format($totalDebt, 2), $tier, number_format($payment, 2)));
 
-            if ($this->option('send') || $this->option('jacob-only')) {
+            if ($this->option('send') || $this->option('jacob-only') || $testTo !== '') {
                 $this->sendReport(
                     $report,
                     $window['label'],
                     $totalDebt,
                     $tier,
                     $payment,
-                    (bool) $this->option('jacob-only')
+                    (bool) $this->option('jacob-only'),
+                    $testTo,
+                    $invoicePath
                 );
+                if ($invoiceMode && $this->option('send')) {
+                    if (!is_dir(dirname($marker))) { mkdir(dirname($marker), 0775, true); }
+                    if (file_put_contents($marker, json_encode(['sent_at' => now()->toIso8601String(),
+                        'invoice' => basename($invoicePath), 'payment' => $payment])) === false) {
+                        throw new \RuntimeException('Email sent, but send record could not be saved. Do not retry without checking delivery.');
+                    }
+                }
             } else {
                 $this->info('[INFO] Email not sent. Pass --send to send it.');
             }
@@ -64,14 +132,16 @@ class GenerateParamountEpfSummary extends Command
             $this->error('Paramount Law EPF Summary failed: ' . $e->getMessage());
             Log::error('GenerateParamountEpfSummary: failed', ['exception' => $e]);
             return Command::FAILURE;
+        } finally {
+            $lock?->release();
         }
     }
 
     /** @return array{label:string,start:string,endExclusive:string} */
     private function resolveMonthWindow(): array
     {
-        $month = (string) ($this->option('month') ?: now()->subMonthNoOverflow()->format('Y-m'));
-        if (!preg_match('/^\d{4}-\d{2}$/', $month)) {
+        $month = (string) ($this->option('month') ?: now('America/Los_Angeles')->subMonthNoOverflow()->format('Y-m'));
+        if (!preg_match('/^\d{4}-(0[1-9]|1[0-2])$/', $month)) {
             throw new \InvalidArgumentException("Invalid --month value '{$month}', expected YYYY-MM.");
         }
         $start = \Carbon\Carbon::createFromFormat('Y-m-d', $month . '-01')->startOfMonth();
@@ -127,7 +197,11 @@ class GenerateParamountEpfSummary extends Command
             FROM source_rows
             ORDER BY PROCESS_DATE ASC
         ";
-        return $connector->query($sql)['data'] ?? [];
+        $data = $connector->query($sql)['data'] ?? null;
+        if (!is_array($data)) {
+            throw new \RuntimeException('Snowflake returned no EPF result set.');
+        }
+        return $data;
     }
 
     /** @param array<int,array<string,mixed>> $rows */
@@ -212,40 +286,45 @@ class GenerateParamountEpfSummary extends Command
         float $debt,
         int $tier,
         float $payment,
-        bool $jacobOnly = false
+        bool $jacobOnly = false,
+        string $testTo = '',
+        ?string $invoicePath = null
     ): void
     {
-        $body = "Hi,\n\n"
-            . "Here is the EPF Summary for {$monthLabel}.\n\n"
-            . sprintf("The prorated EPF debt is $%s, which places us at T%d, with a payment due of $%s.\n\n", number_format($debt, 2), $tier, number_format($payment, 2))
-            . "If we are in agreement on the tier, please make the payment at your earliest convenience.\n\n"
-            . "If there are any discrepancies you would like to review, please let me know.\n\nThank you,";
+        $body = '<p>Hi,</p>'
+            . '<p>Here is the EPF Summary for ' . htmlspecialchars($monthLabel, ENT_QUOTES, 'UTF-8') . '.</p>'
+            . sprintf('<p>The prorated EPF debt is <strong>$%s</strong>, which places us at <strong>T%d</strong>, with a payment due of <strong>$%s</strong>.</p>', number_format($debt, 2), $tier, number_format($payment, 2))
+            . '<p>If we are in agreement on the tier, please make the payment at your earliest convenience.</p>'
+            . '<p>If there are any discrepancies you would like to review, please let me know.</p>'
+            . '<p>Thank you,</p>';
         $attachments = [[
             'name' => $report['filename'],
             'contentType' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             'contentBytes' => base64_encode(file_get_contents($report['path'])),
         ]];
-        $to = $jacobOnly ? ['jacob@libertydebtrelief.com'] : ['emcmurtrey@Higbee.law'];
-        $cc = $jacobOnly ? [] : [
-            'omar@libertydebtrelief.com',
-            'sam@libertydebtrelief.com',
-            'ABegg@Higbee.law',
-            'michael@libertydebtrelief.com',
-            'jacob@libertydebtrelief.com',
-        ];
-        $sent = (new EmailSenderService())->sendMailHtml(
-            "Paramount Law EPF Summary - {$monthLabel}",
-            nl2br(htmlspecialchars($body)),
-            $to,
-            $cc,
-            [],
-            $attachments
-        );
+        if ($invoicePath !== null) {
+            $attachments[] = ['name' => basename($invoicePath), 'contentType' => 'application/pdf',
+                'contentBytes' => base64_encode(file_get_contents($invoicePath))];
+        }
+        $review = $testTo !== '' || $jacobOnly;
+        $to = $testTo !== '' ? [$testTo] : ($jacobOnly ? ['jacob@libertydebtrelief.com'] : ['emcmurtrey@Higbee.law']);
+        $subject = ($review ? '[TEST] ' : '') . ($invoicePath !== null ? 'LDR Invoice to Paramount Law' : 'Paramount Law EPF Summary') . " - {$monthLabel}";
+        $mailer = new EmailSenderService();
+        if ($review) {
+            $sent = $mailer->sendMailHtml($subject, $body, $to, [], [], $attachments, ParamountInvoice::SENDER);
+        } else {
+            $azure = DBConnector::fromEnvironment('ldr');
+            $azure->initializeSqlServer();
+            $sent = $mailer->sendMailUsingTblReportsHtml(
+                $azure, [self::REPORT_NAME], ['LDR'], $subject, $body, $attachments,
+                false, true, ParamountInvoice::SENDER
+            );
+        }
         if (!$sent) {
             throw new \RuntimeException('Email send failed.');
         }
-        $this->info($jacobOnly
-            ? '[INFO] Paramount Law EPF Summary email sent only to Jacob Wuydts.'
+        $this->info($review
+            ? '[INFO] Paramount review email sent only to ' . implode(', ', $to) . '.'
             : '[INFO] Paramount Law EPF Summary email sent.');
     }
 

@@ -116,6 +116,11 @@ class ReportsServiceProvider extends ServiceProvider
             __DIR__ . '/../database/migrations' => database_path('migrations'),
         ], 'pmod-migrations');
 
+        // Invoice state classifications are an explicit, separately deployable migration.
+        $this->publishes([
+            __DIR__ . '/../database/lending-tower-migrations' => database_path('migrations'),
+        ], 'lending-tower-migrations');
+
         // Try new dbConfig first, fallback to legacy configs
         $dbConfigPath = __DIR__ . '/../config/dbConfig.php';
         $databaseConfigPath = __DIR__ . '/../config/database.php';
