@@ -280,18 +280,15 @@ class SyncContactsFullRefreshTest extends TestCase
         self::assertStringContainsString('LIMIT 200', $queries[2]);
     }
 
-    public function test_drop_name_suffix_fallback_uses_the_indexed_mailer_column(): void
+    public function test_drop_name_suffix_fallback_uses_a_temporary_cache(): void
     {
         $queries = [];
         $connector = $this->getMockBuilder(DBConnector::class)->disableOriginalConstructor()
             ->onlyMethods(['querySqlServer'])->getMock();
         $connector->method('querySqlServer')->willReturnCallback(function (string $sql) use (&$queries) {
             $queries[] = $sql;
-            if (str_contains($sql, 'sys.indexes')) {
-                return ['success' => true, 'data' => [['available' => 1]]];
-            }
-            if (str_contains($sql, 'External_ID_Last9 IN')) {
-                return ['success' => true, 'data' => [['External_ID' => 'TP-123456789', 'Drop_Name' => 'Spring Drop']]];
+            if (str_contains($sql, 'FROM #TmpMailerSuffixCache WHERE Suffix IN')) {
+                return ['success' => true, 'data' => [['External_ID' => '123456789', 'Drop_Name' => 'Spring Drop']]];
             }
             return ['success' => true, 'data' => []];
         });
@@ -303,22 +300,18 @@ class SyncContactsFullRefreshTest extends TestCase
         $lookup = (new \ReflectionMethod($command, 'fetchDropNamesFiltered'))
             ->invoke($command, $connector, [['EXTERNAL_ID' => 'LDR-123456789']]);
 
-        self::assertSame('Spring Drop', $lookup['TP-123456789']);
         self::assertSame('Spring Drop', $lookup['123456789']);
-        self::assertCount(1, array_filter($queries, fn($sql) => str_contains($sql, 'External_ID_Last9 IN')));
-        self::assertStringNotContainsString('RIGHT(m.External_ID, 9)', implode("\n", $queries));
+        self::assertCount(1, array_filter($queries, fn($sql) => str_contains($sql, 'INSERT INTO #TmpMailerSuffixCache')));
+        self::assertCount(1, array_filter($queries, fn($sql) => str_contains($sql, 'CREATE NONCLUSTERED INDEX IX_TmpMailerSuffixCache_Suffix')));
     }
 
-    public function test_drop_name_suffix_fallback_fails_clearly_without_the_index(): void
+    public function test_drop_name_suffix_cache_is_built_only_once_per_source_run(): void
     {
         $queries = [];
         $connector = $this->getMockBuilder(DBConnector::class)->disableOriginalConstructor()
             ->onlyMethods(['querySqlServer'])->getMock();
         $connector->method('querySqlServer')->willReturnCallback(function (string $sql) use (&$queries) {
             $queries[] = $sql;
-            if (str_contains($sql, 'sys.indexes')) {
-                return ['success' => true, 'data' => [['available' => 0]]];
-            }
             return ['success' => true, 'data' => []];
         });
 
@@ -327,16 +320,11 @@ class SyncContactsFullRefreshTest extends TestCase
         $command->setInput($input);
         $command->setOutput(new OutputStyle($input, new BufferedOutput()));
 
-        try {
-            (new \ReflectionMethod($command, 'fetchDropNamesFiltered'))
-                ->invoke($command, $connector, [['EXTERNAL_ID' => 'LDR-123456789']]);
-            self::fail('Missing suffix index must stop the unsafe table scan.');
-        } catch (\ReflectionException $e) {
-            throw $e;
-        } catch (\RuntimeException $e) {
-            self::assertStringContainsString('External_ID_Last9 is missing', $e->getMessage());
-        }
+        $fetch = new \ReflectionMethod($command, 'fetchDropNamesFiltered');
+        $fetch->invoke($command, $connector, [['EXTERNAL_ID' => 'LDR-123456789']]);
+        $fetch->invoke($command, $connector, [['EXTERNAL_ID' => 'PLAW-987654321']]);
 
-        self::assertFalse((bool) array_filter($queries, fn($sql) => str_contains($sql, 'RIGHT(External_ID, 9)')));
+        self::assertCount(1, array_filter($queries, fn($sql) => str_contains($sql, 'INSERT INTO #TmpMailerSuffixCache')));
+        self::assertCount(2, array_filter($queries, fn($sql) => str_contains($sql, 'FROM #TmpMailerSuffixCache WHERE Suffix IN')));
     }
 }
