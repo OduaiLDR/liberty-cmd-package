@@ -36,6 +36,7 @@ class SyncContactsData extends Command
     private ?\PDO $refreshPdo = null;
     private ?string $refreshStage = null;
     private bool $refreshPublished = false;
+    private bool $mailerSuffixCacheReady = false;
     private int $pageSize = self::PAGE_SIZE;
 
     /** Matching-step counters reset at the start of each matching run. */
@@ -245,6 +246,10 @@ class SyncContactsData extends Command
         } finally {
             if ($this->refreshStage !== null && $this->refreshPdo !== null) {
                 try {
+                    if ($this->mailerSuffixCacheReady) {
+                        $this->checkedExec($this->refreshPdo, 'DROP TABLE IF EXISTS #TmpMailerSuffixCache');
+                        $this->mailerSuffixCacheReady = false;
+                    }
                     $this->checkedExec($this->refreshPdo, "DROP TABLE IF EXISTS {$this->refreshStage}");
                 } catch (\Throwable $e) {
                     $this->warn('[WARN] Could not drop the session-local refresh table; it will be removed when the connection closes.');
@@ -439,6 +444,13 @@ class SyncContactsData extends Command
 
         if ($this->refreshStage !== null) {
             $this->publishFullRefresh($totalInserted);
+        }
+        if ($this->mailerSuffixCacheReady) {
+            $cleanup = $sqlConnector->querySqlServer('DROP TABLE IF EXISTS #TmpMailerSuffixCache');
+            if (! ($cleanup['success'] ?? false)) {
+                $this->warn('[WARN] Temporary mailer suffix cache will be removed when the SQL Server connection closes.');
+            }
+            $this->mailerSuffixCacheReady = false;
         }
         $action = $dryRun ? 'would be upserted' : 'upserted';
         $this->info("[INFO] Completed: {$totalInserted} records {$action} into {$this->targetTable}.");
@@ -870,8 +882,8 @@ class SyncContactsData extends Command
             return $lookup;
         }
 
-        // Exact Ext match first (index-friendly). Last-9 fallback only for misses —
-        // the old OR RIGHT(...) scan over all TblMailers was ~60s per page.
+        // Exact Ext match first (index-friendly). The suffix fallback builds one
+        // session-local cache per source run instead of rescanning TblMailers per page.
         $connector->querySqlServer("CREATE TABLE #TmpMailerFilter (ExtId VARCHAR(50) NOT NULL)");
         try {
             foreach (\array_chunk($externalIds, 1000) as $batch) {
@@ -904,18 +916,17 @@ class SyncContactsData extends Command
             }
 
             foreach (\array_chunk(\array_keys($missTails), 500) as $tailBatch) {
+                $this->ensureMailerSuffixCache($connector);
                 $inList = \implode(', ', \array_map(
                     fn($t) => "'" . \str_replace("'", "''", $t) . "'",
                     $tailBatch
                 ));
-                $fallback = $connector->querySqlServer("
-                    SELECT m.External_ID, m.Drop_Name
-                    FROM TblMailers m
-                    WHERE m.External_ID IS NOT NULL
-                      AND m.Drop_Name IS NOT NULL
-                      AND LEN(m.External_ID) > 9
-                      AND RIGHT(m.External_ID, 9) IN ({$inList})
-                ");
+                $fallback = $connector->querySqlServer(
+                    "SELECT Suffix AS External_ID, Drop_Name FROM #TmpMailerSuffixCache WHERE Suffix IN ({$inList})"
+                );
+                if (! ($fallback['success'] ?? false)) {
+                    throw new \RuntimeException('Temporary TblMailers suffix lookup failed: ' . ($fallback['error'] ?? 'unknown SQL Server error'));
+                }
                 $this->mergeDropNameLookup($lookup, $fallback['data'] ?? []);
             }
         } finally {
@@ -923,6 +934,41 @@ class SyncContactsData extends Command
         }
 
         return $lookup;
+    }
+
+    private function ensureMailerSuffixCache(DBConnector $connector): void
+    {
+        if ($this->mailerSuffixCacheReady) {
+            return;
+        }
+
+        $create = $connector->querySqlServer(
+            "SELECT TOP (0) CAST(RIGHT(External_ID, 9) AS varchar(9)) AS Suffix, Drop_Name
+             INTO #TmpMailerSuffixCache FROM TblMailers"
+        );
+        if (! ($create['success'] ?? false)) {
+            throw new \RuntimeException('Unable to create temporary mailer suffix cache: ' . ($create['error'] ?? 'unknown SQL Server error'));
+        }
+
+        $populate = $connector->querySqlServer(
+            "INSERT INTO #TmpMailerSuffixCache (Suffix, Drop_Name)
+             SELECT CAST(RIGHT(External_ID, 9) AS varchar(9)), Drop_Name
+             FROM TblMailers
+             WHERE External_ID IS NOT NULL AND Drop_Name IS NOT NULL AND LEN(External_ID) > 9"
+        );
+        if (! ($populate['success'] ?? false)) {
+            throw new \RuntimeException('Unable to populate temporary mailer suffix cache: ' . ($populate['error'] ?? 'unknown SQL Server error'));
+        }
+
+        $index = $connector->querySqlServer(
+            'CREATE NONCLUSTERED INDEX IX_TmpMailerSuffixCache_Suffix ON #TmpMailerSuffixCache (Suffix)'
+        );
+        if (! ($index['success'] ?? false)) {
+            throw new \RuntimeException('Unable to index temporary mailer suffix cache: ' . ($index['error'] ?? 'unknown SQL Server error'));
+        }
+
+        $this->mailerSuffixCacheReady = true;
+        $this->info('[INFO] Built temporary TblMailers suffix cache for this source run.');
     }
 
     /** @param array<string, string> $lookup */

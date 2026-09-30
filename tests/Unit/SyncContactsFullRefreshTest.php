@@ -279,4 +279,52 @@ class SyncContactsFullRefreshTest extends TestCase
         self::assertStringContainsString('LIMIT 1000', $queries[1]);
         self::assertStringContainsString('LIMIT 200', $queries[2]);
     }
+
+    public function test_drop_name_suffix_fallback_uses_a_temporary_cache(): void
+    {
+        $queries = [];
+        $connector = $this->getMockBuilder(DBConnector::class)->disableOriginalConstructor()
+            ->onlyMethods(['querySqlServer'])->getMock();
+        $connector->method('querySqlServer')->willReturnCallback(function (string $sql) use (&$queries) {
+            $queries[] = $sql;
+            if (str_contains($sql, 'FROM #TmpMailerSuffixCache WHERE Suffix IN')) {
+                return ['success' => true, 'data' => [['External_ID' => '123456789', 'Drop_Name' => 'Spring Drop']]];
+            }
+            return ['success' => true, 'data' => []];
+        });
+
+        $command = new SyncContactsData();
+        $input = new ArrayInput([], $command->getDefinition());
+        $command->setInput($input);
+        $command->setOutput(new OutputStyle($input, new BufferedOutput()));
+        $lookup = (new \ReflectionMethod($command, 'fetchDropNamesFiltered'))
+            ->invoke($command, $connector, [['EXTERNAL_ID' => 'LDR-123456789']]);
+
+        self::assertSame('Spring Drop', $lookup['123456789']);
+        self::assertCount(1, array_filter($queries, fn($sql) => str_contains($sql, 'INSERT INTO #TmpMailerSuffixCache')));
+        self::assertCount(1, array_filter($queries, fn($sql) => str_contains($sql, 'CREATE NONCLUSTERED INDEX IX_TmpMailerSuffixCache_Suffix')));
+    }
+
+    public function test_drop_name_suffix_cache_is_built_only_once_per_source_run(): void
+    {
+        $queries = [];
+        $connector = $this->getMockBuilder(DBConnector::class)->disableOriginalConstructor()
+            ->onlyMethods(['querySqlServer'])->getMock();
+        $connector->method('querySqlServer')->willReturnCallback(function (string $sql) use (&$queries) {
+            $queries[] = $sql;
+            return ['success' => true, 'data' => []];
+        });
+
+        $command = new SyncContactsData();
+        $input = new ArrayInput([], $command->getDefinition());
+        $command->setInput($input);
+        $command->setOutput(new OutputStyle($input, new BufferedOutput()));
+
+        $fetch = new \ReflectionMethod($command, 'fetchDropNamesFiltered');
+        $fetch->invoke($command, $connector, [['EXTERNAL_ID' => 'LDR-123456789']]);
+        $fetch->invoke($command, $connector, [['EXTERNAL_ID' => 'PLAW-987654321']]);
+
+        self::assertCount(1, array_filter($queries, fn($sql) => str_contains($sql, 'INSERT INTO #TmpMailerSuffixCache')));
+        self::assertCount(2, array_filter($queries, fn($sql) => str_contains($sql, 'FROM #TmpMailerSuffixCache WHERE Suffix IN')));
+    }
 }
