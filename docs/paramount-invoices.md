@@ -9,7 +9,7 @@ php artisan Generate:paramount-epf-summary --month=2026-08 --invoice --send-to-m
 
 The first command saves only. `--send-to-me` sends only to oduai@libertydebtrelief.com with empty CC/BCC. `--test-to=ADDRESS` permits an explicit reviewer; conflicting reviewer options are rejected. Lending Tower's `reports:generate-lending-tower-invoices` also supports `--send-to-me` and produces separate Progress Law and LDR emails.
 
-Paramount live delivery requires `--send`. It reads `dbo.TblReports` using Report_Name `LT Invoices ParamountLaw` and Company `LDR`, without extra environment recipients or cross-company fallback. Apply `paramount-recipients.sql` to configure the approved recipients; this script is not automatically executed. Sender: invoices@libertydebtrelief.com. The configured Graph application must have mailbox send permission.
+Paramount live delivery requires `--send`. It reads `dbo.TblReports` using Report_Name `LT Invoices ParamountLaw` and Company `LDR`, without extra environment recipients or cross-company fallback. Apply `paramount-recipients.sql` to configure the approved recipients; this script is not automatically executed. Sender: invoices@libertydebtrelief.com. Uses the same `GRAPH_LT_TENANT_ID`, `GRAPH_LT_CLIENT_ID`, and `GRAPH_LT_CLIENT_SECRET` as Lending Tower invoices. The shared Graph application must have send permission for both invoice mailboxes. The explicit sender remains invoices@libertydebtrelief.com; no separate GRAPH credentials are required for this command.
 
 Paramount's billing contact defaults to Evan McMurtrey at emcmurtrey@Higbee.law, 1504 Brookhollow Drive Suite 112, Santa Ana, CA 92705. Optional overrides are `PARAMOUNT_INVOICE_BILL_TO_NAME` and `PARAMOUNT_INVOICE_BILL_TO_ADDRESS` (pipe-separated lines).
 
