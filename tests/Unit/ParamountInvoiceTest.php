@@ -40,7 +40,7 @@ final class ParamountInvoiceTest extends TestCase
 
     #[RunInSeparateProcess]
     #[PreserveGlobalState(false)]
-    public function test_private_invoice_email_has_only_requested_recipient_and_default_sender(): void
+    public function test_private_invoice_email_has_only_requested_recipient_and_report_sender(): void
     {
         $xlsx = tempnam(sys_get_temp_dir(), 'paramount-test-');
         $pdf = tempnam(sys_get_temp_dir(), 'paramount-pdf-');
@@ -48,12 +48,12 @@ final class ParamountInvoiceTest extends TestCase
         file_put_contents($pdf, '%PDF-test');
         try {
             $mailer = Mockery::mock('overload:Cmd\\Reports\\Services\\EmailSenderService');
-            $mailer->shouldReceive('__construct')->once()->withNoArgs();
+            $mailer->shouldReceive('__construct')->once()->with('MS');
             $mailer->shouldReceive('sendMailHtml')->once()->withArgs(function ($subject, $body, $to, $cc, $bcc, $attachments, $from = null) {
                 self::assertSame(['oduai@libertydebtrelief.com'], $to);
                 self::assertSame([], $cc);
                 self::assertSame([], $bcc);
-                self::assertNull($from); // Use the configured default Graph mailbox.
+                self::assertSame('admin@libertydebtrelief.com', $from);
                 self::assertCount(2, $attachments);
                 self::assertSame('application/pdf', $attachments[1]['contentType']);
                 self::assertStringContainsString('[TEST]', $subject);

@@ -18,7 +18,8 @@ class GenerateAdvanceRequestDeliveryTest extends TestCase
         self::assertTrue($definition->hasOption('send-to-me'));
         self::assertFalse($definition->hasOption('review'));
         self::assertFalse($definition->hasOption('sample'));
-        self::assertFalse($definition->hasOption('company'));
+        self::assertTrue($definition->hasOption('company'));
+        self::assertSame('all', $definition->getOption('company')->getDefault());
         self::assertFalse($definition->hasOption('send-live'));
 
         $reflection = new ReflectionClass($command);
@@ -40,12 +41,15 @@ class GenerateAdvanceRequestDeliveryTest extends TestCase
         self::assertStringNotContainsString('SAMPLE', strtoupper($body));
     }
 
-    public function test_progress_law_verification_uses_the_valid_ldr_sender_only_for_self_delivery(): void
+    public function test_verification_uses_each_company_production_sender_and_credentials(): void
     {
         $command = new GenerateAdvanceRequest();
         $method = (new ReflectionClass($command))->getMethod('resolveVerificationSender');
+        $prefix = (new ReflectionClass($command))->getMethod('credentialPrefix');
+        self::assertSame('PLAW_MS', $prefix->invoke($command, 'PLAW'));
+        self::assertSame('MS', $prefix->invoke($command, 'LDR'));
 
-        self::assertSame('NGF@libertydebtrelief.com', $method->invoke($command, [
+        self::assertSame('NGF@progresslaw.com', $method->invoke($command, [
             'company' => 'PLAW',
             'sender' => 'NGF@progresslaw.com',
         ]));
