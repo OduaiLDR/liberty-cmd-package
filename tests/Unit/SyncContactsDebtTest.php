@@ -74,6 +74,34 @@ class SyncContactsDebtTest extends TestCase
         self::assertSame($basis, $rows[0]['debt_basis']);
     }
 
+    public function test_contact_inserts_keep_external_id_without_duplicate_tp_id(): void
+    {
+        foreach (['LDR', 'PLAW', 'LT'] as $source) {
+            $command = new SyncContactsData();
+            $this->setSource($command, $source);
+            (new ReflectionProperty(SyncContactsData::class, 'targetTable'))->setValue(
+                $command, $source === 'LT' ? 'TblContacts' : 'TblContacts' . $source
+            );
+            [$rows] = (new ReflectionMethod(SyncContactsData::class, 'processChunk'))->invoke(
+                $command,
+                [['LLG_ID' => '123', 'EXTERNAL_ID' => ' 12345678901 ', 'ENROLLED_DEBT' => 13920]],
+                [],
+                ['categories' => [], 'affiliate_agents' => []]
+            );
+            self::assertSame('12345678901', $rows[0]['external_id']);
+            self::assertArrayNotHasKey('tp_id', $rows[0]);
+            $fields = (new ReflectionMethod(SyncContactsData::class, 'contactFields'))->invoke($command);
+            $pdo = $this->getMockBuilder(\PDO::class)->disableOriginalConstructor()->onlyMethods(['exec'])->getMock();
+            $pdo->expects(self::once())->method('exec')->willReturnCallback(function (string $sql): int {
+                self::assertStringNotContainsString('TP_ID', $sql);
+                self::assertStringContainsString('External_ID', $sql);
+                self::assertSame(1, substr_count($sql, "'12345678901'"));
+                return 1;
+            });
+            (new ReflectionMethod(SyncContactsData::class, 'insertContactRows'))->invoke($command, $pdo, $fields, $rows);
+        }
+    }
+
     public function test_missing_enrolled_alias_cannot_silently_become_zero(): void
     {
         $command = new SyncContactsData();

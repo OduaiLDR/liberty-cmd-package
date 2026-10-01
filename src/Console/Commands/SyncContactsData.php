@@ -632,7 +632,6 @@ class SyncContactsData extends Command
                 SUBSTRING(cr.METADATA, CHARINDEX('RevolvingCreditUtilization', cr.METADATA) + 29,
                     CHARINDEX('Day30', cr.METADATA) - CHARINDEX('RevolvingCreditUtilization', cr.METADATA) - 32) AS CREDIT_UTILIZATION,
                 ep.FEE1,
-                c.TP_ID AS TP_ID_COPY,
                 TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', c.ENROLLED_DATE), 'YYYY-MM-DD HH24:MI:SS') AS ENROLLED_DATE,
                 uf_debt.F_DECIMAL AS DEBT_AMOUNT_CUSTOM,
                 d.ENROLLED_DEBT,
@@ -742,7 +741,6 @@ class SyncContactsData extends Command
                 SUBSTRING(cr.METADATA, CHARINDEX('RevolvingCreditUtilization', cr.METADATA) + 29,
                     CHARINDEX('Day30', cr.METADATA) - CHARINDEX('RevolvingCreditUtilization', cr.METADATA) - 32) AS CREDIT_UTILIZATION,
                 ep.FEE1,
-                c.TP_ID AS TP_ID_COPY,
                 TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', c.ENROLLED_DATE), 'YYYY-MM-DD HH24:MI:SS') AS ENROLLED_DATE,
                 uf_debt.F_SHORTSTRING AS DEBT_AMOUNT_CUSTOM,
                 NULL AS PLAN_TITLE,
@@ -1183,11 +1181,6 @@ class SyncContactsData extends Command
                 'category'           => $category,
                 'affiliate_agent'    => \substr($this->source === 'LT' ? $agent : $assignedTo, 0, 255),
             ];
-
-            // LT inserts into TblContacts which has no TP_ID column
-            if ($this->source !== 'LT') {
-                $processedRow['tp_id'] = \substr($tpId, 0, 50);
-            }
 
             $processed[] = $processedRow;
 
@@ -1662,7 +1655,6 @@ class SyncContactsData extends Command
                     . ((int) $row['credit_utilization']) . ", "
                     . "'{$this->escSql($row['category'])}', "
                     . "'{$this->escSql($row['affiliate_agent'])}'"
-                    . ($this->source !== 'LT' ? ", '{$this->escSql($row['tp_id'])}'" : '')
                     . ')';
             }
 
@@ -1743,8 +1735,7 @@ class SyncContactsData extends Command
         return 'Created_Date, Assigned_Date, LLG_ID, External_ID, Campaign, Data_Source, '
             . 'Created_By, Agent, Client, Phone, Email, Address_1, Address_2, City, State, '
             . 'Zip, Stage, Status, Debt_Amount, Debt_Enrolled, Credit_Score, Credit_Utilization, '
-            . 'Category, Affiliate_Agent'
-            . ($this->source !== 'LT' ? ', TP_ID' : '');
+            . 'Category, Affiliate_Agent';
     }
 
     private function checkedExec(\PDO $pdo, string $sql): void

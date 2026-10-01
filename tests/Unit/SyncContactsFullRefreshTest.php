@@ -54,6 +54,7 @@ class SyncContactsFullRefreshTest extends TestCase
         $pdo->method('exec')->willReturnCallback(function (string $sql) use (&$events, &$targetRows, &$stageRows, &$inTransaction, $failure) {
             $events[] = $sql;
             self::assertStringNotContainsString('TRUNCATE', $sql);
+            self::assertStringNotContainsString('TP_ID', $sql);
             if (str_starts_with($sql, 'INSERT INTO #ContactsRefresh_')) {
                 if ($failure === 'stage') { return false; }
                 $stageRows++;
