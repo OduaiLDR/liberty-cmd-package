@@ -310,14 +310,15 @@ class GenerateParamountEpfSummary extends Command
         $to = $testTo !== '' ? [$testTo] : ($jacobOnly ? ['jacob@libertydebtrelief.com'] : ['emcmurtrey@Higbee.law']);
         $subject = ($review ? '[TEST] ' : '') . ($invoicePath !== null ? 'LDR Invoice to Paramount Law' : 'Paramount Law EPF Summary') . " - {$monthLabel}";
         $mailer = new EmailSenderService('MS');
+        $sender = (string) env('PARAMOUNT_INVOICE_FROM', 'admin@libertydebtrelief.com');
         if ($review) {
-            $sent = $mailer->sendMailHtml($subject, $body, $to, [], [], $attachments);
+            $sent = $mailer->sendMailHtml($subject, $body, $to, [], [], $attachments, $sender);
         } else {
             $azure = DBConnector::fromEnvironment('ldr');
             $azure->initializeSqlServer();
             $sent = $mailer->sendMailUsingTblReportsHtml(
                 $azure, [self::REPORT_NAME], ['LDR'], $subject, $body, $attachments,
-                false, true
+                false, true, $sender
             );
         }
         if (!$sent) {

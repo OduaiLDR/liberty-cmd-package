@@ -111,7 +111,7 @@ class GenerateAdvanceRequest extends Command
                 'amount' => $allocation['ldr'],
                 'report' => 'AdvanceRequest',
                 'company' => 'LDR',
-                'sender' => self::LDR_SENDER,
+                'sender' => (string) env('ADVANCE_REQUEST_LDR_FROM', self::LDR_SENDER),
             ],
             [
                 'name' => 'Progress Law',
@@ -119,7 +119,7 @@ class GenerateAdvanceRequest extends Command
                 'amount' => $allocation['progress_law'],
                 'report' => 'AdvanceRequest',
                 'company' => 'PLAW',
-                'sender' => self::PROGRESS_LAW_SENDER,
+                'sender' => (string) env('ADVANCE_REQUEST_PLAW_FROM', self::PROGRESS_LAW_SENDER),
             ],
         ] as $request) {
             if ($company !== 'ALL' && $request['company'] !== $company) {
