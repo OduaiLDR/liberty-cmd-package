@@ -309,7 +309,7 @@ class GenerateParamountEpfSummary extends Command
         $review = $testTo !== '' || $jacobOnly;
         $to = $testTo !== '' ? [$testTo] : ($jacobOnly ? ['jacob@libertydebtrelief.com'] : ['emcmurtrey@Higbee.law']);
         $subject = ($review ? '[TEST] ' : '') . ($invoicePath !== null ? 'LDR Invoice to Paramount Law' : 'Paramount Law EPF Summary') . " - {$monthLabel}";
-        $mailer = new EmailSenderService();
+        $mailer = new EmailSenderService('MS');
         if ($review) {
             $sent = $mailer->sendMailHtml($subject, $body, $to, [], [], $attachments);
         } else {

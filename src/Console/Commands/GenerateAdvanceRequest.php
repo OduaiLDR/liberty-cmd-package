@@ -195,7 +195,7 @@ class GenerateAdvanceRequest extends Command
 
     private function credentialPrefix(string $company): string
     {
-        return $company === 'PLAW' ? 'PLAW_MS' : 'GRAPH';
+        return $company === 'PLAW' ? 'PLAW_MS' : 'MS';
     }
 
     private function resolveMonthWindow(): array

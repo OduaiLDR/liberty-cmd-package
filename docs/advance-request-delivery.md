@@ -1,6 +1,6 @@
 # Advance Request delivery
 
-LDR uses GRAPH_TENANT_ID, GRAPH_CLIENT_ID, and GRAPH_CLIENT_SECRET, sending from NGF@libertydebtrelief.com.
+LDR uses MS_TENANT_ID, MS_CLIENT_ID, and MS_CLIENT_SECRET, sending from NGF@libertydebtrelief.com.
 Progress Law uses PLAW_MS_TENANT_ID, PLAW_MS_CLIENT_ID, and PLAW_MS_CLIENT_SECRET, sending from NGF@progresslaw.com.
 Private tests use the same company-specific credentials and sender as production, with only oduai@libertydebtrelief.com and no CC/BCC.
 

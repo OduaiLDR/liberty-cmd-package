@@ -47,7 +47,7 @@ class GenerateAdvanceRequestDeliveryTest extends TestCase
         $method = (new ReflectionClass($command))->getMethod('resolveVerificationSender');
         $prefix = (new ReflectionClass($command))->getMethod('credentialPrefix');
         self::assertSame('PLAW_MS', $prefix->invoke($command, 'PLAW'));
-        self::assertSame('GRAPH', $prefix->invoke($command, 'LDR'));
+        self::assertSame('MS', $prefix->invoke($command, 'LDR'));
 
         self::assertSame('NGF@progresslaw.com', $method->invoke($command, [
             'company' => 'PLAW',
