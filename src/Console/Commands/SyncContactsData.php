@@ -898,8 +898,11 @@ class SyncContactsData extends Command
         if ($this->option('dry-run')) {
             foreach (array_chunk($externalIds, 1000) as $batch) {
                 $ids = $this->sqlStringList(array_map(fn($id) => substr((string) $id, 0, 50), $batch));
+                $started = microtime(true);
+                $this->info('[PREVIEW] Mailer exact lookup starting (' . count($batch) . ' IDs).');
                 $rows = $this->selectPreviewRows($connector,
                     "SELECT External_ID, Drop_Name FROM TblMailers WHERE External_ID IN ({$ids}) AND Drop_Name IS NOT NULL");
+                $this->info(sprintf('[PREVIEW] Mailer exact lookup finished (%.1fs).', microtime(true) - $started));
                 $this->mergeDropNameLookup($lookup, $rows);
             }
             $missTails = [];
@@ -913,9 +916,12 @@ class SyncContactsData extends Command
             }
             foreach (array_chunk(array_keys($missTails), 500) as $batch) {
                 $tails = $this->sqlStringList($batch);
+                $started = microtime(true);
+                $this->info('[PREVIEW] Mailer suffix lookup starting (' . count($batch) . ' suffixes).');
                 $rows = $this->selectPreviewRows($connector,
                     "SELECT External_ID, Drop_Name FROM TblMailers WHERE External_ID IS NOT NULL
                      AND Drop_Name IS NOT NULL AND LEN(External_ID) > 9 AND RIGHT(External_ID, 9) IN ({$tails})");
+                $this->info(sprintf('[PREVIEW] Mailer suffix lookup finished (%.1fs).', microtime(true) - $started));
                 $this->mergeDropNameLookup($lookup, $rows);
             }
             return $lookup;
@@ -1368,6 +1374,14 @@ class SyncContactsData extends Command
                 'action' => $change['before'] === null ? 'insert' : ($change['changes'] === [] ? 'unchanged' : 'update'),
                 'changes' => $change['changes'],
             ], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
+            if (isset($change['linked_identity'])) {
+                $identity = $change['linked_identity'];
+                $this->line('[PREVIEW] ' . json_encode([
+                    'source' => $this->source, 'table' => 'TblContacts',
+                    'incoming_id' => $identity['incoming_id'], 'target_id' => $identity['target_id'],
+                    'action' => 'update', 'changes' => $identity['changes'],
+                ], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
+            }
         }
     }
 

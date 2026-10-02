@@ -12,6 +12,11 @@ final class ContactSyncMatching
             throw new \RuntimeException('Only destination companies participate in contact matching.');
         }
         $identity = ContactSyncIdentity::sql('c', 's');
+        $continuity = ContactSyncIdentity::corroboratesSql('c', 's');
+        $uniqueLink = 'SELECT External_ID FROM (
+            SELECT External_ID FROM TblContactsLDR
+            UNION ALL SELECT External_ID FROM TblContactsPLAW
+        ) links GROUP BY External_ID HAVING COUNT(*) = 1';
         // The primary table has no company namespace. A destination ID must have
         // one physical company owner, including rows with a conflicting identity.
         $uniqueOwner = 'SELECT LLG_ID FROM (
@@ -24,8 +29,12 @@ final class ContactSyncMatching
             $side = ContactSyncTargets::table($namespace);
             $edges[] = "SELECT '{$namespace}' AS Namespace, c.LLG_ID AS ContactId, s.LLG_ID AS SourceId
                 FROM TblContacts c JOIN {$side} s
-                  ON (c.LLG_ID = s.LLG_ID OR c.LLG_ID = 'LLG-' + CAST(s.External_ID AS VARCHAR(50)))
-                 AND {$identity}
+                  ON ((c.LLG_ID = s.LLG_ID AND {$identity})
+                    OR (c.LLG_ID = 'LLG-' + CAST(s.External_ID AS VARCHAR(50)) AND {$continuity}
+                        AND LEFT(s.External_ID, 1) BETWEEN '1' AND '9'
+                        AND s.External_ID COLLATE Latin1_General_100_BIN2 NOT LIKE '%[^0-9]%'
+                        AND s.External_ID <> '1234567840'
+                        AND s.External_ID IN ({$uniqueLink})))
                 JOIN (SELECT LLG_ID FROM TblContacts GROUP BY LLG_ID HAVING COUNT(*) = 1) unique_contact
                   ON unique_contact.LLG_ID = c.LLG_ID
                 JOIN ({$uniqueOwner}) unique_source
@@ -43,6 +52,11 @@ final class ContactSyncMatching
         $fields = [];
         foreach (['Affiliate_Agent', 'Campaign', 'Category'] as $field) {
             $fields[$field] = "CASE WHEN COALESCE(s.{$field}, '') <> '' THEN s.{$field} ELSE c.{$field} END";
+        }
+        foreach (['Client', 'Email', 'Phone'] as $field) {
+            $valid = $field === 'Email' ? " AND CHARINDEX('@', s.Email) > 1" : '';
+            $fields[$field] = "CASE WHEN NULLIF(LTRIM(RTRIM(s.{$field})), '') IS NOT NULL{$valid}
+                THEN s.{$field} ELSE c.{$field} END";
         }
         return [
             'linked_fields' => self::step($cte, $from, 'c', $fields, '1 = 1'),
