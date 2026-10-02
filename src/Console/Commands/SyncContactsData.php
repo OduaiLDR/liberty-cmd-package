@@ -4,6 +4,7 @@ namespace Cmd\Reports\Console\Commands;
 
 use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\ContactSyncIdentity;
+use Cmd\Reports\Services\ContactSyncMatching;
 use Cmd\Reports\Services\ContactSyncTargets;
 use Cmd\Reports\Services\ContactSyncWatermark;
 use Illuminate\Console\Command;
@@ -493,7 +494,7 @@ class SyncContactsData extends Command
             $this->info("[INFO] Enrollment updates: " . \count($categoryChanges) . " category, " . \count($affiliateChanges) . " affiliate agent");
         }
 
-        if (!$dryRun) {
+        if (!$this->option('debt-only')) {
             $this->applyEnrollmentCategoryUpdates($sqlConnector, $categoryChanges);
             $this->applyEnrollmentAffiliateUpdates($sqlConnector, $affiliateChanges);
         }
@@ -1423,57 +1424,63 @@ class SyncContactsData extends Command
 
     private function applyEnrollmentCategoryUpdates(DBConnector $connector, array $changes): void
     {
-        if (empty($changes)) {
-            return;
-        }
-
-        $connector->querySqlServer("CREATE TABLE #TmpCatUpd (LLG_ID VARCHAR(50), NewCat VARCHAR(50))");
-
-        foreach (\array_chunk($changes, 500) as $chunk) {
-            $values = \implode(', ', \array_map(
-                fn($c) => "('{$this->escSql($c['llg_id'])}', '{$this->escSql($c['category'])}')",
-                $chunk
-            ));
-            $connector->querySqlServer("INSERT INTO #TmpCatUpd (LLG_ID, NewCat) VALUES {$values}");
-        }
-
-        $connector->querySqlServer("
-            UPDATE TblEnrollment
-            SET Category = u.NewCat
-            FROM TblEnrollment e
-            JOIN #TmpCatUpd u ON e.LLG_ID = u.LLG_ID
-            WHERE e.Category <> u.NewCat OR e.Category IS NULL
-        ");
-
-        $connector->querySqlServer("DROP TABLE #TmpCatUpd");
+        $this->applyEnrollmentFieldChanges($connector, $changes, 'Category', 'category');
     }
 
     private function applyEnrollmentAffiliateUpdates(DBConnector $connector, array $changes): void
     {
-        if (empty($changes)) {
-            return;
+        $this->applyEnrollmentFieldChanges($connector, $changes, 'Affiliate_Agent', 'agent');
+    }
+
+    private function applyEnrollmentFieldChanges(DBConnector $connector, array $changes, string $field, string $key): void
+    {
+        $name = $this->contactNameMatchSql('e', 'u');
+        $identity = ContactSyncIdentity::sql('c', 'u');
+        $owner = ContactSyncMatching::enrollmentOwnerSql('c');
+        foreach (array_chunk($changes, 100) as $batch) {
+            $values = [];
+            $params = [];
+            foreach ($batch as $change) {
+                $values[] = '(?, ?, ?, ?, ?, ?)';
+                array_push($params, $change['llg_id'], $change['client'], $change['email'], $change['phone'], $change['before'], $change[$key]);
+            }
+            $from = 'FROM TblEnrollment e JOIN (VALUES ' . implode(', ', $values) . ") u(LLG_ID, Client, Email, Phone, BeforeValue, AfterValue)
+                ON e.LLG_ID = u.LLG_ID AND {$name}
+                WHERE COALESCE(e.{$field}, '') = u.BeforeValue
+                  AND (SELECT COUNT(*) FROM TblEnrollment d WHERE d.LLG_ID = e.LLG_ID) = 1
+                  AND (SELECT COUNT(*) FROM TblContacts c WHERE c.LLG_ID = e.LLG_ID) = 1
+                  AND EXISTS (SELECT 1 FROM TblContacts c WHERE c.LLG_ID = e.LLG_ID AND {$identity} AND {$owner})";
+            if ($this->option('dry-run')) {
+                $sql = "SELECT e.LLG_ID, e.{$field} AS BeforeValue, u.AfterValue {$from}";
+                $result = $connector->querySqlServer($sql, $params);
+                if (!($result['success'] ?? false)) {
+                    throw new \RuntimeException("Enrollment {$field} preview failed.");
+                }
+                foreach ($result['data'] ?? [] as $row) {
+                    $this->line('[ENROLLMENT PREVIEW] ' . json_encode(['field' => $field, 'change' => $row], JSON_THROW_ON_ERROR));
+                }
+                if (count($result['data'] ?? []) !== count($batch)) {
+                    throw new \RuntimeException("Enrollment {$field} preview has changed or ambiguous identities.");
+                }
+                continue;
+            }
+            $pdo = $connector->getSqlServerConnection();
+            $pdo->beginTransaction();
+            try {
+                $statement = $pdo->prepare("UPDATE e SET e.{$field} = u.AfterValue {$from}");
+                if ($statement === false || !$statement->execute($params) || $statement->rowCount() !== count($batch)) {
+                    throw new \RuntimeException("Enrollment {$field} changed or write count mismatch.");
+                }
+                if (!$pdo->commit()) {
+                    throw new \RuntimeException("Enrollment {$field} commit failed.");
+                }
+            } catch (\Throwable $e) {
+                if ($pdo->inTransaction()) {
+                    $pdo->rollBack();
+                }
+                throw $e;
+            }
         }
-
-        $connector->querySqlServer("CREATE TABLE #TmpAffUpd (LLG_ID VARCHAR(50), NewAffiliate NVARCHAR(100))");
-
-        foreach (\array_chunk($changes, 500) as $chunk) {
-            $values = \implode(', ', \array_map(
-                fn($c) => "('{$this->escSql($c['llg_id'])}', '{$this->escSql($c['agent'])}')",
-                $chunk
-            ));
-            $connector->querySqlServer("INSERT INTO #TmpAffUpd (LLG_ID, NewAffiliate) VALUES {$values}");
-        }
-
-        $connector->querySqlServer("
-            UPDATE TblEnrollment
-            SET Affiliate_Agent = u.NewAffiliate
-            FROM TblEnrollment e
-            JOIN #TmpAffUpd u ON e.LLG_ID = u.LLG_ID
-            WHERE (e.Affiliate_Agent <> u.NewAffiliate OR e.Affiliate_Agent IS NULL)
-              AND u.NewAffiliate <> ''
-        ");
-
-        $connector->querySqlServer("DROP TABLE #TmpAffUpd");
     }
 
     // -------------------------------------------------------------------------
