@@ -4,6 +4,7 @@ namespace Cmd\Reports\Console\Commands;
 
 use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\ContactSyncIdentity;
+use Cmd\Reports\Services\ContactSyncWatermark;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
@@ -13,7 +14,7 @@ class SyncContactsData extends Command
 {
     protected $signature = 'Sync:contacts-data
         {--source=   : Run a single source only (LDR, PLAW, or LT)}
-        {--full      : Force a full refresh even when a previous sync timestamp exists}
+        {--full      : Preview a full source refresh; requires --dry-run while identities are reconciled}
         {--debt-only : Compare debt columns only; requires --dry-run and --source=LDR or PLAW}
         {--owners-refresh : Re-pull EVERY contact since 2021-07-01 (current CRM ASSIGNED_TO) without truncating. Non-destructive DELETE+INSERT per chunk. Use to correct agent names that drifted because an incremental sync never re-pulled a reassignment older than the watermark.}
         {--dry-run   : Fetch and report changes without modifying SQL Server or sync watermarks; matching runs as read-only verification}
@@ -57,6 +58,10 @@ class SyncContactsData extends Command
         ini_set('memory_limit', '512M');
 
         $source = strtoupper((string) $this->option('source'));
+        if ($this->option('full') && !$this->option('dry-run')) {
+            $this->error('Full replacement is disabled while contact identities are being reconciled. Use a reviewed owners-refresh upsert; --full --dry-run remains read-only.');
+            return Command::FAILURE;
+        }
         if ($this->option('debt-only') && (!$this->option('dry-run') || !in_array($source, ['LDR', 'PLAW'], true))) {
             $this->error('--debt-only requires --dry-run and --source=LDR or --source=PLAW.');
             return Command::FAILURE;
@@ -146,7 +151,9 @@ class SyncContactsData extends Command
             try {
                 $connector = DBConnector::fromEnvironment('ldr');
                 $connector->initializeSqlServer();
-                $this->runFinalMatching($connector);
+                if (!$this->runFinalMatching($connector)) {
+                    return Command::FAILURE;
+                }
             } catch (\Throwable $e) {
                 $this->error('[DRY RUN] Matching preview failed: ' . $e->getMessage());
                 return Command::FAILURE;
@@ -180,6 +187,17 @@ class SyncContactsData extends Command
     {
         $this->source = $source;
         $this->info("[INFO] Sync Contacts Data: starting for {$this->source}.");
+        if (!$this->option('dry-run') && !$this->option('owners-refresh')) {
+            try {
+                if ($this->readLastSyncTime($source) === null) {
+                    $this->error('No source checkpoint exists. Refusing an implicit full replacement; review --owners-refresh explicitly.');
+                    return Command::FAILURE;
+                }
+            } catch (\Throwable $e) {
+                $this->error('Invalid contact sync checkpoint: ' . $e->getMessage());
+                return Command::FAILURE;
+            }
+        }
 
         if ($this->source === 'PLAW') {
             $this->debtAmountCustomId = 743019;
@@ -219,7 +237,7 @@ class SyncContactsData extends Command
         if (! $lock->get()) {
             $this->warn("[WARN] Another {$this->source} sync is already running; skipping this run to avoid duplicate rows.");
             Log::warning('SyncContactsData: overlapping run skipped', ['source' => $this->source]);
-            return Command::SUCCESS;
+            return Command::FAILURE;
         }
 
         try {
@@ -2706,23 +2724,12 @@ class SyncContactsData extends Command
 
     private function readLastSyncTime(string $source): ?string
     {
-        $path = $this->timestampFilePath();
-        if (!\file_exists($path)) {
-            return null;
-        }
-        $data = \json_decode(\file_get_contents($path), true);
-        return $data[$source] ?? null;
+        return ContactSyncWatermark::read($this->timestampFilePath(), $source);
     }
 
     private function writeLastSyncTime(string $source, string $datetime): void
     {
-        $path = $this->timestampFilePath();
-        $data = [];
-        if (\file_exists($path)) {
-            $data = \json_decode(\file_get_contents($path), true) ?? [];
-        }
-        $data[$source] = $datetime;
-        \file_put_contents($path, \json_encode($data, JSON_PRETTY_PRINT));
+        ContactSyncWatermark::write($this->timestampFilePath(), $source, $datetime);
     }
 
     // -------------------------------------------------------------------------
