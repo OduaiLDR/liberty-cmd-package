@@ -572,8 +572,28 @@ class SyncContactsData extends Command
         }
     }
 
+    /** The replication clock catches late arrivals even when the source edit is older than the watermark. */
+    private function contactChangedSql(string $startDate): string
+    {
+        $cutoff = "'{$this->esc($startDate)}'::TIMESTAMP_NTZ";
+        $contact = "CONVERT_TIMEZONE('America/Los_Angeles', COALESCE(c.MODIFIED, c.CREATED))::TIMESTAMP_NTZ >= {$cutoff}
+            OR CONVERT_TIMEZONE('America/Los_Angeles', c._FIVETRAN_SYNCED)::TIMESTAMP_NTZ >= {$cutoff}";
+        if ($this->source !== 'LT') {
+            return "({$contact})";
+        }
+        // Assignment STAMP is NTZ, so do not perform a session-dependent two-argument conversion.
+        // Include replicated tombstones in eligibility; exclude them when choosing the current history row.
+        return "({$contact} OR EXISTS (
+            SELECT 1 FROM CONTACTS_ASSIGNED delta
+            WHERE delta.CONTACT_ID = c.ID
+              AND (delta.STAMP >= {$cutoff}
+                OR CONVERT_TIMEZONE('America/Los_Angeles', delta._FIVETRAN_SYNCED)::TIMESTAMP_NTZ >= {$cutoff})
+        ))";
+    }
+
     private function buildStandardQuery(string $startDate, int $lastId, int $limit): string
     {
+        $changed = $this->contactChangedSql($startDate);
         // Page contacts first, then reduce every one-to-many source independently.
         // Joining history tables together before deduplication multiplies their rows
         // (for example, 8 statuses × 4 scores × 3 reports = 96 rows for one contact).
@@ -581,8 +601,8 @@ class SyncContactsData extends Command
             WITH contact_page AS (
                 SELECT c.*
                 FROM CONTACTS AS c
-                WHERE CONVERT_TIMEZONE('America/Los_Angeles', COALESCE(c.MODIFIED, c.CREATED)) >= '{$this->esc($startDate)}'::TIMESTAMP_NTZ
-                  AND c.DEL = 'FALSE'
+                WHERE {$changed}
+                  AND c.DEL = 'FALSE' AND c._FIVETRAN_DELETED = FALSE
                   AND c.FIRSTNAME IS NOT NULL AND c.FIRSTNAME <> ''
                   AND c.ISCOAPP = 0
                   AND c.ID > {$lastId}
@@ -593,6 +613,7 @@ class SyncContactsData extends Command
                 SELECT s.CONTACT_ID, s.STAGE_ID, s.STATUS_ID, s.STAMP
                 FROM CONTACTS_STATUS AS s
                 JOIN contact_page AS p ON p.ID = s.CONTACT_ID
+                WHERE s._FIVETRAN_DELETED = FALSE
                 QUALIFY ROW_NUMBER() OVER (PARTITION BY s.CONTACT_ID ORDER BY s.STAMP DESC, s.ID DESC) = 1
             ),
             page_scores AS (
@@ -665,8 +686,8 @@ class SyncContactsData extends Command
                 uf_agent.F_SHORTSTRING AS AGENT_CUSTOM
             FROM contact_page AS c
             LEFT JOIN DATA_SOURCES AS ds ON c.C_SOURCE = ds.ID
-            LEFT JOIN USERS AS u1 ON c.CREATED_BY = u1.UID
-            LEFT JOIN USERS AS u2 ON c.ASSIGNED_TO = u2.UID
+            LEFT JOIN USERS AS u1 ON c.CREATED_BY = u1.UID AND u1._FIVETRAN_DELETED = FALSE
+            LEFT JOIN USERS AS u2 ON c.ASSIGNED_TO = u2.UID AND u2._FIVETRAN_DELETED = FALSE
             LEFT JOIN page_status AS s ON c.ID = s.CONTACT_ID
             LEFT JOIN CONTACTS_CATEGORIES AS cc ON s.STAGE_ID = cc.ID
             LEFT JOIN CONTACTS_LEAD_STATUS AS cls ON s.STATUS_ID = cls.ID
@@ -683,6 +704,7 @@ class SyncContactsData extends Command
 
     private function buildLTQuery(string $startDate, int $lastId, int $limit): string
     {
+        $changed = $this->contactChangedSql($startDate);
         // Apply the keyset page before reading histories and reduce each history
         // independently. EXISTS keeps pages full of duplicate leads from hiding
         // later eligible contacts. Every joined CTE returns at most one row/contact.
@@ -690,8 +712,8 @@ class SyncContactsData extends Command
             WITH contact_page AS (
                 SELECT c.*
                 FROM CONTACTS c
-                WHERE CONVERT_TIMEZONE('America/Los_Angeles', COALESCE(c.MODIFIED, c.CREATED)) >= '{$this->esc($startDate)}'::TIMESTAMP_NTZ
-                  AND c.DEL = 'FALSE'
+                WHERE {$changed}
+                  AND c.DEL = 'FALSE' AND c._FIVETRAN_DELETED = FALSE
                   AND c.FIRSTNAME IS NOT NULL AND c.FIRSTNAME <> ''
                   AND c.ISCOAPP = 0
                   AND c.ID > {$lastId}
@@ -700,6 +722,8 @@ class SyncContactsData extends Command
                       JOIN CONTACTS_LEAD_STATUS eligible_lead ON eligible_status.STATUS_ID = eligible_lead.ID
                       WHERE eligible_status.CONTACT_ID = c.ID
                         AND eligible_lead.TITLE <> 'Duplicate Lead'
+                        AND eligible_status._FIVETRAN_DELETED = FALSE
+                        AND eligible_lead._FIVETRAN_DELETED = FALSE
                   )
                 ORDER BY c.ID
                 LIMIT {$limit}
@@ -708,6 +732,7 @@ class SyncContactsData extends Command
                 SELECT a.CONTACT_ID, a.STAMP
                 FROM CONTACTS_ASSIGNED AS a
                 JOIN contact_page AS p ON p.ID = a.CONTACT_ID
+                WHERE a._FIVETRAN_DELETED = FALSE
                 QUALIFY ROW_NUMBER() OVER (PARTITION BY a.CONTACT_ID ORDER BY a.STAMP DESC, a.ID DESC) = 1
             ),
             page_status AS (
@@ -716,6 +741,7 @@ class SyncContactsData extends Command
                 JOIN contact_page AS p ON p.ID = s.CONTACT_ID
                 JOIN CONTACTS_LEAD_STATUS AS eligible_cls ON eligible_cls.ID = s.STATUS_ID
                 WHERE eligible_cls.TITLE <> 'Duplicate Lead'
+                  AND s._FIVETRAN_DELETED = FALSE AND eligible_cls._FIVETRAN_DELETED = FALSE
                 QUALIFY ROW_NUMBER() OVER (PARTITION BY s.CONTACT_ID ORDER BY s.STAMP DESC, s.ID DESC) = 1
             ),
             page_scores AS (
@@ -745,7 +771,7 @@ class SyncContactsData extends Command
             )
             SELECT
                 TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', c.CREATED), 'YYYY-MM-DD HH24:MI:SS') AS CREATED,
-                TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', a.STAMP), 'YYYY-MM-DD HH24:MI:SS') AS ASSIGNED_ON,
+                TO_CHAR(a.STAMP, 'YYYY-MM-DD HH24:MI:SS') AS ASSIGNED_ON,
                 TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', COALESCE(c.MODIFIED, a.STAMP)), 'YYYY-MM-DD HH24:MI:SS') AS MODIFIED,
                 c.ID AS LLG_ID,
                 c.TP_ID AS EXTERNAL_ID,
@@ -774,8 +800,8 @@ class SyncContactsData extends Command
             FROM contact_page AS c
             LEFT JOIN page_assignment AS a ON c.ID = a.CONTACT_ID
             LEFT JOIN DATA_SOURCES AS ds ON c.C_SOURCE = ds.ID
-            LEFT JOIN USERS AS u1 ON c.CREATED_BY = u1.UID
-            LEFT JOIN USERS AS u2 ON c.ASSIGNED_TO = u2.UID
+            LEFT JOIN USERS AS u1 ON c.CREATED_BY = u1.UID AND u1._FIVETRAN_DELETED = FALSE
+            LEFT JOIN USERS AS u2 ON c.ASSIGNED_TO = u2.UID AND u2._FIVETRAN_DELETED = FALSE
             JOIN page_status AS s ON c.ID = s.CONTACT_ID
             LEFT JOIN CONTACTS_CATEGORIES AS cc ON s.STAGE_ID = cc.ID
             LEFT JOIN CONTACTS_LEAD_STATUS AS cls ON s.STATUS_ID = cls.ID
@@ -1204,8 +1230,8 @@ class SyncContactsData extends Command
         $existingCategories = $enrollmentData['categories'];
         $existingAffiliates = $enrollmentData['affiliate_agents'];
 
-        // Drop ghosts first, then keep latest Modified per TP_ID. If ghost wins
-        // Modified DESC and we skip it after, the real contact for that TP_ID is lost.
+        // Filter explicit excluded records, then verify native source IDs.
+        // External/partner IDs are allowed to repeat and never choose a winning person.
         $ghostIds = [1212313502, 1212314964, 1212315478, 1212329195, 1212342404];
         $chunk = array_values(array_filter(
             $chunk,
@@ -1276,12 +1302,12 @@ class SyncContactsData extends Command
             if (!empty($enrolledDate) && isset($existingCategories[$contactId]) && $category !== '') {
                 $llgId = "LLG-{$contactId}";
                 if ($existingCategories[$contactId] !== $category) {
-                    $categoryChanges[] = ['llg_id' => $llgId, 'category' => $category];
+                    $categoryChanges[] = ['llg_id' => $llgId, 'category' => $category, 'before' => $existingCategories[$contactId], 'client' => $processedRow['client'], 'email' => $processedRow['email'], 'phone' => $processedRow['phone']];
                 }
                 if ($category !== 'LDR') {
                     $existingAffiliate = $existingAffiliates[$contactId] ?? '';
                     if ($agent !== '' && $existingAffiliate !== $agent && !\str_ends_with(\strtolower($agent), ' user')) {
-                        $affiliateChanges[] = ['llg_id' => $llgId, 'agent' => $agent];
+                        $affiliateChanges[] = ['llg_id' => $llgId, 'agent' => $agent, 'before' => $existingAffiliate, 'client' => $processedRow['client'], 'email' => $processedRow['email'], 'phone' => $processedRow['phone']];
                     }
                 }
             }
@@ -2466,25 +2492,21 @@ class SyncContactsData extends Command
     }
 
     /**
-     * Keep one record per TP_ID (Jacob). Prefer the richest contact row, then newest Modified.
-     * Blank / fake shared TP_IDs are kept individually (keyed by contact ID).
+     * External IDs may be shared by different contacts; never discard a native source ID.
      */
     private function dedupeSnowflakeChunkByTpId(array $chunk): array
     {
-        $best = [];
+        $seen = [];
         foreach ($chunk as $row) {
-            $tpId = trim((string) ($row['EXTERNAL_ID'] ?? $row['TP_ID'] ?? ''));
             $id = (string) ($row['LLG_ID'] ?? '');
-            // Fake shared Ext (1234567840, 0) must not collapse unrelated spam into one key.
-            $key = ($tpId !== '' && !$this->isFakeExternalId($tpId)) ? $tpId : ('ID-' . $id);
-            if (!isset($best[$key]) || $this->snowflakeRowBetterThan($row, $best[$key])) {
-                $best[$key] = $row;
+            if ($id === '' || isset($seen[$id])) {
+                throw new \RuntimeException('Missing or duplicate Snowflake source ID: ' . $id);
             }
+            $seen[$id] = true;
         }
-        return array_values($best);
+        return $chunk;
     }
 
-    /** Prefer phone/email/address completeness, then newer Modified, then higher ID. */
     private function snowflakeRowBetterThan(array $candidate, array $existing): bool
     {
         $cScore = $this->snowflakeRowRichnessScore($candidate);
