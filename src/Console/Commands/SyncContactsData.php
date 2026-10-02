@@ -1588,7 +1588,7 @@ class SyncContactsData extends Command
             return $this->previewMatching($connector, [$this->targetTable]);
         }
 
-        $this->resetMatchingStats(13);
+        $this->resetMatchingStats(6);
         $this->printMatchingHeader("{$this->source} post-sync matching");
         $this->matchSourceTableToContacts($connector, $this->targetTable);
         $this->fillEnrollmentAgents($connector, (bool) $this->option('reconcile-agents'));
@@ -1602,7 +1602,7 @@ class SyncContactsData extends Command
             return $this->previewMatching($connector, ['TblContactsLDR', 'TblContactsPLAW']);
         }
 
-        $this->resetMatchingStats(23);
+        $this->resetMatchingStats(10);
         $this->printMatchingHeader('orchestrator final matching (External ID → TblContacts → TblEnrollment)');
 
         foreach (['TblContactsLDR', 'TblContactsPLAW'] as $table) {
@@ -1871,269 +1871,20 @@ class SyncContactsData extends Command
      */
     private function matchSourceTableToContacts(DBConnector $connector, string $table): void
     {
-        $fields = $this->matchedFieldsSql($table);
-        $sameIdentity = $this->contactIdentityMatchSql('TblContacts', $table);
-        $sameName = $this->contactNameMatchSql('e', 'src');
-        $enrollmentNameCompatible = "(NULLIF(LTRIM(RTRIM(COALESCE(e.Client, ''))), '') IS NULL OR {$sameName})";
-        $duplicateSourceIdentity = $this->contactIdentityMatchSql('TblContacts', 'duplicate');
-        $duplicateContactIdentity = $this->contactIdentityMatchSql('duplicateContact', $table);
-        $keptIdentity = $this->contactIdentityMatchSql('kept', 'src');
-        $orphanContactIdentity = $this->contactIdentityMatchSql('lt', 'src');
-        $ltIdentity = $this->contactIdentityMatchSql('lt', 'source');
-        $otherLtIdentity = $this->contactIdentityMatchSql('otherLt', 'source');
-
-        $this->runMatchingStep(
-            $connector,
-            "{$table}.llg_id_fields",
-            "UPDATE TblContacts
-             SET {$fields}
-             FROM TblContacts
-             INNER JOIN {$table} ON TblContacts.LLG_ID = {$table}.LLG_ID
-               AND {$sameIdentity}",
-            "Switched fields on TblContacts from {$table} (LLG_ID match)"
-        );
-
-        $this->runMatchingStep(
-            $connector,
-            "{$table}.external_id_fields",
-            "UPDATE TblContacts
-             SET {$fields}
-             FROM TblContacts
-             INNER JOIN {$table}
-               ON TblContacts.LLG_ID = 'LLG-' + CAST({$table}.External_ID AS VARCHAR(50))
-              AND {$sameIdentity}",
-            "Switched fields on TblContacts from {$table} (External_ID match)"
-        );
-
-        $this->runMatchingStep(
-            $connector,
-            "{$table}.identity_fields",
-            "UPDATE TblContacts
-             SET {$fields}
-             FROM TblContacts
-             INNER JOIN {$table} ON {$sameIdentity}
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM {$table} AS duplicate
-                 WHERE duplicate.LLG_ID <> {$table}.LLG_ID
-                   AND {$duplicateSourceIdentity}
-             )
-             AND NOT EXISTS (
-                 SELECT 1 FROM TblContacts AS duplicateContact
-                 WHERE duplicateContact.LLG_ID <> TblContacts.LLG_ID
-                   AND {$duplicateContactIdentity}
-             )",
-            "Switched fields on TblContacts from {$table} (verified name/email/phone)"
-        );
-
-        $this->runMatchingStep(
-            $connector,
-            "{$table}.external_id_remap",
-            "UPDATE TblContacts
-             SET TblContacts.LLG_ID = {$table}.LLG_ID
-             FROM TblContacts
-             INNER JOIN {$table}
-               ON TblContacts.LLG_ID = 'LLG-' + CAST({$table}.External_ID AS VARCHAR(50))
-              AND {$sameIdentity}
-             LEFT JOIN TblContacts AS taken ON taken.LLG_ID = {$table}.LLG_ID
-             WHERE taken.LLG_ID IS NULL
-               AND TblContacts.LLG_ID <> {$table}.LLG_ID
-               AND NOT EXISTS (
-                   SELECT 1 FROM {$table} AS duplicate
-                   WHERE duplicate.External_ID = {$table}.External_ID
-                     AND duplicate.LLG_ID <> {$table}.LLG_ID
-                     AND {$duplicateSourceIdentity}
-               )
-               AND NOT EXISTS (
-                   SELECT 1 FROM TblContacts AS duplicateContact
-                   WHERE duplicateContact.LLG_ID <> TblContacts.LLG_ID
-                     AND {$duplicateContactIdentity}
-               )",
-            "Remapped TblContacts.LLG_ID from {$table} (External_ID match)"
-        );
-
-        // Repair stale or previously mis-switched IDs by the verified person identity,
-        // even when an earlier bad ID no longer matches the source External_ID.
-        $this->runMatchingStep(
-            $connector,
-            "{$table}.identity_remap",
-            "UPDATE TblContacts
-             SET TblContacts.LLG_ID = {$table}.LLG_ID
-             FROM TblContacts
-             INNER JOIN {$table} ON {$sameIdentity}
-             LEFT JOIN TblContacts AS taken
-               ON taken.LLG_ID = {$table}.LLG_ID
-              AND taken.LLG_ID <> TblContacts.LLG_ID
-             WHERE taken.LLG_ID IS NULL
-               AND TblContacts.LLG_ID <> {$table}.LLG_ID
-               AND NOT EXISTS (
-                   SELECT 1 FROM {$table} AS duplicate
-                   WHERE duplicate.LLG_ID <> {$table}.LLG_ID
-                     AND {$duplicateSourceIdentity}
-               )
-               AND NOT EXISTS (
-                   SELECT 1 FROM TblContacts AS duplicateContact
-                   WHERE duplicateContact.LLG_ID <> TblContacts.LLG_ID
-                     AND {$duplicateContactIdentity}
-               )",
-            "Repaired TblContacts.LLG_ID by unique name/email/phone identity from {$table}"
-        );
-
-        // Amanda-class: remapped rows often keep blank External_ID (LT TP_ID null).
-        // Store side-table External_ID (LT contact id) so later LT sync can refresh Agent.
-        $this->runMatchingStep(
-            $connector,
-            "{$table}.backfill_external_id",
-            "UPDATE TblContacts
-             SET TblContacts.External_ID = LEFT(CAST({$table}.External_ID AS VARCHAR(50)), 50)
-             FROM TblContacts
-             INNER JOIN {$table} ON TblContacts.LLG_ID = {$table}.LLG_ID
-               AND {$sameIdentity}
-             WHERE COALESCE(TblContacts.External_ID, '') = ''
-               AND COALESCE(CAST({$table}.External_ID AS VARCHAR(50)), '') <> ''
-               AND CAST({$table}.External_ID AS VARCHAR(50)) NOT IN ('0', '1234567840', 'UNKNOWN')",
-            "Backfilled blank TblContacts.External_ID from {$table}"
-        );
-
-        // Side-table Agent is authoritative from the linked LT contact, not the
-        // LDR/PLAW custom agent field. Resolve by the swapped key plus person identity.
-        // When duplicate LT rows disagree on Agent, leave the side row unchanged.
-        $this->runMatchingStep(
-            $connector,
-            "{$table}.lt_agent_sync",
-            "UPDATE source
-             SET source.Agent = lt.Agent
-             FROM {$table} AS source
-             INNER JOIN TblContacts AS lt
-               ON lt.LLG_ID = source.LLG_ID
-              AND {$ltIdentity}
-             WHERE NULLIF(LTRIM(RTRIM(COALESCE(lt.Agent, ''))), '') IS NOT NULL
-               AND lt.Agent NOT LIKE '% User'
-               AND COALESCE(source.Agent, '') <> lt.Agent
-               AND NOT EXISTS (
-                   SELECT 1 FROM TblContacts AS otherLt
-                   WHERE otherLt.LLG_ID = lt.LLG_ID
-                     AND {$otherLtIdentity}
-                     AND COALESCE(otherLt.Agent, '') <> lt.Agent
-               )",
-            "Refreshed {$table}.Agent from its identity-matched LT contact"
-        );
-
-        // If kept already has enrollment, drop orphan enroll keyed by side-table External_ID
-        // (LT contact id). Does NOT require orphan contact row — contact cleanup often
-        // deletes that first and used to leave enroll person-dups behind.
-        $this->runMatchingStep(
-            $connector,
-            "{$table}.drop_enroll_orphans",
-            "DELETE e
-             FROM TblEnrollment AS e
-             INNER JOIN {$table} AS src
-             ON e.LLG_ID = 'LLG-' + CAST(src.External_ID AS VARCHAR(50))
-               AND {$enrollmentNameCompatible}
-             INNER JOIN TblContacts AS kept ON kept.LLG_ID = src.LLG_ID
-               AND {$keptIdentity}
-             WHERE e.LLG_ID <> src.LLG_ID
-               AND NOT EXISTS (
-                    SELECT 1 FROM {$table} AS duplicate
-                    WHERE duplicate.External_ID = src.External_ID
-                      AND duplicate.LLG_ID <> src.LLG_ID
-               )
-               AND EXISTS (
-                    SELECT 1 FROM TblEnrollment AS e2 WHERE e2.LLG_ID = kept.LLG_ID
-               )",
-            "Dropped orphan LT-keyed TblEnrollment rows when kept LLG already enrolled ({$table})"
-        );
-
-        $this->runMatchingStep(
-            $connector,
-            "{$table}.enroll_orphan_to_kept",
-            "UPDATE e
-             SET e.LLG_ID = kept.LLG_ID
-             FROM TblEnrollment AS e
-             INNER JOIN {$table} AS src
-             ON e.LLG_ID = 'LLG-' + CAST(src.External_ID AS VARCHAR(50))
-               AND {$enrollmentNameCompatible}
-             INNER JOIN TblContacts AS kept ON kept.LLG_ID = src.LLG_ID
-               AND {$keptIdentity}
-             WHERE e.LLG_ID <> src.LLG_ID
-               AND NOT EXISTS (
-                    SELECT 1 FROM {$table} AS duplicate
-                    WHERE duplicate.External_ID = src.External_ID
-                      AND duplicate.LLG_ID <> src.LLG_ID
-               )
-               AND NOT EXISTS (
-                    SELECT 1 FROM TblEnrollment AS e2 WHERE e2.LLG_ID = kept.LLG_ID
-               )",
-            "Moved enrollments from orphan LT key to kept LLG_ID ({$table})"
-        );
-
-        $this->runMatchingStep(
-            $connector,
-            "{$table}.drop_lt_orphans",
-            "DELETE lt
-             FROM TblContacts AS lt
-             INNER JOIN {$table} AS src
-               ON lt.LLG_ID = 'LLG-' + CAST(src.External_ID AS VARCHAR(50))
-               AND {$orphanContactIdentity}
-             INNER JOIN TblContacts AS kept ON kept.LLG_ID = src.LLG_ID
-               AND {$keptIdentity}
-             WHERE lt.LLG_ID <> src.LLG_ID
-               AND NOT EXISTS (
-                    SELECT 1 FROM TblEnrollment AS e WHERE e.LLG_ID = lt.LLG_ID
-               )",
-            "Dropped orphan LT-keyed TblContacts rows after {$table} match"
-        );
+        $source = $table === 'TblContactsLDR' ? 'LDR' : 'PLAW';
+        foreach (ContactSyncMatching::sourceSteps($source) as $step => $sql) {
+            if (!$this->runMatchingStep($connector, "{$table}.{$step}", $sql['update'], "{$table}: {$step}")) {
+                throw new \RuntimeException("Matching failed at {$table}.{$step}; watermark must not advance.");
+            }
+        }
     }
 
     private function fillEnrollmentAgents(DBConnector $connector, bool $reconcileAgents = false): void
     {
-        // Enrollment Agent comes from TblContacts (LT roster) only — never LDR/PLAW
-        // process users ("ProgressLaw User", "LDR User").
-        $badAgent = "(TblEnrollment.Agent IS NULL OR TblEnrollment.Agent = '' OR TblEnrollment.Agent LIKE '% User')";
-        $goodContact = "c.Agent IS NOT NULL AND c.Agent <> '' AND c.Agent NOT LIKE '% User'";
-        $sameName = $this->contactNameMatchSql('TblEnrollment', 'c');
-        $sameNameDrop = $this->contactNameMatchSql('TblEnrollment', 'TblContacts');
-
-        $steps = [
-            'enrollment.agent_contacts' => [
-                'sql' => "UPDATE TblEnrollment
-             SET TblEnrollment.Agent = c.Agent
-             FROM TblEnrollment
-             JOIN (
-                 SELECT LLG_ID, MIN(Agent) AS Agent, MIN(Client) AS Client
-                 FROM TblContacts
-                 WHERE Agent IS NOT NULL AND Agent <> '' AND Agent NOT LIKE '% User'
-                 GROUP BY LLG_ID
-             ) c ON TblEnrollment.LLG_ID = c.LLG_ID
-                    AND {$sameName}
-             WHERE {$badAgent}
-                OR TblEnrollment.Agent <> c.Agent",
-                'label' => 'Updated TblEnrollment.Agent from TblContacts',
-            ],
-            'enrollment.clear_system_user_agents' => [
-                'sql' => "UPDATE TblEnrollment
-             SET Agent = NULL
-             WHERE Agent LIKE '% User'
-               AND NOT EXISTS (
-                    SELECT 1 FROM TblContacts c
-                    WHERE c.LLG_ID = TblEnrollment.LLG_ID
-                      AND {$sameName}
-                      AND {$goodContact}
-               )",
-                'label' => 'Cleared enrollment system-user agents with no roster contact',
-            ],
-            'enrollment.drop_name' => [
-                'sql' => "UPDATE TblEnrollment
-             SET TblEnrollment.Drop_Name = TblContacts.Campaign
-             FROM TblEnrollment, TblContacts
-             WHERE TblEnrollment.LLG_ID = TblContacts.LLG_ID
-               AND {$sameNameDrop}
-               AND COALESCE(TblContacts.Campaign, '') <> ''",
-                'label' => 'Updated TblEnrollment.Drop_Name from TblContacts.Campaign',
-            ],
-        ];
-
-        foreach ($steps as $step => $config) {
-            $this->runMatchingStep($connector, $step, $config['sql'], $config['label']);
+        foreach (ContactSyncMatching::enrollmentSteps($reconcileAgents) as $step => $sql) {
+            if (!$this->runMatchingStep($connector, "enrollment.{$step}", $sql['update'], "Enrollment: {$step}")) {
+                throw new \RuntimeException("Enrollment matching failed at {$step}; watermark must not advance.");
+            }
         }
     }
 
