@@ -190,6 +190,8 @@ class SyncContactsFullRefreshTest extends TestCase
         self::assertStringContainsString('AND c.ID > 100', $sql);
         self::assertLessThan(strpos($sql, 'page_assignment AS ('), strpos($sql, 'LIMIT 1000'));
         self::assertStringContainsString('FROM contact_page AS c', $sql);
+        self::assertStringContainsString("CONCAT(u2.FIRSTNAME, ' ', u2.LASTNAME) AS ASSIGNED_TO", $sql);
+        self::assertStringContainsString('LEFT JOIN USERS AS u2 ON c.ASSIGNED_TO = u2.UID', $sql);
         self::assertStringContainsString('page_assignment AS', $sql);
         self::assertStringContainsString('page_status AS', $sql);
         self::assertStringContainsString('page_scores AS', $sql);
