@@ -3,6 +3,7 @@
 namespace Cmd\Reports\Console\Commands;
 
 use Cmd\Reports\Services\DBConnector;
+use Cmd\Reports\Services\ContactSyncIdentity;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
@@ -2542,42 +2543,17 @@ class SyncContactsData extends Command
      */
     private function contactIdentityMatchSql(string $leftAlias, string $rightAlias): string
     {
-        $leftName = $this->normalizedContactNameSql($leftAlias);
-        $rightName = $this->normalizedContactNameSql($rightAlias);
-        $leftEmail = "LOWER(LTRIM(RTRIM(COALESCE({$leftAlias}.Email, ''))))";
-        $rightEmail = "LOWER(LTRIM(RTRIM(COALESCE({$rightAlias}.Email, ''))))";
-        $leftPhone = $this->normalizedContactPhoneSql($leftAlias);
-        $rightPhone = $this->normalizedContactPhoneSql($rightAlias);
-
-        $emailMatches = "({$leftEmail} <> '' AND {$rightEmail} <> '' AND CHARINDEX('@', {$leftEmail}) > 1 AND {$leftEmail} = {$rightEmail})";
-        $phoneMatches = "(LEN({$leftPhone}) >= 7 AND LEN({$rightPhone}) >= 7 AND {$leftPhone} = {$rightPhone})";
-        $emailCompatible = "({$leftEmail} = '' OR {$rightEmail} = '' OR {$leftEmail} = {$rightEmail})";
-        $phoneCompatible = "({$leftPhone} = '' OR {$rightPhone} = '' OR {$leftPhone} = {$rightPhone})";
-
-        return "({$leftName} <> '' AND {$leftName} = {$rightName}
-            AND {$emailCompatible}
-            AND {$phoneCompatible}
-            AND ({$emailMatches} OR {$phoneMatches}))";
+        return ContactSyncIdentity::sql($leftAlias, $rightAlias);
     }
 
     private function normalizedContactNameSql(string $alias): string
     {
-        $value = "UPPER(LTRIM(RTRIM(COALESCE({$alias}.Client, ''))))";
-        foreach (["' '", "'.'", "','", "'-'", "'/'", "CHAR(39)", 'CHAR(9)'] as $character) {
-            $value = "REPLACE({$value}, {$character}, '')";
-        }
-
-        return $value;
+        return ContactSyncIdentity::nameSql($alias);
     }
 
     private function normalizedContactPhoneSql(string $alias): string
     {
-        $value = "LTRIM(RTRIM(COALESCE({$alias}.Phone, '')))";
-        foreach (["' '", "'-'", "'('", "')'", "'+'", "'.'", "'/'", 'CHAR(9)', 'CHAR(10)', 'CHAR(13)'] as $character) {
-            $value = "REPLACE({$value}, {$character}, '')";
-        }
-
-        return $value;
+        return ContactSyncIdentity::phoneSql($alias);
     }
 
     private function resetMatchingStats(int $stepTotal): void
