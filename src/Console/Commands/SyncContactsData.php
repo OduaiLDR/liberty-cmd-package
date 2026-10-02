@@ -17,7 +17,7 @@ class SyncContactsData extends Command
         {--source=   : Run a single source only (LDR, PLAW, or LT)}
         {--full      : Preview a full source refresh; requires --dry-run while identities are reconciled}
         {--debt-only : Compare debt columns only; requires --dry-run and --source=LDR or PLAW}
-        {--owners-refresh : Re-pull EVERY contact since 2021-07-01 (current CRM ASSIGNED_TO) without truncating. Non-destructive DELETE+INSERT per chunk. Use to correct agent names that drifted because an incremental sync never re-pulled a reassignment older than the watermark.}
+        {--owners-refresh : Explicitly re-pull contacts since 2021-07-01 using guarded upserts; existing identities and remapped keys must verify}
         {--dry-run   : Fetch and report changes without modifying SQL Server or sync watermarks; matching runs as read-only verification}
         {--verify-match : Read-only matching verification only (no Snowflake fetch, no SQL writes)}
         {--reconcile-agents : Reconcile non-blank enrollment agents from unambiguous source contact assignments}
@@ -318,7 +318,7 @@ class SyncContactsData extends Command
         //   idempotent, so this safely corrects agent names that an incremental
         //   sync never re-pulled (reassignment older than the watermark) without
         //   the risk/downtime of dropping and rebuilding the table.
-        // Full refresh: stage every page before replacing the target in one transaction.
+        // Full previews are read-only. Full writes are blocked at the command boundary.
         $ownersRefresh = (bool) $this->option('owners-refresh');
         $lastSyncAt    = ($this->option('full') || $ownersRefresh) ? null : $this->readLastSyncTime($this->source);
         $isIncremental = $lastSyncAt !== null;
@@ -326,12 +326,11 @@ class SyncContactsData extends Command
         if ($isIncremental) {
             // Subtract 24 hours as a safety buffer against clock skew / in-flight writes
             // and any latent timezone-conversion edge cases in the Snowflake date filter.
-            // insertChunk() is an idempotent DELETE+INSERT, so re-pulling a day of overlap is safe.
+            // Guarded upserts are idempotent; repeated overlap does not merge native source IDs.
             $startDate = date('Y-m-d H:i:s', strtotime($lastSyncAt) - 86400);
             $this->info("[INFO] Incremental mode: fetching contacts modified since {$startDate}.");
         } elseif ($ownersRefresh) {
-            // Wide fetch, DELETE+INSERT per chunk, no truncate. Runs in incremental
-            // insert mode so existing rows are replaced in place rather than wiped.
+            // Explicit wide fetch uses the same verified target selection and field updates.
             $startDate     = '2021-07-01';
             $isIncremental = true;
             $this->info('[INFO] Owners-refresh mode: re-pulling every contact since 2021-07-01 (no truncate).');
@@ -406,7 +405,7 @@ class SyncContactsData extends Command
             }
 
             $processStarted = microtime(true);
-            $this->logStep("Page {$pageNum}: processing chunk (ghost/dup-lead filter + TP_ID dedupe)...");
+            $this->logStep("Page {$pageNum}: processing chunk (ghost/dup-lead filter + source ID validation)...");
             $beforeProcess = $chunkSize;
             [$processedChunk, $newCatChanges, $newAffChanges] = $this->processChunk(
                 $chunk,
@@ -428,8 +427,12 @@ class SyncContactsData extends Command
             }
 
             if ($dryRun) {
-                $this->info("[DRY RUN][{$this->source}] Comparing proposed debt columns with {$this->targetTable}...");
-                $this->previewDebtChunk($sqlConnector, $processedChunk);
+                $this->info("[DRY RUN][{$this->source}] Comparing proposed source rows with {$this->targetTable}...");
+                if ($this->option('debt-only')) {
+                    $this->previewDebtChunk($sqlConnector, $processedChunk);
+                } else {
+                    $this->previewContactChunk($sqlConnector, $processedChunk);
+                }
                 $totalInserted += count($processedChunk);
                 $this->logStep('Page ' . $pageNum . ': dry-run skip write (' . count($processedChunk) . ' would upsert)');
             } else {
@@ -1172,32 +1175,36 @@ class SyncContactsData extends Command
                 $lookup[$id] = $old;
             }
             foreach ($batch as $row) {
-                $this->debtPreview['processed']++;
-                $this->debtPreview[$row['debt_basis']]++;
-                $old = $lookup[$row['llg_id']] ?? null;
-                if ($old === null) {
-                    $this->debtPreview['new']++;
-                    continue;
-                }
-                $amountChanged = $old['Debt_Amount'] === null
-                    || round((float) $old['Debt_Amount'], 2) !== round((float) $row['debt_amount'], 2);
-                $enrolledChanged = $old['Debt_Enrolled'] === null
-                    || round((float) $old['Debt_Enrolled'], 2) !== round((float) $row['debt_enrolled'], 2);
-                $this->debtPreview['amount_changed'] += (int) $amountChanged;
-                $this->debtPreview['enrolled_changed'] += (int) $enrolledChanged;
-                $this->debtPreview[$amountChanged || $enrolledChanged ? 'changed' : 'unchanged']++;
-                if (($amountChanged || $enrolledChanged) && $this->debtPreview['samples'] < 10) {
-                    $this->debtPreview['samples']++;
-                    $format = fn($value) => $value === null ? 'NULL' : number_format((float) $value, 2, '.', '');
-                    $this->line(sprintf('[DEBT CHANGE] %s Debt_Amount %s => %s; Debt_Enrolled %s => %s; basis=%s',
-                        $row['llg_id'], $format($old['Debt_Amount']), $format($row['debt_amount']),
-                        $format($old['Debt_Enrolled']), $format($row['debt_enrolled']), $row['debt_basis']));
-                }
+                $this->recordDebtPreview($row, isset($lookup[$row['llg_id']]) ? array_change_key_case($lookup[$row['llg_id']], CASE_LOWER) : null);
             }
         }
         $this->info(sprintf('[DRY RUN][%s] Debt comparison: %d processed, %d existing changed, %d unchanged, %d new.',
             $this->source, $this->debtPreview['processed'], $this->debtPreview['changed'],
             $this->debtPreview['unchanged'], $this->debtPreview['new']));
+    }
+
+    private function recordDebtPreview(array $row, ?array $old): void
+    {
+        $this->debtPreview['processed']++;
+        $this->debtPreview[$row['debt_basis']]++;
+        if ($old === null) {
+            $this->debtPreview['new']++;
+            return;
+        }
+        $amountChanged = $old['debt_amount'] === null
+            || round((float) $old['debt_amount'], 2) !== round((float) $row['debt_amount'], 2);
+        $enrolledChanged = $old['debt_enrolled'] === null
+            || round((float) $old['debt_enrolled'], 2) !== round((float) $row['debt_enrolled'], 2);
+        $this->debtPreview['amount_changed'] += (int) $amountChanged;
+        $this->debtPreview['enrolled_changed'] += (int) $enrolledChanged;
+        $this->debtPreview[$amountChanged || $enrolledChanged ? 'changed' : 'unchanged']++;
+        if (($amountChanged || $enrolledChanged) && $this->debtPreview['samples'] < 10) {
+            $this->debtPreview['samples']++;
+            $format = fn($value) => $value === null ? 'NULL' : number_format((float) $value, 2, '.', '');
+            $this->line(sprintf('[DEBT CHANGE] %s Debt_Amount %s => %s; Debt_Enrolled %s => %s; basis=%s',
+                $row['llg_id'], $format($old['debt_amount']), $format($row['debt_amount']),
+                $format($old['debt_enrolled']), $format($row['debt_enrolled']), $row['debt_basis']));
+        }
     }
 
     private function printDebtPreviewSummary(): void
@@ -1321,99 +1328,51 @@ class SyncContactsData extends Command
     // Insertion
     // -------------------------------------------------------------------------
 
-    /**
-     * Inserts one processed chunk and returns the number of rows upserted.
-     * Throws on any failure so the caller can abort the run immediately.
-     *
-     * Full refresh mode:  plain INSERT (table was already truncated).
-     * Incremental mode:   DELETE matching LLG_IDs first, then INSERT — this
-     *                     handles both updated existing contacts and brand-new ones
-     *                     without needing a full-table MERGE statement.
-     *
-     * LT special case: after matching remaps TblContacts.LLG_ID to LDR/PLAW,
-     * the LT key no longer exists. Re-INSERT would create a duplicate. Instead
-     * UPDATE the remapped row by External_ID and keep its LLG_ID (Jacob: match
-     * updates IDs; later LT sync must not insert a second row).
-     */
+    /** Same SELECT-based target decisions as dry-run; commit one validated chunk. */
     private function insertChunk(DBConnector $connector, array $data, bool $incremental = false): int
     {
-        if (empty($data)) {
+        if ($data === []) {
             return 0;
         }
-
-        // Deduplicate by LLG_ID within this chunk: keep the row with the most recent
-        // assigned_date and prefer rows with a non-empty agent.
-        $deduped = [];
-        foreach ($data as $row) {
-            $llgId = $row['llg_id'] ?? '';
-            if ($llgId === '') {
-                $deduped[] = $row;
-                continue;
-            }
-            if (!isset($deduped[$llgId])) {
-                $deduped[$llgId] = $row;
-                continue;
-            }
-            $existing = $deduped[$llgId];
-            $existingAgent    = $existing['agent'] ?? '';
-            $rowAgent         = $row['agent'] ?? '';
-            $existingAssigned = $existing['assigned_date'] ?? '';
-            $rowAssigned      = $row['assigned_date'] ?? '';
-            $rowBetter = ($existingAgent === '' && $rowAgent !== '')
-                || ($existingAgent === $rowAgent && $rowAssigned > $existingAssigned);
-            if ($rowBetter) {
-                $deduped[$llgId] = $row;
-            }
-        }
-        $data = \array_values($deduped);
-
-        $fields = $this->contactFields();
-
         $pdo = $connector->getSqlServerConnection();
-        $pdo->beginTransaction();
-
+        if (!$pdo->beginTransaction()) {
+            throw new \RuntimeException('Could not begin contact upsert transaction.');
+        }
         try {
-            $toInsert = $data;
-            $toUpdate = [];
-
-            if ($incremental && $this->source === 'LT') {
-                $splitStarted = microtime(true);
-                $this->logStep('SQL: splitting LT upserts (External_ID + remapped LDR/PLAW lookup)...');
-                [$toUpdate, $toInsert] = $this->splitLtIncrementalUpserts($pdo, $data);
-                $this->logStep(
-                    'SQL: split done — update=' . count($toUpdate) . ', insert=' . count($toInsert),
-                    $splitStarted
-                );
-
-                if ($toUpdate !== []) {
-                    $updStarted = microtime(true);
-                    $this->logStep('SQL: updating ' . count($toUpdate) . ' remapped TblContacts row(s)...');
-                    $this->updateLtContactsByExternalId($pdo, $toUpdate);
-                    $this->logStep('SQL: remapped updates done', $updStarted);
-                }
+            // Staging only receives rows already planned against the real destination.
+            if ($this->targetTable === $this->refreshStage) {
+                $this->insertContactRows($pdo, $this->contactFields(), $data);
+                $count = count($data);
+            } else {
+                $plan = ContactSyncTargets::plan($pdo, $data, $this->source, true);
+                $count = ContactSyncTargets::apply($pdo, $plan, $this->source);
             }
-
-            if ($incremental && !empty($toInsert)) {
-                $delStarted = microtime(true);
-                $this->logStep('SQL: deleting ' . count($toInsert) . ' existing LLG_ID(s) before re-insert...');
-                $this->deleteByLlgIds($pdo, \array_column($toInsert, 'llg_id'));
-                $this->logStep('SQL: deletes done', $delStarted);
+            if (!$pdo->commit()) {
+                throw new \RuntimeException('Contact upsert commit failed.');
             }
-
-            if (!empty($toInsert)) {
-                $insStarted = microtime(true);
-                $this->logStep('SQL: inserting ' . count($toInsert) . ' row(s) into ' . $this->targetTable . '...');
-                $this->insertContactRows($pdo, $fields, $toInsert);
-                $this->logStep('SQL: inserts done', $insStarted);
-            }
-
-            $pdo->commit();
-            return \count($data);
+            return $count;
         } catch (\Throwable $e) {
             if ($pdo->inTransaction()) {
                 $pdo->rollBack();
             }
             throw $e;
+        }
+    }
+
+    private function previewContactChunk(DBConnector $connector, array $rows): void
+    {
+        $plan = ContactSyncTargets::plan($connector->getSqlServerConnection(), $rows, $this->source);
+        $byId = array_column($rows, null, 'llg_id');
+        foreach ($plan as $change) {
+            $debtRow = $byId[$change['incoming_id']];
+            $debtRow['llg_id'] = $change['target_id'];
+            $this->recordDebtPreview($debtRow, $change['before']);
+            $this->line('[PREVIEW] ' . json_encode([
+                'source' => $this->source, 'table' => $this->targetTable,
+                'incoming_id' => $change['incoming_id'], 'target_id' => $change['target_id'],
+                'action' => $change['before'] === null ? 'insert' : ($change['changes'] === [] ? 'unchanged' : 'update'),
+                'changes' => $change['changes'],
+            ], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
         }
     }
 
@@ -1742,7 +1701,7 @@ class SyncContactsData extends Command
             foreach ($batch as $row) {
                 $createdDate  = $row['created_date'] ? "'{$row['created_date']}'" : 'NULL';
                 $assignedDate = $row['assigned_date'] ? "'{$row['assigned_date']}'" : 'NULL';
-                $email        = \strpos($row['email'], '@') !== false
+                $email        = \strpos((string) ($row['email'] ?? ''), '@') !== false
                     ? "'" . $this->escSql($row['email']) . "'"
                     : 'NULL';
 
@@ -1884,6 +1843,8 @@ class SyncContactsData extends Command
     private function stageFullRefreshChunk(DBConnector $connector, array $rows): int
     {
         $target = $this->targetTable;
+        $plan = ContactSyncTargets::plan($connector->getSqlServerConnection(), $rows, $this->source);
+        $rows = array_column($plan, 'after');
         try {
             $this->targetTable = $this->refreshStage;
             return $this->insertChunk($connector, $rows, false);
