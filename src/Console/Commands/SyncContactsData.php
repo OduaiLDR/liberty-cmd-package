@@ -1838,7 +1838,7 @@ class SyncContactsData extends Command
             return $this->previewMatching($connector, [$this->targetTable]);
         }
 
-        $this->resetMatchingStats(10);
+        $this->resetMatchingStats(13);
         $this->printMatchingHeader("{$this->source} post-sync matching");
         $this->matchSourceTableToContacts($connector, $this->targetTable);
         $this->fillEnrollmentAgents($connector, (bool) $this->option('reconcile-agents'));
@@ -1852,7 +1852,7 @@ class SyncContactsData extends Command
             return $this->previewMatching($connector, ['TblContactsLDR', 'TblContactsPLAW']);
         }
 
-        $this->resetMatchingStats(17);
+        $this->resetMatchingStats(23);
         $this->printMatchingHeader('orchestrator final matching (External ID → TblContacts → TblEnrollment)');
 
         foreach (['TblContactsLDR', 'TblContactsPLAW'] as $table) {
@@ -1872,8 +1872,8 @@ class SyncContactsData extends Command
      */
     private function previewMatching(DBConnector $connector, array $tables): bool
     {
-        // 6 counts per source table + 3 enrollment fix counts + 6 Jacob gap counts
-        $this->resetMatchingStats((\count($tables) * 7) + 3 + 6);
+        // 8 counts per source table + 3 enrollment fix counts + 6 Jacob gap counts
+        $this->resetMatchingStats((\count($tables) * 8) + 3 + 6);
         $this->printMatchingHeader('DRY RUN — matching verification (read-only, no writes)');
 
         foreach ($tables as $table) {
@@ -1891,18 +1891,19 @@ class SyncContactsData extends Command
     private function previewSourceTableMatching(DBConnector $connector, string $table): void
     {
         $agentGap = "COALESCE({$table}.Agent, '') <> '' AND COALESCE(TblContacts.Agent, '') = ''";
+        $sameIdentity = $this->contactIdentityMatchSql('TblContacts', $table);
 
         $this->previewCountStep(
             $connector,
             "{$table}.llg_id_join",
-            "SELECT COUNT(*) AS cnt FROM TblContacts INNER JOIN {$table} ON TblContacts.LLG_ID = {$table}.LLG_ID",
+            "SELECT COUNT(*) AS cnt FROM TblContacts INNER JOIN {$table} ON TblContacts.LLG_ID = {$table}.LLG_ID AND {$sameIdentity}",
             "Rows joined on LLG_ID ({$table})"
         );
 
         $this->previewCountStep(
             $connector,
             "{$table}.llg_id_agent_gap",
-            "SELECT COUNT(*) AS cnt FROM TblContacts INNER JOIN {$table} ON TblContacts.LLG_ID = {$table}.LLG_ID WHERE {$agentGap}",
+            "SELECT COUNT(*) AS cnt FROM TblContacts INNER JOIN {$table} ON TblContacts.LLG_ID = {$table}.LLG_ID AND {$sameIdentity} WHERE {$agentGap}",
             "Joined on LLG_ID with blank TblContacts.Agent ({$table})"
         );
 
@@ -1910,7 +1911,8 @@ class SyncContactsData extends Command
             $connector,
             "{$table}.external_id_join",
             "SELECT COUNT(*) AS cnt FROM TblContacts INNER JOIN {$table}
-             ON TblContacts.LLG_ID = 'LLG-' + CAST({$table}.External_ID AS VARCHAR(50))",
+             ON TblContacts.LLG_ID = 'LLG-' + CAST({$table}.External_ID AS VARCHAR(50))
+               AND {$sameIdentity}",
             "Rows joined on External_ID ({$table})"
         );
 
@@ -1919,6 +1921,7 @@ class SyncContactsData extends Command
             "{$table}.external_id_agent_gap",
             "SELECT COUNT(*) AS cnt FROM TblContacts INNER JOIN {$table}
              ON TblContacts.LLG_ID = 'LLG-' + CAST({$table}.External_ID AS VARCHAR(50))
+               AND {$sameIdentity}
              WHERE {$agentGap}",
             "External_ID join with blank TblContacts.Agent ({$table})"
         );
@@ -1928,6 +1931,7 @@ class SyncContactsData extends Command
             "{$table}.external_id_remap",
             "SELECT COUNT(*) AS cnt FROM TblContacts
              INNER JOIN {$table} ON TblContacts.LLG_ID = 'LLG-' + CAST({$table}.External_ID AS VARCHAR(50))
+               AND {$sameIdentity}
              LEFT JOIN TblContacts AS taken ON taken.LLG_ID = {$table}.LLG_ID
              WHERE taken.LLG_ID IS NULL AND TblContacts.LLG_ID <> {$table}.LLG_ID",
             "Rows eligible for LLG_ID remap ({$table})"
@@ -1935,9 +1939,42 @@ class SyncContactsData extends Command
 
         $this->previewCountStep(
             $connector,
+            "{$table}.identity_remap",
+            "SELECT COUNT(*) AS cnt FROM TblContacts
+             INNER JOIN {$table} ON {$sameIdentity}
+             LEFT JOIN TblContacts AS taken ON taken.LLG_ID = {$table}.LLG_ID
+             WHERE taken.LLG_ID IS NULL AND TblContacts.LLG_ID <> {$table}.LLG_ID",
+            "Rows eligible for identity-verified LLG_ID repair ({$table})"
+        );
+
+        $ltIdentity = $this->contactIdentityMatchSql('lt', 'source');
+        $otherLtIdentity = $this->contactIdentityMatchSql('otherLt', 'source');
+        $this->previewCountStep(
+            $connector,
+            "{$table}.lt_agent_sync",
+            "SELECT COUNT(*) AS cnt
+             FROM {$table} AS source
+             INNER JOIN TblContacts AS lt
+               ON lt.LLG_ID = source.LLG_ID
+              AND {$ltIdentity}
+             WHERE NULLIF(LTRIM(RTRIM(COALESCE(lt.Agent, ''))), '') IS NOT NULL
+               AND lt.Agent NOT LIKE '% User'
+               AND COALESCE(source.Agent, '') <> lt.Agent
+               AND NOT EXISTS (
+                   SELECT 1 FROM TblContacts AS otherLt
+                   WHERE otherLt.LLG_ID = lt.LLG_ID
+                     AND {$otherLtIdentity}
+                     AND COALESCE(otherLt.Agent, '') <> lt.Agent
+               )",
+            "{$table}.Agent would refresh from its verified LT contact"
+        );
+
+        $this->previewCountStep(
+            $connector,
             "{$table}.backfill_external_id",
             "SELECT COUNT(*) AS cnt FROM TblContacts
              INNER JOIN {$table} ON TblContacts.LLG_ID = {$table}.LLG_ID
+               AND {$sameIdentity}
              WHERE COALESCE(TblContacts.External_ID, '') = ''
                AND COALESCE(CAST({$table}.External_ID AS VARCHAR(50)), '') <> ''",
             "Blank External_ID rows {$table} would backfill"
@@ -1946,15 +1983,17 @@ class SyncContactsData extends Command
 
     private function previewEnrollmentAgentFixes(DBConnector $connector): void
     {
+        $sameName = $this->contactNameMatchSql('e', 'c');
         $this->previewCountStep(
             $connector,
             'enrollment.agent_contacts',
             "SELECT COUNT(*) AS cnt FROM TblEnrollment e
              JOIN (
-                 SELECT LLG_ID, MIN(Agent) AS Agent FROM TblContacts
+                 SELECT LLG_ID, MIN(Agent) AS Agent, MIN(Client) AS Client FROM TblContacts
                  WHERE Agent IS NOT NULL AND Agent <> '' AND Agent NOT LIKE '% User'
                  GROUP BY LLG_ID
              ) c ON e.LLG_ID = c.LLG_ID
+                    AND {$sameName}
              WHERE e.Agent IS NULL OR e.Agent = '' OR e.Agent LIKE '% User' OR e.Agent <> c.Agent",
             'Enrollments TblContacts.Agent would update'
         );
@@ -2083,6 +2122,15 @@ class SyncContactsData extends Command
     private function matchSourceTableToContacts(DBConnector $connector, string $table): void
     {
         $fields = $this->matchedFieldsSql($table);
+        $sameIdentity = $this->contactIdentityMatchSql('TblContacts', $table);
+        $sameName = $this->contactNameMatchSql('e', 'src');
+        $enrollmentNameCompatible = "(NULLIF(LTRIM(RTRIM(COALESCE(e.Client, ''))), '') IS NULL OR {$sameName})";
+        $duplicateSourceIdentity = $this->contactIdentityMatchSql('TblContacts', 'duplicate');
+        $duplicateContactIdentity = $this->contactIdentityMatchSql('duplicateContact', $table);
+        $keptIdentity = $this->contactIdentityMatchSql('kept', 'src');
+        $orphanContactIdentity = $this->contactIdentityMatchSql('lt', 'src');
+        $ltIdentity = $this->contactIdentityMatchSql('lt', 'source');
+        $otherLtIdentity = $this->contactIdentityMatchSql('otherLt', 'source');
 
         $this->runMatchingStep(
             $connector,
@@ -2090,7 +2138,8 @@ class SyncContactsData extends Command
             "UPDATE TblContacts
              SET {$fields}
              FROM TblContacts
-             INNER JOIN {$table} ON TblContacts.LLG_ID = {$table}.LLG_ID",
+             INNER JOIN {$table} ON TblContacts.LLG_ID = {$table}.LLG_ID
+               AND {$sameIdentity}",
             "Switched fields on TblContacts from {$table} (LLG_ID match)"
         );
 
@@ -2101,8 +2150,29 @@ class SyncContactsData extends Command
              SET {$fields}
              FROM TblContacts
              INNER JOIN {$table}
-               ON TblContacts.LLG_ID = 'LLG-' + CAST({$table}.External_ID AS VARCHAR(50))",
+               ON TblContacts.LLG_ID = 'LLG-' + CAST({$table}.External_ID AS VARCHAR(50))
+              AND {$sameIdentity}",
             "Switched fields on TblContacts from {$table} (External_ID match)"
+        );
+
+        $this->runMatchingStep(
+            $connector,
+            "{$table}.identity_fields",
+            "UPDATE TblContacts
+             SET {$fields}
+             FROM TblContacts
+             INNER JOIN {$table} ON {$sameIdentity}
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM {$table} AS duplicate
+                 WHERE duplicate.LLG_ID <> {$table}.LLG_ID
+                   AND {$duplicateSourceIdentity}
+             )
+             AND NOT EXISTS (
+                 SELECT 1 FROM TblContacts AS duplicateContact
+                 WHERE duplicateContact.LLG_ID <> TblContacts.LLG_ID
+                   AND {$duplicateContactIdentity}
+             )",
+            "Switched fields on TblContacts from {$table} (verified name/email/phone)"
         );
 
         $this->runMatchingStep(
@@ -2113,10 +2183,49 @@ class SyncContactsData extends Command
              FROM TblContacts
              INNER JOIN {$table}
                ON TblContacts.LLG_ID = 'LLG-' + CAST({$table}.External_ID AS VARCHAR(50))
+              AND {$sameIdentity}
              LEFT JOIN TblContacts AS taken ON taken.LLG_ID = {$table}.LLG_ID
              WHERE taken.LLG_ID IS NULL
-               AND TblContacts.LLG_ID <> {$table}.LLG_ID",
+               AND TblContacts.LLG_ID <> {$table}.LLG_ID
+               AND NOT EXISTS (
+                   SELECT 1 FROM {$table} AS duplicate
+                   WHERE duplicate.External_ID = {$table}.External_ID
+                     AND duplicate.LLG_ID <> {$table}.LLG_ID
+                     AND {$duplicateSourceIdentity}
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM TblContacts AS duplicateContact
+                   WHERE duplicateContact.LLG_ID <> TblContacts.LLG_ID
+                     AND {$duplicateContactIdentity}
+               )",
             "Remapped TblContacts.LLG_ID from {$table} (External_ID match)"
+        );
+
+        // Repair stale or previously mis-switched IDs by the verified person identity,
+        // even when an earlier bad ID no longer matches the source External_ID.
+        $this->runMatchingStep(
+            $connector,
+            "{$table}.identity_remap",
+            "UPDATE TblContacts
+             SET TblContacts.LLG_ID = {$table}.LLG_ID
+             FROM TblContacts
+             INNER JOIN {$table} ON {$sameIdentity}
+             LEFT JOIN TblContacts AS taken
+               ON taken.LLG_ID = {$table}.LLG_ID
+              AND taken.LLG_ID <> TblContacts.LLG_ID
+             WHERE taken.LLG_ID IS NULL
+               AND TblContacts.LLG_ID <> {$table}.LLG_ID
+               AND NOT EXISTS (
+                   SELECT 1 FROM {$table} AS duplicate
+                   WHERE duplicate.LLG_ID <> {$table}.LLG_ID
+                     AND {$duplicateSourceIdentity}
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM TblContacts AS duplicateContact
+                   WHERE duplicateContact.LLG_ID <> TblContacts.LLG_ID
+                     AND {$duplicateContactIdentity}
+               )",
+            "Repaired TblContacts.LLG_ID by unique name/email/phone identity from {$table}"
         );
 
         // Amanda-class: remapped rows often keep blank External_ID (LT TP_ID null).
@@ -2128,10 +2237,35 @@ class SyncContactsData extends Command
              SET TblContacts.External_ID = LEFT(CAST({$table}.External_ID AS VARCHAR(50)), 50)
              FROM TblContacts
              INNER JOIN {$table} ON TblContacts.LLG_ID = {$table}.LLG_ID
+               AND {$sameIdentity}
              WHERE COALESCE(TblContacts.External_ID, '') = ''
                AND COALESCE(CAST({$table}.External_ID AS VARCHAR(50)), '') <> ''
                AND CAST({$table}.External_ID AS VARCHAR(50)) NOT IN ('0', '1234567840', 'UNKNOWN')",
             "Backfilled blank TblContacts.External_ID from {$table}"
+        );
+
+        // Side-table Agent is authoritative from the linked LT contact, not the
+        // LDR/PLAW custom agent field. Resolve by the swapped key plus person identity.
+        // When duplicate LT rows disagree on Agent, leave the side row unchanged.
+        $this->runMatchingStep(
+            $connector,
+            "{$table}.lt_agent_sync",
+            "UPDATE source
+             SET source.Agent = lt.Agent
+             FROM {$table} AS source
+             INNER JOIN TblContacts AS lt
+               ON lt.LLG_ID = source.LLG_ID
+              AND {$ltIdentity}
+             WHERE NULLIF(LTRIM(RTRIM(COALESCE(lt.Agent, ''))), '') IS NOT NULL
+               AND lt.Agent NOT LIKE '% User'
+               AND COALESCE(source.Agent, '') <> lt.Agent
+               AND NOT EXISTS (
+                   SELECT 1 FROM TblContacts AS otherLt
+                   WHERE otherLt.LLG_ID = lt.LLG_ID
+                     AND {$otherLtIdentity}
+                     AND COALESCE(otherLt.Agent, '') <> lt.Agent
+               )",
+            "Refreshed {$table}.Agent from its identity-matched LT contact"
         );
 
         // If kept already has enrollment, drop orphan enroll keyed by side-table External_ID
@@ -2143,9 +2277,16 @@ class SyncContactsData extends Command
             "DELETE e
              FROM TblEnrollment AS e
              INNER JOIN {$table} AS src
-               ON e.LLG_ID = 'LLG-' + CAST(src.External_ID AS VARCHAR(50))
+             ON e.LLG_ID = 'LLG-' + CAST(src.External_ID AS VARCHAR(50))
+               AND {$enrollmentNameCompatible}
              INNER JOIN TblContacts AS kept ON kept.LLG_ID = src.LLG_ID
+               AND {$keptIdentity}
              WHERE e.LLG_ID <> src.LLG_ID
+               AND NOT EXISTS (
+                    SELECT 1 FROM {$table} AS duplicate
+                    WHERE duplicate.External_ID = src.External_ID
+                      AND duplicate.LLG_ID <> src.LLG_ID
+               )
                AND EXISTS (
                     SELECT 1 FROM TblEnrollment AS e2 WHERE e2.LLG_ID = kept.LLG_ID
                )",
@@ -2159,9 +2300,16 @@ class SyncContactsData extends Command
              SET e.LLG_ID = kept.LLG_ID
              FROM TblEnrollment AS e
              INNER JOIN {$table} AS src
-               ON e.LLG_ID = 'LLG-' + CAST(src.External_ID AS VARCHAR(50))
+             ON e.LLG_ID = 'LLG-' + CAST(src.External_ID AS VARCHAR(50))
+               AND {$enrollmentNameCompatible}
              INNER JOIN TblContacts AS kept ON kept.LLG_ID = src.LLG_ID
+               AND {$keptIdentity}
              WHERE e.LLG_ID <> src.LLG_ID
+               AND NOT EXISTS (
+                    SELECT 1 FROM {$table} AS duplicate
+                    WHERE duplicate.External_ID = src.External_ID
+                      AND duplicate.LLG_ID <> src.LLG_ID
+               )
                AND NOT EXISTS (
                     SELECT 1 FROM TblEnrollment AS e2 WHERE e2.LLG_ID = kept.LLG_ID
                )",
@@ -2175,7 +2323,9 @@ class SyncContactsData extends Command
              FROM TblContacts AS lt
              INNER JOIN {$table} AS src
                ON lt.LLG_ID = 'LLG-' + CAST(src.External_ID AS VARCHAR(50))
+               AND {$orphanContactIdentity}
              INNER JOIN TblContacts AS kept ON kept.LLG_ID = src.LLG_ID
+               AND {$keptIdentity}
              WHERE lt.LLG_ID <> src.LLG_ID
                AND NOT EXISTS (
                     SELECT 1 FROM TblEnrollment AS e WHERE e.LLG_ID = lt.LLG_ID
@@ -2190,6 +2340,8 @@ class SyncContactsData extends Command
         // process users ("ProgressLaw User", "LDR User").
         $badAgent = "(TblEnrollment.Agent IS NULL OR TblEnrollment.Agent = '' OR TblEnrollment.Agent LIKE '% User')";
         $goodContact = "c.Agent IS NOT NULL AND c.Agent <> '' AND c.Agent NOT LIKE '% User'";
+        $sameName = $this->contactNameMatchSql('TblEnrollment', 'c');
+        $sameNameDrop = $this->contactNameMatchSql('TblEnrollment', 'TblContacts');
 
         $steps = [
             'enrollment.agent_contacts' => [
@@ -2197,11 +2349,12 @@ class SyncContactsData extends Command
              SET TblEnrollment.Agent = c.Agent
              FROM TblEnrollment
              JOIN (
-                 SELECT LLG_ID, MIN(Agent) AS Agent
+                 SELECT LLG_ID, MIN(Agent) AS Agent, MIN(Client) AS Client
                  FROM TblContacts
                  WHERE Agent IS NOT NULL AND Agent <> '' AND Agent NOT LIKE '% User'
                  GROUP BY LLG_ID
              ) c ON TblEnrollment.LLG_ID = c.LLG_ID
+                    AND {$sameName}
              WHERE {$badAgent}
                 OR TblEnrollment.Agent <> c.Agent",
                 'label' => 'Updated TblEnrollment.Agent from TblContacts',
@@ -2213,6 +2366,7 @@ class SyncContactsData extends Command
                AND NOT EXISTS (
                     SELECT 1 FROM TblContacts c
                     WHERE c.LLG_ID = TblEnrollment.LLG_ID
+                      AND {$sameName}
                       AND {$goodContact}
                )",
                 'label' => 'Cleared enrollment system-user agents with no roster contact',
@@ -2222,6 +2376,7 @@ class SyncContactsData extends Command
              SET TblEnrollment.Drop_Name = TblContacts.Campaign
              FROM TblEnrollment, TblContacts
              WHERE TblEnrollment.LLG_ID = TblContacts.LLG_ID
+               AND {$sameNameDrop}
                AND COALESCE(TblContacts.Campaign, '') <> ''",
                 'label' => 'Updated TblEnrollment.Drop_Name from TblContacts.Campaign',
             ],
@@ -2307,6 +2462,63 @@ class SyncContactsData extends Command
         return "TblContacts.Affiliate_Agent = CASE WHEN COALESCE({$src}.Affiliate_Agent, '') <> '' THEN {$src}.Affiliate_Agent ELSE TblContacts.Affiliate_Agent END,
                 TblContacts.Campaign = CASE WHEN COALESCE({$src}.Campaign, '') <> '' THEN {$src}.Campaign ELSE TblContacts.Campaign END,
                 TblContacts.Category = CASE WHEN COALESCE({$src}.Category, '') <> '' THEN {$src}.Category ELSE TblContacts.Category END";
+    }
+
+    /**
+     * Require a non-empty, normalized client name before treating equal keys as a match.
+     * The source systems can reuse a numeric ID across companies, so IDs alone are not identity.
+     */
+    private function contactNameMatchSql(string $leftAlias, string $rightAlias): string
+    {
+        $left = $this->normalizedContactNameSql($leftAlias);
+        $right = $this->normalizedContactNameSql($rightAlias);
+
+        return "({$left} <> '' AND {$left} = {$right})";
+    }
+
+    /**
+     * Fail closed on cross-company ID collisions: require the same normalized name,
+     * reject conflicting populated phone/email values, and require at least one
+     * matching email or normalized phone as an independent identity signal.
+     */
+    private function contactIdentityMatchSql(string $leftAlias, string $rightAlias): string
+    {
+        $leftName = $this->normalizedContactNameSql($leftAlias);
+        $rightName = $this->normalizedContactNameSql($rightAlias);
+        $leftEmail = "LOWER(LTRIM(RTRIM(COALESCE({$leftAlias}.Email, ''))))";
+        $rightEmail = "LOWER(LTRIM(RTRIM(COALESCE({$rightAlias}.Email, ''))))";
+        $leftPhone = $this->normalizedContactPhoneSql($leftAlias);
+        $rightPhone = $this->normalizedContactPhoneSql($rightAlias);
+
+        $emailMatches = "({$leftEmail} <> '' AND {$rightEmail} <> '' AND CHARINDEX('@', {$leftEmail}) > 1 AND {$leftEmail} = {$rightEmail})";
+        $phoneMatches = "(LEN({$leftPhone}) >= 7 AND LEN({$rightPhone}) >= 7 AND {$leftPhone} = {$rightPhone})";
+        $emailCompatible = "({$leftEmail} = '' OR {$rightEmail} = '' OR {$leftEmail} = {$rightEmail})";
+        $phoneCompatible = "({$leftPhone} = '' OR {$rightPhone} = '' OR {$leftPhone} = {$rightPhone})";
+
+        return "({$leftName} <> '' AND {$leftName} = {$rightName}
+            AND {$emailCompatible}
+            AND {$phoneCompatible}
+            AND ({$emailMatches} OR {$phoneMatches}))";
+    }
+
+    private function normalizedContactNameSql(string $alias): string
+    {
+        $value = "UPPER(LTRIM(RTRIM(COALESCE({$alias}.Client, ''))))";
+        foreach (["' '", "'.'", "','", "'-'", "'/'", "CHAR(39)", 'CHAR(9)'] as $character) {
+            $value = "REPLACE({$value}, {$character}, '')";
+        }
+
+        return $value;
+    }
+
+    private function normalizedContactPhoneSql(string $alias): string
+    {
+        $value = "LTRIM(RTRIM(COALESCE({$alias}.Phone, '')))";
+        foreach (["' '", "'-'", "'('", "')'", "'+'", "'.'", "'/'", 'CHAR(9)', 'CHAR(10)', 'CHAR(13)'] as $character) {
+            $value = "REPLACE({$value}, {$character}, '')";
+        }
+
+        return $value;
     }
 
     private function resetMatchingStats(int $stepTotal): void
