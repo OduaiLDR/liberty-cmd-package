@@ -290,6 +290,7 @@ class SyncEnrollmentData extends Command
 
         // Collect updates needed
         $updates = [];
+        $normalizedCounts = [];
         foreach ($enrollmentData as $enrollment) {
             $llgId = $enrollment['LLG_ID'] ?? null;
             $currentPayments = (float) ($enrollment['Payments'] ?? 0);
@@ -308,7 +309,12 @@ class SyncEnrollmentData extends Command
             // Payments = 1, and nothing ever put it back. Reset only when both Snowflake sources
             // answered, or an outage on one side would zero the other side's clients.
             if (isset($paymentsMap[$contactId])) {
-                $paymentCount = (int) $paymentsMap[$contactId];
+                $rawPaymentCount = (int) $paymentsMap[$contactId];
+                $paymentCount = $this->normalizePaymentCount($rawPaymentCount, $paymentFrequency);
+                if ($paymentCount !== $rawPaymentCount) {
+                    $frequencyLabel = $paymentFrequency !== '' ? $paymentFrequency : '(blank)';
+                    $normalizedCounts[$frequencyLabel] = ($normalizedCounts[$frequencyLabel] ?? 0) + 1;
+                }
             } elseif ($bothSourcesLoaded) {
                 $paymentCount = 0;
             } else {
@@ -322,6 +328,9 @@ class SyncEnrollmentData extends Command
         }
 
         $this->info("[INFO] Found " . count($updates) . " records needing Payments update");
+        foreach ($normalizedCounts as $frequency => $count) {
+            $this->info("[INFO] Normalized {$count} payment count(s) at '{$frequency}' frequency to monthly equivalents");
+        }
 
         // Batch update using CASE statement (500 at a time)
         $updated = 0;
@@ -351,6 +360,26 @@ class SyncEnrollmentData extends Command
         }
 
         $this->info("[INFO] Updated {$updated} Payments records");
+    }
+
+    /**
+     * Convert cleared payment transactions to the monthly-equivalent count used by payroll.
+     * Check bi-weekly before weekly: "Bi-Weekly" contains the substring "Weekly".
+     */
+    private function normalizePaymentCount(int $rawCount, string $frequency): int
+    {
+        $normalizedFrequency = strtolower(preg_replace('/[^a-z]/i', '', trim($frequency)) ?? '');
+
+        if (in_array($normalizedFrequency, ['biweekly', 'semimonthly'], true)) {
+            return (int) round($rawCount / 2);
+        }
+
+        if ($normalizedFrequency === 'weekly') {
+            return (int) round($rawCount / 4);
+        }
+
+        // Monthly and unknown frequencies retain the full observed count, matching legacy behavior.
+        return $rawCount;
     }
 
     private function updateContactsCampaign(DBConnector $sqlConnector): void
