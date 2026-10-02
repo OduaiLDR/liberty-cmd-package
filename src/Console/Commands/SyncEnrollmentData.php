@@ -335,7 +335,7 @@ class SyncEnrollmentData extends Command
             }
 
             // Only add to updates if different
-            if ((int) $currentPayments !== $paymentCount) {
+            if (abs($currentPayments - $paymentCount) > 0.000001) {
                 $updates[$llgId] = $paymentCount;
                 $preview[$llgId] = [
                     'current' => $currentPayments,
@@ -375,7 +375,7 @@ class SyncEnrollmentData extends Command
             $cases = [];
             $ids = [];
             foreach ($chunk as $llgId => $paymentCount) {
-                $cases[] = "WHEN '{$this->esc($llgId)}' THEN {$paymentCount}";
+                $cases[] = "WHEN '{$this->esc($llgId)}' THEN {$this->formatPaymentCount($paymentCount)}";
                 $ids[] = "'{$this->esc($llgId)}'";
             }
 
@@ -397,20 +397,25 @@ class SyncEnrollmentData extends Command
      * Convert cleared payment transactions to the monthly-equivalent count used by payroll.
      * Check bi-weekly before weekly: "Bi-Weekly" contains the substring "Weekly".
      */
-    private function normalizePaymentCount(int $rawCount, string $frequency): int
+    private function normalizePaymentCount(int $rawCount, string $frequency): int|float
     {
         $normalizedFrequency = strtolower(preg_replace('/[^a-z]/i', '', trim($frequency)) ?? '');
 
         if (str_contains($normalizedFrequency, 'biweekly') || str_contains($normalizedFrequency, 'semimonthly')) {
-            return (int) round($rawCount / 2);
+            return $rawCount / 2;
         }
 
         if ($normalizedFrequency === 'weekly') {
-            return (int) round($rawCount / 4);
+            return $rawCount / 4;
         }
 
         // Monthly and unknown frequencies retain the full observed count, matching legacy behavior.
         return $rawCount;
+    }
+
+    private function formatPaymentCount(int|float $paymentCount): string
+    {
+        return rtrim(rtrim(number_format((float) $paymentCount, 6, '.', ''), '0'), '.');
     }
 
     private function updateContactsCampaign(DBConnector $sqlConnector): void
