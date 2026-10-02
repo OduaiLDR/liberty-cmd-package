@@ -8,16 +8,24 @@ use Illuminate\Support\Facades\Log;
 
 class SyncEnrollmentData extends Command
 {
-    protected $signature = 'Sync:enrollment-data';
+    protected $signature = 'Sync:enrollment-data {--payments-only : Update only the Payments count} {--dry-run : Preview changes without writing to SQL Server}';
 
     protected $description = 'Sync enrollment data: updates Drop_Name, State, Cancel_Date, and Payments from Snowflake (no inserts — use enrollment:import-missing for new rows)';
 
     private string $source;
     private string $category;
+    private bool $paymentsOnly = false;
+    private bool $dryRun = false;
 
     public function handle(): int
     {
-        $this->info("[INFO] Sync Enrollment Data: starting for both LDR and PLAW.");
+        $this->paymentsOnly = (bool) $this->option('payments-only');
+        $this->dryRun = (bool) $this->option('dry-run');
+        // A dry run is always limited to payment counts, never the other enrollment sync steps.
+        $this->paymentsOnly = $this->paymentsOnly || $this->dryRun;
+        $mode = $this->paymentsOnly ? 'Payments only' : 'full enrollment sync';
+        $mode .= $this->dryRun ? ' (DRY RUN — no SQL writes)' : '';
+        $this->info("[INFO] Sync Enrollment Data: starting for both LDR and PLAW — {$mode}.");
 
         // Run for LDR
         $this->info("\n" . str_repeat('=', 80));
@@ -65,21 +73,25 @@ class SyncEnrollmentData extends Command
             return Command::FAILURE;
         }
 
-        // Step 1: Update missing Drop_Name and State
-        $this->info('[STEP 1] Updating missing Drop_Name and State...');
-        $this->updateDropNameAndState($sqlConnector);
+        if (!$this->paymentsOnly) {
+            // Step 1: Update missing Drop_Name and State
+            $this->info('[STEP 1] Updating missing Drop_Name and State...');
+            $this->updateDropNameAndState($sqlConnector);
 
-        // Step 2: Update Cancel_Date from Snowflake
-        $this->info('[STEP 2] Updating Cancel_Date from Snowflake...');
-        $this->updateCancelDate($snowflake, $sqlConnector);
+            // Step 2: Update Cancel_Date from Snowflake
+            $this->info('[STEP 2] Updating Cancel_Date from Snowflake...');
+            $this->updateCancelDate($snowflake, $sqlConnector);
+        }
 
         // Step 3: Update Payments count from Snowflake
         $this->info('[STEP 3] Updating Payments count from Snowflake...');
-        $this->updatePayments($snowflake, $sqlConnector);
+        $this->updatePayments($snowflake, $sqlConnector, $this->dryRun);
 
-        // Step 4: Update TblContacts.Campaign from TblEnrollment.Drop_Name
-        $this->info('[STEP 4] Updating TblContacts.Campaign...');
-        $this->updateContactsCampaign($sqlConnector);
+        if (!$this->paymentsOnly) {
+            // Step 4: Update TblContacts.Campaign from TblEnrollment.Drop_Name
+            $this->info('[STEP 4] Updating TblContacts.Campaign...');
+            $this->updateContactsCampaign($sqlConnector);
+        }
 
         $this->info("[SUCCESS] {$this->source} sync completed successfully!");
         return Command::SUCCESS;
@@ -231,7 +243,7 @@ class SyncEnrollmentData extends Command
         $this->info("[INFO] Updated {$updated} Cancel_Date records");
     }
 
-    private function updatePayments(DBConnector $snowflake, DBConnector $sqlConnector): void
+    private function updatePayments(DBConnector $snowflake, DBConnector $sqlConnector, bool $dryRun = false): void
     {
         // Get payment counts from BOTH Snowflake databases (LDR and PLAW)
         // Some contacts have Category=LDR but payments in PLAW or vice versa
@@ -290,6 +302,7 @@ class SyncEnrollmentData extends Command
 
         // Collect updates needed
         $updates = [];
+        $preview = [];
         $normalizedCounts = [];
         foreach ($enrollmentData as $enrollment) {
             $llgId = $enrollment['LLG_ID'] ?? null;
@@ -324,12 +337,30 @@ class SyncEnrollmentData extends Command
             // Only add to updates if different
             if ((int) $currentPayments !== $paymentCount) {
                 $updates[$llgId] = $paymentCount;
+                $preview[$llgId] = [
+                    'current' => $currentPayments,
+                    'frequency' => $paymentFrequency !== '' ? $paymentFrequency : '(blank)',
+                    'next' => $paymentCount,
+                ];
             }
         }
 
         $this->info("[INFO] Found " . count($updates) . " records needing Payments update");
         foreach ($normalizedCounts as $frequency => $count) {
             $this->info("[INFO] Normalized {$count} payment count(s) at '{$frequency}' frequency to monthly equivalents");
+        }
+
+        if ($dryRun) {
+            $this->info('[DRY RUN] Sample payment changes (up to 25):');
+            $shown = 0;
+            foreach ($preview as $llgId => $change) {
+                $this->line("[DRY RUN] {$llgId}: {$change['current']} -> {$change['next']} ({$change['frequency']})");
+                if (++$shown >= 25) {
+                    break;
+                }
+            }
+            $this->info('[DRY RUN] No SQL Server writes performed.');
+            return;
         }
 
         // Batch update using CASE statement (500 at a time)
@@ -370,7 +401,7 @@ class SyncEnrollmentData extends Command
     {
         $normalizedFrequency = strtolower(preg_replace('/[^a-z]/i', '', trim($frequency)) ?? '');
 
-        if (in_array($normalizedFrequency, ['biweekly', 'semimonthly'], true)) {
+        if (str_contains($normalizedFrequency, 'biweekly') || str_contains($normalizedFrequency, 'semimonthly')) {
             return (int) round($rawCount / 2);
         }
 
