@@ -1617,13 +1617,13 @@ class SyncContactsData extends Command
     }
 
     /**
-     * Read-only preview: counts rows that matching would touch + Jacob gap queries.
+     * Read-only preview: exact current target/field differences plus Jacob gap queries.
      * No UPDATE statements are executed.
      */
     private function previewMatching(DBConnector $connector, array $tables): bool
     {
-        // 8 counts per source table + 3 enrollment fix counts + 6 Jacob gap counts
-        $this->resetMatchingStats((\count($tables) * 8) + 3 + 6);
+        // Current-state previews cannot simulate subsequent matching steps without writing.
+        $this->resetMatchingStats((\count($tables) * 4) + 2 + 6);
         $this->printMatchingHeader('DRY RUN — matching verification (read-only, no writes)');
 
         foreach ($tables as $table) {
@@ -1640,135 +1640,29 @@ class SyncContactsData extends Command
 
     private function previewSourceTableMatching(DBConnector $connector, string $table): void
     {
-        $agentGap = "COALESCE({$table}.Agent, '') <> '' AND COALESCE(TblContacts.Agent, '') = ''";
-        $sameIdentity = $this->contactIdentityMatchSql('TblContacts', $table);
-
-        $this->previewCountStep(
-            $connector,
-            "{$table}.llg_id_join",
-            "SELECT COUNT(*) AS cnt FROM TblContacts INNER JOIN {$table} ON TblContacts.LLG_ID = {$table}.LLG_ID AND {$sameIdentity}",
-            "Rows joined on LLG_ID ({$table})"
-        );
-
-        $this->previewCountStep(
-            $connector,
-            "{$table}.llg_id_agent_gap",
-            "SELECT COUNT(*) AS cnt FROM TblContacts INNER JOIN {$table} ON TblContacts.LLG_ID = {$table}.LLG_ID AND {$sameIdentity} WHERE {$agentGap}",
-            "Joined on LLG_ID with blank TblContacts.Agent ({$table})"
-        );
-
-        $this->previewCountStep(
-            $connector,
-            "{$table}.external_id_join",
-            "SELECT COUNT(*) AS cnt FROM TblContacts INNER JOIN {$table}
-             ON TblContacts.LLG_ID = 'LLG-' + CAST({$table}.External_ID AS VARCHAR(50))
-               AND {$sameIdentity}",
-            "Rows joined on External_ID ({$table})"
-        );
-
-        $this->previewCountStep(
-            $connector,
-            "{$table}.external_id_agent_gap",
-            "SELECT COUNT(*) AS cnt FROM TblContacts INNER JOIN {$table}
-             ON TblContacts.LLG_ID = 'LLG-' + CAST({$table}.External_ID AS VARCHAR(50))
-               AND {$sameIdentity}
-             WHERE {$agentGap}",
-            "External_ID join with blank TblContacts.Agent ({$table})"
-        );
-
-        $this->previewCountStep(
-            $connector,
-            "{$table}.external_id_remap",
-            "SELECT COUNT(*) AS cnt FROM TblContacts
-             INNER JOIN {$table} ON TblContacts.LLG_ID = 'LLG-' + CAST({$table}.External_ID AS VARCHAR(50))
-               AND {$sameIdentity}
-             LEFT JOIN TblContacts AS taken ON taken.LLG_ID = {$table}.LLG_ID
-             WHERE taken.LLG_ID IS NULL AND TblContacts.LLG_ID <> {$table}.LLG_ID",
-            "Rows eligible for LLG_ID remap ({$table})"
-        );
-
-        $this->previewCountStep(
-            $connector,
-            "{$table}.identity_remap",
-            "SELECT COUNT(*) AS cnt FROM TblContacts
-             INNER JOIN {$table} ON {$sameIdentity}
-             LEFT JOIN TblContacts AS taken ON taken.LLG_ID = {$table}.LLG_ID
-             WHERE taken.LLG_ID IS NULL AND TblContacts.LLG_ID <> {$table}.LLG_ID",
-            "Rows eligible for identity-verified LLG_ID repair ({$table})"
-        );
-
-        $ltIdentity = $this->contactIdentityMatchSql('lt', 'source');
-        $otherLtIdentity = $this->contactIdentityMatchSql('otherLt', 'source');
-        $this->previewCountStep(
-            $connector,
-            "{$table}.lt_agent_sync",
-            "SELECT COUNT(*) AS cnt
-             FROM {$table} AS source
-             INNER JOIN TblContacts AS lt
-               ON lt.LLG_ID = source.LLG_ID
-              AND {$ltIdentity}
-             WHERE NULLIF(LTRIM(RTRIM(COALESCE(lt.Agent, ''))), '') IS NOT NULL
-               AND lt.Agent NOT LIKE '% User'
-               AND COALESCE(source.Agent, '') <> lt.Agent
-               AND NOT EXISTS (
-                   SELECT 1 FROM TblContacts AS otherLt
-                   WHERE otherLt.LLG_ID = lt.LLG_ID
-                     AND {$otherLtIdentity}
-                     AND COALESCE(otherLt.Agent, '') <> lt.Agent
-               )",
-            "{$table}.Agent would refresh from its verified LT contact"
-        );
-
-        $this->previewCountStep(
-            $connector,
-            "{$table}.backfill_external_id",
-            "SELECT COUNT(*) AS cnt FROM TblContacts
-             INNER JOIN {$table} ON TblContacts.LLG_ID = {$table}.LLG_ID
-               AND {$sameIdentity}
-             WHERE COALESCE(TblContacts.External_ID, '') = ''
-               AND COALESCE(CAST({$table}.External_ID AS VARCHAR(50)), '') <> ''",
-            "Blank External_ID rows {$table} would backfill"
-        );
+        $source = $table === 'TblContactsLDR' ? 'LDR' : 'PLAW';
+        foreach (ContactSyncMatching::sourceSteps($source) as $step => $sql) {
+            $this->previewMatchingRows($connector, "{$table}.{$step}", $sql['preview']);
+        }
     }
 
     private function previewEnrollmentAgentFixes(DBConnector $connector): void
     {
-        $sameName = $this->contactNameMatchSql('e', 'c');
-        $this->previewCountStep(
-            $connector,
-            'enrollment.agent_contacts',
-            "SELECT COUNT(*) AS cnt FROM TblEnrollment e
-             JOIN (
-                 SELECT LLG_ID, MIN(Agent) AS Agent, MIN(Client) AS Client FROM TblContacts
-                 WHERE Agent IS NOT NULL AND Agent <> '' AND Agent NOT LIKE '% User'
-                 GROUP BY LLG_ID
-             ) c ON e.LLG_ID = c.LLG_ID
-                    AND {$sameName}
-             WHERE e.Agent IS NULL OR e.Agent = '' OR e.Agent LIKE '% User' OR e.Agent <> c.Agent",
-            'Enrollments TblContacts.Agent would update'
-        );
+        foreach (ContactSyncMatching::enrollmentSteps((bool) $this->option('reconcile-agents')) as $step => $sql) {
+            $this->previewMatchingRows($connector, "enrollment.{$step}", $sql['preview']);
+        }
+    }
 
-        $this->previewCountStep(
-            $connector,
-            'enrollment.clear_system_user_agents',
-            "SELECT COUNT(*) AS cnt FROM TblEnrollment e
-             WHERE e.Agent LIKE '% User'
-               AND NOT EXISTS (
-                    SELECT 1 FROM TblContacts c
-                    WHERE c.LLG_ID = e.LLG_ID
-                      AND c.Agent IS NOT NULL AND c.Agent <> '' AND c.Agent NOT LIKE '% User'
-               )",
-            'Enrollment system-user agents that would clear'
-        );
-
-        $this->previewCountStep(
-            $connector,
-            'enrollment.drop_name',
-            "SELECT COUNT(*) AS cnt FROM TblEnrollment e
-             JOIN TblContacts c ON e.LLG_ID = c.LLG_ID
-             WHERE COALESCE(c.Campaign, '') <> ''",
-            'Enrollments Drop_Name would update from Campaign'
-        );
+    private function previewMatchingRows(DBConnector $connector, string $step, string $sql): void
+    {
+        $rows = $this->selectPreviewRows($connector, $sql);
+        $this->matchingStepNumber++;
+        $this->matchingStepsOk++;
+        $this->matchingRowsAffected += count($rows);
+        foreach ($rows as $row) {
+            $this->line('[MATCH PREVIEW] ' . json_encode(['step' => $step, 'change' => $row], JSON_THROW_ON_ERROR));
+        }
+        $this->info("[VERIFY] {$step}: " . count($rows) . ' currently eligible changes.');
     }
 
     /** Jacob's gap queries — blank enrollment agent but agent exists on contact table. */
