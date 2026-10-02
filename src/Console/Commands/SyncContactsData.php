@@ -819,7 +819,7 @@ class SyncContactsData extends Command
 
     /**
      * Loads enrollment data scoped to enrolled contacts in this chunk.
-     * A temp table passes the IDs to SQL Server, avoiding a full TblEnrollment table scan.
+     * Bounded SELECTs are identical for preview and execution; lookup failures abort the run.
      */
     private function loadEnrollmentDataFiltered(DBConnector $connector, array $chunk): array
     {
@@ -839,32 +839,13 @@ class SyncContactsData extends Command
             return $empty;
         }
 
-        if ($this->option('dry-run')) {
-            $result = ['data' => []];
-            foreach (array_chunk(array_unique($enrolledIds), 1000) as $batch) {
-                $ids = $this->sqlStringList(array_map(fn($id) => 'LLG-' . $id, $batch));
-                $rows = $this->selectPreviewRows($connector,
-                    "SELECT LLG_ID, Category, Agent, Affiliate_Agent FROM TblEnrollment
-                     WHERE LLG_ID IN ({$ids}) AND Category NOT IN ('', 'FDR', 'CSS', 'CNI')");
-                array_push($result['data'], ...$rows);
-            }
-        } else {
-            $connector->querySqlServer("CREATE TABLE #TmpEnrollFilter (ContactId VARCHAR(20))");
-            foreach (\array_chunk($enrolledIds, 1000) as $batch) {
-                $values = \implode(', ', \array_map(
-                    fn($id) => "('" . \str_replace("'", "''", $id) . "')",
-                    $batch
-                ));
-                $connector->querySqlServer("INSERT INTO #TmpEnrollFilter VALUES {$values}");
-            }
-
-            $result = $connector->querySqlServer("
-                SELECT e.LLG_ID, e.Category, e.Agent, e.Affiliate_Agent
-                FROM TblEnrollment e
-                JOIN #TmpEnrollFilter f ON e.LLG_ID = 'LLG-' + f.ContactId
-                WHERE e.Category NOT IN ('', 'FDR', 'CSS', 'CNI')
-            ");
-            $connector->querySqlServer("DROP TABLE #TmpEnrollFilter");
+        $result = ['data' => []];
+        foreach (array_chunk(array_unique($enrolledIds), 1000) as $batch) {
+            $ids = $this->sqlStringList(array_map(fn($id) => 'LLG-' . $id, $batch));
+            $rows = $this->selectPreviewRows($connector,
+                "SELECT LLG_ID, Category, Agent, Affiliate_Agent FROM TblEnrollment
+                 WHERE LLG_ID IN ({$ids}) AND Category NOT IN ('', 'FDR', 'CSS', 'CNI')");
+            array_push($result['data'], ...$rows);
         }
 
         $categories      = [];
@@ -875,6 +856,9 @@ class SyncContactsData extends Command
             $llgId = $row['LLG_ID'] ?? '';
             if (preg_match('/LLG-(\d+)/', $llgId, $matches)) {
                 $contactId                   = $matches[1];
+                if (array_key_exists($contactId, $categories)) {
+                    throw new \RuntimeException('Duplicate enrollment target: ' . $llgId);
+                }
                 $categories[$contactId]      = $row['Category'] ?? '';
                 $assignedAgents[$contactId]  = $row['Agent'] ?? '';
                 $affiliateAgents[$contactId] = $row['Affiliate_Agent'] ?? '';
@@ -937,17 +921,17 @@ class SyncContactsData extends Command
         }
 
         // Exact match first; suffix matches are cached for the source run.
-        $connector->querySqlServer("CREATE TABLE #TmpMailerFilter (ExtId VARCHAR(50) NOT NULL)");
+        $this->checkedSql($connector, "CREATE TABLE #TmpMailerFilter (ExtId VARCHAR(50) NOT NULL)");
         try {
             foreach (\array_chunk($externalIds, 1000) as $batch) {
                 $values = \implode(', ', \array_map(
                     fn($id) => "('" . \str_replace("'", "''", \substr($id, 0, 50)) . "')",
                     $batch
                 ));
-                $connector->querySqlServer("INSERT INTO #TmpMailerFilter (ExtId) VALUES {$values}");
+                $this->checkedSql($connector, "INSERT INTO #TmpMailerFilter (ExtId) VALUES {$values}");
             }
 
-            $exact = $connector->querySqlServer("
+            $exact = $this->checkedSql($connector, "
                 SELECT m.External_ID, m.Drop_Name
                 FROM TblMailers m
                 INNER JOIN #TmpMailerFilter f ON m.External_ID = f.ExtId
@@ -974,7 +958,7 @@ class SyncContactsData extends Command
                     fn($t) => "'" . \str_replace("'", "''", $t) . "'",
                     $tailBatch
                 ));
-                $fallback = $connector->querySqlServer(
+                $fallback = $this->checkedSql($connector,
                     "SELECT Suffix AS External_ID, Drop_Name FROM #TmpMailerSuffixCache WHERE Suffix IN ({$inList})"
                 );
                 if (! ($fallback['success'] ?? false)) {
@@ -983,7 +967,7 @@ class SyncContactsData extends Command
                 $this->mergeDropNameLookup($lookup, $fallback['data'] ?? []);
             }
         } finally {
-            $connector->querySqlServer("DROP TABLE IF EXISTS #TmpMailerFilter");
+            $this->checkedSql($connector, "DROP TABLE IF EXISTS #TmpMailerFilter");
         }
 
         return $lookup;
@@ -995,7 +979,7 @@ class SyncContactsData extends Command
             return;
         }
 
-        $create = $connector->querySqlServer(
+        $create = $this->checkedSql($connector,
             "SET NOCOUNT ON;
              SELECT TOP (0) CAST(RIGHT(External_ID, 9) AS varchar(9)) AS Suffix, Drop_Name
              INTO #TmpMailerSuffixCache FROM TblMailers;
@@ -1005,7 +989,7 @@ class SyncContactsData extends Command
             throw new \RuntimeException('Unable to create temporary mailer suffix cache: ' . ($create['error'] ?? 'unknown SQL Server error'));
         }
 
-        $index = $connector->querySqlServer(
+        $index = $this->checkedSql($connector,
             'CREATE NONCLUSTERED INDEX IX_TmpMailerSuffixCache_Suffix ON #TmpMailerSuffixCache (Suffix)'
         );
         if (! ($index['success'] ?? false)) {
@@ -1025,7 +1009,7 @@ class SyncContactsData extends Command
             return;
         }
 
-        $create = $connector->querySqlServer(
+        $create = $this->checkedSql($connector,
             "SET NOCOUNT ON;
              SELECT TOP (0) CAST(RIGHT(External_ID, 9) AS varchar(9)) AS Suffix
              INTO #TmpMailerSuffixFilter FROM TblMailers;
@@ -1038,12 +1022,12 @@ class SyncContactsData extends Command
         try {
             foreach (array_chunk(array_keys($missing), 1000) as $batch) {
                 $values = implode(', ', array_map(fn($tail) => "('" . $this->escSql((string) $tail) . "')", $batch));
-                $insert = $connector->querySqlServer("INSERT INTO #TmpMailerSuffixFilter (Suffix) VALUES {$values}");
+                $insert = $this->checkedSql($connector, "INSERT INTO #TmpMailerSuffixFilter (Suffix) VALUES {$values}");
                 if (! ($insert['success'] ?? false)) {
                     throw new \RuntimeException('Unable to fill mailer suffix filter: ' . ($insert['error'] ?? 'unknown SQL Server error'));
                 }
             }
-            $populate = $connector->querySqlServer(
+            $populate = $this->checkedSql($connector,
                 "INSERT INTO #TmpMailerSuffixCache (Suffix, Drop_Name)
                  SELECT CAST(RIGHT(m.External_ID, 9) AS varchar(9)), m.Drop_Name
                  FROM #TmpMailerSuffixFilter f
@@ -1054,7 +1038,7 @@ class SyncContactsData extends Command
                 throw new \RuntimeException('Unable to populate temporary mailer suffix cache: ' . ($populate['error'] ?? 'unknown SQL Server error'));
             }
         } finally {
-            $connector->querySqlServer('DROP TABLE IF EXISTS #TmpMailerSuffixFilter');
+            $this->checkedSql($connector, 'DROP TABLE IF EXISTS #TmpMailerSuffixFilter');
         }
 
         $this->cachedMailerSuffixes += $missing;
@@ -1064,10 +1048,11 @@ class SyncContactsData extends Command
 
     private function fetchMailerSuffixes(DBConnector $snowflake, string $startDate): array
     {
+        $changed = $this->contactChangedSql($startDate);
         $result = $snowflake->query(
             "SELECT DISTINCT c.TP_ID AS EXTERNAL_ID FROM CONTACTS c
-             WHERE CONVERT_TIMEZONE('America/Los_Angeles', COALESCE(c.MODIFIED, c.CREATED)) >= '{$this->esc($startDate)}'::TIMESTAMP_NTZ
-               AND c.DEL = 'FALSE' AND c.FIRSTNAME IS NOT NULL AND c.FIRSTNAME <> ''
+             WHERE {$changed}
+               AND c.DEL = 'FALSE' AND c._FIVETRAN_DELETED = FALSE AND c.FIRSTNAME IS NOT NULL AND c.FIRSTNAME <> ''
                AND c.ISCOAPP = 0 AND c.ID > 0"
         );
         if (($result['success'] ?? true) === false || !isset($result['data']) || !is_array($result['data'])
@@ -1143,6 +1128,15 @@ class SyncContactsData extends Command
 
         return ['amount' => floor($amount / 1000) * 1000, 'enrolled' => $enrolled,
             'basis' => $validLoan ? 'loan' : ($enrolled > 0 ? 'enrolled_fallback' : 'no_debt')];
+    }
+
+    private function checkedSql(DBConnector $connector, string $sql): array
+    {
+        $result = $connector->querySqlServer($sql);
+        if (!($result['success'] ?? false)) {
+            throw new \RuntimeException('Contact lookup SQL failed: ' . ($result['error'] ?? 'unknown error'));
+        }
+        return $result;
     }
 
     /** Only SELECTs, including when the normal sync uses temporary lookup tables. */
