@@ -3,6 +3,10 @@
 namespace Cmd\Reports\Console\Commands;
 
 use Cmd\Reports\Services\DBConnector;
+use Cmd\Reports\Services\ContactSyncIdentity;
+use Cmd\Reports\Services\ContactSyncMatching;
+use Cmd\Reports\Services\ContactSyncTargets;
+use Cmd\Reports\Services\ContactSyncWatermark;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
@@ -12,9 +16,9 @@ class SyncContactsData extends Command
 {
     protected $signature = 'Sync:contacts-data
         {--source=   : Run a single source only (LDR, PLAW, or LT)}
-        {--full      : Force a full refresh even when a previous sync timestamp exists}
+        {--full      : Preview a full source refresh; requires --dry-run while identities are reconciled}
         {--debt-only : Compare debt columns only; requires --dry-run and --source=LDR or PLAW}
-        {--owners-refresh : Re-pull EVERY contact since 2021-07-01 (current CRM ASSIGNED_TO) without truncating. Non-destructive DELETE+INSERT per chunk. Use to correct agent names that drifted because an incremental sync never re-pulled a reassignment older than the watermark.}
+        {--owners-refresh : Explicitly re-pull contacts since 2021-07-01 using guarded upserts; existing identities and remapped keys must verify}
         {--dry-run   : Fetch and report changes without modifying SQL Server or sync watermarks; matching runs as read-only verification}
         {--verify-match : Read-only matching verification only (no Snowflake fetch, no SQL writes)}
         {--reconcile-agents : Reconcile non-blank enrollment agents from unambiguous source contact assignments}
@@ -56,6 +60,10 @@ class SyncContactsData extends Command
         ini_set('memory_limit', '512M');
 
         $source = strtoupper((string) $this->option('source'));
+        if ($this->option('full') && !$this->option('dry-run')) {
+            $this->error('Full replacement is disabled while contact identities are being reconciled. Use a reviewed owners-refresh upsert; --full --dry-run remains read-only.');
+            return Command::FAILURE;
+        }
         if ($this->option('debt-only') && (!$this->option('dry-run') || !in_array($source, ['LDR', 'PLAW'], true))) {
             $this->error('--debt-only requires --dry-run and --source=LDR or --source=PLAW.');
             return Command::FAILURE;
@@ -145,7 +153,9 @@ class SyncContactsData extends Command
             try {
                 $connector = DBConnector::fromEnvironment('ldr');
                 $connector->initializeSqlServer();
-                $this->runFinalMatching($connector);
+                if (!$this->runFinalMatching($connector)) {
+                    return Command::FAILURE;
+                }
             } catch (\Throwable $e) {
                 $this->error('[DRY RUN] Matching preview failed: ' . $e->getMessage());
                 return Command::FAILURE;
@@ -179,6 +189,17 @@ class SyncContactsData extends Command
     {
         $this->source = $source;
         $this->info("[INFO] Sync Contacts Data: starting for {$this->source}.");
+        if (!$this->option('dry-run') && !$this->option('owners-refresh')) {
+            try {
+                if ($this->readLastSyncTime($source) === null) {
+                    $this->error('No source checkpoint exists. Refusing an implicit full replacement; review --owners-refresh explicitly.');
+                    return Command::FAILURE;
+                }
+            } catch (\Throwable $e) {
+                $this->error('Invalid contact sync checkpoint: ' . $e->getMessage());
+                return Command::FAILURE;
+            }
+        }
 
         if ($this->source === 'PLAW') {
             $this->debtAmountCustomId = 743019;
@@ -218,7 +239,7 @@ class SyncContactsData extends Command
         if (! $lock->get()) {
             $this->warn("[WARN] Another {$this->source} sync is already running; skipping this run to avoid duplicate rows.");
             Log::warning('SyncContactsData: overlapping run skipped', ['source' => $this->source]);
-            return Command::SUCCESS;
+            return Command::FAILURE;
         }
 
         try {
@@ -298,7 +319,7 @@ class SyncContactsData extends Command
         //   idempotent, so this safely corrects agent names that an incremental
         //   sync never re-pulled (reassignment older than the watermark) without
         //   the risk/downtime of dropping and rebuilding the table.
-        // Full refresh: stage every page before replacing the target in one transaction.
+        // Full previews are read-only. Full writes are blocked at the command boundary.
         $ownersRefresh = (bool) $this->option('owners-refresh');
         $lastSyncAt    = ($this->option('full') || $ownersRefresh) ? null : $this->readLastSyncTime($this->source);
         $isIncremental = $lastSyncAt !== null;
@@ -306,12 +327,11 @@ class SyncContactsData extends Command
         if ($isIncremental) {
             // Subtract 24 hours as a safety buffer against clock skew / in-flight writes
             // and any latent timezone-conversion edge cases in the Snowflake date filter.
-            // insertChunk() is an idempotent DELETE+INSERT, so re-pulling a day of overlap is safe.
+            // Guarded upserts are idempotent; repeated overlap does not merge native source IDs.
             $startDate = date('Y-m-d H:i:s', strtotime($lastSyncAt) - 86400);
             $this->info("[INFO] Incremental mode: fetching contacts modified since {$startDate}.");
         } elseif ($ownersRefresh) {
-            // Wide fetch, DELETE+INSERT per chunk, no truncate. Runs in incremental
-            // insert mode so existing rows are replaced in place rather than wiped.
+            // Explicit wide fetch uses the same verified target selection and field updates.
             $startDate     = '2021-07-01';
             $isIncremental = true;
             $this->info('[INFO] Owners-refresh mode: re-pulling every contact since 2021-07-01 (no truncate).');
@@ -386,7 +406,7 @@ class SyncContactsData extends Command
             }
 
             $processStarted = microtime(true);
-            $this->logStep("Page {$pageNum}: processing chunk (ghost/dup-lead filter + TP_ID dedupe)...");
+            $this->logStep("Page {$pageNum}: processing chunk (ghost/dup-lead filter + source ID validation)...");
             $beforeProcess = $chunkSize;
             [$processedChunk, $newCatChanges, $newAffChanges] = $this->processChunk(
                 $chunk,
@@ -408,8 +428,12 @@ class SyncContactsData extends Command
             }
 
             if ($dryRun) {
-                $this->info("[DRY RUN][{$this->source}] Comparing proposed debt columns with {$this->targetTable}...");
-                $this->previewDebtChunk($sqlConnector, $processedChunk);
+                $this->info("[DRY RUN][{$this->source}] Comparing proposed source rows with {$this->targetTable}...");
+                if ($this->option('debt-only')) {
+                    $this->previewDebtChunk($sqlConnector, $processedChunk);
+                } else {
+                    $this->previewContactChunk($sqlConnector, $processedChunk);
+                }
                 $totalInserted += count($processedChunk);
                 $this->logStep('Page ' . $pageNum . ': dry-run skip write (' . count($processedChunk) . ' would upsert)');
             } else {
@@ -470,7 +494,7 @@ class SyncContactsData extends Command
             $this->info("[INFO] Enrollment updates: " . \count($categoryChanges) . " category, " . \count($affiliateChanges) . " affiliate agent");
         }
 
-        if (!$dryRun) {
+        if (!$this->option('debt-only')) {
             $this->applyEnrollmentCategoryUpdates($sqlConnector, $categoryChanges);
             $this->applyEnrollmentAffiliateUpdates($sqlConnector, $affiliateChanges);
         }
@@ -553,8 +577,28 @@ class SyncContactsData extends Command
         }
     }
 
+    /** The replication clock catches late arrivals even when the source edit is older than the watermark. */
+    private function contactChangedSql(string $startDate): string
+    {
+        $cutoff = "'{$this->esc($startDate)}'::TIMESTAMP_NTZ";
+        $contact = "CONVERT_TIMEZONE('America/Los_Angeles', COALESCE(c.MODIFIED, c.CREATED))::TIMESTAMP_NTZ >= {$cutoff}
+            OR CONVERT_TIMEZONE('America/Los_Angeles', c._FIVETRAN_SYNCED)::TIMESTAMP_NTZ >= {$cutoff}";
+        if ($this->source !== 'LT') {
+            return "({$contact})";
+        }
+        // Assignment STAMP is NTZ, so do not perform a session-dependent two-argument conversion.
+        // Include replicated tombstones in eligibility; exclude them when choosing the current history row.
+        return "({$contact} OR EXISTS (
+            SELECT 1 FROM CONTACTS_ASSIGNED delta
+            WHERE delta.CONTACT_ID = c.ID
+              AND (delta.STAMP >= {$cutoff}
+                OR CONVERT_TIMEZONE('America/Los_Angeles', delta._FIVETRAN_SYNCED)::TIMESTAMP_NTZ >= {$cutoff})
+        ))";
+    }
+
     private function buildStandardQuery(string $startDate, int $lastId, int $limit): string
     {
+        $changed = $this->contactChangedSql($startDate);
         // Page contacts first, then reduce every one-to-many source independently.
         // Joining history tables together before deduplication multiplies their rows
         // (for example, 8 statuses × 4 scores × 3 reports = 96 rows for one contact).
@@ -562,8 +606,8 @@ class SyncContactsData extends Command
             WITH contact_page AS (
                 SELECT c.*
                 FROM CONTACTS AS c
-                WHERE CONVERT_TIMEZONE('America/Los_Angeles', COALESCE(c.MODIFIED, c.CREATED)) >= '{$this->esc($startDate)}'::TIMESTAMP_NTZ
-                  AND c.DEL = 'FALSE'
+                WHERE {$changed}
+                  AND c.DEL = 'FALSE' AND c._FIVETRAN_DELETED = FALSE
                   AND c.FIRSTNAME IS NOT NULL AND c.FIRSTNAME <> ''
                   AND c.ISCOAPP = 0
                   AND c.ID > {$lastId}
@@ -574,6 +618,7 @@ class SyncContactsData extends Command
                 SELECT s.CONTACT_ID, s.STAGE_ID, s.STATUS_ID, s.STAMP
                 FROM CONTACTS_STATUS AS s
                 JOIN contact_page AS p ON p.ID = s.CONTACT_ID
+                WHERE s._FIVETRAN_DELETED = FALSE
                 QUALIFY ROW_NUMBER() OVER (PARTITION BY s.CONTACT_ID ORDER BY s.STAMP DESC, s.ID DESC) = 1
             ),
             page_scores AS (
@@ -646,8 +691,8 @@ class SyncContactsData extends Command
                 uf_agent.F_SHORTSTRING AS AGENT_CUSTOM
             FROM contact_page AS c
             LEFT JOIN DATA_SOURCES AS ds ON c.C_SOURCE = ds.ID
-            LEFT JOIN USERS AS u1 ON c.CREATED_BY = u1.UID
-            LEFT JOIN USERS AS u2 ON c.ASSIGNED_TO = u2.UID
+            LEFT JOIN USERS AS u1 ON c.CREATED_BY = u1.UID AND u1._FIVETRAN_DELETED = FALSE
+            LEFT JOIN USERS AS u2 ON c.ASSIGNED_TO = u2.UID AND u2._FIVETRAN_DELETED = FALSE
             LEFT JOIN page_status AS s ON c.ID = s.CONTACT_ID
             LEFT JOIN CONTACTS_CATEGORIES AS cc ON s.STAGE_ID = cc.ID
             LEFT JOIN CONTACTS_LEAD_STATUS AS cls ON s.STATUS_ID = cls.ID
@@ -664,6 +709,7 @@ class SyncContactsData extends Command
 
     private function buildLTQuery(string $startDate, int $lastId, int $limit): string
     {
+        $changed = $this->contactChangedSql($startDate);
         // Apply the keyset page before reading histories and reduce each history
         // independently. EXISTS keeps pages full of duplicate leads from hiding
         // later eligible contacts. Every joined CTE returns at most one row/contact.
@@ -671,8 +717,8 @@ class SyncContactsData extends Command
             WITH contact_page AS (
                 SELECT c.*
                 FROM CONTACTS c
-                WHERE CONVERT_TIMEZONE('America/Los_Angeles', COALESCE(c.MODIFIED, c.CREATED)) >= '{$this->esc($startDate)}'::TIMESTAMP_NTZ
-                  AND c.DEL = 'FALSE'
+                WHERE {$changed}
+                  AND c.DEL = 'FALSE' AND c._FIVETRAN_DELETED = FALSE
                   AND c.FIRSTNAME IS NOT NULL AND c.FIRSTNAME <> ''
                   AND c.ISCOAPP = 0
                   AND c.ID > {$lastId}
@@ -681,6 +727,8 @@ class SyncContactsData extends Command
                       JOIN CONTACTS_LEAD_STATUS eligible_lead ON eligible_status.STATUS_ID = eligible_lead.ID
                       WHERE eligible_status.CONTACT_ID = c.ID
                         AND eligible_lead.TITLE <> 'Duplicate Lead'
+                        AND eligible_status._FIVETRAN_DELETED = FALSE
+                        AND eligible_lead._FIVETRAN_DELETED = FALSE
                   )
                 ORDER BY c.ID
                 LIMIT {$limit}
@@ -689,6 +737,7 @@ class SyncContactsData extends Command
                 SELECT a.CONTACT_ID, a.STAMP
                 FROM CONTACTS_ASSIGNED AS a
                 JOIN contact_page AS p ON p.ID = a.CONTACT_ID
+                WHERE a._FIVETRAN_DELETED = FALSE
                 QUALIFY ROW_NUMBER() OVER (PARTITION BY a.CONTACT_ID ORDER BY a.STAMP DESC, a.ID DESC) = 1
             ),
             page_status AS (
@@ -697,6 +746,7 @@ class SyncContactsData extends Command
                 JOIN contact_page AS p ON p.ID = s.CONTACT_ID
                 JOIN CONTACTS_LEAD_STATUS AS eligible_cls ON eligible_cls.ID = s.STATUS_ID
                 WHERE eligible_cls.TITLE <> 'Duplicate Lead'
+                  AND s._FIVETRAN_DELETED = FALSE AND eligible_cls._FIVETRAN_DELETED = FALSE
                 QUALIFY ROW_NUMBER() OVER (PARTITION BY s.CONTACT_ID ORDER BY s.STAMP DESC, s.ID DESC) = 1
             ),
             page_scores AS (
@@ -726,7 +776,7 @@ class SyncContactsData extends Command
             )
             SELECT
                 TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', c.CREATED), 'YYYY-MM-DD HH24:MI:SS') AS CREATED,
-                TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', a.STAMP), 'YYYY-MM-DD HH24:MI:SS') AS ASSIGNED_ON,
+                TO_CHAR(a.STAMP, 'YYYY-MM-DD HH24:MI:SS') AS ASSIGNED_ON,
                 TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', COALESCE(c.MODIFIED, a.STAMP)), 'YYYY-MM-DD HH24:MI:SS') AS MODIFIED,
                 c.ID AS LLG_ID,
                 c.TP_ID AS EXTERNAL_ID,
@@ -755,8 +805,8 @@ class SyncContactsData extends Command
             FROM contact_page AS c
             LEFT JOIN page_assignment AS a ON c.ID = a.CONTACT_ID
             LEFT JOIN DATA_SOURCES AS ds ON c.C_SOURCE = ds.ID
-            LEFT JOIN USERS AS u1 ON c.CREATED_BY = u1.UID
-            LEFT JOIN USERS AS u2 ON c.ASSIGNED_TO = u2.UID
+            LEFT JOIN USERS AS u1 ON c.CREATED_BY = u1.UID AND u1._FIVETRAN_DELETED = FALSE
+            LEFT JOIN USERS AS u2 ON c.ASSIGNED_TO = u2.UID AND u2._FIVETRAN_DELETED = FALSE
             JOIN page_status AS s ON c.ID = s.CONTACT_ID
             LEFT JOIN CONTACTS_CATEGORIES AS cc ON s.STAGE_ID = cc.ID
             LEFT JOIN CONTACTS_LEAD_STATUS AS cls ON s.STATUS_ID = cls.ID
@@ -770,7 +820,7 @@ class SyncContactsData extends Command
 
     /**
      * Loads enrollment data scoped to enrolled contacts in this chunk.
-     * A temp table passes the IDs to SQL Server, avoiding a full TblEnrollment table scan.
+     * Bounded SELECTs are identical for preview and execution; lookup failures abort the run.
      */
     private function loadEnrollmentDataFiltered(DBConnector $connector, array $chunk): array
     {
@@ -790,32 +840,13 @@ class SyncContactsData extends Command
             return $empty;
         }
 
-        if ($this->option('dry-run')) {
-            $result = ['data' => []];
-            foreach (array_chunk(array_unique($enrolledIds), 1000) as $batch) {
-                $ids = $this->sqlStringList(array_map(fn($id) => 'LLG-' . $id, $batch));
-                $rows = $this->selectPreviewRows($connector,
-                    "SELECT LLG_ID, Category, Agent, Affiliate_Agent FROM TblEnrollment
-                     WHERE LLG_ID IN ({$ids}) AND Category NOT IN ('', 'FDR', 'CSS', 'CNI')");
-                array_push($result['data'], ...$rows);
-            }
-        } else {
-            $connector->querySqlServer("CREATE TABLE #TmpEnrollFilter (ContactId VARCHAR(20))");
-            foreach (\array_chunk($enrolledIds, 1000) as $batch) {
-                $values = \implode(', ', \array_map(
-                    fn($id) => "('" . \str_replace("'", "''", $id) . "')",
-                    $batch
-                ));
-                $connector->querySqlServer("INSERT INTO #TmpEnrollFilter VALUES {$values}");
-            }
-
-            $result = $connector->querySqlServer("
-                SELECT e.LLG_ID, e.Category, e.Agent, e.Affiliate_Agent
-                FROM TblEnrollment e
-                JOIN #TmpEnrollFilter f ON e.LLG_ID = 'LLG-' + f.ContactId
-                WHERE e.Category NOT IN ('', 'FDR', 'CSS', 'CNI')
-            ");
-            $connector->querySqlServer("DROP TABLE #TmpEnrollFilter");
+        $result = ['data' => []];
+        foreach (array_chunk(array_unique($enrolledIds), 1000) as $batch) {
+            $ids = $this->sqlStringList(array_map(fn($id) => 'LLG-' . $id, $batch));
+            $rows = $this->selectPreviewRows($connector,
+                "SELECT LLG_ID, Category, Agent, Affiliate_Agent FROM TblEnrollment
+                 WHERE LLG_ID IN ({$ids}) AND Category NOT IN ('', 'FDR', 'CSS', 'CNI')");
+            array_push($result['data'], ...$rows);
         }
 
         $categories      = [];
@@ -826,6 +857,9 @@ class SyncContactsData extends Command
             $llgId = $row['LLG_ID'] ?? '';
             if (preg_match('/LLG-(\d+)/', $llgId, $matches)) {
                 $contactId                   = $matches[1];
+                if (array_key_exists($contactId, $categories)) {
+                    throw new \RuntimeException('Duplicate enrollment target: ' . $llgId);
+                }
                 $categories[$contactId]      = $row['Category'] ?? '';
                 $assignedAgents[$contactId]  = $row['Agent'] ?? '';
                 $affiliateAgents[$contactId] = $row['Affiliate_Agent'] ?? '';
@@ -888,17 +922,17 @@ class SyncContactsData extends Command
         }
 
         // Exact match first; suffix matches are cached for the source run.
-        $connector->querySqlServer("CREATE TABLE #TmpMailerFilter (ExtId VARCHAR(50) NOT NULL)");
+        $this->checkedSql($connector, "CREATE TABLE #TmpMailerFilter (ExtId VARCHAR(50) NOT NULL)");
         try {
             foreach (\array_chunk($externalIds, 1000) as $batch) {
                 $values = \implode(', ', \array_map(
                     fn($id) => "('" . \str_replace("'", "''", \substr($id, 0, 50)) . "')",
                     $batch
                 ));
-                $connector->querySqlServer("INSERT INTO #TmpMailerFilter (ExtId) VALUES {$values}");
+                $this->checkedSql($connector, "INSERT INTO #TmpMailerFilter (ExtId) VALUES {$values}");
             }
 
-            $exact = $connector->querySqlServer("
+            $exact = $this->checkedSql($connector, "
                 SELECT m.External_ID, m.Drop_Name
                 FROM TblMailers m
                 INNER JOIN #TmpMailerFilter f ON m.External_ID = f.ExtId
@@ -925,7 +959,7 @@ class SyncContactsData extends Command
                     fn($t) => "'" . \str_replace("'", "''", $t) . "'",
                     $tailBatch
                 ));
-                $fallback = $connector->querySqlServer(
+                $fallback = $this->checkedSql($connector,
                     "SELECT Suffix AS External_ID, Drop_Name FROM #TmpMailerSuffixCache WHERE Suffix IN ({$inList})"
                 );
                 if (! ($fallback['success'] ?? false)) {
@@ -934,7 +968,7 @@ class SyncContactsData extends Command
                 $this->mergeDropNameLookup($lookup, $fallback['data'] ?? []);
             }
         } finally {
-            $connector->querySqlServer("DROP TABLE IF EXISTS #TmpMailerFilter");
+            $this->checkedSql($connector, "DROP TABLE IF EXISTS #TmpMailerFilter");
         }
 
         return $lookup;
@@ -946,7 +980,7 @@ class SyncContactsData extends Command
             return;
         }
 
-        $create = $connector->querySqlServer(
+        $create = $this->checkedSql($connector,
             "SET NOCOUNT ON;
              SELECT TOP (0) CAST(RIGHT(External_ID, 9) AS varchar(9)) AS Suffix, Drop_Name
              INTO #TmpMailerSuffixCache FROM TblMailers;
@@ -956,7 +990,7 @@ class SyncContactsData extends Command
             throw new \RuntimeException('Unable to create temporary mailer suffix cache: ' . ($create['error'] ?? 'unknown SQL Server error'));
         }
 
-        $index = $connector->querySqlServer(
+        $index = $this->checkedSql($connector,
             'CREATE NONCLUSTERED INDEX IX_TmpMailerSuffixCache_Suffix ON #TmpMailerSuffixCache (Suffix)'
         );
         if (! ($index['success'] ?? false)) {
@@ -976,7 +1010,7 @@ class SyncContactsData extends Command
             return;
         }
 
-        $create = $connector->querySqlServer(
+        $create = $this->checkedSql($connector,
             "SET NOCOUNT ON;
              SELECT TOP (0) CAST(RIGHT(External_ID, 9) AS varchar(9)) AS Suffix
              INTO #TmpMailerSuffixFilter FROM TblMailers;
@@ -989,12 +1023,12 @@ class SyncContactsData extends Command
         try {
             foreach (array_chunk(array_keys($missing), 1000) as $batch) {
                 $values = implode(', ', array_map(fn($tail) => "('" . $this->escSql((string) $tail) . "')", $batch));
-                $insert = $connector->querySqlServer("INSERT INTO #TmpMailerSuffixFilter (Suffix) VALUES {$values}");
+                $insert = $this->checkedSql($connector, "INSERT INTO #TmpMailerSuffixFilter (Suffix) VALUES {$values}");
                 if (! ($insert['success'] ?? false)) {
                     throw new \RuntimeException('Unable to fill mailer suffix filter: ' . ($insert['error'] ?? 'unknown SQL Server error'));
                 }
             }
-            $populate = $connector->querySqlServer(
+            $populate = $this->checkedSql($connector,
                 "INSERT INTO #TmpMailerSuffixCache (Suffix, Drop_Name)
                  SELECT CAST(RIGHT(m.External_ID, 9) AS varchar(9)), m.Drop_Name
                  FROM #TmpMailerSuffixFilter f
@@ -1005,7 +1039,7 @@ class SyncContactsData extends Command
                 throw new \RuntimeException('Unable to populate temporary mailer suffix cache: ' . ($populate['error'] ?? 'unknown SQL Server error'));
             }
         } finally {
-            $connector->querySqlServer('DROP TABLE IF EXISTS #TmpMailerSuffixFilter');
+            $this->checkedSql($connector, 'DROP TABLE IF EXISTS #TmpMailerSuffixFilter');
         }
 
         $this->cachedMailerSuffixes += $missing;
@@ -1015,10 +1049,11 @@ class SyncContactsData extends Command
 
     private function fetchMailerSuffixes(DBConnector $snowflake, string $startDate): array
     {
+        $changed = $this->contactChangedSql($startDate);
         $result = $snowflake->query(
             "SELECT DISTINCT c.TP_ID AS EXTERNAL_ID FROM CONTACTS c
-             WHERE CONVERT_TIMEZONE('America/Los_Angeles', COALESCE(c.MODIFIED, c.CREATED)) >= '{$this->esc($startDate)}'::TIMESTAMP_NTZ
-               AND c.DEL = 'FALSE' AND c.FIRSTNAME IS NOT NULL AND c.FIRSTNAME <> ''
+             WHERE {$changed}
+               AND c.DEL = 'FALSE' AND c._FIVETRAN_DELETED = FALSE AND c.FIRSTNAME IS NOT NULL AND c.FIRSTNAME <> ''
                AND c.ISCOAPP = 0 AND c.ID > 0"
         );
         if (($result['success'] ?? true) === false || !isset($result['data']) || !is_array($result['data'])
@@ -1096,6 +1131,15 @@ class SyncContactsData extends Command
             'basis' => $validLoan ? 'loan' : ($enrolled > 0 ? 'enrolled_fallback' : 'no_debt')];
     }
 
+    private function checkedSql(DBConnector $connector, string $sql): array
+    {
+        $result = $connector->querySqlServer($sql);
+        if (!($result['success'] ?? false)) {
+            throw new \RuntimeException('Contact lookup SQL failed: ' . ($result['error'] ?? 'unknown error'));
+        }
+        return $result;
+    }
+
     /** Only SELECTs, including when the normal sync uses temporary lookup tables. */
     private function selectPreviewRows(DBConnector $connector, string $sql): array
     {
@@ -1126,32 +1170,36 @@ class SyncContactsData extends Command
                 $lookup[$id] = $old;
             }
             foreach ($batch as $row) {
-                $this->debtPreview['processed']++;
-                $this->debtPreview[$row['debt_basis']]++;
-                $old = $lookup[$row['llg_id']] ?? null;
-                if ($old === null) {
-                    $this->debtPreview['new']++;
-                    continue;
-                }
-                $amountChanged = $old['Debt_Amount'] === null
-                    || round((float) $old['Debt_Amount'], 2) !== round((float) $row['debt_amount'], 2);
-                $enrolledChanged = $old['Debt_Enrolled'] === null
-                    || round((float) $old['Debt_Enrolled'], 2) !== round((float) $row['debt_enrolled'], 2);
-                $this->debtPreview['amount_changed'] += (int) $amountChanged;
-                $this->debtPreview['enrolled_changed'] += (int) $enrolledChanged;
-                $this->debtPreview[$amountChanged || $enrolledChanged ? 'changed' : 'unchanged']++;
-                if (($amountChanged || $enrolledChanged) && $this->debtPreview['samples'] < 10) {
-                    $this->debtPreview['samples']++;
-                    $format = fn($value) => $value === null ? 'NULL' : number_format((float) $value, 2, '.', '');
-                    $this->line(sprintf('[DEBT CHANGE] %s Debt_Amount %s => %s; Debt_Enrolled %s => %s; basis=%s',
-                        $row['llg_id'], $format($old['Debt_Amount']), $format($row['debt_amount']),
-                        $format($old['Debt_Enrolled']), $format($row['debt_enrolled']), $row['debt_basis']));
-                }
+                $this->recordDebtPreview($row, isset($lookup[$row['llg_id']]) ? array_change_key_case($lookup[$row['llg_id']], CASE_LOWER) : null);
             }
         }
         $this->info(sprintf('[DRY RUN][%s] Debt comparison: %d processed, %d existing changed, %d unchanged, %d new.',
             $this->source, $this->debtPreview['processed'], $this->debtPreview['changed'],
             $this->debtPreview['unchanged'], $this->debtPreview['new']));
+    }
+
+    private function recordDebtPreview(array $row, ?array $old): void
+    {
+        $this->debtPreview['processed']++;
+        $this->debtPreview[$row['debt_basis']]++;
+        if ($old === null) {
+            $this->debtPreview['new']++;
+            return;
+        }
+        $amountChanged = $old['debt_amount'] === null
+            || round((float) $old['debt_amount'], 2) !== round((float) $row['debt_amount'], 2);
+        $enrolledChanged = $old['debt_enrolled'] === null
+            || round((float) $old['debt_enrolled'], 2) !== round((float) $row['debt_enrolled'], 2);
+        $this->debtPreview['amount_changed'] += (int) $amountChanged;
+        $this->debtPreview['enrolled_changed'] += (int) $enrolledChanged;
+        $this->debtPreview[$amountChanged || $enrolledChanged ? 'changed' : 'unchanged']++;
+        if (($amountChanged || $enrolledChanged) && $this->debtPreview['samples'] < 10) {
+            $this->debtPreview['samples']++;
+            $format = fn($value) => $value === null ? 'NULL' : number_format((float) $value, 2, '.', '');
+            $this->line(sprintf('[DEBT CHANGE] %s Debt_Amount %s => %s; Debt_Enrolled %s => %s; basis=%s',
+                $row['llg_id'], $format($old['debt_amount']), $format($row['debt_amount']),
+                $format($old['debt_enrolled']), $format($row['debt_enrolled']), $row['debt_basis']));
+        }
     }
 
     private function printDebtPreviewSummary(): void
@@ -1185,8 +1233,8 @@ class SyncContactsData extends Command
         $existingCategories = $enrollmentData['categories'];
         $existingAffiliates = $enrollmentData['affiliate_agents'];
 
-        // Drop ghosts first, then keep latest Modified per TP_ID. If ghost wins
-        // Modified DESC and we skip it after, the real contact for that TP_ID is lost.
+        // Filter explicit excluded records, then verify native source IDs.
+        // External/partner IDs are allowed to repeat and never choose a winning person.
         $ghostIds = [1212313502, 1212314964, 1212315478, 1212329195, 1212342404];
         $chunk = array_values(array_filter(
             $chunk,
@@ -1257,12 +1305,12 @@ class SyncContactsData extends Command
             if (!empty($enrolledDate) && isset($existingCategories[$contactId]) && $category !== '') {
                 $llgId = "LLG-{$contactId}";
                 if ($existingCategories[$contactId] !== $category) {
-                    $categoryChanges[] = ['llg_id' => $llgId, 'category' => $category];
+                    $categoryChanges[] = ['llg_id' => $llgId, 'category' => $category, 'before' => $existingCategories[$contactId], 'client' => $processedRow['client'], 'email' => $processedRow['email'], 'phone' => $processedRow['phone']];
                 }
                 if ($category !== 'LDR') {
                     $existingAffiliate = $existingAffiliates[$contactId] ?? '';
                     if ($agent !== '' && $existingAffiliate !== $agent && !\str_ends_with(\strtolower($agent), ' user')) {
-                        $affiliateChanges[] = ['llg_id' => $llgId, 'agent' => $agent];
+                        $affiliateChanges[] = ['llg_id' => $llgId, 'agent' => $agent, 'before' => $existingAffiliate, 'client' => $processedRow['client'], 'email' => $processedRow['email'], 'phone' => $processedRow['phone']];
                     }
                 }
             }
@@ -1275,94 +1323,29 @@ class SyncContactsData extends Command
     // Insertion
     // -------------------------------------------------------------------------
 
-    /**
-     * Inserts one processed chunk and returns the number of rows upserted.
-     * Throws on any failure so the caller can abort the run immediately.
-     *
-     * Full refresh mode:  plain INSERT (table was already truncated).
-     * Incremental mode:   DELETE matching LLG_IDs first, then INSERT — this
-     *                     handles both updated existing contacts and brand-new ones
-     *                     without needing a full-table MERGE statement.
-     *
-     * LT special case: after matching remaps TblContacts.LLG_ID to LDR/PLAW,
-     * the LT key no longer exists. Re-INSERT would create a duplicate. Instead
-     * UPDATE the remapped row by External_ID and keep its LLG_ID (Jacob: match
-     * updates IDs; later LT sync must not insert a second row).
-     */
+    /** Same SELECT-based target decisions as dry-run; commit one validated chunk. */
     private function insertChunk(DBConnector $connector, array $data, bool $incremental = false): int
     {
-        if (empty($data)) {
+        if ($data === []) {
             return 0;
         }
-
-        // Deduplicate by LLG_ID within this chunk: keep the row with the most recent
-        // assigned_date and prefer rows with a non-empty agent.
-        $deduped = [];
-        foreach ($data as $row) {
-            $llgId = $row['llg_id'] ?? '';
-            if ($llgId === '') {
-                $deduped[] = $row;
-                continue;
-            }
-            if (!isset($deduped[$llgId])) {
-                $deduped[$llgId] = $row;
-                continue;
-            }
-            $existing = $deduped[$llgId];
-            $existingAgent    = $existing['agent'] ?? '';
-            $rowAgent         = $row['agent'] ?? '';
-            $existingAssigned = $existing['assigned_date'] ?? '';
-            $rowAssigned      = $row['assigned_date'] ?? '';
-            $rowBetter = ($existingAgent === '' && $rowAgent !== '')
-                || ($existingAgent === $rowAgent && $rowAssigned > $existingAssigned);
-            if ($rowBetter) {
-                $deduped[$llgId] = $row;
-            }
-        }
-        $data = \array_values($deduped);
-
-        $fields = $this->contactFields();
-
         $pdo = $connector->getSqlServerConnection();
-        $pdo->beginTransaction();
-
+        if (!$pdo->beginTransaction()) {
+            throw new \RuntimeException('Could not begin contact upsert transaction.');
+        }
         try {
-            $toInsert = $data;
-            $toUpdate = [];
-
-            if ($incremental && $this->source === 'LT') {
-                $splitStarted = microtime(true);
-                $this->logStep('SQL: splitting LT upserts (External_ID + remapped LDR/PLAW lookup)...');
-                [$toUpdate, $toInsert] = $this->splitLtIncrementalUpserts($pdo, $data);
-                $this->logStep(
-                    'SQL: split done — update=' . count($toUpdate) . ', insert=' . count($toInsert),
-                    $splitStarted
-                );
-
-                if ($toUpdate !== []) {
-                    $updStarted = microtime(true);
-                    $this->logStep('SQL: updating ' . count($toUpdate) . ' remapped TblContacts row(s)...');
-                    $this->updateLtContactsByExternalId($pdo, $toUpdate);
-                    $this->logStep('SQL: remapped updates done', $updStarted);
-                }
+            // Staging only receives rows already planned against the real destination.
+            if ($this->targetTable === $this->refreshStage) {
+                $this->insertContactRows($pdo, $this->contactFields(), $data);
+                $count = count($data);
+            } else {
+                $plan = ContactSyncTargets::plan($pdo, $data, $this->source, true);
+                $count = ContactSyncTargets::apply($pdo, $plan, $this->source);
             }
-
-            if ($incremental && !empty($toInsert)) {
-                $delStarted = microtime(true);
-                $this->logStep('SQL: deleting ' . count($toInsert) . ' existing LLG_ID(s) before re-insert...');
-                $this->deleteByLlgIds($pdo, \array_column($toInsert, 'llg_id'));
-                $this->logStep('SQL: deletes done', $delStarted);
+            if (!$pdo->commit()) {
+                throw new \RuntimeException('Contact upsert commit failed.');
             }
-
-            if (!empty($toInsert)) {
-                $insStarted = microtime(true);
-                $this->logStep('SQL: inserting ' . count($toInsert) . ' row(s) into ' . $this->targetTable . '...');
-                $this->insertContactRows($pdo, $fields, $toInsert);
-                $this->logStep('SQL: inserts done', $insStarted);
-            }
-
-            $pdo->commit();
-            return \count($data);
+            return $count;
         } catch (\Throwable $e) {
             if ($pdo->inTransaction()) {
                 $pdo->rollBack();
@@ -1371,320 +1354,20 @@ class SyncContactsData extends Command
         }
     }
 
-    /**
-     * LT incremental: rows whose External_ID already exists under a different LLG_ID
-     * were remapped by matching — UPDATE that row, do not INSERT the old LT key.
-     * Also detects remaps via LDR/PLAW.External_ID = LT contact id (Amanda-class blank TP_ID).
-     *
-     * @return array{0: list<array>, 1: list<array>} [toUpdate, toInsert]
-     */
-    private function splitLtIncrementalUpserts(\PDO $pdo, array $data): array
+    private function previewContactChunk(DBConnector $connector, array $rows): void
     {
-        $extStarted = microtime(true);
-        $this->logStep('SQL: looking up existing External_ID owners (' . count($data) . ' rows)...');
-        $extToExistingLlg = $this->lookupLtExternalIdOwners($pdo, $data);
-        $this->logStep('SQL: External_ID owners found=' . count($extToExistingLlg), $extStarted);
-
-        $remapStarted = microtime(true);
-        $this->logStep('SQL: looking up remapped owners via LDR/PLAW External_ID...');
-        $ltIdToExistingLlg = $this->lookupLtRemappedOwnersByContactId($pdo, $data);
-        $this->logStep('SQL: remapped owners found=' . count($ltIdToExistingLlg), $remapStarted);
-
-        $toUpdate = [];
-        $toInsert = [];
-
-        foreach ($data as $row) {
-            $ext = (string) ($row['external_id'] ?? '');
-            $llg = (string) ($row['llg_id'] ?? '');
-            $ltId = preg_replace('/^LLG-/i', '', $llg);
-            $existingLlg = $ext !== '' ? ($extToExistingLlg[$ext] ?? null) : null;
-            if ($existingLlg === null && $ltId !== '') {
-                $existingLlg = $ltIdToExistingLlg[$ltId] ?? null;
-            }
-            if ($existingLlg !== null && $existingLlg !== $llg) {
-                $row['_lt_contact_id'] = $ltId;
-                $row['_existing_llg_id'] = $existingLlg;
-                $toUpdate[] = $row;
-            } else {
-                $toInsert[] = $row;
-            }
-        }
-
-        return [$toUpdate, $toInsert];
-    }
-
-    /**
-     * Remapped TblContacts rows: side-table External_ID holds the original LT contact id.
-     *
-     * @return array<string, string> LT contact id => existing TblContacts.LLG_ID
-     */
-    private function lookupLtRemappedOwnersByContactId(\PDO $pdo, array $data): array
-    {
-        $ltIds = [];
-        foreach ($data as $row) {
-            $llg = (string) ($row['llg_id'] ?? '');
-            $ltId = preg_replace('/^LLG-/i', '', $llg);
-            if ($ltId !== '' && ctype_digit($ltId)) {
-                $ltIds[$ltId] = $llg;
-            }
-        }
-        if ($ltIds === []) {
-            return [];
-        }
-
-        $pdo->exec('CREATE TABLE #TmpLtRemapIds (LtId VARCHAR(50) NOT NULL PRIMARY KEY)');
-        try {
-            foreach (\array_chunk(\array_keys($ltIds), 1000) as $batch) {
-                $values = \implode(', ', \array_map(
-                    fn($id) => "('" . $this->escSql($id) . "')",
-                    $batch
-                ));
-                if ($pdo->exec("INSERT INTO #TmpLtRemapIds (LtId) VALUES {$values}") === false) {
-                    $err = $pdo->errorInfo();
-                    throw new \RuntimeException('LT remapped id temp insert failed: ' . ($err[2] ?? 'unknown PDO error'));
-                }
-            }
-
-            $sql = "
-                SELECT t.LtId, c.LLG_ID
-                FROM #TmpLtRemapIds AS t
-                INNER JOIN TblContactsPLAW AS src ON src.External_ID = t.LtId
-                INNER JOIN TblContacts AS c ON c.LLG_ID = src.LLG_ID
-                UNION
-                SELECT t.LtId, c.LLG_ID
-                FROM #TmpLtRemapIds AS t
-                INNER JOIN TblContactsLDR AS src ON src.External_ID = t.LtId
-                INNER JOIN TblContacts AS c ON c.LLG_ID = src.LLG_ID
-            ";
-            $stmt = $pdo->query($sql);
-            if ($stmt === false) {
-                $err = $pdo->errorInfo();
-                throw new \RuntimeException('LT remapped contact-id lookup failed: ' . ($err[2] ?? 'unknown PDO error'));
-            }
-
-            $map = [];
-            while ($found = $stmt->fetch(\PDO::FETCH_ASSOC)) {
-                $ltId = (string) ($found['LtId'] ?? $found['ltid'] ?? '');
-                $existing = (string) ($found['LLG_ID'] ?? $found['llg_id'] ?? '');
-                $incoming = $ltIds[$ltId] ?? '';
-                if ($ltId === '' || $existing === '' || $existing === $incoming) {
-                    continue;
-                }
-                $map[$ltId] = $existing;
-            }
-            return $map;
-        } finally {
-            $pdo->exec('DROP TABLE IF EXISTS #TmpLtRemapIds');
-        }
-    }
-
-    /** @return array<string, string> External_ID => preferred existing LLG_ID (prefer non-incoming LT key when both exist) */
-    private function lookupLtExternalIdOwners(\PDO $pdo, array $data): array
-    {
-        $map = [];
-        foreach (\array_chunk($data, 1000) as $batch) {
-            $extIds = [];
-            foreach ($batch as $row) {
-                $ext = (string) ($row['external_id'] ?? '');
-                if ($ext !== '') {
-                    $extIds[$ext] = (string) ($row['llg_id'] ?? '');
-                }
-            }
-            if ($extIds === []) {
-                continue;
-            }
-            $inList = \implode(', ', \array_map(
-                fn($id) => "'" . $this->escSql($id) . "'",
-                \array_keys($extIds)
-            ));
-            $stmt = $pdo->query(
-                "SELECT LLG_ID, External_ID FROM {$this->targetTable} WHERE External_ID IN ({$inList})"
-            );
-            if ($stmt === false) {
-                $err = $pdo->errorInfo();
-                throw new \RuntimeException('LT External_ID lookup failed: ' . ($err[2] ?? 'unknown PDO error'));
-            }
-            $byExt = [];
-            while ($found = $stmt->fetch(\PDO::FETCH_ASSOC)) {
-                $ext = (string) ($found['External_ID'] ?? $found['external_id'] ?? '');
-                $llg = (string) ($found['LLG_ID'] ?? $found['llg_id'] ?? '');
-                if ($ext === '' || $llg === '') {
-                    continue;
-                }
-                $byExt[$ext][] = $llg;
-            }
-            foreach ($byExt as $ext => $llgs) {
-                $incoming = $extIds[$ext] ?? '';
-                $preferred = null;
-                foreach ($llgs as $llg) {
-                    if ($llg !== $incoming) {
-                        $preferred = $llg;
-                        break;
-                    }
-                }
-                $map[$ext] = $preferred ?? $llgs[0];
-            }
-        }
-
-        return $map;
-    }
-
-    private function deleteByLlgIds(\PDO $pdo, array $llgIds): void
-    {
-        $llgIds = \array_values(\array_filter($llgIds, fn($id) => $id !== null && $id !== ''));
-        if ($llgIds === []) {
-            return;
-        }
-        foreach (\array_chunk($llgIds, 1000) as $deleteBatch) {
-            $ids = \implode(', ', \array_map(
-                fn($id) => "'" . $this->escSql((string) $id) . "'",
-                $deleteBatch
-            ));
-            $sql = "DELETE FROM {$this->targetTable} WHERE LLG_ID IN ({$ids})";
-            if ($pdo->exec($sql) === false) {
-                $err = $pdo->errorInfo();
-                throw new \RuntimeException('DELETE batch failed: ' . ($err[2] ?? 'unknown PDO error'));
-            }
-        }
-    }
-
-    /** Refresh fields on remapped TblContacts rows; LLG_ID unchanged. */
-    private function updateLtContactsByExternalId(\PDO $pdo, array $rows): void
-    {
-        if ($rows === []) {
-            return;
-        }
-
-        $batches = \array_chunk($rows, 500);
-        $totalBatches = \count($batches);
-        foreach ($batches as $batchIndex => $batch) {
-            $batchStarted = microtime(true);
-            $this->logStep('SQL: remapped update batch ' . ($batchIndex + 1) . '/' . $totalBatches . ' (' . count($batch) . ' rows)...');
-
-            $pdo->exec('CREATE TABLE #TmpLtExtUpd (
-                ExistingLlgId VARCHAR(50) NOT NULL,
-                External_ID VARCHAR(50) NULL,
-                LtContactId VARCHAR(50) NOT NULL,
-                Created_Date DATETIME NULL,
-                Assigned_Date DATETIME NULL,
-                Campaign NVARCHAR(255) NULL,
-                Data_Source NVARCHAR(255) NULL,
-                Created_By NVARCHAR(255) NULL,
-                Agent NVARCHAR(255) NULL,
-                Client NVARCHAR(255) NULL,
-                Phone VARCHAR(50) NULL,
-                Email NVARCHAR(255) NULL,
-                Address_1 NVARCHAR(255) NULL,
-                Address_2 NVARCHAR(255) NULL,
-                City NVARCHAR(100) NULL,
-                State VARCHAR(20) NULL,
-                Zip VARCHAR(20) NULL,
-                Stage NVARCHAR(255) NULL,
-                Status NVARCHAR(255) NULL,
-                Debt_Amount INT NULL,
-                Debt_Enrolled FLOAT NULL,
-                Credit_Score INT NULL,
-                Credit_Utilization INT NULL,
-                Category NVARCHAR(255) NULL,
-                Affiliate_Agent NVARCHAR(255) NULL
-            )');
-
-            $valuesParts = [];
-            foreach ($batch as $row) {
-                $createdDate  = $row['created_date'] ? "'{$row['created_date']}'" : 'NULL';
-                $assignedDate = $row['assigned_date'] ? "'{$row['assigned_date']}'" : 'NULL';
-                $email        = \strpos($row['email'], '@') !== false
-                    ? "'" . $this->escSql($row['email']) . "'"
-                    : 'NULL';
-                $ltContactId = (string) ($row['_lt_contact_id'] ?? preg_replace('/^LLG-/i', '', (string) ($row['llg_id'] ?? '')));
-                $existingLlg = (string) ($row['_existing_llg_id'] ?? '');
-                if ($existingLlg === '') {
-                    continue;
-                }
-                $extSql = ($row['external_id'] ?? '') !== ''
-                    ? "'" . $this->escSql((string) $row['external_id']) . "'"
-                    : 'NULL';
-                $valuesParts[] = "("
-                    . "'{$this->escSql($existingLlg)}', "
-                    . "{$extSql}, "
-                    . "'{$this->escSql($ltContactId)}', "
-                    . "{$createdDate}, {$assignedDate}, "
-                    . "'{$this->escSql($row['campaign'])}', "
-                    . "'{$this->escSql($row['data_source'])}', "
-                    . "'{$this->escSql($row['created_by'])}', "
-                    . "'{$this->escSql($row['agent'])}', "
-                    . "'{$this->escSql($row['client'])}', "
-                    . "'{$this->escSql($row['phone'])}', "
-                    . "{$email}, "
-                    . "'{$this->escSql($row['address_1'])}', "
-                    . "'{$this->escSql($row['address_2'])}', "
-                    . "'{$this->escSql($row['city'])}', "
-                    . "'{$this->escSql($row['state'])}', "
-                    . "'{$this->escSql($row['zip'])}', "
-                    . "'{$this->escSql($row['stage'])}', "
-                    . "'{$this->escSql($row['status'])}', "
-                    . ((int) $row['debt_amount']) . ", "
-                    . ((float) $row['debt_enrolled']) . ", "
-                    . ((int) $row['credit_score']) . ", "
-                    . ((int) $row['credit_utilization']) . ", "
-                    . "'{$this->escSql($row['category'])}', "
-                    . "'{$this->escSql($row['affiliate_agent'])}'"
-                    . ')';
-            }
-
-            if ($valuesParts === []) {
-                $pdo->exec('DROP TABLE IF EXISTS #TmpLtExtUpd');
-                continue;
-            }
-
-            $ins = 'INSERT INTO #TmpLtExtUpd (
-                ExistingLlgId, External_ID, LtContactId, Created_Date, Assigned_Date, Campaign, Data_Source, Created_By, Agent, Client,
-                Phone, Email, Address_1, Address_2, City, State, Zip, Stage, Status,
-                Debt_Amount, Debt_Enrolled, Credit_Score, Credit_Utilization, Category, Affiliate_Agent
-            ) VALUES ' . \implode(', ', $valuesParts);
-            if ($pdo->exec($ins) === false) {
-                $err = $pdo->errorInfo();
-                throw new \RuntimeException('LT remapped UPDATE staging failed: ' . ($err[2] ?? 'unknown PDO error'));
-            }
-
-            // Join on the remapped LLG_ID we already found — no LDR/PLAW EXISTS scans.
-            $upd = "UPDATE c
-                SET c.External_ID = CASE
-                        WHEN COALESCE(c.External_ID, '') <> '' THEN c.External_ID
-                        WHEN COALESCE(u.External_ID, '') <> '' THEN u.External_ID
-                        ELSE u.LtContactId
-                    END,
-                    c.Created_Date = u.Created_Date,
-                    c.Assigned_Date = u.Assigned_Date,
-                    c.Campaign = u.Campaign,
-                    c.Data_Source = u.Data_Source,
-                    c.Created_By = u.Created_By,
-                    c.Agent = u.Agent,
-                    c.Client = u.Client,
-                    c.Phone = u.Phone,
-                    c.Email = u.Email,
-                    c.Address_1 = u.Address_1,
-                    c.Address_2 = u.Address_2,
-                    c.City = u.City,
-                    c.State = u.State,
-                    c.Zip = u.Zip,
-                    c.Stage = u.Stage,
-                    c.Status = u.Status,
-                    c.Debt_Amount = u.Debt_Amount,
-                    c.Debt_Enrolled = u.Debt_Enrolled,
-                    c.Credit_Score = u.Credit_Score,
-                    c.Credit_Utilization = u.Credit_Utilization,
-                    c.Category = u.Category,
-                    c.Affiliate_Agent = u.Affiliate_Agent
-                FROM {$this->targetTable} AS c
-                INNER JOIN #TmpLtExtUpd AS u ON c.LLG_ID = u.ExistingLlgId";
-            if ($pdo->exec($upd) === false) {
-                $err = $pdo->errorInfo();
-                throw new \RuntimeException('LT remapped UPDATE failed: ' . ($err[2] ?? 'unknown PDO error'));
-            }
-
-            $pdo->exec('DROP TABLE #TmpLtExtUpd');
-            $this->logStep('SQL: remapped update batch ' . ($batchIndex + 1) . '/' . $totalBatches . ' done', $batchStarted);
+        $plan = ContactSyncTargets::plan($connector->getSqlServerConnection(), $rows, $this->source);
+        $byId = array_column($rows, null, 'llg_id');
+        foreach ($plan as $change) {
+            $debtRow = $byId[$change['incoming_id']];
+            $debtRow['llg_id'] = $change['target_id'];
+            $this->recordDebtPreview($debtRow, $change['before']);
+            $this->line('[PREVIEW] ' . json_encode([
+                'source' => $this->source, 'table' => $this->targetTable,
+                'incoming_id' => $change['incoming_id'], 'target_id' => $change['target_id'],
+                'action' => $change['before'] === null ? 'insert' : ($change['changes'] === [] ? 'unchanged' : 'update'),
+                'changes' => $change['changes'],
+            ], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
         }
     }
 
@@ -1696,7 +1379,7 @@ class SyncContactsData extends Command
             foreach ($batch as $row) {
                 $createdDate  = $row['created_date'] ? "'{$row['created_date']}'" : 'NULL';
                 $assignedDate = $row['assigned_date'] ? "'{$row['assigned_date']}'" : 'NULL';
-                $email        = \strpos($row['email'], '@') !== false
+                $email        = \strpos((string) ($row['email'] ?? ''), '@') !== false
                     ? "'" . $this->escSql($row['email']) . "'"
                     : 'NULL';
 
@@ -1741,57 +1424,63 @@ class SyncContactsData extends Command
 
     private function applyEnrollmentCategoryUpdates(DBConnector $connector, array $changes): void
     {
-        if (empty($changes)) {
-            return;
-        }
-
-        $connector->querySqlServer("CREATE TABLE #TmpCatUpd (LLG_ID VARCHAR(50), NewCat VARCHAR(50))");
-
-        foreach (\array_chunk($changes, 500) as $chunk) {
-            $values = \implode(', ', \array_map(
-                fn($c) => "('{$this->escSql($c['llg_id'])}', '{$this->escSql($c['category'])}')",
-                $chunk
-            ));
-            $connector->querySqlServer("INSERT INTO #TmpCatUpd (LLG_ID, NewCat) VALUES {$values}");
-        }
-
-        $connector->querySqlServer("
-            UPDATE TblEnrollment
-            SET Category = u.NewCat
-            FROM TblEnrollment e
-            JOIN #TmpCatUpd u ON e.LLG_ID = u.LLG_ID
-            WHERE e.Category <> u.NewCat OR e.Category IS NULL
-        ");
-
-        $connector->querySqlServer("DROP TABLE #TmpCatUpd");
+        $this->applyEnrollmentFieldChanges($connector, $changes, 'Category', 'category');
     }
 
     private function applyEnrollmentAffiliateUpdates(DBConnector $connector, array $changes): void
     {
-        if (empty($changes)) {
-            return;
+        $this->applyEnrollmentFieldChanges($connector, $changes, 'Affiliate_Agent', 'agent');
+    }
+
+    private function applyEnrollmentFieldChanges(DBConnector $connector, array $changes, string $field, string $key): void
+    {
+        $name = $this->contactNameMatchSql('e', 'u');
+        $identity = ContactSyncIdentity::sql('c', 'u');
+        $owner = ContactSyncMatching::enrollmentOwnerSql('c');
+        foreach (array_chunk($changes, 100) as $batch) {
+            $values = [];
+            $params = [];
+            foreach ($batch as $change) {
+                $values[] = '(?, ?, ?, ?, ?, ?)';
+                array_push($params, $change['llg_id'], $change['client'], $change['email'], $change['phone'], $change['before'], $change[$key]);
+            }
+            $from = 'FROM TblEnrollment e JOIN (VALUES ' . implode(', ', $values) . ") u(LLG_ID, Client, Email, Phone, BeforeValue, AfterValue)
+                ON e.LLG_ID = u.LLG_ID AND {$name}
+                WHERE COALESCE(e.{$field}, '') = u.BeforeValue
+                  AND (SELECT COUNT(*) FROM TblEnrollment d WHERE d.LLG_ID = e.LLG_ID) = 1
+                  AND (SELECT COUNT(*) FROM TblContacts c WHERE c.LLG_ID = e.LLG_ID) = 1
+                  AND EXISTS (SELECT 1 FROM TblContacts c WHERE c.LLG_ID = e.LLG_ID AND {$identity} AND {$owner})";
+            if ($this->option('dry-run')) {
+                $sql = "SELECT e.LLG_ID, e.{$field} AS BeforeValue, u.AfterValue {$from}";
+                $result = $connector->querySqlServer($sql, $params);
+                if (!($result['success'] ?? false)) {
+                    throw new \RuntimeException("Enrollment {$field} preview failed.");
+                }
+                foreach ($result['data'] ?? [] as $row) {
+                    $this->line('[ENROLLMENT PREVIEW] ' . json_encode(['field' => $field, 'change' => $row], JSON_THROW_ON_ERROR));
+                }
+                if (count($result['data'] ?? []) !== count($batch)) {
+                    throw new \RuntimeException("Enrollment {$field} preview has changed or ambiguous identities.");
+                }
+                continue;
+            }
+            $pdo = $connector->getSqlServerConnection();
+            $pdo->beginTransaction();
+            try {
+                $statement = $pdo->prepare("UPDATE e SET e.{$field} = u.AfterValue {$from}");
+                if ($statement === false || !$statement->execute($params) || $statement->rowCount() !== count($batch)) {
+                    throw new \RuntimeException("Enrollment {$field} changed or write count mismatch.");
+                }
+                if (!$pdo->commit()) {
+                    throw new \RuntimeException("Enrollment {$field} commit failed.");
+                }
+            } catch (\Throwable $e) {
+                if ($pdo->inTransaction()) {
+                    $pdo->rollBack();
+                }
+                throw $e;
+            }
         }
-
-        $connector->querySqlServer("CREATE TABLE #TmpAffUpd (LLG_ID VARCHAR(50), NewAffiliate NVARCHAR(100))");
-
-        foreach (\array_chunk($changes, 500) as $chunk) {
-            $values = \implode(', ', \array_map(
-                fn($c) => "('{$this->escSql($c['llg_id'])}', '{$this->escSql($c['agent'])}')",
-                $chunk
-            ));
-            $connector->querySqlServer("INSERT INTO #TmpAffUpd (LLG_ID, NewAffiliate) VALUES {$values}");
-        }
-
-        $connector->querySqlServer("
-            UPDATE TblEnrollment
-            SET Affiliate_Agent = u.NewAffiliate
-            FROM TblEnrollment e
-            JOIN #TmpAffUpd u ON e.LLG_ID = u.LLG_ID
-            WHERE (e.Affiliate_Agent <> u.NewAffiliate OR e.Affiliate_Agent IS NULL)
-              AND u.NewAffiliate <> ''
-        ");
-
-        $connector->querySqlServer("DROP TABLE #TmpAffUpd");
     }
 
     // -------------------------------------------------------------------------
@@ -1838,6 +1527,8 @@ class SyncContactsData extends Command
     private function stageFullRefreshChunk(DBConnector $connector, array $rows): int
     {
         $target = $this->targetTable;
+        $plan = ContactSyncTargets::plan($connector->getSqlServerConnection(), $rows, $this->source);
+        $rows = array_column($plan, 'after');
         try {
             $this->targetTable = $this->refreshStage;
             return $this->insertChunk($connector, $rows, false);
@@ -1897,7 +1588,7 @@ class SyncContactsData extends Command
             return $this->previewMatching($connector, [$this->targetTable]);
         }
 
-        $this->resetMatchingStats(13);
+        $this->resetMatchingStats(6);
         $this->printMatchingHeader("{$this->source} post-sync matching");
         $this->matchSourceTableToContacts($connector, $this->targetTable);
         $this->fillEnrollmentAgents($connector, (bool) $this->option('reconcile-agents'));
@@ -1911,7 +1602,7 @@ class SyncContactsData extends Command
             return $this->previewMatching($connector, ['TblContactsLDR', 'TblContactsPLAW']);
         }
 
-        $this->resetMatchingStats(23);
+        $this->resetMatchingStats(10);
         $this->printMatchingHeader('orchestrator final matching (External ID → TblContacts → TblEnrollment)');
 
         foreach (['TblContactsLDR', 'TblContactsPLAW'] as $table) {
@@ -1926,13 +1617,13 @@ class SyncContactsData extends Command
     }
 
     /**
-     * Read-only preview: counts rows that matching would touch + Jacob gap queries.
+     * Read-only preview: exact current target/field differences plus Jacob gap queries.
      * No UPDATE statements are executed.
      */
     private function previewMatching(DBConnector $connector, array $tables): bool
     {
-        // 8 counts per source table + 3 enrollment fix counts + 6 Jacob gap counts
-        $this->resetMatchingStats((\count($tables) * 8) + 3 + 6);
+        // Current-state previews cannot simulate subsequent matching steps without writing.
+        $this->resetMatchingStats((\count($tables) * 4) + 2 + 6);
         $this->printMatchingHeader('DRY RUN — matching verification (read-only, no writes)');
 
         foreach ($tables as $table) {
@@ -1949,135 +1640,29 @@ class SyncContactsData extends Command
 
     private function previewSourceTableMatching(DBConnector $connector, string $table): void
     {
-        $agentGap = "COALESCE({$table}.Agent, '') <> '' AND COALESCE(TblContacts.Agent, '') = ''";
-        $sameIdentity = $this->contactIdentityMatchSql('TblContacts', $table);
-
-        $this->previewCountStep(
-            $connector,
-            "{$table}.llg_id_join",
-            "SELECT COUNT(*) AS cnt FROM TblContacts INNER JOIN {$table} ON TblContacts.LLG_ID = {$table}.LLG_ID AND {$sameIdentity}",
-            "Rows joined on LLG_ID ({$table})"
-        );
-
-        $this->previewCountStep(
-            $connector,
-            "{$table}.llg_id_agent_gap",
-            "SELECT COUNT(*) AS cnt FROM TblContacts INNER JOIN {$table} ON TblContacts.LLG_ID = {$table}.LLG_ID AND {$sameIdentity} WHERE {$agentGap}",
-            "Joined on LLG_ID with blank TblContacts.Agent ({$table})"
-        );
-
-        $this->previewCountStep(
-            $connector,
-            "{$table}.external_id_join",
-            "SELECT COUNT(*) AS cnt FROM TblContacts INNER JOIN {$table}
-             ON TblContacts.LLG_ID = 'LLG-' + CAST({$table}.External_ID AS VARCHAR(50))
-               AND {$sameIdentity}",
-            "Rows joined on External_ID ({$table})"
-        );
-
-        $this->previewCountStep(
-            $connector,
-            "{$table}.external_id_agent_gap",
-            "SELECT COUNT(*) AS cnt FROM TblContacts INNER JOIN {$table}
-             ON TblContacts.LLG_ID = 'LLG-' + CAST({$table}.External_ID AS VARCHAR(50))
-               AND {$sameIdentity}
-             WHERE {$agentGap}",
-            "External_ID join with blank TblContacts.Agent ({$table})"
-        );
-
-        $this->previewCountStep(
-            $connector,
-            "{$table}.external_id_remap",
-            "SELECT COUNT(*) AS cnt FROM TblContacts
-             INNER JOIN {$table} ON TblContacts.LLG_ID = 'LLG-' + CAST({$table}.External_ID AS VARCHAR(50))
-               AND {$sameIdentity}
-             LEFT JOIN TblContacts AS taken ON taken.LLG_ID = {$table}.LLG_ID
-             WHERE taken.LLG_ID IS NULL AND TblContacts.LLG_ID <> {$table}.LLG_ID",
-            "Rows eligible for LLG_ID remap ({$table})"
-        );
-
-        $this->previewCountStep(
-            $connector,
-            "{$table}.identity_remap",
-            "SELECT COUNT(*) AS cnt FROM TblContacts
-             INNER JOIN {$table} ON {$sameIdentity}
-             LEFT JOIN TblContacts AS taken ON taken.LLG_ID = {$table}.LLG_ID
-             WHERE taken.LLG_ID IS NULL AND TblContacts.LLG_ID <> {$table}.LLG_ID",
-            "Rows eligible for identity-verified LLG_ID repair ({$table})"
-        );
-
-        $ltIdentity = $this->contactIdentityMatchSql('lt', 'source');
-        $otherLtIdentity = $this->contactIdentityMatchSql('otherLt', 'source');
-        $this->previewCountStep(
-            $connector,
-            "{$table}.lt_agent_sync",
-            "SELECT COUNT(*) AS cnt
-             FROM {$table} AS source
-             INNER JOIN TblContacts AS lt
-               ON lt.LLG_ID = source.LLG_ID
-              AND {$ltIdentity}
-             WHERE NULLIF(LTRIM(RTRIM(COALESCE(lt.Agent, ''))), '') IS NOT NULL
-               AND lt.Agent NOT LIKE '% User'
-               AND COALESCE(source.Agent, '') <> lt.Agent
-               AND NOT EXISTS (
-                   SELECT 1 FROM TblContacts AS otherLt
-                   WHERE otherLt.LLG_ID = lt.LLG_ID
-                     AND {$otherLtIdentity}
-                     AND COALESCE(otherLt.Agent, '') <> lt.Agent
-               )",
-            "{$table}.Agent would refresh from its verified LT contact"
-        );
-
-        $this->previewCountStep(
-            $connector,
-            "{$table}.backfill_external_id",
-            "SELECT COUNT(*) AS cnt FROM TblContacts
-             INNER JOIN {$table} ON TblContacts.LLG_ID = {$table}.LLG_ID
-               AND {$sameIdentity}
-             WHERE COALESCE(TblContacts.External_ID, '') = ''
-               AND COALESCE(CAST({$table}.External_ID AS VARCHAR(50)), '') <> ''",
-            "Blank External_ID rows {$table} would backfill"
-        );
+        $source = $table === 'TblContactsLDR' ? 'LDR' : 'PLAW';
+        foreach (ContactSyncMatching::sourceSteps($source) as $step => $sql) {
+            $this->previewMatchingRows($connector, "{$table}.{$step}", $sql['preview']);
+        }
     }
 
     private function previewEnrollmentAgentFixes(DBConnector $connector): void
     {
-        $sameName = $this->contactNameMatchSql('e', 'c');
-        $this->previewCountStep(
-            $connector,
-            'enrollment.agent_contacts',
-            "SELECT COUNT(*) AS cnt FROM TblEnrollment e
-             JOIN (
-                 SELECT LLG_ID, MIN(Agent) AS Agent, MIN(Client) AS Client FROM TblContacts
-                 WHERE Agent IS NOT NULL AND Agent <> '' AND Agent NOT LIKE '% User'
-                 GROUP BY LLG_ID
-             ) c ON e.LLG_ID = c.LLG_ID
-                    AND {$sameName}
-             WHERE e.Agent IS NULL OR e.Agent = '' OR e.Agent LIKE '% User' OR e.Agent <> c.Agent",
-            'Enrollments TblContacts.Agent would update'
-        );
+        foreach (ContactSyncMatching::enrollmentSteps((bool) $this->option('reconcile-agents')) as $step => $sql) {
+            $this->previewMatchingRows($connector, "enrollment.{$step}", $sql['preview']);
+        }
+    }
 
-        $this->previewCountStep(
-            $connector,
-            'enrollment.clear_system_user_agents',
-            "SELECT COUNT(*) AS cnt FROM TblEnrollment e
-             WHERE e.Agent LIKE '% User'
-               AND NOT EXISTS (
-                    SELECT 1 FROM TblContacts c
-                    WHERE c.LLG_ID = e.LLG_ID
-                      AND c.Agent IS NOT NULL AND c.Agent <> '' AND c.Agent NOT LIKE '% User'
-               )",
-            'Enrollment system-user agents that would clear'
-        );
-
-        $this->previewCountStep(
-            $connector,
-            'enrollment.drop_name',
-            "SELECT COUNT(*) AS cnt FROM TblEnrollment e
-             JOIN TblContacts c ON e.LLG_ID = c.LLG_ID
-             WHERE COALESCE(c.Campaign, '') <> ''",
-            'Enrollments Drop_Name would update from Campaign'
-        );
+    private function previewMatchingRows(DBConnector $connector, string $step, string $sql): void
+    {
+        $rows = $this->selectPreviewRows($connector, $sql);
+        $this->matchingStepNumber++;
+        $this->matchingStepsOk++;
+        $this->matchingRowsAffected += count($rows);
+        foreach ($rows as $row) {
+            $this->line('[MATCH PREVIEW] ' . json_encode(['step' => $step, 'change' => $row], JSON_THROW_ON_ERROR));
+        }
+        $this->info("[VERIFY] {$step}: " . count($rows) . ' currently eligible changes.');
     }
 
     /** Jacob's gap queries — blank enrollment agent but agent exists on contact table. */
@@ -2180,292 +1765,39 @@ class SyncContactsData extends Command
      */
     private function matchSourceTableToContacts(DBConnector $connector, string $table): void
     {
-        $fields = $this->matchedFieldsSql($table);
-        $sameIdentity = $this->contactIdentityMatchSql('TblContacts', $table);
-        $sameName = $this->contactNameMatchSql('e', 'src');
-        $enrollmentNameCompatible = "(NULLIF(LTRIM(RTRIM(COALESCE(e.Client, ''))), '') IS NULL OR {$sameName})";
-        $duplicateSourceIdentity = $this->contactIdentityMatchSql('TblContacts', 'duplicate');
-        $duplicateContactIdentity = $this->contactIdentityMatchSql('duplicateContact', $table);
-        $keptIdentity = $this->contactIdentityMatchSql('kept', 'src');
-        $orphanContactIdentity = $this->contactIdentityMatchSql('lt', 'src');
-        $ltIdentity = $this->contactIdentityMatchSql('lt', 'source');
-        $otherLtIdentity = $this->contactIdentityMatchSql('otherLt', 'source');
-
-        $this->runMatchingStep(
-            $connector,
-            "{$table}.llg_id_fields",
-            "UPDATE TblContacts
-             SET {$fields}
-             FROM TblContacts
-             INNER JOIN {$table} ON TblContacts.LLG_ID = {$table}.LLG_ID
-               AND {$sameIdentity}",
-            "Switched fields on TblContacts from {$table} (LLG_ID match)"
-        );
-
-        $this->runMatchingStep(
-            $connector,
-            "{$table}.external_id_fields",
-            "UPDATE TblContacts
-             SET {$fields}
-             FROM TblContacts
-             INNER JOIN {$table}
-               ON TblContacts.LLG_ID = 'LLG-' + CAST({$table}.External_ID AS VARCHAR(50))
-              AND {$sameIdentity}",
-            "Switched fields on TblContacts from {$table} (External_ID match)"
-        );
-
-        $this->runMatchingStep(
-            $connector,
-            "{$table}.identity_fields",
-            "UPDATE TblContacts
-             SET {$fields}
-             FROM TblContacts
-             INNER JOIN {$table} ON {$sameIdentity}
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM {$table} AS duplicate
-                 WHERE duplicate.LLG_ID <> {$table}.LLG_ID
-                   AND {$duplicateSourceIdentity}
-             )
-             AND NOT EXISTS (
-                 SELECT 1 FROM TblContacts AS duplicateContact
-                 WHERE duplicateContact.LLG_ID <> TblContacts.LLG_ID
-                   AND {$duplicateContactIdentity}
-             )",
-            "Switched fields on TblContacts from {$table} (verified name/email/phone)"
-        );
-
-        $this->runMatchingStep(
-            $connector,
-            "{$table}.external_id_remap",
-            "UPDATE TblContacts
-             SET TblContacts.LLG_ID = {$table}.LLG_ID
-             FROM TblContacts
-             INNER JOIN {$table}
-               ON TblContacts.LLG_ID = 'LLG-' + CAST({$table}.External_ID AS VARCHAR(50))
-              AND {$sameIdentity}
-             LEFT JOIN TblContacts AS taken ON taken.LLG_ID = {$table}.LLG_ID
-             WHERE taken.LLG_ID IS NULL
-               AND TblContacts.LLG_ID <> {$table}.LLG_ID
-               AND NOT EXISTS (
-                   SELECT 1 FROM {$table} AS duplicate
-                   WHERE duplicate.External_ID = {$table}.External_ID
-                     AND duplicate.LLG_ID <> {$table}.LLG_ID
-                     AND {$duplicateSourceIdentity}
-               )
-               AND NOT EXISTS (
-                   SELECT 1 FROM TblContacts AS duplicateContact
-                   WHERE duplicateContact.LLG_ID <> TblContacts.LLG_ID
-                     AND {$duplicateContactIdentity}
-               )",
-            "Remapped TblContacts.LLG_ID from {$table} (External_ID match)"
-        );
-
-        // Repair stale or previously mis-switched IDs by the verified person identity,
-        // even when an earlier bad ID no longer matches the source External_ID.
-        $this->runMatchingStep(
-            $connector,
-            "{$table}.identity_remap",
-            "UPDATE TblContacts
-             SET TblContacts.LLG_ID = {$table}.LLG_ID
-             FROM TblContacts
-             INNER JOIN {$table} ON {$sameIdentity}
-             LEFT JOIN TblContacts AS taken
-               ON taken.LLG_ID = {$table}.LLG_ID
-              AND taken.LLG_ID <> TblContacts.LLG_ID
-             WHERE taken.LLG_ID IS NULL
-               AND TblContacts.LLG_ID <> {$table}.LLG_ID
-               AND NOT EXISTS (
-                   SELECT 1 FROM {$table} AS duplicate
-                   WHERE duplicate.LLG_ID <> {$table}.LLG_ID
-                     AND {$duplicateSourceIdentity}
-               )
-               AND NOT EXISTS (
-                   SELECT 1 FROM TblContacts AS duplicateContact
-                   WHERE duplicateContact.LLG_ID <> TblContacts.LLG_ID
-                     AND {$duplicateContactIdentity}
-               )",
-            "Repaired TblContacts.LLG_ID by unique name/email/phone identity from {$table}"
-        );
-
-        // Amanda-class: remapped rows often keep blank External_ID (LT TP_ID null).
-        // Store side-table External_ID (LT contact id) so later LT sync can refresh Agent.
-        $this->runMatchingStep(
-            $connector,
-            "{$table}.backfill_external_id",
-            "UPDATE TblContacts
-             SET TblContacts.External_ID = LEFT(CAST({$table}.External_ID AS VARCHAR(50)), 50)
-             FROM TblContacts
-             INNER JOIN {$table} ON TblContacts.LLG_ID = {$table}.LLG_ID
-               AND {$sameIdentity}
-             WHERE COALESCE(TblContacts.External_ID, '') = ''
-               AND COALESCE(CAST({$table}.External_ID AS VARCHAR(50)), '') <> ''
-               AND CAST({$table}.External_ID AS VARCHAR(50)) NOT IN ('0', '1234567840', 'UNKNOWN')",
-            "Backfilled blank TblContacts.External_ID from {$table}"
-        );
-
-        // Side-table Agent is authoritative from the linked LT contact, not the
-        // LDR/PLAW custom agent field. Resolve by the swapped key plus person identity.
-        // When duplicate LT rows disagree on Agent, leave the side row unchanged.
-        $this->runMatchingStep(
-            $connector,
-            "{$table}.lt_agent_sync",
-            "UPDATE source
-             SET source.Agent = lt.Agent
-             FROM {$table} AS source
-             INNER JOIN TblContacts AS lt
-               ON lt.LLG_ID = source.LLG_ID
-              AND {$ltIdentity}
-             WHERE NULLIF(LTRIM(RTRIM(COALESCE(lt.Agent, ''))), '') IS NOT NULL
-               AND lt.Agent NOT LIKE '% User'
-               AND COALESCE(source.Agent, '') <> lt.Agent
-               AND NOT EXISTS (
-                   SELECT 1 FROM TblContacts AS otherLt
-                   WHERE otherLt.LLG_ID = lt.LLG_ID
-                     AND {$otherLtIdentity}
-                     AND COALESCE(otherLt.Agent, '') <> lt.Agent
-               )",
-            "Refreshed {$table}.Agent from its identity-matched LT contact"
-        );
-
-        // If kept already has enrollment, drop orphan enroll keyed by side-table External_ID
-        // (LT contact id). Does NOT require orphan contact row — contact cleanup often
-        // deletes that first and used to leave enroll person-dups behind.
-        $this->runMatchingStep(
-            $connector,
-            "{$table}.drop_enroll_orphans",
-            "DELETE e
-             FROM TblEnrollment AS e
-             INNER JOIN {$table} AS src
-             ON e.LLG_ID = 'LLG-' + CAST(src.External_ID AS VARCHAR(50))
-               AND {$enrollmentNameCompatible}
-             INNER JOIN TblContacts AS kept ON kept.LLG_ID = src.LLG_ID
-               AND {$keptIdentity}
-             WHERE e.LLG_ID <> src.LLG_ID
-               AND NOT EXISTS (
-                    SELECT 1 FROM {$table} AS duplicate
-                    WHERE duplicate.External_ID = src.External_ID
-                      AND duplicate.LLG_ID <> src.LLG_ID
-               )
-               AND EXISTS (
-                    SELECT 1 FROM TblEnrollment AS e2 WHERE e2.LLG_ID = kept.LLG_ID
-               )",
-            "Dropped orphan LT-keyed TblEnrollment rows when kept LLG already enrolled ({$table})"
-        );
-
-        $this->runMatchingStep(
-            $connector,
-            "{$table}.enroll_orphan_to_kept",
-            "UPDATE e
-             SET e.LLG_ID = kept.LLG_ID
-             FROM TblEnrollment AS e
-             INNER JOIN {$table} AS src
-             ON e.LLG_ID = 'LLG-' + CAST(src.External_ID AS VARCHAR(50))
-               AND {$enrollmentNameCompatible}
-             INNER JOIN TblContacts AS kept ON kept.LLG_ID = src.LLG_ID
-               AND {$keptIdentity}
-             WHERE e.LLG_ID <> src.LLG_ID
-               AND NOT EXISTS (
-                    SELECT 1 FROM {$table} AS duplicate
-                    WHERE duplicate.External_ID = src.External_ID
-                      AND duplicate.LLG_ID <> src.LLG_ID
-               )
-               AND NOT EXISTS (
-                    SELECT 1 FROM TblEnrollment AS e2 WHERE e2.LLG_ID = kept.LLG_ID
-               )",
-            "Moved enrollments from orphan LT key to kept LLG_ID ({$table})"
-        );
-
-        $this->runMatchingStep(
-            $connector,
-            "{$table}.drop_lt_orphans",
-            "DELETE lt
-             FROM TblContacts AS lt
-             INNER JOIN {$table} AS src
-               ON lt.LLG_ID = 'LLG-' + CAST(src.External_ID AS VARCHAR(50))
-               AND {$orphanContactIdentity}
-             INNER JOIN TblContacts AS kept ON kept.LLG_ID = src.LLG_ID
-               AND {$keptIdentity}
-             WHERE lt.LLG_ID <> src.LLG_ID
-               AND NOT EXISTS (
-                    SELECT 1 FROM TblEnrollment AS e WHERE e.LLG_ID = lt.LLG_ID
-               )",
-            "Dropped orphan LT-keyed TblContacts rows after {$table} match"
-        );
+        $source = $table === 'TblContactsLDR' ? 'LDR' : 'PLAW';
+        foreach (ContactSyncMatching::sourceSteps($source) as $step => $sql) {
+            if (!$this->runMatchingStep($connector, "{$table}.{$step}", $sql['update'], "{$table}: {$step}")) {
+                throw new \RuntimeException("Matching failed at {$table}.{$step}; watermark must not advance.");
+            }
+        }
     }
 
     private function fillEnrollmentAgents(DBConnector $connector, bool $reconcileAgents = false): void
     {
-        // Enrollment Agent comes from TblContacts (LT roster) only — never LDR/PLAW
-        // process users ("ProgressLaw User", "LDR User").
-        $badAgent = "(TblEnrollment.Agent IS NULL OR TblEnrollment.Agent = '' OR TblEnrollment.Agent LIKE '% User')";
-        $goodContact = "c.Agent IS NOT NULL AND c.Agent <> '' AND c.Agent NOT LIKE '% User'";
-        $sameName = $this->contactNameMatchSql('TblEnrollment', 'c');
-        $sameNameDrop = $this->contactNameMatchSql('TblEnrollment', 'TblContacts');
-
-        $steps = [
-            'enrollment.agent_contacts' => [
-                'sql' => "UPDATE TblEnrollment
-             SET TblEnrollment.Agent = c.Agent
-             FROM TblEnrollment
-             JOIN (
-                 SELECT LLG_ID, MIN(Agent) AS Agent, MIN(Client) AS Client
-                 FROM TblContacts
-                 WHERE Agent IS NOT NULL AND Agent <> '' AND Agent NOT LIKE '% User'
-                 GROUP BY LLG_ID
-             ) c ON TblEnrollment.LLG_ID = c.LLG_ID
-                    AND {$sameName}
-             WHERE {$badAgent}
-                OR TblEnrollment.Agent <> c.Agent",
-                'label' => 'Updated TblEnrollment.Agent from TblContacts',
-            ],
-            'enrollment.clear_system_user_agents' => [
-                'sql' => "UPDATE TblEnrollment
-             SET Agent = NULL
-             WHERE Agent LIKE '% User'
-               AND NOT EXISTS (
-                    SELECT 1 FROM TblContacts c
-                    WHERE c.LLG_ID = TblEnrollment.LLG_ID
-                      AND {$sameName}
-                      AND {$goodContact}
-               )",
-                'label' => 'Cleared enrollment system-user agents with no roster contact',
-            ],
-            'enrollment.drop_name' => [
-                'sql' => "UPDATE TblEnrollment
-             SET TblEnrollment.Drop_Name = TblContacts.Campaign
-             FROM TblEnrollment, TblContacts
-             WHERE TblEnrollment.LLG_ID = TblContacts.LLG_ID
-               AND {$sameNameDrop}
-               AND COALESCE(TblContacts.Campaign, '') <> ''",
-                'label' => 'Updated TblEnrollment.Drop_Name from TblContacts.Campaign',
-            ],
-        ];
-
-        foreach ($steps as $step => $config) {
-            $this->runMatchingStep($connector, $step, $config['sql'], $config['label']);
+        foreach (ContactSyncMatching::enrollmentSteps($reconcileAgents) as $step => $sql) {
+            if (!$this->runMatchingStep($connector, "enrollment.{$step}", $sql['update'], "Enrollment: {$step}")) {
+                throw new \RuntimeException("Enrollment matching failed at {$step}; watermark must not advance.");
+            }
         }
     }
 
     /**
-     * Keep one record per TP_ID (Jacob). Prefer the richest contact row, then newest Modified.
-     * Blank / fake shared TP_IDs are kept individually (keyed by contact ID).
+     * External IDs may be shared by different contacts; never discard a native source ID.
      */
     private function dedupeSnowflakeChunkByTpId(array $chunk): array
     {
-        $best = [];
+        $seen = [];
         foreach ($chunk as $row) {
-            $tpId = trim((string) ($row['EXTERNAL_ID'] ?? $row['TP_ID'] ?? ''));
             $id = (string) ($row['LLG_ID'] ?? '');
-            // Fake shared Ext (1234567840, 0) must not collapse unrelated spam into one key.
-            $key = ($tpId !== '' && !$this->isFakeExternalId($tpId)) ? $tpId : ('ID-' . $id);
-            if (!isset($best[$key]) || $this->snowflakeRowBetterThan($row, $best[$key])) {
-                $best[$key] = $row;
+            if ($id === '' || isset($seen[$id])) {
+                throw new \RuntimeException('Missing or duplicate Snowflake source ID: ' . $id);
             }
+            $seen[$id] = true;
         }
-        return array_values($best);
+        return $chunk;
     }
 
-    /** Prefer phone/email/address completeness, then newer Modified, then higher ID. */
     private function snowflakeRowBetterThan(array $candidate, array $existing): bool
     {
         $cScore = $this->snowflakeRowRichnessScore($candidate);
@@ -2542,42 +1874,17 @@ class SyncContactsData extends Command
      */
     private function contactIdentityMatchSql(string $leftAlias, string $rightAlias): string
     {
-        $leftName = $this->normalizedContactNameSql($leftAlias);
-        $rightName = $this->normalizedContactNameSql($rightAlias);
-        $leftEmail = "LOWER(LTRIM(RTRIM(COALESCE({$leftAlias}.Email, ''))))";
-        $rightEmail = "LOWER(LTRIM(RTRIM(COALESCE({$rightAlias}.Email, ''))))";
-        $leftPhone = $this->normalizedContactPhoneSql($leftAlias);
-        $rightPhone = $this->normalizedContactPhoneSql($rightAlias);
-
-        $emailMatches = "({$leftEmail} <> '' AND {$rightEmail} <> '' AND CHARINDEX('@', {$leftEmail}) > 1 AND {$leftEmail} = {$rightEmail})";
-        $phoneMatches = "(LEN({$leftPhone}) >= 7 AND LEN({$rightPhone}) >= 7 AND {$leftPhone} = {$rightPhone})";
-        $emailCompatible = "({$leftEmail} = '' OR {$rightEmail} = '' OR {$leftEmail} = {$rightEmail})";
-        $phoneCompatible = "({$leftPhone} = '' OR {$rightPhone} = '' OR {$leftPhone} = {$rightPhone})";
-
-        return "({$leftName} <> '' AND {$leftName} = {$rightName}
-            AND {$emailCompatible}
-            AND {$phoneCompatible}
-            AND ({$emailMatches} OR {$phoneMatches}))";
+        return ContactSyncIdentity::sql($leftAlias, $rightAlias);
     }
 
     private function normalizedContactNameSql(string $alias): string
     {
-        $value = "UPPER(LTRIM(RTRIM(COALESCE({$alias}.Client, ''))))";
-        foreach (["' '", "'.'", "','", "'-'", "'/'", "CHAR(39)", 'CHAR(9)'] as $character) {
-            $value = "REPLACE({$value}, {$character}, '')";
-        }
-
-        return $value;
+        return ContactSyncIdentity::nameSql($alias);
     }
 
     private function normalizedContactPhoneSql(string $alias): string
     {
-        $value = "LTRIM(RTRIM(COALESCE({$alias}.Phone, '')))";
-        foreach (["' '", "'-'", "'('", "')'", "'+'", "'.'", "'/'", 'CHAR(9)', 'CHAR(10)', 'CHAR(13)'] as $character) {
-            $value = "REPLACE({$value}, {$character}, '')";
-        }
-
-        return $value;
+        return ContactSyncIdentity::phoneSql($alias);
     }
 
     private function resetMatchingStats(int $stepTotal): void
@@ -2730,23 +2037,12 @@ class SyncContactsData extends Command
 
     private function readLastSyncTime(string $source): ?string
     {
-        $path = $this->timestampFilePath();
-        if (!\file_exists($path)) {
-            return null;
-        }
-        $data = \json_decode(\file_get_contents($path), true);
-        return $data[$source] ?? null;
+        return ContactSyncWatermark::read($this->timestampFilePath(), $source);
     }
 
     private function writeLastSyncTime(string $source, string $datetime): void
     {
-        $path = $this->timestampFilePath();
-        $data = [];
-        if (\file_exists($path)) {
-            $data = \json_decode(\file_get_contents($path), true) ?? [];
-        }
-        $data[$source] = $datetime;
-        \file_put_contents($path, \json_encode($data, JSON_PRETTY_PRINT));
+        ContactSyncWatermark::write($this->timestampFilePath(), $source, $datetime);
     }
 
     // -------------------------------------------------------------------------
