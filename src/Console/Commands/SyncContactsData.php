@@ -4,6 +4,7 @@ namespace Cmd\Reports\Console\Commands;
 
 use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\ContactSyncIdentity;
+use Cmd\Reports\Services\ContactSyncTargets;
 use Cmd\Reports\Services\ContactSyncWatermark;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Cache;
