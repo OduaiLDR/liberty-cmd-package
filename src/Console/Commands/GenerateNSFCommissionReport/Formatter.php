@@ -3,6 +3,7 @@
 namespace Cmd\Reports\Console\Commands\GenerateNSFCommissionReport;
 
 use Cmd\Reports\Services\CommissionCompanyMatch;
+use Cmd\Reports\Services\NsfReportReadiness;
 use PhpOffice\PhpSpreadsheet\Cell\DataType;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Style\Alignment;
@@ -32,7 +33,8 @@ class Formatter
         string $endDate,
         ?string $agentFilter = null,
         string $sourceCode = '',
-        array $unassigned = []
+        array $unassigned = [],
+        ?array $readiness = null
     ): array {
         $spreadsheet = new Spreadsheet();
 
@@ -47,7 +49,28 @@ class Formatter
         $commSheet->setShowGridlines(false);
         $this->buildCommissionSheet($commSheet, $commissionRows, $sourceCode, $unassigned);
 
-        $spreadsheet->setActiveSheetIndex(0);
+        $timing = $readiness ?? NsfReportReadiness::timing($startDate);
+        $statusSheet = $spreadsheet->createSheet();
+        $statusSheet->setTitle('Run Status');
+        $statusSheet->fromArray([
+            ['NSF Report Run Status', $timing['isProvisional'] ? 'PROVISIONAL — NOT READY FOR FINAL PAYROLL' : 'FINAL-CUTOFF DATA'],
+            ['Source', $source], ['Period Start', $startDate], ['Period End', $endDate],
+            ['Payment cutoff (Pacific)', $timing['cutoffPacific']],
+            ['Run started (UTC)', $timing['startedAt']],
+            ['Workbook generated (UTC)', gmdate('Y-m-d H:i:s')],
+            ['Run ID', $timing['runId'] ?? 'unavailable'],
+            ['Final runs may start after (UTC)', $timing['finalAfter']],
+            ['Payroll readiness', $timing['isProvisional']
+                ? 'Preview only. A new successful run after the cutoff is required; waiting does not make this run final.'
+                : 'Cutoff has closed. Payroll still requires confirmed persistence, snapshot publication, and regenerated payroll items.'],
+        ], null, 'A1', true);
+        $statusSheet->getColumnDimension('A')->setWidth(35);
+        $statusSheet->getColumnDimension('B')->setWidth(95);
+        $statusSheet->getStyle('A1:B1')->getFont()->setBold(true);
+        $statusSheet->getStyle('B1:B10')->getAlignment()->setWrapText(true);
+        $statusSheet->getRowDimension(10)->setRowHeight(45);
+        $statusSheet->setSelectedCells('A1');
+        $spreadsheet->setActiveSheetIndex($timing['isProvisional'] ? 2 : 0);
 
         $period   = date('m-Y', strtotime($startDate));
         $suffix   = $agentFilter !== null ? $this->safeFilenamePart($agentFilter) : 'All';

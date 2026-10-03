@@ -26,10 +26,13 @@ use Illuminate\Support\Facades\Log;
  */
 class GenerateRetentionBonusCommission extends Command
 {
+    private const SAFE_NO_WRITE_TEST_RECIPIENT = 'oduai@libertydebtrelief.com';
+
     protected $signature = 'reports:generate-retention-bonus-commission
                             {source=both : ldr | plaw | both}
                             {period? : Period start date YYYY-MM-01; defaults to first day of last month}
                             {--no-email : Build workbooks only, skip email}
+                            {--no-azure-write : Calculate/build without updating Azure commission results}
                             {--test-recipient= : Send EVERY email (All + agent copies) only to this address}';
 
     protected $description = 'Generate Retention Lookback Commission report for LDR and/or PLAW.';
@@ -41,7 +44,6 @@ class GenerateRetentionBonusCommission extends Command
             'custom_date'       => 742101,
             'custom_results'    => 742105,
             'recon_status_id'   => 377650,
-            'base_months_back'  => 4,
         ],
         'plaw' => [
             'display'           => 'Progress Law',
@@ -49,7 +51,6 @@ class GenerateRetentionBonusCommission extends Command
             'custom_date'       => 742102,
             'custom_results'    => 742106,
             'recon_status_id'   => 377687,
-            'base_months_back'  => 4,
         ],
     ];
 
@@ -67,7 +68,9 @@ class GenerateRetentionBonusCommission extends Command
                 $this->error("Unknown source: $src");
                 return Command::FAILURE;
             }
-            $this->runForSource($src, $period ?: null);
+            if (!$this->runForSource($src, $period ?: null)) {
+                return Command::FAILURE;
+            }
         }
         return Command::SUCCESS;
     }
@@ -79,15 +82,25 @@ class GenerateRetentionBonusCommission extends Command
         return $date !== false && $date->format('Y-m-d') === $period && $date->format('d') === '01';
     }
 
-    private function runForSource(string $source, ?string $periodStart = null): void
+    private function runForSource(string $source, ?string $periodStart = null): bool
     {
         $cfg     = self::SOURCE_CONFIG[$source];
         $display = $cfg['display'];
         $this->info("[INFO] GenerateRetentionBonusCommission – $display");
 
+        // A test run may send the generated workbook, but never to the production distribution.
+        // --test-recipient uses direct Graph delivery and avoids the Azure TblReports/TblLog path.
+        if ($this->requiresTestRecipientForNoAzureWrite(
+            (bool) $this->option('no-azure-write'),
+            (bool) $this->option('no-email'),
+            (string) $this->option('test-recipient')
+        )) {
+            $this->error("[$display] --no-azure-write email must use --test-recipient=" . self::SAFE_NO_WRITE_TEST_RECIPIENT . '.');
+            return false;
+        }
+
         $reportStartDate = $periodStart ?: date('Y-m-01', strtotime('first day of last month'));
-        $endDate         = date('Y-m-t', strtotime($reportStartDate));
-        $baseStartDate   = date('Y-m-01', strtotime('-' . (int) $cfg['base_months_back'] . ' months', strtotime($reportStartDate)));
+        [$baseStartDate, $endDate] = $this->lookbackWindow($reportStartDate);
         $this->info("[INFO] Base period: $baseStartDate → $endDate; report cutoff period: $reportStartDate → $endDate");
 
         try {
@@ -95,11 +108,12 @@ class GenerateRetentionBonusCommission extends Command
             $sql = $this->initSqlServer($source);
         } catch (\Throwable $e) {
             $this->error("[$display] Connector init: " . $e->getMessage());
-            return;
+            return false;
         }
 
         try {
-            // STEP 1 - base data mirrors the VBA raw userfield joins.
+            // Actual reconsideration events select the population; custom fields
+            // supply attribution only and cannot substitute for status history.
             $rows = $this->fetchBase($sf, $cfg, $baseStartDate, $endDate);
             $this->info("[INFO] [$display] Base rows: " . count($rows));
 
@@ -107,18 +121,10 @@ class GenerateRetentionBonusCommission extends Command
             $idList = empty($ids) ? '0' : implode(',', $ids);
 
             // STEP 2 – reconsideration dates
-            $reconMap = $this->fetchReconsiderationDates($sf, $cfg['recon_status_id'], $idList);
+            $reconMap = $this->fetchReconsiderationDates($sf, $cfg['recon_status_id'], $idList, $baseStartDate, $endDate);
             foreach ($rows as &$row) {
                 $id = (string) $this->rowValue($row, 'ID', '');
-                if (!empty($reconMap[$id])) {
-                    $row['RECONSIDERATION_DATE'] = $reconMap[$id];
-                } else {
-                    $dates = array_filter([
-                        $this->dateValue($this->rowValue($row, 'RETENTION_DATE')),
-                        $this->dateValue($this->rowValue($row, 'DROPPED_DATE')),
-                    ]);
-                    $row['RECONSIDERATION_DATE'] = $dates ? min($dates) : null;
-                }
+                $row['RECONSIDERATION_DATE'] = $reconMap[$id] ?? null;
             }
             unset($row);
 
@@ -148,14 +154,10 @@ class GenerateRetentionBonusCommission extends Command
                 $id   = (string) $this->rowValue($row, 'ID', '');
                 $en   = $enrollmentMap['LLG-' . $id] ?? null;
                 $row['FIRST_PAYMENT_CLEARED_DATE'] = $en ? $this->dateValue($this->rowValue($en, 'first_payment_cleared_date')) : null;
-                $row['PAYMENTS']                   = $en ? (int) $this->rowValue($en, 'payments', 0) : 0;
                 $row['AGENT']                      = $en ? $this->rowValue($en, 'agent') : null;
                 $row['COMMISSION_RATE']            = $en ? (float) $this->rowValue($en, 'commission_rate', 0) : 0;
             }
             unset($row);
-
-            // VBA: remove rows with Payments < 2
-            $rows = array_values(array_filter($rows, fn($r) => (int) $this->rowValue($r, 'PAYMENTS', 0) >= 2));
 
             // STEP 5 – calculate cutoff (first payment + 3 months) and filter
             foreach ($rows as &$row) {
@@ -168,24 +170,17 @@ class GenerateRetentionBonusCommission extends Command
             }
             unset($row);
 
-            // VBA filter conditions
-            $rows = array_values(array_filter($rows, function($row) use ($reportStartDate, $endDate) {
-                $retenDate = $this->dateValue($this->rowValue($row, 'RETENTION_DATE'));
-                $dropped   = $this->dateValue($this->rowValue($row, 'DROPPED_DATE'));
-                $cutoff    = $this->dateValue($row['CUTOFF'] ?? null);
+            // The lifetime Azure count can include deposits after the cutoff.
+            // Read dated deposits once and count only those cleared by each client's cutoff.
+            if ($rows !== []) {
+                $otherSource = $source === 'ldr' ? 'plaw' : 'ldr';
+                $otherPayments = DBConnector::fromEnvironment($otherSource);
+                $rows = $this->applyPaymentCountsByCutoff($rows, $sf, $otherPayments, $idList);
+            }
 
-                // If retention_date > cutoff → remove
-                if (!$cutoff) return false;
-                if ($retenDate && $cutoff && $retenDate > $cutoff) return false;
-                // If dropped and dropped <= cutoff → remove
-                if ($dropped && $cutoff && $dropped <= $cutoff) return false;
-                // Expected workbook is for clients whose cutoff lands in the report month.
-                if ($cutoff && ($cutoff < $reportStartDate || $cutoff > $endDate)) return false;
-                // If payments < 3 → remove
-                if ((int) $this->rowValue($row, 'PAYMENTS', 0) < 3) return false;
-
-                return true;
-            }));
+            $rows = array_values(array_filter($rows, fn (array $row): bool =>
+                $this->isEligibleLookbackRow($row, $baseStartDate, $reportStartDate, $endDate)
+            ));
             $this->info("[INFO] [$display] Eligible rows after filtering: " . count($rows));
 
             // STEP 6 – commission and violation deductions in one batched query
@@ -223,29 +218,12 @@ class GenerateRetentionBonusCommission extends Command
             // complete raw source feed here so a legacy or hard-coded roster can
             // never hide a valid retention employee before payroll evaluates it.
 
-            // Persist per-agent retention BONUS COMMISSION to Azure for the Commission Review app
-            // (best-effort; never blocks the report). Aggregates per-contact RETENTION_COMMISSION by agent.
-            $bonusByAgent = [];
-            foreach ($rows as $r) {
-                $agent = trim((string) ($r['RETENTION_AGENT'] ?? ''));
-                if ($agent === '') continue;
-                $bonusByAgent[$agent] = ($bonusByAgent[$agent] ?? 0) + (float) ($r['RETENTION_COMMISSION'] ?? 0);
-            }
+            // Persist per-agent retention BONUS COMMISSION for Commission Review.
+            // A failed replacement stops delivery rather than publishing partial totals.
             $bonusResults = [];
-            foreach ($bonusByAgent as $agentName => $amount) {
-                $bonusResults[] = ['agent' => $agentName, 'amount' => round($amount, 2)];
+            foreach (BonusFormatter::commissionTotals($rows) as $total) {
+                $bonusResults[] = ['agent' => $total['name'], 'amount' => round($total['commission'], 2)];
             }
-            // A re-run must clear a previously calculated bonus when an agent no
-            // longer qualifies. resetColumn() zeroes the whole Bonus_Commission
-            // column for the period first, then persist() writes only the agents
-            // who earned a bonus this run — so stale bonuses are cleared without
-            // needing a separate roster list.
-            CommissionResultsWriter::resetColumn($sql, 'retention', $source, $reportStartDate, 'Bonus_Commission');
-            $persisted = CommissionResultsWriter::persist($sql, 'retention', $source, $reportStartDate, 'Bonus_Commission', $bonusResults);
-            if ($notice = CommissionResultsWriter::failureNotice($persisted, $display)) {
-                $this->warn($notice);
-            }
-
             // Build and send workbooks
             $agentNames  = array_values(array_unique(array_filter(
                 array_map(fn ($r) => (string) ($r['RETENTION_AGENT'] ?? ''), $rows)
@@ -302,6 +280,22 @@ class GenerateRetentionBonusCommission extends Command
                 $rows, $display, $reportStartDate, $endDate, $employeeMap, null, $source, $rosterAgents, $unassigned
             );
 
+            if (!$allFile) {
+                throw new \RuntimeException('Lookback workbook could not be built; Azure results were not changed.');
+            }
+
+            // A reviewable workbook must exist before replacing payable Azure
+            // rows. Reset and replacement then share one transaction.
+            $persisted = $this->persistBonusResults(
+                $sql, $source, $reportStartDate, $bonusResults,
+                (bool) $this->option('no-azure-write')
+            );
+            if ($persisted === null) {
+                $this->info("[INFO] [$display] --no-azure-write set; calculated results were not written to Azure.");
+            } elseif ($notice = CommissionResultsWriter::failureNotice($persisted, $display)) {
+                $this->warn($notice);
+            }
+
             if ($allFile) {
                 $this->info("[INFO] [$display] Workbook: {$allFile['filename']}");
 
@@ -329,7 +323,9 @@ class GenerateRetentionBonusCommission extends Command
         } catch (\Throwable $e) {
             $this->error("[$display] Failed: " . $e->getMessage());
             Log::error("GenerateRetentionBonusCommission[$display]: failed", ['ex' => $e]);
+            return false;
         }
+        return true;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -344,9 +340,12 @@ class GenerateRetentionBonusCommission extends Command
             ));
             $res = $sql->querySqlServer(
                 "SELECT LLG_ID, First_Payment_Cleared_Date AS first_payment_cleared_date,
-                        Payments AS payments, Agent AS agent, Commission_Rate AS commission_rate
+                        Agent AS agent, Commission_Rate AS commission_rate
                  FROM TblEnrollment WHERE LLG_ID IN ($inList)"
             );
+            if (($res['success'] ?? false) !== true || !is_array($res['data'] ?? null)) {
+                throw new \RuntimeException('Lookback enrollment lookup failed; commission calculation stopped.');
+            }
             foreach ($res['data'] ?? [] as $row) {
                 $key = (string) $this->rowValue($row, 'LLG_ID', '');
                 if ($key !== '') {
@@ -372,6 +371,9 @@ class GenerateRetentionBonusCommission extends Command
                  WHERE CID IN ($inList)
                  GROUP BY CID"
             );
+            if (($res['success'] ?? false) !== true || !is_array($res['data'] ?? null)) {
+                throw new \RuntimeException('Lookback violation lookup failed; commission calculation stopped.');
+            }
             foreach ($res['data'] ?? [] as $row) {
                 $key = (string) $this->rowValue($row, 'CID', '');
                 if ($key !== '') {
@@ -382,11 +384,118 @@ class GenerateRetentionBonusCommission extends Command
         return $map;
     }
 
+    /** Four inclusive calendar months ending in the commission report month. */
+    private function lookbackWindow(string $reportStart): array
+    {
+        return [date('Y-m-01', strtotime('-3 months', strtotime($reportStart))), date('Y-m-t', strtotime($reportStart))];
+    }
+
+    /** @param array<int,array{agent:string,amount:float}> $bonusResults */
+    private function persistBonusResults(
+        DBConnector $sql,
+        string $source,
+        string $periodStart,
+        array $bonusResults,
+        bool $noAzureWrite
+    ): ?array {
+        if ($noAzureWrite) {
+            return null;
+        }
+
+        return CommissionResultsWriter::replaceComponent(
+            $sql,
+            'retention',
+            $source,
+            $periodStart,
+            'Bonus_Commission',
+            $bonusResults
+        );
+    }
+
+    private function requiresTestRecipientForNoAzureWrite(bool $noAzureWrite, bool $noEmail, string $testRecipient): bool
+    {
+        return $noAzureWrite && !$noEmail
+            && strtolower(trim($testRecipient)) !== self::SAFE_NO_WRITE_TEST_RECIPIENT;
+    }
+
+    private function isEligibleLookbackRow(array $row, string $windowStart, string $reportStart, string $end): bool
+    {
+        $recon = $this->dateValue($this->rowValue($row, 'RECONSIDERATION_DATE'));
+        $retained = $this->dateValue($this->rowValue($row, 'RETAINED_DATE'));
+        $dropped = $this->dateValue($this->rowValue($row, 'DROPPED_DATE'));
+        $cutoff = $this->dateValue($this->rowValue($row, 'CUTOFF'));
+        if (!$recon || $recon < $windowStart || $recon > $end) return false;
+        if (!$cutoff || $cutoff < $reportStart || $cutoff > $end) return false;
+        if (!$retained || $retained < $recon || $retained > $cutoff) return false;
+        // A cancellation after this client's cutoff does not undo eligibility.
+        if ($dropped && $dropped <= $cutoff) return false;
+        // PAYMENTS is computed from dated cleared deposits, never a lifetime total.
+        return (int) $this->rowValue($row, 'PAYMENTS', 0) >= 3;
+    }
+
+    private function fetchClearedPaymentDates(DBConnector $sf, string $idList): array
+    {
+        $result = $sf->query("
+            SELECT CONTACT_ID,
+                TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', CLEARED_DATE) AS DATE), 'YYYY-MM-DD') AS CLEARED_DATE
+            FROM TRANSACTIONS
+            WHERE TRANS_TYPE = 'D'
+              AND CLEARED_DATE IS NOT NULL
+              AND RETURNED_DATE IS NULL
+              AND (RETURN_CODE IS NULL OR RETURN_CODE = '')
+              AND _FIVETRAN_DELETED = FALSE
+              AND CONTACT_ID IN ($idList)
+            ORDER BY CONTACT_ID ASC, CLEARED_DATE ASC
+        ");
+        // Real Snowflake responses are data/rowCount/columns, not SQL Server's
+        // success envelope. Reject explicit failure without requiring that flag.
+        if (($result['success'] ?? null) === false || !is_array($result['data'] ?? null)) {
+            throw new \RuntimeException('Lookback payment history is unavailable; commission calculation stopped.');
+        }
+        $map = [];
+        foreach ($result['data'] as $row) {
+            $id = trim((string) $this->rowValue($row, 'CONTACT_ID', ''));
+            $date = $this->dateValue($this->rowValue($row, 'CLEARED_DATE'));
+            if ($id === '' || $date === null) {
+                throw new \UnexpectedValueException('Lookback payment history contains an invalid contact or cleared date.');
+            }
+            // Separate transactions cleared on the same day are separate payments.
+            $map[$id][] = $date;
+        }
+        return $map;
+    }
+
+    private function paymentCountByCutoff(array $dates, ?string $cutoff): int
+    {
+        if (!$cutoff) return 0;
+        return count(array_filter($dates, static fn (string $date): bool => $date <= $cutoff));
+    }
+
+    private function applyPaymentCountsByCutoff(array $rows, DBConnector $current, DBConnector $other, string $idList): array
+    {
+        // Preserve SyncEnrollmentData's migrated-contact rule: MAX across the
+        // two sources, not SUM (which would double-count mirrored payments).
+        // Both histories must succeed; never publish using an incomplete source.
+        $currentDates = $this->fetchClearedPaymentDates($current, $idList);
+        $otherDates = $this->fetchClearedPaymentDates($other, $idList);
+        foreach ($rows as &$row) {
+            $id = (string) $this->rowValue($row, 'ID', '');
+            $cutoff = $this->dateValue($this->rowValue($row, 'CUTOFF'));
+            $row['PAYMENTS'] = max(
+                $this->paymentCountByCutoff($currentDates[$id] ?? [], $cutoff),
+                $this->paymentCountByCutoff($otherDates[$id] ?? [], $cutoff)
+            );
+        }
+        unset($row);
+        return $rows;
+    }
+
     private function fetchBase(DBConnector $sf, array $cfg, string $start, string $end): array
     {
         $ca = (int)$cfg['custom_agent'];
         $cd = (int)$cfg['custom_date'];
         $cr = (int)$cfg['custom_results'];
+        $reconStatus = (int)$cfg['recon_status_id'];
         $nextDay = date('Y-m-d', strtotime('+1 day', strtotime($end)));
         $sql = "
             SELECT
@@ -398,13 +507,18 @@ class GenerateRetentionBonusCommission extends Command
                 d.ENROLLED_DEBT,
                 TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.DROPPED_DATE) AS DATE), 'YYYY-MM-DD') AS DROPPED_DATE
             FROM CONTACTS c
-            LEFT JOIN CONTACTS_USERFIELDS cu1 ON c.ID = cu1.CONTACT_ID
+            LEFT JOIN CONTACTS_USERFIELDS cu1
+              ON c.ID = cu1.CONTACT_ID
+             AND cu1._FIVETRAN_DELETED = FALSE
             LEFT JOIN (
                 SELECT CONTACT_ID, F_DATE
                 FROM CONTACTS_USERFIELDS
                 WHERE CUSTOM_ID = $cd
+                  AND _FIVETRAN_DELETED = FALSE
             ) cu2 ON c.ID = cu2.CONTACT_ID
-            LEFT JOIN CONTACTS_USERFIELDS cu3 ON c.ID = cu3.CONTACT_ID
+            LEFT JOIN CONTACTS_USERFIELDS cu3
+              ON c.ID = cu3.CONTACT_ID
+             AND cu3._FIVETRAN_DELETED = FALSE
             LEFT JOIN (
                 SELECT CONTACT_ID, SUM(ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT
                 FROM DEBTS WHERE ENROLLED=1 AND _FIVETRAN_DELETED=FALSE GROUP BY CONTACT_ID
@@ -412,12 +526,56 @@ class GenerateRetentionBonusCommission extends Command
             WHERE cu1.CUSTOM_ID = $ca
               AND cu3.CUSTOM_ID = $cr
               AND cu3.F_STRING = 'Retained'
-              AND cu2.F_DATE >= '$start'
-              AND cu2.F_DATE < '$nextDay'
+              AND EXISTS (
+                  SELECT 1 FROM CONTACTS_STATUS cs
+                  WHERE cs.CONTACT_ID = c.ID AND cs.STATUS_ID = $reconStatus
+                    AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) AS DATE) >= '$start'
+                    AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) AS DATE) < '$nextDay'
+              )
             ORDER BY cu1.F_STRING ASC
         ";
         $res = $sf->query($sql);
-        return $res['data'] ?? [];
+        $rows = $this->requireSnowflakeRows($res, 'Lookback base contacts');
+        return $this->uniqueContactRows($rows);
+    }
+
+    /** An empty successful query is valid; a failed query must never clear payable results. */
+    private function requireSnowflakeRows(mixed $result, string $source): array
+    {
+        if (!is_array($result) || ($result['success'] ?? null) === false || !is_array($result['data'] ?? null)) {
+            throw new \RuntimeException($source . ' query failed; Lookback calculation and publication stopped.');
+        }
+        return $result['data'];
+    }
+
+    /** Collapse identical join copies; never guess between differing records. */
+    private function uniqueContactRows(array $rows): array
+    {
+        $seen = [];
+        $duplicates = [];
+        $unique = [];
+        foreach ($rows as $row) {
+            $id = trim((string) $this->rowValue($row, 'ID', ''));
+            if ($id === '') { $unique[] = $row; continue; }
+            $canonical = array_change_key_case($row, CASE_UPPER);
+            ksort($canonical);
+            $signature = serialize($canonical);
+            if (isset($seen[$id])) {
+                if ($seen[$id] !== $signature) $duplicates[$id] = true;
+                continue;
+            }
+            $seen[$id] = $signature;
+            $unique[] = $row;
+        }
+        if ($duplicates !== []) {
+            $sample = implode(', ', array_slice(array_keys($duplicates), 0, 10));
+            throw new \UnexpectedValueException(
+                'Retention Lookback blocked: duplicate CONTACT ID rows (' . $sample . '). '
+                . 'Resolve ambiguous CONTACTS_USERFIELDS records before rerunning. '
+                . 'No commission amounts were calculated, persisted, or emailed for this source.'
+            );
+        }
+        return $unique;
     }
 
     private function rowValue(array $row, string $key, mixed $default = null): mixed
@@ -457,17 +615,20 @@ class GenerateRetentionBonusCommission extends Command
         return $timestamp === false ? null : date('Y-m-d', $timestamp);
     }
 
-    private function fetchReconsiderationDates(DBConnector $sf, int $statusId, string $idList): array
+    private function fetchReconsiderationDates(DBConnector $sf, int $statusId, string $idList, string $start, string $end): array
     {
+        $nextDay = date('Y-m-d', strtotime('+1 day', strtotime($end)));
         $sql = "
             SELECT cs.CONTACT_ID, TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) AS DATE), 'YYYY-MM-DD') AS RECON_DATE
             FROM CONTACTS_STATUS cs WHERE cs.STATUS_ID=$statusId
              AND cs.CONTACT_ID IN ($idList)
+             AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) AS DATE) >= '$start'
+             AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) AS DATE) < '$nextDay'
             ORDER BY cs.CONTACT_ID ASC, CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) ASC
         ";
         $res = $sf->query($sql);
         $map = [];
-        foreach ($res['data'] ?? [] as $r) {
+        foreach ($this->requireSnowflakeRows($res, 'Lookback reconsideration history') as $r) {
             $id = (string)$r['CONTACT_ID'];
             if (!isset($map[$id])) $map[$id] = $r['RECON_DATE'];
         }
@@ -486,7 +647,7 @@ class GenerateRetentionBonusCommission extends Command
         ";
         $res = $sf->query($sql);
         $map = [];
-        foreach ($res['data'] ?? [] as $r) {
+        foreach ($this->requireSnowflakeRows($res, 'Lookback retained-status history') as $r) {
             $map[(string)$r['CONTACT_ID']][] = $r['RETAINED_DATE'];
         }
         return $map;

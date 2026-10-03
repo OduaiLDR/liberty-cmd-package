@@ -79,7 +79,12 @@ class GenerateRetentionManagerCommission extends Command
     public function buildPayrollReviewSnapshots(string $startDate, string $endDate): array
     {
         $retentionRows = $this->buildAllData($startDate, $endDate, true);
-        $nsfRows = $this->buildNsfRowsForAnthony($startDate, $endDate, true);
+        $nsfReadinessRunIds = [];
+        $nsfRows = $this->buildNsfRowsForAnthony($startDate, $endDate, true, $nsfReadinessRunIds);
+        $nsfTeamLeader = $this->buildAnthonyPayrollSnapshot($nsfRows);
+        if (count($nsfReadinessRunIds) === 2) {
+            $nsfTeamLeader['nsfReadinessRunIds'] = $nsfReadinessRunIds;
+        }
 
         return [
             'periodStart' => $startDate,
@@ -87,7 +92,7 @@ class GenerateRetentionManagerCommission extends Command
             'reports' => [
                 'retention_manager' => $this->buildRamaPayrollSnapshot($retentionRows),
                 'retention_team_leader' => $this->buildNickPayrollSnapshot($retentionRows, $startDate, $endDate),
-                'nsf_team_leader' => $this->buildAnthonyPayrollSnapshot($nsfRows),
+                'nsf_team_leader' => $nsfTeamLeader,
             ],
         ];
     }
@@ -987,7 +992,7 @@ class GenerateRetentionManagerCommission extends Command
     ];
 
     /** @return array<int,array<string,mixed>> */
-    private function buildNsfRowsForAnthony(string $startDate, string $endDate, bool $requireSnapshots = false): array
+    private function buildNsfRowsForAnthony(string $startDate, string $endDate, bool $requireSnapshots = false, ?array &$readinessRunIds = null): array
     {
         $ldrPath = $requireSnapshots ? '' : (string) ($this->option('nsf-ldr') ?? '');
         $plawPath = $requireSnapshots ? '' : (string) ($this->option('nsf-plaw') ?? '');
@@ -1009,8 +1014,8 @@ class GenerateRetentionManagerCommission extends Command
             }
             $this->reportInfo('[INFO] Loading generated NSF commission XLSX files for Anthony');
             return array_merge(
-                $this->loadNsfCommissionRowsFromXlsx($ldrPath, 'LDR'),
-                $this->loadNsfCommissionRowsFromXlsx($plawPath, 'Progress Law')
+                $this->loadNsfCommissionRowsFromXlsx($ldrPath, 'LDR', $readinessRunIds, 'ldr'),
+                $this->loadNsfCommissionRowsFromXlsx($plawPath, 'Progress Law', $readinessRunIds, 'plaw')
             );
         }
 
@@ -1036,7 +1041,7 @@ class GenerateRetentionManagerCommission extends Command
     }
 
     /** @return array<int,array<string,mixed>> */
-    private function loadNsfCommissionRowsFromXlsx(string $path, string $sourceDisplay): array
+    private function loadNsfCommissionRowsFromXlsx(string $path, string $sourceDisplay, ?array &$readinessRunIds = null, string $sourceCode = ''): array
     {
         if (!is_file($path)) {
             throw new \RuntimeException("NSF commission report not found: {$path}");
@@ -1045,6 +1050,17 @@ class GenerateRetentionManagerCommission extends Command
         $reader = IOFactory::createReaderForFile($path);
         $reader->setReadDataOnly(true);
         $spreadsheet = $reader->load($path);
+        if ($readinessRunIds !== null && in_array($sourceCode, ['ldr', 'plaw'], true)) {
+            $statusSheet = $spreadsheet->getSheetByName('Run Status');
+            if ($statusSheet) {
+                for ($row = 1; $row <= $statusSheet->getHighestDataRow(); $row++) {
+                    if (strcasecmp(trim((string) $statusSheet->getCell("A{$row}")->getValue()), 'Run ID') !== 0) continue;
+                    $runId = strtolower(trim((string) $statusSheet->getCell("B{$row}")->getValue()));
+                    if (preg_match('/^[a-f0-9]{32}$/D', $runId)) $readinessRunIds[$sourceCode] = $runId;
+                    break;
+                }
+            }
+        }
         $sheet = $spreadsheet->getSheetByName('NSF Data') ?? $spreadsheet->getActiveSheet();
         $highestRow = $sheet->getHighestDataRow();
         $highestCol = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::columnIndexFromString($sheet->getHighestDataColumn());
@@ -1117,52 +1133,10 @@ class GenerateRetentionManagerCommission extends Command
     /** @param array<string,int> $ids */
     private function fetchNsfCommissionRows(DBConnector $sf, array $ids, string $startDate, string $endExclusive): array
     {
-        $sql = "
-            SELECT * FROM (
-                SELECT
-                    c.ID,
-                    CU1.AGENT,
-                    CU2.NSF_RETURNED_DATE,
-                    CU3.NSF_ACTION,
-                    CU4.NSF_RECOUP_DATE,
-                    CAST(CONVERT_TIMEZONE('America/Los_Angeles', T.CLEARED_DATE) AS DATE) AS CLEARED_DATE,
-                    T.RN
-                FROM CONTACTS c
-                LEFT JOIN (
-                    SELECT CONTACT_ID, F_SHORTSTRING AS AGENT
-                    FROM CONTACTS_USERFIELDS
-                    WHERE CUSTOM_ID = {$ids['agent']}
-                ) CU1 ON c.ID = CU1.CONTACT_ID
-                LEFT JOIN (
-                    SELECT CONTACT_ID, F_DATE AS NSF_RETURNED_DATE
-                    FROM CONTACTS_USERFIELDS
-                    WHERE CUSTOM_ID = {$ids['returned']}
-                ) CU2 ON c.ID = CU2.CONTACT_ID
-                LEFT JOIN (
-                    SELECT CONTACT_ID, F_STRING AS NSF_ACTION
-                    FROM CONTACTS_USERFIELDS
-                    WHERE CUSTOM_ID = {$ids['action']}
-                ) CU3 ON c.ID = CU3.CONTACT_ID
-                LEFT JOIN (
-                    SELECT CONTACT_ID, F_DATE AS NSF_RECOUP_DATE
-                    FROM CONTACTS_USERFIELDS
-                    WHERE CUSTOM_ID = {$ids['recoup']}
-                ) CU4 ON c.ID = CU4.CONTACT_ID
-                LEFT JOIN (
-                    SELECT CONTACT_ID, CLEARED_DATE,
-                           ROW_NUMBER() OVER (PARTITION BY CONTACT_ID ORDER BY CONVERT_TIMEZONE('America/Los_Angeles', PROCESS_DATE) DESC) AS RN
-                    FROM TRANSACTIONS
-                    WHERE TRANS_TYPE = 'D'
-                      AND CLEARED_DATE IS NOT NULL
-                      AND RETURNED_DATE IS NULL
-                ) T ON c.ID = T.CONTACT_ID
-            )
-            WHERE NSF_RETURNED_DATE >= '{$startDate}'
-              AND NSF_RETURNED_DATE < '{$endExclusive}'
-              AND RN = 1
-        ";
-
-        return $sf->query($sql)['data'] ?? [];
+        return \Cmd\Reports\Services\NsfCommissionSource::fetch($sf, [
+            'custom_agent' => $ids['agent'], 'custom_nsf_return' => $ids['returned'],
+            'custom_nsf_action' => $ids['action'], 'custom_nsf_recoup' => $ids['recoup'],
+        ], $startDate, date('Y-m-d', strtotime($endExclusive . ' -1 day')));
     }
 
     /**
@@ -1176,23 +1150,9 @@ class GenerateRetentionManagerCommission extends Command
         $returned = $this->forthToDate($returned);
         $recoup   = $this->forthToDate($recoup);
         $cleared  = $this->forthToDate($cleared);
-        if ($returned === null || $recoup === null || $cleared === null) {
-            return false;
-        }
-
-        // NSF_RECOUP_DATE same month+year as NSF_RETURNED_DATE
-        if (date('Y-m', strtotime($returned)) !== date('Y-m', strtotime($recoup))) {
-            return false;
-        }
-
-        // CLEARED_DATE <= 5th of next month after NSF_RETURNED_DATE
-        $cutoff = date('Y-m-d', mktime(0, 0, 0, (int) date('m', strtotime($returned)) + 1, 5, (int) date('Y', strtotime($returned))));
-        if ($cleared > $cutoff) {
-            return false;
-        }
-
-        // CLEARED_DATE > NSF_RECOUP_DATE
-        return $cleared > $recoup;
+        return \Cmd\Reports\Services\NsfCommissionSource::validCommission([
+            'NSF_RETURNED_DATE' => $returned, 'NSF_RECOUP_DATE' => $recoup, 'CLEARED_DATE' => $cleared,
+        ]);
     }
 
     /** @param array<int,array<string,mixed>> $nsfRows */

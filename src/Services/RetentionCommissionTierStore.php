@@ -8,7 +8,7 @@ use Illuminate\Support\Facades\Log;
 
 /**
  * Monthly retention agent tiers (CommissionDatabase.dbo.TblRetentionCommissionTiers).
- * Best-effort: failures are logged and never interrupt report generation.
+ * Writes remain best-effort; required historical reads fail closed.
  *
  * PK: (Source, Period_Start, Agent)
  */
@@ -83,7 +83,7 @@ final class RetentionCommissionTierStore
      * @param  list<string> $periodStarts Y-m-01 values
      * @return array<string,int> map key => tier
      */
-    public static function fetchMap(DBConnector $sql, string $source, array $periodStarts): array
+    public static function fetchMap(DBConnector $sql, string $source, array $periodStarts, bool $required = false): array
     {
         $source = strtolower(trim($source));
         $periodStarts = array_values(array_unique(array_filter($periodStarts, static fn ($p) => is_string($p) && $p !== '')));
@@ -100,6 +100,9 @@ final class RetentionCommissionTierStore
             $params = array_merge([$source], $periodStarts);
             $res = $sql->querySqlServer($sqlText, $params);
             if (($res['success'] ?? false) !== true) {
+                if ($required) {
+                    throw new \RuntimeException('Tier history query failed: ' . ($res['error'] ?? 'unknown SQL error'));
+                }
                 Log::warning('RetentionCommissionTierStore: fetchMap failed', [
                     'error' => $res['error'] ?? '',
                     'source' => $source,
@@ -118,11 +121,23 @@ final class RetentionCommissionTierStore
                 if ($period === null || $agent === '') {
                     continue;
                 }
-                $map[self::tierMapKey($period, $agent)] = max(0, min(4, (int) ($row['Tier'] ?? $row['tier'] ?? 0)));
+                $rawTier = $row['Tier'] ?? $row['tier'] ?? null;
+                if ($required && (filter_var($rawTier, FILTER_VALIDATE_INT) === false || (int) $rawTier < 0 || (int) $rawTier > 4)) {
+                    throw new \UnexpectedValueException("Invalid saved retention tier for {$agent} ({$period}).");
+                }
+                $key = self::tierMapKey($period, $agent);
+                $tier = max(0, min(4, (int) $rawTier));
+                if ($required && isset($map[$key]) && $map[$key] !== $tier) {
+                    throw new \UnexpectedValueException("Conflicting saved retention tiers for {$agent} ({$period}).");
+                }
+                $map[$key] = $tier;
             }
 
             return $map;
         } catch (\Throwable $e) {
+            if ($required) {
+                throw new \RuntimeException('Retention tier history is unavailable or invalid; no payable report can be generated.', 0, $e);
+            }
             Log::warning('RetentionCommissionTierStore: fetchMap skipped', ['ex' => $e->getMessage()]);
             return [];
         }
@@ -172,7 +187,12 @@ final class RetentionCommissionTierStore
 
     public static function tierMapKey(string $periodStart, string $agent): string
     {
-        return $periodStart . '|' . strtoupper(trim($agent));
+        return $periodStart . '|' . self::agentKey($agent);
+    }
+
+    public static function agentKey(string $agent): string
+    {
+        return strtoupper(trim((string) preg_replace('/\s+/u', ' ', $agent)));
     }
 
     public static function resolveTierForPayment(int $currentTier, ?int $snapshotTier): int
@@ -182,6 +202,26 @@ final class RetentionCommissionTierStore
         }
 
         return max(0, min(4, $snapshotTier));
+    }
+
+    /** Require the earned-month record for delayed payments; never backfill it from today's tier. */
+    public static function retainedMonthTierForPayment(int $currentTier, array $snapshotMap, string $agent, ?string $retentionDate, string $paymentPeriodStart): int
+    {
+        $retainedPeriod = self::periodStartFromDate($retentionDate);
+        if ($retainedPeriod === null || $retainedPeriod > $paymentPeriodStart) {
+            throw new \UnexpectedValueException("Invalid retained month for payable retention row: {$agent} ({$retentionDate}).");
+        }
+        if ($retainedPeriod === $paymentPeriodStart) {
+            return max(0, min(4, $currentTier));
+        }
+        $snapshotTier = self::snapshotTierFor($snapshotMap, $agent, $retentionDate);
+        if ($snapshotTier === null) {
+            throw new \UnexpectedValueException("Missing retained-month tier for {$agent} ({$retainedPeriod}); restore verified tier history before generating commissions.");
+        }
+        if ($snapshotTier < 0 || $snapshotTier > 4) {
+            throw new \UnexpectedValueException("Invalid retained-month tier for {$agent} ({$retainedPeriod}).");
+        }
+        return $snapshotTier;
     }
 
     /**
