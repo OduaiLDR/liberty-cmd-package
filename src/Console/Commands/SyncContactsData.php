@@ -5,6 +5,7 @@ namespace Cmd\Reports\Console\Commands;
 use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\ContactSyncIdentity;
 use Cmd\Reports\Services\ContactSyncMatching;
+use Cmd\Reports\Services\ContactSyncSourceEvidence;
 use Cmd\Reports\Services\ContactSyncTargets;
 use Cmd\Reports\Services\ContactSyncWatermark;
 use Illuminate\Console\Command;
@@ -44,6 +45,8 @@ class SyncContactsData extends Command
     private array $cachedMailerSuffixes = [];
     private array $pendingMailerSuffixes = [];
     private int $pageSize = self::PAGE_SIZE;
+    private array $contactFlags = [];
+    private array $skippedContactIds = [];
 
     /** Matching-step counters reset at the start of each matching run. */
     private int $matchingStepsOk = 0;
@@ -116,6 +119,8 @@ class SyncContactsData extends Command
             $this->error('[ERROR] LT failed — aborting LDR/PLAW to avoid incomplete matching.');
             return Command::FAILURE;
         }
+        $hasSkippedRecords = str_contains($ltProcesses['LT']->output(), '[SYNC FLAGS]');
+        $hasReviewFlags = str_contains($ltProcesses['LT']->output(), '[CONTACT FLAG]');
 
         // ── Step 2: LDR + PLAW (parallel) ────────────────────────────────────
         $this->logStep('Step 2/3: Syncing LDR and PLAW in parallel...');
@@ -136,6 +141,8 @@ class SyncContactsData extends Command
 
         $allOk = true;
         foreach (['LDR', 'PLAW'] as $src) {
+            $hasSkippedRecords = $hasSkippedRecords || str_contains($processes[$src]->output(), '[SYNC FLAGS]');
+            $hasReviewFlags = $hasReviewFlags || str_contains($processes[$src]->output(), '[CONTACT FLAG]');
             if ($processes[$src]->exitCode() !== 0) {
                 $this->error("[ERROR] {$src} failed (exit code {$processes[$src]->exitCode()}).");
                 $allOk = false;
@@ -160,7 +167,16 @@ class SyncContactsData extends Command
                 $this->error('[DRY RUN] Matching preview failed: ' . $e->getMessage());
                 return Command::FAILURE;
             }
-            $this->info('[SUCCESS] Dry run completed; no SQL Server changes were made.');
+            if ($hasSkippedRecords || $hasReviewFlags) {
+                $this->warn('[DRY RUN] Preview completed with flagged records; review source summaries. No SQL Server changes were made.');
+            } else {
+                $this->info('[SUCCESS] Dry run completed; no SQL Server changes were made.');
+            }
+            return Command::SUCCESS;
+        }
+
+        if ($hasSkippedRecords) {
+            $this->warn('[SYNC FLAGS] Source runs completed with skipped records. Their checkpoints were retained; global matching was not run.');
             return Command::SUCCESS;
         }
 
@@ -181,7 +197,8 @@ class SyncContactsData extends Command
 
         $this->logStep('Step 3/3: matching done', $matchStarted);
         $this->info("\n" . str_repeat('=', 80));
-        $this->logStep('All syncs (LT → LDR, PLAW → matching) completed successfully', $orchStarted);
+        $this->logStep($hasReviewFlags ? 'All source runs and matching completed with review flags; see source summaries'
+            : 'All syncs (LT → LDR, PLAW → matching) completed successfully', $orchStarted);
         return Command::SUCCESS;
     }
 
@@ -286,6 +303,8 @@ class SyncContactsData extends Command
 
     private function performSourceSync(): int
     {
+        $this->contactFlags = [];
+        $this->skippedContactIds = [];
         $dryRun = (bool) $this->option('dry-run');
         if ($dryRun) {
             $this->warn('[DRY RUN] Read-only preview: no SQL Server writes or watermark updates. Debt samples show at most 10 changed IDs per source.');
@@ -420,22 +439,15 @@ class SyncContactsData extends Command
                 $processStarted
             );
 
-            foreach ($newCatChanges as $c) {
-                $categoryChanges[] = $c;
-            }
-            foreach ($newAffChanges as $c) {
-                $affiliateChanges[] = $c;
-            }
-
             if ($dryRun) {
                 $this->info("[DRY RUN][{$this->source}] Comparing proposed source rows with {$this->targetTable}...");
                 if ($this->option('debt-only')) {
-                    $this->previewDebtChunk($sqlConnector, $processedChunk);
+                    $accepted = $this->previewDebtChunk($sqlConnector, $processedChunk);
                 } else {
-                    $this->previewContactChunk($sqlConnector, $processedChunk);
+                    $accepted = $this->previewContactChunk($sqlConnector, $processedChunk);
                 }
-                $totalInserted += count($processedChunk);
-                $this->logStep('Page ' . $pageNum . ': dry-run skip write (' . count($processedChunk) . ' would upsert)');
+                $totalInserted += $accepted;
+                $this->logStep('Page ' . $pageNum . ': dry-run skip write (' . $accepted . ' accepted; ' . count($this->skippedContactIds) . ' flagged IDs so far)');
             } else {
                 try {
                     $writeStarted = microtime(true);
@@ -454,6 +466,13 @@ class SyncContactsData extends Command
                     ]);
                     return Command::FAILURE;
                 }
+            }
+
+            foreach ($newCatChanges as $c) {
+                if (!isset($this->skippedContactIds[$c['llg_id']])) $categoryChanges[] = $c;
+            }
+            foreach ($newAffChanges as $c) {
+                if (!isset($this->skippedContactIds[$c['llg_id']])) $affiliateChanges[] = $c;
             }
 
             unset($chunk, $enrollmentData, $dropNames, $processedChunk, $newCatChanges, $newAffChanges);
@@ -501,7 +520,7 @@ class SyncContactsData extends Command
 
         // When called from the orchestrator (no --source flag), matching is deferred
         // to handle() so it runs after ALL sources finish. Skip it here in that case.
-        if (!$this->option('no-match') && !$this->option('debt-only')) {
+        if (!$this->option('no-match') && !$this->option('debt-only') && ($dryRun || $this->skippedContactIds === [])) {
             if ($dryRun) {
                 $this->warn('[DRY RUN] Previewing post-sync matching (read-only)...');
             }
@@ -513,21 +532,36 @@ class SyncContactsData extends Command
                 return Command::FAILURE;
             }
         }
+        if (!$dryRun && $this->skippedContactIds !== [] && !$this->option('no-match')) {
+            $this->warn('[WARN] Post-sync matching was not run because some records were skipped.');
+        }
 
         // Persist the watermark only after a fully successful run. An owners-refresh
         // is a wide corrective sweep, not a chronological checkpoint — leave the
         // incremental watermark untouched so the next scheduled incremental run
         // still picks up everything modified since the last real incremental.
-        if (!$dryRun && !$ownersRefresh) {
+        if (!$dryRun && $this->skippedContactIds !== []) {
+            $this->warn('[WARN] Sync checkpoint retained so skipped records are retried on the next run.');
+        } elseif (!$dryRun && !$ownersRefresh) {
             $this->writeLastSyncTime($this->source, $syncStartedAt);
             $this->info("[INFO] Sync watermark saved: {$syncStartedAt}");
         } elseif ($ownersRefresh) {
             $this->info('[INFO] Owners-refresh: incremental watermark left unchanged.');
         }
 
-        $this->info($dryRun
-            ? "[SUCCESS] {$this->source} dry run completed; no changes applied."
-            : "[SUCCESS] {$this->source} sync completed successfully!");
+        if ($this->skippedContactIds !== []) {
+            $this->warn('[SYNC FLAGS] ' . json_encode(['source' => $this->source, 'accepted' => $totalInserted,
+                'skipped_ids' => count($this->skippedContactIds), 'flags' => count($this->contactFlags),
+                'dry_run' => $dryRun, 'checkpoint_advanced' => false], JSON_THROW_ON_ERROR));
+            $this->warn($dryRun ? '[DRY RUN] Preview completed with flagged records; no changes applied.'
+                : '[WARN] Accepted records were processed; skipped records still require review.');
+        } elseif ($this->contactFlags !== []) {
+            $this->warn('[WARN] Source processing completed with review flags; see [CONTACT FLAG] details above.'
+                . ($dryRun ? ' No changes applied.' : ''));
+        } else {
+            $this->info($dryRun ? "[SUCCESS] {$this->source} dry run completed; no changes applied."
+                : "[SUCCESS] {$this->source} sync completed successfully!");
+        }
         return Command::SUCCESS;
     }
 
@@ -852,13 +886,19 @@ class SyncContactsData extends Command
         $categories      = [];
         $assignedAgents  = [];
         $affiliateAgents = [];
+        $duplicates = [];
 
         foreach ($result['data'] ?? [] as $row) {
             $llgId = $row['LLG_ID'] ?? '';
             if (preg_match('/LLG-(\d+)/', $llgId, $matches)) {
                 $contactId                   = $matches[1];
+                if (isset($duplicates[$contactId])) continue;
                 if (array_key_exists($contactId, $categories)) {
-                    throw new \RuntimeException('Duplicate enrollment target: ' . $llgId);
+                    $duplicates[$contactId] = true;
+                    unset($categories[$contactId], $assignedAgents[$contactId], $affiliateAgents[$contactId]);
+                    $this->recordContactFlag(['id' => $llgId, 'code' => 'duplicate_enrollment_target',
+                        'message' => 'Duplicate enrollment rows; dependent updates were skipped.'], true);
+                    continue;
                 }
                 $categories[$contactId]      = $row['Category'] ?? '';
                 $assignedAgents[$contactId]  = $row['Agent'] ?? '';
@@ -894,6 +934,7 @@ class SyncContactsData extends Command
 
         $externalIds = \array_keys($externalIds);
         $lookup = [];
+        $suffixLookup = [];
 
         if ($this->option('dry-run')) {
             foreach (array_chunk($externalIds, 1000) as $batch) {
@@ -907,11 +948,9 @@ class SyncContactsData extends Command
             }
             $missTails = [];
             foreach ($externalIds as $extId) {
-                if (!isset($lookup[$extId]) && strlen((string) $extId) > 9) {
+                if (!array_key_exists($extId, $lookup) && strlen((string) $extId) > 9) {
                     $tail = substr((string) $extId, -9);
-                    if (!isset($lookup[$tail])) {
-                        $missTails[$tail] = true;
-                    }
+                    $missTails[$tail] = true;
                 }
             }
             foreach (array_chunk(array_keys($missTails), 500) as $batch) {
@@ -922,9 +961,9 @@ class SyncContactsData extends Command
                     "SELECT External_ID, Drop_Name FROM TblMailers WHERE External_ID IS NOT NULL
                      AND Drop_Name IS NOT NULL AND LEN(External_ID) > 9 AND RIGHT(External_ID, 9) IN ({$tails})");
                 $this->info(sprintf('[PREVIEW] Mailer suffix lookup finished (%.1fs).', microtime(true) - $started));
-                $this->mergeDropNameLookup($lookup, $rows);
+                $this->mergeDropNameLookup($suffixLookup, $rows, true);
             }
-            return $lookup;
+            return $this->resolvedDropNames($chunk, $lookup, $suffixLookup);
         }
 
         // Exact match first; suffix matches are cached for the source run.
@@ -948,14 +987,12 @@ class SyncContactsData extends Command
 
             $missTails = [];
             foreach ($externalIds as $extId) {
-                if (isset($lookup[$extId])) {
+                if (array_key_exists($extId, $lookup)) {
                     continue;
                 }
                 if (\strlen($extId) > 9) {
                     $tail = \substr($extId, -9);
-                    if (!isset($lookup[$tail])) {
-                        $missTails[$tail] = true;
-                    }
+                    $missTails[$tail] = true;
                 }
             }
 
@@ -971,13 +1008,13 @@ class SyncContactsData extends Command
                 if (! ($fallback['success'] ?? false)) {
                     throw new \RuntimeException('Temporary TblMailers suffix lookup failed: ' . ($fallback['error'] ?? 'unknown SQL Server error'));
                 }
-                $this->mergeDropNameLookup($lookup, $fallback['data'] ?? []);
+                $this->mergeDropNameLookup($suffixLookup, $fallback['data'] ?? [], true);
             }
         } finally {
             $this->checkedSql($connector, "DROP TABLE IF EXISTS #TmpMailerFilter");
         }
 
-        return $lookup;
+        return $this->resolvedDropNames($chunk, $lookup, $suffixLookup);
     }
 
     private function ensureMailerSuffixCache(DBConnector $connector): void
@@ -1080,8 +1117,8 @@ class SyncContactsData extends Command
         return $suffixes;
     }
 
-    /** @param array<string, string> $lookup */
-    private function mergeDropNameLookup(array &$lookup, array $rows): void
+    /** Conflicting campaign values stay ambiguous regardless of result order. */
+    private function mergeDropNameLookup(array &$lookup, array $rows, bool $suffix = false): void
     {
         foreach ($rows as $row) {
             $externalId = (string) ($row['External_ID'] ?? '');
@@ -1089,14 +1126,28 @@ class SyncContactsData extends Command
             if ($externalId === '' || $dropName === '') {
                 continue;
             }
-            $lookup[$externalId] = $dropName;
-            if (\strlen($externalId) > 9) {
-                $last9 = \substr($externalId, -9);
-                if (!isset($lookup[$last9])) {
-                    $lookup[$last9] = $dropName;
-                }
-            }
+            $key = $suffix ? substr($externalId, -9) : $externalId;
+            $lookup[$key] = array_key_exists($key, $lookup) && $lookup[$key] !== $dropName ? null : $dropName;
         }
+    }
+
+    private function resolvedDropNames(array $chunk, array $exact, array $suffixes): array
+    {
+        $resolved = [];
+        foreach ($chunk as $row) {
+            $id = trim((string) ($row['EXTERNAL_ID'] ?? ''));
+            if ($id === '' || $this->isFakeExternalId($id)) continue;
+            $tail = substr($id, -9);
+            $value = array_key_exists($id, $exact) ? $exact[$id]
+                : (array_key_exists($tail, $suffixes) ? $suffixes[$tail] : '');
+            if ($value === null) {
+                $this->recordContactFlag(['id' => 'LLG-' . ($row['LLG_ID'] ?? ''), 'code' => 'ambiguous_mailer_campaign',
+                    'message' => 'Conflicting mailer campaign values; contact was skipped without choosing a campaign.'], true);
+                continue;
+            }
+            if ($value !== '') $resolved[$id] = $value;
+        }
+        return $resolved;
     }
 
     // -------------------------------------------------------------------------
@@ -1161,27 +1212,37 @@ class SyncContactsData extends Command
         return implode(', ', array_map(fn($value) => "'" . $this->escSql((string) $value) . "'", $values));
     }
 
-    private function previewDebtChunk(DBConnector $connector, array $rows): void
+    private function previewDebtChunk(DBConnector $connector, array $rows): int
     {
+        $accepted = 0;
         foreach (array_chunk($rows, 1000) as $batch) {
             $ids = $this->sqlStringList(array_column($batch, 'llg_id'));
             $existing = $this->selectPreviewRows($connector,
                 "SELECT LLG_ID, Debt_Amount, Debt_Enrolled FROM {$this->targetTable} WHERE LLG_ID IN ({$ids})");
             $lookup = [];
+            $duplicates = [];
             foreach ($existing as $old) {
                 $id = (string) $old['LLG_ID'];
+                if (isset($duplicates[$id])) continue;
                 if (isset($lookup[$id])) {
-                    throw new \RuntimeException("Duplicate target LLG_ID {$id}; debt comparison is ambiguous.");
+                    $duplicates[$id] = true;
+                    unset($lookup[$id]);
+                    $this->recordContactFlag(['id' => $id, 'code' => 'duplicate_debt_target',
+                        'message' => 'Duplicate contact rows; debt comparison was skipped.'], true);
+                    continue;
                 }
                 $lookup[$id] = $old;
             }
             foreach ($batch as $row) {
+                if (isset($this->skippedContactIds[$row['llg_id']])) continue;
                 $this->recordDebtPreview($row, isset($lookup[$row['llg_id']]) ? array_change_key_case($lookup[$row['llg_id']], CASE_LOWER) : null);
+                $accepted++;
             }
         }
         $this->info(sprintf('[DRY RUN][%s] Debt comparison: %d processed, %d existing changed, %d unchanged, %d new.',
             $this->source, $this->debtPreview['processed'], $this->debtPreview['changed'],
             $this->debtPreview['unchanged'], $this->debtPreview['new']));
+        return $accepted;
     }
 
     private function recordDebtPreview(array $row, ?array $old): void
@@ -1273,7 +1334,7 @@ class SyncContactsData extends Command
 
             $campaign = '';
             if ($tpId) {
-                $campaign = $dropNames[$tpId] ?? ($dropNames[\substr($tpId, -9)] ?? '');
+                $campaign = $dropNames[$tpId] ?? '';
             }
 
             $processedRow = [
@@ -1332,10 +1393,13 @@ class SyncContactsData extends Command
     /** Same SELECT-based target decisions as dry-run; commit one validated chunk. */
     private function insertChunk(DBConnector $connector, array $data, bool $incremental = false): int
     {
+        $data = array_values(array_filter($data, fn ($row) => !isset($this->skippedContactIds[$row['llg_id']])));
         if ($data === []) {
             return 0;
         }
         $pdo = $connector->getSqlServerConnection();
+        // Read source corroboration before taking any SQL Server write locks.
+        $evidence = $this->targetTable === $this->refreshStage ? null : $this->contactEvidence($connector, $data);
         if (!$pdo->beginTransaction()) {
             throw new \RuntimeException('Could not begin contact upsert transaction.');
         }
@@ -1345,7 +1409,7 @@ class SyncContactsData extends Command
                 $this->insertContactRows($pdo, $this->contactFields(), $data);
                 $count = count($data);
             } else {
-                $plan = ContactSyncTargets::plan($pdo, $data, $this->source, true);
+                $plan = $this->acceptedContactPlan(ContactSyncTargets::plan($pdo, $data, $this->source, true, $evidence, true));
                 $count = ContactSyncTargets::apply($pdo, $plan, $this->source);
             }
             if (!$pdo->commit()) {
@@ -1360,9 +1424,11 @@ class SyncContactsData extends Command
         }
     }
 
-    private function previewContactChunk(DBConnector $connector, array $rows): void
+    private function previewContactChunk(DBConnector $connector, array $rows): int
     {
-        $plan = ContactSyncTargets::plan($connector->getSqlServerConnection(), $rows, $this->source);
+        $rows = array_values(array_filter($rows, fn ($row) => !isset($this->skippedContactIds[$row['llg_id']])));
+        $evidence = $this->contactEvidence($connector, $rows);
+        $plan = $this->acceptedContactPlan(ContactSyncTargets::plan($connector->getSqlServerConnection(), $rows, $this->source, false, $evidence, true));
         $byId = array_column($rows, null, 'llg_id');
         foreach ($plan as $change) {
             $debtRow = $byId[$change['incoming_id']];
@@ -1383,6 +1449,63 @@ class SyncContactsData extends Command
                 ], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
             }
         }
+        return count($plan);
+    }
+
+    private function acceptedContactPlan(array $plan): array
+    {
+        $accepted = [];
+        foreach ($plan as $change) {
+            $skip = (bool) ($change['skip'] ?? false);
+            $warnings = $change['warnings'] ?? [];
+            if ($skip && $warnings === []) {
+                $warnings[] = ['code' => 'contact_conflict', 'message' => 'Contact identity or ownership requires review.'];
+            }
+            foreach ($warnings as $warning) {
+                $this->recordContactFlag(['id' => $change['incoming_id']] + $warning, $skip);
+            }
+            if (!$skip) $accepted[] = $change;
+        }
+        return $accepted;
+    }
+
+    /** Identity values and evidence tokens never belong in a record flag. */
+    private function recordContactFlag(array $warning, bool $skip): void
+    {
+        $flag = ['source' => $this->source ?? 'UNKNOWN', 'id' => (string) ($warning['id'] ?? ''),
+            'code' => (string) ($warning['code'] ?? 'contact_conflict'),
+            'message' => (string) ($warning['message'] ?? 'Record requires review.'), 'skipped' => $skip];
+        foreach (['winner', 'duplicates', 'candidates', 'stale_candidates'] as $key) {
+            if (!isset($warning[$key]) || !is_array($warning[$key])) continue;
+            $ids = $key === 'winner' ? [$warning[$key]] : $warning[$key];
+            $ids = array_map(fn ($item) => ['source' => (string) ($item['source'] ?? ''),
+                'id' => (string) ($item['id'] ?? '')], $ids);
+            $flag[$key] = $key === 'winner' ? $ids[0] : $ids;
+        }
+        if ($skip) $this->skippedContactIds[$flag['id']] = true;
+        $key = $flag['source'] . ':' . $flag['id'] . ':' . $flag['code'];
+        if (!isset($this->contactFlags[$key])) {
+            $this->contactFlags[$key] = $flag;
+            if (isset($this->output)) $this->warn('[CONTACT FLAG] ' . json_encode($flag, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
+        }
+    }
+
+    protected function contactEvidence(DBConnector $connector, array $rows): ?ContactSyncSourceEvidence
+    {
+        $requests = ContactSyncTargets::evidenceRequests($connector->getSqlServerConnection(), $rows, $this->source);
+        if ($requests === []) {
+            return null;
+        }
+        $sources = [];
+        return ContactSyncSourceEvidence::collect($requests, function (string $source, string $sql) use (&$sources): array {
+            $sources[$source] ??= DBConnector::fromEnvironment(strtolower($source));
+            $result = $sources[$source]->query($sql, [], 60);
+            if (!isset($result['data']) || !is_array($result['data'])
+                || (isset($result['rowCount']) && (int) $result['rowCount'] !== count($result['data']))) {
+                throw new \RuntimeException('Incomplete contact identity evidence response.');
+            }
+            return $result['data'];
+        });
     }
 
     private function insertContactRows(\PDO $pdo, string $fields, array $data): void
@@ -1448,6 +1571,7 @@ class SyncContactsData extends Command
 
     private function applyEnrollmentFieldChanges(DBConnector $connector, array $changes, string $field, string $key): void
     {
+        $changes = array_values(array_filter($changes, fn ($change) => !isset($this->skippedContactIds[$change['llg_id']])));
         $name = $this->contactNameMatchSql('e', 'u');
         $identity = ContactSyncIdentity::sql('c', 'u');
         $owner = ContactSyncMatching::enrollmentOwnerSql('c');
@@ -1473,8 +1597,12 @@ class SyncContactsData extends Command
                 foreach ($result['data'] ?? [] as $row) {
                     $this->line('[ENROLLMENT PREVIEW] ' . json_encode(['field' => $field, 'change' => $row], JSON_THROW_ON_ERROR));
                 }
-                if (count($result['data'] ?? []) !== count($batch)) {
-                    throw new \RuntimeException("Enrollment {$field} preview has changed or ambiguous identities.");
+                $verified = array_fill_keys(array_column($result['data'] ?? [], 'LLG_ID'), true);
+                foreach ($batch as $change) {
+                    if (!isset($verified[$change['llg_id']])) {
+                        $this->recordContactFlag(['id' => $change['llg_id'], 'code' => 'enrollment_' . strtolower($field) . '_conflict',
+                            'message' => 'Enrollment identity or expected value did not verify; proposed update was skipped.'], true);
+                    }
                 }
                 continue;
             }
@@ -1541,7 +1669,9 @@ class SyncContactsData extends Command
     private function stageFullRefreshChunk(DBConnector $connector, array $rows): int
     {
         $target = $this->targetTable;
-        $plan = ContactSyncTargets::plan($connector->getSqlServerConnection(), $rows, $this->source);
+        $rows = array_values(array_filter($rows, fn ($row) => !isset($this->skippedContactIds[$row['llg_id']])));
+        $evidence = $this->contactEvidence($connector, $rows);
+        $plan = $this->acceptedContactPlan(ContactSyncTargets::plan($connector->getSqlServerConnection(), $rows, $this->source, false, $evidence, true));
         $rows = array_column($plan, 'after');
         try {
             $this->targetTable = $this->refreshStage;
@@ -1802,14 +1932,19 @@ class SyncContactsData extends Command
     private function dedupeSnowflakeChunkByTpId(array $chunk): array
     {
         $seen = [];
+        $bad = [];
         foreach ($chunk as $row) {
             $id = (string) ($row['LLG_ID'] ?? '');
-            if ($id === '' || isset($seen[$id])) {
-                throw new \RuntimeException('Missing or duplicate Snowflake source ID: ' . $id);
+            if (!preg_match('/^[1-9][0-9]*$/D', $id) || isset($seen[$id])) {
+                $bad[$id] = true;
             }
             $seen[$id] = true;
         }
-        return $chunk;
+        foreach (array_keys($bad) as $id) {
+            $this->recordContactFlag(['id' => 'LLG-' . $id, 'code' => 'invalid_or_duplicate_source_id',
+                'message' => 'Invalid or duplicate source ID; every occurrence was skipped.'], true);
+        }
+        return array_values(array_filter($chunk, fn ($row) => !isset($bad[(string) ($row['LLG_ID'] ?? '')])));
     }
 
     private function snowflakeRowBetterThan(array $candidate, array $existing): bool
