@@ -54,6 +54,7 @@ class SyncContactsFullRefreshTest extends TestCase
         $pdo->method('exec')->willReturnCallback(function (string $sql) use (&$events, &$targetRows, &$stageRows, &$inTransaction, $failure) {
             $events[] = $sql;
             self::assertStringNotContainsString('TRUNCATE', $sql);
+            self::assertStringNotContainsString('TP_ID', $sql);
             if (str_starts_with($sql, 'INSERT INTO #ContactsRefresh_')) {
                 if ($failure === 'stage') { return false; }
                 $stageRows++;
@@ -81,9 +82,13 @@ class SyncContactsFullRefreshTest extends TestCase
         $snowflake = $this->getMockBuilder(DBConnector::class)->disableOriginalConstructor()->onlyMethods(['query'])->getMock();
         $page = 0;
         $snowflake->method('query')->willReturnCallback(function (string $sql) use (&$page, &$events, $failure) {
+            if (str_contains($sql, 'SELECT DISTINCT c.TP_ID AS EXTERNAL_ID')) {
+                if ($failure === 'mailer_list') { return ['data' => [], 'rowCount' => 1]; }
+                return ['data' => [['EXTERNAL_ID' => '12345678901'], ['EXTERNAL_ID' => '12345678902']]];
+            }
             $page++;
             $events[] = 'fetch:' . $page;
-            self::assertStringContainsString('LIMIT 5000', $sql);
+            self::assertStringContainsString('LIMIT 1000', $sql);
             if (($failure === 'first_fetch' && $page === 1) || ($failure === 'later_fetch' && $page === 2)) {
                 throw new \RuntimeException('simulated Snowflake timeout');
             }
@@ -96,10 +101,13 @@ class SyncContactsFullRefreshTest extends TestCase
         $sql = $this->getMockBuilder(DBConnector::class)->disableOriginalConstructor()
             ->onlyMethods(['querySqlServer', 'getSqlServerConnection'])->getMock();
         $sql->method('getSqlServerConnection')->willReturn($pdo);
-        $sql->method('querySqlServer')->willReturnCallback(function (string $query) use (&$events) {
+        $sql->method('querySqlServer')->willReturnCallback(function (string $query) use (&$events, $failure) {
             $events[] = $query;
             self::assertStringNotContainsString('TRUNCATE', $query);
             self::assertStringNotContainsString('DELETE FROM TblContactsLDR', $query);
+            if ($failure === 'mailer_load' && str_contains($query, 'INSERT INTO #TmpMailerSuffixCache')) {
+                return ['success' => false, 'error' => 'simulated mailer timeout'];
+            }
             return ['success' => true, 'data' => []];
         });
         $command = $this->getMockBuilder(SyncContactsData::class)
@@ -137,7 +145,7 @@ class SyncContactsFullRefreshTest extends TestCase
 
     public function test_first_and_later_fetch_failures_preserve_existing_contacts(): void
     {
-        foreach (['first_fetch', 'later_fetch', 'empty', 'stage_count', 'cursor', 'stage', 'malformed', 'incomplete'] as $failure) {
+        foreach (['first_fetch', 'later_fetch', 'empty', 'stage_count', 'cursor', 'stage', 'malformed', 'incomplete', 'mailer_list', 'mailer_load'] as $failure) {
             [$status, $rows, $events, $watermark, $output] = $this->runRefresh($failure);
             self::assertSame(1, $status, $failure . ': ' . $output);
             self::assertSame(7, $rows, $failure);
@@ -163,6 +171,7 @@ class SyncContactsFullRefreshTest extends TestCase
         self::assertSame(0, $status, $output);
         self::assertSame(2, $rows);
         self::assertTrue($watermark);
+        self::assertCount(1, array_filter($events, fn($sql) => str_contains($sql, 'INSERT INTO #TmpMailerSuffixCache')));
         $delete = array_search('DELETE FROM TblContactsLDR WITH (TABLOCKX)', $events, true);
         self::assertIsInt($delete);
         self::assertGreaterThan(array_search('fetch:3', $events, true), $delete);
@@ -174,12 +183,44 @@ class SyncContactsFullRefreshTest extends TestCase
     {
         $command = new SyncContactsData();
         $this->property($command, 'debtAmountCustomId', 595171);
-        $sql = (new \ReflectionMethod($command, 'buildLTQuery'))->invoke($command, '2021-07-01', 100, 5000);
+        $sql = (new \ReflectionMethod($command, 'buildLTQuery'))->invoke($command, '2021-07-01', 100, 1000);
         self::assertStringContainsString('WITH contact_page AS', $sql);
         self::assertStringContainsString('eligible_lead.TITLE <> \'Duplicate Lead\'', $sql);
+        self::assertStringContainsString('eligible_cls.TITLE <> \'Duplicate Lead\'', $sql);
         self::assertStringContainsString('AND c.ID > 100', $sql);
-        self::assertLessThan(strpos($sql, 'LEFT JOIN CONTACTS_ASSIGNED'), strpos($sql, 'LIMIT 5000'));
+        self::assertLessThan(strpos($sql, 'page_assignment AS ('), strpos($sql, 'LIMIT 1000'));
         self::assertStringContainsString('FROM contact_page AS c', $sql);
+        self::assertStringContainsString("CONCAT(u2.FIRSTNAME, ' ', u2.LASTNAME) AS ASSIGNED_TO", $sql);
+        self::assertStringContainsString('LEFT JOIN USERS AS u2 ON c.ASSIGNED_TO = u2.UID', $sql);
+        self::assertStringContainsString('page_assignment AS', $sql);
+        self::assertStringContainsString('page_status AS', $sql);
+        self::assertStringContainsString('page_scores AS', $sql);
+        self::assertStringContainsString('page_credit_reports AS', $sql);
+        self::assertStringContainsString('page_enrollment_plans AS', $sql);
+        self::assertStringContainsString('page_debt_field AS', $sql);
+        self::assertStringNotContainsString('QUALIFY ROW_NUMBER() OVER(PARTITION BY c.ID', $sql);
+    }
+
+    public function test_standard_sources_page_before_independently_deduping_history_joins(): void
+    {
+        foreach (['LDR' => 745839, 'PLAW' => 743019] as $source => $customId) {
+            $command = new SyncContactsData();
+            $this->property($command, 'source', $source);
+            $this->property($command, 'debtAmountCustomId', $customId);
+            $this->property($command, 'agentCustomId', $source === 'LDR' ? 742152 : 742153);
+            $sql = (new \ReflectionMethod($command, 'buildStandardQuery'))->invoke($command, '2021-07-01', 123, 1000);
+
+            self::assertStringContainsString('WITH contact_page AS', $sql, $source);
+            self::assertStringContainsString('AND c.ID > 123', $sql, $source);
+            self::assertStringContainsString('LIMIT 1000', $sql, $source);
+            self::assertStringContainsString('page_status AS', $sql, $source);
+            self::assertStringContainsString('page_scores AS', $sql, $source);
+            self::assertStringContainsString('page_credit_reports AS', $sql, $source);
+            self::assertStringContainsString('page_enrollment_plans AS', $sql, $source);
+            self::assertStringContainsString('page_debt_field AS', $sql, $source);
+            self::assertStringContainsString('page_agent_field AS', $sql, $source);
+            self::assertStringNotContainsString('QUALIFY ROW_NUMBER() OVER(PARTITION BY c.ID', $sql, $source);
+        }
     }
 
     public function test_statement_timeout_retries_same_cursor_and_keeps_smaller_pages(): void
@@ -248,5 +289,156 @@ class SyncContactsFullRefreshTest extends TestCase
         self::assertStringContainsString('LIMIT 5000', $queries[0]);
         self::assertStringContainsString('LIMIT 1000', $queries[1]);
         self::assertStringContainsString('LIMIT 200', $queries[2]);
+    }
+
+    public function test_drop_name_suffix_fallback_uses_a_temporary_cache(): void
+    {
+        $queries = [];
+        $connector = $this->getMockBuilder(DBConnector::class)->disableOriginalConstructor()
+            ->onlyMethods(['querySqlServer'])->getMock();
+        $connector->method('querySqlServer')->willReturnCallback(function (string $sql) use (&$queries) {
+            $queries[] = $sql;
+            if (str_contains($sql, 'FROM #TmpMailerSuffixCache WHERE Suffix IN')) {
+                return ['success' => true, 'data' => [['External_ID' => '123456789', 'Drop_Name' => 'Spring Drop']]];
+            }
+            return ['success' => true, 'data' => []];
+        });
+
+        $command = new SyncContactsData();
+        $input = new ArrayInput([], $command->getDefinition());
+        $command->setInput($input);
+        $command->setOutput(new OutputStyle($input, new BufferedOutput()));
+        $lookup = (new \ReflectionMethod($command, 'fetchDropNamesFiltered'))
+            ->invoke($command, $connector, [['EXTERNAL_ID' => 'LDR-123456789']]);
+
+        self::assertSame('Spring Drop', $lookup['123456789']);
+        self::assertCount(1, array_filter($queries, fn($sql) => str_contains($sql, 'INSERT INTO #TmpMailerSuffixCache')));
+        self::assertCount(1, array_filter($queries, fn($sql) => str_contains($sql, 'CREATE NONCLUSTERED INDEX IX_TmpMailerSuffixCache_Suffix')));
+        $populate = array_values(array_filter($queries, fn($sql) => str_contains($sql, 'INSERT INTO #TmpMailerSuffixCache')));
+        self::assertStringContainsString('INNER HASH JOIN TblMailers m ON RIGHT(m.External_ID, 9) = f.Suffix', $populate[0]);
+        self::assertTrue((bool) array_filter($queries, fn($sql) => str_contains($sql, "INSERT INTO #TmpMailerSuffixFilter (Suffix) VALUES ('123456789')")));
+        $indexPosition = array_key_first(array_filter($queries, fn($sql) => str_contains($sql, 'CREATE NONCLUSTERED INDEX')));
+        $populatePosition = array_key_first(array_filter($queries, fn($sql) => str_contains($sql, 'INSERT INTO #TmpMailerSuffixCache')));
+        self::assertLessThan($populatePosition, $indexPosition);
+    }
+
+    public function test_exact_mailer_match_skips_the_suffix_scan(): void
+    {
+        $queries = [];
+        $connector = $this->getMockBuilder(DBConnector::class)->disableOriginalConstructor()
+            ->onlyMethods(['querySqlServer'])->getMock();
+        $connector->method('querySqlServer')->willReturnCallback(function (string $sql) use (&$queries) {
+            $queries[] = $sql;
+            $data = str_contains($sql, 'INNER JOIN #TmpMailerFilter')
+                ? [['External_ID' => '12345678901', 'Drop_Name' => 'Exact Drop']] : [];
+            return ['success' => true, 'data' => $data];
+        });
+        $command = new SyncContactsData();
+        $input = new ArrayInput([], $command->getDefinition());
+        $command->setInput($input);
+        $command->setOutput(new OutputStyle($input, new BufferedOutput()));
+        $lookup = (new \ReflectionMethod($command, 'fetchDropNamesFiltered'))
+            ->invoke($command, $connector, [['EXTERNAL_ID' => '12345678901']]);
+        self::assertSame('Exact Drop', $lookup['12345678901']);
+        self::assertSame('Exact Drop', $lookup['345678901']);
+        self::assertFalse((bool) array_filter($queries, fn($sql) => str_contains($sql, '#TmpMailerSuffixCache')));
+    }
+
+    public function test_planned_suffixes_use_one_scan_with_bounded_filter_inserts(): void
+    {
+        $queries = [];
+        $connector = $this->getMockBuilder(DBConnector::class)->disableOriginalConstructor()
+            ->onlyMethods(['querySqlServer'])->getMock();
+        $connector->method('querySqlServer')->willReturnCallback(function (string $sql) use (&$queries) {
+            $queries[] = $sql;
+            return ['success' => true, 'data' => []];
+        });
+        $command = new SyncContactsData();
+        $input = new ArrayInput([], $command->getDefinition());
+        $command->setInput($input);
+        $command->setOutput(new OutputStyle($input, new BufferedOutput()));
+        $suffixes = array_fill_keys(array_map('strval', range(100000000, 100001001)), true);
+        $this->property($command, 'pendingMailerSuffixes', $suffixes);
+        $load = new \ReflectionMethod($command, 'loadMailerSuffixCache');
+        $load->invoke($command, $connector, ['100000000']);
+        $load->invoke($command, $connector, ['100001001']);
+        $inserts = array_values(array_filter($queries, fn($sql) => str_contains($sql, 'INSERT INTO #TmpMailerSuffixFilter')));
+        self::assertCount(2, $inserts);
+        self::assertSame(1000, substr_count($inserts[0], "('"));
+        self::assertSame(2, substr_count($inserts[1], "('"));
+        self::assertCount(1, array_filter($queries, fn($sql) => str_contains($sql, 'INSERT INTO #TmpMailerSuffixCache')));
+        self::assertTrue((bool) array_filter($queries, fn($sql) => $sql === 'DROP TABLE IF EXISTS #TmpMailerSuffixFilter'));
+    }
+
+    public function test_mailer_suffix_plan_preserves_leading_zeroes_and_deduplicates(): void
+    {
+        $snowflake = $this->getMockBuilder(DBConnector::class)->disableOriginalConstructor()->onlyMethods(['query'])->getMock();
+        $snowflake->expects(self::once())->method('query')->willReturnCallback(function (string $sql) {
+            self::assertStringContainsString("COALESCE(c.MODIFIED, c.CREATED)) >= '2026-09-29 17:25:41'", $sql);
+            self::assertStringContainsString("c.DEL = 'FALSE'", $sql);
+            self::assertStringContainsString('c.ISCOAPP = 0 AND c.ID > 0', $sql);
+            return ['data' => [['EXTERNAL_ID' => 'LDR-012345678'], ['EXTERNAL_ID' => ' PLAW-012345678 '],
+                ['EXTERNAL_ID' => '123456789'], ['EXTERNAL_ID' => null]], 'rowCount' => 4];
+        });
+        $command = new SyncContactsData();
+        $input = new ArrayInput([], $command->getDefinition());
+        $command->setOutput(new OutputStyle($input, new BufferedOutput()));
+        $suffixes = (new \ReflectionMethod($command, 'fetchMailerSuffixes'))->invoke($command, $snowflake, '2026-09-29 17:25:41');
+        self::assertSame(['012345678' => true], $suffixes);
+    }
+
+    public function test_failed_suffix_load_does_not_cache_a_false_miss(): void
+    {
+        $loads = 0;
+        $connector = $this->getMockBuilder(DBConnector::class)->disableOriginalConstructor()
+            ->onlyMethods(['querySqlServer'])->getMock();
+        $connector->method('querySqlServer')->willReturnCallback(function (string $sql) use (&$loads) {
+            if (str_contains($sql, 'INSERT INTO #TmpMailerSuffixCache') && ++$loads === 1) {
+                return ['success' => false, 'error' => 'simulated timeout'];
+            }
+            return ['success' => true, 'data' => []];
+        });
+        $command = new SyncContactsData();
+        $input = new ArrayInput([], $command->getDefinition());
+        $command->setInput($input);
+        $command->setOutput(new OutputStyle($input, new BufferedOutput()));
+        $load = new \ReflectionMethod($command, 'loadMailerSuffixCache');
+        try {
+            $load->invoke($command, $connector, ['123456789']);
+            self::fail('A failed lookup must abort the sync.');
+        } catch (\RuntimeException $e) {
+            self::assertStringContainsString('simulated timeout', $e->getMessage());
+        }
+        $load->invoke($command, $connector, ['123456789']);
+        $load->invoke($command, $connector, ['123456789']);
+        self::assertSame(2, $loads);
+    }
+
+    public function test_drop_name_suffix_cache_is_built_only_once_per_source_run(): void
+    {
+        $queries = [];
+        $connector = $this->getMockBuilder(DBConnector::class)->disableOriginalConstructor()
+            ->onlyMethods(['querySqlServer'])->getMock();
+        $connector->method('querySqlServer')->willReturnCallback(function (string $sql) use (&$queries) {
+            $queries[] = $sql;
+            return ['success' => true, 'data' => []];
+        });
+
+        $command = new SyncContactsData();
+        $input = new ArrayInput([], $command->getDefinition());
+        $command->setInput($input);
+        $command->setOutput(new OutputStyle($input, new BufferedOutput()));
+
+        $fetch = new \ReflectionMethod($command, 'fetchDropNamesFiltered');
+        $fetch->invoke($command, $connector, [['EXTERNAL_ID' => 'LDR-123456789']]);
+        $fetch->invoke($command, $connector, [['EXTERNAL_ID' => 'PLAW-987654321']]);
+        $fetch->invoke($command, $connector, [['EXTERNAL_ID' => 'LDR-123456789']]);
+
+        self::assertCount(1, array_filter($queries, fn($sql) => str_contains($sql, 'CREATE NONCLUSTERED INDEX IX_TmpMailerSuffixCache_Suffix')));
+        $populate = array_values(array_filter($queries, fn($sql) => str_contains($sql, 'INSERT INTO #TmpMailerSuffixCache')));
+        self::assertCount(2, $populate);
+        self::assertTrue((bool) array_filter($queries, fn($sql) => str_contains($sql, "INSERT INTO #TmpMailerSuffixFilter (Suffix) VALUES ('123456789')")));
+        self::assertTrue((bool) array_filter($queries, fn($sql) => str_contains($sql, "INSERT INTO #TmpMailerSuffixFilter (Suffix) VALUES ('987654321')")));
+        self::assertCount(3, array_filter($queries, fn($sql) => str_contains($sql, 'FROM #TmpMailerSuffixCache WHERE Suffix IN')));
     }
 }

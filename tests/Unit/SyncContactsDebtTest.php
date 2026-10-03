@@ -74,6 +74,34 @@ class SyncContactsDebtTest extends TestCase
         self::assertSame($basis, $rows[0]['debt_basis']);
     }
 
+    public function test_contact_inserts_keep_external_id_without_duplicate_tp_id(): void
+    {
+        foreach (['LDR', 'PLAW', 'LT'] as $source) {
+            $command = new SyncContactsData();
+            $this->setSource($command, $source);
+            (new ReflectionProperty(SyncContactsData::class, 'targetTable'))->setValue(
+                $command, $source === 'LT' ? 'TblContacts' : 'TblContacts' . $source
+            );
+            [$rows] = (new ReflectionMethod(SyncContactsData::class, 'processChunk'))->invoke(
+                $command,
+                [['LLG_ID' => '123', 'EXTERNAL_ID' => ' 12345678901 ', 'ENROLLED_DEBT' => 13920]],
+                [],
+                ['categories' => [], 'affiliate_agents' => []]
+            );
+            self::assertSame('12345678901', $rows[0]['external_id']);
+            self::assertArrayNotHasKey('tp_id', $rows[0]);
+            $fields = (new ReflectionMethod(SyncContactsData::class, 'contactFields'))->invoke($command);
+            $pdo = $this->getMockBuilder(\PDO::class)->disableOriginalConstructor()->onlyMethods(['exec'])->getMock();
+            $pdo->expects(self::once())->method('exec')->willReturnCallback(function (string $sql): int {
+                self::assertStringNotContainsString('TP_ID', $sql);
+                self::assertStringContainsString('External_ID', $sql);
+                self::assertSame(1, substr_count($sql, "'12345678901'"));
+                return 1;
+            });
+            (new ReflectionMethod(SyncContactsData::class, 'insertContactRows'))->invoke($command, $pdo, $fields, $rows);
+        }
+    }
+
     public function test_missing_enrolled_alias_cannot_silently_become_zero(): void
     {
         $command = new SyncContactsData();
@@ -89,9 +117,9 @@ class SyncContactsDebtTest extends TestCase
         (new ReflectionProperty(SyncContactsData::class, 'debtAmountCustomId'))->setValue($command, 743019);
         (new ReflectionProperty(SyncContactsData::class, 'agentCustomId'))->setValue($command, 742153);
         $sql = (new ReflectionMethod(SyncContactsData::class, 'buildStandardQuery'))->invoke($command, '2021-07-01', 0, 10);
-        self::assertStringContainsString('SUM(ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT', $sql);
-        self::assertStringContainsString('WHERE ENROLLED = 1 AND _FIVETRAN_DELETED = FALSE', $sql);
-        self::assertStringContainsString('GROUP BY CONTACT_ID', $sql);
+        self::assertStringContainsString('SUM(d.ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT', $sql);
+        self::assertStringContainsString('WHERE d.ENROLLED = 1 AND d._FIVETRAN_DELETED = FALSE', $sql);
+        self::assertStringContainsString('GROUP BY d.CONTACT_ID', $sql);
         self::assertStringContainsString('d.ENROLLED_DEBT,', $sql);
         $lt = (new ReflectionMethod(SyncContactsData::class, 'buildLTQuery'))->invoke($command, '2021-07-01', 0, 10);
         self::assertStringNotContainsString('FROM DEBTS', $lt);
@@ -105,7 +133,7 @@ class SyncContactsDebtTest extends TestCase
         $snowflake = $this->getMockBuilder(DBConnector::class)->disableOriginalConstructor()->onlyMethods(['query'])->getMock();
         $calls = 0;
         $snowflake->method('query')->willReturnCallback(function (string $sql) use (&$calls): array {
-            self::assertStringStartsWith('SELECT', ltrim($sql));
+            self::assertMatchesRegularExpression('/^(WITH|SELECT)\b/i', ltrim($sql));
             return ['data' => $calls++ ? [] : [
                 ['LLG_ID' => '123', 'EXTERNAL_ID' => '12345678900', 'ENROLLED_DATE' => '2026-09-01', 'ENROLLED_DEBT' => '13920.00', 'DEBT_AMOUNT_CUSTOM' => null],
                 ['LLG_ID' => '124', 'EXTERNAL_ID' => '12345678901', 'ENROLLED_DEBT' => '50000.25', 'DEBT_AMOUNT_CUSTOM' => '30000'],
