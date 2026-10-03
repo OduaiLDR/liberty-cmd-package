@@ -5,6 +5,9 @@ namespace Cmd\Reports\Console\Commands\GenerateNSFCommissionReport;
 use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\CommissionAgentEmailFiles;
 use Cmd\Reports\Services\CommissionResultsWriter;
+use Cmd\Reports\Services\CommissionReportRunLock;
+use Cmd\Reports\Services\NsfCommissionSource;
+use Cmd\Reports\Services\NsfReportReadiness;
 use Cmd\Reports\Services\CommissionRosterProvider;
 use Cmd\Reports\Services\UnassignedCommissionAgents;
 use Illuminate\Console\Command;
@@ -72,19 +75,23 @@ class GenerateNSFCommissionReport extends Command
                 $this->error("Unknown source: $src");
                 return Command::FAILURE;
             }
-            $this->runForSource($src);
+            if (!$this->runForSource($src)) return Command::FAILURE;
         }
 
         return Command::SUCCESS;
     }
 
-    private function runForSource(string $source): void
+    private function runForSource(string $source): bool
     {
         $cfg     = self::SOURCE_CONFIG[$source];
         $display = $cfg['display'];
         $this->info("[INFO] GenerateNSFCommissionReport — $display");
 
         $periodArg = (string) ($this->argument('period') ?? '');
+        if ($periodArg !== '' && !preg_match('/^\d{4}-(0[1-9]|1[0-2])-01$/D', $periodArg)) {
+            $this->error('Period must be a valid month start (YYYY-MM-01).');
+            return false;
+        }
         $startDate = $periodArg !== '' ? date('Y-m-01', strtotime($periodArg)) : date('Y-m-01', strtotime('first day of last month'));
         $endDate   = date('Y-m-t', strtotime($startDate));
         $this->info("[INFO] Period: $startDate → $endDate");
@@ -95,17 +102,25 @@ class GenerateNSFCommissionReport extends Command
         } catch (\Throwable $e) {
             $this->error("[$display] Connector init: " . $e->getMessage());
             Log::error("GenerateNSFCommissionReport[$display]: connector init failed", ['ex' => $e]);
-            return;
+            return false;
         }
 
         try {
+            // Session ownership survives the writer's COMMIT. All entry points,
+            // including scheduled and manual CLI runs, share this source/month lock.
+            $runLock = CommissionReportRunLock::acquire($sql, 'nsf', $source, $startDate);
+            $readiness = null;
+            try {
+            $readiness = NsfReportReadiness::begin($sql, $source, $startDate);
             $dataRows = $this->fetchNSFRows($sf, $cfg, $startDate, $endDate);
             $this->info("[INFO] [$display] NSF rows fetched: " . count($dataRows));
 
             if (empty($dataRows)) {
-                $this->warn("[WARN] [$display] No NSF data for period — skipping.");
+                // Complete the normal zero-result pipeline, including the summary
+                // workbook consumed by CS managers. Returning here leaves both
+                // old payable amounts and an old manager-input snapshot in place.
+                $this->info("[INFO] [$display] Source returned no NSF data; rebuilding this period with zero earnings.");
                 Log::info("GenerateNSFCommissionReport[$display]: no data for $startDate–$endDate");
-                return;
             }
 
             // Enrich each row with its valid_commission flag before passing to formatter
@@ -168,34 +183,11 @@ class GenerateNSFCommissionReport extends Command
                 );
             }
 
-            // Persist the computed per-agent commission to Azure so the Commission Review app reads
-            // the REAL numbers (best-effort; never blocks the report).
-            //
-            // Zero the column for the whole period first. persist() is an upsert and never deletes,
-            // so without this an agent the report STOPS pricing — dropped from the roster, renamed,
-            // or no longer earning — keeps their last commission in TblCommissionReviewResults
-            // forever, and no amount of re-running clears it. Commission Review and Payroll Review
-            // both read that table, so the stale figure becomes a payroll item.
-            //
-            // Both retention generators have always done this; NSF was the one that did not, which
-            // is why every stale row found in production on 2026-09-09 was an NSF row (Anthony Clark
-            // ldr+plaw, Lucas Wright ldr — left behind by the 09-03 run and untouched on 09-08).
-            // They happened to hold $0.00; the next one will hold whatever that agent last earned.
-            CommissionResultsWriter::resetColumn($sql, 'nsf', $source, $startDate, 'Commission');
-            $persisted = CommissionResultsWriter::persist(
-                $sql, 'nsf', $source, $startDate, 'Commission',
-                array_map(
-                    fn ($r) => ['agent' => $r['agent'], 'amount' => $r['commission']],
-                    $commissionRows
-                )
-            );
-            if ($notice = CommissionResultsWriter::failureNotice($persisted, $display)) {
-                $this->warn($notice);
-            }
-
+            // Build before changing payable amounts: failed workbook generation must not
+            // leave Azure updated while the manager still has the previous report.
             $formatter = new Formatter();
             $allFile = $formatter->buildWorkbook(
-                $dataRows, $commissionRows, $display, $startDate, $endDate, null, $source, $unassigned
+                $dataRows, $commissionRows, $display, $startDate, $endDate, null, $source, $unassigned, $readiness
             );
             $this->info("[INFO] [$display] Workbook: {$allFile['filename']}");
 
@@ -206,7 +198,18 @@ class GenerateNSFCommissionReport extends Command
             // defaultNsfSnapshotPaths() looks for "… - All.xlsx" and nothing else.
             $files = [$allFile];
 
-            $snapshotPath = $this->saveSnapshotCopy($allFile, $startDate);
+            // Verify a staged snapshot before SQL, then publish only after SQL commits.
+            // This is ordered publication, not a filesystem/database transaction.
+            $snapshotPath = $this->persistWithSnapshot($allFile, $startDate, function () use ($sql, $source, $startDate, $commissionRows): void {
+                CommissionResultsWriter::replaceComponent(
+                    $sql, 'nsf', $source, $startDate, 'Commission',
+                    array_map(
+                        fn ($r) => ['agent' => $r['agent'], 'amount' => $r['commission']],
+                        $commissionRows
+                    )
+                );
+            });
+            NsfReportReadiness::complete($sql, $readiness);
             $this->info("[INFO] [$display] Snapshot saved: {$snapshotPath}");
             $this->cleanupOldSnapshots($startDate);
 
@@ -221,74 +224,39 @@ class GenerateNSFCommissionReport extends Command
                     @unlink($f['path']);
                 }
             }
+            } catch (\Throwable $error) {
+                if ($readiness !== null) {
+                    try { NsfReportReadiness::fail($sql, $readiness); }
+                    catch (\Throwable $markerError) {
+                        Log::error('NSF readiness failure could not be recorded; payroll readiness is unverified.', ['error' => $markerError->getMessage()]);
+                    }
+                }
+                throw $error;
+            } finally {
+                $runLock->release();
+            }
         } catch (\Throwable $e) {
             $this->error("[$display] Failed: " . $e->getMessage());
             Log::error("GenerateNSFCommissionReport[$display]: failed", ['ex' => $e]);
+            return false;
         }
+        return true;
     }
 
     private function fetchNSFRows(DBConnector $sf, array $cfg, string $startDate, string $endDate): array
     {
-        $agentId  = (int) $cfg['custom_agent'];
-        $returnId = (int) $cfg['custom_nsf_return'];
-        $actionId = (int) $cfg['custom_nsf_action'];
-        $recoupId = (int) $cfg['custom_nsf_recoup'];
-
-        $sql = "
-            SELECT
-                c.ID,
-                CU1.AGENT,
-                TO_VARCHAR(CU2.NSF_RETURNED_DATE, 'YYYY-MM-DD') AS NSF_RETURNED_DATE,
-                CU3.NSF_ACTION,
-                TO_VARCHAR(CU4.NSF_RECOUP_DATE, 'YYYY-MM-DD') AS NSF_RECOUP_DATE,
-                TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', T.CLEARED_DATE) AS DATE), 'YYYY-MM-DD') AS CLEARED_DATE
-            FROM CONTACTS c
-            LEFT JOIN (
-                SELECT CONTACT_ID, F_SHORTSTRING AS AGENT
-                FROM CONTACTS_USERFIELDS
-                WHERE CUSTOM_ID = $agentId
-            ) CU1 ON c.ID = CU1.CONTACT_ID
-            LEFT JOIN (
-                SELECT CONTACT_ID, F_DATE AS NSF_RETURNED_DATE
-                FROM CONTACTS_USERFIELDS
-                WHERE CUSTOM_ID = $returnId
-            ) CU2 ON c.ID = CU2.CONTACT_ID
-            LEFT JOIN (
-                SELECT CONTACT_ID, F_STRING AS NSF_ACTION
-                FROM CONTACTS_USERFIELDS
-                WHERE CUSTOM_ID = $actionId
-            ) CU3 ON c.ID = CU3.CONTACT_ID
-            LEFT JOIN (
-                SELECT CONTACT_ID, F_DATE AS NSF_RECOUP_DATE
-                FROM CONTACTS_USERFIELDS
-                WHERE CUSTOM_ID = $recoupId
-            ) CU4 ON c.ID = CU4.CONTACT_ID
-            LEFT JOIN (
-                SELECT CONTACT_ID, CLEARED_DATE,
-                       ROW_NUMBER() OVER (PARTITION BY CONTACT_ID ORDER BY CONVERT_TIMEZONE('America/Los_Angeles', PROCESS_DATE) DESC) AS RN
-                FROM TRANSACTIONS
-                WHERE TRANS_TYPE = 'D'
-                  AND CLEARED_DATE IS NOT NULL
-                  AND RETURNED_DATE IS NULL
-            ) T ON c.ID = T.CONTACT_ID
-            WHERE CU2.NSF_RETURNED_DATE >= '$startDate'
-              AND CU2.NSF_RETURNED_DATE <= '$endDate'
-              AND T.RN = 1
-            ORDER BY CU1.AGENT, CU2.NSF_RETURNED_DATE
-        ";
-
-        $result = $sf->query($sql);
-        return $result['data'] ?? [];
+        return NsfCommissionSource::fetch($sf, $cfg, $startDate, $endDate);
     }
 
     /**
      * Compute commission summary per agent.
      *
-     * Mirrors the VBA Commission sheet formulas:
+     * Commission rules (cleared-payment bands confirmed by the user):
      *   Assignments = rows where AGENT = this agent
      *   Actions     = rows where AGENT = this agent AND NSF_ACTION not empty
      *   Ratio       = Actions / Assignments
      *   Valid       = rows where AGENT = this agent AND valid_commission = true
+     *   Clear tier  = successful clears in bands 1–50 / 51–100 / 101+
      *   Rate        = tier lookup (or flat $4 for special agents)
      *   Commission  = Rate * Valid
      */
@@ -300,10 +268,21 @@ class GenerateNSFCommissionReport extends Command
             3 => [1 => 3.50, 2 => 3.75, 3 => 4.00],
         ];
 
-        // Pre-index rows by agent
+        $nameKey = static fn (string $name): string => strtolower((string) preg_replace('/\s+/', ' ', trim($name)));
+        // Roster names come first; retain their spelling but price each identity once.
+        $uniqueAgents = [];
+        foreach ($agents as $agent) {
+            $key = $nameKey((string) $agent);
+            if ($key !== '' && !isset($uniqueAgents[$key])) {
+                $uniqueAgents[$key] = trim((string) $agent);
+            }
+        }
+        $agents = array_values($uniqueAgents);
+
+        // Pre-index rows by the same identity used by the roster and Azure.
         $byAgent = [];
         foreach ($dataRows as $row) {
-            $agent = (string) ($row['AGENT'] ?? '');
+            $agent = $nameKey((string) ($row['AGENT'] ?? ''));
             if ($agent === '') continue;
             $byAgent[$agent][] = $row;
         }
@@ -320,7 +299,7 @@ class GenerateNSFCommissionReport extends Command
             );
             foreach ($empRes['data'] ?? [] as $emp) {
                 $name = (string) ($emp['Employee_Name'] ?? $emp['employee_name'] ?? '');
-                $locationMap[$name] = [
+                $locationMap[$nameKey($name)] = [
                     'location' => (string) ($emp['Location'] ?? $emp['location'] ?? ''),
                     'company'  => (string) ($emp['Company']  ?? $emp['company']  ?? ''),
                 ];
@@ -329,7 +308,8 @@ class GenerateNSFCommissionReport extends Command
 
         $rows = [];
         foreach ($agents as $agent) {
-            $agentRows   = $byAgent[$agent] ?? [];
+            $agentKey = $nameKey($agent);
+            $agentRows   = $byAgent[$agentKey] ?? [];
             $assignments = count($agentRows);
 
             $actions = 0;
@@ -347,14 +327,15 @@ class GenerateNSFCommissionReport extends Command
             $ratio = ($assignments > 0) ? ($actions / $assignments) : 0;
 
             $actionsTier = $this->matchTier($ratio, [0.2, 0.4, 0.6]);
-            $clearedTier = $this->matchTier($actions, [1, 51, 101]);
+            // Actions select the ratio column; successful clears select the
+            // payment-count band. Many actions alone must not raise that band.
+            $clearedTier = $this->matchTier($clears, [1, 51, 101]);
 
             // Compare case/space-insensitively: the agent list can now come from the managed
             // roster, where a name may differ in casing or spacing from the constant below.
             // A miss here would silently pay the tier rate instead of the flat rate.
-            $agentKey = strtolower(preg_replace('/\s+/', ' ', trim($agent)));
             $flatRateKeys = array_map(
-                fn ($n) => strtolower(preg_replace('/\s+/', ' ', trim($n))),
+                $nameKey,
                 self::FLAT_RATE_AGENTS
             );
             if (in_array($agentKey, $flatRateKeys, true)) {
@@ -375,8 +356,8 @@ class GenerateNSFCommissionReport extends Command
                 'rate'         => $rate,
                 'clears'       => $clears,
                 'commission' => $rate * $clears,
-                'location'   => $locationMap[$agent]['location'] ?? '',
-                'company'    => $locationMap[$agent]['company']  ?? '',
+                'location'   => $locationMap[$agentKey]['location'] ?? '',
+                'company'    => $locationMap[$agentKey]['company']  ?? '',
             ];
         }
 
@@ -384,28 +365,12 @@ class GenerateNSFCommissionReport extends Command
     }
 
     /**
-     * VBA: AND(MONTH(NSF_RETURNED)=MONTH(NSF_RECOUP), CLEARED<=DATE(Y,M+1,5), CLEARED>NSF_RECOUP)
+     * Same earned month/year as the manager calculation; stale prior-year fields
+     * must not qualify merely because their month numbers match.
      */
     private function isValidCommission(array $row): bool
     {
-        $nsfReturned = (string) ($row['NSF_RETURNED_DATE'] ?? '');
-        $nsfRecoup   = (string) ($row['NSF_RECOUP_DATE']   ?? '');
-        $cleared     = (string) ($row['CLEARED_DATE']      ?? '');
-
-        if ($nsfReturned === '' || $nsfRecoup === '' || $cleared === '') {
-            return false;
-        }
-
-        $returnMonth = (int) date('m', strtotime($nsfReturned));
-        $recoupMonth = (int) date('m', strtotime($nsfRecoup));
-
-        if ($returnMonth !== $recoupMonth) {
-            return false;
-        }
-
-        $cutoffDate = date('Y-m-05', strtotime('first day of next month', strtotime($nsfReturned)));
-
-        return $cleared <= $cutoffDate && $cleared > $nsfRecoup;
+        return NsfCommissionSource::validCommission($row);
     }
 
     /**
@@ -501,20 +466,62 @@ class GenerateNSFCommissionReport extends Command
 
     private function saveSnapshotCopy(array $file, string $startDate): string
     {
+        return $this->persistWithSnapshot($file, $startDate, static function (): void {});
+    }
+
+    /** Stage first; a failed write must never publish a report or reach email delivery. */
+    private function persistWithSnapshot(array $file, string $startDate, callable $persist): string
+    {
+        [$staged, $dest] = $this->stageSnapshotCopy($file, $startDate);
+        try {
+            $persist();
+            if (!@rename($staged, $dest)) {
+                throw new \RuntimeException('NSF commission results were saved, but the manager snapshot could not be published. No email was sent. Reconcile and rerun this source/period before payroll review: ' . $dest);
+            }
+            return $dest;
+        } finally {
+            if (is_file($staged)) {
+                @unlink($staged);
+            }
+        }
+    }
+
+    /** @return array{0:string,1:string} Unpublished file and its final destination. */
+    private function stageSnapshotCopy(array $file, string $startDate): array
+    {
         if (!isset($file['path'], $file['filename']) || !is_file((string) $file['path'])) {
             throw new \RuntimeException('Cannot save NSF commission snapshot because workbook file is missing.');
         }
 
         $month = date('Y-m', strtotime($startDate));
         $dir = storage_path("app/commission-snapshots/{$month}/nsf");
-        if (!is_dir($dir)) {
-            mkdir($dir, 0775, true);
+        if (!is_dir($dir) && !@mkdir($dir, 0775, true) && !is_dir($dir)) {
+            throw new \RuntimeException('Cannot create NSF commission snapshot directory: ' . $dir);
         }
 
         $dest = $dir . DIRECTORY_SEPARATOR . (string) $file['filename'];
-        copy((string) $file['path'], $dest); // overwrite same month/source if rerun
+        $staged = $dir . DIRECTORY_SEPARATOR . '.nsf-' . bin2hex(random_bytes(12)) . '.tmp';
+        try {
+            if (!$this->copySnapshotFile((string) $file['path'], $staged)) {
+                throw new \RuntimeException('Cannot copy NSF commission workbook to its staged snapshot: ' . $dest);
+            }
+            $sourceHash = @hash_file('sha256', (string) $file['path']);
+            $snapshotHash = @hash_file('sha256', $staged);
+            if ($sourceHash === false || $snapshotHash === false || !hash_equals($sourceHash, $snapshotHash)) {
+                throw new \RuntimeException('NSF commission snapshot verification failed; prior results and snapshot were preserved.');
+            }
+            return [$staged, $dest];
+        } catch (\Throwable $error) {
+            if (is_file($staged)) {
+                @unlink($staged);
+            }
+            throw $error;
+        }
+    }
 
-        return $dest;
+    protected function copySnapshotFile(string $source, string $destination): bool
+    {
+        return @copy($source, $destination);
     }
 
     private function cleanupOldSnapshots(string $currentStartDate): void

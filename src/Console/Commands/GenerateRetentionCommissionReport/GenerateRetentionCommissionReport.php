@@ -97,22 +97,25 @@ class GenerateRetentionCommissionReport extends Command
 
         $arg     = strtolower((string) $this->argument('source'));
         $sources = ($arg === 'both') ? ['ldr', 'plaw'] : [$arg];
+        $failed = false;
 
         foreach ($sources as $src) {
             if (!isset(self::SOURCE_CONFIG[$src])) {
                 $this->error("Unknown source: $src. Use ldr, plaw, or both.");
                 return Command::FAILURE;
             }
-            $this->runForSource($src);
+            if (!$this->runForSource($src)) {
+                $failed = true;
+            }
         }
 
-        return Command::SUCCESS;
+        return $failed ? Command::FAILURE : Command::SUCCESS;
     }
 
     /** Per-agent commission summary from the most recent buildWorkbook(), for the Azure results write. */
     private array $lastSummaryRows = [];
 
-    private function runForSource(string $source): void
+    protected function runForSource(string $source): bool
     {
         // Reset per source: handle() runs LDR then PLAW on the SAME instance, so a stale value
         // here would persist one source's commission under the other source's key.
@@ -132,7 +135,7 @@ class GenerateRetentionCommissionReport extends Command
             $sql = $this->initSqlServer($source);
         } catch (\Throwable $e) {
             $this->error("[$display] Connector init failed: " . $e->getMessage());
-            return;
+            return false;
         }
 
         try {
@@ -152,11 +155,6 @@ class GenerateRetentionCommissionReport extends Command
             unset($row);
 
             $this->info("[INFO] [$display] Base rows: " . count($rows));
-
-            if (empty($rows)) {
-                $this->warn("[$display] No rows found.");
-                return;
-            }
 
             $ids    = array_filter(array_map(fn ($r) => (int) $this->col($r, 'ID', 0), $rows));
             $idList = empty($ids) ? '0' : implode(',', $ids);
@@ -314,10 +312,16 @@ class GenerateRetentionCommissionReport extends Command
             // Keep an explicit environment override for rollback, but make the
             // correct business rule the safe default for scheduled runs too.
             $useRetainedMonthTier = filter_var(env('RETENTION_TIER_BY_RETAINED_MONTH', true), FILTER_VALIDATE_BOOLEAN);
+            $payableRows = array_filter($rows, fn (array $row): bool => $this->inExcelPeriod(
+                $this->col($row, 'RETENTION_PAYMENT_DATE'), $startDate, $endDate, true
+            ));
+            $historicPeriods = array_values(array_filter($this->retentionPeriodStarts($payableRows),
+                static fn (string $period): bool => $period < $startDate));
             $tierSnapshotMap = RetentionCommissionTierStore::fetchMap(
                 $sql,
                 $source,
-                $this->retentionPeriodStarts($rows)
+                $historicPeriods,
+                $useRetainedMonthTier
             );
 
             // ── STEP 7: build workbook with both sheets
@@ -335,6 +339,9 @@ class GenerateRetentionCommissionReport extends Command
                 $rosterAgents,
                 $source
             );
+            if ($file === null) {
+                throw new \RuntimeException('Retention workbook generation failed; commission results were not changed.');
+            }
 
             // Anyone with commission this period who is not on the roster. lastSummaryRows is set
             // inside buildWorkbook and covers every agent found in the data, so it can price the
@@ -353,16 +360,14 @@ class GenerateRetentionCommissionReport extends Command
                 );
             }
 
-            // Persist the computed per-agent retention commission to Azure for the Commission Review
-            // app (best-effort; never blocks the report). $lastSummaryRows is set inside buildWorkbook.
-            // Reset Commission first (same pattern as bonus) so agents who drop off this run
-            // do not keep a stale amount that makes Commission Review / Payroll disagree with the XLSX.
+            // Replace this computed component atomically. History/calculation/workbook failures
+            // must occur before persistence, and a failed write must prevent report delivery.
+            // The sibling lookback component is preserved by replaceComponent.
             $retResults = [];
             foreach ($this->lastSummaryRows as $agentName => $sum) {
                 $retResults[] = ['agent' => (string) $agentName, 'amount' => $sum['commission'] ?? 0];
             }
-            CommissionResultsWriter::resetColumn($sql, 'retention', $source, $startDate, 'Commission');
-            $persisted = CommissionResultsWriter::persist($sql, 'retention', $source, $startDate, 'Commission', $retResults);
+            $persisted = CommissionResultsWriter::replaceComponent($sql, 'retention', $source, $startDate, 'Commission', $retResults);
             if ($notice = CommissionResultsWriter::failureNotice($persisted, $display)) {
                 $this->warn($notice);
             }
@@ -409,6 +414,7 @@ class GenerateRetentionCommissionReport extends Command
             } else {
                 $this->error("[$display] Workbook generation failed.");
             }
+            return true;
 
         } catch (\Throwable $e) {
             $this->error("[$display] Failed: " . $e->getMessage());
@@ -416,6 +422,7 @@ class GenerateRetentionCommissionReport extends Command
                 'exception' => $e->getMessage(),
                 'trace'     => $e->getTraceAsString(),
             ]);
+            return false;
         }
     }
 
@@ -476,7 +483,15 @@ class GenerateRetentionCommissionReport extends Command
             ORDER BY cu1.F_STRING ASC
         ";
 
-        return $sf->query($sql)['data'] ?? [];
+        $rows = $this->sourceRows($sf, $sql);
+        if ($rows === []) {
+            // A source-wide empty response cannot prove the current roster is
+            // genuinely owed zero. In particular, the roster provider conflates
+            // missing/unreachable data and would fall back to a static agent list.
+            // Preserve prior results, but never report this as a refreshed run.
+            throw new \RuntimeException('Retention source returned no base rows. Run is incomplete; prior commission results were preserved and no fresh report will be sent. Verify the source and roster before retrying.');
+        }
+        return $rows;
     }
 
     private function fetchReconsiderationDates(DBConnector $sf, int $statusId, string $idList): array
@@ -489,7 +504,7 @@ class GenerateRetentionCommissionReport extends Command
             ORDER BY cs.CONTACT_ID ASC, cs.STAMP ASC
         ";
         $map = [];
-        foreach ($sf->query($sql)['data'] ?? [] as $r) {
+        foreach ($this->sourceRows($sf, $sql) as $r) {
             $id = (string) $r['CONTACT_ID'];
             if (!isset($map[$id])) {
                 $map[$id] = $r['RECON_DATE'];
@@ -511,7 +526,7 @@ class GenerateRetentionCommissionReport extends Command
             ORDER BY cs.CONTACT_ID ASC, cs.STAMP ASC
         ";
         $map = [];
-        foreach ($sf->query($sql)['data'] ?? [] as $r) {
+        foreach ($this->sourceRows($sf, $sql) as $r) {
             $map[(string) $r['CONTACT_ID']][] = substr((string) $r['RETAINED_DATE'], 0, 10);
         }
         return $map;
@@ -534,10 +549,21 @@ class GenerateRetentionCommissionReport extends Command
             ORDER BY CONTACT_ID ASC, CLEARED_DATE ASC
         ";
         $map = [];
-        foreach ($sf->query($sql)['data'] ?? [] as $r) {
+        foreach ($this->sourceRows($sf, $sql) as $r) {
             $map[(string) $r['CONTACT_ID']][] = (string) $r['CLEARED_DATE'];
         }
         return $map;
+    }
+
+    private function sourceRows(DBConnector $source, string $query): array
+    {
+        $result = $source->query($query);
+        // Snowflake DBConnector::formatResult returns data/rowCount/columns,
+        // without a success flag. Some test/adaptor paths provide one explicitly.
+        if (($result['success'] ?? null) === false || !is_array($result['data'] ?? null)) {
+            throw new \RuntimeException('Retention source query failed: ' . ($result['error'] ?? 'invalid source response'));
+        }
+        return $result['data'];
     }
 
     // ─── Workbook builder ─────────────────────────────────────────────────────
@@ -786,7 +812,7 @@ class GenerateRetentionCommissionReport extends Command
 
         } catch (\Throwable $e) {
             Log::error('GenerateRetentionCommissionReportCommand::buildWorkbook failed', ['err' => $e->getMessage()]);
-            return null;
+            throw new \RuntimeException('Retention workbook generation failed: ' . $e->getMessage(), 0, $e);
         }
     }
 
@@ -823,7 +849,7 @@ class GenerateRetentionCommissionReport extends Command
         $missingWarned = [];
 
         foreach ($agents as $agentName) {
-            $agentUpper = strtoupper($agentName);
+            $agentUpper = RetentionCommissionTierStore::agentKey($agentName);
 
             $assigned   = 0;
             $retained   = 0;
@@ -831,7 +857,7 @@ class GenerateRetentionCommissionReport extends Command
             $commissionNew = 0.0;
 
             foreach ($rows as $row) {
-                $rowAgent = strtoupper((string) $this->col($row, 'RETENTION_AGENT', ''));
+                $rowAgent = RetentionCommissionTierStore::agentKey((string) $this->col($row, 'RETENTION_AGENT', ''));
                 if ($rowAgent !== $agentUpper) {
                     continue;
                 }
@@ -851,7 +877,7 @@ class GenerateRetentionCommissionReport extends Command
             $tier = $this->resolveTier($pct, $retained, $hasT4);
 
             foreach ($rows as $row) {
-                $rowAgent = strtoupper((string) $this->col($row, 'RETENTION_AGENT', ''));
+                $rowAgent = RetentionCommissionTierStore::agentKey((string) $this->col($row, 'RETENTION_AGENT', ''));
                 if ($rowAgent !== $agentUpper) {
                     continue;
                 }
@@ -871,17 +897,20 @@ class GenerateRetentionCommissionReport extends Command
                         $snapshotTier = $tierSnapshotMap[$key];
                     } elseif (
                         $retainedPeriod !== $startDate
-                        && ($useRetainedMonthTier || $logShadowCompare)
+                        && $logShadowCompare && !$useRetainedMonthTier
                         && !isset($missingWarned[$key])
                     ) {
                         $missingWarned[$key] = true;
-                        Log::warning('RetentionCommissionTierStore: missing tier snapshot; using current-month tier', [
+                        Log::warning('RetentionCommissionTierStore: shadow comparison lacks historical tier; policy is explicitly disabled', [
                             'agent' => $agentName,
                             'retained_period' => $retainedPeriod,
                         ]);
                     }
                 }
-                $payTier = RetentionCommissionTierStore::resolveTierForPayment($tier, $snapshotTier);
+                $payTier = $useRetainedMonthTier
+                    ? RetentionCommissionTierStore::retainedMonthTierForPayment($tier, $tierSnapshotMap, $agentName,
+                        (string) ($this->col($row, 'RETENTION_DATE') ?? ''), $startDate)
+                    : RetentionCommissionTierStore::resolveTierForPayment($tier, $snapshotTier);
                 $commissionNew += $this->amountForTier($row, $payTier);
             }
 
