@@ -20,6 +20,104 @@ final class ContactSyncTargets
         };
     }
 
+    /** Gather only unresolved, unique source links before acquiring write locks. */
+    public static function evidenceRequests(PDO $pdo, array $data, string $source): array
+    {
+        if ($data === []) {
+            return [];
+        }
+        $incoming = [];
+        foreach ($data as $row) {
+            $row = self::values(array_change_key_case($row, CASE_LOWER));
+            $id = (string) $row['llg_id'];
+            if (!preg_match('/^LLG-[1-9][0-9]*$/D', $id) || isset($incoming[$id])) {
+                throw new RuntimeException('Invalid or duplicate incoming evidence contact ID.');
+            }
+            $incoming[$id] = $row;
+        }
+        if ($source !== 'LT') {
+            return self::backendEvidenceRequests($pdo, $incoming, $source);
+        }
+        $nativeIds = array_map(fn ($id) => substr($id, 4), array_keys($incoming));
+        $sides = [];
+        foreach (['LDR', 'PLAW'] as $namespace) {
+            $sides = array_merge($sides, self::lookup($pdo, self::table($namespace), [], $nativeIds, false));
+        }
+        $ownerIds = array_unique(array_column($sides, 'llg_id'));
+        $sides = [];
+        foreach (['LDR', 'PLAW'] as $namespace) {
+            foreach (self::lookup($pdo, self::table($namespace), $ownerIds, $nativeIds, false) as $side) {
+                $side['_source'] = $namespace;
+                $sides[] = $side;
+            }
+        }
+        $requests = [];
+        foreach ($incoming as $id => $row) {
+            $bridges = array_values(array_filter($sides, fn ($side) => (string) $side['external_id'] === substr($id, 4)));
+            if (count($bridges) > 1 && ContactSyncIdentity::validNativeId(substr($id, 4))) {
+                if (array_filter($bridges, fn ($side) => !preg_match('/^LLG-[1-9][0-9]*$/D', (string) $side['llg_id'])
+                    || !ContactSyncIdentity::validNativeId(substr((string) $side['llg_id'], 4))) === []) {
+                    $requests[] = ['kind' => 'backend_selection', 'incoming' => $row, 'candidates' => $bridges];
+                }
+                continue;
+            }
+            if (count($bridges) !== 1 || !ContactSyncIdentity::validNativeId(substr($id, 4))) {
+                continue;
+            }
+            $backend = $bridges[0];
+            $owners = array_filter($sides, fn ($side) => (string) $side['llg_id'] === (string) $backend['llg_id']);
+            if (count($owners) === 1 && preg_match('/^LLG-[1-9][0-9]*$/D', (string) $backend['llg_id'])
+                && ContactSyncIdentity::validNativeId(substr((string) $backend['llg_id'], 4))
+                && !ContactSyncIdentity::corroborates($row, $backend)) {
+                $requests[] = ['incoming' => $row, 'backend' => $backend];
+            }
+        }
+        return $requests;
+    }
+
+    private static function backendEvidenceRequests(PDO $pdo, array $incoming, string $source): array
+    {
+        self::table($source);
+        $nativeIds = array_values(array_filter(array_column($incoming, 'external_id'),
+            fn ($id) => ContactSyncIdentity::validNativeId((string) $id)));
+        $owners = [];
+        $current = [];
+        foreach (['LDR', 'PLAW'] as $namespace) {
+            $rows = self::lookup($pdo, self::table($namespace), array_keys($incoming), $nativeIds, false);
+            array_push($owners, ...$rows);
+            if ($namespace === $source) {
+                $current = $rows;
+            }
+        }
+        $requests = [];
+        foreach ($incoming as $id => $row) {
+            $existing = array_values(array_filter($current, fn ($old) => (string) $old['llg_id'] === (string) $id));
+            // Legacy backend-only records need no LT proof for a verified same-CRM refresh.
+            if (count($existing) !== 1 || self::sameNativeOwner($row, $existing[0]) || ContactSyncIdentity::matches($row, $existing[0])
+                || ContactSyncIdentity::corroborates($row, $existing[0]) || !self::sameNativeLink($row, $existing[0])) {
+                continue;
+            }
+            if (count(self::backendOwners($owners, $row)) === 1) {
+                $requests[] = ['kind' => 'backend_update', 'incoming' => $row,
+                    'backend' => $existing[0] + ['_source' => $source]];
+            }
+        }
+        return $requests;
+    }
+
+    private static function backendOwners(array $owners, array $row): array
+    {
+        return array_filter($owners, fn ($owner) => (string) $owner['llg_id'] === (string) $row['llg_id']
+            || (string) $owner['external_id'] === (string) $row['external_id']);
+    }
+
+    private static function provenBackendUpdate(array $row, array $old, array $owners, string $source, ?ContactSyncSourceEvidence $evidence): bool
+    {
+        return $evidence !== null && (string) $row['llg_id'] === (string) $old['llg_id']
+            && self::sameNativeLink($row, $old) && count(self::backendOwners($owners, $row)) === 1
+            && $evidence->supportsBackendUpdate($row, $old, $source);
+    }
+
     public static function plan(PDO $pdo, array $data, string $source, bool $lock = false): array
     {
         if ($data === []) {
@@ -243,6 +341,19 @@ final class ContactSyncTargets
             throw new RuntimeException('Contact target lookup failed.');
         }
         return array_map(fn ($r) => array_change_key_case($r, CASE_LOWER), $stmt->fetchAll(PDO::FETCH_ASSOC));
+    }
+
+    private static function sameNativeOwner(array $row, array $old): bool
+    {
+        if (trim((string) $row['client']) === '' || !ContactSyncIdentity::validNativeId(substr((string) $row['llg_id'], 4))) {
+            return false;
+        }
+        foreach (['llg_id', 'external_id'] as $field) {
+            if ((string) $row[$field] !== (string) $old[$field]) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static function sameNativeLink(array $left, array $right): bool
