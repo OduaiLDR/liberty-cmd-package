@@ -184,12 +184,51 @@ final class ContactSyncSourceEvidence
                 }
                 unset($response, $row, $raw);
             }
+            $rows = self::resolveMissingPlanTitles($batch, $rows, $claims, $query);
             foreach ($batch as $request) {
                 $decision = self::selectBackend($request, $rows, $claims[$request['native']] ?? []);
                 $this->selections[self::selectionKey($request['incoming'], $request['candidates'])] = $decision;
             }
             unset($rows, $claims);
         }
+    }
+
+    private static function resolveMissingPlanTitles(array $batch, array $rows, array $claims, callable $query): array
+    {
+        $missing = [];
+        foreach ($batch as $request) {
+            $native = $request['native'];
+            $lt = $rows['LT'][$native][0] ?? [];
+            $planId = (string) ($lt['PLAN_ID'] ?? '');
+            if (trim((string) ($lt['PLAN_TITLE'] ?? '')) === '' && preg_match('/^[1-9][0-9]*$/D', $planId)
+                && in_array(self::selectBackend($request, $rows, $claims[$native] ?? [])['reason'], ['neither_enrolled', 'multiple_enrolled'], true)) {
+                $missing[$native] = $planId;
+            }
+        }
+        if ($missing === []) { return $rows; }
+        $ids = array_values(array_unique($missing)); // At most 500 LT candidates in this batch.
+        $definitions = [];
+        foreach (['LDR', 'PLAW'] as $source) {
+            try {
+                $response = $query($source, 'SELECT ID AS PLAN_ID, TITLE, _FIVETRAN_DELETED FROM ENROLLMENT_DEFAULTS2 WHERE ID IN ('
+                    . implode(',', $ids) . ') AND _FIVETRAN_DELETED = FALSE');
+            } catch (\Throwable $error) { throw new RuntimeException('Contact plan definition read failed for ' . $source . '.'); }
+            foreach ($response as $raw) {
+                $row = array_change_key_case($raw, CASE_UPPER);
+                $deleted = $row['_FIVETRAN_DELETED'] ?? null;
+                $id = (string) ($row['PLAN_ID'] ?? '');
+                if (in_array($id, $ids, true) && ($deleted === false || in_array(strtolower((string) $deleted), ['0', 'false'], true))) {
+                    $definitions[$id][] = ['source' => $source, 'title' => (string) ($row['TITLE'] ?? '')];
+                }
+            }
+        }
+        foreach ($missing as $native => $id) {
+            $found = $definitions[$id] ?? [];
+            if (count($found) === 1 && self::planCompany($found[0]['title']) === $found[0]['source']) {
+                $rows['LT'][$native][0]['PLAN_TITLE'] = $found[0]['title'];
+            }
+        }
+        return $rows;
     }
 
     private static function selectBackend(array $request, array $rows, array $claims): array
@@ -210,6 +249,7 @@ final class ContactSyncSourceEvidence
             return $result;
         }
         $enrolled = [];
+        $eligible = [];
         foreach ($candidates as $candidate) {
             $sourceRows = $rows[$candidate['_source']][substr($candidate['llg_id'], 4)] ?? [];
             if (count($sourceRows) > 1) { return $result; }
@@ -223,11 +263,20 @@ final class ContactSyncSourceEvidence
                 $result['reason'] = 'unknown_enrollment';
                 return $result;
             }
+            $eligible[] = [$candidate, $sourceRows[0]];
             if (in_array($flag, ['1', 'true'], true)) { $enrolled[] = [$candidate, $sourceRows[0]]; }
         }
+        $reason = 'single_enrolled';
         if (count($enrolled) !== 1) {
             $result['reason'] = $enrolled === [] ? 'neither_enrolled' : 'multiple_enrolled';
-            return $result;
+            $company = self::planCompany((string) ($lt[0]['PLAN_TITLE'] ?? ''));
+            if ($company === null) { return $result; }
+            $enrolled = array_values(array_filter($eligible, fn ($pair) => $pair[0]['_source'] === $company));
+            if (count($enrolled) !== 1) {
+                $result['reason'] = $enrolled === [] ? 'plan_company_missing' : 'plan_company_ambiguous';
+                return $result;
+            }
+            $reason = 'lt_plan_company';
         }
         [$candidate, $fresh] = $enrolled[0];
         if (!self::matchesStoredSnapshot(self::sourceSnapshot($fresh), $candidate)) {
@@ -242,10 +291,18 @@ final class ContactSyncSourceEvidence
             return $result;
         }
         $result['winner'] = ['source' => $candidate['_source'], 'id' => $candidate['llg_id']];
-        $result['reason'] = 'single_enrolled';
+        $result['reason'] = $reason;
         $result['identity_proven'] = true;
         $result['losers'] = array_values(array_filter($identifiers, fn ($id) => $id !== $result['winner']));
         return $result;
+    }
+
+    private static function planCompany(string $title): ?string
+    {
+        // Bare PLAW/Paramount plan names also occur in legacy LDR; only explicit current branding routes a file.
+        $plaw = preg_match('/\b(?:PRO\s*LAW|PROGRESS\s+LAW)\b/i', $title) === 1;
+        $ldr = preg_match('/\b(?:LDR|LIBERTY\s+DEBT\s+RELIEF)\b/i', $title) === 1;
+        return $plaw === $ldr ? null : ($plaw ? 'PLAW' : 'LDR');
     }
 
     private static function selectionResult(array $candidates, string $reason): array
@@ -333,15 +390,29 @@ final class ContactSyncSourceEvidence
             : "(c.ID IN ({$targets}) OR {$nativeReference} IN ({$references}))";
         $candidateEnrollment = $enrollment ? 'c.ENROLLED,' : '';
         $selectedEnrollment = $enrollment ? 'ENROLLED,' : '';
+        $planCte = $planField = $planJoin = '';
+        if ($enrollment && $source === 'LT') {
+            $planCte = ", latest_plan AS (
+                SELECT ep.CONTACT_ID, ep.PLAN_ID FROM ENROLLMENT_PLAN AS ep
+                JOIN candidate AS p ON p.ID = ep.CONTACT_ID
+                WHERE ep._FIVETRAN_DELETED = FALSE
+                QUALIFY ROW_NUMBER() OVER (PARTITION BY ep.CONTACT_ID ORDER BY ep.CREATED_AT DESC, ep.ID DESC) = 1
+            ), plan_title AS (
+                SELECT ep.CONTACT_ID, ep.PLAN_ID, ed.TITLE AS PLAN_TITLE FROM latest_plan AS ep
+                LEFT JOIN ENROLLMENT_DEFAULTS2 AS ed ON ep.PLAN_ID = ed.ID AND ed._FIVETRAN_DELETED = FALSE
+            )";
+            $planField = 'plan_title.PLAN_ID, plan_title.PLAN_TITLE,';
+            $planJoin = ' LEFT JOIN plan_title ON candidate.ID = plan_title.CONTACT_ID';
+        }
         return "WITH candidate AS (
             SELECT c.ID, c.TP_ID, c.DEL, c.ISCOAPP, {$candidateEnrollment} CONCAT(c.FIRSTNAME, ' ', c.LASTNAME) AS FULLNAME, c.PHONE3, c.EMAIL,
                 CASE WHEN c.ID IN ({$targets}) THEN REGEXP_REPLACE(COALESCE(c.SSN, ''), '[^0-9]', '') ELSE '' END AS DIGITS
             FROM CONTACTS c WHERE c._FIVETRAN_DELETED = FALSE AND c.DEL = 'FALSE' AND c.ISCOAPP = 0
                 AND c.ID > 0 AND c.FIRSTNAME IS NOT NULL AND c.FIRSTNAME <> '' AND {$selection}
-        ) SELECT ID, TP_ID, DEL, ISCOAPP, {$selectedEnrollment} FULLNAME, PHONE3, EMAIL,
+        ){$planCte} SELECT ID, TP_ID, DEL, ISCOAPP, {$selectedEnrollment} {$planField} FULLNAME, PHONE3, EMAIL,
             CASE WHEN LENGTH(DIGITS) = 9 AND DIGITS <> REPEAT(LEFT(DIGITS, 1), 9)
                 AND DIGITS NOT IN ('123456789', '987654321')
                 THEN SHA2(CONCAT('{$salt}', ':full:', DIGITS), 256) ELSE NULL END AS FULL_TOKEN
-            FROM candidate";
+            FROM candidate{$planJoin}";
     }
 }
