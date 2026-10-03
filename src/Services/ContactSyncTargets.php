@@ -118,7 +118,7 @@ final class ContactSyncTargets
             && $evidence->supportsBackendUpdate($row, $old, $source);
     }
 
-    public static function plan(PDO $pdo, array $data, string $source, bool $lock = false): array
+    public static function plan(PDO $pdo, array $data, string $source, bool $lock = false, ?ContactSyncSourceEvidence $evidence = null, bool $reportConflicts = false): array
     {
         if ($data === []) {
             return [];
@@ -175,105 +175,163 @@ final class ContactSyncTargets
             }
         }
 
-        $linked = $source === 'LT' ? [] : self::backendIdentityPlans($incoming, $current, $main, array_merge(...array_values($backendRows)));
+        $backendOwners = $source === 'LT' ? [] : array_merge(...array_values($backendRows));
+        $linked = $source === 'LT' ? [] : self::backendIdentityPlans($incoming, $current, $main, $backendOwners, $source, $evidence);
         $plan = [];
         $claimed = [];
         foreach ($incoming as $id => $row) {
-            // Count every physical claim, including a competing row with a different identity.
-            $bridges = array_values(array_filter($sides, fn ($s) => (string) $s['external_id'] === substr($id, 4)));
-            if (count($bridges) > 1) {
-                throw new RuntimeException("Ambiguous source namespace for {$source}:{$id}; explicit repair required.");
-            }
-            $backend = $bridges[0] ?? null;
-            if ($backend !== null && (!ContactSyncIdentity::validNativeId(substr($id, 4))
-                || !ContactSyncIdentity::corroborates($row, $backend))) {
-                throw new RuntimeException("Conflicting identity on native LT bridge for {$id}; explicit repair required.");
-            }
-            if ($backend !== null && count(array_filter($sides, fn ($s) => (string) $s['llg_id'] === (string) $backend['llg_id'])) !== 1) {
-                throw new RuntimeException("Conflicting source ownership at native LT bridge for {$id}; explicit repair required.");
-            }
-            $candidates = [];
-            foreach ($current as $old) {
-                $direct = (string) $old['llg_id'] === $id;
-                $bridge = $backend !== null && (string) $old['llg_id'] === (string) $backend['llg_id'];
-                $sameIdentity = ContactSyncIdentity::matches($row, $old);
-                if ($source === 'LT' && $backend !== null && ($direct || $bridge)) {
-                    // Do not chain relaxed comparisons through a historically mixed main row.
-                    $sameIdentity = $sameIdentity || ContactSyncIdentity::matches($backend, $old);
-                } elseif ($source !== 'LT' && $direct && self::sameNativeLink($row, $old)) {
-                    $sameIdentity = $sameIdentity || ContactSyncIdentity::corroborates($row, $old);
+            $warnings = [];
+            try {
+                // Count every physical claim, including a competing row with a different identity.
+                $bridges = array_values(array_filter($sides, fn ($s) => (string) $s['external_id'] === substr($id, 4)));
+                $selection = null;
+                if (count($bridges) > 1) {
+                    $selection = $evidence?->selection($row, $bridges);
+                    if (empty($selection['winner']) || empty($selection['identity_proven'])) {
+                        $warnings[] = ['code' => 'backend_selection_review', 'source' => $source, 'id' => $id,
+                            'message' => $selection['reason'] ?? 'Current enrolled winner is unverified.',
+                            'candidates' => array_map(fn ($side) => ['source' => $side['_source'], 'id' => $side['llg_id']], $bridges)];
+                        throw new ContactSyncConflict("Ambiguous source namespace for {$source}:{$id}; "
+                            . ($selection['reason'] ?? 'current enrolled winner is unverified') . '; skipped for review.');
+                    }
+                    $selected = array_values(array_filter($bridges, fn ($side) => $side['_source'] === $selection['winner']['source']
+                        && (string) $side['llg_id'] === $selection['winner']['id']));
+                    if (count($selected) !== 1) {
+                        throw new ContactSyncConflict("Ambiguous physical enrolled winner for {$source}:{$id}; skipped for review.");
+                    }
+                    $warnings[] = ['code' => 'duplicate_backend', 'source' => $source, 'id' => $id,
+                        'message' => $selection['reason'] === 'lt_plan_company'
+                            ? 'Selected the backend named by the LT enrollment plan; competing files are duplicates for review.'
+                            : 'Selected the enrolled backend; competing files are duplicates for review.',
+                        'winner' => $selection['winner'], 'duplicates' => $selection['losers'],
+                        'stale_candidates' => $selection['stale_candidates'] ?? []];
+                    $bridges = $selected;
                 }
-                if ($direct && !$sameIdentity) {
-                    throw new RuntimeException("Conflicting identity at {$table}.{$id}; refusing overwrite.");
+                $backend = $bridges[0] ?? null;
+                $corroborated = $backend !== null && (ContactSyncIdentity::corroborates($row, $backend)
+                    || ($evidence !== null && $evidence->supports($row, $backend)) || !empty($selection['identity_proven']));
+                if ($backend !== null && (!ContactSyncIdentity::validNativeId(substr($id, 4))
+                    || !$corroborated)) {
+                    throw new ContactSyncConflict("Conflicting identity on native LT bridge for {$id}; explicit repair required.");
                 }
-                $external = $source === 'LT' && $row['external_id'] !== '' && $row['external_id'] !== null
-                    && (string) $old['external_id'] === (string) $row['external_id'];
-                if ($bridge && !$sameIdentity) {
-                    throw new RuntimeException("Conflicting identity at bridge target {$table}.{$old['llg_id']}; explicit repair required.");
+                if ($backend !== null && count(array_filter($sides, fn ($s) => (string) $s['llg_id'] === (string) $backend['llg_id'])) !== 1) {
+                    throw new ContactSyncConflict("Conflicting source ownership at native LT bridge for {$id}; explicit repair required.");
                 }
-                if ($external && ContactSyncIdentity::matches($row, $old)) {
-                    foreach ($sides as $side) {
-                        $verifiedBackend = $bridge && $sameIdentity && $side === $backend;
-                        if ((string) $side['llg_id'] === (string) $old['llg_id']
-                            && !ContactSyncIdentity::matches($old, $side) && !$verifiedBackend) {
-                            throw new RuntimeException("Existing identity contamination at {$table}.{$old['llg_id']}; explicit repair required.");
+                $candidates = [];
+                foreach ($current as $old) {
+                    $direct = (string) $old['llg_id'] === $id;
+                    $bridge = $backend !== null && (string) $old['llg_id'] === (string) $backend['llg_id'];
+                    $sameIdentity = ContactSyncIdentity::matches($row, $old);
+                    // The owning CRM may edit its own record. This never proves a CRM transfer.
+                    if (!$sameIdentity && $source === 'LT' && $direct && $backend === null
+                        && self::sameNativeOwner($row, $old)
+                        && count(array_filter($sides, fn ($side) => (string) $side['llg_id'] === $id)) === 0) {
+                        $sameIdentity = true;
+                    }
+                    if ($source === 'LT' && $backend !== null && ($direct || $bridge)) {
+                        // Do not chain relaxed comparisons through a historically mixed main row.
+                        $sameIdentity = $sameIdentity || ContactSyncIdentity::matches($backend, $old);
+                    } elseif ($source !== 'LT' && $direct) {
+                        $sameIdentity = $sameIdentity || self::sameNativeOwner($row, $old)
+                            || (self::sameNativeLink($row, $old) && (ContactSyncIdentity::corroborates($row, $old)
+                                || self::provenBackendUpdate($row, $old, $backendOwners, $source, $evidence)));
+                    }
+                    if ($direct && !$sameIdentity) {
+                        throw new ContactSyncConflict("Conflicting identity at {$table}.{$id}; refusing overwrite.");
+                    }
+                    $external = $source === 'LT' && $row['external_id'] !== '' && $row['external_id'] !== null
+                        && (string) $old['external_id'] === (string) $row['external_id'];
+                    if ($bridge && !$sameIdentity) {
+                        throw new ContactSyncConflict("Conflicting identity at bridge target {$table}.{$old['llg_id']}; explicit repair required.");
+                    }
+                    if ($external && ContactSyncIdentity::matches($row, $old)) {
+                        foreach ($sides as $side) {
+                            $verifiedBackend = $bridge && $sameIdentity && $side === $backend;
+                            if ((string) $side['llg_id'] === (string) $old['llg_id']
+                                && !ContactSyncIdentity::matches($old, $side) && !$verifiedBackend) {
+                                throw new ContactSyncConflict("Existing identity contamination at {$table}.{$old['llg_id']}; explicit repair required.");
+                            }
+                        }
+                    }
+                    // Shared mailer/partner IDs do not prove a switch. A native LT ID bridge does.
+                    if (($direct || $bridge) && $sameIdentity) {
+                        $candidates[] = $old;
+                    }
+                }
+                if (count($candidates) > 1) {
+                    throw new ContactSyncConflict("Ambiguous contact target for {$source}:{$id}; explicit repair required.");
+                }
+                $before = $candidates[0] ?? null;
+                $target = (string) ($before['llg_id'] ?? $id);
+                $owners = array_values(array_filter($sides, fn ($s) => (string) $s['llg_id'] === $target));
+                if ($source === 'LT' && $owners !== []) {
+                    if (count($owners) !== 1 || !$corroborated || $owners[0] !== $backend
+                        || (string) $owners[0]['external_id'] !== substr($id, 4)) {
+                        throw new ContactSyncConflict("Conflicting source ownership for {$table}.{$target}; explicit repair required.");
+                    }
+                }
+                if (isset($claimed[$target])) {
+                    $message = "Two incoming contacts claim {$table}.{$target}.";
+                    if ($reportConflicts) {
+                        foreach ($plan as &$prior) {
+                            if ($prior['target_id'] === $target) {
+                                $prior = self::skipped($prior['incoming_id'], $source, $message);
+                            }
+                        }
+                        unset($prior);
+                    }
+                    throw new ContactSyncConflict($message);
+                }
+                $claimed[$target] = true;
+                $after = $row;
+                $after['llg_id'] = $target;
+                if ($source === 'LT' && $backend !== null) {
+                    foreach (['client', 'email', 'phone'] as $field) {
+                        $value = $backend[$field];
+                        // Blank backend fields do not authorize erasing a known contact detail.
+                        $populated = trim((string) $value) !== ''
+                            && ($field !== 'email' || strpos((string) $value, '@') > 0);
+                        $after[$field] = $populated ? $value : (($before[$field] ?? null) ?: $row[$field]);
+                    }
+                }
+                if ($source === 'LT' && $before !== null && $target !== $id) {
+                    $after['external_id'] = $before['external_id'] ?: ($row['external_id'] ?: substr($id, 4));
+                    // These fields belong to the verified destination company after a switch.
+                    if ($owners !== []) {
+                        foreach (['category', 'affiliate_agent', 'campaign'] as $field) {
+                            $after[$field] = $before[$field];
                         }
                     }
                 }
-                // Shared mailer/partner IDs do not prove a switch. A native LT ID bridge does.
-                if (($direct || $bridge) && $sameIdentity) {
-                    $candidates[] = $old;
-                }
-            }
-            if (count($candidates) > 1) {
-                throw new RuntimeException("Ambiguous contact target for {$source}:{$id}; explicit repair required.");
-            }
-            $before = $candidates[0] ?? null;
-            $target = (string) ($before['llg_id'] ?? $id);
-            $owners = array_values(array_filter($sides, fn ($s) => (string) $s['llg_id'] === $target));
-            if ($source === 'LT' && $owners !== []) {
-                if (count($owners) !== 1 || !ContactSyncIdentity::corroborates($row, $owners[0])
-                    || (string) $owners[0]['external_id'] !== substr($id, 4)) {
-                    throw new RuntimeException("Conflicting source ownership for {$table}.{$target}; explicit repair required.");
-                }
-            }
-            if (isset($claimed[$target])) {
-                throw new RuntimeException("Two incoming contacts claim {$table}.{$target}.");
-            }
-            $claimed[$target] = true;
-            $after = $row;
-            $after['llg_id'] = $target;
-            if ($source === 'LT' && $backend !== null) {
-                foreach (['client', 'email', 'phone'] as $field) {
-                    $value = $backend[$field];
-                    // Blank backend fields do not authorize erasing a known contact detail.
-                    $populated = trim((string) $value) !== ''
-                        && ($field !== 'email' || strpos((string) $value, '@') > 0);
-                    $after[$field] = $populated ? $value : (($before[$field] ?? null) ?: $row[$field]);
-                }
-            }
-            if ($source === 'LT' && $before !== null && $target !== $id) {
-                $after['external_id'] = $before['external_id'] ?: ($row['external_id'] ?: substr($id, 4));
-                // These fields belong to the verified destination company after a switch.
-                if ($owners !== []) {
-                    foreach (['category', 'affiliate_agent', 'campaign'] as $field) {
-                        $after[$field] = $before[$field];
+                $changes = [];
+                foreach ($after as $field => $value) {
+                    $old = $before[$field] ?? null;
+                    if ($before === null || !self::equal($field, $old, $value)) {
+                        $changes[$field] = ['before' => $old, 'after' => $value];
                     }
                 }
-            }
-            $changes = [];
-            foreach ($after as $field => $value) {
-                $old = $before[$field] ?? null;
-                if ($before === null || !self::equal($field, $old, $value)) {
-                    $changes[$field] = ['before' => $old, 'after' => $value];
+                $plan[] = ['incoming_id' => $id, 'target_id' => $target, 'before' => $before, 'after' => $after, 'changes' => $changes];
+                if (isset($linked[$id])) {
+                    $plan[array_key_last($plan)]['linked_identity'] = $linked[$id];
                 }
-            }
-            $plan[] = ['incoming_id' => $id, 'target_id' => $target, 'before' => $before, 'after' => $after, 'changes' => $changes];
-            if (isset($linked[$id])) {
-                $plan[array_key_last($plan)]['linked_identity'] = $linked[$id];
+                if ($warnings !== []) {
+                    $plan[array_key_last($plan)]['warnings'] = $warnings;
+                }
+            } catch (ContactSyncConflict $error) {
+                if (!$reportConflicts) {
+                    throw $error;
+                }
+                $plan[] = self::skipped($id, $source, $error->getMessage(), $warnings);
             }
         }
         return $plan;
+    }
+
+    private static function skipped(string $id, string $source, string $message, array $warnings = []): array
+    {
+        $warnings[] = ['code' => 'contact_review', 'source' => $source, 'id' => $id, 'message' => $message];
+        return ['incoming_id' => $id, 'target_id' => $id, 'before' => null, 'after' => null,
+            'changes' => [], 'skip' => true, 'warnings' => $warnings];
     }
 
     /** Requires the transaction/locks acquired by plan(..., true). */
@@ -283,7 +341,12 @@ final class ContactSyncTargets
             throw new RuntimeException('Contact writes require a transaction.');
         }
         $table = self::table($source);
+        $accepted = 0;
         foreach ($plan as $change) {
+            if (!empty($change['skip'])) {
+                continue;
+            }
+            $accepted++;
             if (isset($change['linked_identity'])) {
                 self::apply($pdo, [$change['linked_identity']], 'LT');
             }
@@ -316,7 +379,7 @@ final class ContactSyncTargets
                 throw new RuntimeException("Contact target changed or write count was not one: {$table}.{$change['target_id']}");
             }
         }
-        return count($plan);
+        return $accepted;
     }
 
     private static function lookup(PDO $pdo, string $table, array $ids, array $exts, bool $lock): array
@@ -364,12 +427,14 @@ final class ContactSyncTargets
     }
 
     /** Preserve a proven pre-update identity when only the backend appears in the delta. */
-    private static function backendIdentityPlans(array $incoming, array $current, array $main, array $owners): array
+    private static function backendIdentityPlans(array $incoming, array $current, array $main, array $owners, string $source, ?ContactSyncSourceEvidence $evidence): array
     {
         $changed = [];
         foreach ($current as $old) {
             $row = $incoming[$old['llg_id']] ?? null;
-            if ($row !== null && self::sameNativeLink($row, $old) && ContactSyncIdentity::corroborates($row, $old)) {
+            if ($row !== null && self::sameNativeLink($row, $old) && (self::sameNativeOwner($row, $old)
+                || (self::sameNativeLink($row, $old)
+                    && (ContactSyncIdentity::corroborates($row, $old) || self::provenBackendUpdate($row, $old, $owners, $source, $evidence))))) {
                 foreach (['client', 'email', 'phone'] as $field) {
                     if (!self::equal($field, $old[$field], $row[$field])) {
                         $changed[$old['llg_id']] = $old;
