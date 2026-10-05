@@ -11,6 +11,7 @@ use Cmd\Reports\Services\CommissionResultsWriter;
 use Cmd\Reports\Services\CommissionRosterProvider;
 use Cmd\Reports\Services\EmailSenderService;
 use Cmd\Reports\Services\RetentionCommissionTierStore;
+use Cmd\Reports\Services\RetentionAgentIdentity;
 use Cmd\Reports\Services\RetentionCommissionReportBuilder;
 use Cmd\Reports\Services\UnassignedCommissionAgents;
 use Illuminate\Console\Command;
@@ -192,7 +193,7 @@ class GenerateRetentionCommissionReport extends Command
             unset($row);
 
             // ── STEP 4: first enrolled-status date >= reconsideration → column J (RETAINED_DATE)
-            $retainedMap = $this->fetchRetainedDates($sf, $idList);
+            $retainedMap = $this->fetchRetainedDates($sf, $idList, $endDate);
             foreach ($rows as &$row) {
                 $recon            = $this->toDate($row['RECONSIDERATION_DATE'] ?? null);
                 $row['RETAINED_DATE'] = null;
@@ -559,21 +560,30 @@ class GenerateRetentionCommissionReport extends Command
         return $map;
     }
 
-    /** Returns map of contact_id → array of enrolled-status dates (sorted asc) */
-    private function fetchRetainedDates(DBConnector $sf, string $idList): array
+    /** Returns map of contact_id → enrolled-status dates through the report cutoff (sorted asc). */
+    private function fetchRetainedDates(DBConnector $sf, string $idList, string $endDate): array
     {
+        if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $endDate)) {
+            throw new \InvalidArgumentException('Retention report cutoff must be a YYYY-MM-DD date.');
+        }
         $sql = "
             SELECT cs.CONTACT_ID, LEFT(cs.STAMP,10) AS RETAINED_DATE
             FROM CONTACTS_STATUS cs
             LEFT JOIN CONTACTS_LEAD_STATUS cls ON cs.STATUS_ID = cls.ID
             WHERE UPPER(cls.TITLE) LIKE '%ENROLLED%'
               AND UPPER(cls.TITLE) NOT LIKE '%RECONSIDERATION%'
+              AND LEFT(cs.STAMP,10) <= '{$endDate}'
               AND cs.CONTACT_ID IN ($idList)
             ORDER BY cs.CONTACT_ID ASC, cs.STAMP ASC
         ";
         $map = [];
         foreach ($this->sourceRows($sf, $sql) as $r) {
-            $map[(string) $r['CONTACT_ID']][] = substr((string) $r['RETAINED_DATE'], 0, 10);
+            $retainedDate = substr((string) $r['RETAINED_DATE'], 0, 10);
+            // Also enforce the as-of cutoff in PHP so adapters/test doubles cannot
+            // accidentally make post-period statuses payable for an older report.
+            if ($retainedDate <= $endDate) {
+                $map[(string) $r['CONTACT_ID']][] = $retainedDate;
+            }
         }
         return $map;
     }
@@ -1140,18 +1150,7 @@ class GenerateRetentionCommissionReport extends Command
      */
     private function normalizeRetentionAgentAliases(array $rows): array
     {
-        foreach ($rows as &$row) {
-            $agent = strtoupper((string) $this->col($row, 'RETENTION_AGENT', ''));
-            if ($agent === 'ANDREA MENDOZE') {
-                $row['RETENTION_AGENT'] = 'ANDREA MENDOZA';
-            } elseif ($agent === 'ANDREA GALVES') {
-                // VBA list typo "Galves"; CRM / Summary use Galvez.
-                $row['RETENTION_AGENT'] = 'ANDREA GALVEZ';
-            }
-        }
-        unset($row);
-
-        return $rows;
+        return RetentionAgentIdentity::canonicalizeRows($rows);
     }
 
     /**

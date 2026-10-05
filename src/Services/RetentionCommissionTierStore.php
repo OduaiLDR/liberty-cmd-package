@@ -29,7 +29,7 @@ final class RetentionCommissionTierStore
         try {
             $written = 0;
             foreach ($rows as $row) {
-                $agent = trim((string) ($row['agent'] ?? ''));
+                $agent = RetentionAgentIdentity::canonicalName((string) ($row['agent'] ?? ''));
                 if ($agent === '') {
                     continue;
                 }
@@ -151,7 +151,7 @@ final class RetentionCommissionTierStore
     {
         $out = [];
         foreach ($summaryRows as $agentName => $sum) {
-            $agent = trim((string) $agentName);
+            $agent = RetentionAgentIdentity::canonicalName((string) $agentName);
             if ($agent === '') {
                 continue;
             }
@@ -192,7 +192,9 @@ final class RetentionCommissionTierStore
 
     public static function agentKey(string $agent): string
     {
-        return strtoupper(trim((string) preg_replace('/\s+/u', ' ', $agent)));
+        $canonical = RetentionAgentIdentity::canonicalName($agent);
+
+        return strtoupper(trim((string) preg_replace('/\s+/u', ' ', $canonical)));
     }
 
     public static function resolveTierForPayment(int $currentTier, ?int $snapshotTier): int

@@ -7,6 +7,7 @@ use Cmd\Reports\Services\CommissionAgentEmailFiles;
 use Cmd\Reports\Services\CommissionResultsWriter;
 use Cmd\Reports\Services\CommissionRosterProvider;
 use Cmd\Reports\Services\EmailSenderService;
+use Cmd\Reports\Services\RetentionAgentIdentity;
 use Cmd\Reports\Services\UnassignedCommissionAgents;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
@@ -115,6 +116,9 @@ class GenerateRetentionBonusCommission extends Command
             // Actual reconsideration events select the population; custom fields
             // supply attribution only and cannot substitute for status history.
             $rows = $this->fetchBase($sf, $cfg, $baseStartDate, $endDate);
+            // Canonicalize verified CRM aliases before grouping, roster comparison,
+            // employee lookup, workbook rendering, and aggregate persistence.
+            $rows = RetentionAgentIdentity::canonicalizeRows($rows);
             $this->info("[INFO] [$display] Base rows: " . count($rows));
 
             $ids = array_filter(array_map(fn($r) => (int) $this->rowValue($r, 'ID', 0), $rows));
@@ -242,6 +246,9 @@ class GenerateRetentionBonusCommission extends Command
             // roster would otherwise mean emailing a blank summary. Null keeps the previous
             // CRM-derived behaviour and warns, which is wrong-but-familiar rather than silently empty.
             $rosterAgents = CommissionRosterProvider::fromRoster($sql, 'retention', $source);
+            if ($rosterAgents !== null) {
+                $rosterAgents = RetentionAgentIdentity::canonicalizeNames($rosterAgents);
+            }
             if ($rosterAgents === null) {
                 $this->warn(
                     "[WARN] [$display] The retention roster in Azure (dbo.TblCommissionRoster) is empty or "
