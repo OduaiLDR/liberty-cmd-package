@@ -312,7 +312,9 @@ class GenerateRetentionCommissionReport extends Command
             );
 
             // Payroll policy: a retained account is paid at the tier earned in
-            // its retained month, even when the payment clears in a later month.
+            // the month its Enrolled status resumes after reconsideration,
+            // even when payment clears in a later month. This is RETAINED_DATE,
+            // not the optional custom RETENTION_DATE field used by the worksheet.
             // Keep an explicit environment override for rollback, but make the
             // correct business rule the safe default for scheduled runs too.
             $useRetainedMonthTier = filter_var(env('RETENTION_TIER_BY_RETAINED_MONTH', true), FILTER_VALIDATE_BOOLEAN);
@@ -940,7 +942,7 @@ class GenerateRetentionCommissionReport extends Command
                     $assigned++;
                 }
 
-                // Retained: retention date (date-only in Excel) inclusive through endDate.
+                // Worksheet's Retention Date field (date-only in Excel), inclusive through endDate.
                 if ($this->inExcelPeriod($this->col($row, 'RETENTION_DATE'), $startDate, $endDate, false)) {
                     $retained++;
                 }
@@ -960,8 +962,10 @@ class GenerateRetentionCommissionReport extends Command
 
                 $commissionOld += $this->amountForTier($row, $tier);
 
+                // Tier snapshot month comes from the actual Enrolled status event,
+                // not the optional/custom worksheet Retention Date.
                 $retainedPeriod = RetentionCommissionTierStore::periodStartFromDate(
-                    (string) ($this->col($row, 'RETENTION_DATE') ?? '')
+                    (string) ($this->col($row, 'RETAINED_DATE') ?? '')
                 );
                 $snapshotTier = null;
                 if ($retainedPeriod !== null) {
@@ -982,7 +986,7 @@ class GenerateRetentionCommissionReport extends Command
                 }
                 $payTier = $useRetainedMonthTier
                     ? RetentionCommissionTierStore::retainedMonthTierForPayment($tier, $tierSnapshotMap, $agentName,
-                        (string) ($this->col($row, 'RETENTION_DATE') ?? ''), $startDate)
+                        (string) ($this->col($row, 'RETAINED_DATE') ?? ''), $startDate)
                     : RetentionCommissionTierStore::resolveTierForPayment($tier, $snapshotTier);
                 $commissionNew += $this->amountForTier($row, $payTier);
             }
@@ -1049,7 +1053,7 @@ class GenerateRetentionCommissionReport extends Command
         $months = [];
         foreach ($rows as $row) {
             $period = RetentionCommissionTierStore::periodStartFromDate(
-                (string) ($this->col($row, 'RETENTION_DATE') ?? '')
+                (string) ($this->col($row, 'RETAINED_DATE') ?? '')
             );
             if ($period !== null) {
                 $months[$period] = true;
