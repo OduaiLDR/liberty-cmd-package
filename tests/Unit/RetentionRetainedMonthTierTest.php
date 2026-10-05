@@ -55,6 +55,25 @@ final class RetentionRetainedMonthTierTest extends TestCase
         $this->assertSame(30.0, $this->summary($rows, [Tiers::tierMapKey('2098-02-01', 'Jane Doe') => 1])['Jane Doe']['commission']);
     }
 
+    public function test_monthly_assignment_window_accepts_snowflake_epoch_datetime(): void
+    {
+        $inPeriod = new ReflectionMethod(GenerateRetentionCommissionReport::class, 'inExcelPeriod');
+        $command = new GenerateRetentionCommissionReport;
+        $duringMonth = (string) strtotime('2098-02-10 12:00:00') . '.000000000';
+        $atEndMidnight = (string) strtotime('2098-02-28 00:00:00') . '.000000000';
+        $afterEndMidnight = (string) strtotime('2098-02-28 00:00:01') . '.000000000';
+        $nextMonth = (string) strtotime('2098-03-01 00:00:00') . '.000000000';
+        $this->assertTrue($inPeriod->invoke($command, $duringMonth, '2098-02-01', '2098-02-28', true));
+        $this->assertTrue($inPeriod->invoke($command, $atEndMidnight, '2098-02-01', '2098-02-28', true));
+        $this->assertTrue($inPeriod->invoke($command, $afterEndMidnight, '2098-02-01', '2098-02-28', true));
+        $this->assertFalse($inPeriod->invoke($command, $nextMonth, '2098-02-01', '2098-02-28', true));
+
+        $sheet = (new \PhpOffice\PhpSpreadsheet\Spreadsheet)->getActiveSheet();
+        (new ReflectionMethod(GenerateRetentionCommissionReport::class, 'setDateTime'))
+            ->invoke($command, $sheet, 'A1', $duringMonth);
+        $this->assertIsNumeric($sheet->getCell('A1')->getValue());
+    }
+
     public function test_saved_zero_tier_is_valid_and_unpaid_history_requires_no_tier(): void
     {
         $this->assertSame(0.0, $this->summary($this->rows(), [Tiers::tierMapKey('2098-01-01', 'Jane Doe') => 0])['Jane Doe']['commission']);
@@ -92,7 +111,7 @@ final class RetentionRetainedMonthTierTest extends TestCase
         $this->expectException(\RuntimeException::class);
         $this->expectExceptionMessage('Retention source query failed');
         (new ReflectionMethod(GenerateRetentionCommissionReport::class, 'fetchBase'))->invoke(
-            new GenerateRetentionCommissionReport, $source, ['custom_agent' => 1, 'custom_date' => 2, 'custom_results' => 3, 'cancel_request_custom' => 4]
+            new GenerateRetentionCommissionReport, $source, ['custom_agent' => 1, 'custom_date' => 2, 'custom_results' => 3, 'cancel_request_custom' => 4], '2098-02-01'
         );
     }
 
@@ -102,9 +121,41 @@ final class RetentionRetainedMonthTierTest extends TestCase
         $fetch = new ReflectionMethod(GenerateRetentionCommissionReport::class, 'fetchBase');
         $cfg = ['custom_agent' => 1, 'custom_date' => 2, 'custom_results' => 3, 'cancel_request_custom' => 4];
         $this->assertSame($rows, $fetch->invoke(new GenerateRetentionCommissionReport,
-            new RetainedTierConnector(['data' => $rows, 'rowCount' => 1, 'columns' => []]), $cfg));
+            new RetainedTierConnector(['data' => $rows, 'rowCount' => 1, 'columns' => []]), $cfg, '2098-02-01'));
         $this->assertSame($rows, $fetch->invoke(new GenerateRetentionCommissionReport,
-            new RetainedTierConnector(['success' => true, 'data' => $rows]), $cfg));
+            new RetainedTierConnector(['success' => true, 'data' => $rows]), $cfg, '2098-02-01'));
+    }
+
+    public function test_base_query_scopes_candidates_to_three_months_without_truncating_history(): void
+    {
+        $source = new RetainedTierConnector(['data' => [['ID' => '101', 'RETENTION_AGENT' => 'Jane Doe']]]);
+        (new ReflectionMethod(GenerateRetentionCommissionReport::class, 'fetchBase'))->invoke(
+            new GenerateRetentionCommissionReport, $source,
+            ['custom_agent' => 1, 'custom_date' => 2, 'custom_results' => 3, 'cancel_request_custom' => 4],
+            '2026-09-01'
+        );
+        $this->assertStringContainsString("F_DATETIME >= '2026-07-01'::TIMESTAMP_NTZ", $source->lastSql);
+        $this->assertStringContainsString("F_DATE >= '2026-07-01'::DATE", $source->lastSql);
+        $this->assertStringContainsString("CLEARED_DATE < '2026-10-01'::DATE", $source->lastSql);
+        $this->assertStringContainsString('JOIN relevant_contacts eligible', $source->lastSql);
+        $this->assertSame(4, substr_count($source->lastSql, 'JOIN relevant_contacts relevant'));
+        $this->assertSame(4, substr_count($source->lastSql, 'SELECT DISTINCT uf.CONTACT_ID'));
+        $this->assertStringContainsString('WHERE uf.CUSTOM_ID = 1 AND uf._FIVETRAN_DELETED = FALSE', $source->lastSql);
+        $this->assertStringContainsString('WHERE uf.CUSTOM_ID = 3 AND uf._FIVETRAN_DELETED = FALSE', $source->lastSql);
+        $this->assertStringContainsString('WHERE uf.CUSTOM_ID = 4 AND uf._FIVETRAN_DELETED = FALSE', $source->lastSql);
+    }
+
+    public function test_base_query_deduplicates_identical_contacts_and_rejects_conflicts(): void
+    {
+        $row = ['ID' => '101', 'RETENTION_AGENT' => 'Jane Doe'];
+        $fetch = new ReflectionMethod(GenerateRetentionCommissionReport::class, 'fetchBase');
+        $cfg = ['custom_agent' => 1, 'custom_date' => 2, 'custom_results' => 3, 'cancel_request_custom' => 4];
+        $this->assertSame([$row], $fetch->invoke(new GenerateRetentionCommissionReport,
+            new RetainedTierConnector(['data' => [$row, $row]]), $cfg, '2026-09-01'));
+        $this->expectException(\UnexpectedValueException::class);
+        $fetch->invoke(new GenerateRetentionCommissionReport,
+            new RetainedTierConnector(['data' => [$row, [...$row, 'RETENTION_AGENT' => 'Other Agent']]]),
+            $cfg, '2026-09-01');
     }
 
     public function test_malformed_source_payload_fails_before_calculation(): void
@@ -121,7 +172,7 @@ final class RetentionRetainedMonthTierTest extends TestCase
         try {
             (new ReflectionMethod(GenerateRetentionCommissionReport::class, 'fetchBase'))->invoke(
                 new GenerateRetentionCommissionReport, $source,
-                ['custom_agent' => 1, 'custom_date' => 2, 'custom_results' => 3, 'cancel_request_custom' => 4]
+                ['custom_agent' => 1, 'custom_date' => 2, 'custom_results' => 3, 'cancel_request_custom' => 4], '2098-02-01'
             );
             $this->fail('Empty source must not advance to persistence or report delivery.');
         } catch (\RuntimeException $error) {
@@ -143,6 +194,7 @@ final class RetentionRetainedMonthTierTest extends TestCase
 final class RetainedTierConnector extends DBConnector
 {
     public int $writes = 0;
+    public string $lastSql = '';
     public function __construct(private array $result) {}
     public function querySqlServer(string $sql, array $params = []): array
     {
@@ -152,7 +204,11 @@ final class RetainedTierConnector extends DBConnector
         }
         return $this->result;
     }
-    public function query(string $sql, array $bindings = [], ?int $timeoutSeconds = null): array { return $this->result; }
+    public function query(string $sql, array $bindings = [], ?int $timeoutSeconds = null): array
+    {
+        $this->lastSql = $sql;
+        return $this->result;
+    }
 }
 
 final class RetainedTierCommandStatus extends GenerateRetentionCommissionReport
