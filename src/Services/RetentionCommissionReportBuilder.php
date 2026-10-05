@@ -53,7 +53,7 @@ class RetentionCommissionReportBuilder
     ];
 
     /** @param callable(string):void|null $log */
-    public function buildSourceRows(string $source, ?callable $log = null): array
+    public function buildSourceRows(string $source, ?callable $log = null, ?string $asOfDate = null): array
     {
         $cfg = self::SOURCE_CONFIG[$source] ?? null;
         if ($cfg === null) {
@@ -67,14 +67,8 @@ class RetentionCommissionReportBuilder
         $sf = DBConnector::fromEnvironment($source);
         $rows = $this->fetchBase($sf, $cfg);
 
+        $rows = RetentionAgentIdentity::canonicalizeRows($rows);
         foreach ($rows as &$row) {
-            $agent = strtoupper((string) $this->col($row, 'RETENTION_AGENT', ''));
-            if ($agent === 'ANDREA MENDOZE') {
-                $row['RETENTION_AGENT'] = 'ANDREA MENDOZA';
-            } elseif ($agent === 'ANDREA GALVES') {
-                // VBA list typo "Galves"; CRM / Summary use Galvez.
-                $row['RETENTION_AGENT'] = 'ANDREA GALVEZ';
-            }
             $row['SOURCE'] = $display;
         }
         unset($row);
@@ -119,7 +113,7 @@ class RetentionCommissionReportBuilder
         }
         unset($row);
 
-        $retainedMap = $this->fetchRetainedDates($sf, $idList);
+        $retainedMap = $this->fetchRetainedDates($sf, $idList, $asOfDate);
         foreach ($rows as &$row) {
             $recon = $this->toDate($row['RECONSIDERATION_DATE'] ?? null);
             $row['RETAINED_DATE'] = null;
@@ -209,7 +203,7 @@ class RetentionCommissionReportBuilder
             }
         } else {
             foreach (array_keys(self::SOURCE_CONFIG) as $source) {
-                array_push($all, ...$this->buildSourceRows($source, $log));
+                array_push($all, ...$this->buildSourceRows($source, $log, $endDate));
             }
         }
 
@@ -320,20 +314,29 @@ class RetentionCommissionReportBuilder
         return $map;
     }
 
-    private function fetchRetainedDates(DBConnector $sf, string $idList): array
+    private function fetchRetainedDates(DBConnector $sf, string $idList, ?string $asOfDate = null): array
     {
+        if ($asOfDate !== null && !preg_match('/^\d{4}-\d{2}-\d{2}$/', $asOfDate)) {
+            throw new \InvalidArgumentException('Retention report cutoff must be a YYYY-MM-DD date.');
+        }
+        $cutoffSql = $asOfDate === null ? '' : "AND LEFT(cs.STAMP,10) <= '{$asOfDate}'";
         $sql = "
             SELECT cs.CONTACT_ID, LEFT(cs.STAMP,10) AS RETAINED_DATE
             FROM CONTACTS_STATUS cs
             LEFT JOIN CONTACTS_LEAD_STATUS cls ON cs.STATUS_ID = cls.ID
             WHERE UPPER(cls.TITLE) LIKE '%ENROLLED%'
               AND UPPER(cls.TITLE) NOT LIKE '%RECONSIDERATION%'
+              {$cutoffSql}
               AND cs.CONTACT_ID IN ({$idList})
             ORDER BY cs.CONTACT_ID ASC, cs.STAMP ASC
         ";
         $map = [];
         foreach ($this->requireRows($sf->query($sql), 'Retention retained-status history') as $r) {
-            $map[(string) $r['CONTACT_ID']][] = substr((string) $r['RETAINED_DATE'], 0, 10);
+            $retainedDate = substr((string) $r['RETAINED_DATE'], 0, 10);
+            // Defense in depth for adapters that return rows beyond the SQL cutoff.
+            if ($asOfDate === null || $retainedDate <= $asOfDate) {
+                $map[(string) $r['CONTACT_ID']][] = $retainedDate;
+            }
         }
         return $map;
     }

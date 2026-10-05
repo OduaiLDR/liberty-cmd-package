@@ -154,6 +154,20 @@ final class RetentionRetainedMonthTierTest extends TestCase
         $this->assertStringContainsString('WHERE uf.CUSTOM_ID = 4 AND uf._FIVETRAN_DELETED = FALSE', $source->lastSql);
     }
 
+    public function test_retained_status_selection_is_as_of_the_report_end_date(): void
+    {
+        $source = new RetainedTierConnector(['data' => [
+            ['CONTACT_ID' => '101', 'RETAINED_DATE' => '2026-09-30'],
+            ['CONTACT_ID' => '101', 'RETAINED_DATE' => '2026-10-05'],
+        ]]);
+        $retained = (new ReflectionMethod(GenerateRetentionCommissionReport::class, 'fetchRetainedDates'))->invoke(
+            new GenerateRetentionCommissionReport, $source, '101', '2026-09-30'
+        );
+
+        $this->assertSame(['2026-09-30'], $retained['101']);
+        $this->assertStringContainsString("LEFT(cs.STAMP,10) <= '2026-09-30'", $source->lastSql);
+    }
+
     public function test_base_query_deduplicates_identical_contacts_and_rejects_conflicts(): void
     {
         $row = ['ID' => '101', 'RETENTION_AGENT' => 'Jane Doe'];

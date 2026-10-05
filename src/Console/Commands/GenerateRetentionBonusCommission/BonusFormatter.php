@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Cmd\Reports\Console\Commands\GenerateRetentionBonusCommission;
 
 use Cmd\Reports\Services\CommissionCompanyMatch;
+use Cmd\Reports\Services\RetentionAgentIdentity;
 use Illuminate\Support\Facades\Log;
 use PhpOffice\PhpSpreadsheet\Shared\Date as XlDate;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
@@ -37,12 +38,18 @@ class BonusFormatter
         return strtolower(trim((string) preg_replace('/\s+/', ' ', trim($name))));
     }
 
+    /** Canonicalize verified CRM spelling aliases before rollup/persistence. */
+    private static function canonicalAgentName(string $name): string
+    {
+        return RetentionAgentIdentity::canonicalName($name);
+    }
+
     /** The workbook and Azure must aggregate identical employee identities. */
     public static function commissionTotals(array $rows): array
     {
         $totals = [];
         foreach ($rows as $row) {
-            $name = trim((string) ($row['RETENTION_AGENT'] ?? ''));
+            $name = self::canonicalAgentName((string) ($row['RETENTION_AGENT'] ?? ''));
             if ($name === '') continue;
             $key = self::nameKey($name);
             $totals[$key]['name'] = $totals[$key]['name'] ?? $name;
@@ -156,6 +163,20 @@ class BonusFormatter
         array $unassigned = []
     ): ?array {
         try {
+            $rows = RetentionAgentIdentity::canonicalizeRows($rows);
+            if ($rosterAgents !== null) {
+                $rosterAgents = RetentionAgentIdentity::canonicalizeNames($rosterAgents);
+            }
+            if ($agentFilter !== null) {
+                $agentFilter = RetentionAgentIdentity::canonicalName($agentFilter);
+            }
+            $canonicalEmployeeMap = [];
+            foreach ($employeeMap as $name => $employee) {
+                $canonicalName = RetentionAgentIdentity::canonicalName((string) $name);
+                $canonicalEmployeeMap[strtoupper($canonicalName)] = $employee;
+            }
+            $employeeMap = $canonicalEmployeeMap;
+
             $sp    = new Spreadsheet();
             $sheet = $sp->getActiveSheet();
             $sheet->setTitle('Retention Data');
@@ -263,7 +284,7 @@ class BonusFormatter
             }
 
             $buildRow = static function (string $key, string $name) use ($commissionByAgent, $employeeMap): array {
-                $lookup = strtoupper($name);
+                $lookup = strtoupper(RetentionAgentIdentity::canonicalName($name));
                 return [
                     'name'       => $name,
                     'commission' => round((float) ($commissionByAgent[$key]['commission'] ?? 0.0), 2, PHP_ROUND_HALF_EVEN),

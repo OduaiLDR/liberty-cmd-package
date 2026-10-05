@@ -20,7 +20,7 @@ class RetentionDetailSafetyTest extends TestCase
         $cases = [
             ['fetchBase', [RetentionCommissionReportBuilder::SOURCE_CONFIG['ldr']]],
             ['fetchReconsiderationDates', [377650, '101']],
-            ['fetchRetainedDates', ['101']],
+            ['fetchRetainedDates', ['101', '2098-01-31']],
             ['fetchFirstClearedPerContact', ['101']],
         ];
         foreach ($cases as [$method, $args]) {
@@ -49,15 +49,30 @@ class RetentionDetailSafetyTest extends TestCase
         $this->expectException(UnexpectedValueException::class);
         $builder->dedupeRetentionRowsByContactId([$row, [...$row, 'RETENTION_AGENT' => 'Bob']]);
     }
+
+    public function test_retained_status_lookup_excludes_dates_after_report_cutoff(): void
+    {
+        $builder = new RetentionCommissionReportBuilder;
+        $source = new RetentionDetailFakeConnector(true, [
+            ['CONTACT_ID' => '101', 'RETAINED_DATE' => '2026-09-30'],
+            ['CONTACT_ID' => '101', 'RETAINED_DATE' => '2026-10-05'],
+        ]);
+        $retained = (new ReflectionMethod($builder, 'fetchRetainedDates'))->invoke(
+            $builder, $source, '101', '2026-09-30'
+        );
+
+        $this->assertSame(['2026-09-30'], $retained['101']);
+        $this->assertStringContainsString("LEFT(cs.STAMP,10) <= '2026-09-30'", $source->sql);
+    }
 }
 
 final class RetentionDetailFakeConnector extends DBConnector
 {
     public string $sql = '';
-    public function __construct(private bool $success) {}
+    public function __construct(private bool $success, private array $data = []) {}
     public function query(string $sql, array $bindings = [], ?int $timeoutSeconds = null): array
     {
         $this->sql = $sql;
-        return ['success' => $this->success, 'data' => []];
+        return ['success' => $this->success, 'data' => $this->data];
     }
 }
