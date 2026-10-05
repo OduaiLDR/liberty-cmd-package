@@ -23,8 +23,8 @@ final class RetentionRetainedMonthTierTest extends TestCase
     private function rows(): array
     {
         return [
-            ['RETENTION_AGENT' => 'Jane Doe', 'CANCEL_REQUEST_DATE' => '2098-02-05', 'RETENTION_DATE' => '2098-02-06'],
-            ['RETENTION_AGENT' => ' Jane   DOE ', 'CANCEL_REQUEST_DATE' => '2098-01-05', 'RETENTION_DATE' => '2098-01-06',
+            ['RETENTION_AGENT' => 'Jane Doe', 'CANCEL_REQUEST_DATE' => '2098-02-05', 'RETENTION_DATE' => '2098-02-06', 'RETAINED_DATE' => '2098-02-06'],
+            ['RETENTION_AGENT' => ' Jane   DOE ', 'CANCEL_REQUEST_DATE' => '2098-01-05', 'RETENTION_DATE' => '2098-01-06', 'RETAINED_DATE' => '2098-01-06',
                 'RETENTION_PAYMENT_DATE' => '2098-02-10', 'T1' => 10, 'T2' => 20, 'T3' => 30, 'T4' => 40],
         ];
     }
@@ -42,6 +42,15 @@ final class RetentionRetainedMonthTierTest extends TestCase
         $this->expectException(\UnexpectedValueException::class);
         $this->expectExceptionMessage('Missing retained-month tier for Jane Doe (2098-01-01)');
         $this->summary($this->rows());
+    }
+
+    public function test_missing_custom_retention_date_uses_actual_enrolled_status_month_for_tiering(): void
+    {
+        $rows = $this->rows();
+        $rows[1]['RETENTION_DATE'] = '';
+        $map = [Tiers::tierMapKey('2098-01-01', 'Jane Doe') => 1];
+
+        $this->assertSame(10.0, $this->summary($rows, $map)['Jane Doe']['commission']);
     }
 
     public function test_explicit_disabled_policy_preserves_current_tier_payment(): void
@@ -156,6 +165,18 @@ final class RetentionRetainedMonthTierTest extends TestCase
         $fetch->invoke(new GenerateRetentionCommissionReport,
             new RetainedTierConnector(['data' => [$row, [...$row, 'RETENTION_AGENT' => 'Other Agent']]]),
             $cfg, '2026-09-01');
+    }
+
+    public function test_historical_tier_periods_follow_enrolled_status_date_not_custom_retention_date(): void
+    {
+        $periods = (new ReflectionMethod(GenerateRetentionCommissionReport::class, 'retentionPeriodStarts'))
+            ->invoke(new GenerateRetentionCommissionReport, [[
+                'RETENTION_DATE' => '',
+                'RETAINED_DATE' => '2026-08-17',
+                'RETENTION_PAYMENT_DATE' => '2026-09-05',
+            ]]);
+
+        $this->assertSame(['2026-08-01'], $periods);
     }
 
     public function test_malformed_source_payload_fails_before_calculation(): void
