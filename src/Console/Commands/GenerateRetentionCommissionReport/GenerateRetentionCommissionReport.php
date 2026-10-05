@@ -146,17 +146,7 @@ class GenerateRetentionCommissionReport extends Command
             // payment this month is not lost just because retention occurred earlier.
             $rows = $this->fetchBase($sf, $cfg, $startDate);
 
-            // Normalize known misspellings so Summary matches the configured agent list.
-            foreach ($rows as &$row) {
-                $agent = strtoupper((string) $this->col($row, 'RETENTION_AGENT', ''));
-                if ($agent === 'ANDREA MENDOZE') {
-                    $row['RETENTION_AGENT'] = 'ANDREA MENDOZA';
-                } elseif ($agent === 'ANDREA GALVES') {
-                    // VBA list typo "Galves"; CRM / Summary use Galvez.
-                    $row['RETENTION_AGENT'] = 'ANDREA GALVEZ';
-                }
-            }
-            unset($row);
+            $rows = $this->normalizeRetentionAgentAliases($rows);
 
             $this->info("[INFO] [$display] Base rows: " . count($rows));
 
@@ -321,12 +311,14 @@ class GenerateRetentionCommissionReport extends Command
             $payableRows = array_filter($rows, fn (array $row): bool => $this->inExcelPeriod(
                 $this->col($row, 'RETENTION_PAYMENT_DATE'), $startDate, $endDate, true
             ));
-            $historicPeriods = array_values(array_filter($this->retentionPeriodStarts($payableRows),
-                static fn (string $period): bool => $period < $startDate));
-            $tierSnapshotMap = RetentionCommissionTierStore::fetchMap(
+            $tierSnapshotMap = $this->loadTierSnapshotMap(
+                $sf,
                 $sql,
+                $cfg,
                 $source,
-                $historicPeriods,
+                $payableRows,
+                $startDate,
+                $locationMap,
                 $useRetainedMonthTier
             );
 
@@ -442,7 +434,7 @@ class GenerateRetentionCommissionReport extends Command
     // ─── Data fetchers ────────────────────────────────────────────────────────
 
     /** @param array<string,mixed> $cfg */
-    private function fetchBase(DBConnector $sf, array $cfg, string $startDate): array
+    private function fetchBase(DBConnector $sf, array $cfg, string $startDate, bool $allowEmpty = false): array
     {
         $ca = (int) $cfg['custom_agent'];
         $cd = (int) $cfg['custom_date'];
@@ -538,7 +530,7 @@ class GenerateRetentionCommissionReport extends Command
         ";
 
         $rows = $this->sourceRows($sf, $sql);
-        if ($rows === []) {
+        if ($rows === [] && !$allowEmpty) {
             // A source-wide empty response cannot prove the current roster is
             // genuinely owed zero. In particular, the roster provider conflates
             // missing/unreachable data and would fall back to a static agent list.
@@ -1045,7 +1037,125 @@ class GenerateRetentionCommissionReport extends Command
     }
 
     /**
-     * @param  array<int,array<string,mixed>> $rows
+     * Use stored tier snapshots where available. For legacy months without a
+     * saved snapshot, recalculate that month's tier from the same period-scoped
+     * CRM source rows instead of substituting the payment month's tier.
+     *
+     * @param array<string,mixed> $cfg
+     * @param array<int,array<string,mixed>> $payableRows
+     * @param array<string,array{location:string,company:string}> $locationMap
+     * @return array<string,int>
+     */
+    private function loadTierSnapshotMap(
+        DBConnector $sf,
+        DBConnector $sql,
+        array $cfg,
+        string $source,
+        array $payableRows,
+        string $paymentPeriod,
+        array $locationMap,
+        bool $enabled
+    ): array {
+        if (!$enabled) {
+            return [];
+        }
+
+        $required = [];
+        foreach ($payableRows as $row) {
+            $retainedDate = $this->toDate($this->col($row, 'RETAINED_DATE'));
+            $period = RetentionCommissionTierStore::periodStartFromDate($retainedDate);
+            $agent = trim((string) $this->col($row, 'RETENTION_AGENT', ''));
+            if ($period === null || $period >= $paymentPeriod || $agent === '') {
+                continue;
+            }
+            $key = RetentionCommissionTierStore::tierMapKey($period, $agent);
+            $required[$period][$key] = $agent;
+        }
+
+        $periods = array_keys($required);
+        $tierMap = RetentionCommissionTierStore::fetchMap($sql, $source, $periods, true);
+        foreach ($required as $period => $agents) {
+            $missing = array_filter($agents, static function (string $agent) use ($tierMap, $period): bool {
+                return !array_key_exists(RetentionCommissionTierStore::tierMapKey($period, $agent), $tierMap);
+            });
+            if ($missing === []) {
+                continue;
+            }
+
+            // The source query is constrained to this historical report month
+            // (plus its two-month candidate lookback). Empty is a legitimate
+            // zero-activity month; source errors still throw in sourceRows().
+            $historyRows = $this->normalizeRetentionAgentAliases(
+                $this->fetchBase($sf, $cfg, $period, true)
+            );
+            $historyAgents = [];
+            foreach ($historyRows as $row) {
+                $agent = trim((string) $this->col($row, 'RETENTION_AGENT', ''));
+                if ($agent !== '') {
+                    $historyAgents[RetentionCommissionTierStore::agentKey($agent)] = $agent;
+                }
+            }
+            foreach ($missing as $agent) {
+                $historyAgents[RetentionCommissionTierStore::agentKey($agent)] = $agent;
+            }
+
+            $monthEnd = date('Y-m-t', strtotime($period));
+            $summary = $this->buildSummary(
+                $historyRows,
+                array_values($historyAgents),
+                $period,
+                $monthEnd,
+                $locationMap,
+                (bool) ($cfg['has_t4'] ?? false),
+                [],
+                false,
+                false
+            );
+            $summaryByKey = [];
+            foreach ($summary as $agent => $totals) {
+                $summaryByKey[RetentionCommissionTierStore::agentKey($agent)] = $totals;
+            }
+
+            foreach ($missing as $agent) {
+                $agentKey = RetentionCommissionTierStore::agentKey($agent);
+                if (!isset($summaryByKey[$agentKey]) || !isset($summaryByKey[$agentKey]['tier'])) {
+                    throw new \RuntimeException("Could not rebuild missing retained-month tier for {$agent} ({$period}).");
+                }
+                $key = RetentionCommissionTierStore::tierMapKey($period, $agent);
+                $tierMap[$key] = (int) $summaryByKey[$agentKey]['tier'];
+                if (function_exists('app') && app()->bound('log')) {
+                    Log::warning("[$source] Recalculated missing {$period} retained-month tier for {$agent} from period source data.");
+                }
+            }
+        }
+
+        return $tierMap;
+    }
+
+    /**
+     * Normalize known CRM misspellings used by the retention report.
+     *
+     * @param array<int,array<string,mixed>> $rows
+     * @return array<int,array<string,mixed>>
+     */
+    private function normalizeRetentionAgentAliases(array $rows): array
+    {
+        foreach ($rows as &$row) {
+            $agent = strtoupper((string) $this->col($row, 'RETENTION_AGENT', ''));
+            if ($agent === 'ANDREA MENDOZE') {
+                $row['RETENTION_AGENT'] = 'ANDREA MENDOZA';
+            } elseif ($agent === 'ANDREA GALVES') {
+                // VBA list typo "Galves"; CRM / Summary use Galvez.
+                $row['RETENTION_AGENT'] = 'ANDREA GALVEZ';
+            }
+        }
+        unset($row);
+
+        return $rows;
+    }
+
+    /**
+     * @param array<int,array<string,mixed>> $rows
      * @return list<string>
      */
     private function retentionPeriodStarts(array $rows): array

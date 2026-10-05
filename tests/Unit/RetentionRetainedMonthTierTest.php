@@ -179,6 +179,35 @@ final class RetentionRetainedMonthTierTest extends TestCase
         $this->assertSame(['2026-08-01'], $periods);
     }
 
+    public function test_missing_historical_snapshot_is_rebuilt_from_that_months_source_rows_without_writes(): void
+    {
+        $command = new GenerateRetentionCommissionReport;
+        $source = new RetainedTierConnector(['success' => true, 'data' => [[
+            'ID' => '123',
+            'RETENTION_AGENT' => 'Gracia Rivera',
+            'RETENTION_DATE' => '2026-04-12',
+            'CANCEL_REQUEST_DATE' => '2026-04-02 09:00:00',
+        ]]]);
+        $sql = new RetainedTierConnector(['success' => true, 'data' => []]);
+        $loader = new ReflectionMethod(GenerateRetentionCommissionReport::class, 'loadTierSnapshotMap');
+
+        $map = $loader->invoke($command, $source, $sql, [
+            'custom_agent' => 742096,
+            'custom_date' => 742101,
+            'custom_results' => 742105,
+            'cancel_request_custom' => 742098,
+            'has_t4' => true,
+        ], 'ldr', [[
+            'RETENTION_AGENT' => 'Gracia Rivera',
+            'RETAINED_DATE' => '2026-04-12',
+            'RETENTION_PAYMENT_DATE' => '2026-09-08',
+        ]], '2026-09-01', [], true);
+
+        $this->assertSame(3, $map[Tiers::tierMapKey('2026-04-01', 'Gracia Rivera')]);
+        $this->assertSame(0, $source->writes);
+        $this->assertSame(0, $sql->writes);
+    }
+
     public function test_malformed_source_payload_fails_before_calculation(): void
     {
         $this->expectException(\RuntimeException::class);
