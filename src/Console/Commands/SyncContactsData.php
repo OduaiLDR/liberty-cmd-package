@@ -4,6 +4,10 @@ namespace Cmd\Reports\Console\Commands;
 
 use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\ContactSyncIdentity;
+use Cmd\Reports\Services\ContactSyncCampaignLookup;
+use Cmd\Reports\Services\ContactSyncExclusions;
+use Cmd\Reports\Services\ContactSyncEnrollmentChanges;
+use Cmd\Reports\Services\ContactSyncRunScope;
 use Cmd\Reports\Services\ContactSyncMatching;
 use Cmd\Reports\Services\ContactSyncSourceEvidence;
 use Cmd\Reports\Services\ContactSyncTargets;
@@ -41,14 +45,18 @@ class SyncContactsData extends Command
     private ?\PDO $refreshPdo = null;
     private ?string $refreshStage = null;
     private bool $refreshPublished = false;
-    private bool $mailerSuffixCacheReady = false;
-    private array $cachedMailerSuffixes = [];
-    private array $pendingMailerSuffixes = [];
     private int $pageSize = self::PAGE_SIZE;
     private array $contactFlags = [];
     private array $skippedContactIds = [];
 
     /** Matching-step counters reset at the start of each matching run. */
+    private array $campaignProofs = [];
+    private array $verifiedCampaigns = [];
+    private array $exclusionSeeds = [];
+    private array $matchingExclusions = [];
+    private array $sourceLinks = [];
+    private array $deferredEnrollmentChanges = [];
+    private bool $matchingScopePrepared = false;
     private int $matchingStepsOk = 0;
     private int $matchingStepsFailed = 0;
     private int $matchingRowsAffected = 0;
@@ -286,11 +294,6 @@ class SyncContactsData extends Command
         } finally {
             if ($this->refreshStage !== null && $this->refreshPdo !== null) {
                 try {
-                    if ($this->mailerSuffixCacheReady) {
-                        $this->checkedExec($this->refreshPdo, 'DROP TABLE IF EXISTS #TmpMailerSuffixCache');
-                        $this->mailerSuffixCacheReady = false;
-                        $this->cachedMailerSuffixes = [];
-                    }
                     $this->checkedExec($this->refreshPdo, "DROP TABLE IF EXISTS {$this->refreshStage}");
                 } catch (\Throwable $e) {
                     $this->warn('[WARN] Could not drop the session-local refresh table; it will be removed when the connection closes.');
@@ -368,9 +371,6 @@ class SyncContactsData extends Command
         // This timestamp is written to the file only after the entire run succeeds,
         // ensuring a failed/partial run never advances the watermark.
         $syncStartedAt = date('Y-m-d H:i:s');
-        if (!$dryRun && !$this->option('debt-only')) {
-            $this->pendingMailerSuffixes = $this->fetchMailerSuffixes($snowflake, $startDate);
-        }
 
         $lastId           = 0;
         $categoryChanges  = [];
@@ -913,246 +913,29 @@ class SyncContactsData extends Command
         ];
     }
 
-    /**
-     * Fetches drop names only for the External_IDs present in this chunk.
-     * Uses a SQL Server temp table to avoid loading all of TblMailers.
-     * Preserves fallback matching on the last 9 characters of External_ID.
-     */
+    /** Verify the full mailer key and recipient; previews and writes use the same SELECTs. */
     private function fetchDropNamesFiltered(DBConnector $connector, array $chunk): array
     {
-        $externalIds = [];
-        foreach ($chunk as $row) {
-            $tpId = \trim((string) ($row['EXTERNAL_ID'] ?? ''));
-            if ($tpId !== '') {
-                $externalIds[$tpId] = true;
-            }
+        $lt = $this->source === 'LT' ? null : $this->initializeLendingTowerConnector();
+        $this->campaignProofs = ContactSyncCampaignLookup::collect($connector, $chunk, $this->source, $lt);
+        $names = [];
+        foreach ($this->campaignProofs as $id => $proof) {
+            if ($proof['status'] === 'verified') $names[$id] = $proof['campaign'];
         }
-
-        if (empty($externalIds)) {
-            return [];
-        }
-
-        $externalIds = \array_keys($externalIds);
-        $lookup = [];
-        $suffixLookup = [];
-
-        if ($this->option('dry-run')) {
-            foreach (array_chunk($externalIds, 1000) as $batch) {
-                $ids = $this->sqlStringList(array_map(fn($id) => substr((string) $id, 0, 50), $batch));
-                $started = microtime(true);
-                $this->info('[PREVIEW] Mailer exact lookup starting (' . count($batch) . ' IDs).');
-                $rows = $this->selectPreviewRows($connector,
-                    "SELECT External_ID, Drop_Name FROM TblMailers WHERE External_ID IN ({$ids}) AND Drop_Name IS NOT NULL");
-                $this->info(sprintf('[PREVIEW] Mailer exact lookup finished (%.1fs).', microtime(true) - $started));
-                $this->mergeDropNameLookup($lookup, $rows);
-            }
-            $missTails = [];
-            foreach ($externalIds as $extId) {
-                if (!array_key_exists($extId, $lookup) && strlen((string) $extId) > 9) {
-                    $tail = substr((string) $extId, -9);
-                    $missTails[$tail] = true;
-                }
-            }
-            foreach (array_chunk(array_keys($missTails), 500) as $batch) {
-                $tails = $this->sqlStringList($batch);
-                $started = microtime(true);
-                $this->info('[PREVIEW] Mailer suffix lookup starting (' . count($batch) . ' suffixes).');
-                $rows = $this->selectPreviewRows($connector,
-                    "SELECT External_ID, Drop_Name FROM TblMailers WHERE External_ID IS NOT NULL
-                     AND Drop_Name IS NOT NULL AND LEN(External_ID) > 9 AND RIGHT(External_ID, 9) IN ({$tails})");
-                $this->info(sprintf('[PREVIEW] Mailer suffix lookup finished (%.1fs).', microtime(true) - $started));
-                $this->mergeDropNameLookup($suffixLookup, $rows, true);
-            }
-            return $this->resolvedDropNames($chunk, $lookup, $suffixLookup);
-        }
-
-        // Exact match first; suffix matches are cached for the source run.
-        $this->checkedSql($connector, "CREATE TABLE #TmpMailerFilter (ExtId VARCHAR(50) NOT NULL)");
-        try {
-            foreach (\array_chunk($externalIds, 1000) as $batch) {
-                $values = \implode(', ', \array_map(
-                    fn($id) => "('" . \str_replace("'", "''", \substr($id, 0, 50)) . "')",
-                    $batch
-                ));
-                $this->checkedSql($connector, "INSERT INTO #TmpMailerFilter (ExtId) VALUES {$values}");
-            }
-
-            $exact = $this->checkedSql($connector, "
-                SELECT m.External_ID, m.Drop_Name
-                FROM TblMailers m
-                INNER JOIN #TmpMailerFilter f ON m.External_ID = f.ExtId
-                WHERE m.Drop_Name IS NOT NULL
-            ");
-            $this->mergeDropNameLookup($lookup, $exact['data'] ?? []);
-
-            $missTails = [];
-            foreach ($externalIds as $extId) {
-                if (array_key_exists($extId, $lookup)) {
-                    continue;
-                }
-                if (\strlen($extId) > 9) {
-                    $tail = \substr($extId, -9);
-                    $missTails[$tail] = true;
-                }
-            }
-
-            foreach (\array_chunk(\array_keys($missTails), 500) as $tailBatch) {
-                $this->loadMailerSuffixCache($connector, $tailBatch);
-                $inList = \implode(', ', \array_map(
-                    fn($t) => "'" . \str_replace("'", "''", $t) . "'",
-                    $tailBatch
-                ));
-                $fallback = $this->checkedSql($connector,
-                    "SELECT Suffix AS External_ID, Drop_Name FROM #TmpMailerSuffixCache WHERE Suffix IN ({$inList})"
-                );
-                if (! ($fallback['success'] ?? false)) {
-                    throw new \RuntimeException('Temporary TblMailers suffix lookup failed: ' . ($fallback['error'] ?? 'unknown SQL Server error'));
-                }
-                $this->mergeDropNameLookup($suffixLookup, $fallback['data'] ?? [], true);
-            }
-        } finally {
-            $this->checkedSql($connector, "DROP TABLE IF EXISTS #TmpMailerFilter");
-        }
-
-        return $this->resolvedDropNames($chunk, $lookup, $suffixLookup);
+        return $names;
     }
 
-    private function ensureMailerSuffixCache(DBConnector $connector): void
+    protected function initializeLendingTowerConnector(): DBConnector
     {
-        if ($this->mailerSuffixCacheReady) {
-            return;
-        }
-
-        $create = $this->checkedSql($connector,
-            "SET NOCOUNT ON;
-             SELECT TOP (0) CAST(RIGHT(External_ID, 9) AS varchar(9)) AS Suffix, Drop_Name
-             INTO #TmpMailerSuffixCache FROM TblMailers;
-             SET NOCOUNT OFF;"
-        );
-        if (! ($create['success'] ?? false)) {
-            throw new \RuntimeException('Unable to create temporary mailer suffix cache: ' . ($create['error'] ?? 'unknown SQL Server error'));
-        }
-
-        $index = $this->checkedSql($connector,
-            'CREATE NONCLUSTERED INDEX IX_TmpMailerSuffixCache_Suffix ON #TmpMailerSuffixCache (Suffix)'
-        );
-        if (! ($index['success'] ?? false)) {
-            throw new \RuntimeException('Unable to index temporary mailer suffix cache: ' . ($index['error'] ?? 'unknown SQL Server error'));
-        }
-
-        $this->mailerSuffixCacheReady = true;
-        $this->info('[INFO] Created temporary TblMailers suffix cache for requested suffixes.');
+        return DBConnector::fromEnvironment('lt');
     }
 
-    private function loadMailerSuffixCache(DBConnector $connector, array $suffixes): void
+    protected function initializeMatchingConnector(): DBConnector
     {
-        $this->ensureMailerSuffixCache($connector);
-        $requested = $this->pendingMailerSuffixes + array_fill_keys($suffixes, true);
-        $missing = array_diff_key($requested, $this->cachedMailerSuffixes);
-        if ($missing === []) {
-            return;
-        }
-
-        $create = $this->checkedSql($connector,
-            "SET NOCOUNT ON;
-             SELECT TOP (0) CAST(RIGHT(External_ID, 9) AS varchar(9)) AS Suffix
-             INTO #TmpMailerSuffixFilter FROM TblMailers;
-             CREATE UNIQUE CLUSTERED INDEX IX_TmpMailerSuffixFilter_Suffix ON #TmpMailerSuffixFilter (Suffix);
-             SET NOCOUNT OFF;"
-        );
-        if (! ($create['success'] ?? false)) {
-            throw new \RuntimeException('Unable to create mailer suffix filter: ' . ($create['error'] ?? 'unknown SQL Server error'));
-        }
-        try {
-            foreach (array_chunk(array_keys($missing), 1000) as $batch) {
-                $values = implode(', ', array_map(fn($tail) => "('" . $this->escSql((string) $tail) . "')", $batch));
-                $insert = $this->checkedSql($connector, "INSERT INTO #TmpMailerSuffixFilter (Suffix) VALUES {$values}");
-                if (! ($insert['success'] ?? false)) {
-                    throw new \RuntimeException('Unable to fill mailer suffix filter: ' . ($insert['error'] ?? 'unknown SQL Server error'));
-                }
-            }
-            $populate = $this->checkedSql($connector,
-                "INSERT INTO #TmpMailerSuffixCache (Suffix, Drop_Name)
-                 SELECT CAST(RIGHT(m.External_ID, 9) AS varchar(9)), m.Drop_Name
-                 FROM #TmpMailerSuffixFilter f
-                 INNER HASH JOIN TblMailers m ON RIGHT(m.External_ID, 9) = f.Suffix
-                 WHERE m.External_ID IS NOT NULL AND m.Drop_Name IS NOT NULL AND LEN(m.External_ID) > 9"
-            );
-            if (! ($populate['success'] ?? false)) {
-                throw new \RuntimeException('Unable to populate temporary mailer suffix cache: ' . ($populate['error'] ?? 'unknown SQL Server error'));
-            }
-        } finally {
-            $this->checkedSql($connector, 'DROP TABLE IF EXISTS #TmpMailerSuffixFilter');
-        }
-
-        $this->cachedMailerSuffixes += $missing;
-        $this->pendingMailerSuffixes = [];
-        $this->info('[INFO] Cached mailer lookup for ' . count($missing) . ' requested suffix(es).');
+        $connector = DBConnector::fromEnvironment('ldr');
+        $connector->initializeSqlServer();
+        return $connector;
     }
-
-    private function fetchMailerSuffixes(DBConnector $snowflake, string $startDate): array
-    {
-        $changed = $this->contactChangedSql($startDate);
-        $result = $snowflake->query(
-            "SELECT DISTINCT c.TP_ID AS EXTERNAL_ID FROM CONTACTS c
-             WHERE {$changed}
-               AND c.DEL = 'FALSE' AND c._FIVETRAN_DELETED = FALSE AND c.FIRSTNAME IS NOT NULL AND c.FIRSTNAME <> ''
-               AND c.ISCOAPP = 0 AND c.ID > 0"
-        );
-        if (($result['success'] ?? true) === false || !isset($result['data']) || !is_array($result['data'])
-            || (isset($result['rowCount']) && (int) $result['rowCount'] !== count($result['data']))) {
-            throw new \RuntimeException('Snowflake did not return a complete mailer suffix list.');
-        }
-        $suffixes = [];
-        foreach ($result['data'] as $row) {
-            if (!array_key_exists('EXTERNAL_ID', $row)) {
-                throw new \RuntimeException('Snowflake mailer suffix list is missing EXTERNAL_ID.');
-            }
-            $externalId = trim((string) $row['EXTERNAL_ID']);
-            if (strlen($externalId) > 9) {
-                $suffixes[substr($externalId, -9)] = true;
-            }
-        }
-        $this->info('[INFO] Planned ' . count($suffixes) . ' mailer suffix(es) for this source run.');
-        return $suffixes;
-    }
-
-    /** Conflicting campaign values stay ambiguous regardless of result order. */
-    private function mergeDropNameLookup(array &$lookup, array $rows, bool $suffix = false): void
-    {
-        foreach ($rows as $row) {
-            $externalId = (string) ($row['External_ID'] ?? '');
-            $dropName   = (string) ($row['Drop_Name'] ?? '');
-            if ($externalId === '' || $dropName === '') {
-                continue;
-            }
-            $key = $suffix ? substr($externalId, -9) : $externalId;
-            $lookup[$key] = array_key_exists($key, $lookup) && $lookup[$key] !== $dropName ? null : $dropName;
-        }
-    }
-
-    private function resolvedDropNames(array $chunk, array $exact, array $suffixes): array
-    {
-        $resolved = [];
-        foreach ($chunk as $row) {
-            $id = trim((string) ($row['EXTERNAL_ID'] ?? ''));
-            if ($id === '' || $this->isFakeExternalId($id)) continue;
-            $tail = substr($id, -9);
-            $value = array_key_exists($id, $exact) ? $exact[$id]
-                : (array_key_exists($tail, $suffixes) ? $suffixes[$tail] : '');
-            if ($value === null) {
-                $this->recordContactFlag(['id' => 'LLG-' . ($row['LLG_ID'] ?? ''), 'code' => 'ambiguous_mailer_campaign',
-                    'message' => 'Conflicting mailer campaign values; contact was skipped without choosing a campaign.'], true);
-                continue;
-            }
-            if ($value !== '') $resolved[$id] = $value;
-        }
-        return $resolved;
-    }
-
-    // -------------------------------------------------------------------------
-    // Processing
-    // -------------------------------------------------------------------------
 
     /** Loan/requested amount and enrolled debt are deliberately separate. */
     private function resolveDebtValues(array $row): array
@@ -1188,16 +971,6 @@ class SyncContactsData extends Command
             'basis' => $validLoan ? 'loan' : ($enrolled > 0 ? 'enrolled_fallback' : 'no_debt')];
     }
 
-    private function checkedSql(DBConnector $connector, string $sql): array
-    {
-        $result = $connector->querySqlServer($sql);
-        if (!($result['success'] ?? false)) {
-            throw new \RuntimeException('Contact lookup SQL failed: ' . ($result['error'] ?? 'unknown error'));
-        }
-        return $result;
-    }
-
-    /** Only SELECTs, including when the normal sync uses temporary lookup tables. */
     private function selectPreviewRows(DBConnector $connector, string $sql): array
     {
         $result = $connector->querySqlServer($sql);
@@ -1334,7 +1107,7 @@ class SyncContactsData extends Command
 
             $campaign = '';
             if ($tpId) {
-                $campaign = $dropNames[$tpId] ?? '';
+                $campaign = $dropNames[$contactId] ?? '';
             }
 
             $processedRow = [
@@ -1395,6 +1168,7 @@ class SyncContactsData extends Command
     {
         $data = array_values(array_filter($data, fn ($row) => !isset($this->skippedContactIds[$row['llg_id']])));
         if ($data === []) {
+                '_campaign_proof'    => $this->campaignProofs[$contactId] ?? null,
             return 0;
         }
         $pdo = $connector->getSqlServerConnection();
