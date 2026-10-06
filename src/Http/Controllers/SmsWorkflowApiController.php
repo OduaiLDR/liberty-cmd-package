@@ -29,17 +29,26 @@ class SmsWorkflowApiController extends Controller
         $data = Validator::make($request->query(), [
             'target' => ['nullable', 'integer', 'min:1', 'max:10000000'],
             'page' => ['nullable', 'integer', 'min:1'],
+            'drop_pks' => ['sometimes', 'array', 'min:1', 'max:500'],
+            'drop_pks.*' => ['required', 'integer', 'min:1', 'distinct'],
         ])->validate();
         $this->ensureSchemaReady();
         $target = (int) ($data['target'] ?? 0);
         $page = (int) ($data['page'] ?? 1);
-        $drops = $target > 0 ? $this->drops->selectDrops($target) : $this->drops->allDrops($page);
+        $manual = isset($data['drop_pks']);
+        $drops = $manual ? $this->drops->selectDropsByIds(array_map('intval', $data['drop_pks']))
+            : ($target > 0 ? $this->drops->selectDrops($target) : $this->drops->allDrops($page));
         $total = (int) $drops->sum('Amount_Dropped');
+        if ($manual && $total > 10000000) {
+            throw \Illuminate\Validation\ValidationException::withMessages(['drop_pks' => 'Selected drops exceed the 10,000,000 phone export limit.']);
+        }
+        if ($manual) $target = $total;
 
         return new JsonResponse([
             'drops' => $drops->values(), 'target' => $target, 'total' => $total,
             'request_id' => (string) Str::uuid(), 'page' => $page,
-            'has_more' => $target === 0 && $this->drops->allDrops($page + 1)->isNotEmpty(),
+            'has_more' => ! $manual && $target === 0 && $this->drops->allDrops($page + 1)->isNotEmpty(),
+            'selection_mode' => $manual ? 'manual' : ($target > 0 ? 'automatic' : 'browse'),
             'shortfall' => max(0, $target - $total),
         ], 200, ['Cache-Control' => 'private, no-store']);
     }
@@ -50,7 +59,9 @@ class SmsWorkflowApiController extends Controller
         $data = Validator::make($request->all(), (new MailDropExportRequest)->rules())->validate();
         $this->ensureSchemaReady();
         set_time_limit(0);
-        $export = $this->drops->prepareExport((int) $data['target'], $data['request_id']);
+        $export = isset($data['drop_pks'])
+            ? $this->drops->prepareExport((int) $data['target'], $data['request_id'], array_map('intval', $data['drop_pks']))
+            : $this->drops->prepareExport((int) $data['target'], $data['request_id']);
         clearstatcache(true, $export['path']);
         $response = new BinaryFileResponse($export['path'], 200, [
             'Content-Type' => 'text/csv; charset=UTF-8',

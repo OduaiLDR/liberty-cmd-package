@@ -45,11 +45,33 @@ class MailDropExportRepository extends SqlSrvRepository
             }
             return true;
         });
-        return (new SmsDropPlanner)->select($selected, $target);
+        $planned = (new SmsDropPlanner)->select($selected, $target);
+        $this->assertUniqueSourceNames($planned, 'target');
+        return $planned;
+    }
+
+    /** @param array<int, int> $ids */
+    public function selectDropsByIds(array $ids): Collection
+    {
+        $drops = $this->marketingDrops()->whereIn('m.PK', $ids)->get()->keyBy('PK');
+        if ($drops->count() !== count($ids)) {
+            throw ValidationException::withMessages(['drop_pks' => 'One or more selected drops no longer exist. Refresh the list.']);
+        }
+
+        $selected = collect($ids)->map(function (int $id) use ($drops): object {
+            $drop = $drops->get($id);
+            $drop->Amount_Dropped = $this->eligiblePhones()->where('e.Drop_Name', $drop->Drop_Name)->count();
+            if ($drop->Amount_Dropped < 1) {
+                throw ValidationException::withMessages(['drop_pks' => "{$drop->Drop_Name} has no eligible phones. Deselect it and preview again."]);
+            }
+            return $drop;
+        });
+        $this->assertUniqueSourceNames($selected, 'drop_pks');
+        return $selected;
     }
 
     /** @return array{path:string, count:int, names:array<string>} */
-    public function prepareExport(int $target, string $requestId): array
+    public function prepareExport(int $target, string $requestId, ?array $dropPks = null): array
     {
         $path = tempnam(sys_get_temp_dir(), 'sms-export-');
         if ($path === false) {
@@ -57,12 +79,13 @@ class MailDropExportRepository extends SqlSrvRepository
         }
 
         try {
-            return $this->connection()->transaction(function () use ($target, $requestId, $path): array {
+            return $this->connection()->transaction(function () use ($target, $requestId, $dropPks, $path): array {
                 $last = $this->table('TblSmsExports')->orderByDesc('PK')->lockForUpdate()->first();
                 if ($this->table('TblSmsExports')->where('Request_ID', $requestId)->exists()) {
                     throw ValidationException::withMessages(['target' => 'This request was already exported. Refresh before starting another export.']);
                 }
-                $selected = $this->selectDrops($target);
+                $selected = $dropPks === null ? $this->selectDrops($target) : $this->selectDropsByIds($dropPks);
+                $this->assertUniqueSourceNames($selected, 'target');
                 if ((int) $selected->sum('Amount_Dropped') < $target) {
                     throw ValidationException::withMessages(['target' => 'There are not enough eligible phones to reach this target. Enter a smaller target.']);
                 }
@@ -134,6 +157,22 @@ class MailDropExportRepository extends SqlSrvRepository
         } catch (Throwable $exception) {
             unlink($path);
             throw $exception;
+        }
+    }
+
+    protected function assertUniqueSourceNames(Collection $drops, string $field): void
+    {
+        $names = [];
+        foreach ($drops as $drop) {
+            $name = strtolower(trim((string) $drop->Drop_Name));
+            if (isset($names[$name])) {
+                throw ValidationException::withMessages([$field => 'Selected marketing records share a source drop name. Correct the duplicate records before exporting.']);
+            }
+            $names[$name] = true;
+        }
+        if ($this->table('TblMarketing')->whereIn('Drop_Name', $drops->pluck('Drop_Name')->all())
+            ->groupBy('Drop_Name')->havingRaw('COUNT(*) > 1')->exists()) {
+            throw ValidationException::withMessages([$field => 'A source drop name appears more than once in marketing records. Correct the duplicates before exporting.']);
         }
     }
 
