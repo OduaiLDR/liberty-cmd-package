@@ -141,6 +141,9 @@ $registerCmdReportRoutes = function (bool $withNames = true): void {
     Route::get('/marketing-report', [MarketingReportController::class, 'index'])
         ->middleware('can:cmd.reports.marketing_report')
         ->name($name('cmd.reports.marketing_report'));
+    Route::post('/marketing-report/invoice', [MarketingReportController::class, 'allocateInvoice'])
+        ->middleware('can:cmd.reports.marketing_report')
+        ->name($name('cmd.reports.marketing_report.invoice'));
     Route::patch('/marketing-report/{pk}/mail', [MarketingReportController::class, 'updateMailDropCost'])
         ->middleware('can:cmd.reports.marketing_report')
         ->name($name('cmd.reports.marketing_report.mail.update'));

@@ -2,110 +2,49 @@
 
 namespace Cmd\Reports\Http\Controllers;
 
-use Carbon\Carbon;
 use Cmd\Reports\Http\Requests\MailDropExportRequest;
 use Cmd\Reports\Repositories\MailDropExportRepository;
-use Cmd\Reports\Support\CsvFormatting;
 use Illuminate\Contracts\View\View;
+use Illuminate\Http\Request;
 use Illuminate\Routing\Controller;
-use Illuminate\Support\Facades\Log;
-use Symfony\Component\HttpFoundation\StreamedResponse;
-use Throwable;
+use Illuminate\Support\Str;
+use Symfony\Component\HttpFoundation\BinaryFileResponse;
 
 class MailDropExportController extends Controller
 {
-    use CsvFormatting;
-
-    public function __construct(
-        protected MailDropExportRepository $repository
-    ) {
+    public function __construct(protected MailDropExportRepository $repository)
+    {
     }
 
-    public function index(): View
+    public function index(Request $request): View
     {
-        $drops = $this->repository->allDrops();
+        $validated = $request->validate([
+            'target' => ['nullable', 'integer', 'min:1', 'max:10000000'],
+            'page' => ['nullable', 'integer', 'min:1'],
+        ]);
+        $target = (int) ($validated['target'] ?? 0);
+        $drops = $target > 0
+            ? $this->repository->selectDrops($target)
+            : $this->repository->allDrops((int) ($validated['page'] ?? 1));
 
         return view('reports::reports.mail_drop_export', [
-            'drops' => $drops,
+            'drops' => $drops, 'target' => $target, 'total' => (int) $drops->sum('Amount_Dropped'),
+            'requestId' => (string) Str::uuid(), 'page' => (int) ($validated['page'] ?? 1),
         ]);
     }
 
-    public function export(MailDropExportRequest $request): StreamedResponse
+    public function export(MailDropExportRequest $request): BinaryFileResponse
     {
-        // 1. Remove execution limits so it won't crash on huge data.
         set_time_limit(0);
-        ini_set('max_execution_time', '0');
+        $data = $request->validated();
+        $export = $this->repository->prepareExport((int) $data['target'], $data['request_id']);
 
-        // 2. Remove memory limits. If the sqlsrv driver buffers too much locally,
-        // a memory limit crash will corrupt the file.
-        ini_set('memory_limit', '-1');
+        clearstatcache(true, $export['path']);
 
-        $pks = array_values(array_map('intval', $request->input('pks', [])));
-
-        return $this->exportCsv($pks);
-    }
-
-    protected function exportCsv(array $pks): StreamedResponse
-    {
-        $filename = 'mail_drop_export_' . Carbon::now()->format('Ymd_His') . '.csv';
-
-        // Match the exact headers used by other working CSV reports.
-        $headers = [
+        return response()->download($export['path'], 'sms_export_'.now()->format('Ymd_His').'.csv', [
             'Content-Type' => 'text/csv; charset=UTF-8',
-            'Content-Disposition' => "attachment; filename=\"{$filename}\"",
-            'Cache-Control' => 'must-revalidate, post-check=0, pre-check=0',
-            'Pragma' => 'public',
-            'X-Accel-Buffering' => 'no',
-        ];
-
-        return response()->streamDownload(function () use ($pks) {
-            set_time_limit(0);
-            $rowsWritten = 0;
-            $out = null;
-
-            try {
-                $out = fopen('php://output', 'w');
-
-                // UTF-8 BOM ensures Microsoft Excel opens the CSV as UTF-8.
-                fprintf($out, chr(0xEF) . chr(0xBB) . chr(0xBF));
-
-                fputcsv($out, [
-                    'First Name',
-                    'Address',
-                    'Debt',
-                    'Phone',
-                    'Send Date',
-                ]);
-
-                foreach ($this->repository->exportRows($pks) as $row) {
-                    fputcsv($out, [
-                        $row->First_Name  ?? '',
-                        $row->Address     ?? '',
-                        $row->Debt        ?? '',
-                        $row->Phone       ?? '',
-                        $this->formatCsvDate($row->Send_Date),
-                    ]);
-
-                    $rowsWritten++;
-
-                    if ($rowsWritten % 1000 === 0) {
-                        fflush($out);
-                    }
-                }
-
-                $this->repository->logExport($pks);
-            } catch (Throwable $e) {
-                Log::error('Mail drop CSV export failed.', [
-                    'rows_written' => $rowsWritten,
-                    'exception' => $e,
-                ]);
-
-                throw $e;
-            } finally {
-                if (is_resource($out)) {
-                    fclose($out);
-                }
-            }
-        }, $filename, $headers);
+            'X-SMS-Count' => (string) $export['count'],
+            'Cache-Control' => 'private, no-store',
+        ])->deleteFileAfterSend(true);
     }
 }

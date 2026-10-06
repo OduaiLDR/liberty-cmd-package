@@ -49,7 +49,11 @@ class MarketingReportController extends Controller
 
         $reports = $this->repository->paginate($from, $to, $perPage, $filters);
 
+        $smsWeek = $request->validate(['sms_week' => ['nullable', 'date_format:Y-m-d']])['sms_week'] ?? now()->startOfWeek()->toDateString();
+
         return view('reports::reports.marketing', [
+            'smsWeek' => $smsWeek,
+            'smsExports' => $this->repository->smsExports($smsWeek),
             'reports' => $reports,
             'options' => $this->repository->options(),
             'filters' => $filters,
@@ -58,6 +62,12 @@ class MarketingReportController extends Controller
             'to' => $to,
             'range' => $range,
         ]);
+    }
+
+    public function allocateInvoice(\Cmd\Reports\Http\Requests\MarketingInvoiceRequest $request): \Illuminate\Http\RedirectResponse
+    {
+        $this->repository->allocateInvoice($request->validated());
+        return back()->with('status', 'Invoice saved and cost distributed proportionally across all tiers in the selected week.');
     }
 
     public function updateMailDropCost(Request $request, int $pk)

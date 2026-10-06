@@ -21,6 +21,72 @@
             <h6 class="py-3 mb-0">Marketing Report</h6>
         </div>
         <div class="card-body">
+
+            @if (session('status'))
+                <div class="alert alert-success" role="status">{{ session('status') }}</div>
+            @endif
+            @if ($errors->any())
+                <div class="alert alert-danger" role="alert">{{ $errors->first() }}</div>
+            @endif
+            <section class="border rounded p-3 mb-3" aria-labelledby="invoice-heading">
+                <h6 id="invoice-heading">Weekly invoice allocation</h6>
+                <p class="small">Enter any date in the Monday–Sunday week. Mail and data costs apply to every tier for the selected vendor, weighted by mailed count. SMS costs apply to every SMS drop exported that week, weighted by exported phone count. Saving replaces the invoice and cost for that selection.</p>
+                <form method="post" action="{{ route('cmd.reports.marketing_report.invoice') }}" class="row g-2 align-items-end">
+                    @csrf
+                    <div class="col-md-2">
+                        <label for="invoice-kind" class="form-label">Cost type</label>
+                        <select id="invoice-kind" name="kind" class="form-select" required>
+                            <option value="mail">Mail</option><option value="data">Data</option><option value="sms">SMS</option>
+                        </select>
+                    </div>
+                    <div class="col-md-2">
+                        <label for="invoice-week" class="form-label">Date in week</label>
+                        <input id="invoice-week" name="week" type="date" class="form-control" value="{{ old('week', $smsWeek) }}" required>
+                    </div>
+                    <div class="col-md-2">
+                        <label for="invoice-vendor" class="form-label">Mail / data vendor</label>
+                        <select id="invoice-vendor" name="vendor" class="form-select">
+                            <option value="">Choose for mail/data</option>
+                            @foreach (($options['vendors'] ?? []) as $value)
+                                <option value="{{ $value }}">{{ $value }}</option>
+                            @endforeach
+                        </select>
+                    </div>
+                    <div class="col-md-2">
+                        <label for="invoice-number" class="form-label">Invoice number</label>
+                        <input id="invoice-number" name="invoice_number" maxlength="100" class="form-control" value="{{ old('invoice_number') }}" required>
+                    </div>
+                    <div class="col-md-2">
+                        <label for="invoice-cost" class="form-label">Total cost ($)</label>
+                        <input id="invoice-cost" name="cost" type="number" min="0" max="9999999.99" step="0.01" class="form-control" value="{{ old('cost') }}" required>
+                    </div>
+                    <div class="col-md-2"><button class="btn btn-primary" type="submit">Distribute invoice</button></div>
+                </form>
+            </section>
+            <section class="border rounded p-3 mb-3" aria-labelledby="sms-history-heading">
+                <h6 id="sms-history-heading">SMS drops and invoices</h6>
+                <form method="get" action="{{ route('cmd.reports.marketing_report') }}" class="d-flex gap-2 align-items-end mb-2">
+                    <div>
+                        <label for="sms-week" class="form-label">Date in export week</label>
+                        <input id="sms-week" type="date" name="sms_week" class="form-control" value="{{ $smsWeek }}" required>
+                    </div>
+                    <button class="btn btn-light" type="submit">Show SMS week</button>
+                </form>
+                <div class="table-responsive">
+                    <table class="table table-striped table-bordered">
+                        <thead><tr><th>SMS drop</th><th>Tier</th><th>Exported</th><th>SMS count</th><th>SMS invoice</th><th>SMS cost</th></tr></thead>
+                        <tbody>
+                        @forelse ($smsExports as $smsExport)
+                            <tr><td>{{ $smsExport->SMS_Drop_Name }}</td><td>{{ $smsExport->Debt_Tier }}</td><td>{{ $smsExport->Exported_At }}</td><td>{{ number_format((int) $smsExport->SMS_Count) }}</td><td>{{ $smsExport->SMS_Invoice_Number }}</td><td>{{ $formatCurrency($smsExport->SMS_Cost) }}</td></tr>
+                        @empty
+                            <tr><td colspan="6">No SMS exports for this week.</td></tr>
+                        @endforelse
+                        </tbody>
+                        <tfoot><tr><th colspan="3">Week total</th><th>{{ number_format((int) $smsExports->sum('SMS_Count')) }}</th><td></td><th>{{ $formatCurrency($smsExports->sum('SMS_Cost')) }}</th></tr></tfoot>
+                    </table>
+                </div>
+            </section>
+
             <form method="get" action="{{ route('cmd.reports.marketing_report') }}" class="bg-light rounded-3 p-2 p-md-3 mb-3" id="marketing-report-form">
                 <input type="hidden" name="range" id="range" value="{{ $currentRange }}">
                 <input type="hidden" name="export" id="export" value="">

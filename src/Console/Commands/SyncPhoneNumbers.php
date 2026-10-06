@@ -80,17 +80,8 @@ class SyncPhoneNumbers extends Command
                 return Command::SUCCESS;
             }
 
-            $deleted = $this->deleteExistingPhones($sqlServer);
-            $this->info("[INFO] Deleted {$deleted} existing rows for Source = '" . self::SOURCE . "'.");
-
-            $inserted = $this->insertPhonesFromFile($sqlServer, $stagePath, $batchSize);
-            $this->info("[INFO] Inserted {$inserted} rows into TblPhoneNumbers.");
-
-            $cleaned = $this->cleanupEmptyPhones($sqlServer);
-            if ($cleaned > 0) {
-                $this->info("[INFO] Cleanup removed {$cleaned} empty-phone rows.");
-            }
-
+            [$deleted, $inserted, $cleaned] = $this->replacePhonesFromFile($sqlServer, $stagePath, $batchSize);
+            $this->info("[INFO] Replaced {$deleted} existing phone rows with {$inserted} rows.");
             Log::info('SyncPhoneNumbers command finished.', [
                 'source' => self::SOURCE,
                 'deleted' => $deleted,
@@ -109,6 +100,25 @@ class SyncPhoneNumbers extends Command
 
         $this->info('[SUCCESS] SyncPhoneNumbers completed successfully!');
         return Command::SUCCESS;
+    }
+
+    /** @return array{int, int, int} */
+    protected function replacePhonesFromFile(DBConnector $connector, string $stagePath, int $batchSize): array
+    {
+        $connection = $connector->getSqlServerConnection();
+        $connection->beginTransaction();
+        try {
+            $deleted = $this->deleteExistingPhones($connector);
+            $inserted = $this->insertPhonesFromFile($connector, $stagePath, $batchSize);
+            $cleaned = $this->cleanupEmptyPhones($connector);
+            $connection->commit();
+            return [$deleted, $inserted, $cleaned];
+        } catch (\Throwable $exception) {
+            if ($connection->inTransaction()) {
+                $connection->rollBack();
+            }
+            throw $exception;
+        }
     }
 
     private function stagePhonesFromSnowflake(DBConnector $snowflake): array
