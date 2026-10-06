@@ -454,7 +454,7 @@ class DBConnector
         ];
 
         if (!empty($bindings)) {
-            $requestBody['bindings'] = $bindings;
+            $requestBody['bindings'] = self::snowflakeBindings($bindings);
         }
 
         $this->debugLog("Making API request with token: " . substr($token, 0, 50) . "...");
@@ -639,6 +639,33 @@ class DBConnector
      *
      * @return list<string>
      */
+    /**
+     * The SQL API only accepts bindings keyed by 1-based position:
+     * {"1": {"type": "TEXT", "value": "READER"}}. A plain list (["READER"]) is rejected with
+     * 391917, so convert lists in `?` order; an already-keyed map is passed through unchanged.
+     *
+     * @param  array<int|string,mixed> $bindings
+     * @return array<int|string,mixed>
+     */
+    public static function snowflakeBindings(array $bindings): array
+    {
+        if (!array_is_list($bindings)) {
+            return $bindings;
+        }
+
+        $keyed = [];
+        foreach ($bindings as $i => $value) {
+            $keyed[(string) ($i + 1)] = match (true) {
+                is_bool($value) => ['type' => 'BOOLEAN', 'value' => $value ? 'true' : 'false'],
+                is_int($value) => ['type' => 'FIXED', 'value' => (string) $value],
+                is_float($value) => ['type' => 'REAL', 'value' => (string) $value],
+                default => ['type' => 'TEXT', 'value' => $value === null ? null : (string) $value],
+            };
+        }
+
+        return $keyed;
+    }
+
     private function getFivetranDeletedTables(): array
     {
         if ($this->fivetranDeletedTables !== null) {
