@@ -101,7 +101,8 @@ final class NsfReportReadinessTest extends TestCase
         }
     }
 
-    public function test_workbook_run_status_is_visible_without_changing_data_contract(): void
+    /** Jacob had the Run Status sheet removed (2026-10-05); the run evidence moved to document properties. */
+    public function test_workbook_carries_run_evidence_as_properties_not_a_sheet(): void
     {
         $root = sys_get_temp_dir() . '/nsf-readiness-' . bin2hex(random_bytes(8));
         mkdir($root . '/app', 0777, true);
@@ -118,14 +119,14 @@ final class NsfReportReadinessTest extends TestCase
                 $this->assertSame('NSF Commission Report - LDR - 09-2098 - All.xlsx', $file['filename']);
                 $book = IOFactory::load($file['path']);
                 try {
-                    $this->assertSame(['NSF Data', 'Agent Summary', 'Run Status'], $book->getSheetNames());
-                    $this->assertSame($provisional ? 'Run Status' : 'NSF Data', $book->getActiveSheet()->getTitle());
-                    $status = $book->getSheetByName('Run Status');
-                    $this->assertSame($provisional ? 'PROVISIONAL — NOT READY FOR FINAL PAYROLL' : 'FINAL-CUTOFF DATA', $status->getCell('B1')->getValue());
-                    $this->assertSame('2098-10-05 23:59:59 PDT', $status->getCell('B5')->getValue());
-                    $this->assertSame($timing['startedAt'], $status->getCell('B6')->getValue());
-                    $this->assertSame('synthetic-run-id', $status->getCell('B8')->getValue());
-                    $this->assertSame($timing['finalAfter'], $status->getCell('B9')->getValue());
+                    $this->assertSame(['NSF Data', 'Agent Summary'], $book->getSheetNames());
+                    $this->assertSame('NSF Data', $book->getActiveSheet()->getTitle());
+                    $props = $book->getProperties();
+                    $this->assertSame($provisional ? 'PROVISIONAL' : 'FINAL', $props->getCustomPropertyValue(Formatter::PROPERTY_RUN_STATUS));
+                    $this->assertSame('synthetic-run-id', $props->getCustomPropertyValue(Formatter::PROPERTY_RUN_ID));
+                    $this->assertSame('2098-10-05 23:59:59 PDT', $props->getCustomPropertyValue('NSF Payment Cutoff (Pacific)'));
+                    $this->assertSame($timing['startedAt'], $props->getCustomPropertyValue('NSF Run Started (UTC)'));
+                    $this->assertSame($timing['finalAfter'], $props->getCustomPropertyValue('NSF Final Runs After (UTC)'));
                     $this->assertSame('ID', $book->getSheetByName('NSF Data')->getCell('A1')->getValue());
                 } finally { $book->disconnectWorksheets(); }
             }

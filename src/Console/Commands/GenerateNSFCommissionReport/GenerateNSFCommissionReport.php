@@ -216,7 +216,7 @@ class GenerateNSFCommissionReport extends Command
             if ($this->option('no-email')) {
                 $this->info("[INFO] [$display] --no-email set; skipping email send.");
             } else {
-                $this->sendReport($sql, $files, $display, $startDate, $endDate, $unassigned, $rosterAgents === null);
+                $this->sendReport($sql, $files, $display, $startDate, $endDate, $unassigned, $rosterAgents === null, $readiness);
             }
 
             foreach ($files as $f) {
@@ -395,6 +395,22 @@ class GenerateNSFCommissionReport extends Command
      * @param array<int,array{filename:string,path:string}>       $files
      * @param array<int,array{agent:string,amount:float}>          $unassigned Earners missing from the roster.
      */
+    /**
+     * One line saying the report is a preview when it ran before the month's payment cutoff. This
+     * used to be the Run Status sheet the workbook opened on; Jacob had that sheet removed
+     * (2026-10-05), and a preview should still never be mistaken for final payroll figures.
+     */
+    private function provisionalNoteHtml(?array $readiness): string
+    {
+        if ($readiness === null || empty($readiness['isProvisional'])) {
+            return '';
+        }
+
+        return '<p><strong>Preview:</strong> this ran before the payment cutoff ('
+            . htmlspecialchars((string) $readiness['cutoffPacific'])
+            . '), so returned payments can still change. A run after the cutoff gives the final figures.</p>';
+    }
+
     private function sendReport(
         DBConnector $sql,
         array $files,
@@ -402,7 +418,8 @@ class GenerateNSFCommissionReport extends Command
         string $start,
         string $end,
         array $unassigned = [],
-        bool $rosterUnavailable = false
+        bool $rosterUnavailable = false,
+        ?array $readiness = null
     ): void {
         $parts = CommissionAgentEmailFiles::partition($files);
         foreach ($parts['missing'] as $missingName) {
@@ -417,6 +434,7 @@ class GenerateNSFCommissionReport extends Command
         // remove the table and just have a message." The per-agent table used to be duplicated here
         // from the attached workbook's Commission sheet, which is where it belongs.
         $body = '<p>See attached NSF Commission Report - ' . htmlspecialchars($display) . '.</p>'
+            . $this->provisionalNoteHtml($readiness)
             . UnassignedCommissionAgents::emailBlockHtml($unassigned, $rosterUnavailable, 'NSF roster');
 
         $email  = new \Cmd\Reports\Services\EmailSenderService();
