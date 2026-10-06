@@ -24,6 +24,12 @@ use Illuminate\Support\Facades\Log;
  * is NOT a return (it's an unprocessed draft). Both Snowflake instances (ldr + plaw)
  * are consulted; a contact living in both resolves to the PLAW value (matches the
  * prior command's precedence).
+ *
+ * Reconsideration hold (ticket #512): a client in 'Enrolled (Reconsideration Pending)' who has
+ * not had a payment processed keeps the First_Payment_Date already on file. Forth pulls the
+ * paused drafts, so "first D transaction" jumps to a far-future draft (10/09 -> 2027-01-11)
+ * and the client drops out of the Enrollment Summary's "Reconsideration Pending Debt Paying in"
+ * month. Once a payment processes, or they leave reconsideration, the normal rule applies again.
  */
 class SyncFirstPaymentDate extends Command
 {
@@ -68,15 +74,27 @@ class SyncFirstPaymentDate extends Command
             $ldr = $this->fetchFirstPaymentDates($sqlConnector, $contactIds);
             $this->info('LDR: ' . count($ldr) . ' contact(s) with transactions.');
 
+            $held = $this->fetchReconsiderationHolds($sqlConnector);
+
             // LLG_ID => new First_Payment_Date. PLAW wins if a contact is in both.
             $newDates = [];
+            $heldCount = 0;
             foreach ($contactToLlg as $cid => $llgId) {
-                $fpd = $plaw[$cid] ?? ($ldr[$cid] ?? null);
-                if ($fpd !== null && $fpd !== '') {
-                    $newDates[$llgId] = $fpd;
+                $computed = $plaw[$cid] ?? ($ldr[$cid] ?? null);
+                if ($computed === null || $computed['date'] === '') {
+                    continue;
                 }
+                // Reconsideration Pending with no payment processed yet: keep the date on file.
+                if (isset($held[$llgId]) && !$computed['processed']) {
+                    $heldCount++;
+                    continue;
+                }
+                $newDates[$llgId] = $computed['date'];
             }
             $this->info('Computed First_Payment_Date for ' . count($newDates) . ' contact(s).');
+            if ($heldCount > 0) {
+                $this->info("Kept First_Payment_Date for {$heldCount} Reconsideration Pending contact(s) with no payment processed yet.");
+            }
 
             if ($dryRun) {
                 $this->previewChanges($sqlConnector, $newDates);
@@ -129,12 +147,39 @@ SQL;
     }
 
     /**
+     * LLG_IDs to leave alone: in Reconsideration Pending, first payment never cleared, and a
+     * First_Payment_Date already on file (a NULL still gets filled).
+     *
+     * @return array<string, true>
+     */
+    protected function fetchReconsiderationHolds(DBConnector $connector): array
+    {
+        $sql = <<<SQL
+SELECT LLG_ID
+FROM dbo.TblEnrollment
+WHERE Enrollment_Status = 'Enrolled (Reconsideration Pending)'
+  AND First_Payment_Cleared_Date IS NULL
+  AND First_Payment_Date IS NOT NULL
+SQL;
+
+        $held = [];
+        foreach ($this->extractRows($connector->querySqlServer($sql)) as $row) {
+            $llg = $this->getRowValue($row, 'LLG_ID');
+            if ($llg !== null && $llg !== '') {
+                $held[$llg] = true;
+            }
+        }
+
+        return $held;
+    }
+
+    /**
      * Per contact: process date of the FIRST cleared-or-returned D transaction; if none, the
      * FIRST D transaction's process date. One aggregate query per chunk — no per-draft rows are
-     * pulled into PHP.
+     * pulled into PHP. 'processed' says whether a payment was actually cleared/returned.
      *
      * @param list<string> $contactIds
-     * @return array<string, string> CONTACT_ID => 'Y-m-d'
+     * @return array<string, array{date: string, processed: bool}> CONTACT_ID => result
      */
     protected function fetchFirstPaymentDates(DBConnector $connector, array $contactIds): array
     {
@@ -180,7 +225,7 @@ SQL;
                 $draft = $this->normalizeDate($this->getRowValue($row, 'FIRST_DRAFT'));
                 $fpd = $processed ?? $draft;
                 if ($fpd !== null) {
-                    $out[$cid] = $fpd;
+                    $out[$cid] = ['date' => $fpd, 'processed' => $processed !== null];
                 }
             }
         }
