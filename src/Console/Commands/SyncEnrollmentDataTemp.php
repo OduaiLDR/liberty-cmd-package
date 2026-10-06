@@ -178,7 +178,7 @@ class SyncEnrollmentDataTemp extends Command
         $snowflakeSql = "
             SELECT ID, CAST(CONVERT_TIMEZONE('America/Los_Angeles', DROPPED_DATE) AS DATE) AS DROPPED_DATE
             FROM CONTACTS
-            WHERE _FIVETRAN_DELETED = FALSE
+            WHERE (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
               AND DROPPED_DATE IS NOT NULL
         ";
         $snowflakeResult = $snowflake->query($snowflakeSql);
@@ -238,7 +238,7 @@ class SyncEnrollmentDataTemp extends Command
             WHERE TRANS_TYPE = 'D'
               AND CLEARED_DATE IS NOT NULL
               AND RETURNED_DATE IS NULL
-              AND _FIVETRAN_DELETED = FALSE
+              AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
             GROUP BY CONTACT_ID
         ";
         $snowflakeResult = $snowflake->query($snowflakeSql);

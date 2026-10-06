@@ -18,7 +18,7 @@ final class ContactSyncCampaignLookup
                     TRIM(CONCAT(COALESCE(FIRSTNAME, ''), ' ', COALESCE(LASTNAME, ''))) AS FULLNAME,
                     EMAIL, PHONE3 AS CELL_PHONE, ADDRESS AS ADDRESS1, CITY, STATE, ZIP
                     FROM CONTACTS WHERE ID IN (" . implode(',', $batch) . ")
-                    AND _FIVETRAN_DELETED=FALSE AND DEL=FALSE AND COALESCE(ISCOAPP,0)=0");
+                    AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL) AND DEL=FALSE AND COALESCE(ISCOAPP,0)=0");
                 if (($result['success'] ?? true) !== true || !is_array($result['data'] ?? null)
                     || !empty($result['error']) || !empty($result['truncated'])
                     || (isset($result['rowCount']) && (int) $result['rowCount'] !== count($result['data']))) {

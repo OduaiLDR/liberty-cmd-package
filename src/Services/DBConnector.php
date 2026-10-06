@@ -34,6 +34,8 @@ class DBConnector
     private ?string $accessToken = null;
     private ?int $tokenExpiry = null;
     private Client $client;
+    private ?array $fivetranDeletedTables = null;
+    private bool $loadingFivetranDeletedTables = false;
 
     // SQL Server connection properties
     private ?PDO $sqlServerConnection = null;
@@ -425,6 +427,17 @@ class DBConnector
      */
     public function query(string $sql, array $bindings = [], ?int $timeoutSeconds = null): array
     {
+        $queryHead = preg_replace('/\A(?:(?:\s+)|(?:--[^\r\n]*(?:\r?\n|$))|(?:\/\*.*?\*\/))*/s', '', $sql) ?? $sql;
+        if (!$this->loadingFivetranDeletedTables
+            && preg_match('/^(?:SELECT|WITH)\b/i', $queryHead)
+            && preg_match('/\b(?:FROM|JOIN)\b/i', $queryHead)) {
+            $filtered = FivetranDeletedRowFilter::apply($sql, $this->getFivetranDeletedTables());
+            $sql = $filtered['sql'];
+            if ($filtered['tables'] !== []) {
+                $this->debugLog('Applied NULL-safe Fivetran deletion filters to: ' . implode(', ', $filtered['tables']));
+            }
+        }
+
         $token = $this->getAccessToken();
         $url = sprintf(
             'https://%s.snowflakecomputing.com/api/v2/statements',
@@ -618,6 +631,54 @@ class DBConnector
         $this->debugLog('Final total rows: ' . $rowCount);
 
         return $this->formatResult($result);
+    }
+
+    /**
+     * Read the marker-bearing tables for this Snowflake schema once per connector.
+     * Fail closed if metadata cannot be checked so reports never silently include deleted rows.
+     *
+     * @return list<string>
+     */
+    private function getFivetranDeletedTables(): array
+    {
+        if ($this->fivetranDeletedTables !== null) {
+            return $this->fivetranDeletedTables;
+        }
+
+        $database = strtoupper($this->database);
+        if (!preg_match('/^[A-Z_][A-Z0-9_$]*$/', $database)) {
+            throw new Exception('Snowflake database name cannot be safely used for deletion-marker metadata lookup.');
+        }
+
+        $metadataSql = "SELECT TABLE_NAME\n"
+            . "FROM {$database}.INFORMATION_SCHEMA.COLUMNS\n"
+            . "WHERE UPPER(TABLE_SCHEMA) = UPPER(?)\n"
+            . "  AND UPPER(COLUMN_NAME) = '_FIVETRAN_DELETED'\n"
+            . "GROUP BY TABLE_NAME";
+
+        $this->loadingFivetranDeletedTables = true;
+        try {
+            $result = $this->query($metadataSql, [$this->schema], 30);
+        } finally {
+            $this->loadingFivetranDeletedTables = false;
+        }
+
+        $rows = $result['data'] ?? null;
+        if (!is_array($rows)) {
+            throw new Exception('Snowflake returned an invalid result while checking Fivetran deletion-marker metadata.');
+        }
+
+        $tables = [];
+        foreach ($rows as $row) {
+            $table = $row['TABLE_NAME'] ?? $row['table_name'] ?? null;
+            if (is_string($table) && $table !== '') {
+                $tables[] = strtoupper($table);
+            }
+        }
+
+        $this->fivetranDeletedTables = array_values(array_unique($tables));
+
+        return $this->fivetranDeletedTables;
     }
 
     /**

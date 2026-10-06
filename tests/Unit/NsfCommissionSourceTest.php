@@ -33,8 +33,8 @@ final class NsfCommissionSourceTest extends TestCase
         $result = NsfCommissionSource::fetch($connector, self::CONFIG, '2098-01-01', '2098-01-31');
         $this->assertCount(1, $result);
         $query = $connector->queryText;
-        $this->assertStringContainsString('WHERE _FIVETRAN_DELETED = FALSE', $query);
-        $this->assertStringContainsString('t._FIVETRAN_DELETED = FALSE', $query);
+        $this->assertStringContainsString('WHERE (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)', $query);
+        $this->assertStringContainsString('(t._FIVETRAN_DELETED = FALSE OR t._FIVETRAN_DELETED IS NULL)', $query);
         $this->assertSame(5, substr_count($query, 'GROUP BY CONTACT_ID'));
         // The return-date aggregation is NOT restricted to the selected month:
         // an in-month + out-of-month pair must still produce RETURN_VARIANTS=2.

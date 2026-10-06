@@ -211,7 +211,7 @@ final class ContactSyncSourceEvidence
         foreach (['LDR', 'PLAW'] as $source) {
             try {
                 $response = $query($source, 'SELECT ID AS PLAN_ID, TITLE, _FIVETRAN_DELETED FROM ENROLLMENT_DEFAULTS2 WHERE ID IN ('
-                    . implode(',', $ids) . ') AND _FIVETRAN_DELETED = FALSE');
+                    . implode(',', $ids) . ') AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)');
             } catch (\Throwable $error) { throw new RuntimeException('Contact plan definition read failed for ' . $source . '.'); }
             foreach ($response as $raw) {
                 $row = array_change_key_case($raw, CASE_UPPER);
@@ -395,11 +395,11 @@ final class ContactSyncSourceEvidence
             $planCte = ", latest_plan AS (
                 SELECT ep.CONTACT_ID, ep.PLAN_ID FROM ENROLLMENT_PLAN AS ep
                 JOIN candidate AS p ON p.ID = ep.CONTACT_ID
-                WHERE ep._FIVETRAN_DELETED = FALSE
+                WHERE (ep._FIVETRAN_DELETED = FALSE OR ep._FIVETRAN_DELETED IS NULL)
                 QUALIFY ROW_NUMBER() OVER (PARTITION BY ep.CONTACT_ID ORDER BY ep.CREATED_AT DESC, ep.ID DESC) = 1
             ), plan_title AS (
                 SELECT ep.CONTACT_ID, ep.PLAN_ID, ed.TITLE AS PLAN_TITLE FROM latest_plan AS ep
-                LEFT JOIN ENROLLMENT_DEFAULTS2 AS ed ON ep.PLAN_ID = ed.ID AND ed._FIVETRAN_DELETED = FALSE
+                LEFT JOIN ENROLLMENT_DEFAULTS2 AS ed ON ep.PLAN_ID = ed.ID AND (ed._FIVETRAN_DELETED = FALSE OR ed._FIVETRAN_DELETED IS NULL)
             )";
             $planField = 'plan_title.PLAN_ID, plan_title.PLAN_TITLE,';
             $planJoin = ' LEFT JOIN plan_title ON candidate.ID = plan_title.CONTACT_ID';
@@ -407,7 +407,7 @@ final class ContactSyncSourceEvidence
         return "WITH candidate AS (
             SELECT c.ID, c.TP_ID, c.DEL, c.ISCOAPP, {$candidateEnrollment} CONCAT(c.FIRSTNAME, ' ', c.LASTNAME) AS FULLNAME, c.PHONE3, c.EMAIL,
                 CASE WHEN c.ID IN ({$targets}) THEN REGEXP_REPLACE(COALESCE(c.SSN, ''), '[^0-9]', '') ELSE '' END AS DIGITS
-            FROM CONTACTS c WHERE c._FIVETRAN_DELETED = FALSE AND c.DEL = 'FALSE' AND c.ISCOAPP = 0
+            FROM CONTACTS c WHERE (c._FIVETRAN_DELETED = FALSE OR c._FIVETRAN_DELETED IS NULL) AND c.DEL = 'FALSE' AND c.ISCOAPP = 0
                 AND c.ID > 0 AND c.FIRSTNAME IS NOT NULL AND c.FIRSTNAME <> '' AND {$selection}
         ){$planCte} SELECT ID, TP_ID, DEL, ISCOAPP, {$selectedEnrollment} {$planField} FULLNAME, PHONE3, EMAIL,
             CASE WHEN LENGTH(DIGITS) = 9 AND DIGITS <> REPEAT(LEFT(DIGITS, 1), 9)
