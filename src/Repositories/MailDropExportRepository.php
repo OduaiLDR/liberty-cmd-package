@@ -3,217 +3,190 @@
 namespace Cmd\Reports\Repositories;
 
 use Carbon\Carbon;
+use Cmd\Reports\Services\SmsDropPlanner;
+use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Collection;
+use Illuminate\Validation\ValidationException;
+use RuntimeException;
+use Throwable;
 
 class MailDropExportRepository extends SqlSrvRepository
 {
-    /**
-     * All drops from TblMarketing for the selector table.
-     *
-     * Sort order:
-     *   1. Latest_Export_Date — NULLs first (new/unexported drops)
-     *   2. Latest_Export_Date ASC (oldest exports next for max repeat gap)
-     *   3. Send_Date DESC (newest sends first within each group)
-     *   4. Drop_Name ASC (alphabetical tiebreaker)
-     */
-    public function allDrops(): Collection
+    protected function marketingDrops(): Builder
     {
-        $latestExportDateSelect = $this->enrichedLatestExportDateColumnExists()
-            ? 'MAX(e.Latest_Export_Date)'
-            : 'CAST(NULL AS DATE)';
-
-        $sql = "
-            WITH DropStats AS (
-                SELECT
-                    m.PK,
-                    m.Drop_Name,
-                    m.Send_Date,
-                    m.Debt_Tier,
-                    SUM(
-                        CASE
-                            WHEN NULLIF(LTRIM(RTRIM(e.Phone)), '') IS NULL THEN 0
-                            ELSE 1
-                        END
-                    ) AS Amount_Dropped,
-                    {$latestExportDateSelect} AS Latest_Export_Date
-                FROM TblMarketing m
-                INNER JOIN TblMailersUniqueEnriched e
-                    ON e.Drop_Name = m.Drop_Name
-                GROUP BY
-                    m.PK,
-                    m.Drop_Name,
-                    m.Send_Date,
-                    m.Debt_Tier
-            )
-            SELECT
-                PK,
-                Drop_Name,
-                Debt_Tier,
-                Send_Date,
-                Amount_Dropped,
-                Latest_Export_Date
-            FROM DropStats
-            ORDER BY
-                CASE WHEN Latest_Export_Date IS NULL THEN 0 ELSE 1 END ASC,
-                Latest_Export_Date ASC,
-                Send_Date DESC,
-                Drop_Name ASC
-        ";
-
-        return collect($this->connection()->select($sql));
+        return $this->table('TblMarketing', 'm')
+            ->select(['m.PK', 'm.Drop_Name', 'm.Debt_Tier', 'm.Send_Date', 'm.SMS_Drops', 'm.SMS_Last_Export_Date'])
+            ->whereNotNull('m.Drop_Name')
+            ->orderBy('m.SMS_Drops')
+            ->orderByRaw('CASE WHEN m.SMS_Drops > 0 THEN m.SMS_Last_Export_Date END ASC')
+            ->orderByDesc('m.Send_Date')->orderBy('m.Drop_Name');
     }
 
-    private function enrichedLatestExportDateColumnExists(): bool
+    public function allDrops(int $page = 1): Collection
     {
-        return (bool) $this->connection()->selectOne(
-            "SELECT 1 AS present FROM INFORMATION_SCHEMA.COLUMNS
-             WHERE TABLE_NAME = 'TblMailersUniqueEnriched' AND COLUMN_NAME = 'Latest_Export_Date'"
-        );
+        $counts = $this->eligiblePhones()->whereColumn('e.Drop_Name', 'm.Drop_Name')->selectRaw('COUNT(*)');
+        return $this->marketingDrops()->selectSub($counts, 'Amount_Dropped')->forPage($page, 25)->get();
     }
 
-    /**
-     * @param  array<int>  $pks
-     * @return array<string>
-     */
-    private function dropNamesForPks(array $pks): array
+    public function selectDrops(int $target): Collection
     {
-        $pks = array_values(array_unique(array_filter(
-            array_map('intval', $pks),
-            static fn (int $pk): bool => $pk > 0
-        )));
-
-        if (empty($pks)) {
-            return [];
-        }
-
-        $dropNames = [];
-
-        foreach (array_chunk($pks, 1000) as $chunk) {
-            $this->table('TblMarketing')
-                ->whereIn('PK', $chunk)
-                ->pluck('Drop_Name')
-                ->each(function ($dropName) use (&$dropNames): void {
-                    if ($dropName !== null && $dropName !== '') {
-                        $dropNames[(string) $dropName] = (string) $dropName;
-                    }
-                });
-        }
-
-        return array_values($dropNames);
-    }
-
-    /**
-     * Count the exact CSV rows that will be emitted: one row per non-empty phone column.
-     *
-     * @param  array<int>  $pks  TblMarketing PKs
-     */
-    public function countExportRows(array $pks): int
-    {
-        $dropNames = $this->dropNamesForPks($pks);
-
-        if (empty($dropNames)) {
-            return 0;
-        }
-
+        $selected = collect();
         $total = 0;
-
-        foreach (array_chunk($dropNames, 200) as $chunk) {
-            $row = $this->connection()->table('TblMailersUniqueEnriched')
-                ->whereIn('Drop_Name', $chunk)
-                ->selectRaw("
-                    SUM(
-                        CASE WHEN NULLIF(LTRIM(RTRIM(Phone)), '') IS NULL THEN 0 ELSE 1 END
-                    ) AS Export_Row_Count
-                ")
-                ->first();
-
-            $total += (int) ($row->Export_Row_Count ?? 0);
-        }
-
-        return $total;
-    }
-
-    /**
-     * Export rows from enriched mailer data: one row per non-empty phone.
-     *
-     * @param  array<int>  $pks  TblMarketing PKs
-     */
-    public function exportRows(array $pks): \Generator
-    {
-        if (empty($pks)) {
-            return (function () { yield from []; })();
-        }
-
-        $marketingDrops = $this->connection()->table('TblMarketing')
-            ->whereIn('PK', $pks)
-            ->get(['PK as Drop_PK', 'Drop_Name', 'Send_Date']);
-
-        if ($marketingDrops->isEmpty()) {
-            return (function () { yield from []; })();
-        }
-
-        foreach ($marketingDrops as $drop) {
-            $lastId = 0;
-            $batchSize = 10000;
-
-            while (true) {
-                $records = $this->connection()->table('TblMailersUniqueEnriched as e')
-                    ->leftJoin('TblMailersUnique as u', 'u.External_ID', '=', 'e.External_ID')
-                    ->select('e.PK', 'e.Client', 'e.Address', 'e.Phone', 'u.Debt_Amount')
-                    ->where('e.Drop_Name', $drop->Drop_Name)
-                    ->where('e.PK', '>', $lastId)
-                    ->whereRaw("NULLIF(LTRIM(RTRIM(e.Phone)), '') IS NOT NULL")
-                    ->orderBy('e.PK')
-                    ->limit($batchSize)
-                    ->get();
-
-                if ($records->isEmpty()) {
-                    break;
+        $this->marketingDrops()->chunk(25, function (Collection $drops) use ($target, &$selected, &$total): bool {
+            foreach ($drops as $drop) {
+                $drop->Amount_Dropped = $this->eligiblePhones()->where('e.Drop_Name', $drop->Drop_Name)->count();
+                if ($drop->Amount_Dropped > 0) {
+                    $selected->push($drop);
+                    $total += $drop->Amount_Dropped;
                 }
-
-                foreach ($records as $row) {
-                    $lastId = $row->PK;
-
-                    // Parse first word of Client as the first name.
-                    $clientStr = trim((string) ($row->Client ?? ''));
-                    $firstName = $clientStr !== '' ? explode(' ', $clientStr)[0] : '';
-
-                    yield (object) [
-                        'First_Name' => $firstName,
-                        'Address'    => $row->Address,
-                        'Debt'       => $row->Debt_Amount,
-                        'Phone'      => trim((string) $row->Phone),
-                        'Send_Date'  => $drop->Send_Date,
-                    ];
+                if ($total >= $target) {
+                    return false;
                 }
             }
+            return true;
+        });
+        return (new SmsDropPlanner)->select($selected, $target);
+    }
+
+    /** @return array{path:string, count:int, names:array<string>} */
+    public function prepareExport(int $target, string $requestId): array
+    {
+        $path = tempnam(sys_get_temp_dir(), 'sms-export-');
+        if ($path === false) {
+            throw new RuntimeException('Unable to create the SMS export file.');
+        }
+
+        try {
+            return $this->connection()->transaction(function () use ($target, $requestId, $path): array {
+                $last = $this->table('TblSmsExports')->orderByDesc('PK')->lockForUpdate()->first();
+                if ($this->table('TblSmsExports')->where('Request_ID', $requestId)->exists()) {
+                    throw ValidationException::withMessages(['target' => 'This request was already exported. Refresh before starting another export.']);
+                }
+                $selected = $this->selectDrops($target);
+                if ((int) $selected->sum('Amount_Dropped') < $target) {
+                    throw ValidationException::withMessages(['target' => 'There are not enough eligible phones to reach this target. Enter a smaller target.']);
+                }
+                if ($selected->contains(fn (object $drop): bool => trim((string) $drop->Debt_Tier) === '')) {
+                    throw ValidationException::withMessages(['target' => 'A selected drop is missing its debt tier. Correct the marketing record first.']);
+                }
+                $groups = $selected->groupBy('Debt_Tier')->sortKeys(SORT_NATURAL);
+                $next = (int) ($last->PK ?? 0);
+                $exportedAt = Carbon::now();
+                $total = 0;
+                $names = [];
+                $out = fopen($path, 'wb');
+                if ($out === false) {
+                    throw new RuntimeException('Unable to open the SMS export file.');
+                }
+                try {
+                    $this->writeCsv($out, ['SMS Drop', 'Debt Tier', 'Source Drop', 'First Name', 'Address', 'Debt', 'Phone', 'Send Date']);
+                    foreach ($groups as $tier => $drops) {
+                        $id = ++$next;
+                        $name = 'SMS'.str_pad((string) $id, 4, '0', STR_PAD_LEFT);
+                        $tierCount = 0;
+                        $sourceCounts = [];
+                        foreach ($drops as $drop) {
+                            $sourceCount = 0;
+                            foreach ($this->rowsForDrop($drop->Drop_Name) as $row) {
+                                $this->writeCsv($out, [
+                                    $name, $tier, $drop->Drop_Name,
+                                    explode(' ', trim((string) $row->Client))[0],
+                                    $row->Address, $row->Debt_Amount, $row->SMS_Phone, $drop->Send_Date,
+                                ]);
+                                $sourceCount++;
+                            }
+                            if ($sourceCount === 0) {
+                                throw ValidationException::withMessages(['target' => 'Phone eligibility changed during export. Refresh and try again.']);
+                            }
+                            $sourceCounts[(int) $drop->PK] = $sourceCount;
+                            $tierCount += $sourceCount;
+                        }
+
+                        $this->table('TblSmsExports')->insert([
+                            'PK' => $id, 'SMS_Drop_Name' => $name, 'Request_ID' => $requestId,
+                            'Debt_Tier' => (string) $tier, 'Week_Start' => $exportedAt->copy()->startOfWeek()->toDateString(),
+                            'Exported_At' => $exportedAt->toDateTimeString(), 'SMS_Count' => $tierCount,
+                            'SMS_Cost' => '0.00',
+                        ]);
+                        foreach ($sourceCounts as $pk => $count) {
+                            $this->table('TblSmsExportSources')->insert([
+                                'SMS_Export_PK' => $id, 'Marketing_PK' => $pk, 'SMS_Count' => $count,
+                            ]);
+                            $this->table('TblMarketing')->where('PK', $pk)->increment('SMS_Drops', 1, [
+                                'SMS_Last_Export_Date' => $exportedAt->toDateTimeString(),
+                            ]);
+                        }
+                        $names[] = $name;
+                        $total += $tierCount;
+                    }
+                    if ($total < $target) {
+                        throw ValidationException::withMessages(['target' => 'Phone eligibility changed and the target is no longer met. Refresh and try again.']);
+                    }
+                    if (! fflush($out)) {
+                        throw new RuntimeException('Unable to finish writing the SMS export.');
+                    }
+                } finally {
+                    fclose($out);
+                }
+
+                return ['path' => $path, 'count' => $total, 'names' => $names];
+            });
+        } catch (Throwable $exception) {
+            unlink($path);
+            throw $exception;
         }
     }
 
-    /**
-     * Stamp Latest_Export_Date for exported enriched mailer rows.
-     * Adds the column to TblMailersUniqueEnriched if it does not yet exist.
-     *
-     * @param  array<int>  $pks
-     */
-    public function logExport(array $pks): Carbon
+    protected function eligiblePhones(): Builder
     {
-        $exportedAt = Carbon::today();
+        $phone = $this->normalizedPhoneExpression();
+        $sqlServer = $this->connection()->getDriverName() === 'sqlsrv';
+        $length = $sqlServer ? 'LEN' : 'LENGTH';
+        $prefixed = $sqlServer ? "('1' + {$phone})" : "('1' || {$phone})";
 
-        if (! $this->enrichedLatestExportDateColumnExists()) {
-            $this->connection()->statement(
-                "ALTER TABLE TblMailersUniqueEnriched ADD Latest_Export_Date DATE NULL"
-            );
+        return $this->table('TblMailersUniqueEnriched', 'e')
+            ->whereRaw("{$length}({$phone}) = 10")
+            ->whereRaw($sqlServer ? "{$phone} NOT LIKE '%[^0-9]%'" : "{$phone} NOT GLOB '*[^0-9]*'")
+            ->whereNotExists(function (Builder $query) use ($phone, $prefixed): void {
+                $query->selectRaw('1')->from('TblPhoneNumbers as p')
+                    ->whereRaw("(p.Phone = {$phone} OR p.Phone = {$prefixed})");
+            });
+    }
+
+    protected function rowsForDrop(string $dropName): iterable
+    {
+        $debt = $this->table('TblMailersUnique', 'u')
+            ->select('u.Debt_Amount')
+            ->whereColumn('u.External_ID', 'e.External_ID')
+            ->whereColumn('u.Drop_Name', 'e.Drop_Name')
+            ->orderBy('u.PK')->limit(1);
+
+        return $this->eligiblePhones()->where('e.Drop_Name', $dropName)
+            ->select(['e.PK', 'e.Client', 'e.Address'])
+            ->selectRaw($this->normalizedPhoneExpression().' AS SMS_Phone')
+            ->selectSub($debt, 'Debt_Amount')
+            ->lazyById(10000, 'e.PK', 'PK');
+    }
+
+    protected function normalizedPhoneExpression(): string
+    {
+        $phone = "COALESCE(e.Phone, '')";
+        foreach ([' ', '-', '(', ')', '+', '.'] as $character) {
+            $phone = "REPLACE({$phone}, '{$character}', '')";
         }
+        $length = $this->connection()->getDriverName() === 'sqlsrv' ? 'LEN' : 'LENGTH';
+        return "CASE WHEN {$length}({$phone}) = 11 AND SUBSTRING({$phone}, 1, 1) = '1' THEN SUBSTRING({$phone}, 2, 10) ELSE {$phone} END";
+    }
 
-        $dropNames = $this->dropNamesForPks($pks);
-
-        foreach (array_chunk($dropNames, 200) as $chunk) {
-            $this->table('TblMailersUniqueEnriched')
-                ->whereIn('Drop_Name', $chunk)
-                ->update(['Latest_Export_Date' => $exportedAt->toDateString()]);
+    /** @param resource $out @param array<int, mixed> $values */
+    protected function writeCsv(mixed $out, array $values): void
+    {
+        $values = array_map(function (mixed $value): string {
+            $text = (string) ($value ?? '');
+            return preg_match('/^[=+@\\-\\t\\r\\n]/', $text) ? "'".$text : $text;
+        }, $values);
+        if (fputcsv($out, $values, ',', '"', '') === false) {
+            throw new RuntimeException('Unable to write the SMS export.');
         }
-
-        return $exportedAt;
     }
 }

@@ -147,4 +147,45 @@ class MarketingReportRepository extends SqlSrvRepository
             }
         }
     }
+
+    public function smsExports(string $week): Collection
+    {
+        $start = \Carbon\Carbon::parse($week)->startOfWeek()->toDateString();
+        return $this->table('TblSmsExports')->where('Week_Start', $start)->orderBy('PK')->get();
+    }
+
+    /** @param array{kind:string,invoice_number:string,cost:string,week:string,vendor?:?string} $data */
+    public function allocateInvoice(array $data): void
+    {
+        $this->connection()->transaction(function () use ($data): void {
+            $start = \Carbon\Carbon::parse($data['week'])->startOfWeek();
+            $sms = $data['kind'] === 'sms';
+            if ($sms) {
+                $query = $this->table('TblSmsExports')->where('Week_Start', $start->toDateString());
+                $countColumn = 'SMS_Count';
+                $costColumn = 'SMS_Cost';
+                $invoiceColumn = 'SMS_Invoice_Number';
+                $table = 'TblSmsExports';
+            } else {
+                $table = 'TblMarketing';
+                $query = $this->table($table)
+                    ->whereBetween('Send_Date', [$start->toDateString(), $start->copy()->endOfWeek()->toDateString()])
+                    ->where('Vendor', $data['vendor']);
+                $countColumn = 'Amount_Dropped';
+                $costColumn = $data['kind'] === 'mail' ? 'Mail_Drop_Cost' : 'Data_Drop_Cost';
+                $invoiceColumn = $data['kind'] === 'mail' ? 'Mail_Invoice_Number' : 'Data_Invoice_Number';
+            }
+            $rows = $query->orderBy('PK')->lockForUpdate()->get(['PK', $countColumn]);
+            if ($rows->isEmpty()) {
+                throw \Illuminate\Validation\ValidationException::withMessages(['week' => 'No drops match this week and vendor.']);
+            }
+            $counts = $rows->mapWithKeys(fn (object $row): array => [(int) $row->PK => (int) $row->{$countColumn}])->all();
+            $costs = (new \Cmd\Reports\Services\SmsDropPlanner)->allocate((string) $data['cost'], $counts);
+            foreach ($costs as $pk => $cost) {
+                $this->table($table)->where('PK', $pk)->update([
+                    $costColumn => $cost, $invoiceColumn => $data['invoice_number'],
+                ]);
+            }
+        });
+    }
 }
