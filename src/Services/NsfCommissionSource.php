@@ -27,7 +27,7 @@ final class NsfCommissionSource
             WITH active_fields AS (
                 SELECT CONTACT_ID, CUSTOM_ID, F_SHORTSTRING, F_STRING, F_DATE
                 FROM CONTACTS_USERFIELDS
-                WHERE _FIVETRAN_DELETED = FALSE
+                WHERE (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
                   AND CUSTOM_ID IN ($agentId, $returnId, $actionId, $recoupId)
             ), agents AS (
                 SELECT CONTACT_ID,
@@ -55,7 +55,7 @@ final class NsfCommissionSource
                     TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', t.CLEARED_DATE) AS DATE), 'YYYY-MM-DD') AS CLEARED_DATE,
                     CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE) AS PROCESS_DATE
                 FROM TRANSACTIONS t JOIN candidates c ON c.CONTACT_ID = t.CONTACT_ID
-                WHERE t._FIVETRAN_DELETED = FALSE AND t.TRANS_TYPE = 'D'
+                WHERE (t._FIVETRAN_DELETED = FALSE OR t._FIVETRAN_DELETED IS NULL) AND t.TRANS_TYPE = 'D'
                   AND t.CLEARED_DATE IS NOT NULL AND t.RETURNED_DATE IS NULL
                   AND (t.RETURN_CODE IS NULL OR t.RETURN_CODE = '')
             ), payment_presence AS (

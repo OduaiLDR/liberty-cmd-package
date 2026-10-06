@@ -460,13 +460,13 @@ class GenerateRetentionCommissionReport extends Command
             WITH relevant_contacts AS (
                 SELECT CONTACT_ID
                 FROM CONTACTS_USERFIELDS
-                WHERE CUSTOM_ID = $cc AND _FIVETRAN_DELETED = FALSE
+                WHERE CUSTOM_ID = $cc AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
                   AND F_DATETIME >= '$windowStart'::TIMESTAMP_NTZ
                   AND F_DATETIME < '$windowEnd'::TIMESTAMP_NTZ
                 UNION
                 SELECT CONTACT_ID
                 FROM CONTACTS_USERFIELDS
-                WHERE CUSTOM_ID = $cd AND _FIVETRAN_DELETED = FALSE
+                WHERE CUSTOM_ID = $cd AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
                   AND F_DATE >= '$windowStart'::DATE
                   AND F_DATE < '$windowEnd'::DATE
                 UNION
@@ -480,25 +480,25 @@ class GenerateRetentionCommissionReport extends Command
                 SELECT DISTINCT uf.CONTACT_ID, uf.F_STRING
                 FROM CONTACTS_USERFIELDS uf
                 JOIN relevant_contacts relevant ON relevant.CONTACT_ID = uf.CONTACT_ID
-                WHERE uf.CUSTOM_ID = $ca AND uf._FIVETRAN_DELETED = FALSE
+                WHERE uf.CUSTOM_ID = $ca AND (uf._FIVETRAN_DELETED = FALSE OR uf._FIVETRAN_DELETED IS NULL)
             ),
             retention_fields AS (
                 SELECT DISTINCT uf.CONTACT_ID, uf.F_DATE
                 FROM CONTACTS_USERFIELDS uf
                 JOIN relevant_contacts relevant ON relevant.CONTACT_ID = uf.CONTACT_ID
-                WHERE uf.CUSTOM_ID = $cd AND uf._FIVETRAN_DELETED = FALSE
+                WHERE uf.CUSTOM_ID = $cd AND (uf._FIVETRAN_DELETED = FALSE OR uf._FIVETRAN_DELETED IS NULL)
             ),
             result_fields AS (
                 SELECT DISTINCT uf.CONTACT_ID, uf.F_STRING
                 FROM CONTACTS_USERFIELDS uf
                 JOIN relevant_contacts relevant ON relevant.CONTACT_ID = uf.CONTACT_ID
-                WHERE uf.CUSTOM_ID = $cr AND uf._FIVETRAN_DELETED = FALSE
+                WHERE uf.CUSTOM_ID = $cr AND (uf._FIVETRAN_DELETED = FALSE OR uf._FIVETRAN_DELETED IS NULL)
             ),
             cancel_fields AS (
                 SELECT DISTINCT uf.CONTACT_ID, uf.F_DATETIME
                 FROM CONTACTS_USERFIELDS uf
                 JOIN relevant_contacts relevant ON relevant.CONTACT_ID = uf.CONTACT_ID
-                WHERE uf.CUSTOM_ID = $cc AND uf._FIVETRAN_DELETED = FALSE
+                WHERE uf.CUSTOM_ID = $cc AND (uf._FIVETRAN_DELETED = FALSE OR uf._FIVETRAN_DELETED IS NULL)
             )
             SELECT
                 c.ID,
@@ -520,7 +520,7 @@ class GenerateRetentionCommissionReport extends Command
                 SELECT debt.CONTACT_ID, SUM(debt.ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT
                 FROM DEBTS debt
                 JOIN relevant_contacts eligible ON eligible.CONTACT_ID = debt.CONTACT_ID
-                WHERE debt.ENROLLED=1 AND debt._FIVETRAN_DELETED=FALSE
+                WHERE debt.ENROLLED=1 AND (debt._FIVETRAN_DELETED = FALSE OR debt._FIVETRAN_DELETED IS NULL)
                 GROUP BY debt.CONTACT_ID
             ) d ON c.ID = d.CONTACT_ID
             WHERE cu1.CONTACT_ID IS NOT NULL

@@ -693,7 +693,7 @@ class SyncContactsData extends Command
                 SELECT c.*
                 FROM CONTACTS AS c
                 WHERE {$changed}
-                  AND c.DEL = 'FALSE' AND c._FIVETRAN_DELETED = FALSE
+                  AND c.DEL = 'FALSE' AND (c._FIVETRAN_DELETED = FALSE OR c._FIVETRAN_DELETED IS NULL)
                   AND c.FIRSTNAME IS NOT NULL AND c.FIRSTNAME <> ''
                   AND c.ISCOAPP = 0
                   AND c.ID > {$lastId}
@@ -704,7 +704,7 @@ class SyncContactsData extends Command
                 SELECT s.CONTACT_ID, s.STAGE_ID, s.STATUS_ID, s.STAMP
                 FROM CONTACTS_STATUS AS s
                 JOIN contact_page AS p ON p.ID = s.CONTACT_ID
-                WHERE s._FIVETRAN_DELETED = FALSE
+                WHERE (s._FIVETRAN_DELETED = FALSE OR s._FIVETRAN_DELETED IS NULL)
                 QUALIFY ROW_NUMBER() OVER (PARTITION BY s.CONTACT_ID ORDER BY s.STAMP DESC, s.ID DESC) = 1
             ),
             page_scores AS (
@@ -729,7 +729,7 @@ class SyncContactsData extends Command
                 SELECT d.CONTACT_ID, SUM(d.ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT
                 FROM DEBTS AS d
                 JOIN contact_page AS p ON p.ID = d.CONTACT_ID
-                WHERE d.ENROLLED = 1 AND d._FIVETRAN_DELETED = FALSE
+                WHERE d.ENROLLED = 1 AND (d._FIVETRAN_DELETED = FALSE OR d._FIVETRAN_DELETED IS NULL)
                 GROUP BY d.CONTACT_ID
             ),
             page_debt_field AS (
@@ -777,8 +777,8 @@ class SyncContactsData extends Command
                 uf_agent.F_SHORTSTRING AS AGENT_CUSTOM
             FROM contact_page AS c
             LEFT JOIN DATA_SOURCES AS ds ON c.C_SOURCE = ds.ID
-            LEFT JOIN USERS AS u1 ON c.CREATED_BY = u1.UID AND u1._FIVETRAN_DELETED = FALSE
-            LEFT JOIN USERS AS u2 ON c.ASSIGNED_TO = u2.UID AND u2._FIVETRAN_DELETED = FALSE
+            LEFT JOIN USERS AS u1 ON c.CREATED_BY = u1.UID AND (u1._FIVETRAN_DELETED = FALSE OR u1._FIVETRAN_DELETED IS NULL)
+            LEFT JOIN USERS AS u2 ON c.ASSIGNED_TO = u2.UID AND (u2._FIVETRAN_DELETED = FALSE OR u2._FIVETRAN_DELETED IS NULL)
             LEFT JOIN page_status AS s ON c.ID = s.CONTACT_ID
             LEFT JOIN CONTACTS_CATEGORIES AS cc ON s.STAGE_ID = cc.ID
             LEFT JOIN CONTACTS_LEAD_STATUS AS cls ON s.STATUS_ID = cls.ID
@@ -804,7 +804,7 @@ class SyncContactsData extends Command
                 SELECT c.*
                 FROM CONTACTS c
                 WHERE {$changed}
-                  AND c.DEL = 'FALSE' AND c._FIVETRAN_DELETED = FALSE
+                  AND c.DEL = 'FALSE' AND (c._FIVETRAN_DELETED = FALSE OR c._FIVETRAN_DELETED IS NULL)
                   AND c.FIRSTNAME IS NOT NULL AND c.FIRSTNAME <> ''
                   AND c.ISCOAPP = 0
                   AND c.ID > {$lastId}
@@ -813,8 +813,8 @@ class SyncContactsData extends Command
                       JOIN CONTACTS_LEAD_STATUS eligible_lead ON eligible_status.STATUS_ID = eligible_lead.ID
                       WHERE eligible_status.CONTACT_ID = c.ID
                         AND eligible_lead.TITLE <> 'Duplicate Lead'
-                        AND eligible_status._FIVETRAN_DELETED = FALSE
-                        AND eligible_lead._FIVETRAN_DELETED = FALSE
+                        AND (eligible_status._FIVETRAN_DELETED = FALSE OR eligible_status._FIVETRAN_DELETED IS NULL)
+                        AND (eligible_lead._FIVETRAN_DELETED = FALSE OR eligible_lead._FIVETRAN_DELETED IS NULL)
                   )
                 ORDER BY c.ID
                 LIMIT {$limit}
@@ -823,7 +823,7 @@ class SyncContactsData extends Command
                 SELECT a.CONTACT_ID, a.STAMP
                 FROM CONTACTS_ASSIGNED AS a
                 JOIN contact_page AS p ON p.ID = a.CONTACT_ID
-                WHERE a._FIVETRAN_DELETED = FALSE
+                WHERE (a._FIVETRAN_DELETED = FALSE OR a._FIVETRAN_DELETED IS NULL)
                 QUALIFY ROW_NUMBER() OVER (PARTITION BY a.CONTACT_ID ORDER BY a.STAMP DESC, a.ID DESC) = 1
             ),
             page_status AS (
@@ -832,7 +832,7 @@ class SyncContactsData extends Command
                 JOIN contact_page AS p ON p.ID = s.CONTACT_ID
                 JOIN CONTACTS_LEAD_STATUS AS eligible_cls ON eligible_cls.ID = s.STATUS_ID
                 WHERE eligible_cls.TITLE <> 'Duplicate Lead'
-                  AND s._FIVETRAN_DELETED = FALSE AND eligible_cls._FIVETRAN_DELETED = FALSE
+                  AND (s._FIVETRAN_DELETED = FALSE OR s._FIVETRAN_DELETED IS NULL) AND (eligible_cls._FIVETRAN_DELETED = FALSE OR eligible_cls._FIVETRAN_DELETED IS NULL)
                 QUALIFY ROW_NUMBER() OVER (PARTITION BY s.CONTACT_ID ORDER BY s.STAMP DESC, s.ID DESC) = 1
             ),
             page_scores AS (
@@ -891,8 +891,8 @@ class SyncContactsData extends Command
             FROM contact_page AS c
             LEFT JOIN page_assignment AS a ON c.ID = a.CONTACT_ID
             LEFT JOIN DATA_SOURCES AS ds ON c.C_SOURCE = ds.ID
-            LEFT JOIN USERS AS u1 ON c.CREATED_BY = u1.UID AND u1._FIVETRAN_DELETED = FALSE
-            LEFT JOIN USERS AS u2 ON c.ASSIGNED_TO = u2.UID AND u2._FIVETRAN_DELETED = FALSE
+            LEFT JOIN USERS AS u1 ON c.CREATED_BY = u1.UID AND (u1._FIVETRAN_DELETED = FALSE OR u1._FIVETRAN_DELETED IS NULL)
+            LEFT JOIN USERS AS u2 ON c.ASSIGNED_TO = u2.UID AND (u2._FIVETRAN_DELETED = FALSE OR u2._FIVETRAN_DELETED IS NULL)
             JOIN page_status AS s ON c.ID = s.CONTACT_ID
             LEFT JOIN CONTACTS_CATEGORIES AS cc ON s.STAGE_ID = cc.ID
             LEFT JOIN CONTACTS_LEAD_STATUS AS cls ON s.STATUS_ID = cls.ID

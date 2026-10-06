@@ -237,7 +237,7 @@ final class OfferAuthorizationFakeConnector extends DBConnector
 
     public function __construct(private readonly array $result) {}
 
-    public function query(string $sql, array $bindings = []): array
+    public function query(string $sql, array $bindings = [], ?int $timeoutSeconds = null): array
     {
         $this->sql = $sql;
 

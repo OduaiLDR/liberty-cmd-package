@@ -450,7 +450,7 @@ class GenerateRetentionBonusCommission extends Command
               AND CLEARED_DATE IS NOT NULL
               AND RETURNED_DATE IS NULL
               AND (RETURN_CODE IS NULL OR RETURN_CODE = '')
-              AND _FIVETRAN_DELETED = FALSE
+              AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
               AND CONTACT_ID IN ($idList)
             ORDER BY CONTACT_ID ASC, CLEARED_DATE ASC
         ");
@@ -516,19 +516,19 @@ class GenerateRetentionBonusCommission extends Command
             FROM CONTACTS c
             LEFT JOIN CONTACTS_USERFIELDS cu1
               ON c.ID = cu1.CONTACT_ID
-             AND cu1._FIVETRAN_DELETED = FALSE
+             AND (cu1._FIVETRAN_DELETED = FALSE OR cu1._FIVETRAN_DELETED IS NULL)
             LEFT JOIN (
                 SELECT CONTACT_ID, F_DATE
                 FROM CONTACTS_USERFIELDS
                 WHERE CUSTOM_ID = $cd
-                  AND _FIVETRAN_DELETED = FALSE
+                  AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
             ) cu2 ON c.ID = cu2.CONTACT_ID
             LEFT JOIN CONTACTS_USERFIELDS cu3
               ON c.ID = cu3.CONTACT_ID
-             AND cu3._FIVETRAN_DELETED = FALSE
+             AND (cu3._FIVETRAN_DELETED = FALSE OR cu3._FIVETRAN_DELETED IS NULL)
             LEFT JOIN (
                 SELECT CONTACT_ID, SUM(ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT
-                FROM DEBTS WHERE ENROLLED=1 AND _FIVETRAN_DELETED=FALSE GROUP BY CONTACT_ID
+                FROM DEBTS WHERE ENROLLED=1 AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL) GROUP BY CONTACT_ID
             ) d ON c.ID=d.CONTACT_ID
             WHERE cu1.CUSTOM_ID = $ca
               AND cu3.CUSTOM_ID = $cr

@@ -103,7 +103,7 @@ class GenerateCompanyStatsReport extends Command
             SELECT SUM(ORIGINAL_DEBT_AMOUNT)
             FROM DEBTS
             WHERE ENROLLED = 1
-              AND _FIVETRAN_DELETED = FALSE
+              AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
               AND SETTLED = 0
               AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE ENROLLED = 1 OR GRADUATED = 1)
               AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE {$clientFilter})
@@ -112,7 +112,7 @@ class GenerateCompanyStatsReport extends Command
             SELECT SUM(ORIGINAL_DEBT_AMOUNT)
             FROM DEBTS
             WHERE ENROLLED = 1
-              AND _FIVETRAN_DELETED = FALSE
+              AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
               AND SETTLED = 0
               AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE ENROLLED = 1 OR GRADUATED = 1)
               AND CONTACT_ID IN (
@@ -127,7 +127,7 @@ class GenerateCompanyStatsReport extends Command
             SELECT SUM(ORIGINAL_DEBT_AMOUNT)
             FROM DEBTS
             WHERE ENROLLED = 1
-              AND _FIVETRAN_DELETED = FALSE
+              AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
               AND COALESCE(CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE), '2018-01-01') >= '2019-01-01'
               AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE ENROLLED = 1 OR GRADUATED = 1)
               AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE {$clientFilter})
@@ -136,7 +136,7 @@ class GenerateCompanyStatsReport extends Command
             SELECT SUM(ORIGINAL_DEBT_AMOUNT)
             FROM DEBTS
             WHERE ENROLLED = 1
-              AND _FIVETRAN_DELETED = FALSE
+              AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
               AND COALESCE(CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE), '2018-01-01') >= '{$this->esc($yearStart)}'
               AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE ENROLLED = 1 OR GRADUATED = 1)
               AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE {$clientFilter})
@@ -147,7 +147,7 @@ class GenerateCompanyStatsReport extends Command
             SELECT COUNT(*)
             FROM DEBTS
             WHERE ENROLLED = 1
-              AND _FIVETRAN_DELETED = FALSE
+              AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
               AND COALESCE(CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE), '2018-01-01') >= '2019-01-01'
               AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE {$clientFilter})
         ");
@@ -155,7 +155,7 @@ class GenerateCompanyStatsReport extends Command
             SELECT COUNT(*)
             FROM DEBTS
             WHERE ENROLLED = 1
-              AND _FIVETRAN_DELETED = FALSE
+              AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
               AND COALESCE(CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE), '2018-01-01') >= '{$this->esc($yearStart)}'
               AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE {$clientFilter})
         ");
@@ -169,7 +169,7 @@ class GenerateCompanyStatsReport extends Command
                        ROW_NUMBER() OVER (PARTITION BY CONTACT_ID ORDER BY CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) ASC) AS N
                 FROM DEBTS
                 WHERE ENROLLED = 1
-                  AND _FIVETRAN_DELETED = FALSE
+                  AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
                   AND COALESCE(CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE), '2018-01-01') >= '2019-01-01'
                   AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE ENROLLED = 1 OR GRADUATED = 1)
                   AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE {$clientFilter})
@@ -186,7 +186,7 @@ class GenerateCompanyStatsReport extends Command
                        ROW_NUMBER() OVER (PARTITION BY CONTACT_ID ORDER BY CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) ASC) AS N
                 FROM DEBTS
                 WHERE ENROLLED = 1
-                  AND _FIVETRAN_DELETED = FALSE
+                  AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
                   AND COALESCE(CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE), '2018-01-01') >= '2019-01-01'
                   AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE ENROLLED = 1 OR GRADUATED = 1)
                   AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE {$clientFilter})
@@ -203,7 +203,7 @@ class GenerateCompanyStatsReport extends Command
                 SELECT SUM(ORIGINAL_DEBT_AMOUNT) AS ORIGINAL_DEBT_AMOUNT_SUM
                 FROM DEBTS
                 WHERE ENROLLED = 1
-                  AND _FIVETRAN_DELETED = FALSE
+                  AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
                   AND COALESCE(CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE), '2018-01-01') >= '2019-01-01'
                   AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE ENROLLED = 1 OR GRADUATED = 1)
                   AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE {$clientFilter})
@@ -216,7 +216,7 @@ class GenerateCompanyStatsReport extends Command
                 SELECT SUM(ORIGINAL_DEBT_AMOUNT) AS ORIGINAL_DEBT_AMOUNT_SUM
                 FROM DEBTS
                 WHERE ENROLLED = 1
-                  AND _FIVETRAN_DELETED = FALSE
+                  AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
                   AND COALESCE(CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE), '2018-01-01') >= '{$this->esc($yearStart)}'
                   AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE ENROLLED = 1 OR GRADUATED = 1)
                   AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE {$clientFilter})
@@ -231,7 +231,7 @@ class GenerateCompanyStatsReport extends Command
                 SELECT COUNT(*) AS ACCOUNTS
                 FROM DEBTS
                 WHERE ENROLLED = 1
-                  AND _FIVETRAN_DELETED = FALSE
+                  AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
                   AND COALESCE(CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE), '2018-01-01') >= '2019-01-01'
                   AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE {$clientFilter})
                 GROUP BY YEAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE)), MONTH(CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE))
@@ -243,7 +243,7 @@ class GenerateCompanyStatsReport extends Command
                 SELECT COUNT(*) AS ACCOUNTS
                 FROM DEBTS
                 WHERE ENROLLED = 1
-                  AND _FIVETRAN_DELETED = FALSE
+                  AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
                   AND COALESCE(CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE), '2018-01-01') >= '{$this->esc($yearStart)}'
                   AND CONTACT_ID IN (SELECT ID FROM CONTACTS WHERE {$clientFilter})
                 GROUP BY YEAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE)), MONTH(CAST(CONVERT_TIMEZONE('America/Los_Angeles', SETTLEMENT_DATE) AS DATE))

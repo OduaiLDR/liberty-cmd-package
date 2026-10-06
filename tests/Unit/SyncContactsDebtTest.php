@@ -118,7 +118,7 @@ class SyncContactsDebtTest extends TestCase
         (new ReflectionProperty(SyncContactsData::class, 'agentCustomId'))->setValue($command, 742153);
         $sql = (new ReflectionMethod(SyncContactsData::class, 'buildStandardQuery'))->invoke($command, '2021-07-01', 0, 10);
         self::assertStringContainsString('SUM(d.ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT', $sql);
-        self::assertStringContainsString('WHERE d.ENROLLED = 1 AND d._FIVETRAN_DELETED = FALSE', $sql);
+        self::assertStringContainsString('WHERE d.ENROLLED = 1 AND (d._FIVETRAN_DELETED = FALSE OR d._FIVETRAN_DELETED IS NULL)', $sql);
         self::assertStringContainsString('GROUP BY d.CONTACT_ID', $sql);
         self::assertStringContainsString('d.ENROLLED_DEBT,', $sql);
         $lt = (new ReflectionMethod(SyncContactsData::class, 'buildLTQuery'))->invoke($command, '2021-07-01', 0, 10);

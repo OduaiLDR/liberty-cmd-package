@@ -149,9 +149,9 @@ final class RetentionRetainedMonthTierTest extends TestCase
         $this->assertStringContainsString('JOIN relevant_contacts eligible', $source->lastSql);
         $this->assertSame(4, substr_count($source->lastSql, 'JOIN relevant_contacts relevant'));
         $this->assertSame(4, substr_count($source->lastSql, 'SELECT DISTINCT uf.CONTACT_ID'));
-        $this->assertStringContainsString('WHERE uf.CUSTOM_ID = 1 AND uf._FIVETRAN_DELETED = FALSE', $source->lastSql);
-        $this->assertStringContainsString('WHERE uf.CUSTOM_ID = 3 AND uf._FIVETRAN_DELETED = FALSE', $source->lastSql);
-        $this->assertStringContainsString('WHERE uf.CUSTOM_ID = 4 AND uf._FIVETRAN_DELETED = FALSE', $source->lastSql);
+        $this->assertStringContainsString('WHERE uf.CUSTOM_ID = 1 AND (uf._FIVETRAN_DELETED = FALSE OR uf._FIVETRAN_DELETED IS NULL)', $source->lastSql);
+        $this->assertStringContainsString('WHERE uf.CUSTOM_ID = 3 AND (uf._FIVETRAN_DELETED = FALSE OR uf._FIVETRAN_DELETED IS NULL)', $source->lastSql);
+        $this->assertStringContainsString('WHERE uf.CUSTOM_ID = 4 AND (uf._FIVETRAN_DELETED = FALSE OR uf._FIVETRAN_DELETED IS NULL)', $source->lastSql);
     }
 
     public function test_retained_status_selection_is_as_of_the_report_end_date(): void

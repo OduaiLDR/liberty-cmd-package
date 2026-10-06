@@ -105,12 +105,12 @@ class RetentionLookbackSourceGuardTest extends TestCase
         $this->assertStringContainsString("AS DATE) >= '2098-01-01'", $source->sql);
         $this->assertStringContainsString("AS DATE) < '2098-02-01'", $source->sql);
         $this->assertStringNotContainsString('AND cu2.F_DATE', $source->sql);
-        $this->assertSame(3, substr_count($source->sql, '_FIVETRAN_DELETED = FALSE'),
-            'Only current agent, retention-date, and result custom-field rows may join a contact.');
-        $this->assertStringContainsString('cu1._FIVETRAN_DELETED = FALSE', $source->sql);
-        $this->assertStringContainsString('cu3._FIVETRAN_DELETED = FALSE', $source->sql);
+        $this->assertSame(4, substr_count($source->sql, '_FIVETRAN_DELETED = FALSE'),
+            'Current custom-field and debt rows must be retained.');
+        $this->assertStringContainsString('(cu1._FIVETRAN_DELETED = FALSE OR cu1._FIVETRAN_DELETED IS NULL)', $source->sql);
+        $this->assertStringContainsString('(cu3._FIVETRAN_DELETED = FALSE OR cu3._FIVETRAN_DELETED IS NULL)', $source->sql);
         $this->assertMatchesRegularExpression(
-            '/SELECT CONTACT_ID, F_DATE\s+FROM CONTACTS_USERFIELDS\s+WHERE CUSTOM_ID = 742101\s+AND _FIVETRAN_DELETED = FALSE/s',
+            '/SELECT CONTACT_ID, F_DATE\s+FROM CONTACTS_USERFIELDS\s+WHERE CUSTOM_ID = 742101\s+AND \(_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL\)/s',
             $source->sql
         );
     }

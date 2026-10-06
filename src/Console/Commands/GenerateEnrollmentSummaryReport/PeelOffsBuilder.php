@@ -378,7 +378,7 @@ class PeelOffsBuilder
                            MAX(CASE WHEN (RETURNED_DATE IS NOT NULL AND CAST(RETURNED_DATE AS DATE) <= '{$reportDate}')
                                       OR (RETURNED_DATE IS NULL AND RETURN_CODE IS NOT NULL AND RETURN_CODE <> '') THEN 1 ELSE 0 END) AS RETURNED
                     FROM TRANSACTIONS
-                    WHERE TRANS_TYPE = 'D' AND _FIVETRAN_DELETED = FALSE
+                    WHERE TRANS_TYPE = 'D' AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
                       AND CONTACT_ID IN ({$in})
                       AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', PROCESS_DATE) AS DATE) <= '{$reportDate}'
                     GROUP BY CONTACT_ID";

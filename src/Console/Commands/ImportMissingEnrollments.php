@@ -139,7 +139,7 @@ class ImportMissingEnrollments extends Command
                     SUM(ORIGINAL_DEBT_AMOUNT) AS DEBT
                 FROM DEBTS
                 WHERE ENROLLED          = 1
-                  AND _FIVETRAN_DELETED = FALSE
+                  AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
                 GROUP BY CONTACT_ID
             ) AS d ON c.ID = d.CONTACT_ID
             LEFT JOIN (
@@ -157,7 +157,7 @@ class ImportMissingEnrollments extends Command
                         ) AS N
                     FROM TRANSACTIONS
                     WHERE TRANS_TYPE        = 'D'
-                      AND _FIVETRAN_DELETED = FALSE
+                      AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
                 )
                 WHERE N <= 2
                 GROUP BY CONTACT_ID
@@ -167,7 +167,7 @@ class ImportMissingEnrollments extends Command
             LEFT JOIN ENROLLMENT_DEFAULTS2 AS ed
                 ON ep.PLAN_ID = ed.ID
             WHERE CAST(CONVERT_TIMEZONE('America/Los_Angeles', c.ENROLLED_DATE) AS DATE) >= '2022-07-01'
-              AND c._FIVETRAN_DELETED = FALSE
+              AND (c._FIVETRAN_DELETED = FALSE OR c._FIVETRAN_DELETED IS NULL)
               AND c.DEL = 'FALSE'
         ";
 
