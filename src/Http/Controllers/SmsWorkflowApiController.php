@@ -62,13 +62,15 @@ class SmsWorkflowApiController extends Controller
         $export = isset($data['drop_pks'])
             ? $this->drops->prepareExport((int) $data['target'], $data['request_id'], array_map('intval', $data['drop_pks']))
             : $this->drops->prepareExport((int) $data['target'], $data['request_id']);
+        $zip = ($export['format'] ?? 'csv') === 'zip';
         clearstatcache(true, $export['path']);
         $response = new BinaryFileResponse($export['path'], 200, [
-            'Content-Type' => 'text/csv; charset=UTF-8',
+            'Content-Type' => $zip ? 'application/zip' : 'text/csv; charset=UTF-8',
             'X-SMS-Count' => (string) $export['count'],
+            'X-SMS-File-Count' => (string) ($export['part_count'] ?? 1),
             'Cache-Control' => 'private, no-store',
         ]);
-        $response->setContentDisposition('attachment', 'sms_export_'.now()->format('Ymd_His').'.csv');
+        $response->setContentDisposition('attachment', 'sms_export_'.now()->format('Ymd_His').($zip ? '.zip' : '.csv'));
 
         return $response->deleteFileAfterSend(true);
     }

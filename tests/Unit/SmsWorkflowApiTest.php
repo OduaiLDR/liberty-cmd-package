@@ -176,6 +176,23 @@ test('API export forwards only validated manual drop IDs', function () {
     }
 });
 
+test('API export labels a multi-file archive for download', function () {
+    $path = tempnam(sys_get_temp_dir(), 'sms-api-zip-');
+    file_put_contents($path, 'archive');
+    $id = '00000000-0000-4000-8000-000000000011';
+    $this->drops->shouldReceive('prepareExport')->once()->with(1000001, $id)
+        ->andReturn(['path' => $path, 'count' => 1000001, 'names' => ['SMS0011'], 'part_count' => 2, 'format' => 'zip']);
+    try {
+        $response = $this->controller->export(Request::create('/', 'POST', ['target' => 1000001, 'request_id' => $id]));
+        expect($response->headers->get('Content-Type'))->toBe('application/zip');
+        expect($response->headers->get('Content-Disposition'))->toContain('.zip');
+        expect($response->headers->get('X-SMS-File-Count'))->toBe('2');
+        expect($response->headers->get('X-SMS-Count'))->toBe('1000001');
+    } finally {
+        unlink($path);
+    }
+});
+
 class SmsApiTestSessionGuard {}
 class SmsApiTestPolicyGuard {}
 
