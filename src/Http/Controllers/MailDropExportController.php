@@ -38,12 +38,14 @@ class MailDropExportController extends Controller
         set_time_limit(0);
         $data = $request->validated();
         $export = $this->repository->prepareExport((int) $data['target'], $data['request_id']);
+        $zip = ($export['format'] ?? 'csv') === 'zip';
 
         clearstatcache(true, $export['path']);
 
-        return response()->download($export['path'], 'sms_export_'.now()->format('Ymd_His').'.csv', [
-            'Content-Type' => 'text/csv; charset=UTF-8',
+        return response()->download($export['path'], 'sms_export_'.now()->format('Ymd_His').($zip ? '.zip' : '.csv'), [
+            'Content-Type' => $zip ? 'application/zip' : 'text/csv; charset=UTF-8',
             'X-SMS-Count' => (string) $export['count'],
+            'X-SMS-File-Count' => (string) ($export['part_count'] ?? 1),
             'Cache-Control' => 'private, no-store',
         ])->deleteFileAfterSend(true);
     }

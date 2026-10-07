@@ -4,7 +4,8 @@
 <div class="card">
     <div class="card-header"><h6 class="mb-0">Mail Drop Export · SMS</h6></div>
     <div class="card-body">
-        <p>Choose a phone target. Whole drops are selected in order: fewest SMS exports first, newest unused drops first, then oldest last export. Synced contact phone numbers are excluded.</p>
+        <p>Choose a phone target. Whole drops are selected in order: fewest SMS exports first, newest unused drops first, then oldest last export. Synced contact phone numbers are excluded. Browsing shows drops immediately; eligible counts appear after selecting a target.</p>
+        <p>Each CSV contains at most 1,000,000 records. Larger exports download as a ZIP of numbered CSV files.</p>
         @if ($errors->any())
             <div class="alert alert-danger" role="alert">{{ $errors->first() }}</div>
         @endif
@@ -38,12 +39,12 @@
                 @forelse ($drops as $drop)
                     <tr>
                         <td>{{ $drop->Drop_Name }}</td><td>{{ $drop->Debt_Tier }}</td>
-                        <td>{{ number_format((int) $drop->Amount_Dropped) }}</td>
+                        <td>{{ $drop->Amount_Dropped === null ? '—' : number_format((int) $drop->Amount_Dropped) }}</td>
                         <td>{{ $drop->Send_Date }}</td><td>{{ $drop->SMS_Drops }}</td>
                         <td>{{ $drop->SMS_Last_Export_Date ?: $drop->Send_Date }}</td>
                     </tr>
                 @empty
-                    <tr><td colspan="6">No eligible drops found.</td></tr>
+                    <tr><td colspan="6">No drops found.</td></tr>
                 @endforelse
                 </tbody>
             </table>
@@ -71,20 +72,22 @@ document.addEventListener('DOMContentLoaded', function () {
         status.textContent = 'Building export…';
         try {
             const response = await fetch(form.action, {
-                method: 'POST', body: new FormData(form), headers: {'Accept': 'application/json'}
+                method: 'POST', body: new FormData(form), headers: {'Accept': 'text/csv, application/zip, application/json'}
             });
             if (!response.ok) {
                 const data = await response.json().catch(() => ({}));
                 throw new Error(Object.values(data.errors || {}).flat()[0] || 'Export failed. Refresh and try again.');
             }
-            if (!(response.headers.get('Content-Type') || '').includes('text/csv')) {
+            const contentType = (response.headers.get('Content-Type') || '').toLowerCase();
+            const zip = contentType.includes('application/zip');
+            if (!zip && !contentType.includes('text/csv')) {
                 throw new Error('Your session may have expired. Refresh and sign in again.');
             }
             const blob = await response.blob();
             const url = URL.createObjectURL(blob);
             const link = document.createElement('a');
             link.href = url;
-            link.download = 'sms_export.csv';
+            link.download = zip ? 'sms_export.zip' : 'sms_export.csv';
             document.body.appendChild(link);
             link.click();
             link.remove();

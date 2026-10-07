@@ -97,7 +97,8 @@ function smsFixture($db, int $pk, string $tier, string $date, array $phones): vo
 test('counts and CSV exclude synced phones including country-code and punctuation variants', function () {
     smsFixture($this->db, 1, 'T1', '2026-10-05', ['(202) 555-0101', '+1 202-555-0102', '2025550103', '', 'invalid']);
     $this->db->table('TblPhoneNumbers')->insert([['Phone' => '2025550101'], ['Phone' => '12025550102']]);
-    expect((int) $this->repo->allDrops()->first()->Amount_Dropped)->toBe(1);
+    expect($this->repo->allDrops()->first()->Amount_Dropped)->toBeNull();
+    expect((int) $this->repo->selectDrops(1)->first()->Amount_Dropped)->toBe(1);
     $export = $this->repo->prepareExport(1, '00000000-0000-4000-8000-000000000001');
     try {
         $csv = file_get_contents($export['path']);
@@ -310,6 +311,88 @@ test('marketing view renders SMS invoice fields and weekly totals', function () 
         ]]),
     ]);
     expect($html)->toContain('SMS0009')->toContain('INV-9')->toContain('$1.23')->not->toContain('Distribute SMS invoice');
+});
+
+test('splits CSV records into numbered archive parts without splitting export tracking', function () {
+    smsFixture($this->db, 1, 'T1', '2026-10-05', ['2025550101', '2025550102', '2025550103']);
+    $repo = new class extends MailDropExportRepository {
+        protected function csvRecordLimit(): int { return 2; }
+    };
+    $export = $repo->prepareExport(3, '00000000-0000-4000-8000-000000000101');
+    try {
+        expect($export['format'])->toBe('zip');
+        expect($export['part_count'])->toBe(2);
+        expect($export['count'])->toBe(3);
+        $zip = new ZipArchive;
+        expect($zip->open($export['path']))->toBeTrue();
+        try {
+            expect($zip->numFiles)->toBe(2);
+            $first = $zip->getFromIndex(0);
+            $second = $zip->getFromIndex(1);
+            expect(substr_count($first, "\n"))->toBe(3);
+            expect(substr_count($second, "\n"))->toBe(2);
+            expect($first)->toContain('2025550101')->toContain('2025550102')->not->toContain('2025550103');
+            expect($second)->toContain('2025550103');
+            expect(strtok($first, "\r\n"))->toBe(strtok($second, "\r\n"));
+        } finally {
+            $zip->close();
+        }
+        expect($this->db->table('TblSmsExports')->count())->toBe(1);
+        expect((int) $this->db->table('TblSmsExports')->value('SMS_Count'))->toBe(3);
+        expect((int) $this->db->table('TblMarketing')->value('SMS_Drops'))->toBe(1);
+    } finally {
+        unlink($export['path']);
+    }
+});
+
+test('keeps an export at the CSV row limit as one CSV', function () {
+    smsFixture($this->db, 1, 'T1', '2026-10-05', ['2025550101', '2025550102']);
+    $repo = new class extends MailDropExportRepository {
+        protected function csvRecordLimit(): int { return 2; }
+    };
+    $export = $repo->prepareExport(2, '00000000-0000-4000-8000-000000000102');
+    try {
+        expect($export['format'])->toBe('csv');
+        expect($export['part_count'])->toBe(1);
+        expect(substr_count(file_get_contents($export['path']), "\n"))->toBe(3);
+    } finally {
+        unlink($export['path']);
+    }
+});
+
+test('rolls back tracking when a later CSV part cannot be written', function () {
+    smsFixture($this->db, 1, 'T1', '2026-10-05', ['2025550101', '2025550102', '2025550103']);
+    $repo = new class extends MailDropExportRepository {
+        private int $writes = 0;
+        protected function csvRecordLimit(): int { return 2; }
+        protected function writeCsv(mixed $out, array $values): void {
+            if (++$this->writes === 4) throw new RuntimeException('Second part failed');
+            parent::writeCsv($out, $values);
+        }
+    };
+    expect(fn () => $repo->prepareExport(3, '00000000-0000-4000-8000-000000000103'))
+        ->toThrow(RuntimeException::class, 'Second part failed');
+    expect($this->db->table('TblSmsExports')->count())->toBe(0);
+    expect($this->db->table('TblSmsExportSources')->count())->toBe(0);
+    expect((int) $this->db->table('TblMarketing')->value('SMS_Drops'))->toBe(0);
+});
+
+test('removes CSV parts and rolls back tracking when archive creation fails', function () {
+    smsFixture($this->db, 1, 'T1', '2026-10-05', ['2025550101', '2025550102', '2025550103']);
+    $repo = new class extends MailDropExportRepository {
+        public array $createdPaths = [];
+        protected function csvRecordLimit(): int { return 2; }
+        protected function archiveCsvParts(array $parts, string $archivePath, Carbon $exportedAt): void {
+            $this->createdPaths = [...$parts, $archivePath];
+            throw new RuntimeException('Archive failed');
+        }
+    };
+    expect(fn () => $repo->prepareExport(3, '00000000-0000-4000-8000-000000000104'))
+        ->toThrow(RuntimeException::class, 'Archive failed');
+    expect($repo->createdPaths)->toHaveCount(3);
+    foreach ($repo->createdPaths as $path) expect(is_file($path))->toBeFalse();
+    expect($this->db->table('TblSmsExports')->count())->toBe(0);
+    expect((int) $this->db->table('TblMarketing')->value('SMS_Drops'))->toBe(0);
 });
 
 test('marketing rows flag an invoice recorded on another tier of the same drop', function () {

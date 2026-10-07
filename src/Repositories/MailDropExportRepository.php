@@ -12,6 +12,11 @@ use Throwable;
 
 class MailDropExportRepository extends SqlSrvRepository
 {
+    protected function csvRecordLimit(): int
+    {
+        return 1000000;
+    }
+
     protected function marketingDrops(): Builder
     {
         return $this->table('TblMarketing', 'm')
@@ -25,10 +30,9 @@ class MailDropExportRepository extends SqlSrvRepository
 
     public function allDrops(int $page = 1): Collection
     {
-        $counts = $this->eligiblePhones()->whereColumn('e.Drop_Name', 'm.Drop_Name')->selectRaw('COUNT(*)');
         return $this->marketingDrops()
             ->selectRaw('CASE WHEN m.Send_Date <= ? THEN 1 ELSE 0 END AS SMS_Selectable', [Carbon::today()->toDateString()])
-            ->selectSub($counts, 'Amount_Dropped')->forPage($page, 25)->get();
+            ->selectRaw('NULL AS Amount_Dropped')->forPage($page, 25)->get();
     }
 
     public function selectDrops(int $target): Collection
@@ -73,7 +77,7 @@ class MailDropExportRepository extends SqlSrvRepository
         return $selected;
     }
 
-    /** @return array{path:string, count:int, names:array<string>} */
+    /** @return array{path:string, count:int, names:array<string>, part_count:int, format:string} */
     public function prepareExport(int $target, string $requestId, ?array $dropPks = null): array
     {
         $path = tempnam(sys_get_temp_dir(), 'sms-export-');
@@ -81,8 +85,10 @@ class MailDropExportRepository extends SqlSrvRepository
             throw new RuntimeException('Unable to create the SMS export file.');
         }
 
+        $parts = [$path];
+        $archivePath = null;
         try {
-            return $this->connection()->transaction(function () use ($target, $requestId, $dropPks, $path): array {
+            return $this->connection()->transaction(function () use ($target, $requestId, $dropPks, $path, &$parts, &$archivePath): array {
                 $last = $this->table('TblSmsExports')->orderByDesc('PK')->lockForUpdate()->first();
                 if ($this->table('TblSmsExports')->where('Request_ID', $requestId)->exists()) {
                     throw ValidationException::withMessages(['target' => 'This request was already exported. Refresh before starting another export.']);
@@ -95,11 +101,19 @@ class MailDropExportRepository extends SqlSrvRepository
                 if ($selected->contains(fn (object $drop): bool => trim((string) $drop->Debt_Tier) === '')) {
                     throw ValidationException::withMessages(['target' => 'A selected drop is missing its debt tier. Correct the marketing record first.']);
                 }
+                $limit = $this->csvRecordLimit();
+                if ($limit < 1) {
+                    throw new RuntimeException('The SMS CSV row limit must be positive.');
+                }
+                if ($selected->sum('Amount_Dropped') > $limit && ! class_exists(\ZipArchive::class)) {
+                    throw new RuntimeException('The server needs PHP ZipArchive to package multiple SMS CSV files.');
+                }
                 $groups = $selected->groupBy('Debt_Tier')->sortKeys(SORT_NATURAL);
                 $next = (int) ($last->PK ?? 0);
                 $exportedAt = Carbon::now();
                 $total = 0;
                 $names = [];
+                $partRows = 0;
                 $out = fopen($path, 'wb');
                 if ($out === false) {
                     throw new RuntimeException('Unable to open the SMS export file.');
@@ -114,11 +128,33 @@ class MailDropExportRepository extends SqlSrvRepository
                         foreach ($drops as $drop) {
                             $sourceCount = 0;
                             foreach ($this->rowsForDrop($drop->Drop_Name) as $row) {
+                                if ($partRows >= $limit) {
+                                    if (! class_exists(\ZipArchive::class)) {
+                                        throw new RuntimeException('The server needs PHP ZipArchive to package multiple SMS CSV files.');
+                                    }
+                                    if (! fflush($out)) {
+                                        throw new RuntimeException('Unable to finish writing an SMS CSV part.');
+                                    }
+                                    fclose($out);
+                                    $out = null;
+                                    $partPath = tempnam(sys_get_temp_dir(), 'sms-export-');
+                                    if ($partPath === false) {
+                                        throw new RuntimeException('Unable to create another SMS CSV part.');
+                                    }
+                                    $parts[] = $partPath;
+                                    $out = fopen($partPath, 'wb');
+                                    if ($out === false) {
+                                        throw new RuntimeException('Unable to open another SMS CSV part.');
+                                    }
+                                    $this->writeCsv($out, ['SMS Drop', 'Debt Tier', 'Source Drop', 'First Name', 'Address', 'Debt', 'Phone', 'Send Date']);
+                                    $partRows = 0;
+                                }
                                 $this->writeCsv($out, [
                                     $name, $tier, $drop->Drop_Name,
                                     explode(' ', trim((string) $row->Client))[0],
                                     $row->Address, $row->Debt_Amount, $row->SMS_Phone, $drop->Send_Date,
                                 ]);
+                                $partRows++;
                                 $sourceCount++;
                             }
                             if ($sourceCount === 0) {
@@ -152,13 +188,59 @@ class MailDropExportRepository extends SqlSrvRepository
                         throw new RuntimeException('Unable to finish writing the SMS export.');
                     }
                 } finally {
-                    fclose($out);
+                    if (is_resource($out)) {
+                        fclose($out);
+                    }
                 }
 
-                return ['path' => $path, 'count' => $total, 'names' => $names];
+                if (count($parts) === 1) {
+                    return ['path' => $path, 'count' => $total, 'names' => $names, 'part_count' => 1, 'format' => 'csv'];
+                }
+                if (! class_exists(\ZipArchive::class)) {
+                    throw new RuntimeException('The server needs PHP ZipArchive to package multiple SMS CSV files.');
+                }
+                $archivePath = tempnam(sys_get_temp_dir(), 'sms-export-zip-');
+                if ($archivePath === false) {
+                    throw new RuntimeException('Unable to create the SMS archive.');
+                }
+                $this->archiveCsvParts($parts, $archivePath, $exportedAt);
+                foreach ($parts as $part) {
+                    unlink($part);
+                }
+                $partCount = count($parts);
+                $parts = [];
+                return ['path' => $archivePath, 'count' => $total, 'names' => $names, 'part_count' => $partCount, 'format' => 'zip'];
             });
         } catch (Throwable $exception) {
-            unlink($path);
+            foreach ($parts as $part) {
+                if (is_file($part)) unlink($part);
+            }
+            if ($archivePath !== null && is_file($archivePath)) unlink($archivePath);
+            throw $exception;
+        }
+    }
+
+    /** @param array<int, string> $parts */
+    protected function archiveCsvParts(array $parts, string $archivePath, Carbon $exportedAt): void
+    {
+        $zip = new \ZipArchive;
+        if ($zip->open($archivePath, \ZipArchive::CREATE | \ZipArchive::OVERWRITE) !== true) {
+            throw new RuntimeException('Unable to open the SMS archive.');
+        }
+        $closeAttempted = false;
+        try {
+            foreach ($parts as $index => $part) {
+                $filename = sprintf('sms_export_%s_part%03d.csv', $exportedAt->format('Ymd_His'), $index + 1);
+                if (! $zip->addFile($part, $filename)) {
+                    throw new RuntimeException('Unable to add an SMS CSV part to the archive.');
+                }
+            }
+            $closeAttempted = true;
+            if (! $zip->close()) {
+                throw new RuntimeException('Unable to finish the SMS archive.');
+            }
+        } catch (Throwable $exception) {
+            if (! $closeAttempted) $zip->close();
             throw $exception;
         }
     }
