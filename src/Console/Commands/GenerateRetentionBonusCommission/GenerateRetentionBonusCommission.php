@@ -101,8 +101,8 @@ class GenerateRetentionBonusCommission extends Command
         }
 
         $reportStartDate = $periodStart ?: date('Y-m-01', strtotime('first day of last month'));
-        [$baseStartDate, $endDate] = $this->lookbackWindow($reportStartDate);
-        $this->info("[INFO] Base period: $baseStartDate → $endDate; report cutoff period: $reportStartDate → $endDate");
+        $endDate = date('Y-m-t', strtotime($reportStartDate));
+        $this->info("[INFO] Report cutoff period: $reportStartDate → $endDate; reconsideration on or before each client's cutoff");
 
         try {
             $sf  = DBConnector::fromEnvironment($source);
@@ -115,39 +115,12 @@ class GenerateRetentionBonusCommission extends Command
         try {
             // Actual reconsideration events select the population; custom fields
             // supply attribution only and cannot substitute for status history.
-            $rows = $this->fetchBase($sf, $cfg, $baseStartDate, $endDate);
-            // Canonicalize verified CRM aliases before grouping, roster comparison,
-            // employee lookup, workbook rendering, and aggregate persistence.
-            $rows = RetentionAgentIdentity::canonicalizeRows($rows);
-            $this->info("[INFO] [$display] Base rows: " . count($rows));
+            // Ticket #578: a reconsideration before the first payment counts, so
+            // there is no lower date bound; the cutoff month narrows candidates.
+            $rows = $this->fetchBase($sf, $cfg, $endDate);
+            $this->info("[INFO] [$display] Candidate rows: " . count($rows));
 
-            $ids = array_filter(array_map(fn($r) => (int) $this->rowValue($r, 'ID', 0), $rows));
-            $idList = empty($ids) ? '0' : implode(',', $ids);
-
-            // STEP 2 – reconsideration dates
-            $reconMap = $this->fetchReconsiderationDates($sf, $cfg['recon_status_id'], $idList, $baseStartDate, $endDate);
-            foreach ($rows as &$row) {
-                $id = (string) $this->rowValue($row, 'ID', '');
-                $row['RECONSIDERATION_DATE'] = $reconMap[$id] ?? null;
-            }
-            unset($row);
-
-            // STEP 3 – retained dates
-            $retainedMap = $this->fetchRetainedDates($sf, $idList);
-            foreach ($rows as &$row) {
-                $recon = $this->dateValue($row['RECONSIDERATION_DATE'] ?? null);
-                $row['RETAINED_DATE'] = null;
-                $id = (string) $this->rowValue($row, 'ID', '');
-                if ($recon && !empty($retainedMap[$id])) {
-                    foreach ($retainedMap[$id] as $rd) {
-                        $retainedDate = $this->dateValue($rd);
-                        if ($retainedDate && $retainedDate >= $recon) { $row['RETAINED_DATE'] = $retainedDate; break; }
-                    }
-                }
-            }
-            unset($row);
-
-            // STEP 4 – SQL Server enrollment data in one batched query
+            // STEP 2 – SQL Server enrollment data in one batched query
             $llgIds = array_values(array_unique(array_filter(
                 array_map(fn ($r) => 'LLG-' . (string) $this->rowValue($r, 'ID', ''), $rows),
                 fn (string $id): bool => $id !== 'LLG-'
@@ -163,13 +136,51 @@ class GenerateRetentionBonusCommission extends Command
             }
             unset($row);
 
-            // STEP 5 – calculate cutoff (first payment + 3 months) and filter
+            // STEP 3 – cutoff (first payment + 3 months); only clients whose
+            // cutoff falls in the report month can qualify this period.
             foreach ($rows as &$row) {
                 $fp = $this->dateValue($row['FIRST_PAYMENT_CLEARED_DATE'] ?? null);
                 if ($fp) {
                     $row['CUTOFF'] = date('Y-m-d', strtotime('+3 months', strtotime($fp)));
                 } else {
                     $row['CUTOFF'] = null;
+                }
+            }
+            unset($row);
+            $rows = array_values(array_filter($rows, fn (array $row): bool =>
+                $this->cutoffInReportMonth($row, $reportStartDate, $endDate)
+            ));
+
+            // Duplicate contacts are checked only for clients that can qualify,
+            // so an old ambiguous CRM record cannot block this month's report.
+            $rows = $this->uniqueContactRows($rows);
+            // Canonicalize verified CRM aliases before grouping, roster comparison,
+            // employee lookup, workbook rendering, and aggregate persistence.
+            $rows = RetentionAgentIdentity::canonicalizeRows($rows);
+            $this->info("[INFO] [$display] Base rows (cutoff in report month): " . count($rows));
+
+            $ids = array_filter(array_map(fn($r) => (int) $this->rowValue($r, 'ID', 0), $rows));
+            $idList = empty($ids) ? '0' : implode(',', $ids);
+
+            // STEP 4 – first reconsideration date (eligibility requires it on or before the cutoff)
+            $reconMap = $this->fetchReconsiderationDates($sf, $cfg['recon_status_id'], $idList, $endDate);
+            foreach ($rows as &$row) {
+                $id = (string) $this->rowValue($row, 'ID', '');
+                $row['RECONSIDERATION_DATE'] = $reconMap[$id] ?? null;
+            }
+            unset($row);
+
+            // STEP 5 – retained dates
+            $retainedMap = $this->fetchRetainedDates($sf, $idList);
+            foreach ($rows as &$row) {
+                $recon = $this->dateValue($row['RECONSIDERATION_DATE'] ?? null);
+                $row['RETAINED_DATE'] = null;
+                $id = (string) $this->rowValue($row, 'ID', '');
+                if ($recon && !empty($retainedMap[$id])) {
+                    foreach ($retainedMap[$id] as $rd) {
+                        $retainedDate = $this->dateValue($rd);
+                        if ($retainedDate && $retainedDate >= $recon) { $row['RETAINED_DATE'] = $retainedDate; break; }
+                    }
                 }
             }
             unset($row);
@@ -183,7 +194,7 @@ class GenerateRetentionBonusCommission extends Command
             }
 
             $rows = array_values(array_filter($rows, fn (array $row): bool =>
-                $this->isEligibleLookbackRow($row, $baseStartDate, $reportStartDate, $endDate)
+                $this->isEligibleLookbackRow($row, $reportStartDate, $endDate)
             ));
             $this->info("[INFO] [$display] Eligible rows after filtering: " . count($rows));
 
@@ -391,12 +402,6 @@ class GenerateRetentionBonusCommission extends Command
         return $map;
     }
 
-    /** Four inclusive calendar months ending in the commission report month. */
-    private function lookbackWindow(string $reportStart): array
-    {
-        return [date('Y-m-01', strtotime('-3 months', strtotime($reportStart))), date('Y-m-t', strtotime($reportStart))];
-    }
-
     /** @param array<int,array{agent:string,amount:float}> $bonusResults */
     private function persistBonusResults(
         DBConnector $sql,
@@ -425,14 +430,22 @@ class GenerateRetentionBonusCommission extends Command
             && strtolower(trim($testRecipient)) !== self::SAFE_NO_WRITE_TEST_RECIPIENT;
     }
 
-    private function isEligibleLookbackRow(array $row, string $windowStart, string $reportStart, string $end): bool
+    private function cutoffInReportMonth(array $row, string $reportStart, string $end): bool
+    {
+        $cutoff = $this->dateValue($this->rowValue($row, 'CUTOFF'));
+        return $cutoff !== null && $cutoff >= $reportStart && $cutoff <= $end;
+    }
+
+    private function isEligibleLookbackRow(array $row, string $reportStart, string $end): bool
     {
         $recon = $this->dateValue($this->rowValue($row, 'RECONSIDERATION_DATE'));
         $retained = $this->dateValue($this->rowValue($row, 'RETAINED_DATE'));
         $dropped = $this->dateValue($this->rowValue($row, 'DROPPED_DATE'));
         $cutoff = $this->dateValue($this->rowValue($row, 'CUTOFF'));
-        if (!$recon || $recon < $windowStart || $recon > $end) return false;
-        if (!$cutoff || $cutoff < $reportStart || $cutoff > $end) return false;
+        if (!$this->cutoffInReportMonth($row, $reportStart, $end)) return false;
+        // Ticket #578: the reconsideration only has to be on or before the cutoff,
+        // including before the first payment; there is no earlier limit.
+        if (!$recon || $recon > $cutoff) return false;
         if (!$retained || $retained < $recon || $retained > $cutoff) return false;
         // A cancellation after this client's cutoff does not undo eligibility.
         if ($dropped && $dropped <= $cutoff) return false;
@@ -497,7 +510,8 @@ class GenerateRetentionBonusCommission extends Command
         return $rows;
     }
 
-    private function fetchBase(DBConnector $sf, array $cfg, string $start, string $end): array
+    /** Raw candidates; the caller checks duplicates after narrowing to the cutoff month. */
+    private function fetchBase(DBConnector $sf, array $cfg, string $end): array
     {
         $ca = (int)$cfg['custom_agent'];
         $cd = (int)$cfg['custom_date'];
@@ -536,14 +550,12 @@ class GenerateRetentionBonusCommission extends Command
               AND EXISTS (
                   SELECT 1 FROM CONTACTS_STATUS cs
                   WHERE cs.CONTACT_ID = c.ID AND cs.STATUS_ID = $reconStatus
-                    AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) AS DATE) >= '$start'
                     AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) AS DATE) < '$nextDay'
               )
             ORDER BY cu1.F_STRING ASC
         ";
         $res = $sf->query($sql);
-        $rows = $this->requireSnowflakeRows($res, 'Lookback base contacts');
-        return $this->uniqueContactRows($rows);
+        return $this->requireSnowflakeRows($res, 'Lookback base contacts');
     }
 
     /** An empty successful query is valid; a failed query must never clear payable results. */
@@ -622,14 +634,17 @@ class GenerateRetentionBonusCommission extends Command
         return $timestamp === false ? null : date('Y-m-d', $timestamp);
     }
 
-    private function fetchReconsiderationDates(DBConnector $sf, int $statusId, string $idList, string $start, string $end): array
+    /**
+     * First reconsideration on or before $end. The earliest event is used: if any
+     * reconsideration up to the cutoff was retained by the cutoff, the earliest one was too.
+     */
+    private function fetchReconsiderationDates(DBConnector $sf, int $statusId, string $idList, string $end): array
     {
         $nextDay = date('Y-m-d', strtotime('+1 day', strtotime($end)));
         $sql = "
             SELECT cs.CONTACT_ID, TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) AS DATE), 'YYYY-MM-DD') AS RECON_DATE
             FROM CONTACTS_STATUS cs WHERE cs.STATUS_ID=$statusId
              AND cs.CONTACT_ID IN ($idList)
-             AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) AS DATE) >= '$start'
              AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) AS DATE) < '$nextDay'
             ORDER BY cs.CONTACT_ID ASC, CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) ASC
         ";

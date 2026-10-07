@@ -102,7 +102,8 @@ class RetentionLookbackSourceGuardTest extends TestCase
         $this->assertSame(50.0, BonusFormatter::commissionTotals($unique)['alice smith']['commission']);
         $this->assertStringContainsString('EXISTS (', $source->sql);
         $this->assertStringContainsString('cs.STATUS_ID = 377650', $source->sql);
-        $this->assertStringContainsString("AS DATE) >= '2098-01-01'", $source->sql);
+        $this->assertStringNotContainsString("AS DATE) >= '", $source->sql,
+            'Ticket #578: a reconsideration before the first payment must not be excluded.');
         $this->assertStringContainsString("AS DATE) < '2098-02-01'", $source->sql);
         $this->assertStringNotContainsString('AND cu2.F_DATE', $source->sql);
         $this->assertSame(4, substr_count($source->sql, '_FIVETRAN_DELETED = FALSE'),
@@ -115,39 +116,49 @@ class RetentionLookbackSourceGuardTest extends TestCase
         );
     }
 
-    public function test_four_month_window_and_confirmed_eligibility_boundaries(): void
+    public function test_reconsideration_only_needs_to_be_on_or_before_cutoff(): void
     {
         $command = new GenerateRetentionBonusCommission;
-        $window = (new ReflectionMethod($command, 'lookbackWindow'))->invoke($command, '2098-09-01');
-        $this->assertSame(['2098-06-01', '2098-09-30'], $window);
         $eligible = new ReflectionMethod($command, 'isEligibleLookbackRow');
+        // First payment cleared 2098-06-20, so the cutoff is 2098-09-20 (September report).
         $base = ['RECONSIDERATION_DATE' => '2098-06-15', 'RETAINED_DATE' => '2098-06-16',
             'CUTOFF' => '2098-09-20', 'DROPPED_DATE' => '2098-09-24', 'PAYMENTS' => 3,
             'RETENTION_DATE' => '2098-05-01'];
         $check = static fn (array $changes): bool => $eligible->invoke($command, array_replace($base, $changes),
-            $window[0], '2098-09-01', $window[1]);
+            '2098-09-01', '2098-09-30');
         $this->assertTrue($check([]), 'Three payments and cancellation four days after cutoff remain eligible.');
         $this->assertTrue($check(['DROPPED_DATE' => null]));
         $this->assertFalse($check(['DROPPED_DATE' => '2098-09-19']));
         $this->assertFalse($check(['DROPPED_DATE' => '2098-09-20']), 'Existing on-cutoff exclusion is preserved.');
         $this->assertFalse($check(['PAYMENTS' => 2]));
         $this->assertFalse($check(['RECONSIDERATION_DATE' => null]), 'Custom retention date cannot substitute for an actual status.');
-        $this->assertFalse($check(['RECONSIDERATION_DATE' => '2098-05-31']));
+        $this->assertTrue($check(['RECONSIDERATION_DATE' => '2098-05-31']),
+            'Ticket #578: a reconsideration before the first payment is no longer excluded.');
+        $this->assertTrue($check(['RECONSIDERATION_DATE' => '2098-01-10', 'RETAINED_DATE' => '2098-01-12']),
+            'There is no earlier limit on the reconsideration date.');
+        $this->assertTrue($check(['RECONSIDERATION_DATE' => '2098-09-20', 'RETAINED_DATE' => '2098-09-20']));
+        $this->assertFalse($check(['RECONSIDERATION_DATE' => '2098-09-21', 'RETAINED_DATE' => '2098-09-21']),
+            'A reconsideration after the cutoff does not qualify.');
         $this->assertFalse($check(['RECONSIDERATION_DATE' => '2098-10-01']));
         $this->assertFalse($check(['RETAINED_DATE' => null]));
         $this->assertFalse($check(['RETAINED_DATE' => '2098-06-14']));
         $this->assertFalse($check(['RETAINED_DATE' => '2098-09-21']));
+        $this->assertFalse($check(['CUTOFF' => '2098-08-31']));
         $this->assertFalse($check(['CUTOFF' => '2098-10-01']));
+        $this->assertFalse($check(['CUTOFF' => null]));
     }
 
-    public function test_reconsideration_lookup_is_scoped_to_confirmed_window(): void
+    public function test_reconsideration_lookup_has_no_lower_date_bound(): void
     {
         $command = new GenerateRetentionBonusCommission;
-        $source = new LookbackGuardConnector([]);
+        $source = new LookbackGuardConnector([
+            ['CONTACT_ID' => '101', 'RECON_DATE' => '2098-05-02'],
+            ['CONTACT_ID' => '101', 'RECON_DATE' => '2098-08-10'],
+        ]);
         $result = (new ReflectionMethod($command, 'fetchReconsiderationDates'))->invoke($command,
-            $source, 377650, '101', '2098-06-01', '2098-09-30');
-        $this->assertSame([], $result);
-        $this->assertStringContainsString("AS DATE) >= '2098-06-01'", $source->sql);
+            $source, 377650, '101', '2098-09-30');
+        $this->assertSame(['101' => '2098-05-02'], $result, 'The earliest reconsideration is used.');
+        $this->assertStringNotContainsString("AS DATE) >= '", $source->sql);
         $this->assertStringContainsString("AS DATE) < '2098-10-01'", $source->sql);
     }
 
@@ -166,7 +177,7 @@ class RetentionLookbackSourceGuardTest extends TestCase
         $row = ['RECONSIDERATION_DATE' => '2098-06-15', 'RETAINED_DATE' => '2098-06-16',
             'CUTOFF' => '2098-09-20', 'DROPPED_DATE' => '2098-09-24',
             'PAYMENTS' => $count->invoke($command, ['2098-06-20', '2098-07-20', '2098-09-21'], '2098-09-20')];
-        $this->assertFalse($eligible->invoke($command, $row, '2098-06-01', '2098-09-01', '2098-09-30'));
+        $this->assertFalse($eligible->invoke($command, $row, '2098-09-01', '2098-09-30'));
     }
 
     public function test_payment_history_uses_cleared_active_deposits_and_pacific_dates(): void
@@ -258,7 +269,7 @@ class RetentionLookbackSourceGuardTest extends TestCase
     {
         $command = new GenerateRetentionBonusCommission;
         foreach ([
-            ['fetchReconsiderationDates', [377650, '101', '2098-01-01', '2098-04-30']],
+            ['fetchReconsiderationDates', [377650, '101', '2098-04-30']],
             ['fetchRetainedDates', ['101']],
         ] as [$method, $args]) {
             try {
@@ -293,14 +304,17 @@ class RetentionLookbackSourceGuardTest extends TestCase
         }
     }
 
+    /** fetchBase returns raw candidates; handle() applies the duplicate guard after the cutoff filter. */
     private function fetch(LookbackGuardConnector $source): array
     {
-        return (new ReflectionMethod(GenerateRetentionBonusCommission::class, 'fetchBase'))->invoke(
-            new GenerateRetentionBonusCommission,
+        $command = new GenerateRetentionBonusCommission;
+        $rows = (new ReflectionMethod($command, 'fetchBase'))->invoke(
+            $command,
             $source,
             ['custom_agent' => 742096, 'custom_date' => 742101, 'custom_results' => 742105, 'recon_status_id' => 377650],
-            '2098-01-01', '2098-01-31'
+            '2098-01-31'
         );
+        return (new ReflectionMethod($command, 'uniqueContactRows'))->invoke($command, $rows);
     }
 }
 
