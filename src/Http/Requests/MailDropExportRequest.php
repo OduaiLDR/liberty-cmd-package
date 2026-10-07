@@ -16,6 +16,8 @@ class MailDropExportRequest extends FormRequest
         return [
             'target' => ['required', 'integer', 'min:1', 'max:10000000'],
             'request_id' => ['required', 'uuid'],
+            'drop_pks' => ['sometimes', 'array', 'min:1', 'max:500'],
+            'drop_pks.*' => ['required', 'integer', 'min:1', 'distinct'],
         ];
     }
 }

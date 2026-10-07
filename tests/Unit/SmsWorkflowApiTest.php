@@ -78,6 +78,17 @@ test('API browse reports whether another page actually exists', function () {
     expect($data['target'])->toBe(0)->and($data['page'])->toBe(2)->and($data['has_more'])->toBeFalse();
 });
 
+test('API previews exactly the manually chosen drops without an amount target', function () {
+    $this->drops->shouldReceive('selectDropsByIds')->once()->with([7, 3])->andReturn(collect([
+        (object) ['PK' => 7, 'Drop_Name' => 'DROP7', 'Amount_Dropped' => 2],
+        (object) ['PK' => 3, 'Drop_Name' => 'DROP3', 'Amount_Dropped' => 3],
+    ]));
+    $data = $this->controller->preview(Request::create('/', 'GET', ['drop_pks' => ['7', '3']]))->getData(true);
+    expect($data['selection_mode'])->toBe('manual')->and($data['target'])->toBe(5)
+        ->and($data['total'])->toBe(5)->and($data['has_more'])->toBeFalse();
+    expect(array_column($data['drops'], 'PK'))->toBe([7, 3]);
+});
+
 test('API input rejects invalid targets identifiers dates and invoice costs before repository calls', function (string $method, array $data) {
     expect(fn () => $this->controller->{$method}(Request::create('/', in_array($method, ['preview', 'history']) ? 'GET' : 'POST', $data)))
         ->toThrow(ValidationException::class);
@@ -85,7 +96,11 @@ test('API input rejects invalid targets identifiers dates and invoice costs befo
     ['preview', ['target' => 0]],
     ['preview', ['target' => 10000001]],
     ['preview', ['page' => -1]],
+    ['preview', ['drop_pks' => []]],
+    ['preview', ['drop_pks' => [1, 1]]],
+    ['preview', ['drop_pks' => '1']],
     ['export', ['target' => 1, 'request_id' => 'invalid']],
+    ['export', ['target' => 1, 'request_id' => '00000000-0000-4000-8000-000000000001', 'drop_pks' => [1, 1]]],
     ['export', ['request_id' => '00000000-0000-4000-8000-000000000001']],
     ['history', ['week' => '2026-02-30']],
     ['invoice', ['kind' => 'sms', 'week' => '2026-10-05', 'invoice_number' => 'INV', 'cost' => '1.001']],
@@ -141,6 +156,21 @@ test('API export streams the repository file with count and attachment headers',
         expect($response->headers->get('X-SMS-Count'))->toBe('1');
         expect($response->headers->get('Content-Disposition'))->toContain('attachment');
         expect($response->getFile()->getPathname())->toBe($path);
+    } finally {
+        unlink($path);
+    }
+});
+
+test('API export forwards only validated manual drop IDs', function () {
+    $path = tempnam(sys_get_temp_dir(), 'sms-api-manual-');
+    file_put_contents($path, "Phone\n2025550100\n");
+    $id = '00000000-0000-4000-8000-000000000009';
+    $this->drops->shouldReceive('prepareExport')->once()->with(1, $id, [7])->andReturn(['path' => $path, 'count' => 1, 'names' => ['SMS0009']]);
+    try {
+        $response = $this->controller->export(Request::create('/', 'POST', [
+            'target' => 1, 'request_id' => $id, 'drop_pks' => ['7'],
+        ]));
+        expect($response->headers->get('X-SMS-Count'))->toBe('1');
     } finally {
         unlink($path);
     }

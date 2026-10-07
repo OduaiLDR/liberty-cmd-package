@@ -154,6 +154,8 @@ test('replaying an export request cannot increment counters twice', function () 
     expect(fn () => $this->repo->prepareExport(1, $request))->toThrow(ValidationException::class);
     expect((int) $this->db->table('TblMarketing')->value('SMS_Drops'))->toBe(1);
     expect($this->db->table('TblSmsExports')->count())->toBe(1);
+    expect($this->db->table('TblMarketing')->value('SMS_Last_Export_Date'))->toBe('2026-10-06 12:00:00');
+    expect((int) $this->db->table('TblSmsExportSources')->where('Marketing_PK', 1)->value('SMS_Count'))->toBe(1);
 });
 
 test('a file failure rolls back earlier tier logs and all counters', function () {
@@ -294,19 +296,14 @@ test('failed phone sync preserves the previous suppression snapshot', function (
         $table->integer('CID')->nullable();
     });
     $this->db->table('TblPhoneNumbers')->insert(['Phone' => '2025550101', 'Source' => 'DP_LT']);
-    $connector = \Mockery::mock(\Cmd\Reports\Services\DBConnector::class);
     $pdo = $this->db->getPdo();
-    $connector->shouldReceive('getSqlServerConnection')->andReturn($pdo);
-    $connector->shouldReceive('querySqlServer')->andReturnUsing(function (string $sql) use ($pdo): array {
-        return ['success' => true, 'row_count' => $pdo->exec($sql)];
-    });
     $command = \Mockery::mock(\Cmd\Reports\Console\Commands\SyncPhoneNumbers::class)->makePartial();
     $command->shouldReceive('info')->andReturnNull();
     $path = tempnam(sys_get_temp_dir(), 'sms-sync-test-');
     file_put_contents($path, json_encode(['phone' => '2025550199', 'cid' => 1])."\ninvalid json\n");
     try {
         $method = new ReflectionMethod($command, 'replacePhonesFromFile');
-        expect(fn () => $method->invoke($command, $connector, $path, 1))->toThrow(JsonException::class);
+        expect(fn () => $method->invoke($command, $pdo, $path, 1))->toThrow(JsonException::class);
         expect($this->db->table('TblPhoneNumbers')->pluck('Phone')->all())->toBe(['2025550101']);
         expect($pdo->inTransaction())->toBeFalse();
     } finally {
@@ -325,21 +322,52 @@ test('successful phone sync atomically replaces only its own source', function (
         ['Phone' => '2025550102', 'Source' => 'DP_LDR'],
     ]);
     $pdo = $this->db->getPdo();
-    $connector = \Mockery::mock(\Cmd\Reports\Services\DBConnector::class);
-    $connector->shouldReceive('getSqlServerConnection')->andReturn($pdo);
-    $connector->shouldReceive('querySqlServer')->andReturnUsing(function (string $sql) use ($pdo): array {
-        return ['success' => true, 'row_count' => $pdo->exec($sql)];
-    });
     $command = \Mockery::mock(\Cmd\Reports\Console\Commands\SyncPhoneNumbers::class)->makePartial();
     $command->shouldReceive('info')->andReturnNull();
     $path = tempnam(sys_get_temp_dir(), 'sms-sync-test-');
     file_put_contents($path, json_encode(['phone' => '2025550199', 'cid' => 1])."\n");
     try {
-        $result = (new ReflectionMethod($command, 'replacePhonesFromFile'))->invoke($command, $connector, $path, 1);
+        $result = (new ReflectionMethod($command, 'replacePhonesFromFile'))->invoke($command, $pdo, $path, 1);
         expect($result)->toBe([1, 1, 0]);
         expect($this->db->table('TblPhoneNumbers')->orderBy('Phone')->pluck('Phone')->all())->toBe(['2025550102', '2025550199']);
     } finally {
         unlink($path);
         \Mockery::close();
     }
+});
+
+test('manual export uses only the chosen whole drops', function () {
+    smsFixture($this->db, 1, 'T1', '2026-09-28', ['2025550101', '2025550102']);
+    smsFixture($this->db, 2, 'T2', '2026-10-05', ['2025550103']);
+    expect($this->repo->selectDropsByIds([1])->pluck('PK')->all())->toBe([1]);
+    $export = $this->repo->prepareExport(2, '00000000-0000-4000-8000-000000000009', [1]);
+    try {
+        expect($export['count'])->toBe(2);
+        expect(file_get_contents($export['path']))->toContain('DROP1')->not->toContain('DROP2');
+        expect($this->db->table('TblMarketing')->where('PK', 1)->value('SMS_Drops'))->toBe(1);
+        expect($this->db->table('TblMarketing')->where('PK', 2)->value('SMS_Drops'))->toBe(0);
+    } finally {
+        unlink($export['path']);
+    }
+    expect(fn () => $this->repo->selectDropsByIds([99]))->toThrow(ValidationException::class);
+});
+
+test('duplicate marketing source names cannot export the same phones twice', function () {
+    smsFixture($this->db, 1, 'T1', '2026-10-05', ['2025550101']);
+    $this->db->table('TblMarketing')->insert([
+        'PK' => 2, 'Drop_Name' => 'DROP1', 'Debt_Tier' => 'T2', 'Send_Date' => '2026-10-06',
+    ]);
+    expect(fn () => $this->repo->selectDropsByIds([1]))->toThrow(ValidationException::class);
+    expect(fn () => $this->repo->selectDropsByIds([1, 2]))->toThrow(ValidationException::class);
+    expect(fn () => $this->repo->selectDrops(1))->toThrow(ValidationException::class);
+    expect(fn () => $this->repo->prepareExport(1, '00000000-0000-4000-8000-000000000010'))
+        ->toThrow(ValidationException::class);
+    expect($this->db->table('TblSmsExports')->count())->toBe(0);
+    expect((int) $this->db->table('TblMarketing')->sum('SMS_Drops'))->toBe(0);
+});
+
+test('phone sync refuses a non-sqlsrv target before any replacement', function () {
+    $command = new \Cmd\Reports\Console\Commands\SyncPhoneNumbers;
+    expect(fn () => (new ReflectionMethod($command, 'initializeSqlServerConnection'))->invoke($command))
+        ->toThrow(RuntimeException::class, 'sqlsrv connection');
 });
