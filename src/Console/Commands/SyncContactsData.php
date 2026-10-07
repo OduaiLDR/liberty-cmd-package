@@ -150,38 +150,39 @@ class SyncContactsData extends Command
         $hasReviewFlags = str_contains($ltProcesses['LT']->output(), '[CONTACT FLAG]');
         ContactSyncRunScope::read($scopeDirectory . '/LT.json', 'LT');
 
-        // ── Step 2: LDR + PLAW (parallel) ────────────────────────────────────
-        $this->logStep('Step 2/3: Syncing LDR and PLAW in parallel...');
-        $pool = Process::pool(function ($pool) use ($php, $artisan, $fullFlag, $ownersRefreshFlag, $dryRunFlag, $reconcileAgentsFlag, $scopeDirectory) {
-            foreach (['LDR', 'PLAW'] as $src) {
-                $pool->as($src)->timeout(self::PROCESS_TIMEOUT_SECONDS)->command(
-                    array_merge([$php, $artisan, 'Sync:contacts-data', "--source={$src}", '--no-match', '--scope-file=' . $scopeDirectory . "/{$src}.json",
-                        '--exclude-scope-file=' . $scopeDirectory . '/LT.json'], $fullFlag, $ownersRefreshFlag, $dryRunFlag, $reconcileAgentsFlag)
-                );
-            }
-        })->start(function (string $type, string $output, string $key) {
-            foreach (explode("\n", rtrim($output)) as $line) {
-                if ($line !== '') $this->line("[{$key}] {$line}");
-            }
-        });
+        // ── Step 2: LDR then PLAW ────────────────────────────────────────────
+        // Both sources lock shared contact rows and emit review flags inside page
+        // transactions. Run one child at a time so an unread sibling output pipe
+        // cannot block that child while it holds locks needed by the other source.
         $sideStarted = microtime(true);
-        $processes = $pool->wait();
-        $this->logStep('Step 2/3: LDR + PLAW child processes finished', $sideStarted);
-
-        $allOk = true;
         foreach (['LDR', 'PLAW'] as $src) {
-            $hasSkippedRecords = $hasSkippedRecords || str_contains($processes[$src]->output(), '[SYNC FLAGS]');
-            $hasReviewFlags = $hasReviewFlags || str_contains($processes[$src]->output(), '[CONTACT FLAG]');
-            if ($processes[$src]->exitCode() !== 0) {
-                $this->error("[ERROR] {$src} failed (exit code {$processes[$src]->exitCode()}).");
-                $allOk = false;
+            $sourceStarted = microtime(true);
+            $this->logStep("Step 2/3: Syncing {$src}...");
+            try {
+                $result = Process::timeout(self::PROCESS_TIMEOUT_SECONDS)->run(
+                    array_merge([$php, $artisan, 'Sync:contacts-data', "--source={$src}", '--no-match',
+                        '--scope-file=' . $scopeDirectory . "/{$src}.json",
+                        '--exclude-scope-file=' . $scopeDirectory . '/LT.json'],
+                        $fullFlag, $ownersRefreshFlag, $dryRunFlag, $reconcileAgentsFlag),
+                    function (string $type, string $output) use ($src) {
+                        foreach (explode("\n", rtrim($output)) as $line) {
+                            if ($line !== '') $this->line("[{$src}] {$line}");
+                        }
+                    }
+                );
+            } catch (\Throwable $error) {
+                throw new \RuntimeException("{$src} contact child failed: " . $error->getMessage(), 0, $error);
             }
+            $this->logStep("Step 2/3: {$src} child process finished", $sourceStarted);
+            if ($result->exitCode() !== 0) {
+                $this->error("[ERROR] {$src} failed (exit code {$result->exitCode()}); stopping before further sources or matching.");
+                return Command::FAILURE;
+            }
+            ContactSyncRunScope::read($scopeDirectory . "/{$src}.json", $src);
+            $hasSkippedRecords = $hasSkippedRecords || str_contains($result->output(), '[SYNC FLAGS]');
+            $hasReviewFlags = $hasReviewFlags || str_contains($result->output(), '[CONTACT FLAG]');
         }
-        if (!$allOk) {
-            $this->info("\n" . str_repeat('=', 80));
-            $this->error('[ERROR] LDR or PLAW failed — skipping final matching.');
-            return Command::FAILURE;
-        }
+        $this->logStep('Step 2/3: LDR and PLAW child processes finished', $sideStarted);
 
         $scopes = [];
         foreach (['LT', 'LDR', 'PLAW'] as $src) {
