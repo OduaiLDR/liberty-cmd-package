@@ -103,7 +103,7 @@ class MailDropExportRepository extends SqlSrvRepository
     }
 
     /** @return array{path:string, count:int, names:array<string>, part_count:int, format:string} */
-    public function prepareExport(int $target, string $requestId, ?array $dropPks = null): array
+    public function prepareExport(int $target, string $requestId, ?array $dropPks = null, ?callable $publish = null): array
     {
         $path = tempnam(sys_get_temp_dir(), 'sms-export-');
         if ($path === false) {
@@ -113,7 +113,7 @@ class MailDropExportRepository extends SqlSrvRepository
         $parts = [$path];
         $archivePath = null;
         try {
-            return $this->connection()->transaction(function () use ($target, $requestId, $dropPks, $path, &$parts, &$archivePath): array {
+            return $this->connection()->transaction(function () use ($target, $requestId, $dropPks, $path, $publish, &$parts, &$archivePath): array {
                 $last = $this->table('TblSmsExports')->orderByDesc('PK')->lockForUpdate()->first();
                 if ($this->table('TblSmsExports')->where('Request_ID', $requestId)->exists()) {
                     throw ValidationException::withMessages(['target' => 'This request was already exported. Refresh before starting another export.']);
@@ -218,7 +218,9 @@ class MailDropExportRepository extends SqlSrvRepository
                 }
 
                 if (count($parts) === 1) {
-                    return ['path' => $path, 'count' => $total, 'names' => $names, 'part_count' => 1, 'format' => 'csv'];
+                    $result = ['path' => $path, 'count' => $total, 'names' => $names, 'part_count' => 1, 'format' => 'csv'];
+                    if ($publish !== null) $publish($result);
+                    return $result;
                 }
                 if (! class_exists(\ZipArchive::class)) {
                     throw new RuntimeException('The server needs PHP ZipArchive to package multiple SMS CSV files.');
@@ -233,7 +235,9 @@ class MailDropExportRepository extends SqlSrvRepository
                 }
                 $partCount = count($parts);
                 $parts = [];
-                return ['path' => $archivePath, 'count' => $total, 'names' => $names, 'part_count' => $partCount, 'format' => 'zip'];
+                $result = ['path' => $archivePath, 'count' => $total, 'names' => $names, 'part_count' => $partCount, 'format' => 'zip'];
+                if ($publish !== null) $publish($result);
+                return $result;
             });
         } catch (Throwable $exception) {
             foreach ($parts as $part) {

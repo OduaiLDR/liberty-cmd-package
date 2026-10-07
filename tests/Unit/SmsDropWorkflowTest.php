@@ -323,6 +323,41 @@ test('marketing view renders SMS invoice fields and weekly totals', function () 
     expect($html)->toContain('SMS0009')->toContain('INV-9')->toContain('$1.23')->not->toContain('Distribute SMS invoice');
 });
 
+test('failed durable publishing rolls back SMS tracking and cleans the CSV', function () {
+    smsFixture($this->db, 1, 'T1', '2026-10-05', ['2025550101']);
+    $file = null;
+    expect(function () use (&$file) { $this->repo->prepareExport(1, '00000000-0000-4000-8000-000000000116', null,
+        function (array $export) use (&$file): void {
+            $file = $export['path'];
+            expect(is_file($file))->toBeTrue();
+            throw new RuntimeException('S3 upload failed');
+        }); })->toThrow(RuntimeException::class, 'S3 upload failed');
+    expect(is_file($file))->toBeFalse();
+    expect($this->db->table('TblSmsExports')->count())->toBe(0);
+    expect($this->db->table('TblSmsExportSources')->count())->toBe(0);
+    expect((int) $this->db->table('TblMarketing')->value('SMS_Drops'))->toBe(0);
+});
+
+test('durable publishing sees completed CSV and ZIP before tracking commits', function () {
+    smsFixture($this->db, 1, 'T1', '2026-10-05', ['2025550101', '2025550102', '2025550103']);
+    $seen = [];
+    $csv = $this->repo->prepareExport(3, '00000000-0000-4000-8000-000000000117', null,
+        function (array $export) use (&$seen): void {
+            $seen[] = [$export['format'], is_file($export['path'])];
+        });
+    unlink($csv['path']);
+    $repo = new class extends MailDropExportRepository {
+        protected function csvRecordLimit(): int { return 2; }
+    };
+    $zip = $repo->prepareExport(3, '00000000-0000-4000-8000-000000000118', null,
+        function (array $export) use (&$seen): void {
+            $seen[] = [$export['format'], is_file($export['path'])];
+        });
+    unlink($zip['path']);
+    expect($seen)->toBe([['csv', true], ['zip', true]]);
+    expect($this->db->table('TblSmsExports')->count())->toBe(2);
+});
+
 test('counts frozen priority candidates in small ordered batches including zero-eligible drops', function () {
     for ($id = 1; $id <= 12; $id++) {
         smsFixture($this->db, $id, 'T1', '2026-10-05', ['202555'.str_pad((string) $id, 4, '0', STR_PAD_LEFT)]);
