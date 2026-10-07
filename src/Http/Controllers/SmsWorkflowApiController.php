@@ -29,6 +29,9 @@ class SmsWorkflowApiController extends Controller
         $data = Validator::make($request->query(), [
             'target' => ['nullable', 'integer', 'min:1', 'max:10000000'],
             'page' => ['nullable', 'integer', 'min:1'],
+            'count_candidates' => ['nullable', 'boolean'],
+            'count_pks' => ['sometimes', 'array', 'min:1', 'max:10'],
+            'count_pks.*' => ['required', 'integer', 'min:1', 'distinct'],
             'drop_pks' => ['sometimes', 'array', 'min:1', 'max:500'],
             'drop_pks.*' => ['required', 'integer', 'min:1', 'distinct'],
         ])->validate();
@@ -36,8 +39,21 @@ class SmsWorkflowApiController extends Controller
         $target = (int) ($data['target'] ?? 0);
         $page = (int) ($data['page'] ?? 1);
         $manual = isset($data['drop_pks']);
+        $countCandidates = (int) ($data['count_candidates'] ?? 0) === 1;
+        $countIds = isset($data['count_pks']);
+        if (($countCandidates || $countIds) && ($manual || $target < 1 || ($countCandidates && $countIds))) {
+            throw \Illuminate\Validation\ValidationException::withMessages(['target' => 'A phone target and one selection mode are required.']);
+        }
+        if ($countCandidates) {
+            return new JsonResponse([
+                'candidate_pks' => $this->drops->orderedSelectableDropIds()->values(),
+                'target' => $target, 'request_id' => (string) Str::uuid(),
+                'selection_mode' => 'candidate_ids',
+            ], 200, ['Cache-Control' => 'private, no-store']);
+        }
         $drops = $manual ? $this->drops->selectDropsByIds(array_map('intval', $data['drop_pks']))
-            : ($target > 0 ? $this->drops->selectDrops($target) : $this->drops->allDrops($page));
+            : ($countIds ? $this->drops->countedDropsByIds(array_map('intval', $data['count_pks']))
+                : ($target > 0 ? $this->drops->selectDrops($target) : $this->drops->allDrops($page)));
         $total = (int) $drops->sum('Amount_Dropped');
         if ($manual && $total > 10000000) {
             throw \Illuminate\Validation\ValidationException::withMessages(['drop_pks' => 'Selected drops exceed the 10,000,000 phone export limit.']);
@@ -47,8 +63,8 @@ class SmsWorkflowApiController extends Controller
         return new JsonResponse([
             'drops' => $drops->values(), 'target' => $target, 'total' => $total,
             'request_id' => (string) Str::uuid(), 'page' => $page,
-            'has_more' => ! $manual && $target === 0 && $this->drops->allDrops($page + 1)->isNotEmpty(),
-            'selection_mode' => $manual ? 'manual' : ($target > 0 ? 'automatic' : 'browse'),
+            'has_more' => ! $manual && ! $countIds && $target === 0 && $this->drops->allDrops($page + 1)->isNotEmpty(),
+            'selection_mode' => $manual ? 'manual' : ($countIds ? 'counted_ids' : ($target > 0 ? 'automatic' : 'browse')),
             'shortfall' => max(0, $target - $total),
         ], 200, ['Cache-Control' => 'private, no-store']);
     }

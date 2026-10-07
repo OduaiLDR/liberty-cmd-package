@@ -313,6 +313,20 @@ test('marketing view renders SMS invoice fields and weekly totals', function () 
     expect($html)->toContain('SMS0009')->toContain('INV-9')->toContain('$1.23')->not->toContain('Distribute SMS invoice');
 });
 
+test('counts frozen priority candidates in small ordered batches including zero-eligible drops', function () {
+    for ($id = 1; $id <= 12; $id++) {
+        smsFixture($this->db, $id, 'T1', '2026-10-05', ['202555'.str_pad((string) $id, 4, '0', STR_PAD_LEFT)]);
+    }
+    $this->db->table('TblPhoneNumbers')->insert(['Phone' => '2025550012']);
+    $ids = $this->repo->orderedSelectableDropIds()->all();
+    expect($ids)->toBe(range(1, 12));
+    $first = $this->repo->countedDropsByIds(array_slice($ids, 0, 10));
+    $second = $this->repo->countedDropsByIds(array_slice($ids, 10, 10));
+    expect($first->pluck('PK')->all())->toBe(range(1, 10));
+    expect($second->pluck('PK')->all())->toBe([11, 12]);
+    expect((int) $second->last()->Amount_Dropped)->toBe(0);
+});
+
 test('splits CSV records into numbered archive parts without splitting export tracking', function () {
     smsFixture($this->db, 1, 'T1', '2026-10-05', ['2025550101', '2025550102', '2025550103']);
     $repo = new class extends MailDropExportRepository {
