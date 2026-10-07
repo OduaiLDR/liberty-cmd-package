@@ -410,7 +410,9 @@ class MailDropExportRepository extends SqlSrvRepository
         // excludes the whole merged lead, not just one phone slot.
         foreach (array_chunk(array_keys($numbers), 900) as $chunk) {
             $lookups = [];
-            foreach ($chunk as $phone) { $lookups[] = $phone; $lookups[] = '1'.$phone; }
+            // PHP turns numeric string array keys into integers. SQL Server then
+            // promotes this IN list to int and overflows on 11-digit phones.
+            foreach ($chunk as $phone) { $lookups[] = (string) $phone; $lookups[] = '1'.(string) $phone; }
             foreach ($this->table('TblPhoneNumbers')->whereIn('Phone', $lookups)->pluck('Phone') as $phone) {
                 $contacted[strlen((string) $phone) === 11 ? substr((string) $phone, 1) : (string) $phone] = true;
             }
