@@ -120,6 +120,19 @@ test('counts and CSV exclude synced phones including country-code and punctuatio
     }
 });
 
+test('contacted phone lookups bind every number as text for SQL Server', function () {
+    smsFixture($this->db, 1, 'T1', '2026-10-05', ['3147577081']);
+    $this->db->table('TblPhoneNumbers')->insert(['Phone' => '13147577081']);
+    $this->db->enableQueryLog();
+
+    expect($this->repo->selectDrops(1))->toHaveCount(0);
+    $lookup = collect($this->db->getQueryLog())->first(
+        fn ($query) => str_contains($query['query'], 'TblPhoneNumbers')
+    );
+    expect($lookup)->not->toBeNull();
+    expect($lookup['bindings'])->toBe(['3147577081', '13147577081']);
+});
+
 test('selects whole drops newest first and overshoots the target', function () {
     smsFixture($this->db, 1, 'T1', '2026-09-28', ['2025550101', '2025550102']);
     smsFixture($this->db, 2, 'T2', '2026-10-05', ['2025550103', '2025550104', '2025550105']);
