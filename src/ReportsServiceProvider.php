@@ -102,6 +102,7 @@ class ReportsServiceProvider extends ServiceProvider
 {
     public function boot()
     {
+        $this->mergeConfigFrom(__DIR__ . '/../config/sms-exports.php', 'sms-exports');
         $this->loadRoutesFrom(__DIR__ . '/../routes/web.php');
         $this->loadRoutesFrom(__DIR__ . '/../routes/pmod.php');
         $this->loadRoutesFrom(__DIR__ . '/../routes/sms-api.php');
@@ -109,6 +110,8 @@ class ReportsServiceProvider extends ServiceProvider
 
         $this->publishes([
             __DIR__ . '/../database/sms-migrations/2026_10_06_092340_add_sms_export_tracking.php' => database_path('migrations/2026_10_06_092340_add_sms_export_tracking.php'),
+            __DIR__ . '/../database/sms-migrations/2026_10_07_000001_add_sms_export_requests.php' => database_path('migrations/2026_10_07_000001_add_sms_export_requests.php'),
+            __DIR__ . '/../database/sms-migrations/2026_10_07_000002_add_sms_selection_requests.php' => database_path('migrations/2026_10_07_000002_add_sms_selection_requests.php'),
         ], 'reports-sms-migrations');
         // PMOD migrations ship with the package but are NOT auto-loaded.
         // Consumers must explicitly opt in by publishing them:

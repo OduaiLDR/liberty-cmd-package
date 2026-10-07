@@ -3,6 +3,9 @@
 use Cmd\Reports\Http\Controllers\SmsWorkflowApiController;
 use Cmd\Reports\Repositories\MailDropExportRepository;
 use Cmd\Reports\Repositories\MarketingReportRepository;
+use Cmd\Reports\Services\SmsExportArtifacts;
+use Cmd\Reports\Jobs\BuildSmsExportJob;
+use Illuminate\Contracts\Bus\Dispatcher as BusDispatcher;
 use Illuminate\Config\Repository;
 use Illuminate\Container\Container;
 use Illuminate\Database\Capsule\Manager;
@@ -23,7 +26,8 @@ beforeEach(function () {
     $this->previousContainer = Container::getInstance();
     $container = new Container;
     Container::setInstance($container);
-    $container->instance('config', new Repository);
+    $container->instance('config', new Repository(['queue' => ['default' => 'database',
+        'connections' => ['database' => ['retry_after' => 15000]]]]));
     $capsule = new Manager($container);
     $capsule->addConnection(['driver' => 'sqlite', 'database' => ':memory:', 'prefix' => ''], 'sqlsrv');
     $container->instance('db', $capsule->getDatabaseManager());
@@ -45,6 +49,33 @@ beforeEach(function () {
         $table->integer('SMS_Export_PK');
         $table->integer('Marketing_PK');
         $table->integer('SMS_Count');
+    });
+    $schema->create('TblSmsExportRequests', function (Blueprint $table) {
+        $table->string('Request_ID')->primary();
+        $table->string('Actor_Email');
+        $table->string('Status');
+        $table->integer('Target');
+        $table->text('Drop_PKs')->nullable();
+        $table->string('Artifact_Key')->nullable();
+        $table->integer('Artifact_Bytes')->nullable();
+        $table->integer('SMS_Count')->nullable();
+        $table->integer('Part_Count')->nullable();
+        $table->string('Artifact_Format')->nullable();
+        $table->string('Error')->nullable();
+        $table->dateTime('Created_At');
+        $table->dateTime('Updated_At');
+    });
+    $schema->create('TblSmsSelectionRequests', function (Blueprint $table) {
+        $table->string('Request_ID')->primary();
+        $table->string('Actor_Email');
+        $table->string('Status');
+        $table->string('Selection_Mode');
+        $table->integer('Target')->nullable();
+        $table->text('Drop_PKs')->nullable();
+        $table->text('Result')->nullable();
+        $table->string('Error')->nullable();
+        $table->dateTime('Created_At');
+        $table->dateTime('Updated_At');
     });
     $this->drops = Mockery::mock(MailDropExportRepository::class);
     $this->marketing = Mockery::mock(MarketingReportRepository::class);
@@ -146,53 +177,38 @@ test('API invoice preserves exact cost string and delegates only validated field
     expect($response->getData(true)['message'])->toContain('selected drop');
 });
 
-test('API export streams the repository file with count and attachment headers', function () {
-    $path = tempnam(sys_get_temp_dir(), 'sms-api-test-');
-    file_put_contents($path, "Phone\n2025550100\n");
+test('API export queues once and scopes the request to its actor', function () {
     $id = '00000000-0000-4000-8000-000000000001';
-    $this->drops->shouldReceive('prepareExport')->once()->with(1, $id)->andReturn(['path' => $path, 'count' => 1, 'names' => ['SMS0001']]);
-    try {
-        $response = $this->controller->export(Request::create('/', 'POST', ['target' => 1, 'request_id' => $id]));
-        expect($response->headers->get('X-SMS-Count'))->toBe('1');
-        expect($response->headers->get('Content-Disposition'))->toContain('attachment');
-        expect($response->getFile()->getPathname())->toBe($path);
-    } finally {
-        unlink($path);
-    }
+    $artifacts = Mockery::mock(SmsExportArtifacts::class);
+    $artifacts->shouldReceive('assertConfigured')->twice();
+    $dispatcher = Mockery::mock(BusDispatcher::class);
+    $dispatcher->shouldReceive('dispatch')->once()->with(Mockery::type(BuildSmsExportJob::class));
+    Container::getInstance()->instance(BusDispatcher::class, $dispatcher);
+    $request = Request::create('/', 'POST', ['target' => 1, 'request_id' => $id, 'drop_pks' => ['7']]);
+    $request->attributes->set('cmd_user', ['email' => 'one@example.com']);
+    $response = $this->controller->export($request, $artifacts);
+    expect($response->getStatusCode())->toBe(202);
+    expect($response->getData(true)['status'])->toBe('queued');
+    expect($this->db->table('TblSmsExportRequests')->where('Request_ID', $id)->value('Actor_Email'))->toBe('one@example.com');
+    $this->controller->export($request, $artifacts);
 });
 
-test('API export forwards only validated manual drop IDs', function () {
-    $path = tempnam(sys_get_temp_dir(), 'sms-api-manual-');
-    file_put_contents($path, "Phone\n2025550100\n");
+test('API status never gives another actor a download URL', function () {
     $id = '00000000-0000-4000-8000-000000000009';
-    $this->drops->shouldReceive('prepareExport')->once()->with(1, $id, [7])->andReturn(['path' => $path, 'count' => 1, 'names' => ['SMS0009']]);
-    try {
-        $response = $this->controller->export(Request::create('/', 'POST', [
-            'target' => 1, 'request_id' => $id, 'drop_pks' => ['7'],
-        ]));
-        expect($response->headers->get('X-SMS-Count'))->toBe('1');
-    } finally {
-        unlink($path);
-    }
+    $this->db->table('TblSmsExportRequests')->insert([
+        'Request_ID' => $id, 'Actor_Email' => 'one@example.com', 'Status' => 'ready', 'Target' => 1,
+        'Artifact_Key' => 'sms-exports/file.csv', 'Artifact_Bytes' => 100, 'SMS_Count' => 1,
+        'Part_Count' => 1, 'Artifact_Format' => 'csv', 'Created_At' => now(), 'Updated_At' => now(),
+    ]);
+    $artifacts = Mockery::mock(SmsExportArtifacts::class);
+    $artifacts->shouldReceive('temporaryUrl')->once()->with('sms-exports/file.csv', 100)->andReturn('https://example.com/signed');
+    $other = Request::create('/', 'GET', ['request_id' => $id]);
+    $other->attributes->set('cmd_user', ['email' => 'other@example.com']);
+    expect(fn () => $this->controller->exportStatus($other, $artifacts))->toThrow(HttpException::class);
+    $owner = Request::create('/', 'GET', ['request_id' => $id]);
+    $owner->attributes->set('cmd_user', ['email' => 'one@example.com']);
+    expect($this->controller->exportStatus($owner, $artifacts)->getData(true)['download_url'])->toBe('https://example.com/signed');
 });
-
-test('API export labels a multi-file archive for download', function () {
-    $path = tempnam(sys_get_temp_dir(), 'sms-api-zip-');
-    file_put_contents($path, 'archive');
-    $id = '00000000-0000-4000-8000-000000000011';
-    $this->drops->shouldReceive('prepareExport')->once()->with(1000001, $id)
-        ->andReturn(['path' => $path, 'count' => 1000001, 'names' => ['SMS0011'], 'part_count' => 2, 'format' => 'zip']);
-    try {
-        $response = $this->controller->export(Request::create('/', 'POST', ['target' => 1000001, 'request_id' => $id]));
-        expect($response->headers->get('Content-Type'))->toBe('application/zip');
-        expect($response->headers->get('Content-Disposition'))->toContain('.zip');
-        expect($response->headers->get('X-SMS-File-Count'))->toBe('2');
-        expect($response->headers->get('X-SMS-Count'))->toBe('1000001');
-    } finally {
-        unlink($path);
-    }
-});
-
 class SmsApiTestSessionGuard {}
 class SmsApiTestPolicyGuard {}
 
@@ -210,10 +226,13 @@ test('API routes are host gated and bind correct methods and CMD report permissi
     if (! class_exists($session)) class_alias(SmsApiTestSessionGuard::class, $session);
     if (! class_exists($policy)) class_alias(SmsApiTestPolicyGuard::class, $policy);
     require __DIR__.'/../../routes/sms-api.php';
-    expect($router->getRoutes()->count())->toBe(4);
+    expect($router->getRoutes()->count())->toBe(7);
     foreach ([
         ['GET', 'mail-drop-export-report/preview', 'cmd.mail_drop_export.preview'],
         ['POST', 'mail-drop-export-report/export', 'cmd.mail_drop_export.export'],
+        ['GET', 'mail-drop-export-report/export-status', 'cmd.mail_drop_export.export_status'],
+        ['POST', 'mail-drop-export-report/selection', 'cmd.mail_drop_export.selection'],
+        ['GET', 'mail-drop-export-report/selection-status', 'cmd.mail_drop_export.selection_status'],
         ['GET', 'marketing-report/sms-history', 'cmd.marketing.sms_history'],
         ['POST', 'marketing-report/invoice', 'cmd.marketing.invoice'],
     ] as [$method, $path, $name]) {

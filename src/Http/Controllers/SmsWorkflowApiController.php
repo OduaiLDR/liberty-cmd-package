@@ -5,15 +5,18 @@ namespace Cmd\Reports\Http\Controllers;
 use Carbon\Carbon;
 use Cmd\Reports\Http\Requests\MailDropExportRequest;
 use Cmd\Reports\Http\Requests\MarketingInvoiceRequest;
+use Cmd\Reports\Jobs\BuildSmsExportJob;
+use Cmd\Reports\Jobs\PlanSmsSelectionJob;
 use Cmd\Reports\Repositories\MailDropExportRepository;
 use Cmd\Reports\Repositories\MarketingReportRepository;
+use Cmd\Reports\Services\SmsExportArtifacts;
+use Cmd\Reports\Services\SmsExportQueue;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Routing\Controller;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Str;
-use Symfony\Component\HttpFoundation\BinaryFileResponse;
 use Symfony\Component\HttpKernel\Exception\HttpException;
 
 /** Authorization is supplied by the CMD host's session and report-policy middleware. */
@@ -69,26 +72,200 @@ class SmsWorkflowApiController extends Controller
         ], 200, ['Cache-Control' => 'private, no-store']);
     }
 
-    public function export(Request $request): BinaryFileResponse
+    public function export(Request $request, ?SmsExportArtifacts $artifacts = null): JsonResponse
     {
         // Reuse validation rules, but do not invoke the Blade request's Laravel-user gate.
         $data = Validator::make($request->all(), (new MailDropExportRequest)->rules())->validate();
         $this->ensureSchemaReady();
-        set_time_limit(0);
-        $export = isset($data['drop_pks'])
-            ? $this->drops->prepareExport((int) $data['target'], $data['request_id'], array_map('intval', $data['drop_pks']))
-            : $this->drops->prepareExport((int) $data['target'], $data['request_id']);
-        $zip = ($export['format'] ?? 'csv') === 'zip';
-        clearstatcache(true, $export['path']);
-        $response = new BinaryFileResponse($export['path'], 200, [
-            'Content-Type' => $zip ? 'application/zip' : 'text/csv; charset=UTF-8',
-            'X-SMS-Count' => (string) $export['count'],
-            'X-SMS-File-Count' => (string) ($export['part_count'] ?? 1),
-            'Cache-Control' => 'private, no-store',
-        ]);
-        $response->setContentDisposition('attachment', 'sms_export_'.now()->format('Ymd_His').($zip ? '.zip' : '.csv'));
+        $this->ensureRequestSchemaReady();
+        $artifacts ??= app(SmsExportArtifacts::class);
+        $artifacts->assertConfigured();
+        app(SmsExportQueue::class)->assertReady();
+        $id = $data['request_id'];
+        $actor = $this->actorEmail($request);
+        $ids = isset($data['drop_pks']) ? array_map('intval', $data['drop_pks']) : null;
+        $encoded = $ids === null ? null : json_encode($ids, JSON_THROW_ON_ERROR);
+        $table = DB::connection('sqlsrv')->table('TblSmsExportRequests');
+        $existing = $table->where('Request_ID', $id)->first();
+        if ($existing !== null) {
+            if (strcasecmp((string) $existing->Actor_Email, $actor) !== 0) throw new HttpException(404, 'SMS export request not found.');
+            if ((int) $existing->Target !== (int) $data['target'] || $existing->Drop_PKs !== $encoded) {
+                throw new HttpException(409, 'This request ID belongs to a different SMS selection. Refresh and try again.');
+            }
+            if ($existing->Status === 'failed') {
+                if (DB::connection('sqlsrv')->table('TblSmsExports')->where('Request_ID', $id)->exists()) {
+                    throw new HttpException(409, 'SMS tracking exists for this request. Check its status before retrying.');
+                }
+                $claimed = $table->where('Request_ID', $id)->where('Status', 'failed')->update([
+                    'Status' => 'queued', 'Error' => null, 'Updated_At' => now()->toDateTimeString(),
+                ]);
+                if ($claimed === 1) {
+                    try {
+                        BuildSmsExportJob::dispatch($id);
+                    } catch (\Throwable $error) {
+                        $table->where('Request_ID', $id)->where('Status', 'queued')->update([
+                            'Status' => 'failed', 'Error' => 'Unable to queue the SMS export.',
+                            'Updated_At' => now()->toDateTimeString(),
+                        ]);
+                        throw $error;
+                    }
+                }
+            }
+        } else {
+            $now = now()->toDateTimeString();
+            $table->insert(['Request_ID' => $id, 'Actor_Email' => $actor, 'Status' => 'queued', 'Target' => $data['target'],
+                'Drop_PKs' => $encoded, 'Created_At' => $now, 'Updated_At' => $now]);
+            try {
+                BuildSmsExportJob::dispatch($id);
+            } catch (\Throwable $error) {
+                $table->where('Request_ID', $id)->update(['Status' => 'failed',
+                    'Error' => 'Unable to queue the SMS export.', 'Updated_At' => now()->toDateTimeString()]);
+                throw $error;
+            }
+        }
 
-        return $response->deleteFileAfterSend(true);
+        return new JsonResponse(['request_id' => $id, 'status' => $table->where('Request_ID', $id)->value('Status')], 202,
+            ['Cache-Control' => 'private, no-store']);
+    }
+
+    public function exportStatus(Request $request, SmsExportArtifacts $artifacts): JsonResponse
+    {
+        $data = Validator::make($request->query(), ['request_id' => ['required', 'uuid']])->validate();
+        $this->ensureSchemaReady();
+        $this->ensureRequestSchemaReady();
+        $id = $data['request_id'];
+        $row = DB::connection('sqlsrv')->table('TblSmsExportRequests')->where('Request_ID', $id)->first();
+        if ($row === null || strcasecmp((string) $row->Actor_Email, $this->actorEmail($request)) !== 0) {
+            throw new HttpException(404, 'SMS export request not found.');
+        }
+
+        if ($row->Status !== 'ready') {
+            $tracked = DB::connection('sqlsrv')->table('TblSmsExports')->where('Request_ID', $id);
+            if ($tracked->exists()) {
+                try {
+                    $recovered = $artifacts->recover($id, (int) $tracked->sum('SMS_Count'));
+                    if ($recovered === null) throw new \RuntimeException('No matching durable artifact exists.');
+                    DB::connection('sqlsrv')->table('TblSmsExportRequests')->where('Request_ID', $id)->update([
+                        'Status' => 'ready', 'Artifact_Key' => $recovered['key'],
+                        'Artifact_Format' => $recovered['format'], 'Artifact_Bytes' => $recovered['bytes'],
+                        'SMS_Count' => $recovered['count'], 'Part_Count' => $recovered['part_count'],
+                        'Error' => null, 'Updated_At' => now()->toDateTimeString(),
+                    ]);
+                    $row = DB::connection('sqlsrv')->table('TblSmsExportRequests')->where('Request_ID', $id)->first();
+                } catch (\Throwable $error) {
+                    return new JsonResponse(['request_id' => $id, 'status' => 'needs_reconciliation',
+                        'error' => 'SMS tracking exists, but the export file could not be verified. Do not retry this request; contact an administrator.'],
+                        200, ['Cache-Control' => 'private, no-store']);
+                }
+            }
+        }
+
+        $response = ['request_id' => $id, 'status' => $row->Status];
+        if ($row->Status === 'ready') {
+            try {
+                $response['download_url'] = $artifacts->temporaryUrl($row->Artifact_Key, (int) $row->Artifact_Bytes);
+                $response['count'] = (int) $row->SMS_Count;
+                $response['part_count'] = (int) $row->Part_Count;
+                $response['format'] = $row->Artifact_Format;
+            } catch (\Throwable $error) {
+                // Keep the recorded export visible; never regenerate it automatically.
+                $response['status'] = 'needs_reconciliation';
+                $response['error'] = 'SMS tracking was recorded, but the download is unavailable. Contact an administrator with this request ID.';
+            }
+        } elseif ($row->Status === 'failed') {
+            $response['error'] = $row->Error ?: 'The SMS export failed.';
+            if (DB::connection('sqlsrv')->table('TblSmsExports')->where('Request_ID', $id)->exists()) {
+                $response['status'] = 'needs_reconciliation';
+                $response['error'] = 'SMS tracking exists for this request. Do not export these drops again until reconciled.';
+            }
+        } elseif ($row->Status === 'running' && \Carbon\Carbon::parse($row->Updated_At)->lt(now()->subHours(3))) {
+            $response['status'] = 'needs_reconciliation';
+            $response['error'] = 'The export worker stopped or exceeded its time limit. Check tracking and the artifact before retrying.';
+        }
+
+        return new JsonResponse($response, 200, ['Cache-Control' => 'private, no-store']);
+    }
+
+    public function selection(Request $request): JsonResponse
+    {
+        $data = Validator::make($request->all(), [
+            'request_id' => ['required', 'uuid'],
+            'target' => ['nullable', 'integer', 'min:1', 'max:10000000'],
+            'drop_pks' => ['sometimes', 'array', 'min:1', 'max:500'],
+            'drop_pks.*' => ['required', 'integer', 'min:1', 'distinct'],
+        ])->validate();
+        if (isset($data['drop_pks']) === isset($data['target'])) {
+            throw \Illuminate\Validation\ValidationException::withMessages(['target' => 'Enter a target or choose specific drops.']);
+        }
+        $this->ensureSchemaReady();
+        $this->ensureSelectionSchemaReady();
+        app(SmsExportQueue::class)->assertReady();
+
+        $id = $data['request_id'];
+        $actor = $this->actorEmail($request);
+        $mode = isset($data['drop_pks']) ? 'manual' : 'automatic';
+        $target = $mode === 'automatic' ? (int) $data['target'] : null;
+        $ids = $mode === 'manual' ? json_encode(array_map('intval', $data['drop_pks']), JSON_THROW_ON_ERROR) : null;
+        $table = DB::connection('sqlsrv')->table('TblSmsSelectionRequests');
+        $existing = $table->where('Request_ID', $id)->first();
+        if ($existing !== null) {
+            if (strcasecmp((string) $existing->Actor_Email, $actor) !== 0) throw new HttpException(404, 'SMS selection request not found.');
+            if ($existing->Selection_Mode !== $mode || (int) $existing->Target !== (int) $target || $existing->Drop_PKs !== $ids) {
+                throw new HttpException(409, 'This request ID belongs to a different SMS selection.');
+            }
+            if ($existing->Status === 'failed') {
+                $claimed = $table->where('Request_ID', $id)->where('Status', 'failed')->update([
+                    'Status' => 'queued', 'Error' => null, 'Updated_At' => now()->toDateTimeString(),
+                ]);
+                if ($claimed === 1) {
+                    try {
+                        PlanSmsSelectionJob::dispatch($id);
+                    } catch (\Throwable $error) {
+                        $table->where('Request_ID', $id)->where('Status', 'queued')->update([
+                            'Status' => 'failed', 'Error' => 'Unable to queue SMS selection.',
+                            'Updated_At' => now()->toDateTimeString(),
+                        ]);
+                        throw $error;
+                    }
+                }
+            }
+        } else {
+            $now = now()->toDateTimeString();
+            $table->insert(['Request_ID' => $id, 'Actor_Email' => $actor, 'Status' => 'queued',
+                'Selection_Mode' => $mode, 'Target' => $target, 'Drop_PKs' => $ids,
+                'Created_At' => $now, 'Updated_At' => $now]);
+            try {
+                PlanSmsSelectionJob::dispatch($id);
+            } catch (\Throwable $error) {
+                $table->where('Request_ID', $id)->update(['Status' => 'failed', 'Error' => 'Unable to queue SMS selection.',
+                    'Updated_At' => now()->toDateTimeString()]);
+                throw $error;
+            }
+        }
+
+        return new JsonResponse(['request_id' => $id, 'status' => $table->where('Request_ID', $id)->value('Status')], 202,
+            ['Cache-Control' => 'private, no-store']);
+    }
+
+    public function selectionStatus(Request $request): JsonResponse
+    {
+        $data = Validator::make($request->query(), ['request_id' => ['required', 'uuid']])->validate();
+        $this->ensureSelectionSchemaReady();
+        $row = DB::connection('sqlsrv')->table('TblSmsSelectionRequests')->where('Request_ID', $data['request_id'])->first();
+        if ($row === null || strcasecmp((string) $row->Actor_Email, $this->actorEmail($request)) !== 0) {
+            throw new HttpException(404, 'SMS selection request not found.');
+        }
+        $result = ['request_id' => $data['request_id'], 'status' => $row->Status, 'selection_mode' => $row->Selection_Mode];
+        if ($row->Status === 'ready') {
+            $result += json_decode($row->Result, true, 512, JSON_THROW_ON_ERROR);
+        } elseif ($row->Status === 'failed') {
+            $result['error'] = $row->Error ?: 'SMS selection failed.';
+        } elseif ($row->Status === 'running' && \Carbon\Carbon::parse($row->Updated_At)->lt(now()->subHours(3))) {
+            $result['status'] = 'failed';
+            $result['error'] = 'The selection worker stopped or exceeded its time limit. Try again with a new request.';
+        }
+
+        return new JsonResponse($result, 200, ['Cache-Control' => 'private, no-store']);
     }
 
     public function history(Request $request): JsonResponse
@@ -132,5 +309,28 @@ class SmsWorkflowApiController extends Controller
             || ! $schema->hasTable('TblSmsExports') || ! $schema->hasTable('TblSmsExportSources')) {
             throw new HttpException(503, 'SMS workflow is not ready: the reports-sms-migrations schema has not been applied.');
         }
+    }
+
+    protected function ensureRequestSchemaReady(): void
+    {
+        if (! DB::connection('sqlsrv')->getSchemaBuilder()->hasTable('TblSmsExportRequests')) {
+            throw new HttpException(503, 'SMS workflow is not ready: publish and apply the new reports-sms-migrations request schema.');
+        }
+    }
+
+    protected function ensureSelectionSchemaReady(): void
+    {
+        if (! DB::connection('sqlsrv')->getSchemaBuilder()->hasTable('TblSmsSelectionRequests')) {
+            throw new HttpException(503, 'SMS workflow is not ready: publish and apply the new reports-sms-migrations selection schema.');
+        }
+    }
+
+    protected function actorEmail(Request $request): string
+    {
+        $user = $request->attributes->get('cmd_user');
+        $email = is_array($user) ? strtolower(trim((string) ($user['email'] ?? ''))) : '';
+        if ($email === '') throw new HttpException(401, 'An authenticated CMD user is required for SMS exports.');
+
+        return $email;
     }
 }

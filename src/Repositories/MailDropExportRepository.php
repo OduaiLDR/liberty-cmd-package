@@ -41,7 +41,7 @@ class MailDropExportRepository extends SqlSrvRepository
         $total = 0;
         $this->marketingDrops()->where('m.Send_Date', '<=', Carbon::today()->toDateString())->chunk(25, function (Collection $drops) use ($target, &$selected, &$total): bool {
             foreach ($drops as $drop) {
-                $drop->Amount_Dropped = $this->eligiblePhones()->where('e.Drop_Name', $drop->Drop_Name)->count();
+                $drop->Amount_Dropped = $this->countPhonesForDrop($drop->Drop_Name);
                 if ($drop->Amount_Dropped > 0) {
                     $selected->push($drop);
                     $total += $drop->Amount_Dropped;
@@ -76,12 +76,8 @@ class MailDropExportRepository extends SqlSrvRepository
         $drops = collect($ids)->map(fn (int $id): object => $byId->get($id));
         if ($drops->isEmpty()) return $drops;
 
-        $counts = $this->eligiblePhones()->whereIn('e.Drop_Name', $drops->pluck('Drop_Name')->all())
-            ->select('e.Drop_Name')->selectRaw('COUNT(*) AS Amount_Dropped')
-            ->groupBy('e.Drop_Name')->get()
-            ->mapWithKeys(fn (object $row): array => [strtolower(trim((string) $row->Drop_Name)) => (int) $row->Amount_Dropped]);
         foreach ($drops as $drop) {
-            $drop->Amount_Dropped = $counts->get(strtolower(trim((string) $drop->Drop_Name)), 0);
+            $drop->Amount_Dropped = $this->countPhonesForDrop($drop->Drop_Name);
         }
         return $drops;
     }
@@ -96,7 +92,7 @@ class MailDropExportRepository extends SqlSrvRepository
 
         $selected = collect($ids)->map(function (int $id) use ($drops): object {
             $drop = $drops->get($id);
-            $drop->Amount_Dropped = $this->eligiblePhones()->where('e.Drop_Name', $drop->Drop_Name)->count();
+            $drop->Amount_Dropped = $this->countPhonesForDrop($drop->Drop_Name);
             if ($drop->Amount_Dropped < 1) {
                 throw ValidationException::withMessages(['drop_pks' => "{$drop->Drop_Name} has no eligible phones. Deselect it and preview again."]);
             }
@@ -107,7 +103,7 @@ class MailDropExportRepository extends SqlSrvRepository
     }
 
     /** @return array{path:string, count:int, names:array<string>, part_count:int, format:string} */
-    public function prepareExport(int $target, string $requestId, ?array $dropPks = null): array
+    public function prepareExport(int $target, string $requestId, ?array $dropPks = null, ?callable $publish = null): array
     {
         $path = tempnam(sys_get_temp_dir(), 'sms-export-');
         if ($path === false) {
@@ -117,7 +113,7 @@ class MailDropExportRepository extends SqlSrvRepository
         $parts = [$path];
         $archivePath = null;
         try {
-            return $this->connection()->transaction(function () use ($target, $requestId, $dropPks, $path, &$parts, &$archivePath): array {
+            return $this->connection()->transaction(function () use ($target, $requestId, $dropPks, $path, $publish, &$parts, &$archivePath): array {
                 $last = $this->table('TblSmsExports')->orderByDesc('PK')->lockForUpdate()->first();
                 if ($this->table('TblSmsExports')->where('Request_ID', $requestId)->exists()) {
                     throw ValidationException::withMessages(['target' => 'This request was already exported. Refresh before starting another export.']);
@@ -137,9 +133,6 @@ class MailDropExportRepository extends SqlSrvRepository
                 if ($limit < 1) {
                     throw new RuntimeException('The SMS CSV row limit must be positive.');
                 }
-                if ($selected->sum('Amount_Dropped') > $limit && ! class_exists(\ZipArchive::class)) {
-                    throw new RuntimeException('The server needs PHP ZipArchive to package multiple SMS CSV files.');
-                }
                 $groups = $selected->groupBy('Debt_Tier')->sortKeys(SORT_NATURAL);
                 $next = (int) ($last->PK ?? 0);
                 $exportedAt = Carbon::now();
@@ -151,7 +144,7 @@ class MailDropExportRepository extends SqlSrvRepository
                     throw new RuntimeException('Unable to open the SMS export file.');
                 }
                 try {
-                    $this->writeCsv($out, ['SMS Drop', 'Debt Tier', 'Source Drop', 'First Name', 'Address', 'Debt', 'Phone', 'Send Date']);
+                    $this->writeCsv($out, $this->csvHeader());
                     foreach ($groups as $tier => $drops) {
                         $id = ++$next;
                         $name = 'SMS'.str_pad((string) $id, 4, '0', STR_PAD_LEFT);
@@ -178,16 +171,15 @@ class MailDropExportRepository extends SqlSrvRepository
                                     if ($out === false) {
                                         throw new RuntimeException('Unable to open another SMS CSV part.');
                                     }
-                                    $this->writeCsv($out, ['SMS Drop', 'Debt Tier', 'Source Drop', 'First Name', 'Address', 'Debt', 'Phone', 'Send Date']);
+                                    $this->writeCsv($out, $this->csvHeader());
                                     $partRows = 0;
                                 }
                                 $this->writeCsv($out, [
-                                    $name, $tier, $drop->Drop_Name,
-                                    explode(' ', trim((string) $row->Client))[0],
-                                    $row->Address, $row->Debt_Amount, $row->SMS_Phone, $drop->Send_Date,
+                                    $row->First_Name, $row->Address, $row->Debt_Amount,
+                                    ...$row->Phones, $exportedAt->toDateString(),
                                 ]);
                                 $partRows++;
-                                $sourceCount++;
+                                $sourceCount += count(array_filter($row->Phones, static fn (string $phone): bool => $phone !== ''));
                             }
                             if ($sourceCount === 0) {
                                 throw ValidationException::withMessages(['target' => 'Phone eligibility changed during export. Refresh and try again.']);
@@ -226,7 +218,9 @@ class MailDropExportRepository extends SqlSrvRepository
                 }
 
                 if (count($parts) === 1) {
-                    return ['path' => $path, 'count' => $total, 'names' => $names, 'part_count' => 1, 'format' => 'csv'];
+                    $result = ['path' => $path, 'count' => $total, 'names' => $names, 'part_count' => 1, 'format' => 'csv'];
+                    if ($publish !== null) $publish($result);
+                    return $result;
                 }
                 if (! class_exists(\ZipArchive::class)) {
                     throw new RuntimeException('The server needs PHP ZipArchive to package multiple SMS CSV files.');
@@ -241,7 +235,9 @@ class MailDropExportRepository extends SqlSrvRepository
                 }
                 $partCount = count($parts);
                 $parts = [];
-                return ['path' => $archivePath, 'count' => $total, 'names' => $names, 'part_count' => $partCount, 'format' => 'zip'];
+                $result = ['path' => $archivePath, 'count' => $total, 'names' => $names, 'part_count' => $partCount, 'format' => 'zip'];
+                if ($publish !== null) $publish($result);
+                return $result;
             });
         } catch (Throwable $exception) {
             foreach ($parts as $part) {
@@ -293,55 +289,175 @@ class MailDropExportRepository extends SqlSrvRepository
         }
     }
 
-    protected function eligiblePhones(): Builder
+    /** Target and SMS_Count count actual eligible phone numbers, not CSV lines. */
+    protected function countPhonesForDrop(string $dropName): int
     {
-        $phone = $this->normalizedPhoneExpression();
-        $sqlServer = $this->connection()->getDriverName() === 'sqlsrv';
-        $length = $sqlServer ? 'LEN' : 'LENGTH';
-        $prefixed = $sqlServer ? "('1' + {$phone})" : "('1' || {$phone})";
-
-        return $this->table('TblMailersUniqueEnriched', 'e')
-            ->whereRaw("{$length}({$phone}) = 10")
-            ->whereRaw($sqlServer ? "{$phone} NOT LIKE '%[^0-9]%'" : "{$phone} NOT GLOB '*[^0-9]*'")
-            ->whereNotExists(function (Builder $query) use ($phone, $prefixed): void {
-                $query->selectRaw('1')->from('TblPhoneNumbers as p')
-                    ->whereRaw("(p.Phone = {$phone} OR p.Phone = {$prefixed})");
-            });
+        $count = 0;
+        foreach ($this->rowsForDrop($dropName) as $row) {
+            $count += count(array_filter($row->Phones, static fn (string $phone): bool => $phone !== ''));
+        }
+        return $count;
     }
 
-    protected function rowsForDrop(string $dropName): iterable
+    /** @return array<int, string> */
+    protected function csvHeader(): array
+    {
+        return ['First name', 'address', 'debt load', 'phone1', 'phone2', 'phone3', 'phone4', 'phone5', 'send date'];
+    }
+
+    /**
+     * Both source tables can contain a lead. E has one phone per row (often several
+     * rows per External_ID); E2 has five slots and also has leads absent from E.
+     * Sorting their union by identity lets us merge without dropping either source.
+     */
+    protected function sourceRowsForDrop(string $dropName): iterable
     {
         $debt = $this->table('TblMailersUnique', 'u')
             ->select('u.Debt_Amount')
             ->whereColumn('u.External_ID', 'e.External_ID')
             ->whereColumn('u.Drop_Name', 'e.Drop_Name')
             ->orderBy('u.PK')->limit(1);
-
-        return $this->eligiblePhones()->where('e.Drop_Name', $dropName)
-            ->select(['e.PK', 'e.Client', 'e.Address'])
-            ->selectRaw($this->normalizedPhoneExpression().' AS SMS_Phone')
-            ->selectSub($debt, 'Debt_Amount')
-            ->lazyById(10000, 'e.PK', 'PK');
+        $one = $this->table('TblMailersUniqueEnriched', 'e')
+            ->where('e.Drop_Name', $dropName)
+            ->selectRaw('e.PK, e.External_ID, e.Client, e.Address, e.Phone AS phone1, NULL AS phone2, NULL AS phone3, NULL AS phone4, NULL AS phone5, 0 AS source_rank')
+            ->selectSub($debt, 'Debt_Amount');
+        $five = $this->table('TblMailersUniqueEnriched2', 'e2')
+            ->where('e2.Drop_Name', $dropName)
+            ->selectRaw('e2.PK, e2.External_ID, e2.Client, e2.Address, e2.phone1, e2.phone2, e2.phone3, e2.phone4, e2.phone5, 1 AS source_rank, e2.Debt_Amount');
+        $union = $one->unionAll($five);
+        $identity = 'LOWER(TRIM(External_ID))';
+        return $this->connection()->query()->fromSub($union, 'sources')
+            ->orderByRaw($identity)->orderBy('source_rank')->orderBy('PK')->cursor();
     }
 
-    protected function normalizedPhoneExpression(): string
+    protected function rowsForDrop(string $dropName): iterable
     {
-        $phone = "COALESCE(e.Phone, '')";
-        foreach ([' ', '-', '(', ')', '+', '.'] as $character) {
-            $phone = "REPLACE({$phone}, '{$character}', '')";
+        $pending = [];
+        $batch = [];
+        $identity = null;
+        foreach ($this->sourceRowsForDrop($dropName) as $source) {
+            $key = strtolower(trim((string) ($source->External_ID ?? '')));
+            if ($key === '') {
+                throw ValidationException::withMessages(['target' => "{$dropName} contains a lead without an External_ID. Correct the source before exporting."]);
+            }
+            if ($identity !== null && $key !== $identity) {
+                $lead = $this->mergeLead($pending, $dropName);
+                if ($lead !== null) $batch[] = $lead;
+                if (count($batch) >= 250) {
+                    yield from $this->eligibleRowsForLeads($batch);
+                    $batch = [];
+                }
+                $pending = [];
+            }
+            $identity = $key;
+            $pending[] = $source;
         }
-        $length = $this->connection()->getDriverName() === 'sqlsrv' ? 'LEN' : 'LENGTH';
-        return "CASE WHEN {$length}({$phone}) = 11 AND SUBSTRING({$phone}, 1, 1) = '1' THEN SUBSTRING({$phone}, 2, 10) ELSE {$phone} END";
+        if ($pending !== []) {
+            $lead = $this->mergeLead($pending, $dropName);
+            if ($lead !== null) $batch[] = $lead;
+        }
+        if ($batch !== []) yield from $this->eligibleRowsForLeads($batch);
+    }
+
+    /** @param array<int, object> $sources */
+    protected function mergeLead(array $sources, string $dropName): ?object
+    {
+        $address = null;
+        $preferred = null;
+        $debt = null;
+        $namesBySource = [];
+        $phones = [];
+        foreach ($sources as $source) {
+            $sourceAddress = strtoupper(trim((string) ($source->Address ?? '')));
+            if ($address !== null && $address !== $sourceAddress) {
+                throw ValidationException::withMessages(['target' => "{$dropName} has one External_ID with conflicting addresses. Reconcile the lead before exporting."]);
+            }
+            $address = $sourceAddress;
+            $rank = (int) $source->source_rank;
+            $sourceName = strtoupper(trim(preg_replace('/\s+/', ' ', (string) ($source->Client ?? ''))));
+            if (isset($namesBySource[$rank]) && $namesBySource[$rank] !== $sourceName) {
+                throw ValidationException::withMessages(['target' => "{$dropName} has one External_ID with conflicting names in the same source. Reconcile the lead before exporting."]);
+            }
+            $namesBySource[$rank] = $sourceName;
+            if ($preferred === null || (int) $source->source_rank > (int) $preferred->source_rank) $preferred = $source;
+            if ($source->Debt_Amount !== null && $source->Debt_Amount !== '') {
+                if ($debt !== null && $this->formatDebtLoad($debt) !== $this->formatDebtLoad($source->Debt_Amount)) {
+                    throw ValidationException::withMessages(['target' => "{$dropName} has one External_ID with conflicting debt amounts. Reconcile the lead before exporting."]);
+                }
+                $debt = $source->Debt_Amount;
+            }
+            foreach (['phone1', 'phone2', 'phone3', 'phone4', 'phone5'] as $column) {
+                $phone = $this->normalizePhone($source->{$column} ?? null);
+                if ($phone !== null) $phones[$phone] = true;
+            }
+        }
+        if ($phones === []) return null;
+        return (object) [
+            'First_Name' => strtoupper(explode(' ', trim((string) $preferred->Client))[0]),
+            'Address' => $address,
+            'Debt_Amount' => $this->formatDebtLoad($debt),
+            'Phones' => array_map('strval', array_keys($phones)),
+        ];
+    }
+
+    /** @param array<int, object> $leads */
+    protected function eligibleRowsForLeads(array $leads): iterable
+    {
+        $numbers = [];
+        foreach ($leads as $lead) foreach ($lead->Phones as $phone) $numbers[$phone] = true;
+        $contacted = [];
+        // SyncPhoneNumbers represents contacted people, so any matching number
+        // excludes the whole merged lead, not just one phone slot.
+        foreach (array_chunk(array_keys($numbers), 900) as $chunk) {
+            $lookups = [];
+            foreach ($chunk as $phone) { $lookups[] = $phone; $lookups[] = '1'.$phone; }
+            foreach ($this->table('TblPhoneNumbers')->whereIn('Phone', $lookups)->pluck('Phone') as $phone) {
+                $contacted[strlen((string) $phone) === 11 ? substr((string) $phone, 1) : (string) $phone] = true;
+            }
+        }
+        foreach ($leads as $lead) {
+            if (array_intersect_key(array_fill_keys($lead->Phones, true), $contacted) !== []) continue;
+            foreach (array_chunk($lead->Phones, 5) as $part) {
+                yield (object) [
+                    'First_Name' => $lead->First_Name,
+                    'Address' => $lead->Address,
+                    'Debt_Amount' => $lead->Debt_Amount,
+                    'Phones' => array_pad($part, 5, ''),
+                ];
+            }
+        }
+    }
+
+    protected function normalizePhone(mixed $value): ?string
+    {
+        $phone = str_replace([' ', '-', '(', ')', '+', '.'], '', (string) ($value ?? ''));
+        if (strlen($phone) === 11 && $phone[0] === '1') $phone = substr($phone, 1);
+        return preg_match('/^[0-9]{10}$/D', $phone) ? $phone : null;
+    }
+
+    protected function formatDebtLoad(mixed $value): string
+    {
+        $text = trim((string) ($value ?? ''));
+        if (! preg_match('/^(-?)(\d+)(?:\.(\d+))?$/D', $text, $matches)) return $text;
+        $integer = ltrim($matches[2], '0');
+        $fraction = rtrim($matches[3] ?? '', '0');
+        return $matches[1].($integer === '' ? '0' : $integer).($fraction === '' ? '' : '.'.$fraction);
     }
 
     /** @param resource $out @param array<int, mixed> $values */
     protected function writeCsv(mixed $out, array $values): void
     {
+        if ($values === $this->csvHeader()) {
+            if (fwrite($out, implode(',', $values)."\r\n") === false) {
+                throw new RuntimeException('Unable to write the SMS export header.');
+            }
+            return;
+        }
         $values = array_map(function (mixed $value): string {
             $text = (string) ($value ?? '');
             return preg_match('/^[=+@\\-\\t\\r\\n]/', $text) ? "'".$text : $text;
         }, $values);
-        if (fputcsv($out, $values, ',', '"', '') === false) {
+        if (fputcsv($out, $values, ',', '"', '', "\r\n") === false) {
             throw new RuntimeException('Unable to write the SMS export.');
         }
     }
