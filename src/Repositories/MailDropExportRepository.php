@@ -25,7 +25,7 @@ class MailDropExportRepository extends SqlSrvRepository
             ->orderByRaw('CASE WHEN m.Send_Date > ? THEN 1 ELSE 0 END ASC', [Carbon::today()->toDateString()])
             ->orderBy('m.SMS_Drops')
             ->orderByRaw('CASE WHEN m.SMS_Drops > 0 THEN m.SMS_Last_Export_Date END ASC')
-            ->orderByDesc('m.Send_Date')->orderBy('m.Drop_Name');
+            ->orderByDesc('m.Send_Date')->orderBy('m.Drop_Name')->orderBy('m.PK');
     }
 
     public function allDrops(int $page = 1): Collection
@@ -55,6 +55,35 @@ class MailDropExportRepository extends SqlSrvRepository
         $planned = (new SmsDropPlanner)->select($selected, $target);
         $this->assertUniqueSourceNames($planned, 'target');
         return $planned;
+    }
+
+    /** Freeze priority order before counting so another export cannot shift offset pages. */
+    public function orderedSelectableDropIds(): Collection
+    {
+        return $this->marketingDrops()
+            ->where('m.Send_Date', '<=', Carbon::today()->toDateString())
+            ->pluck('m.PK');
+    }
+
+    /** @param array<int, int> $ids */
+    public function countedDropsByIds(array $ids): Collection
+    {
+        $byId = $this->marketingDrops()->whereIn('m.PK', $ids)
+            ->where('m.Send_Date', '<=', Carbon::today()->toDateString())->get()->keyBy('PK');
+        if ($byId->count() !== count($ids)) {
+            throw ValidationException::withMessages(['count_pks' => 'The drop list changed. Auto select again.']);
+        }
+        $drops = collect($ids)->map(fn (int $id): object => $byId->get($id));
+        if ($drops->isEmpty()) return $drops;
+
+        $counts = $this->eligiblePhones()->whereIn('e.Drop_Name', $drops->pluck('Drop_Name')->all())
+            ->select('e.Drop_Name')->selectRaw('COUNT(*) AS Amount_Dropped')
+            ->groupBy('e.Drop_Name')->get()
+            ->mapWithKeys(fn (object $row): array => [strtolower(trim((string) $row->Drop_Name)) => (int) $row->Amount_Dropped]);
+        foreach ($drops as $drop) {
+            $drop->Amount_Dropped = $counts->get(strtolower(trim((string) $drop->Drop_Name)), 0);
+        }
+        return $drops;
     }
 
     /** @param array<int, int> $ids */
@@ -95,6 +124,9 @@ class MailDropExportRepository extends SqlSrvRepository
                 }
                 $selected = $dropPks === null ? $this->selectDrops($target) : $this->selectDropsByIds($dropPks);
                 $this->assertUniqueSourceNames($selected, 'target');
+                if ((int) $selected->sum('Amount_Dropped') > 10000000) {
+                    throw ValidationException::withMessages(['target' => 'Whole drops exceed the 10,000,000 phone export limit. Choose a smaller target or different drops.']);
+                }
                 if ((int) $selected->sum('Amount_Dropped') < $target) {
                     throw ValidationException::withMessages(['target' => 'There are not enough eligible phones to reach this target. Enter a smaller target.']);
                 }
