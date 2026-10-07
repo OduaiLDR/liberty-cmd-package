@@ -57,11 +57,7 @@ class MarketingReportRepository extends SqlSrvRepository
      */
     public function updateMailDropCost(int $pk, float $cost)
     {
-        $this->table('TblMarketing')
-            ->where('PK', $pk)
-            ->update(['Mail_Drop_Cost' => $cost]);
-
-        return $this->baseQuery()->where('PK', $pk)->first();
+        return $this->updateUninvoicedCost($pk, $cost, 'Mail_Drop_Cost', 'Mail_Invoice_Number');
     }
 
     /**
@@ -69,11 +65,24 @@ class MarketingReportRepository extends SqlSrvRepository
      */
     public function updateDataDropCost(int $pk, float $cost)
     {
-        $this->table('TblMarketing')
-            ->where('PK', $pk)
-            ->update(['Data_Drop_Cost' => $cost]);
+        return $this->updateUninvoicedCost($pk, $cost, 'Data_Drop_Cost', 'Data_Invoice_Number');
+    }
 
-        return $this->baseQuery()->where('PK', $pk)->first();
+    protected function updateUninvoicedCost(int $pk, float $cost, string $costColumn, string $invoiceColumn)
+    {
+        return $this->connection()->transaction(function () use ($pk, $cost, $costColumn, $invoiceColumn) {
+            $drop = $this->table('TblMarketing')->where('PK', $pk)->first(['Drop_Name']);
+            if (! $drop) {
+                throw \Illuminate\Validation\ValidationException::withMessages(['pk' => 'This marketing row no longer exists.']);
+            }
+            $invoiceNumbers = $this->table('TblMarketing')->where('Drop_Name', $drop->Drop_Name)
+                ->orderBy('PK')->lockForUpdate()->pluck($invoiceColumn);
+            if ($invoiceNumbers->contains(fn ($number): bool => trim((string) ($number ?? '')) !== '')) {
+                throw \Illuminate\Validation\ValidationException::withMessages(['pk' => 'This drop already has an invoice for this cost type.']);
+            }
+            $this->table('TblMarketing')->where('PK', $pk)->update([$costColumn => $cost]);
+            return $this->baseQuery()->where('PK', $pk)->first();
+        });
     }
 
     /**
@@ -95,8 +104,10 @@ class MarketingReportRepository extends SqlSrvRepository
                 'Send_Date',
                 'Amount_Dropped',
                 'Mail_Invoice_Number',
+                DB::raw("CASE WHEN EXISTS (SELECT 1 FROM TblMarketing AS invoiced_mail WHERE invoiced_mail.Drop_Name = TblMarketing.Drop_Name AND LTRIM(RTRIM(COALESCE(invoiced_mail.Mail_Invoice_Number, ''))) <> '') THEN 1 ELSE 0 END AS Mail_Invoice_Recorded"),
                 DB::raw('COALESCE(Mail_Drop_Cost, 0) as Mail_Drop_Cost'),
                 'Data_Invoice_Number',
+                DB::raw("CASE WHEN EXISTS (SELECT 1 FROM TblMarketing AS invoiced_data WHERE invoiced_data.Drop_Name = TblMarketing.Drop_Name AND LTRIM(RTRIM(COALESCE(invoiced_data.Data_Invoice_Number, ''))) <> '') THEN 1 ELSE 0 END AS Data_Invoice_Recorded"),
                 DB::raw('COALESCE(Data_Drop_Cost, 0) as Data_Drop_Cost'),
                 'Calls',
                 'Language',
@@ -154,13 +165,13 @@ class MarketingReportRepository extends SqlSrvRepository
         return $this->table('TblSmsExports')->where('Week_Start', $start)->orderBy('PK')->get();
     }
 
-    /** @param array{kind:string,invoice_number:string,cost:string,week:string,vendor?:?string} $data */
+    /** @param array{kind:string,invoice_number:string,cost:string,week?:string,drop_name?:string} $data */
     public function allocateInvoice(array $data): void
     {
         $this->connection()->transaction(function () use ($data): void {
-            $start = \Carbon\Carbon::parse($data['week'])->startOfWeek();
             $sms = $data['kind'] === 'sms';
             if ($sms) {
+                $start = \Carbon\Carbon::parse($data['week'])->startOfWeek();
                 $query = $this->table('TblSmsExports')->where('Week_Start', $start->toDateString());
                 $countColumn = 'SMS_Count';
                 $costColumn = 'SMS_Cost';
@@ -169,15 +180,19 @@ class MarketingReportRepository extends SqlSrvRepository
             } else {
                 $table = 'TblMarketing';
                 $query = $this->table($table)
-                    ->whereBetween('Send_Date', [$start->toDateString(), $start->copy()->endOfWeek()->toDateString()])
-                    ->where('Vendor', $data['vendor']);
+                    ->where('Drop_Name', $data['drop_name']);
                 $countColumn = 'Amount_Dropped';
                 $costColumn = $data['kind'] === 'mail' ? 'Mail_Drop_Cost' : 'Data_Drop_Cost';
                 $invoiceColumn = $data['kind'] === 'mail' ? 'Mail_Invoice_Number' : 'Data_Invoice_Number';
             }
-            $rows = $query->orderBy('PK')->lockForUpdate()->get(['PK', $countColumn]);
+            $rows = $query->orderBy('PK')->lockForUpdate()->get(['PK', $countColumn, $invoiceColumn]);
             if ($rows->isEmpty()) {
-                throw \Illuminate\Validation\ValidationException::withMessages(['week' => 'No drops match this week and vendor.']);
+                throw \Illuminate\Validation\ValidationException::withMessages([$sms ? 'week' : 'drop_name' => 'No rows match this invoice selection.']);
+            }
+            if ($rows->contains(fn (object $row): bool => trim((string) ($row->{$invoiceColumn} ?? '')) !== '')) {
+                throw \Illuminate\Validation\ValidationException::withMessages([$sms ? 'week' : 'drop_name' => $sms
+                    ? 'This SMS export week already has an invoice.'
+                    : 'This drop already has an invoice for this cost type.']);
             }
             $counts = $rows->mapWithKeys(fn (object $row): array => [(int) $row->PK => (int) $row->{$countColumn}])->all();
             $costs = (new \Cmd\Reports\Services\SmsDropPlanner)->allocate((string) $data['cost'], $counts);

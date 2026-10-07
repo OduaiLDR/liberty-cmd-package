@@ -18,9 +18,10 @@ beforeEach(function () {
     $this->previousContainer = Container::getInstance();
     $container = new Container;
     Container::setInstance($container);
-    $container->instance('config', new Repository);
+    $container->instance('config', new Repository(['database' => ['default' => 'sqlsrv']]));
     $capsule = new Manager($container);
     $capsule->addConnection(['driver' => 'sqlite', 'database' => ':memory:', 'prefix' => ''], 'sqlsrv');
+    $capsule->getDatabaseManager()->setDefaultConnection('sqlsrv');
     $container->instance('db', $capsule->getDatabaseManager());
     $this->db = $capsule->getConnection('sqlsrv');
     $container->instance('db.schema', $this->db->getSchemaBuilder());
@@ -32,9 +33,15 @@ beforeEach(function () {
         $table->integer('PK')->primary();
         $table->string('Drop_Name');
         $table->string('Debt_Tier')->nullable();
+        $table->string('Drop_Type')->nullable();
         $table->date('Send_Date');
         $table->string('Vendor')->default('Vendor A');
+        $table->string('Data_Type')->nullable();
+        $table->string('Mail_Style')->nullable();
         $table->integer('Amount_Dropped')->default(0);
+        $table->integer('Calls')->nullable();
+        $table->string('Language')->nullable();
+        $table->string('Drop_Name_Sequential')->nullable();
         $table->string('Mail_Invoice_Number')->nullable();
         $table->string('Data_Invoice_Number')->nullable();
         $table->decimal('Mail_Drop_Cost', 12, 2)->default(0);
@@ -120,6 +127,10 @@ test('exhausts lower export counts and chooses the oldest last use before repeat
     expect($this->repo->selectDrops(2)->pluck('PK')->all())->toBe([3, 2]);
     smsFixture($this->db, 4, 'T4', '2026-10-06', ['2025550104']);
     expect($this->repo->selectDrops(1)->pluck('PK')->all())->toBe([4]);
+    smsFixture($this->db, 5, 'T5', '2026-10-12', ['2025550105']);
+    expect($this->repo->selectDrops(1)->pluck('PK')->all())->toBe([4]);
+    expect((int) $this->repo->allDrops()->firstWhere('PK', 5)->SMS_Selectable)->toBe(0);
+    expect(fn () => $this->repo->selectDropsByIds([5]))->toThrow(ValidationException::class);
 });
 
 test('creates eight tier IDs and continues at nine in the following week', function () {
@@ -202,17 +213,27 @@ test('weekly SMS billing uses exported counts and does not affect another week',
     expect((float) $this->db->table('TblSmsExports')->where('PK', 1)->value('SMS_Cost'))->toBe(33.33);
     expect((float) $this->db->table('TblSmsExports')->where('PK', 2)->value('SMS_Cost'))->toBe(66.67);
     expect($this->db->table('TblSmsExports')->where('PK', 3)->value('SMS_Invoice_Number'))->toBeNull();
+    expect(fn () => (new MarketingReportRepository)->allocateInvoice(['kind' => 'sms', 'invoice_number' => 'SECOND', 'cost' => '2.00', 'week' => '2026-10-07']))
+        ->toThrow(ValidationException::class);
+    expect($this->db->table('TblSmsExports')->where('PK', 1)->value('SMS_Invoice_Number'))->toBe('SMS-INV');
 });
 
-test('mail invoice distributes across the vendor week and keeps other vendors unchanged', function () {
+test('mail invoice distributes across all tiers of one drop and leaves other drops unchanged', function () {
     smsFixture($this->db, 1, 'T1', '2026-10-05', ['2025550101']);
     smsFixture($this->db, 2, 'T2', '2026-10-05', ['2025550102', '2025550103']);
     smsFixture($this->db, 3, 'T3', '2026-10-05', ['2025550104']);
-    $this->db->table('TblMarketing')->where('PK', 3)->update(['Vendor' => 'Vendor B']);
-    (new MarketingReportRepository)->allocateInvoice(['kind' => 'mail', 'invoice_number' => 'MAIL-INV', 'cost' => '10.00', 'week' => '2026-10-05', 'vendor' => 'Vendor A']);
+    $this->db->table('TblMarketing')->where('PK', 2)->update(['Drop_Name' => 'DROP1']);
+    (new MarketingReportRepository)->allocateInvoice(['kind' => 'mail', 'invoice_number' => 'MAIL-INV', 'cost' => '10.00', 'drop_name' => 'DROP1']);
     expect((float) $this->db->table('TblMarketing')->where('PK', 1)->value('Mail_Drop_Cost'))->toBe(3.33);
     expect((float) $this->db->table('TblMarketing')->where('PK', 2)->value('Mail_Drop_Cost'))->toBe(6.67);
     expect($this->db->table('TblMarketing')->where('PK', 3)->value('Mail_Invoice_Number'))->toBeNull();
+    expect((float) $this->db->table('TblMarketing')->where('PK', 3)->value('Mail_Drop_Cost'))->toBe(0.0);
+    expect(fn () => (new MarketingReportRepository)->allocateInvoice(['kind' => 'mail', 'invoice_number' => 'SECOND', 'cost' => '9.00', 'drop_name' => 'DROP1']))
+        ->toThrow(ValidationException::class);
+    expect($this->db->table('TblMarketing')->where('PK', 1)->value('Mail_Invoice_Number'))->toBe('MAIL-INV');
+    (new MarketingReportRepository)->allocateInvoice(['kind' => 'data', 'invoice_number' => 'DATA-INV', 'cost' => '0.01', 'drop_name' => 'DROP1']);
+    expect((float) $this->db->table('TblMarketing')->where('PK', 1)->value('Data_Drop_Cost'))->toBe(0.0);
+    expect((float) $this->db->table('TblMarketing')->where('PK', 2)->value('Data_Drop_Cost'))->toBe(0.01);
 });
 
 
@@ -224,6 +245,8 @@ test('form requests reject invalid targets and invoices and enforce permissions'
     $validator = Container::getInstance()->make('validator');
     expect($validator->make(['target' => -1, 'request_id' => 'invalid'], $export->rules())->fails())->toBeTrue();
     expect($validator->make(['kind' => 'mail', 'invoice_number' => 'INV', 'cost' => '1.001', 'week' => '2026-10-05'], $invoice->rules())->fails())->toBeTrue();
+    expect($validator->make(['kind' => 'mail', 'invoice_number' => 'INV', 'cost' => '1.00', 'drop_name' => 'DROP1'], $invoice->rules())->passes())->toBeTrue();
+    expect($validator->make(['kind' => 'mail', 'invoice_number' => 'INV', 'cost' => '1.00', 'week' => '2026-10-05'], $invoice->rules())->fails())->toBeTrue();
     expect($validator->make(['kind' => 'sms', 'invoice_number' => 'INV', 'cost' => '1.01', 'week' => '2026-10-05'], $invoice->rules())->passes())->toBeTrue();
 });
 
@@ -250,7 +273,7 @@ function smsRenderView(string $name, array $data): string
     $container->instance('request', $request);
     $container->instance('session', $session);
     $routes = new \Illuminate\Routing\RouteCollection;
-    foreach (['cmd.reports.mail_drop_export', 'cmd.reports.mail_drop_export.export', 'cmd.reports.marketing_report', 'cmd.reports.marketing_report.invoice'] as $routeName) {
+    foreach (['cmd.reports.mail_drop_export', 'cmd.reports.mail_drop_export.export', 'cmd.reports.marketing_report', 'cmd.reports.marketing_report.invoice', 'cmd.reports.marketing_report.mail.update', 'cmd.reports.marketing_report.data.update'] as $routeName) {
         $route = new \Illuminate\Routing\Route('GET', '/'.$routeName, fn () => null);
         $routes->add($route->name($routeName));
     }
@@ -286,7 +309,54 @@ test('marketing view renders SMS invoice fields and weekly totals', function () 
             'SMS_Count' => 12, 'SMS_Invoice_Number' => 'INV-9', 'SMS_Cost' => '1.23',
         ]]),
     ]);
-    expect($html)->toContain('SMS0009')->toContain('INV-9')->toContain('$1.23')->toContain('Distribute invoice');
+    expect($html)->toContain('SMS0009')->toContain('INV-9')->toContain('$1.23')->not->toContain('Distribute SMS invoice');
+});
+
+test('marketing rows flag an invoice recorded on another tier of the same drop', function () {
+    smsFixture($this->db, 1, 'T1', '2026-10-05', ['2025550101']);
+    smsFixture($this->db, 2, 'T2', '2026-10-05', ['2025550102']);
+    smsFixture($this->db, 3, 'T3', '2026-10-05', ['2025550103']);
+    $this->db->table('TblMarketing')->where('PK', 2)->update(['Drop_Name' => 'DROP1', 'Mail_Invoice_Number' => 'OLDER']);
+    $rows = (new MarketingReportRepository)->all()->keyBy('PK');
+    expect((int) $rows[1]->Mail_Invoice_Recorded)->toBe(1);
+    expect((int) $rows[2]->Mail_Invoice_Recorded)->toBe(1);
+    expect((int) $rows[3]->Mail_Invoice_Recorded)->toBe(0);
+    expect((int) $rows[1]->Data_Invoice_Recorded)->toBe(0);
+});
+
+test('direct cost edits cannot change a drop after any tier is invoiced', function () {
+    smsFixture($this->db, 1, 'T1', '2026-10-05', ['2025550101']);
+    smsFixture($this->db, 2, 'T2', '2026-10-05', ['2025550102']);
+    $this->db->table('TblMarketing')->where('PK', 2)->update(['Drop_Name' => 'DROP1', 'Mail_Invoice_Number' => 'OLDER']);
+    $repository = new MarketingReportRepository;
+    expect(fn () => $repository->updateMailDropCost(1, 99.00))->toThrow(ValidationException::class);
+    expect((float) $this->db->table('TblMarketing')->where('PK', 1)->value('Mail_Drop_Cost'))->toBe(0.0);
+    $repository->updateDataDropCost(1, 1.25);
+    expect((float) $this->db->table('TblMarketing')->where('PK', 1)->value('Data_Drop_Cost'))->toBe(1.25);
+    $this->db->table('TblMarketing')->where('PK', 2)->update(['Data_Invoice_Number' => 'DATA-OLD']);
+    expect(fn () => $repository->updateDataDropCost(1, 99.00))->toThrow(ValidationException::class);
+    expect((float) $this->db->table('TblMarketing')->where('PK', 1)->value('Data_Drop_Cost'))->toBe(1.25);
+});
+
+test('marketing view offers only missing invoices for each source drop', function () {
+    $base = [
+        'PK' => 1, 'Drop_Name' => 'DROP1', 'Debt_Tier' => 'T1', 'Drop_Type' => '', 'Vendor' => 'Vendor A',
+        'Data_Type' => '', 'Mail_Style' => '', 'Send_Date' => '2026-10-05', 'Amount_Dropped' => 10,
+        'Mail_Invoice_Number' => null, 'Mail_Drop_Cost' => 0, 'Per_Piece_Mail_Cost' => 0,
+        'Data_Invoice_Number' => 'DATA-1', 'Data_Drop_Cost' => 2, 'Per_Piece_Data_Cost' => 0.2,
+        'Total_Drop_Cost' => 2, 'Per_Piece_Total_Cost' => 0.2, 'Calls' => 0,
+        'Language' => '', 'Drop_Name_Sequential' => '',
+    ];
+    $html = smsRenderView('reports::reports.marketing', [
+        'reports' => collect([(object) $base]), 'options' => [], 'smsWeek' => '2026-10-05', 'smsExports' => collect(),
+    ]);
+    expect($html)->toContain('Add Mail invoice')->not->toContain('Add Data invoice');
+    expect($html)->toContain('name="drop_name" value="DROP1"');
+    $base['Mail_Invoice_Number'] = 'MAIL-1';
+    $html = smsRenderView('reports::reports.marketing', [
+        'reports' => collect([(object) $base]), 'options' => [], 'smsWeek' => '2026-10-05', 'smsExports' => collect(),
+    ]);
+    expect($html)->not->toContain('Add Mail invoice')->not->toContain('Add Data invoice');
 });
 
 

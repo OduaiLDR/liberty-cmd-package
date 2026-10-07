@@ -17,6 +17,7 @@ class MailDropExportRepository extends SqlSrvRepository
         return $this->table('TblMarketing', 'm')
             ->select(['m.PK', 'm.Drop_Name', 'm.Debt_Tier', 'm.Send_Date', 'm.SMS_Drops', 'm.SMS_Last_Export_Date'])
             ->whereNotNull('m.Drop_Name')
+            ->orderByRaw('CASE WHEN m.Send_Date > ? THEN 1 ELSE 0 END ASC', [Carbon::today()->toDateString()])
             ->orderBy('m.SMS_Drops')
             ->orderByRaw('CASE WHEN m.SMS_Drops > 0 THEN m.SMS_Last_Export_Date END ASC')
             ->orderByDesc('m.Send_Date')->orderBy('m.Drop_Name');
@@ -25,14 +26,16 @@ class MailDropExportRepository extends SqlSrvRepository
     public function allDrops(int $page = 1): Collection
     {
         $counts = $this->eligiblePhones()->whereColumn('e.Drop_Name', 'm.Drop_Name')->selectRaw('COUNT(*)');
-        return $this->marketingDrops()->selectSub($counts, 'Amount_Dropped')->forPage($page, 25)->get();
+        return $this->marketingDrops()
+            ->selectRaw('CASE WHEN m.Send_Date <= ? THEN 1 ELSE 0 END AS SMS_Selectable', [Carbon::today()->toDateString()])
+            ->selectSub($counts, 'Amount_Dropped')->forPage($page, 25)->get();
     }
 
     public function selectDrops(int $target): Collection
     {
         $selected = collect();
         $total = 0;
-        $this->marketingDrops()->chunk(25, function (Collection $drops) use ($target, &$selected, &$total): bool {
+        $this->marketingDrops()->where('m.Send_Date', '<=', Carbon::today()->toDateString())->chunk(25, function (Collection $drops) use ($target, &$selected, &$total): bool {
             foreach ($drops as $drop) {
                 $drop->Amount_Dropped = $this->eligiblePhones()->where('e.Drop_Name', $drop->Drop_Name)->count();
                 if ($drop->Amount_Dropped > 0) {
@@ -53,7 +56,7 @@ class MailDropExportRepository extends SqlSrvRepository
     /** @param array<int, int> $ids */
     public function selectDropsByIds(array $ids): Collection
     {
-        $drops = $this->marketingDrops()->whereIn('m.PK', $ids)->get()->keyBy('PK');
+        $drops = $this->marketingDrops()->where('m.Send_Date', '<=', Carbon::today()->toDateString())->whereIn('m.PK', $ids)->get()->keyBy('PK');
         if ($drops->count() !== count($ids)) {
             throw ValidationException::withMessages(['drop_pks' => 'One or more selected drops no longer exist. Refresh the list.']);
         }
