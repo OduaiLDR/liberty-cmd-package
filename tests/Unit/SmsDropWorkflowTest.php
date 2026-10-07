@@ -681,3 +681,41 @@ test('missing E2 debt retains the amount from the one-phone source', function ()
         expect($records[1][2])->toBe('10000');
     } finally { unlink($export['path']); }
 });
+
+test('SMS storage reuses the existing CMD S3 disk when no dedicated bucket is set', function () {
+    $previous = getenv('CMD_SMS_EXPORT_BUCKET');
+    $previousRegion = getenv('CMD_SMS_EXPORT_REGION');
+    $previousDisk = config('filesystems.disks.s3');
+    $previousSms = config('sms-exports');
+    putenv('CMD_SMS_EXPORT_BUCKET');
+    putenv('CMD_SMS_EXPORT_REGION');
+    config()->set('filesystems.disks.s3.bucket', 'existing-cmd-bucket');
+    config()->set('filesystems.disks.s3.region', 'us-east-2');
+    try {
+        $settings = require __DIR__.'/../../config/sms-exports.php';
+        expect($settings['bucket'])->toBe('existing-cmd-bucket');
+        expect($settings['region'])->toBe('us-east-2');
+        expect($settings['prefix'])->toBe('sms-exports');
+        // mergeConfigFrom is skipped with Laravel config:cache. The artifact
+        // service must still use the host's cached S3 disk settings.
+        config()->set('sms-exports', []);
+        expect((new \Cmd\Reports\Services\SmsExportArtifacts)->configured())->toBeTrue();
+        // Older cached package config can retain a different default region.
+        config()->set('sms-exports', ['bucket' => null, 'region' => 'us-west-1']);
+        $artifacts = new \Cmd\Reports\Services\SmsExportArtifacts;
+        $region = new ReflectionMethod($artifacts, 'region');
+        expect($region->invoke($artifacts))->toBe('us-east-2');
+        putenv('CMD_SMS_EXPORT_BUCKET=dedicated-bucket');
+        $dedicated = require __DIR__.'/../../config/sms-exports.php';
+        expect($dedicated['region'])->toBeNull();
+        config()->set('sms-exports', $dedicated);
+        expect((new \Cmd\Reports\Services\SmsExportArtifacts)->configured())->toBeFalse();
+    } finally {
+        config()->set('filesystems.disks.s3', $previousDisk);
+        config()->set('sms-exports', $previousSms);
+        if ($previous === false) putenv('CMD_SMS_EXPORT_BUCKET');
+        else putenv('CMD_SMS_EXPORT_BUCKET='.$previous);
+        if ($previousRegion === false) putenv('CMD_SMS_EXPORT_REGION');
+        else putenv('CMD_SMS_EXPORT_REGION='.$previousRegion);
+    }
+});

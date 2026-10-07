@@ -10,13 +10,13 @@ class SmsExportArtifacts
 {
     public function configured(): bool
     {
-        return class_exists(S3Client::class) && trim((string) config('sms-exports.bucket')) !== '';
+        return class_exists(S3Client::class) && $this->bucket() !== '' && $this->region() !== '';
     }
 
     public function assertConfigured(): void
     {
         if (! $this->configured()) {
-            throw new RuntimeException('SMS export storage is unavailable. Configure CMD_SMS_EXPORT_BUCKET and the AWS SDK before exporting.');
+            throw new RuntimeException('SMS export storage is unavailable. Configure the existing S3 disk, or set both CMD_SMS_EXPORT_BUCKET and CMD_SMS_EXPORT_REGION.');
         }
     }
 
@@ -105,11 +105,25 @@ class SmsExportArtifacts
     {
         $this->assertConfigured();
 
-        return new S3Client(['version' => 'latest', 'region' => config('sms-exports.region', 'us-east-2')]);
+        return new S3Client(['version' => 'latest', 'region' => $this->region()]);
     }
 
     protected function bucket(): string
     {
-        return (string) config('sms-exports.bucket');
+        // Laravel skips mergeConfigFrom when configuration is cached. The host
+        // S3 disk remains in that cache, so exports still work without new env.
+        return trim((string) (config('sms-exports.bucket') ?: config('filesystems.disks.s3.bucket')));
+    }
+
+    protected function region(): string
+    {
+        $smsBucket = trim((string) config('sms-exports.bucket'));
+        $hostBucket = trim((string) config('filesystems.disks.s3.bucket'));
+
+        if ($smsBucket === '' || $smsBucket === $hostBucket) {
+            return trim((string) config('filesystems.disks.s3.region'));
+        }
+
+        return trim((string) config('sms-exports.region'));
     }
 }
