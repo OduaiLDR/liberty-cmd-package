@@ -143,7 +143,7 @@ test('API invoice preserves exact cost string and delegates only validated field
     $this->marketing->shouldReceive('allocateInvoice')->once()->with($data);
     $response = $this->controller->invoice(Request::create('/', 'POST', $data + ['unexpected' => 'ignored']));
     expect($response->getData(true)['ok'])->toBeTrue();
-    expect($response->getData(true)['message'])->toContain('replace existing allocations');
+    expect($response->getData(true)['message'])->toContain('selected drop');
 });
 
 test('API export streams the repository file with count and attachment headers', function () {

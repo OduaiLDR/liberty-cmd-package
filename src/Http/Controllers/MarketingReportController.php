@@ -67,7 +67,7 @@ class MarketingReportController extends Controller
     public function allocateInvoice(\Cmd\Reports\Http\Requests\MarketingInvoiceRequest $request): \Illuminate\Http\RedirectResponse
     {
         $this->repository->allocateInvoice($request->validated());
-        return back()->with('status', 'Invoice saved and cost distributed proportionally across all tiers in the selected week.');
+        return back()->with('status', 'Invoice saved and cost distributed proportionally across the selected drop or SMS export week.');
     }
 
     public function updateMailDropCost(Request $request, int $pk)

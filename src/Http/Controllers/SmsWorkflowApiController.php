@@ -103,7 +103,7 @@ class SmsWorkflowApiController extends Controller
 
         return new JsonResponse([
             'ok' => true,
-            'message' => 'Invoice saved. Costs replace existing allocations for the selected Monday–Sunday week and vendor (mail/data), or SMS export week.',
+            'message' => 'Invoice saved. Mail and data costs are allocated across every tier in the selected drop; SMS costs are allocated across the export week.',
         ]);
     }
 

@@ -18,8 +18,8 @@ class MarketingInvoiceRequest extends FormRequest
             'kind' => ['required', Rule::in(['mail', 'data', 'sms'])],
             'invoice_number' => ['required', 'string', 'max:100'],
             'cost' => ['required', 'regex:/^\\d{1,7}(?:\\.\\d{1,2})?$/'],
-            'week' => ['required', 'date_format:Y-m-d'],
-            'vendor' => ['required_unless:kind,sms', 'nullable', 'string', 'max:255'],
+            'week' => ['required_if:kind,sms', 'nullable', 'date_format:Y-m-d'],
+            'drop_name' => ['required_unless:kind,sms', 'nullable', 'string', 'max:255'],
         ];
     }
 }
