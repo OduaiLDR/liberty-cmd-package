@@ -5,6 +5,8 @@ namespace Cmd\Reports\Services;
 /** Campaign proof is separate from proof that two CRM contacts are the same person. */
 final class ContactSyncCampaign
 {
+    public const RECIPIENT_UNVERIFIED = 'Exact mailer key did not verify the recipient and campaign.';
+
     public static function resolve(array $contact, array $candidates): array
     {
         $contact = array_change_key_case($contact, CASE_LOWER);
@@ -35,7 +37,7 @@ final class ContactSyncCampaign
         }
         if (count($campaigns) !== 1) {
             return array_replace($proof, ['status' => 'unresolved', 'reason' => $campaigns === []
-                ? 'Exact mailer key did not verify the recipient and campaign.'
+                ? self::RECIPIENT_UNVERIFIED
                 : 'More than one campaign belongs to the verified recipient and mailer key.']);
         }
         return array_replace($proof, ['status' => 'verified', 'campaign' => (string) array_key_first($campaigns),
@@ -49,7 +51,12 @@ final class ContactSyncCampaign
         $existing = trim((string) ($before['campaign'] ?? ''));
         $value = $before === null ? '' : $before['campaign'];
         $reject = static fn (string $reason) => ['value' => $value, 'reason' => $reason];
-        if (($proof['status'] ?? null) === 'unresolved' && !($preserveUnverified && $existing !== ''
+        // Target identity/ownership is checked by the caller. Retaining attribution
+        // does not require proving the historical recipient again or create new proof.
+        $preserveAttribution = $before !== null
+            && ($proof['status'] ?? '') === 'unresolved'
+            && ($proof['reason'] ?? '') === self::RECIPIENT_UNVERIFIED;
+        if (($proof['status'] ?? null) === 'unresolved' && !$preserveAttribution && !($preserveUnverified && $existing !== ''
             && ($proof['candidate_campaigns'] ?? []) === [$existing])) {
             return $reject((string) ($proof['reason'] ?? 'Campaign attribution is unresolved.'));
         }
@@ -70,7 +77,7 @@ final class ContactSyncCampaign
             }
             $value = $candidate;
         }
-        return ['value' => $value, 'reason' => null];
+        return ['value' => $value, 'reason' => null, 'preserve_attribution' => $preserveAttribution];
     }
 
     private static function sameRecipient(array $contact, array $mailer): bool

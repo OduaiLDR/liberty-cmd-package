@@ -284,6 +284,12 @@ final class ContactSyncTargets
                         && (string) $campaignLinks[0]['external_id'] === $proofKey
                         && (string) $campaignLinks[0]['campaign'] === (string) $before['campaign']));
                 $campaign = ContactSyncCampaign::plan($row, $before, $proof, $campaignLinks, $preserveUnverified);
+                $preserveAttribution = $campaign['preserve_attribution'] ?? false;
+                if ($preserveAttribution && $source !== 'LT'
+                    && (string) $before['external_id'] !== (string) $row['external_id']) {
+                    // Backend External_ID is a native LT link, not a mailing key.
+                    $campaign['reason'] = 'Backend LT reference changed; attribution preservation requires a stable link.';
+                }
                 if (($proof['status'] ?? '') === 'verified' && $source === 'LT'
                     && (string) ($proof['external_id'] ?? '') !== (string) $row['external_id']) {
                     $campaign['reason'] = 'Campaign proof does not belong to the incoming mailer key.';
@@ -312,7 +318,7 @@ final class ContactSyncTargets
                 }
                 $preserveMailerKey = $source === 'LT' && $before !== null && $target === $id
                     && trim((string) $before['campaign']) !== '' && trim((string) $before['external_id']) !== '';
-                if ($preserveMailerKey && trim((string) $row['external_id']) !== ''
+                if ($preserveMailerKey && !$preserveAttribution && trim((string) $row['external_id']) !== ''
                     && (string) $row['external_id'] !== (string) $before['external_id']) {
                     $campaign['reason'] = 'Existing campaign mailer key differs; a reviewed attribution repair is required.';
                 }
@@ -358,6 +364,12 @@ final class ContactSyncTargets
                             $after[$field] = $before[$field];
                         }
                     }
+                }
+                if ($preserveAttribution) {
+                    // Keep the exact stored value, including NULL/blank, after all remap rules.
+                    $after['external_id'] = $before['external_id'];
+                    $warnings[] = ['code' => 'campaign_attribution_preserved', 'source' => $source, 'id' => $id,
+                        'message' => 'Existing campaign and external ID preserved; ordinary updates allowed without new campaign proof.'];
                 }
                 $changes = [];
                 foreach ($after as $field => $value) {
