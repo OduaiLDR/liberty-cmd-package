@@ -88,9 +88,11 @@ final class ContactSyncCampaign
     private static function sameRecipient(array $contact, array $mailer): bool
     {
         $name = self::normalize($contact['client'] ?? $contact['fullname'] ?? '');
-        $address = self::normalize($contact['address_1'] ?? $contact['address1'] ?? $contact['address'] ?? '');
+        $street = (string) ($contact['address_1'] ?? $contact['address1'] ?? $contact['address'] ?? '');
+        $mailerStreet = (string) ($mailer['address'] ?? '');
+        $address = self::normalize($street);
         if ($name === '' || $address === '' || !self::sameName($contact['client'] ?? $contact['fullname'] ?? '', $mailer['client'] ?? '')
-            || $address !== self::normalize($mailer['address'] ?? '')) {
+            || ($address !== self::normalize($mailerStreet) && !ContactSyncAddress::matches($street, $mailerStreet))) {
             return false;
         }
         $same = [];
