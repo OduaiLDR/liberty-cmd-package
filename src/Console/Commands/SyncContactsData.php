@@ -983,7 +983,18 @@ class SyncContactsData extends Command
     private function fetchDropNamesFiltered(DBConnector $connector, array $chunk): array
     {
         $lt = $this->source === 'LT' ? null : $this->initializeLendingTowerConnector();
-        $this->campaignProofs = ContactSyncCampaignLookup::collect($connector, $chunk, $this->source, $lt);
+        $sources = $lt === null ? [] : ['LT' => $lt];
+        $this->campaignProofs = ContactSyncCampaignLookup::collect($connector, $chunk, $this->source, $lt,
+            function (string $source, string $sql) use (&$sources): array {
+                $sources[$source] ??= DBConnector::fromEnvironment(strtolower($source));
+                $result = $sources[$source]->query($sql, [], 60);
+                if (($result['success'] ?? true) !== true || !is_array($result['data'] ?? null)
+                    || !empty($result['error']) || !empty($result['truncated'])
+                    || (isset($result['rowCount']) && (int) $result['rowCount'] !== count($result['data']))) {
+                    throw new \RuntimeException('Incomplete campaign identity evidence response.');
+                }
+                return $result['data'];
+            });
         $names = [];
         foreach ($this->campaignProofs as $id => $proof) {
             if ($proof['status'] === 'verified') $names[$id] = $proof['campaign'];
