@@ -1307,6 +1307,10 @@ class SyncContactsData extends Command
     {
         $accepted = [];
         foreach ($plan as $change) {
+            foreach ($change['campaign_hold_ids'] ?? [] as $id) {
+                $this->campaignHolds[$id] = true;
+                unset($this->verifiedCampaigns[$id]);
+            }
             $skip = (bool) ($change['skip'] ?? false);
             $warnings = $change['warnings'] ?? [];
             if ($skip && $warnings === []) {

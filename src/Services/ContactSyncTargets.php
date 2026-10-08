@@ -133,7 +133,12 @@ final class ContactSyncTargets
                 }
             }
             $added = array_values(array_diff(array_unique($held), $campaignHolds));
-            if ($added === []) return $plan;
+            if ($added === []) {
+                // Carry the complete closure to the caller so the next page cannot
+                // escape a known hold through an indirect native-ID link.
+                if ($plan !== [] && $campaignHolds !== []) $plan[0]['campaign_hold_ids'] = $campaignHolds;
+                return $plan;
+            }
             $campaignHolds = array_values(array_unique(array_merge($campaignHolds,
                 ContactSyncExclusions::resolve($pdo, $added, null))));
         } while (true);
@@ -341,7 +346,7 @@ final class ContactSyncTargets
                     }
                 }
                 $preserveMailerKey = $source === 'LT' && $before !== null && $target === $id
-                    && trim((string) $before['campaign']) !== '' && trim((string) $before['external_id']) !== '';
+                    && trim((string) $before['external_id']) !== '';
                 if ($preserveMailerKey && !$preserveAttribution && trim((string) $row['external_id']) !== ''
                     && (string) $row['external_id'] !== (string) $before['external_id']) {
                     $attributionReview = 'Existing campaign mailer key differs; a reviewed attribution repair is required.';
