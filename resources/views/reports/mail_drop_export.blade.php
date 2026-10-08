@@ -4,15 +4,15 @@
 <div class="card">
     <div class="card-header"><h6 class="mb-0">Mail Drop Export · SMS</h6></div>
     <div class="card-body">
-        <p>Choose a phone target. Whole drops are selected in order: fewest SMS exports first, newest unused drops first, then oldest last export. Synced contact phone numbers are excluded. Browsing shows drops immediately; eligible counts appear after selecting a target.</p>
-        <p>Each CSV contains at most 1,000,000 records. Larger exports download as a ZIP of numbered CSV files.</p>
+        <p>Choose a phone target. Whole drops are selected in order: fewest SMS exports first, newest unused drops first, then oldest last export. Synced contact phone numbers are excluded. After crossing the target, the next 30 drops are checked for a smaller qualifying final drop at the same SMS-use level. The original final drop is kept if none improves the fit. Browsing shows drops immediately; eligible counts appear after selecting a target.</p>
+        <p>Exports download as one CSV containing all eligible records.</p>
         @if ($errors->any())
             <div class="alert alert-danger" role="alert">{{ $errors->first() }}</div>
         @endif
         <form method="get" action="{{ route('cmd.reports.mail_drop_export') }}" class="d-flex flex-wrap gap-2 align-items-end mb-3">
             <div>
                 <label for="sms-target" class="form-label">SMS phone target</label>
-                <input id="sms-target" name="target" type="number" min="1" max="10000000" step="1" required value="{{ $target ?: '' }}" class="form-control">
+                <input id="sms-target" name="target" type="number" min="1" max="9007199254740991" step="1" required value="{{ $target ?: '' }}" class="form-control">
             </div>
             <button class="btn btn-primary" type="submit">Select drops</button>
             <a class="btn btn-light" href="{{ route('cmd.reports.mail_drop_export') }}">Browse drops</a>

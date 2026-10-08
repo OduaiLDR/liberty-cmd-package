@@ -106,6 +106,7 @@ class ReportsServiceProvider extends ServiceProvider
         $this->loadRoutesFrom(__DIR__ . '/../routes/web.php');
         $this->loadRoutesFrom(__DIR__ . '/../routes/pmod.php');
         $this->loadRoutesFrom(__DIR__ . '/../routes/sms-api.php');
+        $this->loadRoutesFrom(__DIR__ . '/../routes/sms-download.php');
         $this->loadViewsFrom(__DIR__ . '/../resources/views', 'reports');
 
         $this->publishes([

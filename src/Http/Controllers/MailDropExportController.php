@@ -19,7 +19,7 @@ class MailDropExportController extends Controller
     public function index(Request $request): View
     {
         $validated = $request->validate([
-            'target' => ['nullable', 'integer', 'min:1', 'max:10000000'],
+            'target' => ['nullable', 'integer', 'min:1', 'max:9007199254740991'],
             'page' => ['nullable', 'integer', 'min:1'],
         ]);
         $target = (int) ($validated['target'] ?? 0);

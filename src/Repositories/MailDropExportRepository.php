@@ -4,7 +4,9 @@ namespace Cmd\Reports\Repositories;
 
 use Carbon\Carbon;
 use Cmd\Reports\Services\SmsDropPlanner;
+use Cmd\Reports\Services\SmsPhoneCounter;
 use Illuminate\Database\Query\Builder;
+use Illuminate\Database\Query\JoinClause;
 use Illuminate\Support\Collection;
 use Illuminate\Validation\ValidationException;
 use RuntimeException;
@@ -35,23 +37,73 @@ class MailDropExportRepository extends SqlSrvRepository
             ->selectRaw('NULL AS Amount_Dropped')->forPage($page, 25)->get();
     }
 
-    public function selectDrops(int $target): Collection
+    public function selectDrops(int $target, ?callable $progress = null): Collection
     {
+        if ($target < 1) {
+            throw ValidationException::withMessages(['target' => 'Enter a positive SMS target.']);
+        }
         $selected = collect();
         $total = 0;
-        $this->marketingDrops()->where('m.Send_Date', '<=', Carbon::today()->toDateString())->chunk(25, function (Collection $drops) use ($target, &$selected, &$total): bool {
+        $processed = 0;
+        $batchSize = $target >= 100000 ? 25 : 1;
+        // Freeze the priority list so exports cannot move offset pages during counting.
+        $candidates = $this->marketingDrops()->where('m.Send_Date', '<=', Carbon::today()->toDateString())->get();
+        $offset = 0;
+        $crossing = null;
+        $crossingDetails = null;
+        $replacement = null;
+        $replacementDetails = null;
+        $lookedAhead = 0;
+        $done = false;
+        while (! $done && $offset < $candidates->count()) {
+            $limit = $crossing === null ? $batchSize : min(25, 30 - $lookedAhead);
+            $drops = $candidates->slice($offset, $limit)->values();
+            $counts = $this->phoneCounts($drops);
             foreach ($drops as $drop) {
-                $drop->Amount_Dropped = $this->countPhonesForDrop($drop->Drop_Name);
-                if ($drop->Amount_Dropped > 0) {
-                    $selected->push($drop);
-                    $total += $drop->Amount_Dropped;
+                $offset++;
+                if ($crossing !== null) {
+                    // Inspect the next 30 whole drops; unused candidates cannot
+                    // fail the selection merely because their source needs repair.
+                    $details = $counts[$drop->Drop_Name];
+                    $count = $details['count'];
+                    if ($count > 0 && $total + $count >= $target
+                        && (int) $drop->SMS_Drops === (int) $crossing->SMS_Drops
+                        && $count < $crossing->Amount_Dropped
+                        && ($replacement === null || $count < $replacement->Amount_Dropped)) {
+                        $drop->Amount_Dropped = $count;
+                        $replacement = $drop;
+                        $replacementDetails = $details;
+                    }
+                    $lookedAhead++;
+                    if ($progress !== null) $progress(++$processed, $total);
+                    if ($lookedAhead === 30) { $done = true; break; }
+                    continue;
                 }
-                if ($total >= $target) {
-                    return false;
+                $details = $counts[$drop->Drop_Name];
+                $drop->Amount_Dropped = $details['count'];
+                if ($drop->Amount_Dropped > 0 && $total + $drop->Amount_Dropped > $target) {
+                    // Keep the subtotal below target until the final drop is chosen,
+                    // so progress never announces a total that later decreases.
+                    $crossing = $drop;
+                    $crossingDetails = $details;
+                } else {
+                    $drop->Amount_Dropped = (new SmsPhoneCounter)->validatedCount($drop->Drop_Name, $details);
+                    if ($drop->Amount_Dropped > 0) {
+                        $selected->push($drop);
+                        $total += $drop->Amount_Dropped;
+                    }
                 }
+                if ($progress !== null) $progress(++$processed, $total);
+                if ($total === $target) { $done = true; break; }
             }
-            return true;
-        });
+        }
+        if ($crossing !== null) {
+            $last = $replacement ?? $crossing;
+            $last->Amount_Dropped = (new SmsPhoneCounter)->validatedCount($last->Drop_Name, $replacement === null ? $crossingDetails : $replacementDetails);
+            $selected->push($last);
+            $total += $last->Amount_Dropped;
+            if ($progress !== null) $progress($processed, $total);
+        }
         $planned = (new SmsDropPlanner)->select($selected, $target);
         $this->assertUniqueSourceNames($planned, 'target');
         return $planned;
@@ -65,10 +117,91 @@ class MailDropExportRepository extends SqlSrvRepository
             ->pluck('m.PK');
     }
 
+    /** Persisted private state: count one frozen candidate per queued batch. */
+    public function startSelectionCheckpoint(int $target, ?array $ids = null): array
+    {
+        $query = $this->marketingDrops()->where('m.Send_Date', '<=', Carbon::today()->toDateString());
+        if ($ids === null) {
+            if ($target < 1) throw ValidationException::withMessages(['target' => 'Enter a positive SMS target.']);
+            $candidates = $query->get();
+        } else {
+            $byId = $query->whereIntegerInRaw('m.PK', $ids)->get()->keyBy('PK');
+            if ($byId->count() !== count($ids)) throw ValidationException::withMessages(['drop_pks' => 'One or more selected drops no longer exist. Refresh the list.']);
+            $candidates = collect($ids)->map(fn (int $id): object => $byId->get($id));
+        }
+        return ['version' => 1, 'manual' => $ids !== null, 'target' => $target,
+            'candidates' => $candidates->values()->map(fn (object $drop): array => (array) $drop)->all(),
+            'cursor' => 0, 'counts' => [], 'selected' => [], 'subtotal' => 0,
+            'crossing' => null, 'crossing_details' => null, 'replacement' => null, 'replacement_details' => null,
+            'looked_ahead' => 0, 'elapsed_seconds' => 0, 'complete' => $candidates->isEmpty()];
+    }
+
+    /** Finished candidates are never counted again when this checkpoint resumes. */
+    public function advanceSelectionCheckpoint(array $state): array
+    {
+        if ($state['complete']) return $state;
+        $drop = (object) $state['candidates'][$state['cursor']];
+        // Priority metadata is frozen in ascending usage order. Once refinement
+        // reaches another usage band, no later candidate can replace this drop.
+        if ($state['crossing'] !== null && (int) $drop->SMS_Drops !== (int) $state['crossing']['SMS_Drops']) {
+            $state['complete'] = true;
+            return $state;
+        }
+        $details = $this->phoneCounts(collect([$drop]))[$drop->Drop_Name];
+        $drop->Amount_Dropped = $details['count'];
+        if ($state['manual']) {
+            (new SmsPhoneCounter)->validatedCount($drop->Drop_Name, $details);
+            if ($drop->Amount_Dropped < 1) throw ValidationException::withMessages(['drop_pks' => "{$drop->Drop_Name} has no eligible phones. Deselect it and preview again."]);
+            $state['selected'][] = (array) $drop;
+            $state['subtotal'] += $drop->Amount_Dropped;
+        } elseif ($state['crossing'] !== null) {
+            $crossing = $state['crossing'];
+            if ($drop->Amount_Dropped > 0 && $state['subtotal'] + $drop->Amount_Dropped >= $state['target']
+                && (int) $drop->SMS_Drops === (int) $crossing['SMS_Drops']
+                && $drop->Amount_Dropped < $crossing['Amount_Dropped']
+                && ($state['replacement'] === null || $drop->Amount_Dropped < $state['replacement']['Amount_Dropped'])) {
+                $state['replacement'] = (array) $drop;
+                $state['replacement_details'] = $details;
+            }
+            $state['looked_ahead']++;
+            if ($state['looked_ahead'] === 30) $state['complete'] = true;
+        } elseif ($drop->Amount_Dropped > 0 && $state['subtotal'] + $drop->Amount_Dropped > $state['target']) {
+            $state['crossing'] = (array) $drop;
+            $state['crossing_details'] = $details;
+        } else {
+            (new SmsPhoneCounter)->validatedCount($drop->Drop_Name, $details);
+            if ($drop->Amount_Dropped > 0) {
+                $state['selected'][] = (array) $drop;
+                $state['subtotal'] += $drop->Amount_Dropped;
+            }
+            if ($state['subtotal'] === $state['target']) $state['complete'] = true;
+        }
+        $state['counts'][(string) $drop->PK] = $details;
+        $state['cursor']++;
+        if ($state['cursor'] >= count($state['candidates'])) $state['complete'] = true;
+        return $state;
+    }
+
+    public function selectionCheckpointResult(array $state): array
+    {
+        if (! $state['complete']) throw new RuntimeException('Selection counting has not completed.');
+        $selected = collect($state['selected'])->map(fn (array $drop): object => (object) $drop);
+        if ($state['crossing'] !== null) {
+            $last = (object) ($state['replacement'] ?? $state['crossing']);
+            (new SmsPhoneCounter)->validatedCount($last->Drop_Name, $state['replacement_details'] ?? $state['crossing_details']);
+            $selected->push($last);
+        }
+        $this->assertUniqueSourceNames($selected, $state['manual'] ? 'drop_pks' : 'target');
+        $total = (int) $selected->sum('Amount_Dropped');
+        $target = $state['manual'] ? $total : $state['target'];
+        return ['drops' => $selected->values()->all(), 'target' => $target, 'total' => $total,
+            'shortfall' => max(0, $target - $total), 'selection_mode' => $state['manual'] ? 'manual' : 'automatic'];
+    }
+
     /** @param array<int, int> $ids */
     public function countedDropsByIds(array $ids): Collection
     {
-        $byId = $this->marketingDrops()->whereIn('m.PK', $ids)
+        $byId = $this->marketingDrops()->whereIntegerInRaw('m.PK', $ids)
             ->where('m.Send_Date', '<=', Carbon::today()->toDateString())->get()->keyBy('PK');
         if ($byId->count() !== count($ids)) {
             throw ValidationException::withMessages(['count_pks' => 'The drop list changed. Auto select again.']);
@@ -76,28 +209,37 @@ class MailDropExportRepository extends SqlSrvRepository
         $drops = collect($ids)->map(fn (int $id): object => $byId->get($id));
         if ($drops->isEmpty()) return $drops;
 
+        $counts = $this->phoneCounts($drops);
         foreach ($drops as $drop) {
-            $drop->Amount_Dropped = $this->countPhonesForDrop($drop->Drop_Name);
+            $drop->Amount_Dropped = (new SmsPhoneCounter)->validatedCount($drop->Drop_Name, $counts[$drop->Drop_Name]);
         }
         return $drops;
     }
 
     /** @param array<int, int> $ids */
-    public function selectDropsByIds(array $ids): Collection
+    public function selectDropsByIds(array $ids, ?callable $progress = null): Collection
     {
-        $drops = $this->marketingDrops()->where('m.Send_Date', '<=', Carbon::today()->toDateString())->whereIn('m.PK', $ids)->get()->keyBy('PK');
+        $drops = $this->marketingDrops()->where('m.Send_Date', '<=', Carbon::today()->toDateString())->whereIntegerInRaw('m.PK', $ids)->get()->keyBy('PK');
         if ($drops->count() !== count($ids)) {
             throw ValidationException::withMessages(['drop_pks' => 'One or more selected drops no longer exist. Refresh the list.']);
         }
 
-        $selected = collect($ids)->map(function (int $id) use ($drops): object {
-            $drop = $drops->get($id);
-            $drop->Amount_Dropped = $this->countPhonesForDrop($drop->Drop_Name);
-            if ($drop->Amount_Dropped < 1) {
-                throw ValidationException::withMessages(['drop_pks' => "{$drop->Drop_Name} has no eligible phones. Deselect it and preview again."]);
+        $processed = 0;
+        $total = 0;
+        $selected = collect();
+        foreach (array_chunk($ids, 25) as $batch) {
+            $counts = $this->phoneCounts(collect($batch)->map(fn (int $id) => $drops->get($id)));
+            foreach ($batch as $id) {
+                $drop = $drops->get($id);
+                $drop->Amount_Dropped = (new SmsPhoneCounter)->validatedCount($drop->Drop_Name, $counts[$drop->Drop_Name]);
+                if ($drop->Amount_Dropped < 1) {
+                    throw ValidationException::withMessages(['drop_pks' => "{$drop->Drop_Name} has no eligible phones. Deselect it and preview again."]);
+                }
+                $total += $drop->Amount_Dropped;
+                if ($progress !== null) $progress(++$processed, $total);
+                $selected->push($drop);
             }
-            return $drop;
-        });
+        }
         $this->assertUniqueSourceNames($selected, 'drop_pks');
         return $selected;
     }
@@ -120,17 +262,15 @@ class MailDropExportRepository extends SqlSrvRepository
                 }
                 $selected = $dropPks === null ? $this->selectDrops($target) : $this->selectDropsByIds($dropPks);
                 $this->assertUniqueSourceNames($selected, 'target');
-                if ((int) $selected->sum('Amount_Dropped') > 10000000) {
-                    throw ValidationException::withMessages(['target' => 'Whole drops exceed the 10,000,000 phone export limit. Choose a smaller target or different drops.']);
-                }
                 if ((int) $selected->sum('Amount_Dropped') < $target) {
                     throw ValidationException::withMessages(['target' => 'There are not enough eligible phones to reach this target. Enter a smaller target.']);
                 }
                 if ($selected->contains(fn (object $drop): bool => trim((string) $drop->Debt_Tier) === '')) {
                     throw ValidationException::withMessages(['target' => 'A selected drop is missing its debt tier. Correct the marketing record first.']);
                 }
+                $splitCsv = filter_var(config('sms-exports.split_csv', false), FILTER_VALIDATE_BOOLEAN);
                 $limit = $this->csvRecordLimit();
-                if ($limit < 1) {
+                if ($splitCsv && $limit < 1) {
                     throw new RuntimeException('The SMS CSV row limit must be positive.');
                 }
                 $groups = $selected->groupBy('Debt_Tier')->sortKeys(SORT_NATURAL);
@@ -153,7 +293,7 @@ class MailDropExportRepository extends SqlSrvRepository
                         foreach ($drops as $drop) {
                             $sourceCount = 0;
                             foreach ($this->rowsForDrop($drop->Drop_Name) as $row) {
-                                if ($partRows >= $limit) {
+                                if ($splitCsv && $partRows >= $limit) {
                                     if (! class_exists(\ZipArchive::class)) {
                                         throw new RuntimeException('The server needs PHP ZipArchive to package multiple SMS CSV files.');
                                     }
@@ -283,20 +423,39 @@ class MailDropExportRepository extends SqlSrvRepository
             }
             $names[$name] = true;
         }
-        if ($this->table('TblMarketing')->whereIn('Drop_Name', $drops->pluck('Drop_Name')->all())
-            ->groupBy('Drop_Name')->havingRaw('COUNT(*) > 1')->exists()) {
-            throw ValidationException::withMessages([$field => 'A source drop name appears more than once in marketing records. Correct the duplicates before exporting.']);
+        foreach (array_chunk($drops->pluck('Drop_Name')->all(), 900) as $batch) {
+            if ($this->table('TblMarketing')->whereIn('Drop_Name', $batch)
+                ->groupBy('Drop_Name')->havingRaw('COUNT(*) > 1')->exists()) {
+                throw ValidationException::withMessages([$field => 'A source drop name appears more than once in marketing records. Correct the duplicates before exporting.']);
+            }
         }
     }
 
     /** Target and SMS_Count count actual eligible phone numbers, not CSV lines. */
     protected function countPhonesForDrop(string $dropName): int
     {
+        if ($this->connection()->getDriverName() === 'sqlsrv') {
+            // Selection needs only phones, not the CSV's debt/name/address lookups.
+            // Full identity validation still happens before any export is recorded.
+            return (new SmsPhoneCounter)->count($this->connection(), $dropName);
+        }
+
         $count = 0;
         foreach ($this->rowsForDrop($dropName) as $row) {
             $count += count(array_filter($row->Phones, static fn (string $phone): bool => $phone !== ''));
         }
         return $count;
+    }
+
+    protected function phoneCounts(Collection $drops): array
+    {
+        if ($this->connection()->getDriverName() === 'sqlsrv') {
+            return (new SmsPhoneCounter)->details($this->connection(), $drops->pluck('Drop_Name')->all());
+        }
+
+        $counts = [];
+        foreach ($drops as $drop) $counts[$drop->Drop_Name] = ['count' => $this->countPhonesForDrop($drop->Drop_Name), 'missing_identity' => false];
+        return $counts;
     }
 
     /** @return array<int, string> */
@@ -313,19 +472,22 @@ class MailDropExportRepository extends SqlSrvRepository
     protected function sourceRowsForDrop(string $dropName): iterable
     {
         $debt = $this->table('TblMailersUnique', 'u')
-            ->select('u.Debt_Amount')
-            ->whereColumn('u.External_ID', 'e.External_ID')
-            ->whereColumn('u.Drop_Name', 'e.Drop_Name')
-            ->orderBy('u.PK')->limit(1);
+            ->select(['u.External_ID', 'u.Debt_Amount'])
+            ->selectRaw('ROW_NUMBER() OVER (PARTITION BY u.External_ID ORDER BY u.PK) AS debt_rank')
+            ->where('u.Drop_Name', $dropName);
         $one = $this->table('TblMailersUniqueEnriched', 'e')
             ->where('e.Drop_Name', $dropName)
-            ->selectRaw('e.PK, e.External_ID, e.Client, e.Address, e.Phone AS phone1, NULL AS phone2, NULL AS phone3, NULL AS phone4, NULL AS phone5, 0 AS source_rank')
-            ->selectSub($debt, 'Debt_Amount');
+            ->leftJoinSub($debt, 'source_debt', function (JoinClause $join): void {
+                $join->on('source_debt.External_ID', '=', 'e.External_ID')->where('source_debt.debt_rank', 1);
+            })
+            ->selectRaw('e.PK, e.External_ID, e.Client, e.Address, e.Phone AS phone1, NULL AS phone2, NULL AS phone3, NULL AS phone4, NULL AS phone5, 0 AS source_rank, source_debt.Debt_Amount');
         $five = $this->table('TblMailersUniqueEnriched2', 'e2')
             ->where('e2.Drop_Name', $dropName)
             ->selectRaw('e2.PK, e2.External_ID, e2.Client, e2.Address, e2.phone1, e2.phone2, e2.phone3, e2.phone4, e2.phone5, 1 AS source_rank, e2.Debt_Amount');
         $union = $one->unionAll($five);
-        $identity = 'LOWER(TRIM(External_ID))';
+        $identity = $this->connection()->getDriverName() === 'sqlsrv'
+            ? SmsPhoneCounter::identitySql('External_ID')
+            : 'LOWER(TRIM(External_ID, char(9) || char(10) || char(11) || char(13) || char(32) || char(0))) COLLATE BINARY';
         return $this->connection()->query()->fromSub($union, 'sources')
             ->orderByRaw($identity)->orderBy('source_rank')->orderBy('PK')->cursor();
     }

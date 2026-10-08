@@ -133,12 +133,273 @@ test('contacted phone lookups bind every number as text for SQL Server', functio
     expect($lookup['bindings'])->toBe(['3147577081', '13147577081']);
 });
 
+test('whitespace identity variants remain adjacent and suppress the complete merged lead', function () {
+    smsFixture($this->db, 1, 'T1', '2026-10-05', ['2025550101', '2025550102']);
+    $this->db->table('TblMailersUniqueEnriched')->insert([
+        ['PK' => 102, 'Drop_Name' => 'DROP1', 'External_ID' => "\tEXT100", 'Phone' => '2025550103'],
+        ['PK' => 103, 'Drop_Name' => 'DROP1', 'External_ID' => "\tEXT101", 'Phone' => '2025550104'],
+    ]);
+    $this->db->table('TblPhoneNumbers')->insert(['Phone' => '2025550103']);
+    $export = $this->repo->prepareExport(1, '00000000-0000-4000-8000-000000000099');
+    try {
+        expect($export['count'])->toBe(2);
+        expect(file_get_contents($export['path']))->not->toContain('2025550101')->not->toContain('2025550103');
+    } finally { unlink($export['path']); }
+});
+
 test('selects whole drops newest first and overshoots the target', function () {
     smsFixture($this->db, 1, 'T1', '2026-09-28', ['2025550101', '2025550102']);
     smsFixture($this->db, 2, 'T2', '2026-10-05', ['2025550103', '2025550104', '2025550105']);
     $selected = $this->repo->selectDrops(4);
     expect($selected->pluck('PK')->all())->toBe([2, 1]);
     expect((int) $selected->sum('Amount_Dropped'))->toBe(5);
+});
+
+/** Small metadata fixtures exercise large phone targets without creating fake millions of leads. */
+function smsSelectionCountFixture($db, array $counts): MailDropExportRepository
+{
+    $details = [];
+    foreach ($counts as $index => $count) {
+        $id = $index + 1;
+        smsFixture($db, $id, 'T1', Carbon::parse('2026-10-06')->subDays($index)->toDateString(), []);
+        $details['DROP'.$id] = is_array($count) ? $count : ['count' => $count, 'missing_identity' => false];
+    }
+    $repo = new class extends MailDropExportRepository {
+        public array $details;
+        public array $countedIds = [];
+        protected function phoneCounts(\Illuminate\Support\Collection $drops): array
+        {
+            $result = [];
+            foreach ($drops as $drop) {
+                $this->countedIds[] = (int) $drop->PK;
+                $result[$drop->Drop_Name] = $this->details[$drop->Drop_Name];
+            }
+            return $result;
+        }
+    };
+    $repo->details = $details;
+    return $repo;
+}
+
+test('automatic selection replaces the crossing drop with the smallest qualifying next drop', function () {
+    $repo = smsSelectionCountFixture($this->db, [600000, 800000, 500000, 400000, 400000, 390000, 0]);
+    $progress = [];
+    $selected = $repo->selectDrops(1000000, function ($processed, $phones) use (&$progress) { $progress[] = [$processed, $phones]; });
+    expect($selected->pluck('PK')->all())->toBe([1, 4]);
+    expect((int) $selected->sum('Amount_Dropped'))->toBe(1000000);
+    expect(end($progress))->toBe([7, 1000000]);
+    foreach (array_slice($progress, 1) as $index => $current) {
+        expect($current[0])->toBeGreaterThanOrEqual($progress[$index][0]);
+        expect($current[1])->toBeGreaterThanOrEqual($progress[$index][1]);
+    }
+});
+
+test('automatic selection retains an exact hit and does not inspect later drops', function () {
+    $repo = smsSelectionCountFixture($this->db, [6, 4, ['count' => 1, 'missing_identity' => true]]);
+    expect($repo->selectDrops(10)->pluck('PK')->all())->toBe([1, 2]);
+    expect($repo->countedIds)->toBe([1, 2]);
+});
+
+test('automatic selection looks at exactly the next thirty candidates and otherwise retains the crossing drop', function () {
+    $repo = smsSelectionCountFixture($this->db, [6, 10, ...array_fill(0, 29, 3), 0, 4]);
+    $selected = $repo->selectDrops(10);
+    expect($selected->pluck('PK')->all())->toBe([1, 2]);
+    expect((int) $selected->sum('Amount_Dropped'))->toBe(16);
+    expect($repo->countedIds)->toBe(range(1, 32));
+});
+
+test('automatic selection allows a qualifying replacement at the thirtieth lookahead position', function () {
+    $repo = smsSelectionCountFixture($this->db, [6, 10, ...array_fill(0, 29, 3), 5, 4]);
+    $selected = $repo->selectDrops(10);
+    expect($selected->pluck('PK')->all())->toBe([1, 32]);
+    expect((int) $selected->sum('Amount_Dropped'))->toBe(11);
+    expect($repo->countedIds)->toBe(range(1, 32));
+});
+
+test('automatic selection validates only the selected lookahead replacement', function () {
+    $repo = smsSelectionCountFixture($this->db, [6, 10, ['count' => 5, 'missing_identity' => true], 4]);
+    expect($repo->selectDrops(10)->pluck('PK')->all())->toBe([1, 4]);
+    $repo->details['DROP4'] = ['count' => 4, 'missing_identity' => true];
+    expect(fn () => $repo->selectDrops(10))->toThrow(ValidationException::class);
+});
+
+test('automatic selection retains a shortfall when no crossing drop exists', function () {
+    $repo = smsSelectionCountFixture($this->db, [6, 0, 3]);
+    expect((int) $repo->selectDrops(10)->sum('Amount_Dropped'))->toBe(9);
+});
+
+test('automatic selection compares suppressed phone counts when choosing its replacement', function () {
+    smsFixture($this->db, 1, 'T1', '2026-10-06', ['2025550101']);
+    smsFixture($this->db, 2, 'T1', '2026-10-05', ['2025550102', '2025550103', '2025550104', '2025550105']);
+    smsFixture($this->db, 3, 'T1', '2026-10-04', ['2025550106', '2025550107']);
+    smsFixture($this->db, 4, 'T1', '2026-10-03', ['2025550108', '2025550109']);
+    $this->db->table('TblPhoneNumbers')->insert(['Phone' => '12025550106']);
+    $selected = $this->repo->selectDrops(3);
+    expect($selected->pluck('PK')->all())->toBe([1, 4]);
+    expect((int) $selected->sum('Amount_Dropped'))->toBe(3);
+});
+
+test('automatic selection never replaces the crossing drop with a worse overshoot', function () {
+    $repo = smsSelectionCountFixture($this->db, [6, 5, 8, 5]);
+    $selected = $repo->selectDrops(10);
+    expect($selected->pluck('PK')->all())->toBe([1, 2]);
+    expect((int) $selected->sum('Amount_Dropped'))->toBe(11);
+});
+
+test('automatic selection defers validation of a crossing drop that is replaced', function () {
+    $repo = smsSelectionCountFixture($this->db, [6, ['count' => 10, 'missing_identity' => true], 4]);
+    expect($repo->selectDrops(10)->pluck('PK')->all())->toBe([1, 3]);
+    $repo->details['DROP3'] = ['count' => 3, 'missing_identity' => false];
+    expect(fn () => $repo->selectDrops(10))->toThrow(ValidationException::class);
+});
+
+test('automatic selection does not replace an unused crossing drop with a previously exported drop', function () {
+    $repo = smsSelectionCountFixture($this->db, [6, 10, 4]);
+    $this->db->table('TblMarketing')->where('PK', 3)->update(['SMS_Drops' => 1, 'SMS_Last_Export_Date' => '2026-10-01']);
+    $selected = $repo->selectDrops(10);
+    expect($selected->pluck('PK')->all())->toBe([1, 2]);
+    expect((int) $selected->sum('Amount_Dropped'))->toBe(16);
+});
+
+test('manual selections above the old cap keep SQL binding batches below the server limit', function () {
+    $repo = smsSelectionCountFixture($this->db, array_fill(0, 2101, 1));
+    $this->db->enableQueryLog();
+    $selected = $repo->selectDropsByIds(range(1, 2101));
+    expect($selected)->toHaveCount(2101);
+    expect((int) $selected->sum('Amount_Dropped'))->toBe(2101);
+    foreach ($this->db->getQueryLog() as $query) {
+        expect(count($query['bindings']))->toBeLessThanOrEqual(900);
+    }
+});
+
+function smsBatchedSelectionJob(string $id, int $cursor = 0): \Cmd\Reports\Jobs\PlanSmsSelectionJob
+{
+    return new class($id, $cursor) extends \Cmd\Reports\Jobs\PlanSmsSelectionJob {
+        public array $continuations = [];
+        public bool $failDispatch = false;
+        protected function dispatchNext(int $cursor): void
+        {
+            if ($this->failDispatch) throw new RuntimeException('queue unavailable');
+            $this->continuations[] = $cursor;
+        }
+    };
+}
+
+function smsBatchedSelectionSetup($db, int $target): array
+{
+    (require __DIR__.'/../../database/sms-migrations/2026_10_07_000002_add_sms_selection_requests.php')->up();
+    $id = '00000000-0000-4000-8000-000000000071';
+    $db->table('TblSmsSelectionRequests')->insert(['Request_ID' => $id, 'Actor_Email' => 'one@example.com',
+        'Status' => 'queued', 'Selection_Mode' => 'automatic', 'Target' => $target,
+        'Created_At' => now()->toDateTimeString(), 'Updated_At' => now()->toDateTimeString()]);
+    $snapshots = new class extends \Cmd\Reports\Services\SmsSelectionProgress {
+        public array $results = [];
+        public function write(string $id, string $actor, array $result): void { $this->results[] = $result; }
+        public function forget(string $id): void {}
+    };
+    Container::getInstance()->instance(\Cmd\Reports\Services\SmsSelectionProgress::class, $snapshots);
+    Container::getInstance()->instance('log', new \Psr\Log\NullLogger);
+    $queue = new class extends \Cmd\Reports\Services\SmsExportQueue { public function assertReady(): void {} };
+    return [$id, $queue, $snapshots];
+}
+
+test('selection jobs checkpoint one drop and resume without recounting finished candidates', function () {
+    $repo = smsSelectionCountFixture($this->db, [6, 10, 5, 4]);
+    [$id, $queue, $snapshots] = smsBatchedSelectionSetup($this->db, 10);
+    $first = smsBatchedSelectionJob($id);
+    $first->handle($repo, $queue);
+    $row = $this->db->table('TblSmsSelectionRequests')->first();
+    $saved = json_decode($row->Result, true);
+    expect($row->Status)->toBe('queued');
+    expect($saved['checkpoint']['cursor'])->toBe(1);
+    expect($saved['checkpoint']['counts']['1']['count'])->toBe(6);
+    expect($first->continuations)->toBe([1]);
+    $first->handle($repo, $queue);
+    $first->failed(new RuntimeException('a stale callback'));
+    expect($repo->countedIds)->toBe([1]);
+    expect($this->db->table('TblSmsSelectionRequests')->value('Status'))->toBe('queued');
+    foreach ([1, 2, 3] as $cursor) smsBatchedSelectionJob($id, $cursor)->handle($repo, $queue);
+    $row = $this->db->table('TblSmsSelectionRequests')->first();
+    $ready = json_decode($row->Result, true);
+    expect($row->Status)->toBe('ready');
+    expect(array_column($ready['drops'], 'PK'))->toBe([1, 4]);
+    expect($ready['total'])->toBe(10);
+    expect($repo->countedIds)->toBe([1, 2, 3, 4]);
+    expect($ready)->not->toHaveKey('checkpoint');
+    foreach ($snapshots->results as $snapshot) expect($snapshot)->not->toHaveKey('checkpoint');
+});
+
+test('selection continuation dispatch failure preserves completed count for same-request resume', function () {
+    $repo = smsSelectionCountFixture($this->db, [6, 4]);
+    [$id, $queue, $snapshots] = smsBatchedSelectionSetup($this->db, 10);
+    $first = smsBatchedSelectionJob($id);
+    $first->failDispatch = true;
+    expect(fn () => $first->handle($repo, $queue))->toThrow(RuntimeException::class, 'queue unavailable');
+    $row = $this->db->table('TblSmsSelectionRequests')->first();
+    expect($row->Status)->toBe('failed');
+    expect(json_decode($row->Result, true)['checkpoint']['cursor'])->toBe(1);
+    expect(end($snapshots->results)['can_resume'])->toBeTrue();
+    $this->db->table('TblSmsSelectionRequests')->update(['Status' => 'queued', 'Error' => null]);
+    smsBatchedSelectionJob($id, 1)->handle($repo, $queue);
+    expect($repo->countedIds)->toBe([1, 2]);
+    expect($this->db->table('TblSmsSelectionRequests')->value('Status'))->toBe('ready');
+});
+
+test('selection job rejects a duplicate claim already owned by a running worker', function () {
+    $repo = smsSelectionCountFixture($this->db, [1]);
+    [$id, $queue] = smsBatchedSelectionSetup($this->db, 1);
+    $this->db->table('TblSmsSelectionRequests')->update(['Status' => 'running']);
+    smsBatchedSelectionJob($id)->handle($repo, $queue);
+    expect($repo->countedIds)->toBe([]);
+});
+
+test('selection checkpoint retains its frozen order across new mailers and marketing updates', function () {
+    $repo = smsSelectionCountFixture($this->db, [6, 10, 4]);
+    $state = $repo->advanceSelectionCheckpoint($repo->startSelectionCheckpoint(10));
+    $this->db->table('TblMarketing')->where('PK', 2)->update(['Send_Date' => '2026-10-12']);
+    smsFixture($this->db, 99, 'T1', '2026-10-06', ['2025550199']);
+    while (! $state['complete']) $state = $repo->advanceSelectionCheckpoint(json_decode(json_encode($state), true));
+    $result = $repo->selectionCheckpointResult($state);
+    expect(array_column($result['drops'], 'PK'))->toBe([1, 3]);
+    expect($repo->countedIds)->toBe([1, 2, 3]);
+});
+
+test('selection refinement stops before counting an ineligible higher usage band', function () {
+    $repo = smsSelectionCountFixture($this->db, [6, 5, 4]);
+    $this->db->table('TblMarketing')->where('PK', 3)->update(['SMS_Drops' => 1]);
+    $state = $repo->startSelectionCheckpoint(10);
+    while (! $state['complete']) $state = $repo->advanceSelectionCheckpoint($state);
+    $result = $repo->selectionCheckpointResult($state);
+    expect(array_column($result['drops'], 'PK'))->toBe([1, 2]);
+    expect($result['total'])->toBe(11);
+    expect($repo->countedIds)->toBe([1, 2]);
+    expect($state['cursor'])->toBe(2);
+});
+
+test('an older selection failure callback cannot fail a newly claimed continuation', function () {
+    $repo = smsSelectionCountFixture($this->db, [6, 4]);
+    [$id, $queue] = smsBatchedSelectionSetup($this->db, 10);
+    $old = smsBatchedSelectionJob($id);
+    $old->handle($repo, $queue);
+    $row = $this->db->table('TblSmsSelectionRequests')->first();
+    $saved = json_decode($row->Result, true);
+    $saved['worker_token'] = 'another-worker';
+    $this->db->table('TblSmsSelectionRequests')->update(['Status' => 'running', 'Result' => json_encode($saved)]);
+    $old->failed(new RuntimeException('old job failed'));
+    expect($this->db->table('TblSmsSelectionRequests')->value('Status'))->toBe('running');
+});
+
+test('legacy serialized selection jobs initialize missing batch properties safely', function () {
+    $repo = smsSelectionCountFixture($this->db, [1]);
+    [$id, $queue] = smsBatchedSelectionSetup($this->db, 1);
+    $legacy = smsBatchedSelectionJob($id);
+    unset($legacy->workerToken, $legacy->expectedCursor);
+    $legacy->handle($repo, $queue);
+    expect($this->db->table('TblSmsSelectionRequests')->value('Status'))->toBe('ready');
+    $callback = smsBatchedSelectionJob($id);
+    unset($callback->workerToken, $callback->expectedCursor);
+    $callback->failed(new RuntimeException('old callback'));
+    expect($this->db->table('TblSmsSelectionRequests')->value('Status'))->toBe('ready');
 });
 
 test('exhausts lower export counts and chooses the oldest last use before repeating', function () {
@@ -359,6 +620,7 @@ test('durable publishing sees completed CSV and ZIP before tracking commits', fu
             $seen[] = [$export['format'], is_file($export['path'])];
         });
     unlink($csv['path']);
+    config()->set('sms-exports.split_csv', true);
     $repo = new class extends MailDropExportRepository {
         protected function csvRecordLimit(): int { return 2; }
     };
@@ -373,7 +635,7 @@ test('durable publishing sees completed CSV and ZIP before tracking commits', fu
 
 test('counts frozen priority candidates in small ordered batches including zero-eligible drops', function () {
     for ($id = 1; $id <= 12; $id++) {
-        smsFixture($this->db, $id, 'T1', '2026-10-05', ['202555'.str_pad((string) $id, 4, '0', STR_PAD_LEFT)]);
+        smsFixture($this->db, $id, 'T1', Carbon::parse('2026-10-06')->subDays($id)->toDateString(), ['202555'.str_pad((string) $id, 4, '0', STR_PAD_LEFT)]);
     }
     $this->db->table('TblPhoneNumbers')->insert(['Phone' => '2025550012']);
     $ids = $this->repo->orderedSelectableDropIds()->all();
@@ -385,7 +647,29 @@ test('counts frozen priority candidates in small ordered batches including zero-
     expect((int) $second->last()->Amount_Dropped)->toBe(0);
 });
 
+test('defaults to one CSV even beyond the optional part limit without losing records or tracking', function () {
+    smsFixture($this->db, 1, 'T1', '2026-10-05', ['2025550101', '2025550102', '2025550103']);
+    $repo = new class extends MailDropExportRepository {
+        protected function csvRecordLimit(): int { return 2; }
+    };
+    $export = $repo->prepareExport(3, '00000000-0000-4000-8000-000000000120');
+    try {
+        expect($export['format'])->toBe('csv');
+        expect($export['part_count'])->toBe(1);
+        expect($export['count'])->toBe(3);
+        $csv = file_get_contents($export['path']);
+        expect(substr_count($csv, "\n"))->toBe(4);
+        expect($csv)->toContain('2025550101')->toContain('2025550102')->toContain('2025550103');
+        expect($this->db->table('TblSmsExports')->count())->toBe(1);
+        expect((int) $this->db->table('TblSmsExports')->value('SMS_Count'))->toBe(3);
+        expect((int) $this->db->table('TblMarketing')->value('SMS_Drops'))->toBe(1);
+    } finally {
+        unlink($export['path']);
+    }
+});
+
 test('splits CSV records into numbered archive parts without splitting export tracking', function () {
+    config()->set('sms-exports.split_csv', true);
     smsFixture($this->db, 1, 'T1', '2026-10-05', ['2025550101', '2025550102', '2025550103']);
     $repo = new class extends MailDropExportRepository {
         protected function csvRecordLimit(): int { return 2; }
@@ -417,7 +701,8 @@ test('splits CSV records into numbered archive parts without splitting export tr
     }
 });
 
-test('keeps an export at the CSV row limit as one CSV', function () {
+test('keeps an export at the optional CSV row limit as one CSV', function () {
+    config()->set('sms-exports.split_csv', true);
     smsFixture($this->db, 1, 'T1', '2026-10-05', ['2025550101', '2025550102']);
     $repo = new class extends MailDropExportRepository {
         protected function csvRecordLimit(): int { return 2; }
@@ -433,6 +718,7 @@ test('keeps an export at the CSV row limit as one CSV', function () {
 });
 
 test('rolls back tracking when a later CSV part cannot be written', function () {
+    config()->set('sms-exports.split_csv', true);
     smsFixture($this->db, 1, 'T1', '2026-10-05', ['2025550101', '2025550102', '2025550103']);
     $repo = new class extends MailDropExportRepository {
         private int $writes = 0;
@@ -450,6 +736,7 @@ test('rolls back tracking when a later CSV part cannot be written', function () 
 });
 
 test('removes CSV parts and rolls back tracking when archive creation fails', function () {
+    config()->set('sms-exports.split_csv', true);
     smsFixture($this->db, 1, 'T1', '2026-10-05', ['2025550101', '2025550102', '2025550103']);
     $repo = new class extends MailDropExportRepository {
         public array $createdPaths = [];
@@ -711,16 +998,17 @@ test('SMS storage reuses the existing CMD S3 disk when no dedicated bucket is se
         expect($settings['prefix'])->toBe('sms-exports');
         // mergeConfigFrom is skipped with Laravel config:cache. The artifact
         // service must still use the host's cached S3 disk settings.
-        config()->set('sms-exports', []);
+        config()->set('sms-exports', ['driver' => 's3']);
         expect((new \Cmd\Reports\Services\SmsExportArtifacts)->configured())->toBeTrue();
         // Older cached package config can retain a different default region.
-        config()->set('sms-exports', ['bucket' => null, 'region' => 'us-west-1']);
+        config()->set('sms-exports', ['driver' => 's3', 'bucket' => null, 'region' => 'us-west-1']);
         $artifacts = new \Cmd\Reports\Services\SmsExportArtifacts;
         $region = new ReflectionMethod($artifacts, 'region');
         expect($region->invoke($artifacts))->toBe('us-east-2');
         putenv('CMD_SMS_EXPORT_BUCKET=dedicated-bucket');
         $dedicated = require __DIR__.'/../../config/sms-exports.php';
         expect($dedicated['region'])->toBeNull();
+        $dedicated['driver'] = 's3';
         config()->set('sms-exports', $dedicated);
         expect((new \Cmd\Reports\Services\SmsExportArtifacts)->configured())->toBeFalse();
     } finally {

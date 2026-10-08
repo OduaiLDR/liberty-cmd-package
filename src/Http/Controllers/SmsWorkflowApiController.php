@@ -11,6 +11,7 @@ use Cmd\Reports\Repositories\MailDropExportRepository;
 use Cmd\Reports\Repositories\MarketingReportRepository;
 use Cmd\Reports\Services\SmsExportArtifacts;
 use Cmd\Reports\Services\SmsExportQueue;
+use Cmd\Reports\Services\SmsSelectionProgress;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Routing\Controller;
@@ -30,12 +31,12 @@ class SmsWorkflowApiController extends Controller
     public function preview(Request $request): JsonResponse
     {
         $data = Validator::make($request->query(), [
-            'target' => ['nullable', 'integer', 'min:1', 'max:10000000'],
+            'target' => ['nullable', 'integer', 'min:1', 'max:9007199254740991'],
             'page' => ['nullable', 'integer', 'min:1'],
             'count_candidates' => ['nullable', 'boolean'],
             'count_pks' => ['sometimes', 'array', 'min:1', 'max:10'],
             'count_pks.*' => ['required', 'integer', 'min:1', 'distinct'],
-            'drop_pks' => ['sometimes', 'array', 'min:1', 'max:500'],
+            'drop_pks' => ['sometimes', 'array', 'min:1'],
             'drop_pks.*' => ['required', 'integer', 'min:1', 'distinct'],
         ])->validate();
         $this->ensureSchemaReady();
@@ -58,9 +59,6 @@ class SmsWorkflowApiController extends Controller
             : ($countIds ? $this->drops->countedDropsByIds(array_map('intval', $data['count_pks']))
                 : ($target > 0 ? $this->drops->selectDrops($target) : $this->drops->allDrops($page)));
         $total = (int) $drops->sum('Amount_Dropped');
-        if ($manual && $total > 10000000) {
-            throw \Illuminate\Validation\ValidationException::withMessages(['drop_pks' => 'Selected drops exceed the 10,000,000 phone export limit.']);
-        }
         if ($manual) $target = $total;
 
         return new JsonResponse([
@@ -86,7 +84,7 @@ class SmsWorkflowApiController extends Controller
         $ids = isset($data['drop_pks']) ? array_map('intval', $data['drop_pks']) : null;
         $encoded = $ids === null ? null : json_encode($ids, JSON_THROW_ON_ERROR);
         $table = DB::connection('sqlsrv')->table('TblSmsExportRequests');
-        $existing = $table->where('Request_ID', $id)->first();
+        $existing = (clone $table)->where('Request_ID', $id)->first();
         if ($existing !== null) {
             if (strcasecmp((string) $existing->Actor_Email, $actor) !== 0) throw new HttpException(404, 'SMS export request not found.');
             if ((int) $existing->Target !== (int) $data['target'] || $existing->Drop_PKs !== $encoded) {
@@ -96,14 +94,14 @@ class SmsWorkflowApiController extends Controller
                 if (DB::connection('sqlsrv')->table('TblSmsExports')->where('Request_ID', $id)->exists()) {
                     throw new HttpException(409, 'SMS tracking exists for this request. Check its status before retrying.');
                 }
-                $claimed = $table->where('Request_ID', $id)->where('Status', 'failed')->update([
+                $claimed = (clone $table)->where('Request_ID', $id)->where('Status', 'failed')->update([
                     'Status' => 'queued', 'Error' => null, 'Updated_At' => now()->toDateTimeString(),
                 ]);
                 if ($claimed === 1) {
                     try {
                         BuildSmsExportJob::dispatch($id);
                     } catch (\Throwable $error) {
-                        $table->where('Request_ID', $id)->where('Status', 'queued')->update([
+                        (clone $table)->where('Request_ID', $id)->where('Status', 'queued')->update([
                             'Status' => 'failed', 'Error' => 'Unable to queue the SMS export.',
                             'Updated_At' => now()->toDateTimeString(),
                         ]);
@@ -118,21 +116,20 @@ class SmsWorkflowApiController extends Controller
             try {
                 BuildSmsExportJob::dispatch($id);
             } catch (\Throwable $error) {
-                $table->where('Request_ID', $id)->update(['Status' => 'failed',
+                (clone $table)->where('Request_ID', $id)->update(['Status' => 'failed',
                     'Error' => 'Unable to queue the SMS export.', 'Updated_At' => now()->toDateTimeString()]);
                 throw $error;
             }
         }
 
-        return new JsonResponse(['request_id' => $id, 'status' => $table->where('Request_ID', $id)->value('Status')], 202,
+        return new JsonResponse(['request_id' => $id, 'status' => (clone $table)->where('Request_ID', $id)->value('Status')], 202,
             ['Cache-Control' => 'private, no-store']);
     }
 
     public function exportStatus(Request $request, SmsExportArtifacts $artifacts): JsonResponse
     {
         $data = Validator::make($request->query(), ['request_id' => ['required', 'uuid']])->validate();
-        $this->ensureSchemaReady();
-        $this->ensureRequestSchemaReady();
+        // A status read uses the existing request row; schema is checked when queuing.
         $id = $data['request_id'];
         $row = DB::connection('sqlsrv')->table('TblSmsExportRequests')->where('Request_ID', $id)->first();
         if ($row === null || strcasecmp((string) $row->Actor_Email, $this->actorEmail($request)) !== 0) {
@@ -190,8 +187,8 @@ class SmsWorkflowApiController extends Controller
     {
         $data = Validator::make($request->all(), [
             'request_id' => ['required', 'uuid'],
-            'target' => ['nullable', 'integer', 'min:1', 'max:10000000'],
-            'drop_pks' => ['sometimes', 'array', 'min:1', 'max:500'],
+            'target' => ['nullable', 'integer', 'min:1', 'max:9007199254740991'],
+            'drop_pks' => ['sometimes', 'array', 'min:1'],
             'drop_pks.*' => ['required', 'integer', 'min:1', 'distinct'],
         ])->validate();
         if (isset($data['drop_pks']) === isset($data['target'])) {
@@ -207,21 +204,26 @@ class SmsWorkflowApiController extends Controller
         $target = $mode === 'automatic' ? (int) $data['target'] : null;
         $ids = $mode === 'manual' ? json_encode(array_map('intval', $data['drop_pks']), JSON_THROW_ON_ERROR) : null;
         $table = DB::connection('sqlsrv')->table('TblSmsSelectionRequests');
-        $existing = $table->where('Request_ID', $id)->first();
+        $existing = (clone $table)->where('Request_ID', $id)->first();
         if ($existing !== null) {
             if (strcasecmp((string) $existing->Actor_Email, $actor) !== 0) throw new HttpException(404, 'SMS selection request not found.');
             if ($existing->Selection_Mode !== $mode || (int) $existing->Target !== (int) $target || $existing->Drop_PKs !== $ids) {
                 throw new HttpException(409, 'This request ID belongs to a different SMS selection.');
             }
             if ($existing->Status === 'failed') {
-                $claimed = $table->where('Request_ID', $id)->where('Status', 'failed')->update([
+                $retryClaim = (clone $table)->where('Request_ID', $id)->where('Status', 'failed')
+                    ->where('Updated_At', $existing->Updated_At);
+                $existing->Result === null ? $retryClaim->whereNull('Result') : $retryClaim->where('Result', $existing->Result);
+                $claimed = $retryClaim->update([
                     'Status' => 'queued', 'Error' => null, 'Updated_At' => now()->toDateTimeString(),
                 ]);
                 if ($claimed === 1) {
                     try {
-                        PlanSmsSelectionJob::dispatch($id);
+                        app(SmsSelectionProgress::class)->forget($id);
+                        $saved = $existing->Result ? json_decode($existing->Result, true, 512, JSON_THROW_ON_ERROR) : [];
+                        PlanSmsSelectionJob::dispatch($id, (int) ($saved['checkpoint']['cursor'] ?? 0));
                     } catch (\Throwable $error) {
-                        $table->where('Request_ID', $id)->where('Status', 'queued')->update([
+                        (clone $table)->where('Request_ID', $id)->where('Status', 'queued')->update([
                             'Status' => 'failed', 'Error' => 'Unable to queue SMS selection.',
                             'Updated_At' => now()->toDateTimeString(),
                         ]);
@@ -235,24 +237,33 @@ class SmsWorkflowApiController extends Controller
                 'Selection_Mode' => $mode, 'Target' => $target, 'Drop_PKs' => $ids,
                 'Created_At' => $now, 'Updated_At' => $now]);
             try {
+                app(SmsSelectionProgress::class)->forget($id);
                 PlanSmsSelectionJob::dispatch($id);
             } catch (\Throwable $error) {
-                $table->where('Request_ID', $id)->update(['Status' => 'failed', 'Error' => 'Unable to queue SMS selection.',
+                (clone $table)->where('Request_ID', $id)->update(['Status' => 'failed', 'Error' => 'Unable to queue SMS selection.',
                     'Updated_At' => now()->toDateTimeString()]);
                 throw $error;
             }
         }
 
-        return new JsonResponse(['request_id' => $id, 'status' => $table->where('Request_ID', $id)->value('Status')], 202,
+        return new JsonResponse(['request_id' => $id, 'status' => (clone $table)->where('Request_ID', $id)->value('Status')], 202,
             ['Cache-Control' => 'private, no-store']);
     }
 
     public function selectionStatus(Request $request): JsonResponse
     {
         $data = Validator::make($request->query(), ['request_id' => ['required', 'uuid']])->validate();
-        $this->ensureSelectionSchemaReady();
+        $actor = $this->actorEmail($request);
+        $snapshot = app(SmsSelectionProgress::class)->read($data['request_id'], $actor);
+        if ($snapshot !== null) {
+            $heartbeat = $snapshot['progress']['heartbeat_at'] ?? null;
+            if (! in_array($snapshot['status'] ?? '', ['queued', 'running'], true) || ($heartbeat !== null && Carbon::parse($heartbeat)->gte(now()->subHours(3)))) {
+                return new JsonResponse($snapshot, 200, ['Cache-Control' => 'private, no-store']);
+            }
+        }
+        // Polling needs a single request lookup, not schema metadata on every poll.
         $row = DB::connection('sqlsrv')->table('TblSmsSelectionRequests')->where('Request_ID', $data['request_id'])->first();
-        if ($row === null || strcasecmp((string) $row->Actor_Email, $this->actorEmail($request)) !== 0) {
+        if ($row === null || strcasecmp((string) $row->Actor_Email, $actor) !== 0) {
             throw new HttpException(404, 'SMS selection request not found.');
         }
         $result = ['request_id' => $data['request_id'], 'status' => $row->Status, 'selection_mode' => $row->Selection_Mode];
@@ -260,9 +271,20 @@ class SmsWorkflowApiController extends Controller
             $result += json_decode($row->Result, true, 512, JSON_THROW_ON_ERROR);
         } elseif ($row->Status === 'failed') {
             $result['error'] = $row->Error ?: 'SMS selection failed.';
-        } elseif ($row->Status === 'running' && \Carbon\Carbon::parse($row->Updated_At)->lt(now()->subHours(3))) {
-            $result['status'] = 'failed';
-            $result['error'] = 'The selection worker stopped or exceeded its time limit. Try again with a new request.';
+        } elseif (in_array($row->Status, ['queued', 'running'], true) && \Carbon\Carbon::parse($row->Updated_At)->lt(now()->subHours(3))) {
+            $changed = DB::connection('sqlsrv')->table('TblSmsSelectionRequests')->where('Request_ID', $row->Request_ID)
+                ->where('Status', $row->Status)->where('Updated_At', $row->Updated_At)
+                ->update(['Status' => 'failed', 'Error' => 'The selection worker stopped or exceeded its time limit. Resume the saved batches.', 'Updated_At' => now()->toDateTimeString()]);
+            if ($changed === 1) {
+                app(SmsSelectionProgress::class)->forget($row->Request_ID);
+                $result['status'] = 'failed';
+                $result['error'] = 'The selection worker stopped or exceeded its time limit. Resume the saved batches.';
+            }
+        }
+        if ($row->Status !== 'ready' && $row->Result !== null) {
+            $partial = json_decode($row->Result, true, 512, JSON_THROW_ON_ERROR);
+            if (is_array($partial['progress'] ?? null)) $result['progress'] = $partial['progress'];
+            $result['can_resume'] = is_array($partial['checkpoint'] ?? null);
         }
 
         return new JsonResponse($result, 200, ['Cache-Control' => 'private, no-store']);
