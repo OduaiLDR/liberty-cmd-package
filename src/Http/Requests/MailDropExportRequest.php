@@ -14,9 +14,9 @@ class MailDropExportRequest extends FormRequest
     public function rules(): array
     {
         return [
-            'target' => ['required', 'integer', 'min:1', 'max:10000000'],
+            'target' => ['required', 'integer', 'min:1', 'max:9007199254740991'],
             'request_id' => ['required', 'uuid'],
-            'drop_pks' => ['sometimes', 'array', 'min:1', 'max:500'],
+            'drop_pks' => ['sometimes', 'array', 'min:1'],
             'drop_pks.*' => ['required', 'integer', 'min:1', 'distinct'],
         ];
     }

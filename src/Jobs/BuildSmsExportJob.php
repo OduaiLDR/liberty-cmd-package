@@ -32,11 +32,11 @@ class BuildSmsExportJob implements ShouldQueue
     {
         $queue->assertReady();
         $table = DB::connection('sqlsrv')->table('TblSmsExportRequests');
-        $request = $table->where('Request_ID', $this->requestId)->first();
+        $request = (clone $table)->where('Request_ID', $this->requestId)->first();
         if ($request === null || $request->Status === 'ready') return;
         if ($request->Status !== 'queued') return;
 
-        if ($table->where('Request_ID', $this->requestId)->where('Status', 'queued')
+        if ((clone $table)->where('Request_ID', $this->requestId)->where('Status', 'queued')
             ->update(['Status' => 'running', 'Updated_At' => now()->toDateTimeString()]) !== 1) return;
         $path = null;
         try {
@@ -61,7 +61,7 @@ class BuildSmsExportJob implements ShouldQueue
         } catch (Throwable $error) {
             // The repository rolls back tracking if generation, upload, or verification fails.
             // If the SQL commit succeeded, never overwrite its ready state with a failure.
-            $table->where('Request_ID', $this->requestId)->where('Status', 'running')
+            (clone $table)->where('Request_ID', $this->requestId)->where('Status', 'running')
                 ->update(['Status' => 'failed', 'Error' => mb_substr($error->getMessage(), 0, 500),
                     'Updated_At' => now()->toDateTimeString()]);
             Log::error('SMS export failed', ['request_id' => $this->requestId, 'error' => $error->getMessage()]);
