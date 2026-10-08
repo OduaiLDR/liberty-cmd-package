@@ -979,7 +979,7 @@ class SyncContactsData extends Command
         ];
     }
 
-    /** Verify the full mailer key and recipient; previews and writes use the same SELECTs. */
+    /** Resolve full offer attribution; previews and writes use the same SELECTs. */
     private function fetchDropNamesFiltered(DBConnector $connector, array $chunk): array
     {
         $lt = $this->source === 'LT' ? null : $this->initializeLendingTowerConnector();

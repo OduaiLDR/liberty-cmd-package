@@ -54,6 +54,7 @@ final class ContactSyncCampaignLookup
             $id = (string) ($row['LLG_ID'] ?? '');
             $reference = trim((string) ($row['EXTERNAL_ID'] ?? ''));
             $recipient = $row;
+            $authoritativeOffer = $source === 'LT';
             if ($source !== 'LT' && isset($contacts[$reference])) {
                 $candidates = $contacts[$reference];
                 $request = $identityRequests[$id] ?? null;
@@ -66,9 +67,10 @@ final class ContactSyncCampaignLookup
                     continue;
                 }
                 $recipient = $candidates[0];
+                $authoritativeOffer = true;
             }
             $key = trim((string) ($recipient['EXTERNAL_ID'] ?? ''));
-            $recipients[$id] = [$recipient, $reference];
+            $recipients[$id] = [$recipient, $reference, $authoritativeOffer];
             if ($key !== '' && !in_array($key, ['0', '1234567840', 'UNKNOWN'], true)) $keys[$key] = true;
         }
 
@@ -77,11 +79,11 @@ final class ContactSyncCampaignLookup
             $result = $sql->querySqlServer('SELECT External_ID, Drop_Name, Client, Address, City, State, Zip
                 FROM TblMailers WHERE External_ID IN (' . implode(',', array_fill(0, count($batch), '?')) . ')', $batch);
             if (!($result['success'] ?? false)) throw new \RuntimeException('Mailer evidence query failed.');
-            foreach ($result['data'] ?? [] as $mailer) $mailers[(string) $mailer['External_ID']][] = $mailer;
+            foreach ($result['data'] ?? [] as $mailer) $mailers[trim((string) $mailer['External_ID'])][] = $mailer;
         }
-        foreach ($recipients as $id => [$recipient, $reference]) {
+        foreach ($recipients as $id => [$recipient, $reference, $authoritativeOffer]) {
             $key = trim((string) ($recipient['EXTERNAL_ID'] ?? ''));
-            $proofs[$id] = ContactSyncCampaign::resolve($recipient, $mailers[$key] ?? []);
+            $proofs[$id] = ContactSyncCampaign::resolve($recipient, $mailers[$key] ?? [], $authoritativeOffer);
             if ($source !== 'LT') $proofs[$id]['source_reference'] = $reference;
         }
         return $proofs;

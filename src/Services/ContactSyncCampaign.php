@@ -8,7 +8,7 @@ final class ContactSyncCampaign
     public const RECIPIENT_UNVERIFIED = 'Exact mailer key did not verify the recipient and campaign.';
     public const MULTIPLE_CAMPAIGNS = 'More than one campaign belongs to the verified recipient and mailer key.';
 
-    public static function resolve(array $contact, array $candidates): array
+    public static function resolve(array $contact, array $candidates, bool $authoritativeOffer = false): array
     {
         $contact = array_change_key_case($contact, CASE_LOWER);
         $key = trim((string) ($contact['external_id'] ?? ''));
@@ -29,6 +29,16 @@ final class ContactSyncCampaign
         }
         $proof['candidate_campaigns'] = array_values(array_unique(array_filter(array_map(
             fn ($row) => trim((string) ($row['drop_name'] ?? '')), $exact), fn ($name) => $name !== '')));
+        // LT's recorded offer determines campaign credit even when the respondent
+        // differs from the mailed recipient. This does not prove contact identity.
+        // Reused keys still need recipient disambiguation; incomplete campaigns
+        // cannot establish an authoritative one-campaign association.
+        if ($authoritativeOffer && !in_array($key, ['0', '1234567840', 'UNKNOWN'], true)
+            && count($proof['candidate_campaigns']) === 1
+            && !array_filter($exact, fn ($row) => trim((string) ($row['drop_name'] ?? '')) === '')) {
+            return array_replace($proof, ['status' => 'verified', 'campaign' => $proof['candidate_campaigns'][0],
+                'reason' => 'Authoritative LT offer ID identifies one campaign.']);
+        }
         $campaigns = [];
         $recipients = [];
         $usedOmission = $blankCampaign = false;
@@ -96,7 +106,7 @@ final class ContactSyncCampaign
         if ($candidate !== '' && $existing === '') {
             if (($proof['status'] ?? '') !== 'verified' || ($proof['campaign'] ?? '') !== $candidate
                 || trim((string) ($proof['external_id'] ?? '')) === '') {
-                return $preserve('Assigning a campaign requires an exact mailer key and verified recipient.');
+                return $preserve('Assigning a campaign requires verified attribution for the exact mailer key.');
             }
             $value = $candidate;
         }
