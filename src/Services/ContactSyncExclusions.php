@@ -8,10 +8,11 @@ use RuntimeException;
 /** Expand review flags without writing staging tables or treating mailer IDs as CRM links. */
 final class ContactSyncExclusions
 {
-    public static function resolve(PDO $pdo, array $ids): array
+    /** A null limit is reserved for campaign-only holds that filter proof maps, never write predicates. */
+    public static function resolve(PDO $pdo, array $ids, ?int $limit = 10000): array
     {
         $known = array_fill_keys(self::normalize($ids), true);
-        if (count($known) > 10000) {
+        if ($limit !== null && count($known) > $limit) {
             throw new RuntimeException('Contact review scope exceeds 10,000 IDs; matching requires review.');
         }
         $pending = array_keys($known);
@@ -20,13 +21,16 @@ final class ContactSyncExclusions
             foreach (array_chunk($pending, 400) as $batch) {
                 $native = array_values(array_filter(array_map(fn ($id) => substr($id, 4), $batch),
                     fn ($id) => ContactSyncIdentity::validNativeId($id)));
-                $where = 'LLG_ID IN (' . implode(', ', array_fill(0, count($batch), '?')) . ')';
+                $conditions = ['LLG_ID IN (' . implode(', ', array_fill(0, count($batch), '?')) . ')'];
                 if ($native !== []) {
-                    $where .= ' OR External_ID IN (' . implode(', ', array_fill(0, count($native), '?')) . ')';
+                    $conditions[] = 'External_ID IN (' . implode(', ', array_fill(0, count($native), '?')) . ')';
                 }
                 // Keep both namespaces, conflicting identities and physical duplicates in scope.
-                $query = "SELECT LLG_ID, External_ID FROM TblContactsLDR WHERE {$where}
-                    UNION ALL SELECT LLG_ID, External_ID FROM TblContactsPLAW WHERE {$where}";
+                $queries = [];
+                foreach (['TblContactsLDR', 'TblContactsPLAW'] as $table) {
+                    foreach ($conditions as $where) $queries[] = "SELECT LLG_ID, External_ID FROM {$table} WHERE {$where}";
+                }
+                $query = implode(' UNION ALL ', $queries);
                 $parameters = array_merge($batch, $native);
                 $statement = $pdo->prepare($query);
                 if ($statement === false || !$statement->execute(array_merge($parameters, $parameters))) {
@@ -46,7 +50,7 @@ final class ContactSyncExclusions
                         }
                     }
                     // An unexpectedly connected component must stop safely, never truncate exclusions.
-                    if (count($known) > 10000) {
+                    if ($limit !== null && count($known) > $limit) {
                         throw new RuntimeException('Contact review scope exceeds 10,000 IDs; matching requires review.');
                     }
                 }

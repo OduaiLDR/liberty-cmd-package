@@ -29,6 +29,7 @@ class SyncContactsData extends Command
         {--reconcile-agents : Reconcile non-blank enrollment agents from unambiguous source contact assignments}
         {--scope-file= : Internal completed source result for the orchestrator}
         {--exclude-scope-file= : Internal LT exclusions inherited by backend sources}
+        {--campaign-scope-file= : Internal LDR attribution holds inherited by PLAW}
         {--no-match  : Skip post-sync table matching (internal flag used by the orchestrator)}';
 
     protected $description = 'Sync contacts data from Snowflake to SQL Server (TblContactsLDR, TblContactsPLAW, and TblContactsLT)';
@@ -52,6 +53,7 @@ class SyncContactsData extends Command
     private array $skippedContactIds = [];
     private array $campaignProofs = [];
     private array $verifiedCampaigns = [];
+    private array $campaignHolds = [];
     private array $exclusionSeeds = [];
     private array $matchingExclusions = [];
     private array $sourceLinks = [];
@@ -109,6 +111,7 @@ class SyncContactsData extends Command
         $this->source = 'MATCH';
         $this->contactFlags = $this->skippedContactIds = $this->exclusionSeeds = [];
         $this->matchingExclusions = $this->verifiedCampaigns = $this->deferredEnrollmentChanges = [];
+        $this->campaignHolds = [];
         $this->matchingScopePrepared = false;
         // LT holds the primary contact data (TblContacts). It must complete before
         // LDR/PLAW run, because the final matching step joins TblContactsLDR/PLAW
@@ -163,6 +166,7 @@ class SyncContactsData extends Command
                     array_merge([$php, $artisan, 'Sync:contacts-data', "--source={$src}", '--no-match',
                         '--scope-file=' . $scopeDirectory . "/{$src}.json",
                         '--exclude-scope-file=' . $scopeDirectory . '/LT.json'],
+                        $src === 'PLAW' ? ['--campaign-scope-file=' . $scopeDirectory . '/LDR.json'] : [],
                         $fullFlag, $ownersRefreshFlag, $dryRunFlag, $reconcileAgentsFlag),
                     function (string $type, string $output) use ($src) {
                         foreach (explode("\n", rtrim($output)) as $line) {
@@ -189,11 +193,9 @@ class SyncContactsData extends Command
             $scopes[$src] = ContactSyncRunScope::read($scopeDirectory . "/{$src}.json", $src);
             $this->deferredEnrollmentChanges[$src] = $scopes[$src]['enrollment_changes'];
             foreach ($scopes[$src]['excluded_ids'] as $id) $this->exclusionSeeds[$id] = true;
+            foreach ($scopes[$src]['campaign_hold_ids'] as $id) $this->campaignHolds[$id] = true;
             foreach ($scopes[$src]['campaigns'] as $id => $campaign) {
-                if (isset($this->verifiedCampaigns[$id]) && $this->verifiedCampaigns[$id] !== $campaign) {
-                    $this->recordContactFlag(['id' => $id, 'code' => 'campaign_proof_conflict',
-                        'message' => 'Sources disagree on campaign attribution; file excluded.'], true);
-                } else $this->verifiedCampaigns[$id] = $campaign;
+                $this->rememberCampaignProof($id, $campaign);
             }
         }
         // ── Step 3: Final matching (or read-only preview in dry-run) ─────────────
@@ -208,7 +210,7 @@ class SyncContactsData extends Command
                 $this->error('[DRY RUN] Matching preview failed: ' . $e->getMessage());
                 return Command::FAILURE;
             }
-            if ($hasSkippedRecords || $hasReviewFlags || $this->exclusionSeeds !== []) {
+            if ($hasSkippedRecords || $hasReviewFlags || $this->contactFlags !== [] || $this->exclusionSeeds !== []) {
                 $this->warn('[DRY RUN] Preview completed with flagged records; review source summaries. No SQL Server changes were made.');
             } else {
                 $this->info('[SUCCESS] Dry run completed; no SQL Server changes were made.');
@@ -231,6 +233,7 @@ class SyncContactsData extends Command
         }
 
         $this->logStep('Step 3/3: matching done', $matchStarted);
+        $hasReviewFlags = $hasReviewFlags || $this->contactFlags !== [];
         if ($this->exclusionSeeds !== [] || $hasSkippedRecords) {
             $this->warn('[SYNC FLAGS] Eligible files reconciled; excluded file groups require review. All source checkpoints retained for retry.');
             $hasReviewFlags = true;
@@ -342,6 +345,7 @@ class SyncContactsData extends Command
         $this->contactFlags = [];
         $this->skippedContactIds = [];
         $this->exclusionSeeds = $this->matchingExclusions = $this->verifiedCampaigns = $this->sourceLinks = [];
+        $this->campaignHolds = [];
         $this->matchingScopePrepared = false;
         $dryRun = (bool) $this->option('dry-run');
         if ($dryRun) {
@@ -371,6 +375,14 @@ class SyncContactsData extends Command
             $inherited = ContactSyncRunScope::read((string) $this->option('exclude-scope-file'), 'LT');
             $this->matchingExclusions = ContactSyncExclusions::resolve($sqlConnector->getSqlServerConnection(), $inherited['excluded_ids']);
             $this->exclusionSeeds = array_fill_keys($this->matchingExclusions, true);
+            $this->campaignHolds = array_fill_keys(ContactSyncExclusions::resolve(
+                $sqlConnector->getSqlServerConnection(), $inherited['campaign_hold_ids'], null), true);
+        }
+        if ($this->option('campaign-scope-file')) {
+            if ($this->source !== 'PLAW') throw new \RuntimeException('Only PLAW may inherit the completed LDR campaign scope.');
+            $prior = ContactSyncRunScope::read((string) $this->option('campaign-scope-file'), 'LDR');
+            $this->campaignHolds += array_fill_keys(ContactSyncExclusions::resolve(
+                $sqlConnector->getSqlServerConnection(), $prior['campaign_hold_ids'], null), true);
         }
 
         // Determine sync mode.
@@ -612,6 +624,7 @@ class SyncContactsData extends Command
             ContactSyncRunScope::write((string) $this->option('scope-file'), [
                 'source' => $this->source, 'complete' => true, 'started_at' => $syncStartedAt,
                 'excluded_ids' => array_keys($this->exclusionSeeds), 'campaigns' => $this->verifiedCampaigns,
+                'campaign_hold_ids' => array_keys($this->campaignHolds),
                 'enrollment_changes' => ['categories' => $categoryChanges, 'affiliates' => $affiliateChanges],
             ]);
         }
@@ -1236,7 +1249,7 @@ class SyncContactsData extends Command
                 $this->insertContactRows($pdo, $this->contactFields(), $data);
                 $count = count($data);
             } else {
-                $plan = $this->acceptedContactPlan(ContactSyncTargets::plan($pdo, $data, $this->source, true, $evidence, true));
+                $plan = $this->acceptedContactPlan(ContactSyncTargets::plan($pdo, $data, $this->source, true, $evidence, true, array_keys($this->campaignHolds)));
                 $count = ContactSyncTargets::apply($pdo, $plan, $this->source);
             }
             if (!$pdo->commit()) {
@@ -1255,7 +1268,7 @@ class SyncContactsData extends Command
     {
         $rows = array_values(array_filter($rows, fn ($row) => !isset($this->skippedContactIds[$row['llg_id']])));
         $evidence = $this->contactEvidence($connector, $rows);
-        $plan = $this->acceptedContactPlan(ContactSyncTargets::plan($connector->getSqlServerConnection(), $rows, $this->source, false, $evidence, true));
+        $plan = $this->acceptedContactPlan(ContactSyncTargets::plan($connector->getSqlServerConnection(), $rows, $this->source, false, $evidence, true, array_keys($this->campaignHolds)));
         $byId = array_column($rows, null, 'llg_id');
         foreach ($plan as $change) {
             $debtRow = $byId[$change['incoming_id']];
@@ -1296,12 +1309,23 @@ class SyncContactsData extends Command
                 $proof = $change['campaign_proof'] ?? null;
                 if (($proof['status'] ?? '') === 'verified') {
                     foreach ($change['campaign_proof_ids'] ?? [$change['target_id']] as $id) {
-                        $this->verifiedCampaigns[$id] = $proof['campaign'];
+                        $this->rememberCampaignProof($id, $proof['campaign']);
                     }
                 }
             }
         }
         return $accepted;
+    }
+
+    private function rememberCampaignProof(string $id, string $campaign): void
+    {
+        if (isset($this->verifiedCampaigns[$id]) && $this->verifiedCampaigns[$id] !== $campaign) {
+            $this->recordContactFlag(['id' => $id, 'code' => 'campaign_proof_conflict',
+                'message' => 'Sources disagree on campaign attribution; campaign fills withheld.'], false);
+            $this->campaignHolds[$id] = true;
+        }
+        if (isset($this->campaignHolds[$id])) unset($this->verifiedCampaigns[$id]);
+        else $this->verifiedCampaigns[$id] = $campaign;
     }
 
     /** Identity values and evidence tokens never belong in a record flag. */
@@ -1321,6 +1345,11 @@ class SyncContactsData extends Command
             $this->skippedContactIds[$flag['id']] = true;
             foreach (array_merge($this->sourceLinks[$flag['id']] ?? [$flag['id']], $warning['related_ids'] ?? []) as $id) {
                 $this->exclusionSeeds[(string) $id] = true;
+            }
+        } elseif ($flag['code'] === 'campaign_attribution_preserved') {
+            foreach (array_merge($this->sourceLinks[$flag['id']] ?? [$flag['id']], $warning['related_ids'] ?? []) as $id) {
+                $this->campaignHolds[(string) $id] = true;
+                unset($this->verifiedCampaigns[(string) $id]);
             }
         }
         $key = $flag['source'] . ':' . $flag['id'] . ':' . $flag['code'];
@@ -1512,7 +1541,7 @@ class SyncContactsData extends Command
         $target = $this->targetTable;
         $rows = array_values(array_filter($rows, fn ($row) => !isset($this->skippedContactIds[$row['llg_id']])));
         $evidence = $this->contactEvidence($connector, $rows);
-        $plan = $this->acceptedContactPlan(ContactSyncTargets::plan($connector->getSqlServerConnection(), $rows, $this->source, false, $evidence, true));
+        $plan = $this->acceptedContactPlan(ContactSyncTargets::plan($connector->getSqlServerConnection(), $rows, $this->source, false, $evidence, true, array_keys($this->campaignHolds)));
         $rows = array_column($plan, 'after');
         try {
             $this->targetTable = $this->refreshStage;
@@ -1589,14 +1618,19 @@ class SyncContactsData extends Command
             $review = ContactSyncMatching::campaignPreflight($pdo, $this->verifiedCampaigns);
             foreach ($review['conflicts'] as $flag) {
                 $flag['related_ids'] = [$flag['id'], $flag['proof_id']];
-                $this->recordContactFlag($flag, true);
+                $this->recordContactFlag($flag, false);
+                foreach ($flag['related_ids'] as $id) $this->campaignHolds[$id] = true;
             }
             $this->verifiedCampaigns = $review['verified_campaigns'];
             $this->matchingScopePrepared = true;
         }
         $this->matchingExclusions = ContactSyncExclusions::resolve($pdo, array_keys($this->exclusionSeeds));
-        $this->verifiedCampaigns = array_diff_key($this->verifiedCampaigns, array_fill_keys($this->matchingExclusions, true));
+        // Campaign holds only filter proof maps; they do not render large contact exclusion SQL.
+        $this->campaignHolds = array_fill_keys(ContactSyncExclusions::resolve($pdo, array_keys($this->campaignHolds), null), true);
+        $this->verifiedCampaigns = array_diff_key($this->verifiedCampaigns,
+            array_fill_keys($this->matchingExclusions, true) + $this->campaignHolds);
         $this->info('[MATCH SCOPE] ' . count($this->matchingExclusions) . ' linked IDs excluded; '
+            . count($this->campaignHolds) . ' IDs retain attribution; '
             . count($this->verifiedCampaigns) . ' verified blank campaign fills eligible.');
     }
 

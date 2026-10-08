@@ -6,6 +6,7 @@ namespace Cmd\Reports\Services;
 final class ContactSyncCampaign
 {
     public const RECIPIENT_UNVERIFIED = 'Exact mailer key did not verify the recipient and campaign.';
+    public const MULTIPLE_CAMPAIGNS = 'More than one campaign belongs to the verified recipient and mailer key.';
 
     public static function resolve(array $contact, array $candidates): array
     {
@@ -38,7 +39,7 @@ final class ContactSyncCampaign
         if (count($campaigns) !== 1) {
             return array_replace($proof, ['status' => 'unresolved', 'reason' => $campaigns === []
                 ? self::RECIPIENT_UNVERIFIED
-                : 'More than one campaign belongs to the verified recipient and mailer key.']);
+                : self::MULTIPLE_CAMPAIGNS]);
         }
         return array_replace($proof, ['status' => 'verified', 'campaign' => (string) array_key_first($campaigns),
             'reason' => 'Exact mailer key and recipient name/address verified.']);
@@ -51,33 +52,37 @@ final class ContactSyncCampaign
         $existing = trim((string) ($before['campaign'] ?? ''));
         $value = $before === null ? '' : $before['campaign'];
         $reject = static fn (string $reason) => ['value' => $value, 'reason' => $reason];
+        $preserve = static fn (string $reason) => $before === null ? $reject($reason)
+            : ['value' => $value, 'reason' => null, 'preserve_attribution' => true, 'review_reason' => $reason];
         // Target identity/ownership is checked by the caller. Retaining attribution
         // does not require proving the historical recipient again or create new proof.
-        $preserveAttribution = $before !== null
-            && ($proof['status'] ?? '') === 'unresolved'
-            && ($proof['reason'] ?? '') === self::RECIPIENT_UNVERIFIED;
-        if (($proof['status'] ?? null) === 'unresolved' && !$preserveAttribution && !($preserveUnverified && $existing !== ''
+        if (($proof['status'] ?? null) === 'unresolved'
+            && in_array($proof['reason'] ?? '', [self::RECIPIENT_UNVERIFIED, self::MULTIPLE_CAMPAIGNS], true)) {
+            return $preserve($proof['reason']);
+        }
+        // A fresh disagreement about the backend's LT identity is not mailing ambiguity.
+        if (($proof['status'] ?? null) === 'unresolved' && !($preserveUnverified && $existing !== ''
             && ($proof['candidate_campaigns'] ?? []) === [$existing])) {
             return $reject((string) ($proof['reason'] ?? 'Campaign attribution is unresolved.'));
         }
         if ($candidate !== '' && $existing !== '' && $candidate !== $existing) {
-            return $reject('Existing campaign differs from the candidate; a reviewed attribution repair is required.');
+            return $preserve('Existing campaign differs from the candidate; a reviewed attribution repair is required.');
         }
         $effective = $existing !== '' ? $existing : $candidate;
         foreach ($linked as $other) {
             $otherCampaign = trim((string) ($other['campaign'] ?? ''));
             if ($effective !== '' && $otherCampaign !== '' && $effective !== $otherCampaign) {
-                return $reject('Linked contact campaigns disagree; existing attribution was preserved for review.');
+                return $preserve('Linked contact campaigns disagree; existing attribution was preserved for review.');
             }
         }
         if ($candidate !== '' && $existing === '') {
             if (($proof['status'] ?? '') !== 'verified' || ($proof['campaign'] ?? '') !== $candidate
                 || trim((string) ($proof['external_id'] ?? '')) === '') {
-                return $reject('Assigning a campaign requires an exact mailer key and verified recipient.');
+                return $preserve('Assigning a campaign requires an exact mailer key and verified recipient.');
             }
             $value = $candidate;
         }
-        return ['value' => $value, 'reason' => null, 'preserve_attribution' => $preserveAttribution];
+        return ['value' => $value, 'reason' => null, 'preserve_attribution' => false];
     }
 
     private static function sameRecipient(array $contact, array $mailer): bool
