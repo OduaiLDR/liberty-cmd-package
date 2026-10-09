@@ -431,7 +431,7 @@ class MailDropExportRepository extends SqlSrvRepository
         }
     }
 
-    /** Target and SMS_Count count actual eligible phone numbers, not CSV lines. */
+    /** Target and SMS_Count count eligible phones: one per lead, so one per CSV line. */
     protected function countPhonesForDrop(string $dropName): int
     {
         if ($this->connection()->getDriverName() === 'sqlsrv') {
@@ -465,9 +465,10 @@ class MailDropExportRepository extends SqlSrvRepository
     }
 
     /**
-     * Both source tables can contain a lead. E has one phone per row (often several
-     * rows per External_ID); E2 has five slots and also has leads absent from E.
-     * Sorting their union by identity lets us merge without dropping either source.
+     * SMS uses only TblMailersUniqueEnriched: one TU cell-phone append per row, sometimes
+     * several rows per External_ID. TblMailersUniqueEnriched2 is an older five-slot source
+     * whose numbers are not all cell phones, so it is not read (Jacob, 2026-10-09).
+     * Rows come sorted by identity, oldest PK first, so each lead's rows are adjacent.
      */
     protected function sourceRowsForDrop(string $dropName): iterable
     {
@@ -475,21 +476,17 @@ class MailDropExportRepository extends SqlSrvRepository
             ->select(['u.External_ID', 'u.Debt_Amount'])
             ->selectRaw('ROW_NUMBER() OVER (PARTITION BY u.External_ID ORDER BY u.PK) AS debt_rank')
             ->where('u.Drop_Name', $dropName);
-        $one = $this->table('TblMailersUniqueEnriched', 'e')
+        $enriched = $this->table('TblMailersUniqueEnriched', 'e')
             ->where('e.Drop_Name', $dropName)
             ->leftJoinSub($debt, 'source_debt', function (JoinClause $join): void {
                 $join->on('source_debt.External_ID', '=', 'e.External_ID')->where('source_debt.debt_rank', 1);
             })
-            ->selectRaw('e.PK, e.External_ID, e.Client, e.Address, e.Phone AS phone1, NULL AS phone2, NULL AS phone3, NULL AS phone4, NULL AS phone5, 0 AS source_rank, source_debt.Debt_Amount');
-        $five = $this->table('TblMailersUniqueEnriched2', 'e2')
-            ->where('e2.Drop_Name', $dropName)
-            ->selectRaw('e2.PK, e2.External_ID, e2.Client, e2.Address, e2.phone1, e2.phone2, e2.phone3, e2.phone4, e2.phone5, 1 AS source_rank, e2.Debt_Amount');
-        $union = $one->unionAll($five);
+            ->selectRaw('e.PK, e.External_ID, e.Client, e.Address, e.Phone, source_debt.Debt_Amount');
         $identity = $this->connection()->getDriverName() === 'sqlsrv'
             ? SmsPhoneCounter::identitySql('External_ID')
             : 'LOWER(TRIM(External_ID, char(9) || char(10) || char(11) || char(13) || char(32) || char(0))) COLLATE BINARY';
-        return $this->connection()->query()->fromSub($union, 'sources')
-            ->orderByRaw($identity)->orderBy('source_rank')->orderBy('PK')->cursor();
+        return $this->connection()->query()->fromSub($enriched, 'sources')
+            ->orderByRaw($identity)->orderBy('PK')->cursor();
     }
 
     protected function rowsForDrop(string $dropName): iterable
@@ -521,44 +518,46 @@ class MailDropExportRepository extends SqlSrvRepository
         if ($batch !== []) yield from $this->eligibleRowsForLeads($batch);
     }
 
-    /** @param array<int, object> $sources */
+    /** @param array<int, object> $sources One lead's rows, oldest PK first. */
     protected function mergeLead(array $sources, string $dropName): ?object
     {
         $address = null;
-        $preferred = null;
+        $name = null;
         $debt = null;
-        $namesBySource = [];
         $phones = [];
+        $latest = null;
         foreach ($sources as $source) {
             $sourceAddress = strtoupper(trim((string) ($source->Address ?? '')));
             if ($address !== null && $address !== $sourceAddress) {
                 throw ValidationException::withMessages(['target' => "{$dropName} has one External_ID with conflicting addresses. Reconcile the lead before exporting."]);
             }
             $address = $sourceAddress;
-            $rank = (int) $source->source_rank;
             $sourceName = strtoupper(trim(preg_replace('/\s+/', ' ', (string) ($source->Client ?? ''))));
-            if (isset($namesBySource[$rank]) && $namesBySource[$rank] !== $sourceName) {
+            if ($name !== null && $name !== $sourceName) {
                 throw ValidationException::withMessages(['target' => "{$dropName} has one External_ID with conflicting names in the same source. Reconcile the lead before exporting."]);
             }
-            $namesBySource[$rank] = $sourceName;
-            if ($preferred === null || (int) $source->source_rank > (int) $preferred->source_rank) $preferred = $source;
+            $name = $sourceName;
             if ($source->Debt_Amount !== null && $source->Debt_Amount !== '') {
                 if ($debt !== null && $this->formatDebtLoad($debt) !== $this->formatDebtLoad($source->Debt_Amount)) {
                     throw ValidationException::withMessages(['target' => "{$dropName} has one External_ID with conflicting debt amounts. Reconcile the lead before exporting."]);
                 }
                 $debt = $source->Debt_Amount;
             }
-            foreach (['phone1', 'phone2', 'phone3', 'phone4', 'phone5'] as $column) {
-                $phone = $this->normalizePhone($source->{$column} ?? null);
-                if ($phone !== null) $phones[$phone] = true;
+            $phone = $this->normalizePhone($source->Phone ?? null);
+            if ($phone !== null) {
+                $phones[$phone] = true;
+                $latest = ['phone' => $phone, 'source' => $source];
             }
         }
-        if ($phones === []) return null;
+        if ($latest === null) return null;
         return (object) [
-            'First_Name' => strtoupper(explode(' ', trim((string) $preferred->Client))[0]),
+            'First_Name' => strtoupper(explode(' ', trim((string) $latest['source']->Client))[0]),
             'Address' => $address,
             'Debt_Amount' => $this->formatDebtLoad($debt),
-            'Phones' => array_map('strval', array_keys($phones)),
+            // SMS goes to one number: the lead's most recent TU cell append.
+            'Phone' => $latest['phone'],
+            // Every number we hold for the lead still counts for contact suppression.
+            'Known_Phones' => array_map('strval', array_keys($phones)),
         ];
     }
 
@@ -566,7 +565,7 @@ class MailDropExportRepository extends SqlSrvRepository
     protected function eligibleRowsForLeads(array $leads): iterable
     {
         $numbers = [];
-        foreach ($leads as $lead) foreach ($lead->Phones as $phone) $numbers[$phone] = true;
+        foreach ($leads as $lead) foreach ($lead->Known_Phones as $phone) $numbers[$phone] = true;
         $contacted = [];
         // SyncPhoneNumbers represents contacted people, so any matching number
         // excludes the whole merged lead, not just one phone slot.
@@ -580,15 +579,14 @@ class MailDropExportRepository extends SqlSrvRepository
             }
         }
         foreach ($leads as $lead) {
-            if (array_intersect_key(array_fill_keys($lead->Phones, true), $contacted) !== []) continue;
-            foreach (array_chunk($lead->Phones, 5) as $part) {
-                yield (object) [
-                    'First_Name' => $lead->First_Name,
-                    'Address' => $lead->Address,
-                    'Debt_Amount' => $lead->Debt_Amount,
-                    'Phones' => array_pad($part, 5, ''),
-                ];
-            }
+            if (array_intersect_key(array_fill_keys($lead->Known_Phones, true), $contacted) !== []) continue;
+            // The vendor file keeps its five phone columns; SMS fills only the first.
+            yield (object) [
+                'First_Name' => $lead->First_Name,
+                'Address' => $lead->Address,
+                'Debt_Amount' => $lead->Debt_Amount,
+                'Phones' => array_pad([$lead->Phone], 5, ''),
+            ];
         }
     }
 

@@ -5,7 +5,12 @@ namespace Cmd\Reports\Services;
 use Illuminate\Database\ConnectionInterface;
 use Illuminate\Validation\ValidationException;
 
-/** Counts eligible phones without building CSV rows or looking up debt per lead. */
+/**
+ * Counts eligible SMS phones without building CSV rows or looking up debt per lead.
+ * SMS sends to one number per lead (its TU cell append in TblMailersUniqueEnriched),
+ * so a lead counts once when it has a valid phone and none of its numbers is a contact.
+ * TblMailersUniqueEnriched2 is an older five-slot source, not all cell numbers; SMS ignores it.
+ */
 class SmsPhoneCounter
 {
     public function count(ConnectionInterface $connection, string $dropName): int
@@ -44,10 +49,7 @@ class SmsPhoneCounter
                 '('.$index.', CONVERT(nvarchar(4000), ?))', array_keys($names)));
             $filters = implode(',', array_fill(0, count($names), '?'));
             $sources = 'SELECT d.Drop_Key AS Drop_Key, e.External_ID, e.Phone FROM TblMailersUniqueEnriched e WITH (FORCESEEK) '
-                .'JOIN RequestedDrops d ON e.Drop_Name = d.Drop_Name WHERE e.Drop_Name IN ('.$filters.') '
-                .'UNION ALL SELECT d.Drop_Key AS Drop_Key, e.External_ID, p.Phone FROM TblMailersUniqueEnriched2 e WITH (FORCESEEK) '
-                .'JOIN RequestedDrops d ON e.Drop_Name = d.Drop_Name '
-                .'CROSS APPLY (VALUES (e.phone1), (e.phone2), (e.phone3), (e.phone4), (e.phone5)) p(Phone) WHERE e.Drop_Name IN ('.$filters.')';
+                .'JOIN RequestedDrops d ON e.Drop_Name = d.Drop_Name WHERE e.Drop_Name IN ('.$filters.')';
             $pdo = $connection->getPdo();
             $attribute = defined('PDO::SQLSRV_ATTR_QUERY_TIMEOUT') ? constant('PDO::SQLSRV_ATTR_QUERY_TIMEOUT') : null;
             $previousTimeout = $attribute === null ? null : $pdo->getAttribute($attribute);
@@ -55,7 +57,7 @@ class SmsPhoneCounter
             // below the 7,000-second queue job and the queue retry reservation.
             if ($attribute !== null) $pdo->setAttribute($attribute, 1800);
             try {
-                $rows = $connection->select($this->aggregateSql($sources, null, "RequestedDrops AS (SELECT Drop_Key, Drop_Name FROM (VALUES {$marks}) requested(Drop_Key, Drop_Name)),", '50')."\nOPTION (RECOMPILE)", array_merge($names, $names, $names));
+                $rows = $connection->select($this->aggregateSql($sources, null, "RequestedDrops AS (SELECT Drop_Key, Drop_Name FROM (VALUES {$marks}) requested(Drop_Key, Drop_Name)),", '50')."\nOPTION (RECOMPILE)", array_merge($names, $names));
             } finally {
                 if ($attribute !== null) $pdo->setAttribute($attribute, $previousTimeout);
             }
@@ -76,10 +78,6 @@ class SmsPhoneCounter
             $sources = "SELECT N'fixture' AS Drop_Key, fixture.* FROM ({$sources}) fixture";
         } else $sources = <<<'SQL'
 SELECT Drop_Name AS Drop_Key, External_ID, Phone FROM TblMailersUniqueEnriched WHERE Drop_Name = ?
-UNION ALL
-SELECT e.Drop_Name AS Drop_Key, e.External_ID, p.Phone FROM TblMailersUniqueEnriched2 e
-CROSS APPLY (VALUES (e.phone1), (e.phone2), (e.phone3), (e.phone4), (e.phone5)) p(Phone)
-WHERE e.Drop_Name = ?
 SQL;
 
         return $this->aggregateSql($sources, $contacts);
@@ -89,7 +87,7 @@ SQL;
     {
         $contacts ??= 'SELECT Phone FROM TblPhoneNumbers';
         $identity = self::identitySql('External_ID');
-        // Verified source widths: E phone is nvarchar(50), E2 slots varchar(32).
+        // Verified source width: E phone is nvarchar(50).
         // Fixture SQL keeps arbitrary-length phone values for normalization tests.
 
         return <<<SQL
@@ -119,7 +117,7 @@ LeadCounts AS (
         WHERE c.Phone = d.Phone OR c.Phone = N'1' + d.Phone) c
     GROUP BY d.Drop_Key, d.Lead_ID
 )
-SELECT Drop_Key, COALESCE(SUM(CASE WHEN Contacted = 0 THEN Phone_Count ELSE 0 END), 0) AS Eligible_Phones,
+SELECT Drop_Key, COALESCE(SUM(CASE WHEN Contacted = 0 AND Phone_Count > 0 THEN 1 ELSE 0 END), 0) AS Eligible_Phones,
     COALESCE(MAX(CASE WHEN Lead_ID IS NULL OR Lead_ID = N'' THEN 1 ELSE 0 END), 0) AS Missing_Identity
 FROM LeadCounts
 GROUP BY Drop_Key

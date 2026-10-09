@@ -181,8 +181,8 @@ class SmsSelectionJobTest extends TestCase
         foreach ([11, 7] as $index => $count) {
             $name = $names[$index];
             $connection->shouldReceive('select')->once()->withArgs(function ($sql, $bindings) use ($name): bool {
-                return $bindings === [$name, $name, $name] && str_contains($sql, 'requested(Drop_Key, Drop_Name)')
-                    && str_contains($sql, 'OPTION (RECOMPILE)');
+                return $bindings === [$name, $name] && str_contains($sql, 'requested(Drop_Key, Drop_Name)')
+                    && str_contains($sql, 'OPTION (RECOMPILE)') && ! str_contains($sql, 'TblMailersUniqueEnriched2');
             })->andReturn([(object) ['Drop_Key' => 0, 'Eligible_Phones' => $count, 'Missing_Identity' => 0]]);
         }
         $counts = (new \Cmd\Reports\Services\SmsPhoneCounter)->countMany($connection, $names);

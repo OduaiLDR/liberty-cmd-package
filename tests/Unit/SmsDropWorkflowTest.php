@@ -142,8 +142,10 @@ test('whitespace identity variants remain adjacent and suppress the complete mer
     $this->db->table('TblPhoneNumbers')->insert(['Phone' => '2025550103']);
     $export = $this->repo->prepareExport(1, '00000000-0000-4000-8000-000000000099');
     try {
-        expect($export['count'])->toBe(2);
-        expect(file_get_contents($export['path']))->not->toContain('2025550101')->not->toContain('2025550103');
+        // EXT101 merges two enriched rows; SMS sends only its most recent phone.
+        expect($export['count'])->toBe(1);
+        expect(file_get_contents($export['path']))->toContain('2025550104')->not->toContain('2025550102')
+            ->not->toContain('2025550101')->not->toContain('2025550103');
     } finally { unlink($export['path']); }
 });
 
@@ -884,7 +886,7 @@ test('phone sync refuses a non-sqlsrv target before any replacement', function (
         ->toThrow(RuntimeException::class, 'sqlsrv connection');
 });
 
-test('merges one-phone and five-phone sources without losing E2-only leads or duplicate E phones', function () {
+test('SMS ignores TblMailersUniqueEnriched2 and sends one phone per lead', function () {
     smsFixture($this->db, 1, 'T1', '2026-10-05', ['2025550101']);
     $this->db->table('TblMailersUniqueEnriched')->insert([
         'PK' => 999, 'Drop_Name' => 'DROP1', 'External_ID' => 'EXT100',
@@ -900,57 +902,56 @@ test('merges one-phone and five-phone sources without losing E2-only leads or du
         'Client' => 'Only Here', 'Address' => 'Another address', 'Debt_Amount' => 20000,
         'phone1' => '2025550104',
     ]);
-    expect((int) $this->repo->selectDrops(2)->first()->Amount_Dropped)->toBe(4);
-    $export = $this->repo->prepareExport(2, '00000000-0000-4000-8000-000000000201');
+    expect((int) $this->repo->selectDrops(1)->first()->Amount_Dropped)->toBe(1);
+    $export = $this->repo->prepareExport(1, '00000000-0000-4000-8000-000000000201');
     try {
         $records = array_map('str_getcsv', file($export['path'], FILE_IGNORE_NEW_LINES));
-        expect($export['count'])->toBe(4);
+        expect($export['count'])->toBe(1);
+        expect($records)->toHaveCount(2);
         expect($records[0])->toBe(['First name','address','debt load','phone1','phone2','phone3','phone4','phone5','send date']);
-        expect($records[1][0])->toBe('ONLY');
-        expect($records[2])->toBe(['JANE','SAMPLE ADDRESS','10000','2025550101','2025550102','2025550103','','','2026-10-06']);
+        // The newest enriched row (PK 999) supplies the phone; E2 adds no phones, names or leads.
+        expect($records[1])->toBe(['SAMPLE','SAMPLE ADDRESS','10000','2025550102','','','','','2026-10-06']);
     } finally { unlink($export['path']); }
 });
 
 test('a contacted number excludes its entire merged lead', function () {
     smsFixture($this->db, 1, 'T1', '2026-10-05', ['2025550101', '2025550199']);
-    $this->db->table('TblMailersUniqueEnriched2')->insert([
-        'PK' => 1, 'Drop_Name' => 'DROP1', 'External_ID' => 'EXT100',
-        'Client' => 'Sample Person', 'Address' => 'Sample address', 'Debt_Amount' => 10000,
-        'phone1' => '2025550102',
+    // EXT100 would send its newer phone 0102, but its older number is already a contact.
+    $this->db->table('TblMailersUniqueEnriched')->insert([
+        'PK' => 999, 'Drop_Name' => 'DROP1', 'External_ID' => 'EXT100',
+        'Client' => 'Sample Person', 'Address' => 'Sample address', 'Phone' => '2025550102',
     ]);
-    $this->db->table('TblPhoneNumbers')->insert(['Phone' => '12025550102']);
+    $this->db->table('TblPhoneNumbers')->insert(['Phone' => '12025550101']);
     expect((int) $this->repo->selectDrops(1)->first()->Amount_Dropped)->toBe(1);
     $export = $this->repo->prepareExport(1, '00000000-0000-4000-8000-000000000202');
     try { expect(file_get_contents($export['path']))->toContain('2025550199')->not->toContain('2025550101')->not->toContain('2025550102'); }
     finally { unlink($export['path']); }
 });
 
-test('six distinct phones use continuation rows so no eligible phone is lost', function () {
+test('a lead with several enriched phones counts once and sends its most recent valid phone', function () {
     smsFixture($this->db, 1, 'T1', '2026-10-05', ['2025550101']);
-    $this->db->table('TblMailersUniqueEnriched2')->insert([
-        'PK' => 1, 'Drop_Name' => 'DROP1', 'External_ID' => 'EXT100',
-        'Client' => 'Sample Person', 'Address' => 'Sample address', 'Debt_Amount' => 10000,
-        'phone1' => '2025550102', 'phone2' => '2025550103', 'phone3' => '2025550104',
-        'phone4' => '2025550105', 'phone5' => '2025550106',
-    ]);
-    expect((int) $this->repo->selectDrops(2)->first()->Amount_Dropped)->toBe(6);
-    $export = $this->repo->prepareExport(2, '00000000-0000-4000-8000-000000000203');
+    foreach (['2025550102', '2025550103', '2025550104', '2025550105', '2025550106', 'invalid'] as $offset => $phone) {
+        $this->db->table('TblMailersUniqueEnriched')->insert([
+            'PK' => 1000 + $offset, 'Drop_Name' => 'DROP1', 'External_ID' => 'EXT100',
+            'Client' => 'Sample Person', 'Address' => 'Sample address', 'Phone' => $phone,
+        ]);
+    }
+    expect((int) $this->repo->selectDrops(1)->first()->Amount_Dropped)->toBe(1);
+    $export = $this->repo->prepareExport(1, '00000000-0000-4000-8000-000000000203');
     try {
         $records = array_map('str_getcsv', file($export['path'], FILE_IGNORE_NEW_LINES));
-        expect($records)->toHaveCount(3);
-        expect($export['count'])->toBe(6);
-        expect((int) $this->db->table('TblSmsExports')->value('SMS_Count'))->toBe(6);
-        expect(array_merge(array_slice($records[1], 3, 5), array_slice($records[2], 3, 5)))
-            ->toContain('2025550101','2025550102','2025550103','2025550104','2025550105','2025550106');
+        expect($records)->toHaveCount(2);
+        expect($export['count'])->toBe(1);
+        expect((int) $this->db->table('TblSmsExports')->value('SMS_Count'))->toBe(1);
+        expect(array_slice($records[1], 3, 5))->toBe(['2025550106', '', '', '', '']);
     } finally { unlink($export['path']); }
 });
 
 test('conflicting identity fails before export tracking changes', function () {
     smsFixture($this->db, 1, 'T1', '2026-10-05', ['2025550101']);
-    $this->db->table('TblMailersUniqueEnriched2')->insert([
-        'PK' => 1, 'Drop_Name' => 'DROP1', 'External_ID' => 'EXT100',
-        'Client' => 'Other Person', 'Address' => 'Different address', 'Debt_Amount' => 10000,
-        'phone1' => '2025550102',
+    $this->db->table('TblMailersUniqueEnriched')->insert([
+        'PK' => 999, 'Drop_Name' => 'DROP1', 'External_ID' => 'EXT100',
+        'Client' => 'Sample Person', 'Address' => 'Different address', 'Phone' => '2025550102',
     ]);
     expect(fn () => $this->repo->prepareExport(1, '00000000-0000-4000-8000-000000000204'))
         ->toThrow(ValidationException::class);
@@ -968,18 +969,16 @@ test('duplicate one-phone identities with different names cannot be conflated', 
     expect($this->db->table('TblSmsExports')->count())->toBe(0);
 });
 
-test('missing E2 debt retains the amount from the one-phone source', function () {
-    smsFixture($this->db, 1, 'T1', '2026-10-05', ['2025550101']);
+test('a drop whose phones exist only in TblMailersUniqueEnriched2 has nothing eligible', function () {
+    smsFixture($this->db, 1, 'T1', '2026-10-05', []);
     $this->db->table('TblMailersUniqueEnriched2')->insert([
-        'PK' => 1, 'Drop_Name' => 'DROP1', 'External_ID' => 'EXT100',
-        'Client' => 'Sample Person', 'Address' => 'Sample address', 'Debt_Amount' => null,
-        'phone1' => '2025550102',
+        'PK' => 1, 'Drop_Name' => 'DROP1', 'External_ID' => 'E2-ONLY',
+        'Client' => 'Only Here', 'Address' => 'Another address', 'Debt_Amount' => 20000,
+        'phone1' => '2025550102', 'phone2' => '2025550103',
     ]);
-    $export = $this->repo->prepareExport(1, '00000000-0000-4000-8000-000000000206');
-    try {
-        $records = array_map('str_getcsv', file($export['path'], FILE_IGNORE_NEW_LINES));
-        expect($records[1][2])->toBe('10000');
-    } finally { unlink($export['path']); }
+    expect($this->repo->selectDrops(1))->toHaveCount(0);
+    expect(fn () => $this->repo->selectDropsByIds([1]))->toThrow(ValidationException::class);
+    expect($this->db->table('TblSmsExports')->count())->toBe(0);
 });
 
 test('SMS storage reuses the existing CMD S3 disk when no dedicated bucket is set', function () {
