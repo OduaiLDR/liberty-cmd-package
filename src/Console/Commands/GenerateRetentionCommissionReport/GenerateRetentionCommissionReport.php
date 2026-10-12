@@ -286,9 +286,8 @@ class GenerateRetentionCommissionReport extends Command
             );
 
             // Payroll policy: a retained account is paid at the tier earned in
-            // the month its Enrolled status resumes after reconsideration,
-            // even when payment clears in a later month. This is RETENTION_DATE,
-            // the Retention Date field in column D, confirmed by Jacob on 2026-10-12.
+            // the month recorded in column D (RETENTION_DATE), even when payment
+            // clears in a later month. Jacob confirmed D as the only source on 2026-10-12.
             // Keep an explicit environment override for rollback, but make the
             // correct business rule the safe default for scheduled runs too.
             $useRetainedMonthTier = filter_var(env('RETENTION_TIER_BY_RETAINED_MONTH', true), FILTER_VALIDATE_BOOLEAN);
@@ -934,14 +933,17 @@ class GenerateRetentionCommissionReport extends Command
             $tier = $this->resolveTier($pct, $retained, $hasT4);
 
             foreach ($agentRows as $row) {
+                // Old snapshots must not award commission when column D is blank.
+                if ($this->toDate($this->col($row, 'RETENTION_DATE')) === null) {
+                    continue;
+                }
                 if (!$this->inExcelPeriod($this->col($row, 'RETENTION_PAYMENT_DATE'), $startDate, $endDate, true)) {
                     continue;
                 }
 
                 $commissionOld += $this->amountForTier($row, $tier);
 
-                // Tier snapshot month comes from the actual Enrolled status event,
-                // not the optional/custom worksheet Retention Date.
+                // Jacob, 2026-10-12: column D also determines the earned tier month.
                 $retainedPeriod = RetentionCommissionTierStore::periodStartFromDate(
                     (string) ($this->col($row, 'RETENTION_DATE') ?? '')
                 );

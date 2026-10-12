@@ -44,13 +44,13 @@ final class RetentionRetainedMonthTierTest extends TestCase
         $this->summary($this->rows());
     }
 
-    public function test_missing_custom_retention_date_uses_actual_enrolled_status_month_for_tiering(): void
+    public function test_blank_column_d_blocks_commission_even_when_old_column_j_has_a_date(): void
     {
         $rows = $this->rows();
         $rows[1]['RETENTION_DATE'] = '';
         $map = [Tiers::tierMapKey('2098-01-01', 'Jane Doe') => 1];
 
-        $this->assertSame(10.0, $this->summary($rows, $map)['Jane Doe']['commission']);
+        $this->assertSame(0.0, $this->summary($rows, $map)['Jane Doe']['commission']);
     }
 
     public function test_explicit_disabled_policy_preserves_current_tier_payment(): void
@@ -210,20 +210,6 @@ final class RetentionRetainedMonthTierTest extends TestCase
         $this->assertSame([' JANE DOE ', 'Jane Doe', 'No Activity', 'Other Agent'], array_keys($summary));
     }
 
-    public function test_retained_status_selection_is_as_of_the_report_end_date(): void
-    {
-        $source = new RetainedTierConnector(['data' => [
-            ['CONTACT_ID' => '101', 'RETAINED_DATE' => '2026-09-30'],
-            ['CONTACT_ID' => '101', 'RETAINED_DATE' => '2026-10-05'],
-        ]]);
-        $retained = (new ReflectionMethod(GenerateRetentionCommissionReport::class, 'fetchRetainedDates'))->invoke(
-            new GenerateRetentionCommissionReport, $source, '101', '2026-09-30'
-        );
-
-        $this->assertSame(['2026-09-30'], $retained['101']);
-        $this->assertStringContainsString("LEFT(cs.STAMP,10) <= '2026-09-30'", $source->lastSql);
-    }
-
     public function test_base_query_deduplicates_identical_contacts_and_rejects_conflicts(): void
     {
         $row = ['ID' => '101', 'RETENTION_AGENT' => 'Jane Doe'];
@@ -237,12 +223,12 @@ final class RetentionRetainedMonthTierTest extends TestCase
             $cfg, '2026-09-01');
     }
 
-    public function test_historical_tier_periods_follow_enrolled_status_date_not_custom_retention_date(): void
+    public function test_historical_tier_periods_follow_column_d_instead_of_old_column_j(): void
     {
         $periods = (new ReflectionMethod(GenerateRetentionCommissionReport::class, 'retentionPeriodStarts'))
             ->invoke(new GenerateRetentionCommissionReport, [[
-                'RETENTION_DATE' => '',
-                'RETAINED_DATE' => '2026-08-17',
+                'RETENTION_DATE' => '2026-08-17',
+                'RETAINED_DATE' => '2026-07-17',
                 'RETENTION_PAYMENT_DATE' => '2026-09-05',
             ]]);
 
@@ -269,7 +255,7 @@ final class RetentionRetainedMonthTierTest extends TestCase
             'has_t4' => true,
         ], 'ldr', [[
             'RETENTION_AGENT' => 'Gracia Rivera',
-            'RETAINED_DATE' => '2026-04-12',
+            'RETENTION_DATE' => '2026-04-12',
             'RETENTION_PAYMENT_DATE' => '2026-09-08',
         ]], '2026-09-01', [], true);
 
