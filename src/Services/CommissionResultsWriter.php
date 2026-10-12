@@ -7,8 +7,9 @@ use Illuminate\Support\Facades\Log;
 /**
  * Persists the report generators' computed per-agent commission to Azure SQL
  * (CommissionDatabase.dbo.TblCommissionReviewResults) so the Commission Review app can read the
- * REAL numbers. Best-effort: any failure (missing table / DDL rights / connection) is logged and
- * NEVER interrupts report generation or emailing.
+ * REAL numbers. Report generators use replaceComponent(), which atomically replaces
+ * one complete component and throws on failure before report distribution. persist()
+ * remains the legacy best-effort upsert API for compatibility.
  *
  * Table contract — must match CMD_PAYROLL_REVIEW's fetchCommissionResultsByAgent():
  *   TblCommissionReviewResults(Report_Type, Source, Period_Start, Agent, Commission, Bonus_Commission, Updated_At)
@@ -22,6 +23,51 @@ class CommissionResultsWriter
 {
     private const TABLE = 'TblCommissionReviewResults';
     private const COLUMNS = ['Commission', 'Bonus_Commission'];
+
+    /** Replace a complete source component atomically; never publish a partial reset. */
+    public static function replaceComponent(DBConnector $sql, string $reportType, string $source, string $periodStart, string $column, array $rows): array
+    {
+        if (!in_array($column, self::COLUMNS, true)) {
+            throw new \InvalidArgumentException("Unsupported commission result column: {$column}");
+        }
+        $identities = [];
+        foreach ($rows as $row) {
+            if (trim((string) ($row['agent'] ?? '')) === '' || !isset($row['amount'])
+                || !is_numeric($row['amount']) || !is_finite((float) $row['amount'])) {
+                throw new \InvalidArgumentException('Commission results require an employee and a finite amount.');
+            }
+            $identity = strtolower((string) preg_replace('/\s+/u', ' ', trim((string) $row['agent'])));
+            if (isset($identities[$identity])) {
+                throw new \InvalidArgumentException('Duplicate employee identities must be aggregated before replacing commission results.');
+            }
+            $identities[$identity] = true;
+        }
+        $pdo = $sql->getSqlServerConnection();
+        if ($pdo->inTransaction()) {
+            throw new \LogicException('Commission replacement requires its own transaction.');
+        }
+        self::ensureTable($sql);
+        if (!$pdo->beginTransaction()) throw new \RuntimeException('Could not begin commission replacement transaction.');
+        try {
+            $reset = $sql->querySqlServer(
+                'UPDATE dbo.' . self::TABLE . ' SET ' . $column . ' = 0, Updated_At = GETDATE()'
+                . ' WHERE Report_Type = ? AND Source = ? AND Period_Start = CAST(? AS DATE)',
+                [strtolower(trim($reportType)), strtolower(trim($source)), $periodStart]
+            );
+            if (($reset['success'] ?? false) !== true) {
+                throw new \RuntimeException('Commission component reset failed.');
+            }
+            $result = self::persist($sql, $reportType, $source, $periodStart, $column, $rows);
+            if ($result['failed'] !== 0 || $result['written'] !== count($rows)) {
+                throw new \RuntimeException('Not every commission row was saved.');
+            }
+            if (!$pdo->commit()) throw new \RuntimeException('Commission replacement commit was not confirmed.');
+            return $result;
+        } catch (\Throwable $error) {
+            if ($pdo->inTransaction()) $pdo->rollBack();
+            throw new \RuntimeException('Commission replacement failed; do not mark this report ready. ' . $error->getMessage(), 0, $error);
+        }
+    }
 
     /**
      * @param DBConnector $sql         A SQL Server-connected DBConnector.
@@ -154,6 +200,9 @@ class CommissionResultsWriter
                 Updated_At       DATETIME      NOT NULL DEFAULT GETDATE(),
                 CONSTRAINT PK_" . self::TABLE . " PRIMARY KEY (Report_Type, Source, Period_Start, Agent)
             );";
-        $sql->querySqlServer($ddl);
+        $result = $sql->querySqlServer($ddl);
+        if (($result['success'] ?? false) !== true) {
+            throw new \RuntimeException('Commission results table could not be verified.');
+        }
     }
 }

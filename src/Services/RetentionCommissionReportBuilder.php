@@ -53,7 +53,7 @@ class RetentionCommissionReportBuilder
     ];
 
     /** @param callable(string):void|null $log */
-    public function buildSourceRows(string $source, ?callable $log = null): array
+    public function buildSourceRows(string $source, ?callable $log = null, ?string $asOfDate = null): array
     {
         $cfg = self::SOURCE_CONFIG[$source] ?? null;
         if ($cfg === null) {
@@ -67,14 +67,8 @@ class RetentionCommissionReportBuilder
         $sf = DBConnector::fromEnvironment($source);
         $rows = $this->fetchBase($sf, $cfg);
 
+        $rows = RetentionAgentIdentity::canonicalizeRows($rows);
         foreach ($rows as &$row) {
-            $agent = strtoupper((string) $this->col($row, 'RETENTION_AGENT', ''));
-            if ($agent === 'ANDREA MENDOZE') {
-                $row['RETENTION_AGENT'] = 'ANDREA MENDOZA';
-            } elseif ($agent === 'ANDREA GALVES') {
-                // VBA list typo "Galves"; CRM / Summary use Galvez.
-                $row['RETENTION_AGENT'] = 'ANDREA GALVEZ';
-            }
             $row['SOURCE'] = $display;
         }
         unset($row);
@@ -194,7 +188,7 @@ class RetentionCommissionReportBuilder
             }
         } else {
             foreach (array_keys(self::SOURCE_CONFIG) as $source) {
-                array_push($all, ...$this->buildSourceRows($source, $log));
+                array_push($all, ...$this->buildSourceRows($source, $log, $endDate));
             }
         }
 
@@ -260,14 +254,14 @@ class RetentionCommissionReportBuilder
                 -- Keep full datetime like VBA (Excel COUNTIFS vs DateSerial end = midnight).
                 TO_VARCHAR(cu4.F_DATETIME) AS CANCEL_REQUEST_DATE
             FROM CONTACTS c
-            LEFT JOIN CONTACTS_USERFIELDS cu1 ON cu1.CONTACT_ID = c.ID AND cu1.CUSTOM_ID = {$ca}
-            LEFT JOIN (SELECT CONTACT_ID, F_DATE FROM CONTACTS_USERFIELDS WHERE CUSTOM_ID = {$cd}) cu2 ON c.ID = cu2.CONTACT_ID
-            LEFT JOIN CONTACTS_USERFIELDS cu3 ON cu3.CONTACT_ID = c.ID AND cu3.CUSTOM_ID = {$cr}
-            LEFT JOIN CONTACTS_USERFIELDS cu4 ON cu4.CONTACT_ID = c.ID AND cu4.CUSTOM_ID = {$cc}
+            LEFT JOIN CONTACTS_USERFIELDS cu1 ON cu1.CONTACT_ID = c.ID AND cu1.CUSTOM_ID = {$ca} AND (cu1._FIVETRAN_DELETED = FALSE OR cu1._FIVETRAN_DELETED IS NULL)
+            LEFT JOIN (SELECT CONTACT_ID, F_DATE FROM CONTACTS_USERFIELDS WHERE CUSTOM_ID = {$cd} AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)) cu2 ON c.ID = cu2.CONTACT_ID
+            LEFT JOIN CONTACTS_USERFIELDS cu3 ON cu3.CONTACT_ID = c.ID AND cu3.CUSTOM_ID = {$cr} AND (cu3._FIVETRAN_DELETED = FALSE OR cu3._FIVETRAN_DELETED IS NULL)
+            LEFT JOIN CONTACTS_USERFIELDS cu4 ON cu4.CONTACT_ID = c.ID AND cu4.CUSTOM_ID = {$cc} AND (cu4._FIVETRAN_DELETED = FALSE OR cu4._FIVETRAN_DELETED IS NULL)
             LEFT JOIN (
                 SELECT CONTACT_ID, SUM(ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT
                 FROM DEBTS
-                WHERE ENROLLED=1 AND _FIVETRAN_DELETED=FALSE
+                WHERE ENROLLED=1 AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
                 GROUP BY CONTACT_ID
             ) d ON c.ID = d.CONTACT_ID
             WHERE cu1.CONTACT_ID IS NOT NULL
@@ -277,7 +271,15 @@ class RetentionCommissionReportBuilder
             ORDER BY cu1.F_STRING ASC
         ";
 
-        return $sf->query($sql)['data'] ?? [];
+        return $this->requireRows($sf->query($sql), 'Retention detail base');
+    }
+
+    private function requireRows(mixed $result, string $source): array
+    {
+        if (!is_array($result) || ($result['success'] ?? null) === false || !is_array($result['data'] ?? null)) {
+            throw new \RuntimeException($source . ' query failed; review detail cannot be trusted.');
+        }
+        return $result['data'];
     }
 
     private function fetchReconsiderationDates(DBConnector $sf, int $statusId, string $idList): array
@@ -290,7 +292,7 @@ class RetentionCommissionReportBuilder
             ORDER BY cs.CONTACT_ID ASC, cs.STAMP ASC
         ";
         $map = [];
-        foreach ($sf->query($sql)['data'] ?? [] as $r) {
+        foreach ($this->requireRows($sf->query($sql), 'Retention reconsideration history') as $r) {
             $id = (string) $r['CONTACT_ID'];
             $map[$id] ??= $r['RECON_DATE'];
         }
@@ -305,11 +307,13 @@ class RetentionCommissionReportBuilder
             WHERE TRANS_TYPE = 'D'
               AND CLEARED_DATE IS NOT NULL
               AND RETURNED_DATE IS NULL
+              AND (RETURN_CODE IS NULL OR RETURN_CODE = '')
+              AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
               AND CONTACT_ID IN ({$idList})
             ORDER BY CONTACT_ID ASC, CLEARED_DATE ASC
         ";
         $map = [];
-        foreach ($sf->query($sql)['data'] ?? [] as $r) {
+        foreach ($this->requireRows($sf->query($sql), 'Retention payment history') as $r) {
             $map[(string) $r['CONTACT_ID']][] = (string) $r['CLEARED_DATE'];
         }
         return $map;
@@ -361,11 +365,16 @@ class RetentionCommissionReportBuilder
                 $byId[$id] = $row;
                 continue;
             }
-            $keep = $byId[$id];
-            $keepCancel = $this->toDate($this->col($keep, 'CANCEL_REQUEST_DATE'));
-            $newCancel = $this->toDate($this->col($row, 'CANCEL_REQUEST_DATE'));
-            if ($newCancel !== null && ($keepCancel === null || $newCancel < $keepCancel)) {
-                $byId[$id] = $row;
+            $existing = $byId[$id];
+            $canonical = static function (array $value): array {
+                $value = array_change_key_case($value, CASE_UPPER);
+                ksort($value);
+                return $value;
+            };
+            if ($canonical($existing) !== $canonical($row)) {
+                throw new \UnexpectedValueException(
+                    'Retention detail has conflicting rows for contact ' . $id . '; review stopped rather than choosing an arbitrary commission.'
+                );
             }
         }
 

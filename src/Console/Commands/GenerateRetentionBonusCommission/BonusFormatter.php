@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Cmd\Reports\Console\Commands\GenerateRetentionBonusCommission;
 
 use Cmd\Reports\Services\CommissionCompanyMatch;
+use Cmd\Reports\Services\RetentionAgentIdentity;
 use Illuminate\Support\Facades\Log;
 use PhpOffice\PhpSpreadsheet\Shared\Date as XlDate;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
@@ -35,6 +36,27 @@ class BonusFormatter
     private static function nameKey(string $name): string
     {
         return strtolower(trim((string) preg_replace('/\s+/', ' ', trim($name))));
+    }
+
+    /** Canonicalize verified CRM spelling aliases before rollup/persistence. */
+    private static function canonicalAgentName(string $name): string
+    {
+        return RetentionAgentIdentity::canonicalName($name);
+    }
+
+    /** The workbook and Azure must aggregate identical employee identities. */
+    public static function commissionTotals(array $rows): array
+    {
+        $totals = [];
+        foreach ($rows as $row) {
+            $name = self::canonicalAgentName((string) ($row['RETENTION_AGENT'] ?? ''));
+            if ($name === '') continue;
+            $key = self::nameKey($name);
+            $totals[$key]['name'] = $totals[$key]['name'] ?? $name;
+            $totals[$key]['commission'] = ($totals[$key]['commission'] ?? 0.0)
+                + (float) ($row['RETENTION_COMMISSION'] ?? 0);
+        }
+        return $totals;
     }
 
     /**
@@ -141,6 +163,20 @@ class BonusFormatter
         array $unassigned = []
     ): ?array {
         try {
+            $rows = RetentionAgentIdentity::canonicalizeRows($rows);
+            if ($rosterAgents !== null) {
+                $rosterAgents = RetentionAgentIdentity::canonicalizeNames($rosterAgents);
+            }
+            if ($agentFilter !== null) {
+                $agentFilter = RetentionAgentIdentity::canonicalName($agentFilter);
+            }
+            $canonicalEmployeeMap = [];
+            foreach ($employeeMap as $name => $employee) {
+                $canonicalName = RetentionAgentIdentity::canonicalName((string) $name);
+                $canonicalEmployeeMap[strtoupper($canonicalName)] = $employee;
+            }
+            $employeeMap = $canonicalEmployeeMap;
+
             $sp    = new Spreadsheet();
             $sheet = $sp->getActiveSheet();
             $sheet->setTitle('Retention Data');
@@ -149,7 +185,7 @@ class BonusFormatter
             $headers = [
                 'ID', 'Client', 'Retention Agent', 'Retention Date', 'Immediate Results',
                 'Enrolled Debt', 'Reconsideration Date', 'Retained Date', 'Dropped Date',
-                'First Payment Date', 'Cutoff', 'Payments', 'Agent', 'Commission Rate',
+                'First Payment Date', 'Cutoff', 'Payments by Cutoff', 'Agent', 'Commission Rate',
                 'Violations', 'Retention Commission', 'Agent Deduction',
             ];
 
@@ -223,17 +259,7 @@ class BonusFormatter
             $this->applyHeaderStyle($summary, 'A1:D1');
 
             // Commission earned this period, keyed on the CRM agent name.
-            $commissionByAgent = [];
-            foreach ($rows as $row) {
-                $agentName = trim((string) ($row['RETENTION_AGENT'] ?? ''));
-                if ($agentName === '') {
-                    continue;
-                }
-                $key = self::nameKey($agentName);
-                $commissionByAgent[$key]['name'] = $commissionByAgent[$key]['name'] ?? $agentName;
-                $commissionByAgent[$key]['commission'] =
-                    ($commissionByAgent[$key]['commission'] ?? 0.0) + (float) ($row['RETENTION_COMMISSION'] ?? 0);
-            }
+            $commissionByAgent = self::commissionTotals($rows);
 
             // Who gets a summary row. The roster decides when we have one; without it we keep the
             // old behaviour of listing whoever the CRM named, so a broken roster degrades to the
@@ -258,7 +284,7 @@ class BonusFormatter
             }
 
             $buildRow = static function (string $key, string $name) use ($commissionByAgent, $employeeMap): array {
-                $lookup = strtoupper($name);
+                $lookup = strtoupper(RetentionAgentIdentity::canonicalName($name));
                 return [
                     'name'       => $name,
                     'commission' => round((float) ($commissionByAgent[$key]['commission'] ?? 0.0), 2, PHP_ROUND_HALF_EVEN),

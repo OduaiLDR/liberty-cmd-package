@@ -4,7 +4,9 @@ namespace Cmd\Reports\Console\Commands;
 
 use Cmd\Reports\Services\DBConnector;
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use PDO;
 
 class SyncPhoneNumbers extends Command
 {
@@ -38,7 +40,7 @@ class SyncPhoneNumbers extends Command
                 $this->warn('[DRY RUN] SQL Server connection and all writes are disabled.');
             } else {
                 $this->info('[DEBUG] Initializing LDR SQL Server connection...');
-                $sqlServer = $this->initializeSqlServerConnector();
+                $sqlServer = $this->initializeSqlServerConnection();
                 $this->info('[DEBUG] LDR SQL Server OK.');
             }
         } catch (\Throwable $e) {
@@ -80,17 +82,8 @@ class SyncPhoneNumbers extends Command
                 return Command::SUCCESS;
             }
 
-            $deleted = $this->deleteExistingPhones($sqlServer);
-            $this->info("[INFO] Deleted {$deleted} existing rows for Source = '" . self::SOURCE . "'.");
-
-            $inserted = $this->insertPhonesFromFile($sqlServer, $stagePath, $batchSize);
-            $this->info("[INFO] Inserted {$inserted} rows into TblPhoneNumbers.");
-
-            $cleaned = $this->cleanupEmptyPhones($sqlServer);
-            if ($cleaned > 0) {
-                $this->info("[INFO] Cleanup removed {$cleaned} empty-phone rows.");
-            }
-
+            [$deleted, $inserted, $cleaned] = $this->replacePhonesFromFile($sqlServer, $stagePath, $batchSize);
+            $this->info("[INFO] Replaced {$deleted} existing phone rows with {$inserted} rows.");
             Log::info('SyncPhoneNumbers command finished.', [
                 'source' => self::SOURCE,
                 'deleted' => $deleted,
@@ -109,6 +102,24 @@ class SyncPhoneNumbers extends Command
 
         $this->info('[SUCCESS] SyncPhoneNumbers completed successfully!');
         return Command::SUCCESS;
+    }
+
+    /** @return array{int, int, int} */
+    protected function replacePhonesFromFile(PDO $connection, string $stagePath, int $batchSize): array
+    {
+        $connection->beginTransaction();
+        try {
+            $deleted = $this->deleteExistingPhones($connection);
+            $inserted = $this->insertPhonesFromFile($connection, $stagePath, $batchSize);
+            $cleaned = $this->cleanupEmptyPhones($connection);
+            $connection->commit();
+            return [$deleted, $inserted, $cleaned];
+        } catch (\Throwable $exception) {
+            if ($connection->inTransaction()) {
+                $connection->rollBack();
+            }
+            throw $exception;
+        }
     }
 
     private function stagePhonesFromSnowflake(DBConnector $snowflake): array
@@ -208,16 +219,14 @@ class SyncPhoneNumbers extends Command
         return $normalized;
     }
 
-    private function deleteExistingPhones(DBConnector $connector): int
+    private function deleteExistingPhones(PDO $connection): int
     {
         $source = $this->esc(self::SOURCE);
         $sql = "DELETE FROM TblPhoneNumbers WHERE Source = '{$source}'";
-        $result = $connector->querySqlServer($sql);
-        $this->assertSqlServerSuccess($result, 'delete existing phones');
-        return $this->extractAffected($result);
+        return $this->executeSqlServerWrite($connection, $sql, 'delete existing phones');
     }
 
-    private function insertPhonesFromFile(DBConnector $connector, string $stagePath, int $batchSize): int
+    private function insertPhonesFromFile(PDO $connection, string $stagePath, int $batchSize): int
     {
         $handle = fopen($stagePath, 'rb');
         if ($handle === false) {
@@ -237,13 +246,13 @@ class SyncPhoneNumbers extends Command
                 }
 
                 $batchNumber++;
-                $totalInserted += $this->insertPhoneBatch($connector, $batch, $batchNumber);
+                $totalInserted += $this->insertPhoneBatch($connection, $batch, $batchNumber);
                 $batch = [];
             }
 
             if ($batch !== []) {
                 $batchNumber++;
-                $totalInserted += $this->insertPhoneBatch($connector, $batch, $batchNumber);
+                $totalInserted += $this->insertPhoneBatch($connection, $batch, $batchNumber);
             }
         } finally {
             fclose($handle);
@@ -252,7 +261,7 @@ class SyncPhoneNumbers extends Command
         return $totalInserted;
     }
 
-    private function insertPhoneBatch(DBConnector $connector, array $chunk, int $batchNumber): int
+    private function insertPhoneBatch(PDO $connection, array $chunk, int $batchNumber): int
     {
         $sourceEsc = $this->esc(self::SOURCE);
         $values = [];
@@ -264,64 +273,37 @@ class SyncPhoneNumbers extends Command
         }
 
         $sql = 'INSERT INTO TblPhoneNumbers (Phone, Source, CID) VALUES ' . implode(', ', $values);
-        $result = $connector->querySqlServer($sql);
-        $this->assertSqlServerSuccess($result, 'insert phone batch ' . $batchNumber);
-        $affected = $this->extractAffected($result);
+        $affected = $this->executeSqlServerWrite($connection, $sql, 'insert phone batch ' . $batchNumber);
         $inserted = $affected > 0 ? $affected : count($chunk);
 
         $this->info(sprintf('[INFO] Batch %d: inserted %d rows.', $batchNumber, $inserted));
         return $inserted;
     }
 
-    private function cleanupEmptyPhones(DBConnector $connector): int
+    private function cleanupEmptyPhones(PDO $connection): int
     {
         $source = $this->esc(self::SOURCE);
         $sql = "DELETE FROM TblPhoneNumbers WHERE Source = '{$source}' AND Phone = ''";
-        $result = $connector->querySqlServer($sql);
-        $this->assertSqlServerSuccess($result, 'cleanup empty phones');
-        return $this->extractAffected($result);
+        return $this->executeSqlServerWrite($connection, $sql, 'cleanup empty phones');
     }
 
-    private function assertSqlServerSuccess(array $result, string $operation): void
+    private function executeSqlServerWrite(PDO $connection, string $sql, string $operation): int
     {
-        if (($result['success'] ?? true) === false) {
-            throw new \RuntimeException(sprintf(
-                'SQL Server %s failed: %s',
-                $operation,
-                $result['error'] ?? 'unknown database error'
-            ));
+        $affected = $connection->exec($sql);
+        if ($affected === false) {
+            throw new \RuntimeException("SQL Server {$operation} failed.");
         }
+        return $affected;
     }
 
-    private function extractAffected($result): int
+    protected function initializeSqlServerConnection(): PDO
     {
-        if (!is_array($result)) {
-            return 0;
+        // SMS eligibility reads sqlsrv; suppression writes must use that same connection.
+        $connection = DB::connection('sqlsrv');
+        if ($connection->getDriverName() !== 'sqlsrv') {
+            throw new \RuntimeException('The SMS suppression target must be the sqlsrv connection.');
         }
-        foreach (['rowCount', 'affected_rows', 'row_count'] as $key) {
-            if (isset($result[$key]) && is_numeric($result[$key])) {
-                return (int) $result[$key];
-            }
-        }
-        return 0;
-    }
-
-    protected function initializeSqlServerConnector(): DBConnector
-    {
-        $candidates = ['ldr', 'plaw', 'production', 'sandbox'];
-        $errors = [];
-
-        foreach ($candidates as $env) {
-            try {
-                $connector = DBConnector::fromEnvironment($env);
-                $connector->initializeSqlServer();
-                return $connector;
-            } catch (\Throwable $e) {
-                $errors[] = "{$env}: {$e->getMessage()}";
-            }
-        }
-
-        throw new \RuntimeException('Unable to initialize SQL Server connector. Tried: ' . implode('; ', $errors));
+        return $connection->getPdo();
     }
 
     protected function esc(string $value): string

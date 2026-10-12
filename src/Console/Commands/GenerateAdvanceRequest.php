@@ -12,6 +12,7 @@ class GenerateAdvanceRequest extends Command
 {
     protected $signature = 'Generate:advance-request
                             {--month= : Reporting month as YYYY-MM (defaults to previous calendar month)}
+                            {--company=all : Send LDR, PLAW, or all; allocation always includes both companies}
                             {--dry-run : Calculate and display results without sending email}
                             {--send-to-me : Send only to oduai@libertydebtrelief.com instead of TblReports recipients}';
 
@@ -24,6 +25,11 @@ class GenerateAdvanceRequest extends Command
 
     public function handle(): int
     {
+        $company = strtoupper(trim((string) $this->option('company')));
+        if (!in_array($company, ['ALL', 'LDR', 'PLAW'], true)) {
+            $this->error('--company must be LDR, PLAW, or all.');
+            return Command::FAILURE;
+        }
         $window = $this->resolveMonthWindow();
         $this->info("[INFO] Advance request period: {$window['label']} ({$window['start']} through {$window['end_exclusive']})");
 
@@ -94,7 +100,6 @@ class GenerateAdvanceRequest extends Command
         $this->info(sprintf('[INFO] Allocation: LDR $%0.2f | Progress Law $%0.2f | Tranche %s',
             $allocation['ldr'], $allocation['progress_law'], $tranche));
 
-        $email = new EmailSenderService();
         $invoiceBuilder = new AdvanceRequestInvoiceBuilder();
         $monthLabel = $window['label'];
         $sent = true;
@@ -106,7 +111,7 @@ class GenerateAdvanceRequest extends Command
                 'amount' => $allocation['ldr'],
                 'report' => 'AdvanceRequest',
                 'company' => 'LDR',
-                'sender' => self::LDR_SENDER,
+                'sender' => (string) env('ADVANCE_REQUEST_LDR_FROM', self::LDR_SENDER),
             ],
             [
                 'name' => 'Progress Law',
@@ -114,9 +119,12 @@ class GenerateAdvanceRequest extends Command
                 'amount' => $allocation['progress_law'],
                 'report' => 'AdvanceRequest',
                 'company' => 'PLAW',
-                'sender' => self::PROGRESS_LAW_SENDER,
+                'sender' => (string) env('ADVANCE_REQUEST_PLAW_FROM', self::PROGRESS_LAW_SENDER),
             ],
         ] as $request) {
+            if ($company !== 'ALL' && $request['company'] !== $company) {
+                continue;
+            }
             $subject = $request['subject'];
             $body = $this->buildEmailBody($request['name'], $request['amount'], $tranche, $monthLabel);
             $invoice = $this->buildInvoiceData($request['name'], $request['amount'], $tranche, $window);
@@ -137,6 +145,7 @@ class GenerateAdvanceRequest extends Command
                 continue;
             }
 
+            $email = new EmailSenderService($this->credentialPrefix($request['company']));
             if ($sendToMe) {
                 $wasSent = $email->sendMailHtml(
                     $subject,
@@ -181,11 +190,12 @@ class GenerateAdvanceRequest extends Command
 
     private function resolveVerificationSender(array $request): string
     {
-        // Graph rejected the Progress Law mailbox as an invalid user. Use the verified
-        // LDR sender only for the restricted verification path; production is unchanged.
-        return ($request['company'] ?? '') === 'PLAW'
-            ? self::LDR_SENDER
-            : (string) $request['sender'];
+        return (string) $request['sender'];
+    }
+
+    private function credentialPrefix(string $company): string
+    {
+        return $company === 'PLAW' ? 'PLAW_MS' : 'MS';
     }
 
     private function resolveMonthWindow(): array

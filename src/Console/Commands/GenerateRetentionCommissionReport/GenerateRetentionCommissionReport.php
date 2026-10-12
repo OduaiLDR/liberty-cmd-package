@@ -11,6 +11,8 @@ use Cmd\Reports\Services\CommissionResultsWriter;
 use Cmd\Reports\Services\CommissionRosterProvider;
 use Cmd\Reports\Services\EmailSenderService;
 use Cmd\Reports\Services\RetentionCommissionTierStore;
+use Cmd\Reports\Services\RetentionAgentIdentity;
+use Cmd\Reports\Services\RetentionCommissionReportBuilder;
 use Cmd\Reports\Services\UnassignedCommissionAgents;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
@@ -43,6 +45,7 @@ class GenerateRetentionCommissionReport extends Command
                             {source=both : ldr | plaw | both}
                             {period? : Period start date YYYY-MM-01; defaults to first day of last month}
                             {--no-email : Build/save snapshot but do not send email}
+                            {--no-azure-write : Preview calculation without replacing Azure results, saving a snapshot, or sending email}
                             {--test-recipient= : Send EVERY email (All + agent copies) only to this address}';
 
     protected $description = 'Generate Retention Commission Report (sends to oduai only for testing).';
@@ -97,22 +100,25 @@ class GenerateRetentionCommissionReport extends Command
 
         $arg     = strtolower((string) $this->argument('source'));
         $sources = ($arg === 'both') ? ['ldr', 'plaw'] : [$arg];
+        $failed = false;
 
         foreach ($sources as $src) {
             if (!isset(self::SOURCE_CONFIG[$src])) {
                 $this->error("Unknown source: $src. Use ldr, plaw, or both.");
                 return Command::FAILURE;
             }
-            $this->runForSource($src);
+            if (!$this->runForSource($src)) {
+                $failed = true;
+            }
         }
 
-        return Command::SUCCESS;
+        return $failed ? Command::FAILURE : Command::SUCCESS;
     }
 
     /** Per-agent commission summary from the most recent buildWorkbook(), for the Azure results write. */
     private array $lastSummaryRows = [];
 
-    private function runForSource(string $source): void
+    protected function runForSource(string $source): bool
     {
         // Reset per source: handle() runs LDR then PLAW on the SAME instance, so a stale value
         // here would persist one source's commission under the other source's key.
@@ -132,31 +138,18 @@ class GenerateRetentionCommissionReport extends Command
             $sql = $this->initSqlServer($source);
         } catch (\Throwable $e) {
             $this->error("[$display] Connector init failed: " . $e->getMessage());
-            return;
+            return false;
         }
 
         try {
-            // ── STEP 1: base rows (no date filter — VBA doesn't filter by date on initial query)
-            $rows = $this->fetchBase($sf, $cfg);
+            // ── STEP 1: only load contacts touched in the rolling three-month
+            // window. Their full history is still loaded in the later steps so a
+            // payment this month is not lost just because retention occurred earlier.
+            $rows = $this->fetchBase($sf, $cfg, $startDate);
 
-            // Normalize known misspellings so Summary matches the configured agent list.
-            foreach ($rows as &$row) {
-                $agent = strtoupper((string) $this->col($row, 'RETENTION_AGENT', ''));
-                if ($agent === 'ANDREA MENDOZE') {
-                    $row['RETENTION_AGENT'] = 'ANDREA MENDOZA';
-                } elseif ($agent === 'ANDREA GALVES') {
-                    // VBA list typo "Galves"; CRM / Summary use Galvez.
-                    $row['RETENTION_AGENT'] = 'ANDREA GALVEZ';
-                }
-            }
-            unset($row);
+            $rows = $this->normalizeRetentionAgentAliases($rows);
 
             $this->info("[INFO] [$display] Base rows: " . count($rows));
-
-            if (empty($rows)) {
-                $this->warn("[$display] No rows found.");
-                return;
-            }
 
             $ids    = array_filter(array_map(fn ($r) => (int) $this->col($r, 'ID', 0), $rows));
             $idList = empty($ids) ? '0' : implode(',', $ids);
@@ -293,14 +286,24 @@ class GenerateRetentionCommissionReport extends Command
             );
 
             // Payroll policy: a retained account is paid at the tier earned in
-            // its retained month, even when the payment clears in a later month.
+            // the month its Enrolled status resumes after reconsideration,
+            // even when payment clears in a later month. This is RETENTION_DATE,
+            // the Retention Date field in column D, confirmed by Jacob on 2026-10-12.
             // Keep an explicit environment override for rollback, but make the
             // correct business rule the safe default for scheduled runs too.
             $useRetainedMonthTier = filter_var(env('RETENTION_TIER_BY_RETAINED_MONTH', true), FILTER_VALIDATE_BOOLEAN);
-            $tierSnapshotMap = RetentionCommissionTierStore::fetchMap(
+            $payableRows = array_filter($rows, fn (array $row): bool => $this->inExcelPeriod(
+                $this->col($row, 'RETENTION_PAYMENT_DATE'), $startDate, $endDate, true
+            ));
+            $tierSnapshotMap = $this->loadTierSnapshotMap(
+                $sf,
                 $sql,
+                $cfg,
                 $source,
-                $this->retentionPeriodStarts($rows)
+                $payableRows,
+                $startDate,
+                $locationMap,
+                $useRetainedMonthTier
             );
 
             // ── STEP 7: build workbook with both sheets
@@ -318,6 +321,9 @@ class GenerateRetentionCommissionReport extends Command
                 $rosterAgents,
                 $source
             );
+            if ($file === null) {
+                throw new \RuntimeException('Retention workbook generation failed; commission results were not changed.');
+            }
 
             // Anyone with commission this period who is not on the roster. lastSummaryRows is set
             // inside buildWorkbook and covers every agent found in the data, so it can price the
@@ -336,16 +342,20 @@ class GenerateRetentionCommissionReport extends Command
                 );
             }
 
-            // Persist the computed per-agent retention commission to Azure for the Commission Review
-            // app (best-effort; never blocks the report). $lastSummaryRows is set inside buildWorkbook.
-            // Reset Commission first (same pattern as bonus) so agents who drop off this run
-            // do not keep a stale amount that makes Commission Review / Payroll disagree with the XLSX.
+            if ($this->option('no-azure-write')) {
+                $this->info("[PREVIEW] [$display] Calculated " . count($this->lastSummaryRows) . ' agent summaries; Azure results and tier history were not changed. No snapshot or email was sent.');
+                $this->cleanupGeneratedWorkbook($file);
+                return true;
+            }
+
+            // Replace this computed component atomically. History/calculation/workbook failures
+            // must occur before persistence, and a failed write must prevent report delivery.
+            // The sibling lookback component is preserved by replaceComponent.
             $retResults = [];
             foreach ($this->lastSummaryRows as $agentName => $sum) {
                 $retResults[] = ['agent' => (string) $agentName, 'amount' => $sum['commission'] ?? 0];
             }
-            CommissionResultsWriter::resetColumn($sql, 'retention', $source, $startDate, 'Commission');
-            $persisted = CommissionResultsWriter::persist($sql, 'retention', $source, $startDate, 'Commission', $retResults);
+            $persisted = CommissionResultsWriter::replaceComponent($sql, 'retention', $source, $startDate, 'Commission', $retResults);
             if ($notice = CommissionResultsWriter::failureNotice($persisted, $display)) {
                 $this->warn($notice);
             }
@@ -385,32 +395,38 @@ class GenerateRetentionCommissionReport extends Command
                     $this->sendReport($files, $display, $unassigned, $rosterAgents === null);
                 }
                 foreach ($files as $f) {
-                    if (file_exists($f['path'])) {
-                        @unlink($f['path']);
-                    }
+                    $this->cleanupGeneratedWorkbook($f);
                 }
             } else {
                 $this->error("[$display] Workbook generation failed.");
             }
+            return true;
 
         } catch (\Throwable $e) {
+            if (isset($file) && is_array($file)) {
+                $this->cleanupGeneratedWorkbook($file);
+            }
             $this->error("[$display] Failed: " . $e->getMessage());
             Log::error("GenerateRetentionCommissionReportCommand[$display] failed", [
                 'exception' => $e->getMessage(),
                 'trace'     => $e->getTraceAsString(),
             ]);
+            return false;
         }
     }
 
     // ─── Data fetchers ────────────────────────────────────────────────────────
 
     /** @param array<string,mixed> $cfg */
-    private function fetchBase(DBConnector $sf, array $cfg): array
+    private function fetchBase(DBConnector $sf, array $cfg, string $startDate, bool $allowEmpty = false): array
     {
         $ca = (int) $cfg['custom_agent'];
         $cd = (int) $cfg['custom_date'];
         $cr = (int) $cfg['custom_results'];
         $cc = (int) $cfg['cancel_request_custom'];
+
+        $windowStart = date('Y-m-01', strtotime($startDate . ' -2 months'));
+        $windowEnd = date('Y-m-d', strtotime($startDate . ' +1 month'));
 
 
         $excludedAgents = $cfg['excluded_agents'] ?? [];
@@ -424,6 +440,49 @@ class GenerateRetentionCommissionReport extends Command
         }
 
         $sql = "
+            WITH relevant_contacts AS (
+                SELECT CONTACT_ID
+                FROM CONTACTS_USERFIELDS
+                WHERE CUSTOM_ID = $cc AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
+                  AND F_DATETIME >= '$windowStart'::TIMESTAMP_NTZ
+                  AND F_DATETIME < '$windowEnd'::TIMESTAMP_NTZ
+                UNION
+                SELECT CONTACT_ID
+                FROM CONTACTS_USERFIELDS
+                WHERE CUSTOM_ID = $cd AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
+                  AND F_DATE >= '$windowStart'::DATE
+                  AND F_DATE < '$windowEnd'::DATE
+                UNION
+                SELECT CONTACT_ID
+                FROM TRANSACTIONS
+                WHERE TRANS_TYPE = 'D' AND RETURNED_DATE IS NULL
+                  AND CLEARED_DATE >= '$windowStart'::DATE
+                  AND CLEARED_DATE < '$windowEnd'::DATE
+            ),
+            agent_fields AS (
+                SELECT DISTINCT uf.CONTACT_ID, uf.F_STRING
+                FROM CONTACTS_USERFIELDS uf
+                JOIN relevant_contacts relevant ON relevant.CONTACT_ID = uf.CONTACT_ID
+                WHERE uf.CUSTOM_ID = $ca AND (uf._FIVETRAN_DELETED = FALSE OR uf._FIVETRAN_DELETED IS NULL)
+            ),
+            retention_fields AS (
+                SELECT DISTINCT uf.CONTACT_ID, uf.F_DATE
+                FROM CONTACTS_USERFIELDS uf
+                JOIN relevant_contacts relevant ON relevant.CONTACT_ID = uf.CONTACT_ID
+                WHERE uf.CUSTOM_ID = $cd AND (uf._FIVETRAN_DELETED = FALSE OR uf._FIVETRAN_DELETED IS NULL)
+            ),
+            result_fields AS (
+                SELECT DISTINCT uf.CONTACT_ID, uf.F_STRING
+                FROM CONTACTS_USERFIELDS uf
+                JOIN relevant_contacts relevant ON relevant.CONTACT_ID = uf.CONTACT_ID
+                WHERE uf.CUSTOM_ID = $cr AND (uf._FIVETRAN_DELETED = FALSE OR uf._FIVETRAN_DELETED IS NULL)
+            ),
+            cancel_fields AS (
+                SELECT DISTINCT uf.CONTACT_ID, uf.F_DATETIME
+                FROM CONTACTS_USERFIELDS uf
+                JOIN relevant_contacts relevant ON relevant.CONTACT_ID = uf.CONTACT_ID
+                WHERE uf.CUSTOM_ID = $cc AND (uf._FIVETRAN_DELETED = FALSE OR uf._FIVETRAN_DELETED IS NULL)
+            )
             SELECT
                 c.ID,
                 CONCAT(c.FIRSTNAME,' ',c.LASTNAME)                     AS CLIENT,
@@ -432,25 +491,20 @@ class GenerateRetentionCommissionReport extends Command
                 cu3.F_STRING                                           AS IMMEDIATE_RESULTS,
                 d.ENROLLED_DEBT,
                 LEFT(c.DROPPED_DATE, 10)                               AS DROPPED_DATE,
-                -- Keep full datetime like VBA (Excel COUNTIFS vs DateSerial end = midnight).
+                -- Keep the full timestamp so the report can include the complete final day.
                 TO_VARCHAR(cu4.F_DATETIME)                             AS CANCEL_REQUEST_DATE
-            FROM CONTACTS c
-            LEFT JOIN CONTACTS_USERFIELDS cu1
-                   ON cu1.CONTACT_ID = c.ID AND cu1.CUSTOM_ID = $ca
+            FROM relevant_contacts rc
+            JOIN CONTACTS c ON c.ID = rc.CONTACT_ID
+            LEFT JOIN agent_fields cu1 ON cu1.CONTACT_ID = c.ID
+            LEFT JOIN retention_fields cu2 ON cu2.CONTACT_ID = c.ID
+            LEFT JOIN result_fields cu3 ON cu3.CONTACT_ID = c.ID
+            LEFT JOIN cancel_fields cu4 ON cu4.CONTACT_ID = c.ID
             LEFT JOIN (
-                SELECT CONTACT_ID, F_DATE
-                FROM CONTACTS_USERFIELDS
-                WHERE CUSTOM_ID = $cd
-            ) cu2 ON c.ID = cu2.CONTACT_ID
-            LEFT JOIN CONTACTS_USERFIELDS cu3
-                   ON cu3.CONTACT_ID = c.ID AND cu3.CUSTOM_ID = $cr
-            LEFT JOIN CONTACTS_USERFIELDS cu4
-                   ON cu4.CONTACT_ID = c.ID AND cu4.CUSTOM_ID = $cc
-            LEFT JOIN (
-                SELECT CONTACT_ID, SUM(ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT
-                FROM DEBTS
-                WHERE ENROLLED=1 AND _FIVETRAN_DELETED=FALSE
-                GROUP BY CONTACT_ID
+                SELECT debt.CONTACT_ID, SUM(debt.ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT
+                FROM DEBTS debt
+                JOIN relevant_contacts eligible ON eligible.CONTACT_ID = debt.CONTACT_ID
+                WHERE debt.ENROLLED=1 AND (debt._FIVETRAN_DELETED = FALSE OR debt._FIVETRAN_DELETED IS NULL)
+                GROUP BY debt.CONTACT_ID
             ) d ON c.ID = d.CONTACT_ID
             WHERE cu1.CONTACT_ID IS NOT NULL
               AND cu3.CONTACT_ID IS NOT NULL
@@ -459,7 +513,15 @@ class GenerateRetentionCommissionReport extends Command
             ORDER BY cu1.F_STRING ASC
         ";
 
-        return $sf->query($sql)['data'] ?? [];
+        $rows = $this->sourceRows($sf, $sql);
+        if ($rows === [] && !$allowEmpty) {
+            // A source-wide empty response cannot prove the current roster is
+            // genuinely owed zero. In particular, the roster provider conflates
+            // missing/unreachable data and would fall back to a static agent list.
+            // Preserve prior results, but never report this as a refreshed run.
+            throw new \RuntimeException('Retention source returned no base rows. Run is incomplete; prior commission results were preserved and no fresh report will be sent. Verify the source and roster before retrying.');
+        }
+        return (new RetentionCommissionReportBuilder)->dedupeRetentionRowsByContactId($rows);
     }
 
     private function fetchReconsiderationDates(DBConnector $sf, int $statusId, string $idList): array
@@ -472,7 +534,7 @@ class GenerateRetentionCommissionReport extends Command
             ORDER BY cs.CONTACT_ID ASC, cs.STAMP ASC
         ";
         $map = [];
-        foreach ($sf->query($sql)['data'] ?? [] as $r) {
+        foreach ($this->sourceRows($sf, $sql) as $r) {
             $id = (string) $r['CONTACT_ID'];
             if (!isset($map[$id])) {
                 $map[$id] = $r['RECON_DATE'];
@@ -498,10 +560,21 @@ class GenerateRetentionCommissionReport extends Command
             ORDER BY CONTACT_ID ASC, CLEARED_DATE ASC
         ";
         $map = [];
-        foreach ($sf->query($sql)['data'] ?? [] as $r) {
+        foreach ($this->sourceRows($sf, $sql) as $r) {
             $map[(string) $r['CONTACT_ID']][] = (string) $r['CLEARED_DATE'];
         }
         return $map;
+    }
+
+    private function sourceRows(DBConnector $source, string $query): array
+    {
+        $result = $source->query($query);
+        // Snowflake DBConnector::formatResult returns data/rowCount/columns,
+        // without a success flag. Some test/adaptor paths provide one explicitly.
+        if (($result['success'] ?? null) === false || !is_array($result['data'] ?? null)) {
+            throw new \RuntimeException('Retention source query failed: ' . ($result['error'] ?? 'invalid source response'));
+        }
+        return $result['data'];
     }
 
     // ─── Workbook builder ─────────────────────────────────────────────────────
@@ -569,7 +642,7 @@ class GenerateRetentionCommissionReport extends Command
                 $sheet1->setCellValue("G$r", (int)   $this->col($row, 'CLEARED_PAYMENTS', 0));
                 $this->setDate($sheet1, "H$r", $this->col($row, 'RECONSIDERATION_DATE'));
                 $this->setDate($sheet1, "I$r", $this->col($row, 'DROPPED_DATE'));
-                // Keep full datetime like VBA (Excel COUNTIFS vs DateSerial end = midnight).
+                // Preserve the payment timestamp for the full-month boundary check.
                 $this->setDateTime($sheet1, "J$r", $this->col($row, 'RETENTION_PAYMENT_DATE'));
                 $sheet1->setCellValue("K$r", $row['T1'] ?? '');
                 $sheet1->setCellValue("L$r", $row['T2'] ?? '');
@@ -741,14 +814,35 @@ class GenerateRetentionCommissionReport extends Command
 
             $suffix   = $agentFilter !== null ? $this->safeFilenamePart($agentFilter) : 'All';
             $filename = "Retention Commission ({$display}) - {$suffix}.xlsx";
-            $path     = storage_path("app/{$filename}");
+            // Keep the attachment name stable while isolating concurrent source/month runs.
+            $runDirectory = storage_path('app/retention-report-runs/' . bin2hex(random_bytes(12)));
+            if (!mkdir($runDirectory, 0700, true) && !is_dir($runDirectory)) {
+                throw new \RuntimeException('Could not create isolated retention report directory.');
+            }
+            $path = $runDirectory . DIRECTORY_SEPARATOR . $filename;
             (new Xlsx($sp))->save($path);
 
             return ['filename' => $filename, 'path' => $path];
 
         } catch (\Throwable $e) {
             Log::error('GenerateRetentionCommissionReportCommand::buildWorkbook failed', ['err' => $e->getMessage()]);
-            return null;
+            throw new \RuntimeException('Retention workbook generation failed: ' . $e->getMessage(), 0, $e);
+        }
+    }
+
+    /** Remove only this run's workbook and its private directory. */
+    private function cleanupGeneratedWorkbook(array $file): void
+    {
+        $path = (string) ($file['path'] ?? '');
+        if ($path === '') {
+            return;
+        }
+        if (is_file($path)) {
+            @unlink($path);
+        }
+        $directory = dirname($path);
+        if (basename(dirname($directory)) === 'retention-report-runs') {
+            @rmdir($directory);
         }
     }
 
@@ -785,7 +879,7 @@ class GenerateRetentionCommissionReport extends Command
         $missingWarned = [];
 
         foreach ($agents as $agentName) {
-            $agentUpper = strtoupper($agentName);
+            $agentUpper = RetentionCommissionTierStore::agentKey($agentName);
 
             $assigned   = 0;
             $retained   = 0;
@@ -793,7 +887,7 @@ class GenerateRetentionCommissionReport extends Command
             $commissionNew = 0.0;
 
             foreach ($rows as $row) {
-                $rowAgent = strtoupper((string) $this->col($row, 'RETENTION_AGENT', ''));
+                $rowAgent = RetentionCommissionTierStore::agentKey((string) $this->col($row, 'RETENTION_AGENT', ''));
                 if ($rowAgent !== $agentUpper) {
                     continue;
                 }
@@ -803,7 +897,7 @@ class GenerateRetentionCommissionReport extends Command
                     $assigned++;
                 }
 
-                // Retained: retention date (date-only in Excel) inclusive through endDate.
+                // Worksheet's Retention Date field (date-only in Excel), inclusive through endDate.
                 if ($this->inExcelPeriod($this->col($row, 'RETENTION_DATE'), $startDate, $endDate, false)) {
                     $retained++;
                 }
@@ -813,7 +907,7 @@ class GenerateRetentionCommissionReport extends Command
             $tier = $this->resolveTier($pct, $retained, $hasT4);
 
             foreach ($rows as $row) {
-                $rowAgent = strtoupper((string) $this->col($row, 'RETENTION_AGENT', ''));
+                $rowAgent = RetentionCommissionTierStore::agentKey((string) $this->col($row, 'RETENTION_AGENT', ''));
                 if ($rowAgent !== $agentUpper) {
                     continue;
                 }
@@ -823,6 +917,8 @@ class GenerateRetentionCommissionReport extends Command
 
                 $commissionOld += $this->amountForTier($row, $tier);
 
+                // Tier snapshot month comes from the actual Enrolled status event,
+                // not the optional/custom worksheet Retention Date.
                 $retainedPeriod = RetentionCommissionTierStore::periodStartFromDate(
                     (string) ($this->col($row, 'RETENTION_DATE') ?? '')
                 );
@@ -833,17 +929,20 @@ class GenerateRetentionCommissionReport extends Command
                         $snapshotTier = $tierSnapshotMap[$key];
                     } elseif (
                         $retainedPeriod !== $startDate
-                        && ($useRetainedMonthTier || $logShadowCompare)
+                        && $logShadowCompare && !$useRetainedMonthTier
                         && !isset($missingWarned[$key])
                     ) {
                         $missingWarned[$key] = true;
-                        Log::warning('RetentionCommissionTierStore: missing tier snapshot; using current-month tier', [
+                        Log::warning('RetentionCommissionTierStore: shadow comparison lacks historical tier; policy is explicitly disabled', [
                             'agent' => $agentName,
                             'retained_period' => $retainedPeriod,
                         ]);
                     }
                 }
-                $payTier = RetentionCommissionTierStore::resolveTierForPayment($tier, $snapshotTier);
+                $payTier = $useRetainedMonthTier
+                    ? RetentionCommissionTierStore::retainedMonthTierForPayment($tier, $tierSnapshotMap, $agentName,
+                        (string) ($this->col($row, 'RETENTION_DATE') ?? ''), $startDate)
+                    : RetentionCommissionTierStore::resolveTierForPayment($tier, $snapshotTier);
                 $commissionNew += $this->amountForTier($row, $payTier);
             }
 
@@ -901,7 +1000,114 @@ class GenerateRetentionCommissionReport extends Command
     }
 
     /**
-     * @param  array<int,array<string,mixed>> $rows
+     * Use stored tier snapshots where available. For legacy months without a
+     * saved snapshot, recalculate that month's tier from the same period-scoped
+     * CRM source rows instead of substituting the payment month's tier.
+     *
+     * @param array<string,mixed> $cfg
+     * @param array<int,array<string,mixed>> $payableRows
+     * @param array<string,array{location:string,company:string}> $locationMap
+     * @return array<string,int>
+     */
+    private function loadTierSnapshotMap(
+        DBConnector $sf,
+        DBConnector $sql,
+        array $cfg,
+        string $source,
+        array $payableRows,
+        string $paymentPeriod,
+        array $locationMap,
+        bool $enabled
+    ): array {
+        if (!$enabled) {
+            return [];
+        }
+
+        $required = [];
+        foreach ($payableRows as $row) {
+            $retainedDate = $this->toDate($this->col($row, 'RETENTION_DATE'));
+            $period = RetentionCommissionTierStore::periodStartFromDate($retainedDate);
+            $agent = trim((string) $this->col($row, 'RETENTION_AGENT', ''));
+            if ($period === null || $period >= $paymentPeriod || $agent === '') {
+                continue;
+            }
+            $key = RetentionCommissionTierStore::tierMapKey($period, $agent);
+            $required[$period][$key] = $agent;
+        }
+
+        $periods = array_keys($required);
+        $tierMap = RetentionCommissionTierStore::fetchMap($sql, $source, $periods, true);
+        foreach ($required as $period => $agents) {
+            $missing = array_filter($agents, static function (string $agent) use ($tierMap, $period): bool {
+                return !array_key_exists(RetentionCommissionTierStore::tierMapKey($period, $agent), $tierMap);
+            });
+            if ($missing === []) {
+                continue;
+            }
+
+            // The source query is constrained to this historical report month
+            // (plus its two-month candidate lookback). Empty is a legitimate
+            // zero-activity month; source errors still throw in sourceRows().
+            $historyRows = $this->normalizeRetentionAgentAliases(
+                $this->fetchBase($sf, $cfg, $period, true)
+            );
+            $historyAgents = [];
+            foreach ($historyRows as $row) {
+                $agent = trim((string) $this->col($row, 'RETENTION_AGENT', ''));
+                if ($agent !== '') {
+                    $historyAgents[RetentionCommissionTierStore::agentKey($agent)] = $agent;
+                }
+            }
+            foreach ($missing as $agent) {
+                $historyAgents[RetentionCommissionTierStore::agentKey($agent)] = $agent;
+            }
+
+            $monthEnd = date('Y-m-t', strtotime($period));
+            $summary = $this->buildSummary(
+                $historyRows,
+                array_values($historyAgents),
+                $period,
+                $monthEnd,
+                $locationMap,
+                (bool) ($cfg['has_t4'] ?? false),
+                [],
+                false,
+                false
+            );
+            $summaryByKey = [];
+            foreach ($summary as $agent => $totals) {
+                $summaryByKey[RetentionCommissionTierStore::agentKey($agent)] = $totals;
+            }
+
+            foreach ($missing as $agent) {
+                $agentKey = RetentionCommissionTierStore::agentKey($agent);
+                if (!isset($summaryByKey[$agentKey]) || !isset($summaryByKey[$agentKey]['tier'])) {
+                    throw new \RuntimeException("Could not rebuild missing retained-month tier for {$agent} ({$period}).");
+                }
+                $key = RetentionCommissionTierStore::tierMapKey($period, $agent);
+                $tierMap[$key] = (int) $summaryByKey[$agentKey]['tier'];
+                if (function_exists('app') && app()->bound('log')) {
+                    Log::warning("[$source] Recalculated missing {$period} retained-month tier for {$agent} from period source data.");
+                }
+            }
+        }
+
+        return $tierMap;
+    }
+
+    /**
+     * Normalize known CRM misspellings used by the retention report.
+     *
+     * @param array<int,array<string,mixed>> $rows
+     * @return array<int,array<string,mixed>>
+     */
+    private function normalizeRetentionAgentAliases(array $rows): array
+    {
+        return RetentionAgentIdentity::canonicalizeRows($rows);
+    }
+
+    /**
+     * @param array<int,array<string,mixed>> $rows
      * @return list<string>
      */
     private function retentionPeriodStarts(array $rows): array
@@ -1117,10 +1323,8 @@ class GenerateRetentionCommissionReport extends Command
     }
 
     /**
-     * VBA Excel COUNTIFS vs DateSerial(start)/DateSerial(end).
-     * DateTime fields (cancel / payment): include only timestamps from start 00:00:00 through end 00:00:00.
-     * That matches Excel's end bound at midnight, so most last-day times are excluded.
-     * Date-only fields (retention date): full calendar day inclusive through endDate.
+     * Include the full reporting month. The old VBA-style inclusive midnight
+     * bound silently dropped most activity on the final calendar day.
      */
     private function inExcelPeriod(mixed $value, string $startDate, string $endDate, bool $dateTimeField): bool
     {
@@ -1129,7 +1333,7 @@ class GenerateRetentionCommissionReport extends Command
         }
 
         $startTs = strtotime($startDate . ' 00:00:00');
-        $endTs   = strtotime($endDate . ' 00:00:00');
+        $endTs   = strtotime($endDate . ' +1 day 00:00:00');
         if ($startTs === false || $endTs === false) {
             return false;
         }
@@ -1137,12 +1341,12 @@ class GenerateRetentionCommissionReport extends Command
         if ($dateTimeField) {
             $ts = $value instanceof \DateTimeInterface
                 ? $value->getTimestamp()
-                : strtotime((string) $value);
+                : (is_numeric($value) ? (int) $value : strtotime((string) $value));
             if ($ts === false) {
                 return false;
             }
 
-            return $ts >= $startTs && $ts <= $endTs;
+            return $ts >= $startTs && $ts < $endTs;
         }
 
         $d = $this->toDate($value);
@@ -1210,7 +1414,7 @@ class GenerateRetentionCommissionReport extends Command
         }
         $ts = $val instanceof \DateTimeInterface
             ? $val->getTimestamp()
-            : strtotime((string) $val);
+            : (is_numeric($val) ? (int) $val : strtotime((string) $val));
         if ($ts === false) {
             return;
         }

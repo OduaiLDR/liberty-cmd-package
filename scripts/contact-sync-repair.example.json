@@ -1,0 +1,23 @@
+{
+    "version": 1,
+    "reviewed_by": "Synthetic fixture reviewer",
+    "expected_rows": 1,
+    "rows": [
+        {
+            "table": "TblContacts",
+            "pk": "1",
+            "before": {
+                "LLG_ID": "101",
+                "External_ID": "201",
+                "Client": "Alex Example",
+                "Email": "alex@example.invalid",
+                "Phone": null,
+                "Agent": null
+            },
+            "changes": {
+                "Agent": "Casey Example"
+            },
+            "evidence": "Synthetic LT contact 201: exact identity and current assignment reviewed."
+        }
+    ]
+}

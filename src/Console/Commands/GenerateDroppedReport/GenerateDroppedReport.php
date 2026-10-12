@@ -104,7 +104,7 @@ class GenerateDroppedReport extends Command
                 SELECT CONTACT_ID, SUM(ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT
                 FROM DEBTS
                 WHERE ENROLLED = 1
-                  AND _FIVETRAN_DELETED = FALSE
+                  AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
                 GROUP BY CONTACT_ID
             ) AS d ON c.ID = d.CONTACT_ID
             LEFT JOIN CANCELLATION_REASONS AS cr ON c.DROPPED_REASON = cr.ID

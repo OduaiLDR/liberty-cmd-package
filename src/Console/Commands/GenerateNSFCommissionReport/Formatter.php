@@ -3,6 +3,7 @@
 namespace Cmd\Reports\Console\Commands\GenerateNSFCommissionReport;
 
 use Cmd\Reports\Services\CommissionCompanyMatch;
+use Cmd\Reports\Services\NsfReportReadiness;
 use PhpOffice\PhpSpreadsheet\Cell\DataType;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Style\Alignment;
@@ -13,6 +14,10 @@ use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 
 class Formatter
 {
+    /** Custom document properties carrying the run evidence; read back by the manager report. */
+    public const PROPERTY_RUN_ID = 'NSF Run ID';
+    public const PROPERTY_RUN_STATUS = 'NSF Run Status';
+
     private const HEADER_FILL  = 'FF17853B';
     private const HEADER_FONT  = 'FFFFFFFF';
     private const TIER_FILL    = 'FFC5C5C5';
@@ -32,7 +37,8 @@ class Formatter
         string $endDate,
         ?string $agentFilter = null,
         string $sourceCode = '',
-        array $unassigned = []
+        array $unassigned = [],
+        ?array $readiness = null
     ): array {
         $spreadsheet = new Spreadsheet();
 
@@ -47,6 +53,21 @@ class Formatter
         $commSheet->setShowGridlines(false);
         $this->buildCommissionSheet($commSheet, $commissionRows, $sourceCode, $unassigned);
 
+        // Jacob, 2026-10-05: "NSF has a Run Status sheet you can remove." The run evidence it carried
+        // moves to the workbook's custom document properties: invisible to readers, and still how
+        // GenerateRetentionManagerCommission ties Anthony's report to this exact NSF run. Whether a run
+        // is provisional (before the payment cutoff) is now stated in the email body instead.
+        $timing = $readiness ?? NsfReportReadiness::timing($startDate);
+        $properties = $spreadsheet->getProperties();
+        foreach ([
+            self::PROPERTY_RUN_ID => (string) ($timing['runId'] ?? 'unavailable'),
+            self::PROPERTY_RUN_STATUS => $timing['isProvisional'] ? 'PROVISIONAL' : 'FINAL',
+            'NSF Payment Cutoff (Pacific)' => (string) $timing['cutoffPacific'],
+            'NSF Run Started (UTC)' => (string) $timing['startedAt'],
+            'NSF Final Runs After (UTC)' => (string) $timing['finalAfter'],
+        ] as $name => $value) {
+            $properties->setCustomProperty($name, $value);
+        }
         $spreadsheet->setActiveSheetIndex(0);
 
         $period   = date('m-Y', strtotime($startDate));

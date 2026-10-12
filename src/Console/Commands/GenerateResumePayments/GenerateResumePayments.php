@@ -1340,7 +1340,7 @@ final class GenerateResumePayments extends Command
                 FROM CONTACTS_STATUS s
                 LEFT JOIN CONTACTS_LEAD_STATUS cls ON s.STATUS_ID = cls.ID
                 WHERE s.CONTACT_ID IN ({$cidList})
-                  AND s._FIVETRAN_DELETED = FALSE
+                  AND (s._FIVETRAN_DELETED = FALSE OR s._FIVETRAN_DELETED IS NULL)
             )
             WHERE RN = 1
         ";
