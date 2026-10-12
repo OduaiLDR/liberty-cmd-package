@@ -417,8 +417,11 @@ class GenerateRetentionCommissionReport extends Command
 
     // ─── Data fetchers ────────────────────────────────────────────────────────
 
-    /** @param array<string,mixed> $cfg */
-    private function fetchBase(DBConnector $sf, array $cfg, string $startDate, bool $allowEmpty = false): array
+    /**
+     * @param array<string,mixed> $cfg
+     * @param bool $forTierRebuild Only enable for historical tier calculations, never worksheet rows.
+     */
+    private function fetchBase(DBConnector $sf, array $cfg, string $startDate, bool $allowEmpty = false, bool $forTierRebuild = false): array
     {
         $ca = (int) $cfg['custom_agent'];
         $cd = (int) $cfg['custom_date'];
@@ -439,17 +442,37 @@ class GenerateRetentionCommissionReport extends Command
             $excludeSql = "AND UPPER(cu1.F_STRING) NOT IN ($excludedListUpper)";
         }
 
-        $sql = "
-            WITH relevant_contacts AS (
-                SELECT CONTACT_ID
+        // Keep the data-sheet query text unchanged: it sorts only by agent,
+        // so changing its execution plan can move rows within an agent group.
+        // Historical tier rebuilds consume counts only and can reuse one field
+        // read without changing worksheet rows or choosing between conflicting values.
+        $fieldSource = 'CONTACTS_USERFIELDS';
+        $candidateDeletedFilter = ' AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)';
+        $fieldDeletedFilter = ' AND (uf._FIVETRAN_DELETED = FALSE OR uf._FIVETRAN_DELETED IS NULL)';
+        $fieldReadCte = '';
+        if ($forTierRebuild) {
+            $fieldSource = 'report_fields';
+            $candidateDeletedFilter = $fieldDeletedFilter = '';
+            $fieldReadCte = "report_fields AS (
+                SELECT CONTACT_ID, CUSTOM_ID, F_STRING, F_DATE, F_DATETIME
                 FROM CONTACTS_USERFIELDS
-                WHERE CUSTOM_ID = $cc AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
+                WHERE (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
+                  AND CUSTOM_ID IN ($ca, $cd, $cr, $cc)
+            ),
+            ";
+        }
+
+        $sql = "
+            WITH {$fieldReadCte}relevant_contacts AS (
+                SELECT CONTACT_ID
+                FROM $fieldSource
+                WHERE CUSTOM_ID = $cc{$candidateDeletedFilter}
                   AND F_DATETIME >= '$windowStart'::TIMESTAMP_NTZ
                   AND F_DATETIME < '$windowEnd'::TIMESTAMP_NTZ
                 UNION
                 SELECT CONTACT_ID
-                FROM CONTACTS_USERFIELDS
-                WHERE CUSTOM_ID = $cd AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
+                FROM $fieldSource
+                WHERE CUSTOM_ID = $cd{$candidateDeletedFilter}
                   AND F_DATE >= '$windowStart'::DATE
                   AND F_DATE < '$windowEnd'::DATE
                 UNION
@@ -461,27 +484,27 @@ class GenerateRetentionCommissionReport extends Command
             ),
             agent_fields AS (
                 SELECT DISTINCT uf.CONTACT_ID, uf.F_STRING
-                FROM CONTACTS_USERFIELDS uf
+                FROM $fieldSource uf
                 JOIN relevant_contacts relevant ON relevant.CONTACT_ID = uf.CONTACT_ID
-                WHERE uf.CUSTOM_ID = $ca AND (uf._FIVETRAN_DELETED = FALSE OR uf._FIVETRAN_DELETED IS NULL)
+                WHERE uf.CUSTOM_ID = $ca{$fieldDeletedFilter}
             ),
             retention_fields AS (
                 SELECT DISTINCT uf.CONTACT_ID, uf.F_DATE
-                FROM CONTACTS_USERFIELDS uf
+                FROM $fieldSource uf
                 JOIN relevant_contacts relevant ON relevant.CONTACT_ID = uf.CONTACT_ID
-                WHERE uf.CUSTOM_ID = $cd AND (uf._FIVETRAN_DELETED = FALSE OR uf._FIVETRAN_DELETED IS NULL)
+                WHERE uf.CUSTOM_ID = $cd{$fieldDeletedFilter}
             ),
             result_fields AS (
                 SELECT DISTINCT uf.CONTACT_ID, uf.F_STRING
-                FROM CONTACTS_USERFIELDS uf
+                FROM $fieldSource uf
                 JOIN relevant_contacts relevant ON relevant.CONTACT_ID = uf.CONTACT_ID
-                WHERE uf.CUSTOM_ID = $cr AND (uf._FIVETRAN_DELETED = FALSE OR uf._FIVETRAN_DELETED IS NULL)
+                WHERE uf.CUSTOM_ID = $cr{$fieldDeletedFilter}
             ),
             cancel_fields AS (
                 SELECT DISTINCT uf.CONTACT_ID, uf.F_DATETIME
-                FROM CONTACTS_USERFIELDS uf
+                FROM $fieldSource uf
                 JOIN relevant_contacts relevant ON relevant.CONTACT_ID = uf.CONTACT_ID
-                WHERE uf.CUSTOM_ID = $cc AND (uf._FIVETRAN_DELETED = FALSE OR uf._FIVETRAN_DELETED IS NULL)
+                WHERE uf.CUSTOM_ID = $cc{$fieldDeletedFilter}
             )
             SELECT
                 c.ID,
@@ -878,20 +901,24 @@ class GenerateRetentionCommissionReport extends Command
         $shadowDiffs = 0;
         $missingWarned = [];
 
+        // Preserve input order within each agent, including the order of floating
+        // point additions, while avoiding two complete report scans per agent.
+        $rowsByAgent = [];
+        foreach ($rows as $row) {
+            $key = RetentionCommissionTierStore::agentKey((string) $this->col($row, 'RETENTION_AGENT', ''));
+            $rowsByAgent[$key][] = $row;
+        }
+
         foreach ($agents as $agentName) {
             $agentUpper = RetentionCommissionTierStore::agentKey($agentName);
+            $agentRows = $rowsByAgent[$agentUpper] ?? [];
 
             $assigned   = 0;
             $retained   = 0;
             $commissionOld = 0.0;
             $commissionNew = 0.0;
 
-            foreach ($rows as $row) {
-                $rowAgent = RetentionCommissionTierStore::agentKey((string) $this->col($row, 'RETENTION_AGENT', ''));
-                if ($rowAgent !== $agentUpper) {
-                    continue;
-                }
-
+            foreach ($agentRows as $row) {
                 // Assigned: cancel datetime in VBA COUNTIFS window (see inExcelPeriod).
                 if ($this->inExcelPeriod($this->col($row, 'CANCEL_REQUEST_DATE'), $startDate, $endDate, true)) {
                     $assigned++;
@@ -906,11 +933,7 @@ class GenerateRetentionCommissionReport extends Command
             $pct  = ($assigned > 0) ? ($retained / $assigned) : 0.0;
             $tier = $this->resolveTier($pct, $retained, $hasT4);
 
-            foreach ($rows as $row) {
-                $rowAgent = RetentionCommissionTierStore::agentKey((string) $this->col($row, 'RETENTION_AGENT', ''));
-                if ($rowAgent !== $agentUpper) {
-                    continue;
-                }
+            foreach ($agentRows as $row) {
                 if (!$this->inExcelPeriod($this->col($row, 'RETENTION_PAYMENT_DATE'), $startDate, $endDate, true)) {
                     continue;
                 }
@@ -1049,7 +1072,7 @@ class GenerateRetentionCommissionReport extends Command
             // (plus its two-month candidate lookback). Empty is a legitimate
             // zero-activity month; source errors still throw in sourceRows().
             $historyRows = $this->normalizeRetentionAgentAliases(
-                $this->fetchBase($sf, $cfg, $period, true)
+                $this->fetchBase($sf, $cfg, $period, true, true)
             );
             $historyAgents = [];
             foreach ($historyRows as $row) {

@@ -152,6 +152,62 @@ final class RetentionRetainedMonthTierTest extends TestCase
         $this->assertStringContainsString('WHERE uf.CUSTOM_ID = 1 AND (uf._FIVETRAN_DELETED = FALSE OR uf._FIVETRAN_DELETED IS NULL)', $source->lastSql);
         $this->assertStringContainsString('WHERE uf.CUSTOM_ID = 3 AND (uf._FIVETRAN_DELETED = FALSE OR uf._FIVETRAN_DELETED IS NULL)', $source->lastSql);
         $this->assertStringContainsString('WHERE uf.CUSTOM_ID = 4 AND (uf._FIVETRAN_DELETED = FALSE OR uf._FIVETRAN_DELETED IS NULL)', $source->lastSql);
+        $this->assertSame(6, substr_count($source->lastSql, 'FROM CONTACTS_USERFIELDS'));
+        $this->assertStringNotContainsString('report_fields', $source->lastSql);
+        $this->assertStringContainsString('ORDER BY cu1.F_STRING ASC', $source->lastSql);
+    }
+
+    public function test_only_historical_tier_rebuilds_share_the_field_read(): void
+    {
+        $source = new RetainedTierConnector(['data' => [['ID' => '101', 'RETENTION_AGENT' => 'Jane Doe']]]);
+        $fetch = new ReflectionMethod(GenerateRetentionCommissionReport::class, 'fetchBase');
+        $cfg = ['custom_agent' => 1, 'custom_date' => 2, 'custom_results' => 3, 'cancel_request_custom' => 4];
+
+        // Allowing an empty source alone must not change the data-sheet query.
+        $fetch->invoke(new GenerateRetentionCommissionReport, $source, $cfg, '2026-09-01', true);
+        $this->assertSame(6, substr_count($source->lastSql, 'FROM CONTACTS_USERFIELDS'));
+
+        $fetch->invoke(new GenerateRetentionCommissionReport, $source, $cfg, '2026-09-01', true, true);
+        $this->assertSame(1, substr_count($source->lastSql, 'FROM CONTACTS_USERFIELDS'));
+        $this->assertSame(6, substr_count($source->lastSql, 'FROM report_fields'));
+        $this->assertSame(4, substr_count($source->lastSql, 'SELECT DISTINCT uf.CONTACT_ID'));
+        $this->assertStringContainsString('WHERE (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)', $source->lastSql);
+        $this->assertStringContainsString('AND CUSTOM_ID IN (1, 2, 3, 4)', $source->lastSql);
+        $this->assertStringContainsString("F_DATETIME >= '2026-07-01'::TIMESTAMP_NTZ", $source->lastSql);
+        $this->assertStringContainsString("CLEARED_DATE < '2026-10-01'::DATE", $source->lastSql);
+
+        $this->expectException(\UnexpectedValueException::class);
+        $fetch->invoke(new GenerateRetentionCommissionReport, new RetainedTierConnector(['data' => [
+            ['ID' => '101', 'RETENTION_AGENT' => 'Jane Doe'],
+            ['ID' => '101', 'RETENTION_AGENT' => 'Other Agent'],
+        ]]), $cfg, '2026-09-01', true, true);
+    }
+
+    public function test_summary_index_preserves_aliases_empty_agents_and_addition_order(): void
+    {
+        $base = ['CANCEL_REQUEST_DATE' => '2098-02-01', 'RETENTION_DATE' => '2098-02-02',
+            'RETAINED_DATE' => '2098-02-02', 'RETENTION_PAYMENT_DATE' => '2098-02-03'];
+        $rows = [
+            $base + ['RETENTION_AGENT' => 'Jane Doe', 'T3' => 1e16],
+            $base + ['RETENTION_AGENT' => 'Other Agent', 'T3' => 8],
+            $base + ['retention_agent' => '  jane   DOE  ', 'T3' => 1],
+            $base + ['RETENTION_AGENT' => 'Other Agent', 'T3' => 2],
+            $base + ['RETENTION_AGENT' => 'Jane Doe', 'T3' => -1e16],
+        ];
+        $unchanged = $rows;
+        $summary = (new ReflectionMethod(GenerateRetentionCommissionReport::class, 'buildSummary'))->invoke(
+            new GenerateRetentionCommissionReport, $rows, ['Other Agent', 'No Activity', 'Jane Doe', ' JANE DOE '],
+            '2098-02-01', '2098-02-28'
+        );
+        $this->assertSame($unchanged, $rows);
+        $this->assertSame(3, $summary['Jane Doe']['assigned']);
+        $this->assertSame(3, $summary['Jane Doe']['retained']);
+        $this->assertSame(0.0, $summary['Jane Doe']['commission']);
+        $this->assertSame($summary['Jane Doe'], $summary[' JANE DOE ']);
+        $this->assertSame(10.0, $summary['Other Agent']['commission']);
+        $this->assertSame(0, $summary['No Activity']['assigned']);
+        $this->assertSame(0.0, $summary['No Activity']['commission']);
+        $this->assertSame([' JANE DOE ', 'Jane Doe', 'No Activity', 'Other Agent'], array_keys($summary));
     }
 
     public function test_retained_status_selection_is_as_of_the_report_end_date(): void
@@ -218,6 +274,8 @@ final class RetentionRetainedMonthTierTest extends TestCase
         ]], '2026-09-01', [], true);
 
         $this->assertSame(3, $map[Tiers::tierMapKey('2026-04-01', 'Gracia Rivera')]);
+        $this->assertSame(1, substr_count($source->lastSql, 'FROM CONTACTS_USERFIELDS'));
+        $this->assertStringContainsString('WITH report_fields AS (', $source->lastSql);
         $this->assertSame(0, $source->writes);
         $this->assertSame(0, $sql->writes);
     }
