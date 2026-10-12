@@ -24,8 +24,6 @@ class RetentionCommissionReportRequest extends FormRequest
             'dropped_date_to' => ['nullable', 'date'],
             'reconsideration_date_from' => ['nullable', 'date'],
             'reconsideration_date_to' => ['nullable', 'date'],
-            'retained_date_from' => ['nullable', 'date'],
-            'retained_date_to' => ['nullable', 'date'],
             'retention_payment_date_from' => ['nullable', 'date'],
             'retention_payment_date_to' => ['nullable', 'date'],
             'enrolled_debt_min' => ['nullable', 'numeric', 'min:0'],

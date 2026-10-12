@@ -24,7 +24,6 @@ class RetentionCommissionReportRepository extends SqlSrvRepository
             'cleared_payments' => 'Cleared Payments',
             'reconsideration_date' => 'Reconsideration Date',
             'dropped_date' => 'Dropped Date',
-            'retained_date' => 'Retained Date',
             'retention_payment_date' => 'Retention Payment Date',
             'retention_commission_t1' => 'Retention Commission T1',
             'retention_commission_t2' => 'Retention Commission T2',
@@ -103,7 +102,6 @@ class RetentionCommissionReportRepository extends SqlSrvRepository
                 DB::raw("0 AS cleared_payments"), // Mock data - TRANSACTIONS table not available
                 DB::raw("NULL AS reconsideration_date"), // Mock data - CONTACTS_STATUS table not available
                 'Cancel_Date AS dropped_date',
-                DB::raw("NULL AS retained_date"), // Mock data
                 DB::raw("NULL AS retention_payment_date"), // Mock data
                 DB::raw("CASE 
                     WHEN Debt_Amount <= 15000 THEN 2
@@ -167,7 +165,6 @@ class RetentionCommissionReportRepository extends SqlSrvRepository
 
         // Note: Many filters are not available due to missing tables:
         // - reconsideration_date_from/to (CONTACTS_STATUS table)
-        // - retained_date_from/to (mock data)
         // - retention_payment_date_from/to (mock data)
         // - cleared_payments_min/max (TRANSACTIONS table)
         // - commission_t1/t2/t3_min/max (calculated fields)

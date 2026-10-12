@@ -630,7 +630,6 @@ class GenerateRetentionManagerCommission extends Command
             'RETENTION_DATE' => true,
             'RECONSIDERATION_DATE' => true,
             'DROPPED_DATE' => true,
-            'RETAINED_DATE' => true,
             'RETENTION_PAYMENT_DATE' => true,
             'CANCEL_REQUEST_DATE' => true,
             'CUT_OFF' => true,
@@ -710,7 +709,6 @@ class GenerateRetentionManagerCommission extends Command
             'RETENTION_DATE' => true,
             'RECONSIDERATION_DATE' => true,
             'DROPPED_DATE' => true,
-            'RETAINED_DATE' => true,
             'RETENTION_PAYMENT_DATE' => true,
             'CANCEL_REQUEST_DATE' => true,
         ];
@@ -781,7 +779,6 @@ class GenerateRetentionManagerCommission extends Command
             'CLEARED PAYMENTS' => 'CLEARED_PAYMENTS',
             'RECONSIDERATION DATE' => 'RECONSIDERATION_DATE',
             'DROPPED DATE' => 'DROPPED_DATE',
-            'RETAINED DATE' => 'RETAINED_DATE',
             'RETENTION PAYMENT DATE' => 'RETENTION_PAYMENT_DATE',
             'RETENTION COMMISSION T1' => 'T1',
             'RETENTION COMMISSION T2' => 'T2',
@@ -1454,15 +1451,15 @@ class GenerateRetentionManagerCommission extends Command
         $sheet->setTitle('Retention Data');
         $sheet->setShowGridlines(false);
 
-        // Header wording per Jacob, 2026-09-04: H = Reconsideration, K = Payment Date,
-        // L:O = "Tier N Rate".
+        // Header wording per Jacob, 2026-09-04: H = Reconsideration, J = Payment Date,
+        // K:N = "Tier N Rate".
         $headers = $key === 'rama'
-            ? ['ID', 'CLIENT', 'RETENTION AGENT', 'RETENTION DATE', 'IMMEDIATE RESULTS', 'ENROLLED DEBT', 'CLEARED PAYMENTS', 'Reconsideration', 'DROPPED DATE', 'RETAINED DATE', 'Payment Date', 'Tier 1 Rate', 'Tier 2 Rate', 'Tier 3 Rate', 'Tier 4 Rate', 'CANCEL REQUEST DATE', 'Tranche', 'Cut Off', 'Made Cut Off', 'Bonus']
-            : ['ID', 'CLIENT', 'RETENTION AGENT', 'RETENTION DATE', 'IMMEDIATE RESULTS', 'ENROLLED DEBT', 'CLEARED PAYMENTS', 'Reconsideration', 'DROPPED DATE', 'RETAINED DATE', 'Payment Date', 'Tier 1 Rate', 'Tier 2 Rate', 'Tier 3 Rate', 'Tier 4 Rate', 'CANCEL REQUEST DATE', 'Commission Rate', 'Commission Earned'];
+            ? ['ID', 'CLIENT', 'RETENTION AGENT', 'RETENTION DATE', 'IMMEDIATE RESULTS', 'ENROLLED DEBT', 'CLEARED PAYMENTS', 'Reconsideration', 'DROPPED DATE', 'Payment Date', 'Tier 1 Rate', 'Tier 2 Rate', 'Tier 3 Rate', 'Tier 4 Rate', 'CANCEL REQUEST DATE', 'Tranche', 'Cut Off', 'Made Cut Off', 'Bonus']
+            : ['ID', 'CLIENT', 'RETENTION AGENT', 'RETENTION DATE', 'IMMEDIATE RESULTS', 'ENROLLED DEBT', 'CLEARED PAYMENTS', 'Reconsideration', 'DROPPED DATE', 'Payment Date', 'Tier 1 Rate', 'Tier 2 Rate', 'Tier 3 Rate', 'Tier 4 Rate', 'CANCEL REQUEST DATE', 'Commission Rate', 'Commission Earned'];
         foreach ($headers as $i => $header) {
             $sheet->setCellValue($this->cell($i + 1, 1), $header);
         }
-        $lastHeaderCol = $key === 'rama' ? 'T' : 'R';
+        $lastHeaderCol = $key === 'rama' ? 'S' : 'Q';
         $this->headerStyle($sheet, "A1:{$lastHeaderCol}1");
 
         $nickPct = $this->overallPct($rows);
@@ -1478,34 +1475,33 @@ class GenerateRetentionManagerCommission extends Command
             $sheet->setCellValue("G{$r}", (int) $this->col($row, 'CLEARED_PAYMENTS', 0));
             $this->setDate($sheet, "H{$r}", $this->col($row, 'RECONSIDERATION_DATE'));
             $this->setDate($sheet, "I{$r}", $this->col($row, 'DROPPED_DATE'));
-            $this->setDate($sheet, "J{$r}", $this->col($row, 'RETAINED_DATE'));
-            $this->setDate($sheet, "K{$r}", $this->col($row, 'RETENTION_PAYMENT_DATE'));
-            $sheet->setCellValue("L{$r}", $this->col($row, 'T1', ''));
-            $sheet->setCellValue("M{$r}", $this->col($row, 'T2', ''));
-            $sheet->setCellValue("N{$r}", $this->col($row, 'T3', ''));
-            $sheet->setCellValue("O{$r}", $this->col($row, 'T4', ''));
-            $this->setDate($sheet, "P{$r}", $this->col($row, 'CANCEL_REQUEST_DATE'));
+            $this->setDate($sheet, "J{$r}", $this->col($row, 'RETENTION_PAYMENT_DATE'));
+            $sheet->setCellValue("K{$r}", $this->col($row, 'T1', ''));
+            $sheet->setCellValue("L{$r}", $this->col($row, 'T2', ''));
+            $sheet->setCellValue("M{$r}", $this->col($row, 'T3', ''));
+            $sheet->setCellValue("N{$r}", $this->col($row, 'T4', ''));
+            $this->setDate($sheet, "O{$r}", $this->col($row, 'CANCEL_REQUEST_DATE'));
             if ($key === 'rama') {
-                $sheet->setCellValue("Q{$r}", $this->col($row, 'TRANCHE', ''));
-                $this->setDate($sheet, "R{$r}", $this->col($row, 'CUT_OFF'));
-                $sheet->setCellValue("S{$r}", $this->col($row, 'MADE_CUT_OFF', false) ? 'x' : '');
-                $sheet->setCellValue("T{$r}", $this->col($row, 'BONUS_FLAG', ''));
+                $sheet->setCellValue("P{$r}", $this->col($row, 'TRANCHE', ''));
+                $this->setDate($sheet, "Q{$r}", $this->col($row, 'CUT_OFF'));
+                $sheet->setCellValue("R{$r}", $this->col($row, 'MADE_CUT_OFF', false) ? 'x' : '');
+                $sheet->setCellValue("S{$r}", $this->col($row, 'BONUS_FLAG', ''));
             } else {
                 $rate = $this->nickCommissionRate((float) $this->col($row, 'ENROLLED_DEBT', 0), $nickPct);
-                $sheet->setCellValue("Q{$r}", $rate);
-                $sheet->setCellValue("R{$r}", strtoupper((string) $this->col($row, 'IMMEDIATE_RESULTS', '')) === 'RETAINED' ? $rate : '');
+                $sheet->setCellValue("P{$r}", $rate);
+                $sheet->setCellValue("Q{$r}", strtoupper((string) $this->col($row, 'IMMEDIATE_RESULTS', '')) === 'RETAINED' ? $rate : '');
             }
             $r++;
         }
         $last = max($r - 1, 1);
-        foreach (['D', 'H', 'I', 'J', 'K', 'O', 'R'] as $col) {
-            if ($key === 'nick' && in_array($col, ['O', 'R'], true)) {
+        foreach (['D', 'H', 'I', 'J', 'O', 'Q'] as $col) {
+            if ($key === 'nick' && in_array($col, ['O', 'Q'], true)) {
                 continue;
             }
             $sheet->getStyle("{$col}2:{$col}{$last}")->getNumberFormat()->setFormatCode('mm/dd/yyyy');
         }
         $sheet->getStyle("F2:F{$last}")->getNumberFormat()->setFormatCode('$#,##0');
-        $sheet->getStyle("L2:O{$last}")->getNumberFormat()->setFormatCode('$#,##0.00');
+        $sheet->getStyle("K2:N{$last}")->getNumberFormat()->setFormatCode('$#,##0.00');
         // Borders over the whole table, not just the header row (Jacob: "data sheet add borders").
         $this->tableBorders($sheet, "A1:{$lastHeaderCol}{$last}");
         // Widths 17, with Client (B), Retention Agent (C) and Immediate Results (E) at 28.
@@ -1519,11 +1515,11 @@ class GenerateRetentionManagerCommission extends Command
         // left white so the two states that DO carry money stand out.
         if ($key === 'rama') {
             for ($row = 2; $row <= $last; $row++) {
-                $madeCutOff = trim((string) $sheet->getCell("S{$row}")->getValue());
+                $madeCutOff = trim((string) $sheet->getCell("R{$row}")->getValue());
                 if ($madeCutOff === '') {
                     continue;
                 }
-                $bonus = strtoupper(trim((string) $sheet->getCell("T{$row}")->getValue()));
+                $bonus = strtoupper(trim((string) $sheet->getCell("S{$row}")->getValue()));
                 $fill = $bonus === 'BONUS' ? 'FFC6EFCE' : 'FFFFEB9C';   // green / yellow
                 $sheet->getStyle("A{$row}:{$lastHeaderCol}{$row}")->getFill()
                     ->setFillType(Fill::FILL_SOLID)->getStartColor()->setARGB($fill);

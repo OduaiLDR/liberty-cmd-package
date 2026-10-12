@@ -199,24 +199,7 @@ class GenerateRetentionCommissionReport extends Command
             }
             unset($row);
 
-            // ── STEP 4: first enrolled-status date >= reconsideration → column J (RETAINED_DATE)
-            $retainedMap = $this->fetchRetainedDates($sf, $idList);
-            foreach ($rows as &$row) {
-                $recon            = $this->toDate($row['RECONSIDERATION_DATE'] ?? null);
-                $row['RETAINED_DATE'] = null;
-                $id = (string) $this->col($row, 'ID', '');
-                if ($recon && !empty($retainedMap[$id])) {
-                    foreach ($retainedMap[$id] as $rd) {
-                        if ($rd >= $recon) {
-                            $row['RETAINED_DATE'] = $rd;
-                            break;
-                        }
-                    }
-                }
-            }
-            unset($row);
-
-            // ── STEP 5: reuse the already-fetched transaction map from step 3
+            // ── STEP 4: reuse the already-fetched transaction map from step 3
 
             foreach ($rows as &$row) {
                 $row['RETENTION_PAYMENT_DATE'] = null;
@@ -224,10 +207,10 @@ class GenerateRetentionCommissionReport extends Command
                 $row['T2'] = null;
                 $row['T3'] = null;
 
-                $recon    = $this->toDate($row['RECONSIDERATION_DATE'] ?? null);
-                $retained = $this->toDate($row['RETAINED_DATE'] ?? null);
-
-                if ($recon === null || $retained === null) {
+                $recon = $this->toDate($row['RECONSIDERATION_DATE'] ?? null);
+                // Jacob, 2026-10-12: column D is the sole retention-date source.
+                $retentionDate = $this->toDate($this->col($row, 'RETENTION_DATE'));
+                if ($recon === null || $retentionDate === null) {
                     continue;
                 }
 
@@ -498,25 +481,6 @@ class GenerateRetentionCommissionReport extends Command
         return $map;
     }
 
-    /** Returns map of contact_id → array of enrolled-status dates (sorted asc) */
-    private function fetchRetainedDates(DBConnector $sf, string $idList): array
-    {
-        $sql = "
-            SELECT cs.CONTACT_ID, LEFT(cs.STAMP,10) AS RETAINED_DATE
-            FROM CONTACTS_STATUS cs
-            LEFT JOIN CONTACTS_LEAD_STATUS cls ON cs.STATUS_ID = cls.ID
-            WHERE UPPER(cls.TITLE) LIKE '%ENROLLED%'
-              AND UPPER(cls.TITLE) NOT LIKE '%RECONSIDERATION%'
-              AND cs.CONTACT_ID IN ($idList)
-            ORDER BY cs.CONTACT_ID ASC, cs.STAMP ASC
-        ";
-        $map = [];
-        foreach ($sf->query($sql)['data'] ?? [] as $r) {
-            $map[(string) $r['CONTACT_ID']][] = substr((string) $r['RETAINED_DATE'], 0, 10);
-        }
-        return $map;
-    }
-
     /**
      * Fetch all cleared transaction dates per contact in one query.
      * Returns map of contact_id → array of cleared dates sorted ASC.
@@ -578,7 +542,7 @@ class GenerateRetentionCommissionReport extends Command
             $headers1 = [
                 'ID', 'Client', 'Retention Agent', 'Retention Date', 'Immediate Results',
                 'Enrolled Debt', 'Cleared Payments', 'Reconsideration Date', 'Dropped Date',
-                'Retained Date', 'Retention Payment Date',
+                'Retention Payment Date',
                 // Jacob, 2026-09-04: "L:O: Change headers to T1 Rate and T2 Rate."
                 'T1 Rate', 'T2 Rate', 'T3 Rate',
             ];
@@ -586,8 +550,8 @@ class GenerateRetentionCommissionReport extends Command
                 $headers1[] = 'T4 Rate';
             }
             $headers1[] = 'Cancel Request Date';
-            $lastDataCol = $hasT4 ? 'P' : 'O';
-            $cancelCol   = $hasT4 ? 'P' : 'O';
+            $lastDataCol = $hasT4 ? 'O' : 'N';
+            $cancelCol   = $hasT4 ? 'O' : 'N';
 
             foreach ($headers1 as $i => $h) {
                 $sheet1->setCellValue(chr(65 + $i) . '1', $h);
@@ -605,31 +569,29 @@ class GenerateRetentionCommissionReport extends Command
                 $sheet1->setCellValue("G$r", (int)   $this->col($row, 'CLEARED_PAYMENTS', 0));
                 $this->setDate($sheet1, "H$r", $this->col($row, 'RECONSIDERATION_DATE'));
                 $this->setDate($sheet1, "I$r", $this->col($row, 'DROPPED_DATE'));
-                $this->setDate($sheet1, "J$r", $this->col($row, 'RETAINED_DATE'));
                 // Keep full datetime like VBA (Excel COUNTIFS vs DateSerial end = midnight).
-                $this->setDateTime($sheet1, "K$r", $this->col($row, 'RETENTION_PAYMENT_DATE'));
-                $sheet1->setCellValue("L$r", $row['T1'] ?? '');
-                $sheet1->setCellValue("M$r", $row['T2'] ?? '');
-                $sheet1->setCellValue("N$r", $row['T3'] ?? '');
+                $this->setDateTime($sheet1, "J$r", $this->col($row, 'RETENTION_PAYMENT_DATE'));
+                $sheet1->setCellValue("K$r", $row['T1'] ?? '');
+                $sheet1->setCellValue("L$r", $row['T2'] ?? '');
+                $sheet1->setCellValue("M$r", $row['T3'] ?? '');
                 if ($hasT4) {
-                    $sheet1->setCellValue("O$r", $row['T4'] ?? '');
-                    $this->setDateTime($sheet1, "P$r", $this->col($row, 'CANCEL_REQUEST_DATE'));
-                } else {
+                    $sheet1->setCellValue("N$r", $row['T4'] ?? '');
                     $this->setDateTime($sheet1, "O$r", $this->col($row, 'CANCEL_REQUEST_DATE'));
+                } else {
+                    $this->setDateTime($sheet1, "N$r", $this->col($row, 'CANCEL_REQUEST_DATE'));
                 }
                 $r++;
             }
 
             $last1 = max($r - 1, 1);
-            // Every date column is date-only. K (Retention Payment Date) and the cancel column used
-            // to carry "mm/dd/yyyy hh:mm:ss" — Jacob, 2026-09-04: "K: Date format only; no time…
-            // P: Date format only; no time." The underlying values are untouched, so any period
+            // Every date column is date-only. J (Retention Payment Date) and the cancel column used
+            // to carry "mm/dd/yyyy hh:mm:ss". The underlying values are untouched, so any period
             // arithmetic that relied on the time part still works; only the display changes.
-            foreach (['D', 'H', 'I', 'J', 'K', $cancelCol] as $c) {
+            foreach (['D', 'H', 'I', 'J', $cancelCol] as $c) {
                 $sheet1->getStyle("{$c}2:{$c}{$last1}")->getNumberFormat()->setFormatCode('mm/dd/yyyy');
             }
             $sheet1->getStyle("F2:F{$last1}")->getNumberFormat()->setFormatCode('$#,##0');
-            $tierRange = $hasT4 ? "L2:O{$last1}" : "L2:N{$last1}";
+            $tierRange = $hasT4 ? "K2:N{$last1}" : "K2:M{$last1}";
             $sheet1->getStyle($tierRange)->getNumberFormat()->setFormatCode('$#,##0');
             if ($last1 > 1) {
                 $sheet1->getStyle("A1:{$lastDataCol}{$last1}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);

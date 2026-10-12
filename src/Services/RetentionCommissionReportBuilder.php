@@ -119,22 +119,6 @@ class RetentionCommissionReportBuilder
         }
         unset($row);
 
-        $retainedMap = $this->fetchRetainedDates($sf, $idList);
-        foreach ($rows as &$row) {
-            $recon = $this->toDate($row['RECONSIDERATION_DATE'] ?? null);
-            $row['RETAINED_DATE'] = null;
-            $id = (string) $this->col($row, 'ID', '');
-            if ($recon && !empty($retainedMap[$id])) {
-                foreach ($retainedMap[$id] as $rd) {
-                    if ($rd >= $recon) {
-                        $row['RETAINED_DATE'] = $rd;
-                        break;
-                    }
-                }
-            }
-        }
-        unset($row);
-
         foreach ($rows as &$row) {
             $row['RETENTION_PAYMENT_DATE'] = null;
             $row['T1'] = null;
@@ -143,8 +127,9 @@ class RetentionCommissionReportBuilder
             $row['T4'] = null;
 
             $recon = $this->toDate($row['RECONSIDERATION_DATE'] ?? null);
-            $retained = $this->toDate($row['RETAINED_DATE'] ?? null);
-            if ($recon === null || $retained === null) {
+            // Jacob, 2026-10-12: column D is the sole retention-date source.
+            $retentionDate = $this->toDate($this->col($row, 'RETENTION_DATE'));
+            if ($recon === null || $retentionDate === null) {
                 continue;
             }
 
@@ -308,24 +293,6 @@ class RetentionCommissionReportBuilder
         foreach ($sf->query($sql)['data'] ?? [] as $r) {
             $id = (string) $r['CONTACT_ID'];
             $map[$id] ??= $r['RECON_DATE'];
-        }
-        return $map;
-    }
-
-    private function fetchRetainedDates(DBConnector $sf, string $idList): array
-    {
-        $sql = "
-            SELECT cs.CONTACT_ID, LEFT(cs.STAMP,10) AS RETAINED_DATE
-            FROM CONTACTS_STATUS cs
-            LEFT JOIN CONTACTS_LEAD_STATUS cls ON cs.STATUS_ID = cls.ID
-            WHERE UPPER(cls.TITLE) LIKE '%ENROLLED%'
-              AND UPPER(cls.TITLE) NOT LIKE '%RECONSIDERATION%'
-              AND cs.CONTACT_ID IN ({$idList})
-            ORDER BY cs.CONTACT_ID ASC, cs.STAMP ASC
-        ";
-        $map = [];
-        foreach ($sf->query($sql)['data'] ?? [] as $r) {
-            $map[(string) $r['CONTACT_ID']][] = substr((string) $r['RETAINED_DATE'], 0, 10);
         }
         return $map;
     }
