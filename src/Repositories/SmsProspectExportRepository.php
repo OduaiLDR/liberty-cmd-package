@@ -146,24 +146,34 @@ SQL;
     {
         $this->assertRun($requestId);
         $db = $this->connection();
-        // Our nvarchar values are cast to TblTUData's varchar so its indexes stay usable.
-        $tu = $db->update(<<<'SQL'
-UPDATE h SET Debt_Amount = tu.Debt, Debt_Source = 'TblTUData', Debt_Source_PK = tu.PK,
-    Debt_Tier = COALESCE(h.Debt_Tier, NULLIF(tu.Tier_Tag, ''))
-FROM TblSMSHistory h
-JOIN TblProspects p ON p.PK = h.Prospect_PK
-CROSS APPLY (
-    SELECT TOP 1 t.PK, t.derivedFields1_unsecdebtbalance AS Debt, t.Tier_Tag
-    FROM TblTUData t
-    WHERE t.ncoaAddr_addrLine1Txt = CAST(p.Address AS varchar(255))
-      AND LEFT(t.ncoaAddr_zipCde, 5) = CAST(p.Zip AS varchar(10))
-      AND t.ncoaAddr_frstNme <> '' AND t.ncoaAddr_lastNme <> ''
-      AND CAST(p.Client AS varchar(150)) LIKE t.ncoaAddr_frstNme + ' %'
-      AND CAST(p.Client AS varchar(150)) LIKE '% ' + t.ncoaAddr_lastNme
+        // One pass over TblTUData for the whole run. Production's copy is 26.5M rows (52 GB) with no
+        // index, so a lookup per person would read all of it each time. With a covering index on
+        // address the hash join reads that index instead of the table. Our nvarchar values are cast
+        // to TblTUData's varchar so the 26.5M rows are not converted.
+        $hashJoins = self::HASH_JOINS;
+        $tu = $db->update(<<<SQL
+WITH Wanted AS (
+    SELECT h.PK AS History_PK, CAST(p.Address AS varchar(255)) AS Address, CAST(p.Zip AS varchar(10)) AS Zip,
+        CAST(p.Client AS varchar(150)) AS Client
+    FROM TblSMSHistory h
+    JOIN TblProspects p ON p.PK = h.Prospect_PK
+    WHERE h.Request_ID = ? AND h.Debt_Source IS NULL
+),
+Matches AS (
+    SELECT w.History_PK, t.PK, t.derivedFields1_unsecdebtbalance AS Debt, t.Tier_Tag,
+        ROW_NUMBER() OVER (PARTITION BY w.History_PK ORDER BY t.Creation_Date DESC, t.PK DESC) AS Match_Rank
+    FROM Wanted w
+    JOIN TblTUData t ON t.ncoaAddr_addrLine1Txt = w.Address AND LEFT(t.ncoaAddr_zipCde, 5) = w.Zip
+    WHERE t.ncoaAddr_frstNme <> '' AND t.ncoaAddr_lastNme <> ''
+      AND w.Client LIKE t.ncoaAddr_frstNme + ' %'
+      AND w.Client LIKE '% ' + t.ncoaAddr_lastNme
       AND t.derivedFields1_unsecdebtbalance > 0
-    ORDER BY t.Creation_Date DESC, t.PK DESC
-) tu
-WHERE h.Request_ID = ? AND h.Debt_Source IS NULL
+)
+UPDATE h SET Debt_Amount = m.Debt, Debt_Source = 'TblTUData', Debt_Source_PK = m.PK,
+    Debt_Tier = COALESCE(h.Debt_Tier, NULLIF(m.Tier_Tag, ''))
+FROM TblSMSHistory h
+JOIN Matches m ON m.History_PK = h.PK AND m.Match_Rank = 1
+{$hashJoins}
 SQL, [$requestId]);
 
         $mailers = $db->update(<<<'SQL'
