@@ -4,6 +4,10 @@ namespace Cmd\Reports\Console\Commands;
 
 use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\ContactSyncIdentity;
+use Cmd\Reports\Services\ContactSyncCampaignLookup;
+use Cmd\Reports\Services\ContactSyncExclusions;
+use Cmd\Reports\Services\ContactSyncEnrollmentChanges;
+use Cmd\Reports\Services\ContactSyncRunScope;
 use Cmd\Reports\Services\ContactSyncMatching;
 use Cmd\Reports\Services\ContactSyncSourceEvidence;
 use Cmd\Reports\Services\ContactSyncTargets;
@@ -23,6 +27,9 @@ class SyncContactsData extends Command
         {--dry-run   : Fetch and report changes without modifying SQL Server or sync watermarks; matching runs as read-only verification}
         {--verify-match : Read-only matching verification only (no Snowflake fetch, no SQL writes)}
         {--reconcile-agents : Reconcile non-blank enrollment agents from unambiguous source contact assignments}
+        {--scope-file= : Internal completed source result for the orchestrator}
+        {--exclude-scope-file= : Internal LT exclusions inherited by backend sources}
+        {--campaign-scope-file= : Internal LDR attribution holds inherited by PLAW}
         {--no-match  : Skip post-sync table matching (internal flag used by the orchestrator)}';
 
     protected $description = 'Sync contacts data from Snowflake to SQL Server (TblContactsLDR, TblContactsPLAW, and TblContactsLT)';
@@ -41,12 +48,17 @@ class SyncContactsData extends Command
     private ?\PDO $refreshPdo = null;
     private ?string $refreshStage = null;
     private bool $refreshPublished = false;
-    private bool $mailerSuffixCacheReady = false;
-    private array $cachedMailerSuffixes = [];
-    private array $pendingMailerSuffixes = [];
     private int $pageSize = self::PAGE_SIZE;
     private array $contactFlags = [];
     private array $skippedContactIds = [];
+    private array $campaignProofs = [];
+    private array $verifiedCampaigns = [];
+    private array $campaignHolds = [];
+    private array $exclusionSeeds = [];
+    private array $matchingExclusions = [];
+    private array $sourceLinks = [];
+    private array $deferredEnrollmentChanges = [];
+    private bool $matchingScopePrepared = false;
 
     /** Matching-step counters reset at the start of each matching run. */
     private int $matchingStepsOk = 0;
@@ -83,6 +95,24 @@ class SyncContactsData extends Command
             return $this->syncForSource($source);
         }
 
+        $scopeDirectory = ContactSyncRunScope::create(storage_path('app/contact-sync-scopes'));
+        try {
+            return $this->orchestrate($scopeDirectory);
+        } catch (\Throwable $error) {
+            $this->error('Contact reconciliation stopped: ' . $error->getMessage());
+            return Command::FAILURE;
+        } finally {
+            ContactSyncRunScope::cleanup($scopeDirectory);
+        }
+    }
+
+    private function orchestrate(string $scopeDirectory): int
+    {
+        $this->source = 'MATCH';
+        $this->contactFlags = $this->skippedContactIds = $this->exclusionSeeds = [];
+        $this->matchingExclusions = $this->verifiedCampaigns = $this->deferredEnrollmentChanges = [];
+        $this->campaignHolds = [];
+        $this->matchingScopePrepared = false;
         // LT holds the primary contact data (TblContacts). It must complete before
         // LDR/PLAW run, because the final matching step joins TblContactsLDR/PLAW
         // back to TblContacts — which only has correct data after LT finishes.
@@ -101,9 +131,9 @@ class SyncContactsData extends Command
         // ── Step 1: LT ────────────────────────────────────────────────────────
         $orchStarted = microtime(true);
         $this->logStep('Step 1/3: Syncing LT (primary contacts)...');
-        $ltPool = Process::pool(function ($pool) use ($php, $artisan, $fullFlag, $ownersRefreshFlag, $dryRunFlag, $reconcileAgentsFlag) {
+        $ltPool = Process::pool(function ($pool) use ($php, $artisan, $fullFlag, $ownersRefreshFlag, $dryRunFlag, $reconcileAgentsFlag, $scopeDirectory) {
             $pool->as('LT')->timeout(self::PROCESS_TIMEOUT_SECONDS)->command(
-                array_merge([$php, $artisan, 'Sync:contacts-data', '--source=LT', '--no-match'], $fullFlag, $ownersRefreshFlag, $dryRunFlag, $reconcileAgentsFlag)
+                array_merge([$php, $artisan, 'Sync:contacts-data', '--source=LT', '--no-match', '--scope-file=' . $scopeDirectory . '/LT.json'], $fullFlag, $ownersRefreshFlag, $dryRunFlag, $reconcileAgentsFlag)
             );
         })->start(function (string $type, string $output, string $key) {
             foreach (explode("\n", rtrim($output)) as $line) {
@@ -121,45 +151,58 @@ class SyncContactsData extends Command
         }
         $hasSkippedRecords = str_contains($ltProcesses['LT']->output(), '[SYNC FLAGS]');
         $hasReviewFlags = str_contains($ltProcesses['LT']->output(), '[CONTACT FLAG]');
+        ContactSyncRunScope::read($scopeDirectory . '/LT.json', 'LT');
 
-        // ── Step 2: LDR + PLAW (parallel) ────────────────────────────────────
-        $this->logStep('Step 2/3: Syncing LDR and PLAW in parallel...');
-        $pool = Process::pool(function ($pool) use ($php, $artisan, $fullFlag, $ownersRefreshFlag, $dryRunFlag, $reconcileAgentsFlag) {
-            foreach (['LDR', 'PLAW'] as $src) {
-                $pool->as($src)->timeout(self::PROCESS_TIMEOUT_SECONDS)->command(
-                    array_merge([$php, $artisan, 'Sync:contacts-data', "--source={$src}", '--no-match'], $fullFlag, $ownersRefreshFlag, $dryRunFlag, $reconcileAgentsFlag)
-                );
-            }
-        })->start(function (string $type, string $output, string $key) {
-            foreach (explode("\n", rtrim($output)) as $line) {
-                if ($line !== '') $this->line("[{$key}] {$line}");
-            }
-        });
+        // ── Step 2: LDR then PLAW ────────────────────────────────────────────
+        // Both sources lock shared contact rows and emit review flags inside page
+        // transactions. Run one child at a time so an unread sibling output pipe
+        // cannot block that child while it holds locks needed by the other source.
         $sideStarted = microtime(true);
-        $processes = $pool->wait();
-        $this->logStep('Step 2/3: LDR + PLAW child processes finished', $sideStarted);
-
-        $allOk = true;
         foreach (['LDR', 'PLAW'] as $src) {
-            $hasSkippedRecords = $hasSkippedRecords || str_contains($processes[$src]->output(), '[SYNC FLAGS]');
-            $hasReviewFlags = $hasReviewFlags || str_contains($processes[$src]->output(), '[CONTACT FLAG]');
-            if ($processes[$src]->exitCode() !== 0) {
-                $this->error("[ERROR] {$src} failed (exit code {$processes[$src]->exitCode()}).");
-                $allOk = false;
+            $sourceStarted = microtime(true);
+            $this->logStep("Step 2/3: Syncing {$src}...");
+            try {
+                $result = Process::timeout(self::PROCESS_TIMEOUT_SECONDS)->run(
+                    array_merge([$php, $artisan, 'Sync:contacts-data', "--source={$src}", '--no-match',
+                        '--scope-file=' . $scopeDirectory . "/{$src}.json",
+                        '--exclude-scope-file=' . $scopeDirectory . '/LT.json'],
+                        $src === 'PLAW' ? ['--campaign-scope-file=' . $scopeDirectory . '/LDR.json'] : [],
+                        $fullFlag, $ownersRefreshFlag, $dryRunFlag, $reconcileAgentsFlag),
+                    function (string $type, string $output) use ($src) {
+                        foreach (explode("\n", rtrim($output)) as $line) {
+                            if ($line !== '') $this->line("[{$src}] {$line}");
+                        }
+                    }
+                );
+            } catch (\Throwable $error) {
+                throw new \RuntimeException("{$src} contact child failed: " . $error->getMessage(), 0, $error);
+            }
+            $this->logStep("Step 2/3: {$src} child process finished", $sourceStarted);
+            if ($result->exitCode() !== 0) {
+                $this->error("[ERROR] {$src} failed (exit code {$result->exitCode()}); stopping before further sources or matching.");
+                return Command::FAILURE;
+            }
+            ContactSyncRunScope::read($scopeDirectory . "/{$src}.json", $src);
+            $hasSkippedRecords = $hasSkippedRecords || str_contains($result->output(), '[SYNC FLAGS]');
+            $hasReviewFlags = $hasReviewFlags || str_contains($result->output(), '[CONTACT FLAG]');
+        }
+        $this->logStep('Step 2/3: LDR and PLAW child processes finished', $sideStarted);
+
+        $scopes = [];
+        foreach (['LT', 'LDR', 'PLAW'] as $src) {
+            $scopes[$src] = ContactSyncRunScope::read($scopeDirectory . "/{$src}.json", $src);
+            $this->deferredEnrollmentChanges[$src] = $scopes[$src]['enrollment_changes'];
+            foreach ($scopes[$src]['excluded_ids'] as $id) $this->exclusionSeeds[$id] = true;
+            foreach ($scopes[$src]['campaign_hold_ids'] as $id) $this->campaignHolds[$id] = true;
+            foreach ($scopes[$src]['campaigns'] as $id => $campaign) {
+                $this->rememberCampaignProof($id, $campaign);
             }
         }
-        if (!$allOk) {
-            $this->info("\n" . str_repeat('=', 80));
-            $this->error('[ERROR] LDR or PLAW failed — skipping final matching.');
-            return Command::FAILURE;
-        }
-
         // ── Step 3: Final matching (or read-only preview in dry-run) ─────────────
         if ($this->option('dry-run')) {
             $this->info('[DRY RUN] Step 3/3: Previewing final matching (read-only)...');
             try {
-                $connector = DBConnector::fromEnvironment('ldr');
-                $connector->initializeSqlServer();
+                $connector = $this->initializeMatchingConnector();
                 if (!$this->runFinalMatching($connector)) {
                     return Command::FAILURE;
                 }
@@ -167,7 +210,7 @@ class SyncContactsData extends Command
                 $this->error('[DRY RUN] Matching preview failed: ' . $e->getMessage());
                 return Command::FAILURE;
             }
-            if ($hasSkippedRecords || $hasReviewFlags) {
+            if ($hasSkippedRecords || $hasReviewFlags || $this->contactFlags !== [] || $this->exclusionSeeds !== []) {
                 $this->warn('[DRY RUN] Preview completed with flagged records; review source summaries. No SQL Server changes were made.');
             } else {
                 $this->info('[SUCCESS] Dry run completed; no SQL Server changes were made.');
@@ -175,16 +218,10 @@ class SyncContactsData extends Command
             return Command::SUCCESS;
         }
 
-        if ($hasSkippedRecords) {
-            $this->warn('[SYNC FLAGS] Source runs completed with skipped records. Their checkpoints were retained; global matching was not run.');
-            return Command::SUCCESS;
-        }
-
         $this->logStep('Step 3/3: Running final table matching...');
         $matchStarted = microtime(true);
         try {
-            $connector = DBConnector::fromEnvironment('ldr');
-            $connector->initializeSqlServer();
+            $connector = $this->initializeMatchingConnector();
             if (!$this->runFinalMatching($connector)) {
                 $this->error('[ERROR] Final matching completed with failures — see summary above.');
                 return Command::FAILURE;
@@ -196,6 +233,13 @@ class SyncContactsData extends Command
         }
 
         $this->logStep('Step 3/3: matching done', $matchStarted);
+        $hasReviewFlags = $hasReviewFlags || $this->contactFlags !== [];
+        if ($this->exclusionSeeds !== [] || $hasSkippedRecords) {
+            $this->warn('[SYNC FLAGS] Eligible files reconciled; excluded file groups require review. All source checkpoints retained for retry.');
+            $hasReviewFlags = true;
+        } elseif (!$this->option('owners-refresh')) {
+            foreach ($scopes as $src => $scope) $this->writeLastSyncTime($src, $scope['started_at']);
+        }
         $this->info("\n" . str_repeat('=', 80));
         $this->logStep($hasReviewFlags ? 'All source runs and matching completed with review flags; see source summaries'
             : 'All syncs (LT → LDR, PLAW → matching) completed successfully', $orchStarted);
@@ -286,11 +330,6 @@ class SyncContactsData extends Command
         } finally {
             if ($this->refreshStage !== null && $this->refreshPdo !== null) {
                 try {
-                    if ($this->mailerSuffixCacheReady) {
-                        $this->checkedExec($this->refreshPdo, 'DROP TABLE IF EXISTS #TmpMailerSuffixCache');
-                        $this->mailerSuffixCacheReady = false;
-                        $this->cachedMailerSuffixes = [];
-                    }
                     $this->checkedExec($this->refreshPdo, "DROP TABLE IF EXISTS {$this->refreshStage}");
                 } catch (\Throwable $e) {
                     $this->warn('[WARN] Could not drop the session-local refresh table; it will be removed when the connection closes.');
@@ -305,6 +344,9 @@ class SyncContactsData extends Command
     {
         $this->contactFlags = [];
         $this->skippedContactIds = [];
+        $this->exclusionSeeds = $this->matchingExclusions = $this->verifiedCampaigns = $this->sourceLinks = [];
+        $this->campaignHolds = [];
+        $this->matchingScopePrepared = false;
         $dryRun = (bool) $this->option('dry-run');
         if ($dryRun) {
             $this->warn('[DRY RUN] Read-only preview: no SQL Server writes or watermark updates. Debt samples show at most 10 changed IDs per source.');
@@ -329,6 +371,19 @@ class SyncContactsData extends Command
             return Command::FAILURE;
         }
         $this->info("[DEBUG] SQL Server connector OK.");
+        if ($this->option('exclude-scope-file')) {
+            $inherited = ContactSyncRunScope::read((string) $this->option('exclude-scope-file'), 'LT');
+            $this->matchingExclusions = ContactSyncExclusions::resolve($sqlConnector->getSqlServerConnection(), $inherited['excluded_ids']);
+            $this->exclusionSeeds = array_fill_keys($this->matchingExclusions, true);
+            $this->campaignHolds = array_fill_keys(ContactSyncExclusions::resolve(
+                $sqlConnector->getSqlServerConnection(), $inherited['campaign_hold_ids'], null), true);
+        }
+        if ($this->option('campaign-scope-file')) {
+            if ($this->source !== 'PLAW') throw new \RuntimeException('Only PLAW may inherit the completed LDR campaign scope.');
+            $prior = ContactSyncRunScope::read((string) $this->option('campaign-scope-file'), 'LDR');
+            $this->campaignHolds += array_fill_keys(ContactSyncExclusions::resolve(
+                $sqlConnector->getSqlServerConnection(), $prior['campaign_hold_ids'], null), true);
+        }
 
         // Determine sync mode.
         // Incremental: fetch only contacts modified since the last successful run,
@@ -368,9 +423,6 @@ class SyncContactsData extends Command
         // This timestamp is written to the file only after the entire run succeeds,
         // ensuring a failed/partial run never advances the watermark.
         $syncStartedAt = date('Y-m-d H:i:s');
-        if (!$dryRun && !$this->option('debt-only')) {
-            $this->pendingMailerSuffixes = $this->fetchMailerSuffixes($snowflake, $startDate);
-        }
 
         $lastId           = 0;
         $categoryChanges  = [];
@@ -395,6 +447,19 @@ class SyncContactsData extends Command
                 break;
             }
 
+            foreach ($chunk as $row) {
+                $id = 'LLG-' . (string) ($row['LLG_ID'] ?? '');
+                $this->sourceLinks[$id] = $this->sourceLinks[$id] ?? [$id];
+                $reference = (string) ($row['EXTERNAL_ID'] ?? '');
+                if ($this->source !== 'LT' && ContactSyncIdentity::validNativeId($reference)) {
+                    $this->sourceLinks[$id][] = 'LLG-' . $reference;
+                    $this->sourceLinks[$id] = array_values(array_unique($this->sourceLinks[$id]));
+                }
+                if (array_intersect($this->sourceLinks[$id], $this->matchingExclusions) !== []) {
+                    $this->recordContactFlag(['id' => $id, 'code' => 'related_contact_review',
+                        'message' => 'A linked LT file requires review; backend intake was excluded.'], true);
+                }
+            }
             $totalFetched += $chunkSize;
             $firstId = (int) ($chunk[0]['LLG_ID'] ?? 0);
             $nextId = (int) (end($chunk)['LLG_ID'] ?? 0);
@@ -469,9 +534,11 @@ class SyncContactsData extends Command
             }
 
             foreach ($newCatChanges as $c) {
+                $c['related_ids'] = $this->sourceLinks[$c['llg_id']] ?? [$c['llg_id']];
                 if (!isset($this->skippedContactIds[$c['llg_id']])) $categoryChanges[] = $c;
             }
             foreach ($newAffChanges as $c) {
+                $c['related_ids'] = $this->sourceLinks[$c['llg_id']] ?? [$c['llg_id']];
                 if (!isset($this->skippedContactIds[$c['llg_id']])) $affiliateChanges[] = $c;
             }
 
@@ -494,14 +561,6 @@ class SyncContactsData extends Command
         if ($this->refreshStage !== null) {
             $this->publishFullRefresh($totalInserted);
         }
-        if ($this->mailerSuffixCacheReady) {
-            $cleanup = $sqlConnector->querySqlServer('DROP TABLE IF EXISTS #TmpMailerSuffixCache');
-            if (! ($cleanup['success'] ?? false)) {
-                $this->warn('[WARN] Temporary mailer suffix cache will be removed when the SQL Server connection closes.');
-            }
-            $this->mailerSuffixCacheReady = false;
-            $this->cachedMailerSuffixes = [];
-        }
         $action = $dryRun ? 'would be upserted' : 'upserted';
         $this->info("[INFO] Completed: {$totalInserted} records {$action} into {$this->targetTable}.");
         if ($dryRun) {
@@ -513,14 +572,16 @@ class SyncContactsData extends Command
             $this->info("[INFO] Enrollment updates: " . \count($categoryChanges) . " category, " . \count($affiliateChanges) . " affiliate agent");
         }
 
-        if (!$this->option('debt-only')) {
-            $this->applyEnrollmentCategoryUpdates($sqlConnector, $categoryChanges);
-            $this->applyEnrollmentAffiliateUpdates($sqlConnector, $affiliateChanges);
+        if (!$this->option('debt-only') && !$this->option('scope-file')) {
+            $this->prepareMatchingScope($sqlConnector);
+            $this->applyDeferredEnrollmentChanges($sqlConnector, [$this->source => [
+                'categories' => $categoryChanges, 'affiliates' => $affiliateChanges,
+            ]]);
         }
 
         // When called from the orchestrator (no --source flag), matching is deferred
         // to handle() so it runs after ALL sources finish. Skip it here in that case.
-        if (!$this->option('no-match') && !$this->option('debt-only') && ($dryRun || $this->skippedContactIds === [])) {
+        if (!$this->option('no-match') && !$this->option('debt-only')) {
             if ($dryRun) {
                 $this->warn('[DRY RUN] Previewing post-sync matching (read-only)...');
             }
@@ -532,17 +593,14 @@ class SyncContactsData extends Command
                 return Command::FAILURE;
             }
         }
-        if (!$dryRun && $this->skippedContactIds !== [] && !$this->option('no-match')) {
-            $this->warn('[WARN] Post-sync matching was not run because some records were skipped.');
-        }
 
         // Persist the watermark only after a fully successful run. An owners-refresh
         // is a wide corrective sweep, not a chronological checkpoint — leave the
         // incremental watermark untouched so the next scheduled incremental run
         // still picks up everything modified since the last real incremental.
-        if (!$dryRun && $this->skippedContactIds !== []) {
+        if (!$dryRun && $this->exclusionSeeds !== []) {
             $this->warn('[WARN] Sync checkpoint retained so skipped records are retried on the next run.');
-        } elseif (!$dryRun && !$ownersRefresh) {
+        } elseif (!$dryRun && !$ownersRefresh && !$this->option('no-match')) {
             $this->writeLastSyncTime($this->source, $syncStartedAt);
             $this->info("[INFO] Sync watermark saved: {$syncStartedAt}");
         } elseif ($ownersRefresh) {
@@ -561,6 +619,14 @@ class SyncContactsData extends Command
         } else {
             $this->info($dryRun ? "[SUCCESS] {$this->source} dry run completed; no changes applied."
                 : "[SUCCESS] {$this->source} sync completed successfully!");
+        }
+        if ($this->option('scope-file')) {
+            ContactSyncRunScope::write((string) $this->option('scope-file'), [
+                'source' => $this->source, 'complete' => true, 'started_at' => $syncStartedAt,
+                'excluded_ids' => array_keys($this->exclusionSeeds), 'campaigns' => $this->verifiedCampaigns,
+                'campaign_hold_ids' => array_keys($this->campaignHolds),
+                'enrollment_changes' => ['categories' => $categoryChanges, 'affiliates' => $affiliateChanges],
+            ]);
         }
         return Command::SUCCESS;
     }
@@ -641,7 +707,7 @@ class SyncContactsData extends Command
                 SELECT c.*
                 FROM CONTACTS AS c
                 WHERE {$changed}
-                  AND c.DEL = 'FALSE' AND c._FIVETRAN_DELETED = FALSE
+                  AND c.DEL = 'FALSE' AND (c._FIVETRAN_DELETED = FALSE OR c._FIVETRAN_DELETED IS NULL)
                   AND c.FIRSTNAME IS NOT NULL AND c.FIRSTNAME <> ''
                   AND c.ISCOAPP = 0
                   AND c.ID > {$lastId}
@@ -652,7 +718,7 @@ class SyncContactsData extends Command
                 SELECT s.CONTACT_ID, s.STAGE_ID, s.STATUS_ID, s.STAMP
                 FROM CONTACTS_STATUS AS s
                 JOIN contact_page AS p ON p.ID = s.CONTACT_ID
-                WHERE s._FIVETRAN_DELETED = FALSE
+                WHERE (s._FIVETRAN_DELETED = FALSE OR s._FIVETRAN_DELETED IS NULL)
                 QUALIFY ROW_NUMBER() OVER (PARTITION BY s.CONTACT_ID ORDER BY s.STAMP DESC, s.ID DESC) = 1
             ),
             page_scores AS (
@@ -677,7 +743,7 @@ class SyncContactsData extends Command
                 SELECT d.CONTACT_ID, SUM(d.ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT
                 FROM DEBTS AS d
                 JOIN contact_page AS p ON p.ID = d.CONTACT_ID
-                WHERE d.ENROLLED = 1 AND d._FIVETRAN_DELETED = FALSE
+                WHERE d.ENROLLED = 1 AND (d._FIVETRAN_DELETED = FALSE OR d._FIVETRAN_DELETED IS NULL)
                 GROUP BY d.CONTACT_ID
             ),
             page_debt_field AS (
@@ -725,8 +791,8 @@ class SyncContactsData extends Command
                 uf_agent.F_SHORTSTRING AS AGENT_CUSTOM
             FROM contact_page AS c
             LEFT JOIN DATA_SOURCES AS ds ON c.C_SOURCE = ds.ID
-            LEFT JOIN USERS AS u1 ON c.CREATED_BY = u1.UID AND u1._FIVETRAN_DELETED = FALSE
-            LEFT JOIN USERS AS u2 ON c.ASSIGNED_TO = u2.UID AND u2._FIVETRAN_DELETED = FALSE
+            LEFT JOIN USERS AS u1 ON c.CREATED_BY = u1.UID AND (u1._FIVETRAN_DELETED = FALSE OR u1._FIVETRAN_DELETED IS NULL)
+            LEFT JOIN USERS AS u2 ON c.ASSIGNED_TO = u2.UID AND (u2._FIVETRAN_DELETED = FALSE OR u2._FIVETRAN_DELETED IS NULL)
             LEFT JOIN page_status AS s ON c.ID = s.CONTACT_ID
             LEFT JOIN CONTACTS_CATEGORIES AS cc ON s.STAGE_ID = cc.ID
             LEFT JOIN CONTACTS_LEAD_STATUS AS cls ON s.STATUS_ID = cls.ID
@@ -752,7 +818,7 @@ class SyncContactsData extends Command
                 SELECT c.*
                 FROM CONTACTS c
                 WHERE {$changed}
-                  AND c.DEL = 'FALSE' AND c._FIVETRAN_DELETED = FALSE
+                  AND c.DEL = 'FALSE' AND (c._FIVETRAN_DELETED = FALSE OR c._FIVETRAN_DELETED IS NULL)
                   AND c.FIRSTNAME IS NOT NULL AND c.FIRSTNAME <> ''
                   AND c.ISCOAPP = 0
                   AND c.ID > {$lastId}
@@ -761,8 +827,8 @@ class SyncContactsData extends Command
                       JOIN CONTACTS_LEAD_STATUS eligible_lead ON eligible_status.STATUS_ID = eligible_lead.ID
                       WHERE eligible_status.CONTACT_ID = c.ID
                         AND eligible_lead.TITLE <> 'Duplicate Lead'
-                        AND eligible_status._FIVETRAN_DELETED = FALSE
-                        AND eligible_lead._FIVETRAN_DELETED = FALSE
+                        AND (eligible_status._FIVETRAN_DELETED = FALSE OR eligible_status._FIVETRAN_DELETED IS NULL)
+                        AND (eligible_lead._FIVETRAN_DELETED = FALSE OR eligible_lead._FIVETRAN_DELETED IS NULL)
                   )
                 ORDER BY c.ID
                 LIMIT {$limit}
@@ -771,7 +837,7 @@ class SyncContactsData extends Command
                 SELECT a.CONTACT_ID, a.STAMP
                 FROM CONTACTS_ASSIGNED AS a
                 JOIN contact_page AS p ON p.ID = a.CONTACT_ID
-                WHERE a._FIVETRAN_DELETED = FALSE
+                WHERE (a._FIVETRAN_DELETED = FALSE OR a._FIVETRAN_DELETED IS NULL)
                 QUALIFY ROW_NUMBER() OVER (PARTITION BY a.CONTACT_ID ORDER BY a.STAMP DESC, a.ID DESC) = 1
             ),
             page_status AS (
@@ -780,7 +846,7 @@ class SyncContactsData extends Command
                 JOIN contact_page AS p ON p.ID = s.CONTACT_ID
                 JOIN CONTACTS_LEAD_STATUS AS eligible_cls ON eligible_cls.ID = s.STATUS_ID
                 WHERE eligible_cls.TITLE <> 'Duplicate Lead'
-                  AND s._FIVETRAN_DELETED = FALSE AND eligible_cls._FIVETRAN_DELETED = FALSE
+                  AND (s._FIVETRAN_DELETED = FALSE OR s._FIVETRAN_DELETED IS NULL) AND (eligible_cls._FIVETRAN_DELETED = FALSE OR eligible_cls._FIVETRAN_DELETED IS NULL)
                 QUALIFY ROW_NUMBER() OVER (PARTITION BY s.CONTACT_ID ORDER BY s.STAMP DESC, s.ID DESC) = 1
             ),
             page_scores AS (
@@ -839,8 +905,8 @@ class SyncContactsData extends Command
             FROM contact_page AS c
             LEFT JOIN page_assignment AS a ON c.ID = a.CONTACT_ID
             LEFT JOIN DATA_SOURCES AS ds ON c.C_SOURCE = ds.ID
-            LEFT JOIN USERS AS u1 ON c.CREATED_BY = u1.UID AND u1._FIVETRAN_DELETED = FALSE
-            LEFT JOIN USERS AS u2 ON c.ASSIGNED_TO = u2.UID AND u2._FIVETRAN_DELETED = FALSE
+            LEFT JOIN USERS AS u1 ON c.CREATED_BY = u1.UID AND (u1._FIVETRAN_DELETED = FALSE OR u1._FIVETRAN_DELETED IS NULL)
+            LEFT JOIN USERS AS u2 ON c.ASSIGNED_TO = u2.UID AND (u2._FIVETRAN_DELETED = FALSE OR u2._FIVETRAN_DELETED IS NULL)
             JOIN page_status AS s ON c.ID = s.CONTACT_ID
             LEFT JOIN CONTACTS_CATEGORIES AS cc ON s.STAGE_ID = cc.ID
             LEFT JOIN CONTACTS_LEAD_STATUS AS cls ON s.STATUS_ID = cls.ID
@@ -913,246 +979,40 @@ class SyncContactsData extends Command
         ];
     }
 
-    /**
-     * Fetches drop names only for the External_IDs present in this chunk.
-     * Uses a SQL Server temp table to avoid loading all of TblMailers.
-     * Preserves fallback matching on the last 9 characters of External_ID.
-     */
+    /** Resolve full offer attribution; previews and writes use the same SELECTs. */
     private function fetchDropNamesFiltered(DBConnector $connector, array $chunk): array
     {
-        $externalIds = [];
-        foreach ($chunk as $row) {
-            $tpId = \trim((string) ($row['EXTERNAL_ID'] ?? ''));
-            if ($tpId !== '') {
-                $externalIds[$tpId] = true;
-            }
-        }
-
-        if (empty($externalIds)) {
-            return [];
-        }
-
-        $externalIds = \array_keys($externalIds);
-        $lookup = [];
-        $suffixLookup = [];
-
-        if ($this->option('dry-run')) {
-            foreach (array_chunk($externalIds, 1000) as $batch) {
-                $ids = $this->sqlStringList(array_map(fn($id) => substr((string) $id, 0, 50), $batch));
-                $started = microtime(true);
-                $this->info('[PREVIEW] Mailer exact lookup starting (' . count($batch) . ' IDs).');
-                $rows = $this->selectPreviewRows($connector,
-                    "SELECT External_ID, Drop_Name FROM TblMailers WHERE External_ID IN ({$ids}) AND Drop_Name IS NOT NULL");
-                $this->info(sprintf('[PREVIEW] Mailer exact lookup finished (%.1fs).', microtime(true) - $started));
-                $this->mergeDropNameLookup($lookup, $rows);
-            }
-            $missTails = [];
-            foreach ($externalIds as $extId) {
-                if (!array_key_exists($extId, $lookup) && strlen((string) $extId) > 9) {
-                    $tail = substr((string) $extId, -9);
-                    $missTails[$tail] = true;
+        $lt = $this->source === 'LT' ? null : $this->initializeLendingTowerConnector();
+        $sources = $lt === null ? [] : ['LT' => $lt];
+        $this->campaignProofs = ContactSyncCampaignLookup::collect($connector, $chunk, $this->source, $lt,
+            function (string $source, string $sql) use (&$sources): array {
+                $sources[$source] ??= DBConnector::fromEnvironment(strtolower($source));
+                $result = $sources[$source]->query($sql, [], 60);
+                if (($result['success'] ?? true) !== true || !is_array($result['data'] ?? null)
+                    || !empty($result['error']) || !empty($result['truncated'])
+                    || (isset($result['rowCount']) && (int) $result['rowCount'] !== count($result['data']))) {
+                    throw new \RuntimeException('Incomplete campaign identity evidence response.');
                 }
-            }
-            foreach (array_chunk(array_keys($missTails), 500) as $batch) {
-                $tails = $this->sqlStringList($batch);
-                $started = microtime(true);
-                $this->info('[PREVIEW] Mailer suffix lookup starting (' . count($batch) . ' suffixes).');
-                $rows = $this->selectPreviewRows($connector,
-                    "SELECT External_ID, Drop_Name FROM TblMailers WHERE External_ID IS NOT NULL
-                     AND Drop_Name IS NOT NULL AND LEN(External_ID) > 9 AND RIGHT(External_ID, 9) IN ({$tails})");
-                $this->info(sprintf('[PREVIEW] Mailer suffix lookup finished (%.1fs).', microtime(true) - $started));
-                $this->mergeDropNameLookup($suffixLookup, $rows, true);
-            }
-            return $this->resolvedDropNames($chunk, $lookup, $suffixLookup);
+                return $result['data'];
+            });
+        $names = [];
+        foreach ($this->campaignProofs as $id => $proof) {
+            if ($proof['status'] === 'verified') $names[$id] = $proof['campaign'];
         }
-
-        // Exact match first; suffix matches are cached for the source run.
-        $this->checkedSql($connector, "CREATE TABLE #TmpMailerFilter (ExtId VARCHAR(50) NOT NULL)");
-        try {
-            foreach (\array_chunk($externalIds, 1000) as $batch) {
-                $values = \implode(', ', \array_map(
-                    fn($id) => "('" . \str_replace("'", "''", \substr($id, 0, 50)) . "')",
-                    $batch
-                ));
-                $this->checkedSql($connector, "INSERT INTO #TmpMailerFilter (ExtId) VALUES {$values}");
-            }
-
-            $exact = $this->checkedSql($connector, "
-                SELECT m.External_ID, m.Drop_Name
-                FROM TblMailers m
-                INNER JOIN #TmpMailerFilter f ON m.External_ID = f.ExtId
-                WHERE m.Drop_Name IS NOT NULL
-            ");
-            $this->mergeDropNameLookup($lookup, $exact['data'] ?? []);
-
-            $missTails = [];
-            foreach ($externalIds as $extId) {
-                if (array_key_exists($extId, $lookup)) {
-                    continue;
-                }
-                if (\strlen($extId) > 9) {
-                    $tail = \substr($extId, -9);
-                    $missTails[$tail] = true;
-                }
-            }
-
-            foreach (\array_chunk(\array_keys($missTails), 500) as $tailBatch) {
-                $this->loadMailerSuffixCache($connector, $tailBatch);
-                $inList = \implode(', ', \array_map(
-                    fn($t) => "'" . \str_replace("'", "''", $t) . "'",
-                    $tailBatch
-                ));
-                $fallback = $this->checkedSql($connector,
-                    "SELECT Suffix AS External_ID, Drop_Name FROM #TmpMailerSuffixCache WHERE Suffix IN ({$inList})"
-                );
-                if (! ($fallback['success'] ?? false)) {
-                    throw new \RuntimeException('Temporary TblMailers suffix lookup failed: ' . ($fallback['error'] ?? 'unknown SQL Server error'));
-                }
-                $this->mergeDropNameLookup($suffixLookup, $fallback['data'] ?? [], true);
-            }
-        } finally {
-            $this->checkedSql($connector, "DROP TABLE IF EXISTS #TmpMailerFilter");
-        }
-
-        return $this->resolvedDropNames($chunk, $lookup, $suffixLookup);
+        return $names;
     }
 
-    private function ensureMailerSuffixCache(DBConnector $connector): void
+    protected function initializeLendingTowerConnector(): DBConnector
     {
-        if ($this->mailerSuffixCacheReady) {
-            return;
-        }
-
-        $create = $this->checkedSql($connector,
-            "SET NOCOUNT ON;
-             SELECT TOP (0) CAST(RIGHT(External_ID, 9) AS varchar(9)) AS Suffix, Drop_Name
-             INTO #TmpMailerSuffixCache FROM TblMailers;
-             SET NOCOUNT OFF;"
-        );
-        if (! ($create['success'] ?? false)) {
-            throw new \RuntimeException('Unable to create temporary mailer suffix cache: ' . ($create['error'] ?? 'unknown SQL Server error'));
-        }
-
-        $index = $this->checkedSql($connector,
-            'CREATE NONCLUSTERED INDEX IX_TmpMailerSuffixCache_Suffix ON #TmpMailerSuffixCache (Suffix)'
-        );
-        if (! ($index['success'] ?? false)) {
-            throw new \RuntimeException('Unable to index temporary mailer suffix cache: ' . ($index['error'] ?? 'unknown SQL Server error'));
-        }
-
-        $this->mailerSuffixCacheReady = true;
-        $this->info('[INFO] Created temporary TblMailers suffix cache for requested suffixes.');
+        return DBConnector::fromEnvironment('lt');
     }
 
-    private function loadMailerSuffixCache(DBConnector $connector, array $suffixes): void
+    protected function initializeMatchingConnector(): DBConnector
     {
-        $this->ensureMailerSuffixCache($connector);
-        $requested = $this->pendingMailerSuffixes + array_fill_keys($suffixes, true);
-        $missing = array_diff_key($requested, $this->cachedMailerSuffixes);
-        if ($missing === []) {
-            return;
-        }
-
-        $create = $this->checkedSql($connector,
-            "SET NOCOUNT ON;
-             SELECT TOP (0) CAST(RIGHT(External_ID, 9) AS varchar(9)) AS Suffix
-             INTO #TmpMailerSuffixFilter FROM TblMailers;
-             CREATE UNIQUE CLUSTERED INDEX IX_TmpMailerSuffixFilter_Suffix ON #TmpMailerSuffixFilter (Suffix);
-             SET NOCOUNT OFF;"
-        );
-        if (! ($create['success'] ?? false)) {
-            throw new \RuntimeException('Unable to create mailer suffix filter: ' . ($create['error'] ?? 'unknown SQL Server error'));
-        }
-        try {
-            foreach (array_chunk(array_keys($missing), 1000) as $batch) {
-                $values = implode(', ', array_map(fn($tail) => "('" . $this->escSql((string) $tail) . "')", $batch));
-                $insert = $this->checkedSql($connector, "INSERT INTO #TmpMailerSuffixFilter (Suffix) VALUES {$values}");
-                if (! ($insert['success'] ?? false)) {
-                    throw new \RuntimeException('Unable to fill mailer suffix filter: ' . ($insert['error'] ?? 'unknown SQL Server error'));
-                }
-            }
-            $populate = $this->checkedSql($connector,
-                "INSERT INTO #TmpMailerSuffixCache (Suffix, Drop_Name)
-                 SELECT CAST(RIGHT(m.External_ID, 9) AS varchar(9)), m.Drop_Name
-                 FROM #TmpMailerSuffixFilter f
-                 INNER HASH JOIN TblMailers m ON RIGHT(m.External_ID, 9) = f.Suffix
-                 WHERE m.External_ID IS NOT NULL AND m.Drop_Name IS NOT NULL AND LEN(m.External_ID) > 9"
-            );
-            if (! ($populate['success'] ?? false)) {
-                throw new \RuntimeException('Unable to populate temporary mailer suffix cache: ' . ($populate['error'] ?? 'unknown SQL Server error'));
-            }
-        } finally {
-            $this->checkedSql($connector, 'DROP TABLE IF EXISTS #TmpMailerSuffixFilter');
-        }
-
-        $this->cachedMailerSuffixes += $missing;
-        $this->pendingMailerSuffixes = [];
-        $this->info('[INFO] Cached mailer lookup for ' . count($missing) . ' requested suffix(es).');
+        $connector = DBConnector::fromEnvironment('ldr');
+        $connector->initializeSqlServer();
+        return $connector;
     }
-
-    private function fetchMailerSuffixes(DBConnector $snowflake, string $startDate): array
-    {
-        $changed = $this->contactChangedSql($startDate);
-        $result = $snowflake->query(
-            "SELECT DISTINCT c.TP_ID AS EXTERNAL_ID FROM CONTACTS c
-             WHERE {$changed}
-               AND c.DEL = 'FALSE' AND c._FIVETRAN_DELETED = FALSE AND c.FIRSTNAME IS NOT NULL AND c.FIRSTNAME <> ''
-               AND c.ISCOAPP = 0 AND c.ID > 0"
-        );
-        if (($result['success'] ?? true) === false || !isset($result['data']) || !is_array($result['data'])
-            || (isset($result['rowCount']) && (int) $result['rowCount'] !== count($result['data']))) {
-            throw new \RuntimeException('Snowflake did not return a complete mailer suffix list.');
-        }
-        $suffixes = [];
-        foreach ($result['data'] as $row) {
-            if (!array_key_exists('EXTERNAL_ID', $row)) {
-                throw new \RuntimeException('Snowflake mailer suffix list is missing EXTERNAL_ID.');
-            }
-            $externalId = trim((string) $row['EXTERNAL_ID']);
-            if (strlen($externalId) > 9) {
-                $suffixes[substr($externalId, -9)] = true;
-            }
-        }
-        $this->info('[INFO] Planned ' . count($suffixes) . ' mailer suffix(es) for this source run.');
-        return $suffixes;
-    }
-
-    /** Conflicting campaign values stay ambiguous regardless of result order. */
-    private function mergeDropNameLookup(array &$lookup, array $rows, bool $suffix = false): void
-    {
-        foreach ($rows as $row) {
-            $externalId = (string) ($row['External_ID'] ?? '');
-            $dropName   = (string) ($row['Drop_Name'] ?? '');
-            if ($externalId === '' || $dropName === '') {
-                continue;
-            }
-            $key = $suffix ? substr($externalId, -9) : $externalId;
-            $lookup[$key] = array_key_exists($key, $lookup) && $lookup[$key] !== $dropName ? null : $dropName;
-        }
-    }
-
-    private function resolvedDropNames(array $chunk, array $exact, array $suffixes): array
-    {
-        $resolved = [];
-        foreach ($chunk as $row) {
-            $id = trim((string) ($row['EXTERNAL_ID'] ?? ''));
-            if ($id === '' || $this->isFakeExternalId($id)) continue;
-            $tail = substr($id, -9);
-            $value = array_key_exists($id, $exact) ? $exact[$id]
-                : (array_key_exists($tail, $suffixes) ? $suffixes[$tail] : '');
-            if ($value === null) {
-                $this->recordContactFlag(['id' => 'LLG-' . ($row['LLG_ID'] ?? ''), 'code' => 'ambiguous_mailer_campaign',
-                    'message' => 'Conflicting mailer campaign values; contact was skipped without choosing a campaign.'], true);
-                continue;
-            }
-            if ($value !== '') $resolved[$id] = $value;
-        }
-        return $resolved;
-    }
-
-    // -------------------------------------------------------------------------
-    // Processing
-    // -------------------------------------------------------------------------
 
     /** Loan/requested amount and enrolled debt are deliberately separate. */
     private function resolveDebtValues(array $row): array
@@ -1188,16 +1048,6 @@ class SyncContactsData extends Command
             'basis' => $validLoan ? 'loan' : ($enrolled > 0 ? 'enrolled_fallback' : 'no_debt')];
     }
 
-    private function checkedSql(DBConnector $connector, string $sql): array
-    {
-        $result = $connector->querySqlServer($sql);
-        if (!($result['success'] ?? false)) {
-            throw new \RuntimeException('Contact lookup SQL failed: ' . ($result['error'] ?? 'unknown error'));
-        }
-        return $result;
-    }
-
-    /** Only SELECTs, including when the normal sync uses temporary lookup tables. */
     private function selectPreviewRows(DBConnector $connector, string $sql): array
     {
         $result = $connector->querySqlServer($sql);
@@ -1334,7 +1184,7 @@ class SyncContactsData extends Command
 
             $campaign = '';
             if ($tpId) {
-                $campaign = $dropNames[$tpId] ?? '';
+                $campaign = $dropNames[$contactId] ?? '';
             }
 
             $processedRow = [
@@ -1343,6 +1193,7 @@ class SyncContactsData extends Command
                 'llg_id'             => 'LLG-' . $contactId,
                 'external_id'        => \substr($tpId, 0, 50),
                 'campaign'           => \substr($campaign, 0, 255),
+                '_campaign_proof'    => $this->campaignProofs[$contactId] ?? null,
                 'data_source'        => \substr($row['DATA_SOURCE'] ?? '', 0, 255),
                 'created_by'         => \substr($row['CREATED_BY'] ?? '', 0, 255),
                 'agent'              => \substr($agent, 0, 255),
@@ -1409,7 +1260,7 @@ class SyncContactsData extends Command
                 $this->insertContactRows($pdo, $this->contactFields(), $data);
                 $count = count($data);
             } else {
-                $plan = $this->acceptedContactPlan(ContactSyncTargets::plan($pdo, $data, $this->source, true, $evidence, true));
+                $plan = $this->acceptedContactPlan(ContactSyncTargets::plan($pdo, $data, $this->source, true, $evidence, true, array_keys($this->campaignHolds)));
                 $count = ContactSyncTargets::apply($pdo, $plan, $this->source);
             }
             if (!$pdo->commit()) {
@@ -1428,7 +1279,7 @@ class SyncContactsData extends Command
     {
         $rows = array_values(array_filter($rows, fn ($row) => !isset($this->skippedContactIds[$row['llg_id']])));
         $evidence = $this->contactEvidence($connector, $rows);
-        $plan = $this->acceptedContactPlan(ContactSyncTargets::plan($connector->getSqlServerConnection(), $rows, $this->source, false, $evidence, true));
+        $plan = $this->acceptedContactPlan(ContactSyncTargets::plan($connector->getSqlServerConnection(), $rows, $this->source, false, $evidence, true, array_keys($this->campaignHolds)));
         $byId = array_column($rows, null, 'llg_id');
         foreach ($plan as $change) {
             $debtRow = $byId[$change['incoming_id']];
@@ -1456,6 +1307,10 @@ class SyncContactsData extends Command
     {
         $accepted = [];
         foreach ($plan as $change) {
+            foreach ($change['campaign_hold_ids'] ?? [] as $id) {
+                $this->campaignHolds[$id] = true;
+                unset($this->verifiedCampaigns[$id]);
+            }
             $skip = (bool) ($change['skip'] ?? false);
             $warnings = $change['warnings'] ?? [];
             if ($skip && $warnings === []) {
@@ -1464,15 +1319,34 @@ class SyncContactsData extends Command
             foreach ($warnings as $warning) {
                 $this->recordContactFlag(['id' => $change['incoming_id']] + $warning, $skip);
             }
-            if (!$skip) $accepted[] = $change;
+            if (!$skip) {
+                $accepted[] = $change;
+                $proof = $change['campaign_proof'] ?? null;
+                if (($proof['status'] ?? '') === 'verified') {
+                    foreach ($change['campaign_proof_ids'] ?? [$change['target_id']] as $id) {
+                        $this->rememberCampaignProof($id, $proof['campaign']);
+                    }
+                }
+            }
         }
         return $accepted;
+    }
+
+    private function rememberCampaignProof(string $id, string $campaign): void
+    {
+        if (isset($this->verifiedCampaigns[$id]) && $this->verifiedCampaigns[$id] !== $campaign) {
+            $this->recordContactFlag(['id' => $id, 'code' => 'campaign_proof_conflict',
+                'message' => 'Sources disagree on campaign attribution; campaign fills withheld.'], false);
+            $this->campaignHolds[$id] = true;
+        }
+        if (isset($this->campaignHolds[$id])) unset($this->verifiedCampaigns[$id]);
+        else $this->verifiedCampaigns[$id] = $campaign;
     }
 
     /** Identity values and evidence tokens never belong in a record flag. */
     private function recordContactFlag(array $warning, bool $skip): void
     {
-        $flag = ['source' => $this->source ?? 'UNKNOWN', 'id' => (string) ($warning['id'] ?? ''),
+        $flag = ['source' => $this->source ?? 'MATCH', 'id' => (string) ($warning['id'] ?? ''),
             'code' => (string) ($warning['code'] ?? 'contact_conflict'),
             'message' => (string) ($warning['message'] ?? 'Record requires review.'), 'skipped' => $skip];
         foreach (['winner', 'duplicates', 'candidates', 'stale_candidates'] as $key) {
@@ -1482,7 +1356,17 @@ class SyncContactsData extends Command
                 'id' => (string) ($item['id'] ?? '')], $ids);
             $flag[$key] = $key === 'winner' ? $ids[0] : $ids;
         }
-        if ($skip) $this->skippedContactIds[$flag['id']] = true;
+        if ($skip) {
+            $this->skippedContactIds[$flag['id']] = true;
+            foreach (array_merge($this->sourceLinks[$flag['id']] ?? [$flag['id']], $warning['related_ids'] ?? []) as $id) {
+                $this->exclusionSeeds[(string) $id] = true;
+            }
+        } elseif ($flag['code'] === 'campaign_attribution_preserved') {
+            foreach (array_merge($this->sourceLinks[$flag['id']] ?? [$flag['id']], $warning['related_ids'] ?? []) as $id) {
+                $this->campaignHolds[(string) $id] = true;
+                unset($this->verifiedCampaigns[(string) $id]);
+            }
+        }
         $key = $flag['source'] . ':' . $flag['id'] . ':' . $flag['code'];
         if (!isset($this->contactFlags[$key])) {
             $this->contactFlags[$key] = $flag;
@@ -1571,7 +1455,8 @@ class SyncContactsData extends Command
 
     private function applyEnrollmentFieldChanges(DBConnector $connector, array $changes, string $field, string $key): void
     {
-        $changes = array_values(array_filter($changes, fn ($change) => !isset($this->skippedContactIds[$change['llg_id']])));
+        $blocked = array_fill_keys($this->matchingExclusions, true) + $this->skippedContactIds;
+        $changes = array_values(array_filter($changes, fn ($change) => !isset($blocked[$change['llg_id']])));
         $name = $this->contactNameMatchSql('e', 'u');
         $identity = ContactSyncIdentity::sql('c', 'u');
         $owner = ContactSyncMatching::enrollmentOwnerSql('c');
@@ -1671,7 +1556,7 @@ class SyncContactsData extends Command
         $target = $this->targetTable;
         $rows = array_values(array_filter($rows, fn ($row) => !isset($this->skippedContactIds[$row['llg_id']])));
         $evidence = $this->contactEvidence($connector, $rows);
-        $plan = $this->acceptedContactPlan(ContactSyncTargets::plan($connector->getSqlServerConnection(), $rows, $this->source, false, $evidence, true));
+        $plan = $this->acceptedContactPlan(ContactSyncTargets::plan($connector->getSqlServerConnection(), $rows, $this->source, false, $evidence, true, array_keys($this->campaignHolds)));
         $rows = array_column($plan, 'after');
         try {
             $this->targetTable = $this->refreshStage;
@@ -1724,6 +1609,7 @@ class SyncContactsData extends Command
 
     private function updateRelatedTables(DBConnector $connector): bool
     {
+        $this->prepareMatchingScope($connector);
         if ($this->source === 'LT') {
             return true;
         }
@@ -1732,7 +1618,7 @@ class SyncContactsData extends Command
             return $this->previewMatching($connector, [$this->targetTable]);
         }
 
-        $this->resetMatchingStats(6);
+        $this->resetMatchingStats(5);
         $this->printMatchingHeader("{$this->source} post-sync matching");
         $this->matchSourceTableToContacts($connector, $this->targetTable);
         $this->fillEnrollmentAgents($connector, (bool) $this->option('reconcile-agents'));
@@ -1740,13 +1626,38 @@ class SyncContactsData extends Command
         return $this->logMatchingSummary("{$this->source} post-sync");
     }
 
+    private function prepareMatchingScope(DBConnector $connector): void
+    {
+        $pdo = $connector->getSqlServerConnection();
+        if (!$this->matchingScopePrepared) {
+            $review = ContactSyncMatching::campaignPreflight($pdo, $this->verifiedCampaigns);
+            foreach ($review['conflicts'] as $flag) {
+                $flag['related_ids'] = [$flag['id'], $flag['proof_id']];
+                $this->recordContactFlag($flag, false);
+                foreach ($flag['related_ids'] as $id) $this->campaignHolds[$id] = true;
+            }
+            $this->verifiedCampaigns = $review['verified_campaigns'];
+            $this->matchingScopePrepared = true;
+        }
+        $this->matchingExclusions = ContactSyncExclusions::resolve($pdo, array_keys($this->exclusionSeeds));
+        // Campaign holds only filter proof maps; they do not render large contact exclusion SQL.
+        $this->campaignHolds = array_fill_keys(ContactSyncExclusions::resolve($pdo, array_keys($this->campaignHolds), null), true);
+        $this->verifiedCampaigns = array_diff_key($this->verifiedCampaigns,
+            array_fill_keys($this->matchingExclusions, true) + $this->campaignHolds);
+        $this->info('[MATCH SCOPE] ' . count($this->matchingExclusions) . ' linked IDs excluded; '
+            . count($this->campaignHolds) . ' IDs retain attribution; '
+            . count($this->verifiedCampaigns) . ' verified blank campaign fills eligible.');
+    }
+
     private function runFinalMatching(DBConnector $connector): bool
     {
+        $this->prepareMatchingScope($connector);
+        $this->applyDeferredEnrollmentChanges($connector, $this->deferredEnrollmentChanges);
         if ($this->option('dry-run')) {
             return $this->previewMatching($connector, ['TblContactsLDR', 'TblContactsPLAW']);
         }
 
-        $this->resetMatchingStats(10);
+        $this->resetMatchingStats(8);
         $this->printMatchingHeader('orchestrator final matching (External ID → TblContacts → TblEnrollment)');
 
         foreach (['TblContactsLDR', 'TblContactsPLAW'] as $table) {
@@ -1760,6 +1671,15 @@ class SyncContactsData extends Command
         return $this->logMatchingSummary('orchestrator final');
     }
 
+    private function applyDeferredEnrollmentChanges(DBConnector $connector, array $bySource): void
+    {
+        $review = ContactSyncEnrollmentChanges::preflight($connector, $bySource);
+        foreach ($review['flags'] as $flag) $this->recordContactFlag($flag, true);
+        $this->prepareMatchingScope($connector);
+        $this->applyEnrollmentCategoryUpdates($connector, $review['categories']);
+        $this->applyEnrollmentAffiliateUpdates($connector, $review['affiliates']);
+    }
+
     /**
      * Read-only preview: exact current target/field differences plus Jacob gap queries.
      * No UPDATE statements are executed.
@@ -1767,7 +1687,7 @@ class SyncContactsData extends Command
     private function previewMatching(DBConnector $connector, array $tables): bool
     {
         // Current-state previews cannot simulate subsequent matching steps without writing.
-        $this->resetMatchingStats((\count($tables) * 4) + 2 + 6);
+        $this->resetMatchingStats((\count($tables) * 3) + 2 + 6);
         $this->printMatchingHeader('DRY RUN — matching verification (read-only, no writes)');
 
         foreach ($tables as $table) {
@@ -1785,14 +1705,14 @@ class SyncContactsData extends Command
     private function previewSourceTableMatching(DBConnector $connector, string $table): void
     {
         $source = $table === 'TblContactsLDR' ? 'LDR' : 'PLAW';
-        foreach (ContactSyncMatching::sourceSteps($source) as $step => $sql) {
+        foreach (ContactSyncMatching::sourceSteps($source, $this->matchingExclusions, $this->verifiedCampaigns) as $step => $sql) {
             $this->previewMatchingRows($connector, "{$table}.{$step}", $sql['preview']);
         }
     }
 
     private function previewEnrollmentAgentFixes(DBConnector $connector): void
     {
-        foreach (ContactSyncMatching::enrollmentSteps((bool) $this->option('reconcile-agents')) as $step => $sql) {
+        foreach (ContactSyncMatching::enrollmentSteps((bool) $this->option('reconcile-agents'), $this->matchingExclusions, $this->verifiedCampaigns) as $step => $sql) {
             $this->previewMatchingRows($connector, "enrollment.{$step}", $sql['preview']);
         }
     }
@@ -1871,6 +1791,7 @@ class SyncContactsData extends Command
     private function runVerifyMatchOnly(?string $source): int
     {
         $this->info('[INFO] Verify-match only: read-only SQL counts (no sync, no writes).');
+        $this->warn('[INFO] Structural preview only: no fresh source exclusions or campaign proofs. Use a full dry-run to preview the scoped workflow.');
 
         try {
             $connector = DBConnector::fromEnvironment('ldr');
@@ -1897,7 +1818,7 @@ class SyncContactsData extends Command
             return Command::FAILURE;
         }
 
-        $this->info('[SUCCESS] Verification complete. Re-run without --verify-match to apply fixes.');
+        $this->info('[SUCCESS] Structural verification complete; no source eligibility or campaign repair was approved.');
         return Command::SUCCESS;
     }
 
@@ -1910,7 +1831,7 @@ class SyncContactsData extends Command
     private function matchSourceTableToContacts(DBConnector $connector, string $table): void
     {
         $source = $table === 'TblContactsLDR' ? 'LDR' : 'PLAW';
-        foreach (ContactSyncMatching::sourceSteps($source) as $step => $sql) {
+        foreach (ContactSyncMatching::sourceSteps($source, $this->matchingExclusions, $this->verifiedCampaigns) as $step => $sql) {
             if (!$this->runMatchingStep($connector, "{$table}.{$step}", $sql['update'], "{$table}: {$step}")) {
                 throw new \RuntimeException("Matching failed at {$table}.{$step}; watermark must not advance.");
             }
@@ -1919,7 +1840,7 @@ class SyncContactsData extends Command
 
     private function fillEnrollmentAgents(DBConnector $connector, bool $reconcileAgents = false): void
     {
-        foreach (ContactSyncMatching::enrollmentSteps($reconcileAgents) as $step => $sql) {
+        foreach (ContactSyncMatching::enrollmentSteps($reconcileAgents, $this->matchingExclusions, $this->verifiedCampaigns) as $step => $sql) {
             if (!$this->runMatchingStep($connector, "enrollment.{$step}", $sql['update'], "Enrollment: {$step}")) {
                 throw new \RuntimeException("Enrollment matching failed at {$step}; watermark must not advance.");
             }
@@ -1996,18 +1917,7 @@ class SyncContactsData extends Command
         return $name;
     }
 
-    private function matchedFieldsSql(string $src): string
-    {
-        // Do not overwrite Agent — TblContacts.Agent comes from LT SF ASSIGNED_TO.
-        return "TblContacts.Affiliate_Agent = CASE WHEN COALESCE({$src}.Affiliate_Agent, '') <> '' THEN {$src}.Affiliate_Agent ELSE TblContacts.Affiliate_Agent END,
-                TblContacts.Campaign = CASE WHEN COALESCE({$src}.Campaign, '') <> '' THEN {$src}.Campaign ELSE TblContacts.Campaign END,
-                TblContacts.Category = CASE WHEN COALESCE({$src}.Category, '') <> '' THEN {$src}.Category ELSE TblContacts.Category END";
-    }
-
-    /**
-     * Require a non-empty, normalized client name before treating equal keys as a match.
-     * The source systems can reuse a numeric ID across companies, so IDs alone are not identity.
-     */
+    /** Require a non-empty normalized client name for enrollment reconciliation. */
     private function contactNameMatchSql(string $leftAlias, string $rightAlias): string
     {
         $left = $this->normalizedContactNameSql($leftAlias);

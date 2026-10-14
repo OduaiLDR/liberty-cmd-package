@@ -26,7 +26,8 @@ use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
  *   schedule_mode: specific_dates, specific_dates: [3], run_times: [06:00]
  *
  * Supported reports (email recipients from dbo.TblReports by Report_Name + Company):
- *   - Rama - Retention & NSF Manager   → Report_Name 'Retention & NSF Manager', Company 'Rama'
+ *   - Rama - Customer Support Manager  → Report_Name 'Retention & NSF Manager', Company 'Rama'
+ *     (renamed 2026-10-05 for display only; the TblReports key keeps the old name)
  *   - Nick - Retention Team Leader     → Report_Name 'Retention Team Leader', Company 'Nick'
  *   - Anthony - NSF Team Leader        → Report_Name 'NSF Team Leader', Company 'Anthony'
  */
@@ -47,7 +48,7 @@ class GenerateRetentionManagerCommission extends Command
                             {--all-data-sheet= : Optional sheet name for --all-data-xlsx; defaults to first sheet}
                             {--test-recipient= : Send EVERY manager report email only to this address}';
 
-    protected $description = 'Generate Rama - Retention & NSF Manager, Nick - Retention Team Leader, and/or Anthony - NSF Team Leader workbooks.';
+    protected $description = 'Generate Rama - Customer Support Manager, Nick - Retention Team Leader, and/or Anthony - NSF Team Leader workbooks.';
 
     private bool $hadFailures = false;
 
@@ -107,7 +108,7 @@ class GenerateRetentionManagerCommission extends Command
 
         return [
             'managerName' => 'Rama Davis',
-            'commissionType' => 'Retention & NSF Manager',
+            'commissionType' => $this->managerSheetTitle('rama'),
             'company' => 'LDR / Progress Law',
             'team' => $this->retentionTeamNames($rows),
             'summary' => [
@@ -518,7 +519,7 @@ class GenerateRetentionManagerCommission extends Command
         }
 
         if ($report === 'rama' || $report === 'both' || $report === 'all') {
-            $this->generateReport('rama', 'Rama - Retention & NSF Manager', $rows, $startDate, $endDate);
+            $this->generateReport('rama', 'Rama - ' . $this->managerSheetTitle('rama'), $rows, $startDate, $endDate);
         }
         if ($report === 'nick' || $report === 'both' || $report === 'all') {
             $this->generateReport('nick', 'Nick - Retention Team Leader', $rows, $startDate, $endDate);
@@ -635,7 +636,6 @@ class GenerateRetentionManagerCommission extends Command
             'RETENTION_DATE' => true,
             'RECONSIDERATION_DATE' => true,
             'DROPPED_DATE' => true,
-            'RETAINED_DATE' => true,
             'RETENTION_PAYMENT_DATE' => true,
             'CANCEL_REQUEST_DATE' => true,
             'CUT_OFF' => true,
@@ -715,7 +715,6 @@ class GenerateRetentionManagerCommission extends Command
             'RETENTION_DATE' => true,
             'RECONSIDERATION_DATE' => true,
             'DROPPED_DATE' => true,
-            'RETAINED_DATE' => true,
             'RETENTION_PAYMENT_DATE' => true,
             'CANCEL_REQUEST_DATE' => true,
         ];
@@ -786,7 +785,6 @@ class GenerateRetentionManagerCommission extends Command
             'CLEARED PAYMENTS' => 'CLEARED_PAYMENTS',
             'RECONSIDERATION DATE' => 'RECONSIDERATION_DATE',
             'DROPPED DATE' => 'DROPPED_DATE',
-            'RETAINED DATE' => 'RETAINED_DATE',
             'RETENTION PAYMENT DATE' => 'RETENTION_PAYMENT_DATE',
             'RETENTION COMMISSION T1' => 'T1',
             'RETENTION COMMISSION T2' => 'T2',
@@ -898,6 +896,8 @@ class GenerateRetentionManagerCommission extends Command
             return;
         }
 
+        // 'report' is the TblReports.Report_Name recipient lookup key, not display text: renaming it
+        // matches no row and the email goes to nobody. What people see comes from managerSheetTitle().
         $cfg = match ($key) {
             'rama' => ['report' => 'Retention & NSF Manager', 'company' => 'Rama'],
             'nick' => ['report' => 'Retention Team Leader', 'company' => 'Nick'],
@@ -916,8 +916,8 @@ class GenerateRetentionManagerCommission extends Command
         ];
 
         $sql = $this->initSqlServer('ldr');
-        $subject = (string) $cfg['report'];
-        $body = "See attached {$cfg['report']} report.";
+        $subject = $this->managerSheetTitle($key);
+        $body = "See attached {$subject} report.";
 
         // --test-recipient: redirect this manager report to one address instead of
         // the TblReports Send_To list.
@@ -1051,8 +1051,13 @@ class GenerateRetentionManagerCommission extends Command
         $reader->setReadDataOnly(true);
         $spreadsheet = $reader->load($path);
         if ($readinessRunIds !== null && in_array($sourceCode, ['ldr', 'plaw'], true)) {
-            $statusSheet = $spreadsheet->getSheetByName('Run Status');
-            if ($statusSheet) {
+            // Since 2026-10-05 the run ID is a document property (Jacob had the Run Status sheet
+            // removed). Snapshots written before that still carry it on the sheet.
+            $propertyRunId = strtolower(trim((string) $spreadsheet->getProperties()
+                ->getCustomPropertyValue(\Cmd\Reports\Console\Commands\GenerateNSFCommissionReport\Formatter::PROPERTY_RUN_ID)));
+            if (preg_match('/^[a-f0-9]{32}$/D', $propertyRunId)) {
+                $readinessRunIds[$sourceCode] = $propertyRunId;
+            } elseif ($statusSheet = $spreadsheet->getSheetByName('Run Status')) {
                 for ($row = 1; $row <= $statusSheet->getHighestDataRow(); $row++) {
                     if (strcasecmp(trim((string) $statusSheet->getCell("A{$row}")->getValue()), 'Run ID') !== 0) continue;
                     $runId = strtolower(trim((string) $statusSheet->getCell("B{$row}")->getValue()));
@@ -1414,15 +1419,15 @@ class GenerateRetentionManagerCommission extends Command
         $sheet->setTitle('Retention Data');
         $sheet->setShowGridlines(false);
 
-        // Header wording per Jacob, 2026-09-04: H = Reconsideration, K = Payment Date,
-        // L:O = "Tier N Rate".
+        // Header wording per Jacob, 2026-09-04: H = Reconsideration, J = Payment Date,
+        // K:N = "Tier N Rate".
         $headers = $key === 'rama'
-            ? ['ID', 'CLIENT', 'RETENTION AGENT', 'RETENTION DATE', 'IMMEDIATE RESULTS', 'ENROLLED DEBT', 'CLEARED PAYMENTS', 'Reconsideration', 'DROPPED DATE', 'RETAINED DATE', 'Payment Date', 'Tier 1 Rate', 'Tier 2 Rate', 'Tier 3 Rate', 'Tier 4 Rate', 'CANCEL REQUEST DATE', 'Tranche', 'Cut Off', 'Made Cut Off', 'Bonus']
-            : ['ID', 'CLIENT', 'RETENTION AGENT', 'RETENTION DATE', 'IMMEDIATE RESULTS', 'ENROLLED DEBT', 'CLEARED PAYMENTS', 'Reconsideration', 'DROPPED DATE', 'RETAINED DATE', 'Payment Date', 'Tier 1 Rate', 'Tier 2 Rate', 'Tier 3 Rate', 'Tier 4 Rate', 'CANCEL REQUEST DATE', 'Commission Rate', 'Commission Earned'];
+            ? ['ID', 'CLIENT', 'RETENTION AGENT', 'RETENTION DATE', 'IMMEDIATE RESULTS', 'ENROLLED DEBT', 'CLEARED PAYMENTS', 'Reconsideration', 'DROPPED DATE', 'Payment Date', 'Tier 1 Rate', 'Tier 2 Rate', 'Tier 3 Rate', 'Tier 4 Rate', 'CANCEL REQUEST DATE', 'Tranche', 'Cut Off', 'Made Cut Off', 'Bonus']
+            : ['ID', 'CLIENT', 'RETENTION AGENT', 'RETENTION DATE', 'IMMEDIATE RESULTS', 'ENROLLED DEBT', 'CLEARED PAYMENTS', 'Reconsideration', 'DROPPED DATE', 'Payment Date', 'Tier 1 Rate', 'Tier 2 Rate', 'Tier 3 Rate', 'Tier 4 Rate', 'CANCEL REQUEST DATE', 'Commission Rate', 'Commission Earned'];
         foreach ($headers as $i => $header) {
             $sheet->setCellValue($this->cell($i + 1, 1), $header);
         }
-        $lastHeaderCol = $key === 'rama' ? 'T' : 'R';
+        $lastHeaderCol = $key === 'rama' ? 'S' : 'Q';
         $this->headerStyle($sheet, "A1:{$lastHeaderCol}1");
 
         $nickPct = $this->overallPct($rows);
@@ -1438,34 +1443,33 @@ class GenerateRetentionManagerCommission extends Command
             $sheet->setCellValue("G{$r}", (int) $this->col($row, 'CLEARED_PAYMENTS', 0));
             $this->setDate($sheet, "H{$r}", $this->col($row, 'RECONSIDERATION_DATE'));
             $this->setDate($sheet, "I{$r}", $this->col($row, 'DROPPED_DATE'));
-            $this->setDate($sheet, "J{$r}", $this->col($row, 'RETAINED_DATE'));
-            $this->setDate($sheet, "K{$r}", $this->col($row, 'RETENTION_PAYMENT_DATE'));
-            $sheet->setCellValue("L{$r}", $this->col($row, 'T1', ''));
-            $sheet->setCellValue("M{$r}", $this->col($row, 'T2', ''));
-            $sheet->setCellValue("N{$r}", $this->col($row, 'T3', ''));
-            $sheet->setCellValue("O{$r}", $this->col($row, 'T4', ''));
-            $this->setDate($sheet, "P{$r}", $this->col($row, 'CANCEL_REQUEST_DATE'));
+            $this->setDate($sheet, "J{$r}", $this->col($row, 'RETENTION_PAYMENT_DATE'));
+            $sheet->setCellValue("K{$r}", $this->col($row, 'T1', ''));
+            $sheet->setCellValue("L{$r}", $this->col($row, 'T2', ''));
+            $sheet->setCellValue("M{$r}", $this->col($row, 'T3', ''));
+            $sheet->setCellValue("N{$r}", $this->col($row, 'T4', ''));
+            $this->setDate($sheet, "O{$r}", $this->col($row, 'CANCEL_REQUEST_DATE'));
             if ($key === 'rama') {
-                $sheet->setCellValue("Q{$r}", $this->col($row, 'TRANCHE', ''));
-                $this->setDate($sheet, "R{$r}", $this->col($row, 'CUT_OFF'));
-                $sheet->setCellValue("S{$r}", $this->col($row, 'MADE_CUT_OFF', false) ? 'x' : '');
-                $sheet->setCellValue("T{$r}", $this->col($row, 'BONUS_FLAG', ''));
+                $sheet->setCellValue("P{$r}", $this->col($row, 'TRANCHE', ''));
+                $this->setDate($sheet, "Q{$r}", $this->col($row, 'CUT_OFF'));
+                $sheet->setCellValue("R{$r}", $this->col($row, 'MADE_CUT_OFF', false) ? 'x' : '');
+                $sheet->setCellValue("S{$r}", $this->col($row, 'BONUS_FLAG', ''));
             } else {
                 $rate = $this->nickCommissionRate((float) $this->col($row, 'ENROLLED_DEBT', 0), $nickPct);
-                $sheet->setCellValue("Q{$r}", $rate);
-                $sheet->setCellValue("R{$r}", strtoupper((string) $this->col($row, 'IMMEDIATE_RESULTS', '')) === 'RETAINED' ? $rate : '');
+                $sheet->setCellValue("P{$r}", $rate);
+                $sheet->setCellValue("Q{$r}", strtoupper((string) $this->col($row, 'IMMEDIATE_RESULTS', '')) === 'RETAINED' ? $rate : '');
             }
             $r++;
         }
         $last = max($r - 1, 1);
-        foreach (['D', 'H', 'I', 'J', 'K', 'O', 'R'] as $col) {
-            if ($key === 'nick' && in_array($col, ['O', 'R'], true)) {
+        foreach (['D', 'H', 'I', 'J', 'O', 'Q'] as $col) {
+            if ($key === 'nick' && in_array($col, ['O', 'Q'], true)) {
                 continue;
             }
             $sheet->getStyle("{$col}2:{$col}{$last}")->getNumberFormat()->setFormatCode('mm/dd/yyyy');
         }
         $sheet->getStyle("F2:F{$last}")->getNumberFormat()->setFormatCode('$#,##0');
-        $sheet->getStyle("L2:O{$last}")->getNumberFormat()->setFormatCode('$#,##0.00');
+        $sheet->getStyle("K2:N{$last}")->getNumberFormat()->setFormatCode('$#,##0.00');
         // Borders over the whole table, not just the header row (Jacob: "data sheet add borders").
         $this->tableBorders($sheet, "A1:{$lastHeaderCol}{$last}");
         // Widths 17, with Client (B), Retention Agent (C) and Immediate Results (E) at 28.
@@ -1479,11 +1483,11 @@ class GenerateRetentionManagerCommission extends Command
         // left white so the two states that DO carry money stand out.
         if ($key === 'rama') {
             for ($row = 2; $row <= $last; $row++) {
-                $madeCutOff = trim((string) $sheet->getCell("S{$row}")->getValue());
+                $madeCutOff = trim((string) $sheet->getCell("R{$row}")->getValue());
                 if ($madeCutOff === '') {
                     continue;
                 }
-                $bonus = strtoupper(trim((string) $sheet->getCell("T{$row}")->getValue()));
+                $bonus = strtoupper(trim((string) $sheet->getCell("S{$row}")->getValue()));
                 $fill = $bonus === 'BONUS' ? 'FFC6EFCE' : 'FFFFEB9C';   // green / yellow
                 $sheet->getStyle("A{$row}:{$lastHeaderCol}{$row}")->getFill()
                     ->setFillType(Fill::FILL_SOLID)->getStartColor()->setARGB($fill);
@@ -1910,12 +1914,17 @@ class GenerateRetentionManagerCommission extends Command
      *
      * Jacob first asked (2026-09-03) for this to be the sheet name; his 2026-09-04 notes replaced
      * that with fixed sheet names — "Retention Data" / "NSF Data" and "Commission Summary" — so the
-     * title now heads the Commission Summary sheet instead.
+     * title now heads the Commission Summary sheet instead. It is also the workbook filename and the
+     * email subject.
+     *
+     * Rama's report was renamed from "Retention & NSF Manager" to "Customer Support Manager" (Jacob,
+     * 2026-10-05). Display only: the TblReports lookup key in sendManagerReportEmail() keeps the
+     * old name.
      */
     private function managerSheetTitle(string $key): string
     {
         return match ($key) {
-            'rama'    => 'Retention & NSF Manager',
+            'rama'    => 'Customer Support Manager',
             'nick'    => 'Retention Team Leader',
             'anthony' => 'NSF Team Leader',
             default   => ucfirst($key),

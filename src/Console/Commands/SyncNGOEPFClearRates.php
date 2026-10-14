@@ -201,10 +201,10 @@ class SyncNGOEPFClearRates extends Command
             JOIN DEBTS AS d ON so.DEBT_ID = d.ID
             WHERE t.TRANS_TYPE = 'PF'
               AND t.STATUS IN (0, 1, 4) AND so.OFFER_STATUS = 10
-              AND t._FIVETRAN_DELETED = FALSE
-              AND c._FIVETRAN_DELETED = FALSE
-              AND so._FIVETRAN_DELETED = FALSE
-              AND d._FIVETRAN_DELETED = FALSE
+              AND (t._FIVETRAN_DELETED = FALSE OR t._FIVETRAN_DELETED IS NULL)
+              AND (c._FIVETRAN_DELETED = FALSE OR c._FIVETRAN_DELETED IS NULL)
+              AND (so._FIVETRAN_DELETED = FALSE OR so._FIVETRAN_DELETED IS NULL)
+              AND (d._FIVETRAN_DELETED = FALSE OR d._FIVETRAN_DELETED IS NULL)
               AND d.SETTLEMENT_DATE >= '{$startDate}' AND d.SETTLEMENT_DATE <= '{$endDate}'
               AND so.NEG_ID IN ({$uidList})
             GROUP BY so.NEG_ID

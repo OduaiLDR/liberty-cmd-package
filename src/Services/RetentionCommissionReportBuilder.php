@@ -113,22 +113,6 @@ class RetentionCommissionReportBuilder
         }
         unset($row);
 
-        $retainedMap = $this->fetchRetainedDates($sf, $idList, $asOfDate);
-        foreach ($rows as &$row) {
-            $recon = $this->toDate($row['RECONSIDERATION_DATE'] ?? null);
-            $row['RETAINED_DATE'] = null;
-            $id = (string) $this->col($row, 'ID', '');
-            if ($recon && !empty($retainedMap[$id])) {
-                foreach ($retainedMap[$id] as $rd) {
-                    if ($rd >= $recon) {
-                        $row['RETAINED_DATE'] = $rd;
-                        break;
-                    }
-                }
-            }
-        }
-        unset($row);
-
         foreach ($rows as &$row) {
             $row['RETENTION_PAYMENT_DATE'] = null;
             $row['T1'] = null;
@@ -137,8 +121,9 @@ class RetentionCommissionReportBuilder
             $row['T4'] = null;
 
             $recon = $this->toDate($row['RECONSIDERATION_DATE'] ?? null);
-            $retained = $this->toDate($row['RETAINED_DATE'] ?? null);
-            if ($recon === null || $retained === null) {
+            // Jacob, 2026-10-12: column D is the sole retention-date source.
+            $retentionDate = $this->toDate($this->col($row, 'RETENTION_DATE'));
+            if ($recon === null || $retentionDate === null) {
                 continue;
             }
 
@@ -269,14 +254,14 @@ class RetentionCommissionReportBuilder
                 -- Keep full datetime like VBA (Excel COUNTIFS vs DateSerial end = midnight).
                 TO_VARCHAR(cu4.F_DATETIME) AS CANCEL_REQUEST_DATE
             FROM CONTACTS c
-            LEFT JOIN CONTACTS_USERFIELDS cu1 ON cu1.CONTACT_ID = c.ID AND cu1.CUSTOM_ID = {$ca} AND cu1._FIVETRAN_DELETED = FALSE
-            LEFT JOIN (SELECT CONTACT_ID, F_DATE FROM CONTACTS_USERFIELDS WHERE CUSTOM_ID = {$cd} AND _FIVETRAN_DELETED = FALSE) cu2 ON c.ID = cu2.CONTACT_ID
-            LEFT JOIN CONTACTS_USERFIELDS cu3 ON cu3.CONTACT_ID = c.ID AND cu3.CUSTOM_ID = {$cr} AND cu3._FIVETRAN_DELETED = FALSE
-            LEFT JOIN CONTACTS_USERFIELDS cu4 ON cu4.CONTACT_ID = c.ID AND cu4.CUSTOM_ID = {$cc} AND cu4._FIVETRAN_DELETED = FALSE
+            LEFT JOIN CONTACTS_USERFIELDS cu1 ON cu1.CONTACT_ID = c.ID AND cu1.CUSTOM_ID = {$ca} AND (cu1._FIVETRAN_DELETED = FALSE OR cu1._FIVETRAN_DELETED IS NULL)
+            LEFT JOIN (SELECT CONTACT_ID, F_DATE FROM CONTACTS_USERFIELDS WHERE CUSTOM_ID = {$cd} AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)) cu2 ON c.ID = cu2.CONTACT_ID
+            LEFT JOIN CONTACTS_USERFIELDS cu3 ON cu3.CONTACT_ID = c.ID AND cu3.CUSTOM_ID = {$cr} AND (cu3._FIVETRAN_DELETED = FALSE OR cu3._FIVETRAN_DELETED IS NULL)
+            LEFT JOIN CONTACTS_USERFIELDS cu4 ON cu4.CONTACT_ID = c.ID AND cu4.CUSTOM_ID = {$cc} AND (cu4._FIVETRAN_DELETED = FALSE OR cu4._FIVETRAN_DELETED IS NULL)
             LEFT JOIN (
                 SELECT CONTACT_ID, SUM(ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT
                 FROM DEBTS
-                WHERE ENROLLED=1 AND _FIVETRAN_DELETED=FALSE
+                WHERE ENROLLED=1 AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
                 GROUP BY CONTACT_ID
             ) d ON c.ID = d.CONTACT_ID
             WHERE cu1.CONTACT_ID IS NOT NULL
@@ -314,33 +299,6 @@ class RetentionCommissionReportBuilder
         return $map;
     }
 
-    private function fetchRetainedDates(DBConnector $sf, string $idList, ?string $asOfDate = null): array
-    {
-        if ($asOfDate !== null && !preg_match('/^\d{4}-\d{2}-\d{2}$/', $asOfDate)) {
-            throw new \InvalidArgumentException('Retention report cutoff must be a YYYY-MM-DD date.');
-        }
-        $cutoffSql = $asOfDate === null ? '' : "AND LEFT(cs.STAMP,10) <= '{$asOfDate}'";
-        $sql = "
-            SELECT cs.CONTACT_ID, LEFT(cs.STAMP,10) AS RETAINED_DATE
-            FROM CONTACTS_STATUS cs
-            LEFT JOIN CONTACTS_LEAD_STATUS cls ON cs.STATUS_ID = cls.ID
-            WHERE UPPER(cls.TITLE) LIKE '%ENROLLED%'
-              AND UPPER(cls.TITLE) NOT LIKE '%RECONSIDERATION%'
-              {$cutoffSql}
-              AND cs.CONTACT_ID IN ({$idList})
-            ORDER BY cs.CONTACT_ID ASC, cs.STAMP ASC
-        ";
-        $map = [];
-        foreach ($this->requireRows($sf->query($sql), 'Retention retained-status history') as $r) {
-            $retainedDate = substr((string) $r['RETAINED_DATE'], 0, 10);
-            // Defense in depth for adapters that return rows beyond the SQL cutoff.
-            if ($asOfDate === null || $retainedDate <= $asOfDate) {
-                $map[(string) $r['CONTACT_ID']][] = $retainedDate;
-            }
-        }
-        return $map;
-    }
-
     private function fetchFirstClearedPerContact(DBConnector $sf, string $idList): array
     {
         $sql = "
@@ -350,7 +308,7 @@ class RetentionCommissionReportBuilder
               AND CLEARED_DATE IS NOT NULL
               AND RETURNED_DATE IS NULL
               AND (RETURN_CODE IS NULL OR RETURN_CODE = '')
-              AND _FIVETRAN_DELETED = FALSE
+              AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
               AND CONTACT_ID IN ({$idList})
             ORDER BY CONTACT_ID ASC, CLEARED_DATE ASC
         ";

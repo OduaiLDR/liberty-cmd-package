@@ -62,6 +62,7 @@ use Cmd\Reports\Console\Commands\SyncLastDepositDate;
 use Cmd\Reports\Console\Commands\SyncVeritasTransactions;
 use Cmd\Reports\Console\Commands\ProcessAgentTrainingCompletions;
 use Cmd\Reports\Console\Commands\SyncPhoneNumbers;
+use Cmd\Reports\Console\Commands\LoadSmsProspects;
 use Cmd\Reports\Console\Commands\SyncCalls;
 use Cmd\Reports\Console\Commands\RefreshForthApiTokens;
 use Cmd\Reports\Console\Commands\SyncNegotiatorPayrollData;
@@ -102,10 +103,19 @@ class ReportsServiceProvider extends ServiceProvider
 {
     public function boot()
     {
+        $this->mergeConfigFrom(__DIR__ . '/../config/sms-exports.php', 'sms-exports');
         $this->loadRoutesFrom(__DIR__ . '/../routes/web.php');
         $this->loadRoutesFrom(__DIR__ . '/../routes/pmod.php');
+        $this->loadRoutesFrom(__DIR__ . '/../routes/sms-api.php');
+        $this->loadRoutesFrom(__DIR__ . '/../routes/sms-download.php');
         $this->loadViewsFrom(__DIR__ . '/../resources/views', 'reports');
 
+        $this->publishes([
+            __DIR__ . '/../database/sms-migrations/2026_10_06_092340_add_sms_export_tracking.php' => database_path('migrations/2026_10_06_092340_add_sms_export_tracking.php'),
+            __DIR__ . '/../database/sms-migrations/2026_10_07_000001_add_sms_export_requests.php' => database_path('migrations/2026_10_07_000001_add_sms_export_requests.php'),
+            __DIR__ . '/../database/sms-migrations/2026_10_07_000002_add_sms_selection_requests.php' => database_path('migrations/2026_10_07_000002_add_sms_selection_requests.php'),
+            __DIR__ . '/../database/sms-migrations/2026_10_12_000001_create_sms_prospects_tables.php' => database_path('migrations/2026_10_12_000001_create_sms_prospects_tables.php'),
+        ], 'reports-sms-migrations');
         // PMOD migrations ship with the package but are NOT auto-loaded.
         // Consumers must explicitly opt in by publishing them:
         //     php artisan vendor:publish --tag=pmod-migrations
@@ -207,6 +217,7 @@ class ReportsServiceProvider extends ServiceProvider
                 SyncVeritasTransactions::class,
                 ProcessAgentTrainingCompletions::class,
                 SyncPhoneNumbers::class,
+                LoadSmsProspects::class,
                 SyncCalls::class,
                 SyncNegotiatorPayrollData::class,
                 RefreshForthApiTokens::class,

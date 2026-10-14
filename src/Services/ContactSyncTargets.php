@@ -118,7 +118,33 @@ final class ContactSyncTargets
             && $evidence->supportsBackendUpdate($row, $old, $source);
     }
 
-    public static function plan(PDO $pdo, array $data, string $source, bool $lock = false, ?ContactSyncSourceEvidence $evidence = null, bool $reportConflicts = false): array
+    public static function plan(PDO $pdo, array $data, string $source, bool $lock = false, ?ContactSyncSourceEvidence $evidence = null, bool $reportConflicts = false, array $campaignHolds = []): array
+    {
+        // Resolve the entire page before applying any row, independent of incoming order.
+        // A later contact may establish an attribution hold for an earlier linked target.
+        do {
+            $plan = self::planPage($pdo, $data, $source, $lock, $evidence, $reportConflicts, $campaignHolds);
+            $held = [];
+            foreach ($plan as $change) {
+                foreach ($change['warnings'] ?? [] as $warning) {
+                    if ($warning['code'] === 'campaign_attribution_preserved') {
+                        array_push($held, ...($warning['related_ids'] ?? [$change['incoming_id']]));
+                    }
+                }
+            }
+            $added = array_values(array_diff(array_unique($held), $campaignHolds));
+            if ($added === []) {
+                // Carry the complete closure to the caller so the next page cannot
+                // escape a known hold through an indirect native-ID link.
+                if ($plan !== [] && $campaignHolds !== []) $plan[0]['campaign_hold_ids'] = $campaignHolds;
+                return $plan;
+            }
+            $campaignHolds = array_values(array_unique(array_merge($campaignHolds,
+                ContactSyncExclusions::resolve($pdo, $added, null))));
+        } while (true);
+    }
+
+    private static function planPage(PDO $pdo, array $data, string $source, bool $lock, ?ContactSyncSourceEvidence $evidence, bool $reportConflicts, array $campaignHolds): array
     {
         if ($data === []) {
             return [];
@@ -127,6 +153,7 @@ final class ContactSyncTargets
             throw new RuntimeException('Contact write planning requires a transaction.');
         }
         $incoming = [];
+        $campaignProofs = [];
         foreach ($data as $row) {
             $row = array_change_key_case($row, CASE_LOWER);
             $id = (string) ($row['llg_id'] ?? '');
@@ -134,6 +161,7 @@ final class ContactSyncTargets
                 throw new RuntimeException('Missing or duplicate incoming contact ID: ' . $id);
             }
             $incoming[$id] = self::values($row);
+            $campaignProofs[$id] = is_array($row['_campaign_proof'] ?? null) ? $row['_campaign_proof'] : null;
         }
         $table = self::table($source);
         $ids = array_keys($incoming);
@@ -270,6 +298,78 @@ final class ContactSyncTargets
                         throw new ContactSyncConflict("Conflicting source ownership for {$table}.{$target}; explicit repair required.");
                     }
                 }
+                $campaignLinks = $source === 'LT' ? ($backend === null ? [] : [$backend])
+                    : array_values(array_filter($main, fn ($other) => (string) $other['llg_id'] === $id
+                        || (ContactSyncIdentity::validNativeId((string) $row['external_id'])
+                            && (string) $other['llg_id'] === 'LLG-' . $row['external_id'])));
+                $proof = $campaignProofs[$id];
+                $proofKey = trim((string) ($proof['external_id'] ?? ''));
+                $preserveUnverified = $before !== null && $proofKey !== '' && ($source === 'LT'
+                    ? (string) $before['external_id'] === $proofKey && (string) $row['external_id'] === $proofKey
+                    : (count($campaignLinks) === 1 && (string) ($proof['source_reference'] ?? '') === (string) $row['external_id']
+                        && (string) $campaignLinks[0]['external_id'] === $proofKey
+                        && (string) $campaignLinks[0]['campaign'] === (string) $before['campaign']));
+                $campaign = ContactSyncCampaign::plan($row, $before, $proof, $campaignLinks, $preserveUnverified);
+                $preserveAttribution = $campaign['preserve_attribution'] ?? false;
+                $attributionReview = $campaign['review_reason'] ?? null;
+                $attributionIds = array_merge([$id, $target], array_column($campaignLinks, 'llg_id'));
+                if ($source !== 'LT' && ContactSyncIdentity::validNativeId((string) $row['external_id'])) {
+                    $attributionIds[] = 'LLG-' . $row['external_id'];
+                }
+                if (array_intersect($attributionIds, $campaignHolds) !== []) {
+                    $attributionReview ??= 'Linked campaign attribution remains under review.';
+                }
+                if (($proof['status'] ?? '') === 'verified' && $source === 'LT'
+                    && (string) ($proof['external_id'] ?? '') !== (string) $row['external_id']) {
+                    $campaign['reason'] = 'Campaign proof does not belong to the incoming mailer key.';
+                }
+                if (($proof['status'] ?? '') === 'verified' && $source !== 'LT'
+                    && (string) ($proof['external_id'] ?? '') !== (string) $row['external_id']
+                    && (string) ($proof['source_reference'] ?? '') !== (string) $row['external_id']) {
+                    $campaign['reason'] = 'Campaign proof does not belong to the verified LT source reference.';
+                }
+                if (($proof['status'] ?? '') === 'verified'
+                    && (string) ($proof['campaign'] ?? '') !== trim((string) $row['campaign'])) {
+                    $campaign['reason'] = 'Campaign proof does not belong to the incoming campaign.';
+                }
+                if (($proof['status'] ?? '') === 'verified' && $source === 'LT' && $before !== null && $target !== $id
+                    && trim((string) $before['external_id']) !== ''
+                    && (string) $before['external_id'] !== (string) $proof['external_id']) {
+                    $attributionReview = 'Linked main contact has a different mailer key; a reviewed attribution repair is required.';
+                }
+                if (($proof['status'] ?? '') === 'verified' && $source !== 'LT') {
+                    foreach ($campaignLinks as $other) {
+                        if (trim((string) $other['external_id']) !== ''
+                            && (string) $other['external_id'] !== (string) $proof['external_id']) {
+                            $attributionReview = 'Linked main contact has a different mailer key; a reviewed attribution repair is required.';
+                        }
+                    }
+                }
+                $preserveMailerKey = $source === 'LT' && $before !== null && $target === $id
+                    && trim((string) $before['external_id']) !== '';
+                if ($preserveMailerKey && !$preserveAttribution && trim((string) $row['external_id']) !== ''
+                    && (string) $row['external_id'] !== (string) $before['external_id']) {
+                    $attributionReview = 'Existing campaign mailer key differs; a reviewed attribution repair is required.';
+                }
+                if ($attributionReview !== null && $campaign['reason'] === null) {
+                    if ($before === null) {
+                        $campaign['reason'] = $attributionReview;
+                    } else {
+                        $preserveAttribution = true;
+                        $campaign['value'] = $before['campaign'];
+                    }
+                }
+                if ($preserveAttribution && $source !== 'LT'
+                    && (string) $before['external_id'] !== (string) $row['external_id']) {
+                    // Backend External_ID is a native LT link, not a mailing key.
+                    $campaign['reason'] = 'Backend LT reference changed; attribution preservation requires a stable link.';
+                }
+                if ($campaign['reason'] !== null) {
+                    $warnings[] = ['code' => 'campaign_attribution_review', 'source' => $source, 'id' => $id,
+                        'message' => $campaign['reason'], 'related_ids' => array_values(array_unique(array_merge(
+                            [$id, $target], array_column($campaignLinks, 'llg_id'))))];
+                    throw new ContactSyncConflict($campaign['reason']);
+                }
                 if (isset($claimed[$target])) {
                     $message = "Two incoming contacts claim {$table}.{$target}.";
                     if ($reportConflicts) {
@@ -285,6 +385,10 @@ final class ContactSyncTargets
                 $claimed[$target] = true;
                 $after = $row;
                 $after['llg_id'] = $target;
+                $after['campaign'] = $campaign['value'];
+                if ($preserveMailerKey) {
+                    $after['external_id'] = $before['external_id'];
+                }
                 if ($source === 'LT' && $backend !== null) {
                     foreach (['client', 'email', 'phone'] as $field) {
                         $value = $backend[$field];
@@ -295,13 +399,20 @@ final class ContactSyncTargets
                     }
                 }
                 if ($source === 'LT' && $before !== null && $target !== $id) {
-                    $after['external_id'] = $before['external_id'] ?: ($row['external_id'] ?: substr($id, 4));
+                    $after['external_id'] = $before['external_id'] ?: $row['external_id'];
                     // These fields belong to the verified destination company after a switch.
                     if ($owners !== []) {
-                        foreach (['category', 'affiliate_agent', 'campaign'] as $field) {
+                        foreach (['category', 'affiliate_agent'] as $field) {
                             $after[$field] = $before[$field];
                         }
                     }
+                }
+                if ($preserveAttribution) {
+                    // Keep the exact stored value, including NULL/blank, after all remap rules.
+                    $after['external_id'] = $before['external_id'];
+                    $warnings[] = ['code' => 'campaign_attribution_preserved', 'source' => $source, 'id' => $id,
+                        'message' => 'Existing campaign and external ID preserved; ordinary updates allowed. ' . $attributionReview,
+                        'related_ids' => array_values(array_unique($attributionIds))];
                 }
                 $changes = [];
                 foreach ($after as $field => $value) {
@@ -311,6 +422,13 @@ final class ContactSyncTargets
                     }
                 }
                 $plan[] = ['incoming_id' => $id, 'target_id' => $target, 'before' => $before, 'after' => $after, 'changes' => $changes];
+                if (($proof['status'] ?? '') === 'verified' && !$preserveAttribution) {
+                    $plan[array_key_last($plan)]['campaign_proof'] = $proof;
+                    // The LT main row can still use its native ID until final matching remaps it.
+                    $plan[array_key_last($plan)]['campaign_proof_ids'] = array_values(array_unique(array_merge(
+                        [$target], $source === 'LT' && $backend !== null ? [(string) $backend['llg_id']] : []
+                    )));
+                }
                 if (isset($linked[$id])) {
                     $plan[array_key_last($plan)]['linked_identity'] = $linked[$id];
                 }

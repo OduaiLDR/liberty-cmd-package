@@ -23,12 +23,22 @@ final class NsfCommissionSource
         // Group before joining: deleted Fivetran versions previously multiplied
         // a single client into thousands of rows. MIN only supplies a value when
         // its independent variant count proves that there is no choice to make.
+        // Find the month's contacts using the narrow date field before reading
+        // their text fields. Read ALL return-date versions for these contacts
+        // below so an out-of-month conflict still blocks the existing report.
         $query = "
-            WITH active_fields AS (
+            WITH period_contacts AS (
+                SELECT DISTINCT CONTACT_ID
+                FROM CONTACTS_USERFIELDS
+                WHERE (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
+                  AND CUSTOM_ID = $returnId
+                  AND F_DATE >= '$start' AND F_DATE <= '$end'
+            ), active_fields AS (
                 SELECT CONTACT_ID, CUSTOM_ID, F_SHORTSTRING, F_STRING, F_DATE
                 FROM CONTACTS_USERFIELDS
-                WHERE _FIVETRAN_DELETED = FALSE
+                WHERE (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
                   AND CUSTOM_ID IN ($agentId, $returnId, $actionId, $recoupId)
+                  AND CONTACT_ID IN (SELECT CONTACT_ID FROM period_contacts)
             ), agents AS (
                 SELECT CONTACT_ID,
                     MIN(REGEXP_REPLACE(TRIM(COALESCE(F_SHORTSTRING, '')), '[[:space:]]+', ' ')) AS AGENT,
@@ -55,7 +65,7 @@ final class NsfCommissionSource
                     TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', t.CLEARED_DATE) AS DATE), 'YYYY-MM-DD') AS CLEARED_DATE,
                     CONVERT_TIMEZONE('America/Los_Angeles', t.PROCESS_DATE) AS PROCESS_DATE
                 FROM TRANSACTIONS t JOIN candidates c ON c.CONTACT_ID = t.CONTACT_ID
-                WHERE t._FIVETRAN_DELETED = FALSE AND t.TRANS_TYPE = 'D'
+                WHERE (t._FIVETRAN_DELETED = FALSE OR t._FIVETRAN_DELETED IS NULL) AND t.TRANS_TYPE = 'D'
                   AND t.CLEARED_DATE IS NOT NULL AND t.RETURNED_DATE IS NULL
                   AND (t.RETURN_CODE IS NULL OR t.RETURN_CODE = '')
             ), payment_presence AS (

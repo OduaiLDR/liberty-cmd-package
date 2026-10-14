@@ -33,9 +33,18 @@ final class NsfCommissionSourceTest extends TestCase
         $result = NsfCommissionSource::fetch($connector, self::CONFIG, '2098-01-01', '2098-01-31');
         $this->assertCount(1, $result);
         $query = $connector->queryText;
-        $this->assertStringContainsString('WHERE _FIVETRAN_DELETED = FALSE', $query);
-        $this->assertStringContainsString('t._FIVETRAN_DELETED = FALSE', $query);
+        $this->assertStringContainsString('WHERE (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)', $query);
+        $this->assertStringContainsString('(t._FIVETRAN_DELETED = FALSE OR t._FIVETRAN_DELETED IS NULL)', $query);
         $this->assertSame(5, substr_count($query, 'GROUP BY CONTACT_ID'));
+        $this->assertStringContainsString('WITH period_contacts AS (', $query);
+        $this->assertStringContainsString('SELECT DISTINCT CONTACT_ID', $query);
+        $this->assertStringContainsString("AND F_DATE >= '2098-01-01' AND F_DATE <= '2098-01-31'", $query);
+        $this->assertStringContainsString('AND CONTACT_ID IN (SELECT CONTACT_ID FROM period_contacts)', $query);
+        // The contact scope must not filter individual field versions by date.
+        preg_match('/active_fields AS \\((.*?)\\), agents AS/s', $query, $activeFields);
+        $this->assertArrayHasKey(1, $activeFields);
+        $this->assertStringNotContainsString('F_DATE >=', $activeFields[1]);
+        $this->assertStringNotContainsString('F_DATE <=', $activeFields[1]);
         // The return-date aggregation is NOT restricted to the selected month:
         // an in-month + out-of-month pair must still produce RETURN_VARIANTS=2.
         $this->assertStringContainsString("MAX(IFF(F_DATE >= '2098-01-01' AND F_DATE <= '2098-01-31', 1, 0)) AS IN_PERIOD", $query);

@@ -322,7 +322,7 @@ final class ReconsiderationFakeConnector extends DBConnector
      */
     public function __construct(private array $results) {}
 
-    public function query(string $sql, array $bindings = []): array
+    public function query(string $sql, array $bindings = [], ?int $timeoutSeconds = null): array
     {
         $this->sqls[] = $sql;
         foreach ($this->results as $needle => $result) {

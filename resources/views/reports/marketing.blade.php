@@ -21,6 +21,60 @@
             <h6 class="py-3 mb-0">Marketing Report</h6>
         </div>
         <div class="card-body">
+
+            @if (session('status'))
+                <div class="alert alert-success" role="status">{{ session('status') }}</div>
+            @endif
+            @if ($errors->any())
+                <div class="alert alert-danger" role="alert">{{ $errors->first() }}</div>
+            @endif
+            <section class="border rounded p-3 mb-3" aria-labelledby="invoice-heading">
+                <h6 id="invoice-heading">SMS invoice allocation</h6>
+                <p class="small">Mail and data invoices are entered from the matching drop row below and allocated across all its tiers. An SMS invoice applies to every SMS export in the selected week, weighted by phone count.</p>
+                @if ($smsExports->isNotEmpty() && $smsExports->every(fn ($row) => trim((string) ($row->SMS_Invoice_Number ?? '')) === ''))
+                <form method="post" action="{{ route('cmd.reports.marketing_report.invoice') }}" class="row g-2 align-items-end">
+                    @csrf
+                    <input type="hidden" name="kind" value="sms">
+                    <div class="col-md-2">
+                        <label for="invoice-week" class="form-label">Date in week</label>
+                        <input id="invoice-week" name="week" type="date" class="form-control" value="{{ old('week', $smsWeek) }}" required>
+                    </div>
+                    <div class="col-md-2">
+                        <label for="invoice-number" class="form-label">Invoice number</label>
+                        <input id="invoice-number" name="invoice_number" maxlength="100" class="form-control" value="{{ old('invoice_number') }}" required>
+                    </div>
+                    <div class="col-md-2">
+                        <label for="invoice-cost" class="form-label">Total cost ($)</label>
+                        <input id="invoice-cost" name="cost" type="number" min="0" max="9999999.99" step="0.01" class="form-control" value="{{ old('cost') }}" required>
+                    </div>
+                    <div class="col-md-2"><button class="btn btn-primary" type="submit">Distribute SMS invoice</button></div>
+                </form>
+                @endif
+            </section>
+            <section class="border rounded p-3 mb-3" aria-labelledby="sms-history-heading">
+                <h6 id="sms-history-heading">SMS drops and invoices</h6>
+                <form method="get" action="{{ route('cmd.reports.marketing_report') }}" class="d-flex gap-2 align-items-end mb-2">
+                    <div>
+                        <label for="sms-week" class="form-label">Date in export week</label>
+                        <input id="sms-week" type="date" name="sms_week" class="form-control" value="{{ $smsWeek }}" required>
+                    </div>
+                    <button class="btn btn-light" type="submit">Show SMS week</button>
+                </form>
+                <div class="table-responsive">
+                    <table class="table table-striped table-bordered">
+                        <thead><tr><th>SMS drop</th><th>Tier</th><th>Exported</th><th>SMS count</th><th>SMS invoice</th><th>SMS cost</th></tr></thead>
+                        <tbody>
+                        @forelse ($smsExports as $smsExport)
+                            <tr><td>{{ $smsExport->SMS_Drop_Name }}</td><td>{{ $smsExport->Debt_Tier }}</td><td>{{ $smsExport->Exported_At }}</td><td>{{ number_format((int) $smsExport->SMS_Count) }}</td><td>{{ $smsExport->SMS_Invoice_Number }}</td><td>{{ $formatCurrency($smsExport->SMS_Cost) }}</td></tr>
+                        @empty
+                            <tr><td colspan="6">No SMS exports for this week.</td></tr>
+                        @endforelse
+                        </tbody>
+                        <tfoot><tr><th colspan="3">Week total</th><th>{{ number_format((int) $smsExports->sum('SMS_Count')) }}</th><td></td><th>{{ $formatCurrency($smsExports->sum('SMS_Cost')) }}</th></tr></tfoot>
+                    </table>
+                </div>
+            </section>
+
             <form method="get" action="{{ route('cmd.reports.marketing_report') }}" class="bg-light rounded-3 p-2 p-md-3 mb-3" id="marketing-report-form">
                 <input type="hidden" name="range" id="range" value="{{ $currentRange }}">
                 <input type="hidden" name="export" id="export" value="">
@@ -191,6 +245,7 @@
                                 <td class="text-end">
                                     <div class="mail-drop-cost">
                                         <div class="mail-drop-display">{{ $formatCurrency($report->Mail_Drop_Cost) }}</div>
+                                        @if (empty($report->Mail_Invoice_Recorded) && empty($report->Mail_Invoice_Number))
                                         <button type="button" class="btn btn-link btn-sm p-0 mail-drop-edit-btn" data-value="{{ $report->Mail_Drop_Cost ?? 0 }}">
                                             Edit
                                         </button>
@@ -203,6 +258,7 @@
                                                     value="{{ $report->Mail_Drop_Cost ?? 0 }}" autocomplete="off">
                                             </form>
                                         </div>
+                                        @endif
                                     </div>
                                 </td>
                                 <td class="text-end">{{ $formatPerPiece($report->Per_Piece_Mail_Cost) }}</td>
@@ -210,6 +266,7 @@
                                 <td class="text-end">
                                     <div class="data-drop-cost">
                                         <div class="data-drop-display">{{ $formatCurrency($report->Data_Drop_Cost) }}</div>
+                                        @if (empty($report->Data_Invoice_Recorded) && empty($report->Data_Invoice_Number))
                                         <button type="button" class="btn btn-link btn-sm p-0 data-drop-edit-btn" data-value="{{ $report->Data_Drop_Cost ?? 0 }}">
                                             Edit
                                         </button>
@@ -222,6 +279,7 @@
                                                     value="{{ $report->Data_Drop_Cost ?? 0 }}" autocomplete="off">
                                             </form>
                                         </div>
+                                        @endif
                                     </div>
                                 </td>
                                 <td class="text-end">{{ $formatPerPiece($report->Per_Piece_Data_Cost) }}</td>
@@ -230,7 +288,24 @@
                                 <td class="text-end">{{ number_format((float) ($report->Calls ?? 0)) }}</td>
                                 <td>{{ $report->Language }}</td>
                                 <td>{{ $report->Drop_Name_Sequential }}</td>
-                                <td class="text-end"></td>
+                                <td class="text-end">
+                                    @foreach (['mail' => 'Mail_Invoice_Number', 'data' => 'Data_Invoice_Number'] as $kind => $invoiceField)
+                                        @if (empty($report->{$kind === 'mail' ? 'Mail_Invoice_Recorded' : 'Data_Invoice_Recorded'}) && empty($report->{$invoiceField}))
+                                            <details class="mb-1 text-start">
+                                                <summary>Add {{ ucfirst($kind) }} invoice</summary>
+                                                <form method="post" action="{{ route('cmd.reports.marketing_report.invoice') }}" class="d-flex flex-column gap-1 mt-1">
+                                                    @csrf
+                                                    <input type="hidden" name="kind" value="{{ $kind }}">
+                                                    <input type="hidden" name="drop_name" value="{{ $report->Drop_Name }}">
+                                                    <span class="small">{{ $report->Drop_Name }} — all tiers</span>
+                                                    <input name="invoice_number" maxlength="100" class="form-control form-control-sm" placeholder="Invoice number" aria-label="{{ ucfirst($kind) }} invoice number for {{ $report->Drop_Name }}" required>
+                                                    <input name="cost" type="number" min="0" max="9999999.99" step="0.01" class="form-control form-control-sm" placeholder="Total drop cost" aria-label="Total {{ $kind }} cost for {{ $report->Drop_Name }}" required>
+                                                    <button type="submit" class="btn btn-primary btn-sm">Allocate {{ $kind }} cost</button>
+                                                </form>
+                                            </details>
+                                        @endif
+                                    @endforeach
+                                </td>
                             </tr>
                         @empty
                             <tr>

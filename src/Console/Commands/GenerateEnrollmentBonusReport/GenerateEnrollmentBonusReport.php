@@ -377,7 +377,7 @@ SELECT CONTACT_ID, TITLE, STAMP_PT, CLIENT, EXTERNAL_ID FROM latest WHERE rn = 1
             $sql = "SELECT CONTACT_ID, SUM(ORIGINAL_DEBT_AMOUNT) AS ENROLLED_DEBT
                     FROM DEBTS
                     WHERE ENROLLED = 1
-                      AND _FIVETRAN_DELETED = FALSE
+                      AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)
                       AND TO_VARCHAR(CONTACT_ID) IN (SELECT column1 FROM VALUES {$values})
                     GROUP BY CONTACT_ID";
             foreach (($connector->query($sql)['data'] ?? []) as $row) {

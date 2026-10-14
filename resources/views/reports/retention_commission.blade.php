@@ -85,14 +85,6 @@
 
                 <div class="row g-2 align-items-end mt-2">
                     <div class="col-md-3">
-                        <label class="form-label mb-1">Retained Date From</label>
-                        <input type="date" name="retained_date_from" value="{{ $filters['retained_date_from'] ?? '' }}" class="form-control form-control-sm">
-                    </div>
-                    <div class="col-md-3">
-                        <label class="form-label mb-1">Retained Date To</label>
-                        <input type="date" name="retained_date_to" value="{{ $filters['retained_date_to'] ?? '' }}" class="form-control form-control-sm">
-                    </div>
-                    <div class="col-md-3">
                         <label class="form-label mb-1">Retention Payment Date From</label>
                         <input type="date" name="retention_payment_date_from" value="{{ $filters['retention_payment_date_from'] ?? '' }}" class="form-control form-control-sm">
                     </div>
@@ -141,7 +133,6 @@
                                 <th>Cleared Payments</th>
                                 <th>Reconsideration Date</th>
                                 <th>Dropped Date</th>
-                                <th>Retained Date</th>
                                 <th>Retention Payment Date</th>
                                 <th>Commission T1</th>
                                 <th>Commission T2</th>
@@ -161,7 +152,6 @@
                                     <td class="text-center">{{ $report->cleared_payments }}</td>
                                     <td>{{ $report->reconsideration_date ? \Carbon\Carbon::parse($report->reconsideration_date)->format('m/d/Y') : '' }}</td>
                                     <td>{{ $report->dropped_date ? \Carbon\Carbon::parse($report->dropped_date)->format('m/d/Y') : '' }}</td>
-                                    <td>{{ $report->retained_date ? \Carbon\Carbon::parse($report->retained_date)->format('m/d/Y') : '' }}</td>
                                     <td>{{ $report->retention_payment_date ? \Carbon\Carbon::parse($report->retention_payment_date)->format('m/d/Y') : '' }}</td>
                                     <td class="text-end">{{ $report->retention_commission_t1 ? '$' . number_format($report->retention_commission_t1, 2) : '' }}</td>
                                     <td class="text-end">{{ $report->retention_commission_t2 ? '$' . number_format($report->retention_commission_t2, 2) : '' }}</td>

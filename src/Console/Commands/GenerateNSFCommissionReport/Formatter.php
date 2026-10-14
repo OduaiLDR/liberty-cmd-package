@@ -14,6 +14,10 @@ use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 
 class Formatter
 {
+    /** Custom document properties carrying the run evidence; read back by the manager report. */
+    public const PROPERTY_RUN_ID = 'NSF Run ID';
+    public const PROPERTY_RUN_STATUS = 'NSF Run Status';
+
     private const HEADER_FILL  = 'FF17853B';
     private const HEADER_FONT  = 'FFFFFFFF';
     private const TIER_FILL    = 'FFC5C5C5';
@@ -49,28 +53,22 @@ class Formatter
         $commSheet->setShowGridlines(false);
         $this->buildCommissionSheet($commSheet, $commissionRows, $sourceCode, $unassigned);
 
+        // Jacob, 2026-10-05: "NSF has a Run Status sheet you can remove." The run evidence it carried
+        // moves to the workbook's custom document properties: invisible to readers, and still how
+        // GenerateRetentionManagerCommission ties Anthony's report to this exact NSF run. Whether a run
+        // is provisional (before the payment cutoff) is now stated in the email body instead.
         $timing = $readiness ?? NsfReportReadiness::timing($startDate);
-        $statusSheet = $spreadsheet->createSheet();
-        $statusSheet->setTitle('Run Status');
-        $statusSheet->fromArray([
-            ['NSF Report Run Status', $timing['isProvisional'] ? 'PROVISIONAL — NOT READY FOR FINAL PAYROLL' : 'FINAL-CUTOFF DATA'],
-            ['Source', $source], ['Period Start', $startDate], ['Period End', $endDate],
-            ['Payment cutoff (Pacific)', $timing['cutoffPacific']],
-            ['Run started (UTC)', $timing['startedAt']],
-            ['Workbook generated (UTC)', gmdate('Y-m-d H:i:s')],
-            ['Run ID', $timing['runId'] ?? 'unavailable'],
-            ['Final runs may start after (UTC)', $timing['finalAfter']],
-            ['Payroll readiness', $timing['isProvisional']
-                ? 'Preview only. A new successful run after the cutoff is required; waiting does not make this run final.'
-                : 'Cutoff has closed. Payroll still requires confirmed persistence, snapshot publication, and regenerated payroll items.'],
-        ], null, 'A1', true);
-        $statusSheet->getColumnDimension('A')->setWidth(35);
-        $statusSheet->getColumnDimension('B')->setWidth(95);
-        $statusSheet->getStyle('A1:B1')->getFont()->setBold(true);
-        $statusSheet->getStyle('B1:B10')->getAlignment()->setWrapText(true);
-        $statusSheet->getRowDimension(10)->setRowHeight(45);
-        $statusSheet->setSelectedCells('A1');
-        $spreadsheet->setActiveSheetIndex($timing['isProvisional'] ? 2 : 0);
+        $properties = $spreadsheet->getProperties();
+        foreach ([
+            self::PROPERTY_RUN_ID => (string) ($timing['runId'] ?? 'unavailable'),
+            self::PROPERTY_RUN_STATUS => $timing['isProvisional'] ? 'PROVISIONAL' : 'FINAL',
+            'NSF Payment Cutoff (Pacific)' => (string) $timing['cutoffPacific'],
+            'NSF Run Started (UTC)' => (string) $timing['startedAt'],
+            'NSF Final Runs After (UTC)' => (string) $timing['finalAfter'],
+        ] as $name => $value) {
+            $properties->setCustomProperty($name, $value);
+        }
+        $spreadsheet->setActiveSheetIndex(0);
 
         $period   = date('m-Y', strtotime($startDate));
         $suffix   = $agentFilter !== null ? $this->safeFilenamePart($agentFilter) : 'All';

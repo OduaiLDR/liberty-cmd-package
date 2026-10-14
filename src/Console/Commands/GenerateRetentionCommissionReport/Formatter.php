@@ -85,19 +85,19 @@ class Formatter
     {
         $sheet->setShowGridlines(false);
 
-        // Headers (VBA columns A-O)
+        // Headers (VBA columns A-N)
         $headers = [
             'ID', 'Client', 'Retention Agent', 'Retention Date',
             'Immediate Results', 'Enrolled Debt', 'Cleared Payments',
-            'Reconsideration Date', 'Dropped Date', 'Retained Date',
+            'Reconsideration Date', 'Dropped Date',
             'Retention Payment Date', 'Commission T1', 'Commission T2', 'Commission T3',
             'Cancel Request Date',
         ];
-        $cols = range('A', 'O');
+        $cols = range('A', 'N');
         foreach ($headers as $i => $h) {
             $sheet->setCellValue($cols[$i] . '1', $h);
         }
-        $this->applyHeaderStyle($sheet, 'A1:O1');
+        $this->applyHeaderStyle($sheet, 'A1:N1');
 
         // Data rows
         $r = 2;
@@ -111,33 +111,32 @@ class Formatter
             $sheet->setCellValue("G$r", (int)($row['CLEARED_PAYMENTS'] ?? 0));
             $this->setDate($sheet, "H$r", $row['RECONSIDERATION_DATE'] ?? null);
             $this->setDate($sheet, "I$r", $row['DROPPED_DATE']         ?? null);
-            $this->setDate($sheet, "J$r", $row['RETAINED_DATE']        ?? null);
-            $this->setDate($sheet, "K$r", $row['RETENTION_PAYMENT_DATE'] ?? null);
-            $sheet->setCellValue("L$r", $row['RETENTION_COMMISSION_T1'] ?? '');
-            $sheet->setCellValue("M$r", $row['RETENTION_COMMISSION_T2'] ?? '');
-            $sheet->setCellValue("N$r", $row['RETENTION_COMMISSION_T3'] ?? '');
-            $this->setDate($sheet, "O$r", $row['CANCEL_REQUEST_DATE']   ?? null);
+            $this->setDate($sheet, "J$r", $row['RETENTION_PAYMENT_DATE'] ?? null);
+            $sheet->setCellValue("K$r", $row['RETENTION_COMMISSION_T1'] ?? '');
+            $sheet->setCellValue("L$r", $row['RETENTION_COMMISSION_T2'] ?? '');
+            $sheet->setCellValue("M$r", $row['RETENTION_COMMISSION_T3'] ?? '');
+            $this->setDate($sheet, "N$r", $row['CANCEL_REQUEST_DATE']   ?? null);
             $r++;
         }
 
         $last = max($r - 1, 1);
 
         // Number formats
-        foreach (['D', 'H', 'I', 'J', 'K', 'O'] as $c) {
+        foreach (['D', 'H', 'I', 'J', 'N'] as $c) {
             $sheet->getStyle("{$c}2:{$c}{$last}")->getNumberFormat()->setFormatCode(self::DATE_FORMAT);
         }
-        foreach (['F', 'L', 'M', 'N'] as $c) {
+        foreach (['F', 'K', 'L', 'M'] as $c) {
             $sheet->getStyle("{$c}2:{$c}{$last}")->getNumberFormat()->setFormatCode(self::MONEY_FORMAT);
         }
 
         // Borders + auto-width
         if ($last > 1) {
-            $sheet->getStyle("A1:O{$last}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
+            $sheet->getStyle("A1:N{$last}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
         }
         foreach ($cols as $c) {
             $sheet->getColumnDimension($c)->setAutoSize(true);
         }
-        $sheet->getStyle("A1:O{$last}")->getFont()->setName('Calibri')->setSize(9);
+        $sheet->getStyle("A1:N{$last}")->getFont()->setName('Calibri')->setSize(9);
         $sheet->setSelectedCells('A1');
     }
 

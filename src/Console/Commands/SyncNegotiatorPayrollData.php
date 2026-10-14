@@ -82,10 +82,10 @@ class SyncNegotiatorPayrollData extends Command
             WHERE t.TRANS_TYPE = 'PF'
               AND t.STATUS IN(0, 1, 4)
               AND so.OFFER_STATUS = 10
-              AND t._FIVETRAN_DELETED = FALSE
-              AND c._FIVETRAN_DELETED = FALSE
-              AND so._FIVETRAN_DELETED = FALSE
-              AND d._FIVETRAN_DELETED = FALSE
+              AND (t._FIVETRAN_DELETED = FALSE OR t._FIVETRAN_DELETED IS NULL)
+              AND (c._FIVETRAN_DELETED = FALSE OR c._FIVETRAN_DELETED IS NULL)
+              AND (so._FIVETRAN_DELETED = FALSE OR so._FIVETRAN_DELETED IS NULL)
+              AND (d._FIVETRAN_DELETED = FALSE OR d._FIVETRAN_DELETED IS NULL)
               AND CAST(CONVERT_TIMEZONE('America/Los_Angeles', d.SETTLEMENT_DATE) AS DATE) BETWEEN '{$this->esc($startDate)}' AND '{$this->esc($endDate)}'
             GROUP BY CONCAT(c.FIRSTNAME,' ', c.LASTNAME), CONVERT_TIMEZONE('America/Los_Angeles', d.SETTLEMENT_DATE), d.SETTLEMENT_ID, t.MEMO, t.CONTACT_ID, so.NEG_ID
             ORDER BY so.NEG_ID ASC, CONVERT_TIMEZONE('America/Los_Angeles', d.SETTLEMENT_DATE) ASC
