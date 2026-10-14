@@ -572,7 +572,7 @@ SQL;
     private function getHttpClient(): Client
     {
         if ($this->httpClient === null) {
-            $this->httpClient = new Client([
+            $this->httpClient = new \Cmd\Reports\Observability\ObservedClient([
                 'timeout' => 30,
                 'http_errors' => false,  // Don't throw on 4xx/5xx
                 'verify' => false,

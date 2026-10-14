@@ -128,7 +128,7 @@ class DBConnector
             }
         ));
 
-        return new Client([
+        return new \Cmd\Reports\Observability\ObservedClient([
             'handler' => $stack,
             'timeout' => 60,
             'connect_timeout' => 10,
@@ -426,6 +426,12 @@ class DBConnector
      * Execute a SQL query
      */
     public function query(string $sql, array $bindings = [], ?int $timeoutSeconds = null): array
+    {
+        return \Cmd\Reports\Observability\Telemetry::measure('database', 'query', 'snowflake',
+            fn () => $this->queryObserved($sql, $bindings, $timeoutSeconds));
+    }
+
+    private function queryObserved(string $sql, array $bindings = [], ?int $timeoutSeconds = null): array
     {
         $queryHead = preg_replace('/\A(?:(?:\s+)|(?:--[^\r\n]*(?:\r?\n|$))|(?:\/\*.*?\*\/))*/s', '', $sql) ?? $sql;
         if (!$this->loadingFivetranDeletedTables
@@ -1032,7 +1038,7 @@ class DBConnector
                 $options[PDO::SQLSRV_ATTR_QUERY_TIMEOUT] = $this->sqlServerQueryTimeout();
             }
 
-            $this->sqlServerConnection = new PDO(
+            $this->sqlServerConnection = new \Cmd\Reports\Observability\ObservedPDO(
                 $dsn,
                 $this->sqlServerConfig['username'],
                 $this->sqlServerConfig['password'],

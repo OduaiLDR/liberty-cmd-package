@@ -150,7 +150,7 @@ class UpdateLendingUSAStatuses extends Command
 
             // 6. Process each client
             $this->info('[5/6] Processing clients...');
-            $this->httpClient = new Client(['timeout' => 30, 'verify' => false]);
+            $this->httpClient = new \Cmd\Reports\Observability\ObservedClient(['timeout' => 30, 'verify' => false]);
             $processTime = now()->format('Y-m-d H:i:s');
 
             $filterContactId = (string) ($this->option('contact-id') ?? '');
@@ -1052,7 +1052,7 @@ class UpdateLendingUSAStatuses extends Command
     protected function httpClient(): Client
     {
         if ($this->httpClient === null) {
-            $this->httpClient = new Client(['timeout' => 30, 'verify' => false]);
+            $this->httpClient = new \Cmd\Reports\Observability\ObservedClient(['timeout' => 30, 'verify' => false]);
         }
         return $this->httpClient;
     }

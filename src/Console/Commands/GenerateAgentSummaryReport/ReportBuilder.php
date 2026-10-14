@@ -7,7 +7,7 @@ use PhpOffice\PhpWord\IOFactory;
 use PhpOffice\PhpWord\PhpWord;
 use PhpOffice\PhpWord\Element\Section;
 use PhpOffice\PhpWord\SimpleType\JcTable;
-use Symfony\Component\Process\Process;
+use Cmd\Reports\Observability\ObservedProcess as Process;
 
 /**
  * Builds the Agent Summary Report PDF to match Jacob's reference layout:

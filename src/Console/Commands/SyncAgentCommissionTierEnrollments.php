@@ -203,7 +203,7 @@ SQL;
         }
 
         $dsn = "sqlsrv:Server={$host},{$port};Database={$database};TrustServerCertificate=true;Encrypt=yes";
-        return new PDO($dsn, $username, $password, [
+        return new \Cmd\Reports\Observability\ObservedPDO($dsn, $username, $password, [
             PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
         ]);

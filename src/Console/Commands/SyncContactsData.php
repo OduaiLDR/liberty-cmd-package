@@ -119,7 +119,7 @@ class SyncContactsData extends Command
 
         $php = PHP_BINARY;
         if (str_contains(basename($php), 'fpm')) {
-            $cli = trim((string) shell_exec('which php8.3 2>/dev/null || which php8.2 2>/dev/null || which php 2>/dev/null'));
+            $cli = trim((string) \Cmd\Reports\Observability\Shell::shellExec('which php8.3 2>/dev/null || which php8.2 2>/dev/null || which php 2>/dev/null'));
             $php = $cli ?: 'php';
         }
         $artisan  = base_path('artisan');

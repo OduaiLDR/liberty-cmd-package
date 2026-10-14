@@ -21,7 +21,7 @@ class EmailSenderService
      */
     public function __construct(string $prefix = 'GRAPH')
     {
-        $this->client = new Client(['timeout' => 30]);
+        $this->client = new \Cmd\Reports\Observability\ObservedClient(['timeout' => 30]);
         $this->tenantId = (string) env("{$prefix}_TENANT_ID", '');
         $this->clientId = (string) env("{$prefix}_CLIENT_ID", '');
         $this->clientSecret = (string) env("{$prefix}_CLIENT_SECRET", '');
