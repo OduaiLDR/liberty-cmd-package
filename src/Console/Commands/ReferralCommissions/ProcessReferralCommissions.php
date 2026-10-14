@@ -733,7 +733,7 @@ class ProcessReferralCommissions extends Command
             if ($host === '' || $database === '') {
                 throw new \RuntimeException('CCS SQL Server credentials are not configured. Set CCS_DB_HOST and CCS_DB_DATABASE in .env.');
             }
-            $this->ccs = new PDO(
+            $this->ccs = new \Cmd\Reports\Observability\ObservedPDO(
                 "sqlsrv:Server={$host},{$port};Database={$database};TrustServerCertificate=true",
                 (string) env('CCS_DB_USERNAME', ''),
                 (string) env('CCS_DB_PASSWORD', ''),

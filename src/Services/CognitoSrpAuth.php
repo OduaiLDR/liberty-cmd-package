@@ -56,7 +56,7 @@ class CognitoSrpAuth
             throw new \RuntimeException('COGNITO_POOL_ID and COGNITO_CLIENT_ID must be set in .env');
         }
 
-        $this->httpClient = new Client(['timeout' => 30]);
+        $this->httpClient = new \Cmd\Reports\Observability\ObservedClient(['timeout' => 30]);
         $this->N = new BigInteger(self::N_HEX, 16);
         $this->g = new BigInteger(self::G_HEX, 16);
         // k = H(N || g) with proper padding
