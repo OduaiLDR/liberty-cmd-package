@@ -105,7 +105,8 @@ class SmsRunController extends Controller
     protected function ensureSchemaReady(): void
     {
         $schema = DB::connection('sqlsrv')->getSchemaBuilder();
-        if (! $schema->hasTable('TblSMSRuns') || ! $schema->hasTable('TblProspects') || ! $schema->hasTable('TblSMSHistory')) {
+        if (! $schema->hasTable('TblSMSRuns') || ! $schema->hasTable('TblProspects') || ! $schema->hasTable('TblProspectsExport')
+            || ! $schema->hasTable('TblSMSHistory')) {
             throw new HttpException(503, 'The new SMS tables are not set up on this server yet.');
         }
     }

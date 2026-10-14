@@ -62,6 +62,7 @@ use Cmd\Reports\Console\Commands\SyncLastDepositDate;
 use Cmd\Reports\Console\Commands\SyncVeritasTransactions;
 use Cmd\Reports\Console\Commands\ProcessAgentTrainingCompletions;
 use Cmd\Reports\Console\Commands\SyncPhoneNumbers;
+use Cmd\Reports\Console\Commands\LoadSmsProspects;
 use Cmd\Reports\Console\Commands\SyncCalls;
 use Cmd\Reports\Console\Commands\RefreshForthApiTokens;
 use Cmd\Reports\Console\Commands\SyncNegotiatorPayrollData;
@@ -216,6 +217,7 @@ class ReportsServiceProvider extends ServiceProvider
                 SyncVeritasTransactions::class,
                 ProcessAgentTrainingCompletions::class,
                 SyncPhoneNumbers::class,
+                LoadSmsProspects::class,
                 SyncCalls::class,
                 SyncNegotiatorPayrollData::class,
                 RefreshForthApiTokens::class,

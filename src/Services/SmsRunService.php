@@ -64,19 +64,19 @@ class SmsRunService
     public function prepare(string $requestId): void
     {
         if (! $this->move($requestId, ['queued'], 'selecting')) return;
-        $hasRows = DB::connection('sqlsrv')->table('TblSMSHistory')->where('Request_ID', $requestId)->exists();
+        $hasRows = DB::connection('sqlsrv')->table('TblProspectsExport')->where('Request_ID', $requestId)->exists();
         if (! $hasRows) {
             $this->export->select($requestId, (int) $this->run($requestId)->Target);
         }
-        $selected = DB::connection('sqlsrv')->table('TblSMSHistory')->where('Request_ID', $requestId)->count();
+        $selected = DB::connection('sqlsrv')->table('TblProspectsExport')->where('Request_ID', $requestId)->count();
         $counts = ['Selected' => $selected, 'Debt_TU' => 0, 'Debt_Mailers' => 0, 'Debt_Tier_Default' => 0, 'Debt_Missing' => 0];
         if ($selected > 0) {
             $this->export->lookupDebts($requestId, (array) config('sms-exports.tier_debts', []));
-            $this->export->assignDrops($requestId, Carbon::today());
-            $sources = DB::connection('sqlsrv')->table('TblSMSHistory')->where('Request_ID', $requestId)
+            $this->export->assignDrops($requestId, Carbon::today(SmsProspectExportRepository::TIMEZONE));
+            $sources = DB::connection('sqlsrv')->table('TblProspectsExport')->where('Request_ID', $requestId)
                 ->selectRaw("SUM(CASE WHEN Debt_Source = 'TblTUData' THEN 1 ELSE 0 END) AS TU,
                     SUM(CASE WHEN Debt_Source = 'TblMailers' THEN 1 ELSE 0 END) AS Mailers,
-                    SUM(CASE WHEN Debt_Source = 'None' AND Debt_Amount IS NOT NULL THEN 1 ELSE 0 END) AS TierDefault,
+                    SUM(CASE WHEN Debt_Source = 'Tier' THEN 1 ELSE 0 END) AS TierDefault,
                     SUM(CASE WHEN Debt_Amount IS NULL THEN 1 ELSE 0 END) AS Missing")->first();
             $counts = ['Selected' => $selected, 'Debt_TU' => (int) $sources->TU, 'Debt_Mailers' => (int) $sources->Mailers,
                 'Debt_Tier_Default' => (int) $sources->TierDefault, 'Debt_Missing' => (int) $sources->Missing];
@@ -101,7 +101,7 @@ class SmsRunService
         if ($this->run($requestId)?->Status !== 'building_file') return;
         $dir = $this->runDirectory($requestId);
         if (! is_dir($dir) && ! mkdir($dir, 0750, true) && ! is_dir($dir)) throw new RuntimeException('Unable to create the SMS file folder.');
-        $final = $dir.'/sms-'.Carbon::today()->format('Y-m-d').'.csv';
+        $final = $dir.'/sms-'.Carbon::today(SmsProspectExportRepository::TIMEZONE)->format('Y-m-d').'.csv';
         $partial = $final.'.partial';
         $count = $this->export->writeCsv($requestId, $partial);
         if (! rename($partial, $final)) throw new RuntimeException('Unable to save the SMS file.');

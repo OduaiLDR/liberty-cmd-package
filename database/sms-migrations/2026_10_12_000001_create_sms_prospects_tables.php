@@ -5,13 +5,13 @@ use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
 
 /**
- * Person-level SMS (Jacob, 12-13 Oct 2026): one prospect per person instead of exporting whole
+ * Person-level SMS (Jacob, 12-14 Oct 2026): one prospect per person instead of exporting whole
  * mail drops, which sent the same person once per drop and the same phone many times.
  *
- * A person is Client + Address + Zip, unique under SQL Server's case-insensitive collation;
- * names keep their original case. Nobody gets a second SMS until every eligible prospect at 0
- * attempts has had one: order by SMS_Attempts, then newest Creation_Date, then oldest
- * Latest_SMS_Date. Contacted, Invalid_Phone and Opt_Out exclude a prospect.
+ * TblProspects is Jacob's schema (14 Oct) plus a primary key and 0 defaults. A run's people are
+ * selected into TblProspectsExport, which holds only the open run; when the run is marked as sent
+ * its rows move to TblSMSHistory. TblPhoneNumbers gets the contact's creation date (CA time) so
+ * Response_Date can be filled when a prospect becomes a contact.
  */
 return new class extends Migration
 {
@@ -20,67 +20,27 @@ return new class extends Migration
     public function up(): void
     {
         $schema = Schema::connection($this->getConnection());
+        $this->createProspects($schema);
 
-        // Queue of people from each CMD mailer import who are not in TblProspects yet, waiting
-        // for TU. Rows leave the queue once their TU result is processed, so someone TU found
-        // nothing for can be queued again when their data is bought again.
-        $schema->create('TblProspectsPending', function (Blueprint $table): void {
+        // The open run's rows, until it is marked as sent (then moved to TblSMSHistory) or discarded.
+        // Debt_Source is TblTUData, TblMailers, Tier, or None when there is no amount;
+        // Debt_Source_PK is that row's key (NULL for Tier and None).
+        $schema->create('TblProspectsExport', function (Blueprint $table): void {
             $table->bigIncrements('PK');
-            $table->string('Client', 150);
-            $table->string('Address', 255);
-            $table->string('City', 100)->nullable();
-            $table->string('State', 50)->nullable();
-            $table->string('Zip', 10);
+            $table->uuid('Request_ID');
+            $table->integer('SMS_Drop_PK')->nullable();
+            $table->string('Drop_Name', 32)->nullable();
+            $table->unsignedInteger('Prospect_PK');
+            $table->string('Phone', 10);
+            $table->decimal('Debt_Amount', 12, 2)->nullable();
             $table->string('Debt_Tier', 30)->nullable();
-            $table->string('Drop_Name', 100)->nullable();
-            $table->string('External_ID', 50)->nullable();
-            $table->string('TU_Batch', 50)->nullable()->index();
-            $table->dateTime('Sent_To_TU_At')->nullable();
-            $table->dateTime('Created_At');
-            $table->unique(['Client', 'Address', 'Zip'], 'UX_TblProspectsPending_Person');
+            $table->string('Debt_Source', 20)->nullable();
+            $table->bigInteger('Debt_Source_PK')->nullable();
+            $table->unique(['Request_ID', 'Prospect_PK']);
+            $table->unique(['Request_ID', 'Phone']);
         });
 
-        // One row per person with a phone or email. Creation_Date is the send date of the drop
-        // the person came from (TblMarketing). Zip is the 5-digit zip (TblMailersUniqueEnriched
-        // .Zip5_Normalized), so ZIP+4 variants stay one person; Phone is the normalized 10 digits.
-        // Sizes follow TblMailersUniqueEnriched; Debt_Tier follows TblTUData.Tier_Tag.
-        // Drop_Name / External_ID make the TblMailers debt lookup exact.
-        $schema->create('TblProspects', function (Blueprint $table): void {
-            $table->increments('PK');
-            $table->date('Creation_Date');
-            $table->string('Client', 150);
-            $table->string('Address', 255);
-            $table->string('City', 100)->nullable();
-            $table->string('State', 50)->nullable();
-            $table->string('Zip', 10);
-            $table->string('Phone', 10)->nullable()->index();
-            $table->string('Email', 255)->nullable();
-            $table->boolean('Contacted')->default(false);
-            $table->boolean('Invalid_Phone')->default(false);
-            $table->boolean('Opt_Out')->default(false);
-            $table->dateTime('Latest_SMS_Date')->nullable();
-            $table->integer('SMS_Attempts')->default(0);
-            $table->string('Debt_Tier', 30)->nullable();
-            $table->string('Drop_Name', 100)->nullable();
-            $table->string('External_ID', 50)->nullable();
-            $table->unique(['Client', 'Address', 'Zip'], 'UX_TblProspects_Person');
-            $table->index(['SMS_Attempts', 'Latest_SMS_Date', 'Creation_Date'], 'IX_TblProspects_SMS_Priority');
-        });
-
-        // Per TU batch: how many were sent and what came back.
-        $schema->create('TblProspectEnrichmentLog', function (Blueprint $table): void {
-            $table->bigIncrements('PK');
-            $table->string('TU_Batch', 50)->unique();
-            $table->dateTime('Submitted_At');
-            $table->integer('Submitted');
-            $table->dateTime('Returned_At')->nullable();
-            $table->integer('With_Phone')->nullable();
-            $table->integer('With_Email')->nullable();
-            $table->integer('With_Both')->nullable();
-            $table->integer('With_Neither')->nullable();
-        });
-
-        // SMS drops, like TblMarketing for mailers: one per tier per export (SMS0001, SMS0002, ...).
+        // Like TblMarketing for SMS: one row per SMS drop (SMSxxxx), one drop per debt tier per run.
         // Invoice number and cost keep the weekly SMS invoice split working.
         $schema->create('TblSMSDrops', function (Blueprint $table): void {
             $table->increments('PK');
@@ -120,9 +80,8 @@ return new class extends Migration
             $table->dateTime('Sent_At')->nullable();
         });
 
-        // Every exported SMS. Also the export table: an export run is selected into it, given its
-        // SMS drops, and the file is written from it. The debt, tier and phone are what was sent,
-        // with where the debt came from (TblTUData, TblMailers or None) and that row's key.
+        // Every SMS that was sent: a sent run's rows from TblProspectsExport, with the debt, tier and
+        // phone that went out and where the debt came from.
         $schema->create('TblSMSHistory', function (Blueprint $table): void {
             $table->bigIncrements('PK');
             $table->uuid('Request_ID');
@@ -130,7 +89,7 @@ return new class extends Migration
             $table->string('Drop_Name', 32)->nullable();
             $table->unsignedInteger('Prospect_PK')->index();
             $table->string('Phone', 10);
-            $table->dateTime('Export_Date')->nullable();
+            $table->dateTime('Export_Date');
             $table->decimal('Debt_Amount', 12, 2)->nullable();
             $table->string('Debt_Tier', 30)->nullable();
             $table->string('Debt_Source', 20)->nullable();
@@ -138,13 +97,92 @@ return new class extends Migration
             $table->unique(['Request_ID', 'Prospect_PK']);
             $table->unique(['Request_ID', 'Phone']);
         });
+
+        // The contact's creation date (Snowflake CONTACTS.CREATED, CA date), filled by Sync:phone-numbers.
+        // Adding a nullable column changes no rows.
+        if ($schema->hasTable('TblPhoneNumbers') && ! $schema->hasColumn('TblPhoneNumbers', 'Created_Date')) {
+            $schema->table('TblPhoneNumbers', function (Blueprint $table): void {
+                $table->date('Created_Date')->nullable();
+            });
+        }
     }
 
     public function down(): void
     {
         $schema = Schema::connection($this->getConnection());
-        foreach (['TblSMSHistory', 'TblSMSRuns', 'TblSMSDrops', 'TblProspectEnrichmentLog', 'TblProspects', 'TblProspectsPending'] as $table) {
+        if ($schema->hasTable('TblPhoneNumbers') && $schema->hasColumn('TblPhoneNumbers', 'Created_Date')) {
+            $schema->table('TblPhoneNumbers', fn (Blueprint $table) => $table->dropColumn('Created_Date'));
+        }
+        foreach (['TblSMSHistory', 'TblSMSRuns', 'TblSMSDrops', 'TblProspectsExport', 'TblProspects'] as $table) {
             $schema->dropIfExists($table);
         }
+    }
+
+    /**
+     * Jacob's TblProspects. SQL Server gets his exact DDL (varchar columns, filtered indexes);
+     * Laravel's schema builder only makes nvarchar, so the builder version is for the SQLite tests.
+     */
+    private function createProspects(\Illuminate\Database\Schema\Builder $schema): void
+    {
+        $db = $schema->getConnection();
+        if ($db->getDriverName() !== 'sqlsrv') {
+            $schema->create('TblProspects', function (Blueprint $table): void {
+                $table->increments('PK');
+                $table->date('Creation_Date')->nullable();
+                $table->string('Client', 150)->nullable();
+                $table->string('Address', 200)->nullable();
+                $table->string('City', 100)->nullable();
+                $table->char('State', 2)->nullable();
+                $table->string('Zip', 10)->nullable();
+                $table->string('Tier', 2)->nullable();
+                $table->string('Phone', 10)->nullable()->index('IX_TblProspects_Phone');
+                $table->string('Email', 254)->nullable();
+                $table->boolean('Contacted')->default(false);
+                $table->date('Response_Date')->nullable();
+                $table->boolean('Invalid_Phone')->default(false);
+                $table->boolean('Opt_Out')->default(false);
+                $table->date('Latest_Export_Date')->nullable();
+                $table->integer('SMS_Attempts')->default(0);
+                $table->index(['Latest_Export_Date', 'Creation_Date', 'PK'], 'IX_TblProspects_ExportQueue');
+                $table->index(['Client', 'Address', 'Zip'], 'IX_TblProspects_Match');
+            });
+
+            return;
+        }
+
+        $db->unprepared(<<<'SQL'
+CREATE TABLE dbo.TblProspects (
+    PK INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_TblProspects PRIMARY KEY CLUSTERED,
+    Creation_Date DATE NULL,
+    Client VARCHAR(150) NULL,
+    Address VARCHAR(200) NULL,
+    City VARCHAR(100) NULL,
+    State CHAR(2) NULL,
+    Zip VARCHAR(10) NULL,
+    Tier VARCHAR(2) NULL,
+    Phone VARCHAR(10) NULL,
+    Email VARCHAR(254) NULL,
+    Contacted BIT NOT NULL CONSTRAINT DF_TblProspects_Contacted DEFAULT 0,
+    Response_Date DATE NULL,
+    Invalid_Phone BIT NOT NULL CONSTRAINT DF_TblProspects_Invalid_Phone DEFAULT 0,
+    Opt_Out BIT NOT NULL CONSTRAINT DF_TblProspects_Opt_Out DEFAULT 0,
+    Latest_Export_Date DATE NULL,
+    SMS_Attempts INT NOT NULL CONSTRAINT DF_TblProspects_SMS_Attempts DEFAULT 0
+);
+
+-- Selecting eligible prospects in rotation order.
+CREATE NONCLUSTERED INDEX IX_TblProspects_ExportQueue
+ON dbo.TblProspects (Latest_Export_Date ASC, Creation_Date ASC, PK ASC)
+WHERE Contacted = 0 AND Invalid_Phone = 0 AND Opt_Out = 0 AND Phone IS NOT NULL;
+
+-- The nightly comparison against TblPhoneNumbers.
+CREATE NONCLUSTERED INDEX IX_TblProspects_Phone
+ON dbo.TblProspects (Phone)
+WHERE Contacted = 0 AND Phone IS NOT NULL;
+
+-- Checking incoming weekly records against existing prospects before enrichment.
+CREATE NONCLUSTERED INDEX IX_TblProspects_Match
+ON dbo.TblProspects (Client, Address, Zip);
+SQL);
     }
 };

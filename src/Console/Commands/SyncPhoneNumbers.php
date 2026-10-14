@@ -2,6 +2,7 @@
 
 namespace Cmd\Reports\Console\Commands;
 
+use Cmd\Reports\Repositories\SmsProspectExportRepository;
 use Cmd\Reports\Services\DBConnector;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
@@ -18,6 +19,9 @@ class SyncPhoneNumbers extends Command
 
     private const SOURCE = 'DP_LT';
     private const SNOWFLAKE_ENV = 'lt';
+
+    /** Set once TblPhoneNumbers has the contact's creation date (the SMS prospects migration adds it). */
+    protected bool $withCreatedDate = false;
 
     public function handle(): int
     {
@@ -82,13 +86,17 @@ class SyncPhoneNumbers extends Command
                 return Command::SUCCESS;
             }
 
+            $this->withCreatedDate = DB::connection('sqlsrv')->getSchemaBuilder()->hasColumn('TblPhoneNumbers', 'Created_Date');
             [$deleted, $inserted, $cleaned] = $this->replacePhonesFromFile($sqlServer, $stagePath, $batchSize);
             $this->info("[INFO] Replaced {$deleted} existing phone rows with {$inserted} rows.");
+            $flagged = $this->flagContactedProspects();
+            if ($flagged !== null) $this->info("[INFO] Marked {$flagged} SMS prospects as contacted.");
             Log::info('SyncPhoneNumbers command finished.', [
                 'source' => self::SOURCE,
                 'deleted' => $deleted,
                 'inserted' => $inserted,
                 'cleaned' => $cleaned,
+                'prospects_contacted' => $flagged,
             ]);
         } catch (\Throwable $e) {
             $this->error('SyncPhoneNumbers failed: ' . $e->getMessage());
@@ -163,7 +171,8 @@ class SyncPhoneNumbers extends Command
     {
         // Query only one page so DBConnector never has to hold the full result set.
         $sql = "
-            SELECT c.ID, phone_values.VALUE::STRING AS PHONE
+            SELECT c.ID, phone_values.VALUE::STRING AS PHONE,
+                TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', c.CREATED)::DATE, 'YYYY-MM-DD') AS CREATED_DATE
             FROM CONTACTS AS c,
                  LATERAL FLATTEN(
                      INPUT => ARRAY_CONSTRUCT_COMPACT(c.PHONE, c.PHONE2, c.PHONE3, c.PHONE4)
@@ -211,9 +220,11 @@ class SyncPhoneNumbers extends Command
             if ($digits === '') {
                 continue;
             }
+            $created = (string) ($row['CREATED_DATE'] ?? '');
             $normalized[] = [
                 'phone' => str_pad($digits, 10, '0', STR_PAD_LEFT),
                 'cid'   => isset($row['ID']) ? (int) $row['ID'] : null,
+                'created' => preg_match('/^\d{4}-\d{2}-\d{2}$/', $created) ? $created : null,
             ];
         }
         return $normalized;
@@ -269,15 +280,32 @@ class SyncPhoneNumbers extends Command
         foreach ($chunk as $item) {
             $phoneEsc = $this->esc($item['phone']);
             $cid = $item['cid'] !== null ? (int) $item['cid'] : 'NULL';
-            $values[] = "('{$phoneEsc}', '{$sourceEsc}', {$cid})";
+            if (! $this->withCreatedDate) {
+                $values[] = "('{$phoneEsc}', '{$sourceEsc}', {$cid})";
+                continue;
+            }
+            $created = isset($item['created']) && preg_match('/^\d{4}-\d{2}-\d{2}$/', (string) $item['created']) ? "'{$item['created']}'" : 'NULL';
+            $values[] = "('{$phoneEsc}', '{$sourceEsc}', {$cid}, {$created})";
         }
 
-        $sql = 'INSERT INTO TblPhoneNumbers (Phone, Source, CID) VALUES ' . implode(', ', $values);
+        $columns = $this->withCreatedDate ? 'Phone, Source, CID, Created_Date' : 'Phone, Source, CID';
+        $sql = "INSERT INTO TblPhoneNumbers ({$columns}) VALUES " . implode(', ', $values);
         $affected = $this->executeSqlServerWrite($connection, $sql, 'insert phone batch ' . $batchNumber);
         $inserted = $affected > 0 ? $affected : count($chunk);
 
         $this->info(sprintf('[INFO] Batch %d: inserted %d rows.', $batchNumber, $inserted));
         return $inserted;
+    }
+
+    /**
+     * SMS prospects whose phone is now a contact are flagged with the contact's creation date
+     * (Jacob, 14 Oct). Null until the SMS prospects tables exist.
+     */
+    protected function flagContactedProspects(): ?int
+    {
+        if (! DB::connection('sqlsrv')->getSchemaBuilder()->hasTable('TblProspects')) return null;
+
+        return app(SmsProspectExportRepository::class)->markContacted();
     }
 
     private function cleanupEmptyPhones(PDO $connection): int
