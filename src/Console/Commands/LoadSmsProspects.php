@@ -17,7 +17,9 @@ class LoadSmsProspects extends Command
     protected $signature = 'sms:load-prospects
         {--dry-run : Count only; change nothing}
         {--drop=* : Only these drops (default: every enriched drop)}
+        {--from= : Start at this drop (to continue after a stop; drops before it in the newest-first list are skipped)}
         {--limit=0 : Stop after this many drops (0 = all)}
+        {--until=0 : Stop once TblProspects has this many people with a phone (0 = load everything)}
         {--texted=* : A sent SMS export CSV; every phone in it counts as texted on the row\'s "send date"}
         {--skip-drops : Only mark the --texted files}';
 
@@ -43,7 +45,13 @@ class LoadSmsProspects extends Command
         try {
             if (! $this->option('skip-drops')) {
                 $drops = $load->drops((array) $this->option('drop'));
+                if (($from = trim((string) $this->option('from'))) !== '') {
+                    $start = array_search(strtolower($from), array_map(fn ($d) => strtolower((string) $d->Drop_Name), $drops), true);
+                    if ($start === false) throw new RuntimeException("Drop {$from} is not in the list of enriched drops.");
+                    $drops = array_slice($drops, $start);
+                }
                 $limit = max(0, (int) $this->option('limit'));
+                $until = max(0, (int) $this->option('until'));
                 if ($limit > 0) $drops = array_slice($drops, 0, $limit);
                 $this->info('Drops to load: '.number_format(count($drops)).' (newest first).');
                 $started = microtime(true);
@@ -55,6 +63,10 @@ class LoadSmsProspects extends Command
                         $drop->Drop_Name, $drop->Send_Date ?? 'no date   ',
                         $result['people'] === null ? '' : sprintf('%8s people  ', number_format($result['people'])),
                         number_format($result['added']), number_format($result['filled']), (int) (microtime(true) - $started)));
+                    if ($until > 0 && ! $dryRun && ($withPhone = $load->prospectsWithPhone()) >= $until) {
+                        $this->info('Reached '.number_format($withPhone).' prospects with a phone (--until='.number_format($until).'); the remaining drops can be loaded later.');
+                        break;
+                    }
                 }
             }
             foreach ($paths as $path) {

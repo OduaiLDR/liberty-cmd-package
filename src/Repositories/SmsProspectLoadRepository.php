@@ -104,6 +104,12 @@ SQL, [$dropName]);
         });
     }
 
+    /** Prospects an SMS run could text: a phone and not a contact (counted on the filtered Phone index). */
+    public function prospectsWithPhone(): int
+    {
+        return (int) $this->connection()->selectOne('SELECT COUNT(*) AS n FROM TblProspects WHERE Contacted = 0 AND Phone IS NOT NULL')->n;
+    }
+
     /**
      * Phones from a sent SMS file count as texted on $sentDate: one more attempt and that
      * Latest_Export_Date, unless the prospect already has that date or a later one (so running it
