@@ -113,6 +113,7 @@ class ReportsServiceProvider extends ServiceProvider
             __DIR__ . '/../database/sms-migrations/2026_10_06_092340_add_sms_export_tracking.php' => database_path('migrations/2026_10_06_092340_add_sms_export_tracking.php'),
             __DIR__ . '/../database/sms-migrations/2026_10_07_000001_add_sms_export_requests.php' => database_path('migrations/2026_10_07_000001_add_sms_export_requests.php'),
             __DIR__ . '/../database/sms-migrations/2026_10_07_000002_add_sms_selection_requests.php' => database_path('migrations/2026_10_07_000002_add_sms_selection_requests.php'),
+            __DIR__ . '/../database/sms-migrations/2026_10_12_000001_create_sms_prospects_tables.php' => database_path('migrations/2026_10_12_000001_create_sms_prospects_tables.php'),
         ], 'reports-sms-migrations');
         // PMOD migrations ship with the package but are NOT auto-loaded.
         // Consumers must explicitly opt in by publishing them:

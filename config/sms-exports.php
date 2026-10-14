@@ -17,4 +17,7 @@ return [
     'region' => $dedicatedBucket
         ? env('CMD_SMS_EXPORT_REGION')
         : (config('filesystems.disks.s3.region') ?: env('AWS_DEFAULT_REGION', 'us-east-2')),
+    // Debt used when neither TblTUData nor TblMailers has one, by Debt_Tier (e.g. 'T1' => 10000).
+    // Values come from Jacob; until then those records go out with an empty debt load.
+    'tier_debts' => [],
 ];
