@@ -52,7 +52,7 @@ final class ContactSyncSourceEvidence
                     $response = $query($source, self::querySql($source, $ids[$source], $ids['LT'], $salt));
                 } catch (\Throwable $error) {
                     // Connector exception bodies can contain returned data. Do not propagate them.
-                    throw new RuntimeException('Contact source evidence read failed for ' . $source . '.');
+                    throw new RuntimeException('Contact source evidence read failed for ' . $source . '.' . SnowflakeReadFailure::diagnosticSuffix($error));
                 }
                 foreach ($response as $raw) {
                     $row = array_change_key_case($raw, CASE_UPPER);
@@ -170,7 +170,7 @@ final class ContactSyncSourceEvidence
             $claims = [];
             foreach (array_keys($ids) as $source) {
                 try { $response = $query($source, self::querySql($source, $ids[$source], $ids['LT'], $salt, true)); }
-                catch (\Throwable $error) { throw new RuntimeException('Contact source evidence read failed for ' . $source . '.'); }
+                catch (\Throwable $error) { throw new RuntimeException('Contact source evidence read failed for ' . $source . '.' . SnowflakeReadFailure::diagnosticSuffix($error)); }
                 foreach ($response as $raw) {
                     $row = array_change_key_case($raw, CASE_UPPER);
                     if (!self::activePrimary($row)) { continue; }
@@ -212,7 +212,7 @@ final class ContactSyncSourceEvidence
             try {
                 $response = $query($source, 'SELECT ID AS PLAN_ID, TITLE, _FIVETRAN_DELETED FROM ENROLLMENT_DEFAULTS2 WHERE ID IN ('
                     . implode(',', $ids) . ') AND (_FIVETRAN_DELETED = FALSE OR _FIVETRAN_DELETED IS NULL)');
-            } catch (\Throwable $error) { throw new RuntimeException('Contact plan definition read failed for ' . $source . '.'); }
+            } catch (\Throwable $error) { throw new RuntimeException('Contact plan definition read failed for ' . $source . '.' . SnowflakeReadFailure::diagnosticSuffix($error)); }
             foreach ($response as $raw) {
                 $row = array_change_key_case($raw, CASE_UPPER);
                 $deleted = $row['_FIVETRAN_DELETED'] ?? null;
