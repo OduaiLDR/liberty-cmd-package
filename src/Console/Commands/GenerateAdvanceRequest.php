@@ -3,6 +3,7 @@
 namespace Cmd\Reports\Console\Commands;
 
 use Cmd\Reports\Services\AdvanceRequestInvoiceBuilder;
+use Cmd\Reports\Services\AdvanceRequestRegistration;
 use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\EmailSenderService;
 use Illuminate\Console\Command;
@@ -22,6 +23,14 @@ class GenerateAdvanceRequest extends Command
     private const LDR_SENDER = 'NGF@libertydebtrelief.com';
     private const PROGRESS_LAW_SENDER = 'NGF@progresslaw.com';
     private const ADVANCE_TOTAL = 1000000.0;
+
+    private ?AdvanceRequestRegistration $registration = null;
+
+    /** Inject a registration (tests). */
+    public function useRegistration(?AdvanceRequestRegistration $registration): void
+    {
+        $this->registration = $registration;
+    }
 
     public function handle(): int
     {
@@ -128,6 +137,18 @@ class GenerateAdvanceRequest extends Command
             $subject = $request['subject'];
             $body = $this->buildEmailBody($request['name'], $request['amount'], $tranche, $monthLabel);
             $invoice = $this->buildInvoiceData($request['name'], $request['amount'], $tranche, $window);
+            // Invoice registry (own switch, default off): live sends only; replaces just the printed invoice number.
+            $registeredNumber = null;
+            if (! $isDryRun && ! $sendToMe) {
+                $this->registration ??= AdvanceRequestRegistration::fromEnv(function (string $message, array $context): void {
+                    $this->error('[INVOICE REGISTRY] ' . $message);
+                    Log::error('[INVOICE REGISTRY] ' . $message, $context);
+                });
+                $registeredNumber = $this->registration->reserve($request['company'], $monthLabel, $tranche);
+                if ($registeredNumber !== null) {
+                    $invoice['invoice_number'] = $registeredNumber;
+                }
+            }
             $pdfBytes = $invoiceBuilder->build($invoice);
             $filename = $invoice['invoice_number'] . '.pdf';
             $attachments = [[
@@ -172,6 +193,9 @@ class GenerateAdvanceRequest extends Command
                 $recipientDescription = 'TblReports recipients';
             }
             $sent = $sent && $wasSent;
+            if ($registeredNumber !== null) {
+                $this->registration->record($request['company'], $registeredNumber, (float) $request['amount'], $wasSent ? 'sent' : 'issued', $pdfBytes, $monthLabel, $tranche);
+            }
 
             if ($wasSent) {
                 $this->info(sprintf('[INFO] %s advance request sent to %s.', $request['name'], $recipientDescription));
