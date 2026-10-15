@@ -56,6 +56,12 @@ final class InvoiceRegistry
         throw new InvoiceRegistryException("No free {$series} invoice number for {$invoiceDate} (01-99 are all taken).");
     }
 
+    /** Write the PDF, backup and record.json for a number this registry reserved (see InvoiceRecordWriter). */
+    public function record(string $series, string $number, array $fields, array $files): array
+    {
+        return (new InvoiceRecordWriter($this->store))->write($series, $number, $fields, $files);
+    }
+
     /** One conditional put, retried only for transient S3 conditions; false means the number is taken (412). */
     private function createOnce(string $key, string $body): bool
     {
