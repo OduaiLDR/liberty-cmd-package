@@ -39,7 +39,7 @@ final class InvoiceRecordAndGateTest extends TestCase
         self::assertSame([$folder . 'LT-PL-20261015-01.pdf', $folder . 'LT-PL-20261015-01-backup.xlsx', $folder . 'record.json'], array_keys($store->objects));
         $onDisk = json_decode($store->objects[$folder . 'record.json'], true);
         self::assertEquals($record, $onDisk);
-        self::assertSame(['LT-PL-20261015-01', 'lending-tower', 'progress-law', 5500.0, 'USD', '2026-10-15', 'sent', 1], [
+        self::assertEquals(['LT-PL-20261015-01', 'lending-tower', 'progress-law', 5500.0, 'USD', '2026-10-15', 'sent', 1], [
             $onDisk['invoiceNumber'], $onDisk['company'], $onDisk['type'], $onDisk['amount'], $onDisk['currency'], $onDisk['invoiceDate'], $onDisk['status'], $onDisk['revision'],
         ]);
         self::assertSame(['name' => 'LT-PL-20261015-01.pdf', 'kind' => 'pdf', 'key' => $folder . 'LT-PL-20261015-01.pdf', 'sha256' => hash('sha256', '%PDF-fake'), 'bytes' => 9], $onDisk['files'][0]);
