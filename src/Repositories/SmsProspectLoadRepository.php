@@ -55,14 +55,14 @@ SQL;
      * Enriched drops, newest send date first (TblMarketing.Send_Date); drops without one come last.
      *
      * @param  array<int, string>  $only
-     * @return array<int, object{Drop_Name:string, Send_Date:?string}>
+     * @return array<int, object{Drop_Name:string, Send_Date:?string, Imported:?int}>
      */
     public function drops(array $only = []): array
     {
         $query = $this->table('TblEnrichedDropNames', 'd')
             ->leftJoin('TblMarketing as m', 'm.Drop_Name', '=', 'd.Drop_Name')
             ->groupBy('d.Drop_Name')
-            ->selectRaw('d.Drop_Name, CONVERT(varchar(10), MAX(m.Send_Date), 23) AS Send_Date')
+            ->selectRaw('d.Drop_Name, CONVERT(varchar(10), MAX(m.Send_Date), 23) AS Send_Date, MAX(d.Imported) AS Imported')
             ->orderByRaw('CASE WHEN MAX(m.Send_Date) IS NULL THEN 1 ELSE 0 END, MAX(m.Send_Date) DESC, d.Drop_Name');
         if ($only !== []) $query->whereIn('d.Drop_Name', $only);
 
@@ -76,14 +76,14 @@ SQL;
      *
      * @return array{people:?int, added:int, filled:int}
      */
-    public function loadDrop(string $dropName, ?string $sendDate, bool $dryRun = false): array
+    public function loadDrop(string $dropName, ?string $sendDate, bool $dryRun = false, bool $fill = true): array
     {
         // A large or busy drop can take longer than the default 5-minute query limit.
-        return $this->withQueryTimeout(self::DROP_QUERY_TIMEOUT, fn (): array => $this->loadDropNow($dropName, $sendDate, $dryRun));
+        return $this->withQueryTimeout(self::DROP_QUERY_TIMEOUT, fn (): array => $this->loadDropNow($dropName, $sendDate, $dryRun, $fill));
     }
 
     /** @return array{people:?int, added:int, filled:int} */
-    private function loadDropNow(string $dropName, ?string $sendDate, bool $dryRun): array
+    private function loadDropNow(string $dropName, ?string $sendDate, bool $dryRun, bool $fill): array
     {
         $db = $this->connection();
         if ($dryRun) {
@@ -94,7 +94,7 @@ SQL;
             return ['people' => $people, 'added' => $added, 'filled' => 0];
         }
 
-        return $db->transaction(function () use ($db, $dropName, $sendDate): array {
+        return $db->transaction(function () use ($db, $dropName, $sendDate, $fill): array {
             $added = $db->affectingStatement(self::SOURCE_SQL.<<<'SQL'
 
 INSERT INTO TblProspects (Creation_Date, Client, Address, City, State, Zip, Tier, Phone, Email, Latest_Export_Date, SMS_Attempts)
@@ -105,7 +105,8 @@ OUTER APPLY (SELECT CAST(MAX(m.SMS_Last_Export_Date) AS date) AS Sent FROM TblMa
 WHERE p.Person_Rank = 1
   AND NOT EXISTS (SELECT 1 FROM TblProspects q WHERE q.Client = p.Client AND q.Address = p.Address AND q.Zip = p.Zip)
 SQL, [$dropName, $sendDate, $dropName]);
-            $filled = $db->affectingStatement(self::SOURCE_SQL.<<<'SQL'
+            // The fill reads the drop a second time; --no-fill leaves it for a later run.
+            $filled = ! $fill ? 0 : $db->affectingStatement(self::SOURCE_SQL.<<<'SQL'
 
 UPDATE q SET Phone = COALESCE(q.Phone, p.Phone), Email = COALESCE(q.Email, p.Email)
 FROM TblProspects q

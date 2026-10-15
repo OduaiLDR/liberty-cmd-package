@@ -21,6 +21,8 @@ class LoadSmsProspects extends Command
         {--limit=0 : Stop after this many drops (0 = all)}
         {--until=0 : Stop once TblProspects has this many people with a phone (0 = load everything)}
         {--texted=* : A sent SMS export CSV; every phone in it counts as texted on the row\'s "send date"}
+        {--max-rows=0 : Skip, for now, drops with more rows than this (TblEnrichedDropNames.Imported; 0 = none)}
+        {--no-fill : Do not fill a missing phone or email from older drops (one pass per drop instead of two)}
         {--skip-drops : Only mark the --texted files}';
 
     protected $description = 'Fill TblProspects from TblMailersUniqueEnriched and mark earlier SMS sends as texted.';
@@ -55,8 +57,16 @@ class LoadSmsProspects extends Command
                 if ($limit > 0) $drops = array_slice($drops, 0, $limit);
                 $this->info('Drops to load: '.number_format(count($drops)).' (newest first).');
                 $started = microtime(true);
+                $maxRows = max(0, (int) $this->option('max-rows'));
+                $skipped = [];
                 foreach ($drops as $i => $drop) {
-                    $result = $load->loadDrop((string) $drop->Drop_Name, $drop->Send_Date, $dryRun);
+                    if ($maxRows > 0 && (int) ($drop->Imported ?? 0) > $maxRows) {
+                        $skipped[] = $drop->Drop_Name;
+                        $this->line(sprintf('%5d/%d  %-16s %s  skipped for now: %s rows (--max-rows=%s)', $i + 1, count($drops),
+                            $drop->Drop_Name, $drop->Send_Date ?? 'no date   ', number_format((int) $drop->Imported), number_format($maxRows)));
+                        continue;
+                    }
+                    $result = $load->loadDrop((string) $drop->Drop_Name, $drop->Send_Date, $dryRun, ! $this->option('no-fill'));
                     $totals['drops']++;
                     foreach (['people', 'added', 'filled'] as $key) $totals[$key] += (int) $result[$key];
                     $this->line(sprintf('%5d/%d  %-16s %s  %s%8s new  %6s filled  (%ds)', $i + 1, count($drops),
@@ -67,6 +77,9 @@ class LoadSmsProspects extends Command
                         $this->info('Reached '.number_format($withPhone).' prospects with a phone (--until='.number_format($until).'); the remaining drops can be loaded later.');
                         break;
                     }
+                }
+                if ($skipped !== []) {
+                    $this->warn(count($skipped).' large drops skipped for now; load them later with --drop: '.implode(' ', $skipped));
                 }
             }
             foreach ($paths as $path) {
