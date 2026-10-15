@@ -30,7 +30,7 @@ class GraphMailboxClient
         private readonly string $clientSecret,
         private ?Client $http = null,
     ) {
-        $this->http ??= new Client(['timeout' => 60]);
+        $this->http ??= new \Cmd\Reports\Observability\ObservedClient(['timeout' => 60]);
     }
 
     /**

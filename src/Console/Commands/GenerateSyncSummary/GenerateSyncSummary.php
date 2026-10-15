@@ -79,7 +79,7 @@ class GenerateSyncSummary extends Command
         $username = $config['username'];
         $password = $config['password'];
 
-        $this->sqlConnection = new PDO(
+        $this->sqlConnection = new \Cmd\Reports\Observability\ObservedPDO(
             $dsn,
             $username,
             $password,

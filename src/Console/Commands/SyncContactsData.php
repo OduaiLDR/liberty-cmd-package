@@ -60,6 +60,9 @@ class SyncContactsData extends Command
     private array $deferredEnrollmentChanges = [];
     private bool $matchingScopePrepared = false;
 
+    /** Per-command source instances keep verified metadata scoped to their immutable credentials. */
+    private array $sourceConnectors = [];
+
     /** Matching-step counters reset at the start of each matching run. */
     private int $matchingStepsOk = 0;
     private int $matchingStepsFailed = 0;
@@ -71,6 +74,16 @@ class SyncContactsData extends Command
     private array $matchingFailures = [];
 
     public function handle(): int
+    {
+        $this->sourceConnectors = [];
+        try {
+            return $this->handleRun();
+        } finally {
+            $this->sourceConnectors = [];
+        }
+    }
+
+    private function handleRun(): int
     {
         ini_set('memory_limit', '512M');
 
@@ -119,7 +132,7 @@ class SyncContactsData extends Command
 
         $php = PHP_BINARY;
         if (str_contains(basename($php), 'fpm')) {
-            $cli = trim((string) shell_exec('which php8.3 2>/dev/null || which php8.2 2>/dev/null || which php 2>/dev/null'));
+            $cli = trim((string) \Cmd\Reports\Observability\Shell::shellExec('which php8.3 2>/dev/null || which php8.2 2>/dev/null || which php 2>/dev/null'));
             $php = $cli ?: 'php';
         }
         $artisan  = base_path('artisan');
@@ -983,11 +996,10 @@ class SyncContactsData extends Command
     private function fetchDropNamesFiltered(DBConnector $connector, array $chunk): array
     {
         $lt = $this->source === 'LT' ? null : $this->initializeLendingTowerConnector();
-        $sources = $lt === null ? [] : ['LT' => $lt];
         $this->campaignProofs = ContactSyncCampaignLookup::collect($connector, $chunk, $this->source, $lt,
-            function (string $source, string $sql) use (&$sources): array {
-                $sources[$source] ??= DBConnector::fromEnvironment(strtolower($source));
-                $result = $sources[$source]->query($sql, [], 60);
+            function (string $source, string $sql) use ($lt): array {
+                $connection = $source === 'LT' && $lt !== null ? $lt : $this->sourceConnector($source);
+                $result = $connection->queryReadOnly($sql, [], 60);
                 if (($result['success'] ?? true) !== true || !is_array($result['data'] ?? null)
                     || !empty($result['error']) || !empty($result['truncated'])
                     || (isset($result['rowCount']) && (int) $result['rowCount'] !== count($result['data']))) {
@@ -1004,7 +1016,15 @@ class SyncContactsData extends Command
 
     protected function initializeLendingTowerConnector(): DBConnector
     {
-        return DBConnector::fromEnvironment('lt');
+        return $this->sourceConnector('LT');
+    }
+
+    protected function sourceConnector(string $source): DBConnector
+    {
+        if (!in_array($source, ['LT', 'LDR', 'PLAW'], true)) {
+            throw new \InvalidArgumentException('Unknown contact evidence source.');
+        }
+        return $this->sourceConnectors[$source] ??= DBConnector::fromEnvironment(strtolower($source));
     }
 
     protected function initializeMatchingConnector(): DBConnector
@@ -1380,10 +1400,8 @@ class SyncContactsData extends Command
         if ($requests === []) {
             return null;
         }
-        $sources = [];
-        return ContactSyncSourceEvidence::collect($requests, function (string $source, string $sql) use (&$sources): array {
-            $sources[$source] ??= DBConnector::fromEnvironment(strtolower($source));
-            $result = $sources[$source]->query($sql, [], 60);
+        return ContactSyncSourceEvidence::collect($requests, function (string $source, string $sql): array {
+            $result = $this->sourceConnector($source)->queryReadOnly($sql, [], 60);
             if (!isset($result['data']) || !is_array($result['data'])
                 || (isset($result['rowCount']) && (int) $result['rowCount'] !== count($result['data']))) {
                 throw new \RuntimeException('Incomplete contact identity evidence response.');
@@ -2068,7 +2086,7 @@ class SyncContactsData extends Command
     protected function initializeSnowflakeConnector(): DBConnector
     {
         try {
-            return DBConnector::fromEnvironment(strtolower($this->source));
+            return $this->sourceConnector($this->source);
         } catch (\Throwable $e) {
             throw new \RuntimeException("Unable to initialize Snowflake connector for {$this->source}: {$e->getMessage()}");
         }
