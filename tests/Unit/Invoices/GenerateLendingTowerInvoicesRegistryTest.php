@@ -132,4 +132,38 @@ final class GenerateLendingTowerInvoicesRegistryTest extends TestCase
     {
         self::assertNull(InvoiceRegistryGate::forGenerator('INVOICE_LT_PL_ENABLED'));
     }
+
+    public function test_ldr_has_its_own_switch_independent_of_progress_law(): void
+    {
+        $cmd = $this->command();
+        $cmd->useInvoiceGate('PLAW', null);
+        $cmd->useInvoiceGate('LDR', $this->gate());
+        self::assertTrue($this->deliverLive($cmd, ['PLAW', 'LDR']));
+        $dir = 'cmd/lending-tower-invoices/2026-09/';
+        self::assertTrue($this->disk()->exists($dir . 'LT-PL-2026-09.pdf'), 'Progress Law (switch off) keeps the old number');
+        self::assertTrue($this->disk()->exists($dir . 'LT-LDR-20261001-01.pdf'), 'LDR (switch on) uses the new number');
+        self::assertArrayHasKey('_reservations/LT-LDR/20261001/01.json', $this->store->objects);
+        self::assertArrayNotHasKey('_reservations/LT-PL/20261001/01.json', $this->store->objects);
+        $record = json_decode($this->store->objects['lending-tower/ldr/2026/10/LT-LDR-20261001-01/record.json'], true);
+        self::assertSame(['LT-LDR-20261001-01', 'ldr', 700, 'sent'], [$record['invoiceNumber'], $record['type'], $record['amount'], $record['status']]);
+    }
+
+    public function test_billing_start_still_finds_the_period_marker_of_a_registered_ldr_invoice(): void
+    {
+        $cmd = $this->command();
+        $cmd->useInvoiceGate('LDR', $this->gate());
+        $this->deliverLive($cmd, ['LDR']);
+        self::assertTrue($this->disk()->exists('cmd/lending-tower-invoices/2026-09/LT-LDR-2026-09.sent.json'));
+        self::assertSame('2026-09-01', $this->call($cmd, 'billingStart', ['2026-10-01']));
+    }
+
+    public function test_ldr_failure_falls_back_to_the_old_number(): void
+    {
+        $this->store->failAlways = true;
+        $cmd = $this->command();
+        $cmd->useInvoiceGate('LDR', $this->gate());
+        self::assertTrue($this->deliverLive($cmd, ['LDR']));
+        self::assertTrue($this->disk()->exists('cmd/lending-tower-invoices/2026-09/LT-LDR-2026-09.pdf'));
+        self::assertNotEmpty($this->alerts);
+    }
 }

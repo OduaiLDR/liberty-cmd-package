@@ -81,9 +81,9 @@ class GenerateLendingTowerInvoices extends Command
      * Invoice registry (TASK-006). Each invoice has its OWN switch, default off; when off, the number,
      * files, email and marker are exactly what they were before. Only live sends are registered.
      */
-    private const REGISTRY_SERIES = ['PLAW' => 'LT-PL'];
+    private const REGISTRY_SERIES = ['PLAW' => 'LT-PL', 'LDR' => 'LT-LDR'];
 
-    private const REGISTRY_SWITCH = ['PLAW' => 'INVOICE_LT_PL_ENABLED'];
+    private const REGISTRY_SWITCH = ['PLAW' => 'INVOICE_LT_PL_ENABLED', 'LDR' => 'INVOICE_LT_LDR_ENABLED'];
 
     /** @var array<string, InvoiceRegistryGate|null> */
     private array $gates = [];
