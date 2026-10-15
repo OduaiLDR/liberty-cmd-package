@@ -37,6 +37,12 @@ class SmsProspectExportRepository extends SqlSrvRepository
      */
     private const HASH_JOINS = 'OPTION (HASH JOIN)';
 
+    /**
+     * Seconds one step's query may run: selecting and pricing ~3M people reads all of TblProspects
+     * and TblTUData (52 GB). Below the queue job's 7,200 s; cmd-runner's default limit is 300.
+     */
+    public const STEP_QUERY_TIMEOUT = 3600;
+
     /** A contact phone as 10 digits: '12025551234' and '2025551234' are the same number. */
     private const CONTACT_PHONE = "CASE WHEN LEN(Phone) = 11 AND LEFT(Phone, 1) = '1' THEN SUBSTRING(Phone, 2, 10) ELSE Phone END";
 
@@ -73,10 +79,11 @@ SQL);
         if ($this->hasRows('TblProspectsExport', $requestId) || $this->hasRows('TblSMSHistory', $requestId)) {
             throw ValidationException::withMessages(['request_id' => 'This export run already has its records. Discard it or start a new run.']);
         }
-        $flagged = $this->markContacted();
-        $priority = self::PRIORITY;
-        $hashJoins = self::HASH_JOINS;
-        $selected = $this->connection()->affectingStatement($this->eligibleSql().<<<SQL
+        return $this->withQueryTimeout(self::STEP_QUERY_TIMEOUT, function () use ($requestId, $target): array {
+            $flagged = $this->markContacted();
+            $priority = self::PRIORITY;
+            $hashJoins = self::HASH_JOINS;
+            $selected = $this->connection()->affectingStatement($this->eligibleSql().<<<SQL
 
 INSERT INTO TblProspectsExport (Request_ID, Prospect_PK, Phone, Debt_Tier)
 SELECT TOP (?) ?, PK, Phone, Tier
@@ -86,7 +93,8 @@ ORDER BY {$priority}
 {$hashJoins}
 SQL, [self::SHARED_PHONE_ADDRESSES, $target, $requestId]);
 
-        return ['selected' => $selected, 'target' => $target, 'shortfall' => max(0, $target - $selected), 'contacted_flagged' => $flagged];
+            return ['selected' => $selected, 'target' => $target, 'shortfall' => max(0, $target - $selected), 'contacted_flagged' => $flagged];
+        });
     }
 
     /**
@@ -153,6 +161,12 @@ SQL;
      * @return array{TblTUData:int, TblMailers:int, Tier:int, None:int}
      */
     public function lookupDebts(string $requestId, array $tierDebts = []): array
+    {
+        return $this->withQueryTimeout(self::STEP_QUERY_TIMEOUT, fn (): array => $this->lookupDebtsNow($requestId, $tierDebts));
+    }
+
+    /** @return array{TblTUData:int, TblMailers:int, Tier:int, None:int} */
+    private function lookupDebtsNow(string $requestId, array $tierDebts): array
     {
         $this->assertOpenRun($requestId);
         $db = $this->connection();
@@ -255,6 +269,11 @@ SQL, [$requestId]);
     /** Writes the vendor file from the run's rows; returns the number of records written. */
     public function writeCsv(string $requestId, string $path): int
     {
+        return $this->withQueryTimeout(self::STEP_QUERY_TIMEOUT, fn (): int => $this->writeCsvNow($requestId, $path));
+    }
+
+    private function writeCsvNow(string $requestId, string $path): int
+    {
         $this->assertOpenRun($requestId);
         if ($this->table('TblProspectsExport')->where('Request_ID', $requestId)->whereNull('SMS_Drop_PK')->exists()) {
             throw new RuntimeException('Assign the SMS drops before writing the file.');
@@ -303,7 +322,7 @@ SQL, [$requestId]);
 
         $hashJoins = self::HASH_JOINS;
 
-        return $db->transaction(function () use ($db, $requestId, $sentAt, $hashJoins): int {
+        return $this->withQueryTimeout(self::STEP_QUERY_TIMEOUT, fn (): int => $db->transaction(function () use ($db, $requestId, $sentAt, $hashJoins): int {
             $db->update(<<<SQL
 UPDATE p SET SMS_Attempts = p.SMS_Attempts + 1, Latest_Export_Date = ?
 FROM TblProspects p
@@ -321,7 +340,7 @@ SQL, [$sentAt->toDateTimeString(), $requestId]);
             $db->table('TblProspectsExport')->where('Request_ID', $requestId)->delete();
 
             return $moved;
-        });
+        }));
     }
 
     /** Removes a run that was not sent (its rows and SMS drops), so its people can be selected again. */

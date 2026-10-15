@@ -16,6 +16,9 @@ use InvalidArgumentException;
  */
 class SmsProspectLoadRepository extends SqlSrvRepository
 {
+    /** Seconds one drop's query may run (cmd-runner's default limit is 300). */
+    public const DROP_QUERY_TIMEOUT = 1800;
+
     /** The drop's people, cleaned: phone as 10 digits, 5-digit zip, tier T1-T9, sizes of TblProspects. */
     private const SOURCE_SQL = <<<'SQL'
 WITH Source AS (
@@ -28,12 +31,12 @@ WITH Source AS (
         ph.Phone,
         CASE WHEN LTRIM(RTRIM(e.Email)) LIKE '_%@_%._%' THEN CAST(LEFT(LTRIM(RTRIM(e.Email)), 254) AS varchar(254)) END AS Email,
         CASE WHEN t.Debt_Tier LIKE 'T[1-9]' THEN CAST(UPPER(t.Debt_Tier) AS varchar(2)) END AS Tier
-    FROM TblMailersUniqueEnriched e
+    FROM TblMailersUniqueEnriched e WITH (FORCESEEK)
     CROSS APPLY (SELECT REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(LTRIM(RTRIM(e.Phone)),
         '(', ''), ')', ''), '-', ''), ' ', ''), '.', ''), '+', '') AS Digits) d
     CROSS APPLY (SELECT CASE WHEN LEN(d.Digits) = 11 AND LEFT(d.Digits, 1) = '1' THEN SUBSTRING(d.Digits, 2, 10) ELSE d.Digits END AS Digits) d10
     CROSS APPLY (SELECT CASE WHEN LEN(d10.Digits) = 10 AND d10.Digits NOT LIKE '%[^0-9]%' THEN CAST(d10.Digits AS varchar(10)) END AS Phone) ph
-    OUTER APPLY (SELECT TOP 1 u.Debt_Tier FROM TblMailersUnique u WHERE u.External_ID = e.External_ID AND u.Drop_Name = e.Drop_Name) t
+    OUTER APPLY (SELECT TOP 1 u.Debt_Tier FROM TblMailersUnique u WITH (FORCESEEK) WHERE u.External_ID = e.External_ID AND u.Drop_Name = e.Drop_Name) t
     WHERE e.Drop_Name = ?
 ),
 People AS (
@@ -71,6 +74,13 @@ SQL;
      * @return array{people:?int, added:int, filled:int}
      */
     public function loadDrop(string $dropName, ?string $sendDate, bool $dryRun = false): array
+    {
+        // A large or busy drop can take longer than the default 5-minute query limit.
+        return $this->withQueryTimeout(self::DROP_QUERY_TIMEOUT, fn (): array => $this->loadDropNow($dropName, $sendDate, $dryRun));
+    }
+
+    /** @return array{people:?int, added:int, filled:int} */
+    private function loadDropNow(string $dropName, ?string $sendDate, bool $dryRun): array
     {
         $db = $this->connection();
         if ($dryRun) {
