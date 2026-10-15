@@ -11,7 +11,7 @@ use Illuminate\Support\Facades\Log;
  * PLAW). For every active negotiator (TblEmployees.Term_Date IS NULL) with a Snowflake user ID
  * for that source (SF_UID_LDR / SF_UID_PLAW), sums how much post-fee (PF) EPF was scheduled on
  * settlements closed in the target month vs. how much of that actually cleared, and inserts one
- * TblNGOEPFClearRates row per negotiator whose clear rate is > 0.
+ * TblNGOEPFClearRates row per negotiator, including verified zero collection.
  *
  * The VBA runs the two SUM queries once per negotiator (2×N Snowflake round trips). This combines
  * both sums into a single GROUP BY so.NEG_ID query per source instead — same filters, same
@@ -24,7 +24,7 @@ use Illuminate\Support\Facades\Log;
  */
 class SyncNGOEPFClearRates extends Command
 {
-    protected $signature = 'sync:ngo-epf-clear-rates {--dry-run : Compute rates without writing to TblNGOEPFClearRates}';
+    protected $signature = 'sync:ngo-epf-clear-rates {--period= : Explicit payroll earnings month YYYY-MM} {--dry-run : Compute rates without writing to TblNGOEPFClearRates}';
 
     protected $description = 'Sync negotiator EPF clear rates (LDR + PLAW) into dbo.TblNGOEPFClearRates.';
 
@@ -33,7 +33,12 @@ class SyncNGOEPFClearRates extends Command
     public function handle(): int
     {
         $dryRun = (bool) $this->option('dry-run');
-        [$startDate, $endDate] = $this->resolveDateRange();
+        try {
+            [$startDate, $endDate] = $this->resolveDateRange();
+        } catch (\InvalidArgumentException $e) {
+            $this->error($e->getMessage());
+            return Command::FAILURE;
+        }
         $this->info("Date range: {$startDate} to {$endDate}" . ($dryRun ? ' (dry run — no writes)' : ''));
 
         try {
@@ -48,8 +53,8 @@ class SyncNGOEPFClearRates extends Command
         // fallback) so the LDR pass can never accidentally query PLAW's Snowflake account or vice
         // versa, regardless of which environment the SQL Server fallback happened to land on.
         $snowflakeConnectors = [
-            'LDR' => DBConnector::fromEnvironment('ldr'),
-            'PLAW' => DBConnector::fromEnvironment('plaw'),
+            'LDR' => $this->initializeSnowflakeConnector('ldr'),
+            'PLAW' => $this->initializeSnowflakeConnector('plaw'),
         ];
 
         $hadFailure = false;
@@ -72,6 +77,14 @@ class SyncNGOEPFClearRates extends Command
      */
     private function resolveDateRange(): array
     {
+        $period = $this->option('period');
+        if ($period !== null && $period !== '') {
+            if (!is_string($period) || !preg_match('/^\d{4}-(0[1-9]|1[0-2])$/D', $period)) {
+                throw new \InvalidArgumentException('period must be YYYY-MM.');
+            }
+            $start = new \DateTimeImmutable($period . '-01');
+            return [$start->format('Y-m-d'), $start->modify('last day of this month')->format('Y-m-d')];
+        }
         $today = new \DateTimeImmutable('today');
 
         $target = ((int) $today->format('j') < 6)
@@ -104,7 +117,7 @@ class SyncNGOEPFClearRates extends Command
             }
 
             $uids = array_column($employees, 'uid');
-            $sums = $this->fetchEpfSums($snowflake, $uids, $startDate, $endDate);
+            $sums = $this->fetchEpfSums($snowflake, $uids, $startDate, $endDate, $source);
 
             $rows = [];
             foreach ($employees as $employee) {
@@ -112,11 +125,9 @@ class SyncNGOEPFClearRates extends Command
                 $scheduled = $employeeSums['scheduled'] ?? 0.0;
                 $cleared = $employeeSums['cleared'] ?? 0.0;
 
-                // VBA: F = IFERROR(E/D, 0); only inserted when F > 0.
+                // Keep the actual operands, including zero. A zero denominator is not a
+                // verified collection ratio; Payroll Review applies its reviewed policy.
                 $rate = $scheduled > 0 ? $cleared / $scheduled : 0.0;
-                if ($rate <= 0) {
-                    continue;
-                }
 
                 $rows[] = [
                     'agent_id' => $employee['pk'],
@@ -126,7 +137,7 @@ class SyncNGOEPFClearRates extends Command
                 ];
             }
 
-            $this->info("[{$source}] Negotiators with a clear rate > 0: " . count($rows));
+            $this->info("[{$source}] Negotiators with verified collection operands: " . count($rows));
 
             $uploadDate = (new \DateTimeImmutable())->format('Y-m-d H:i:s');
 
@@ -140,7 +151,7 @@ class SyncNGOEPFClearRates extends Command
             }
 
             if (!$dryRun) {
-                $this->info("[{$source}] Inserted " . count($rows) . ' row(s) into TblNGOEPFClearRates.');
+                $this->info("[{$source}] Replaced " . count($rows) . ' agent-period row(s) in TblNGOEPFClearRates.');
             }
 
             return true;
@@ -164,7 +175,13 @@ class SyncNGOEPFClearRates extends Command
         ");
 
         $employees = [];
+        if (($result['success'] ?? false) !== true || !is_array($result['data'] ?? null)) {
+            throw new \RuntimeException('Active negotiator source failed. No collection data was replaced.');
+        }
         foreach ($result['data'] ?? [] as $row) {
+            if (!is_numeric($row['PK'] ?? null) || !is_numeric($row['UID'] ?? null) || (int)$row['PK'] <= 0 || (int)$row['UID'] <= 0) {
+                throw new \RuntimeException('Invalid employee/Forth collection identity.');
+            }
             $employees[] = [
                 'pk' => (int) $row['PK'],
                 'uid' => (int) $row['UID'],
@@ -181,7 +198,7 @@ class SyncNGOEPFClearRates extends Command
      * @param int[] $uids
      * @return array<int, array{scheduled: float, cleared: float}> Keyed by NEG_ID
      */
-    private function fetchEpfSums(DBConnector $snowflake, array $uids, string $startDate, string $endDate): array
+    private function fetchEpfSums(DBConnector $snowflake, array $uids, string $startDate, string $endDate, string $source): array
     {
         if (empty($uids)) {
             return [];
@@ -189,6 +206,9 @@ class SyncNGOEPFClearRates extends Command
 
         $uidList = implode(',', array_map('intval', array_unique($uids)));
 
+        $nextMonth = (new \DateTimeImmutable($endDate))->modify('+1 day')->format('Y-m-d');
+        $companyId = $source === 'LDR' ? 85781 : 85785;
+        // The connector is company-specific; the join is additionally contact-qualified.
         $sql = "
             SELECT
                 so.NEG_ID,
@@ -203,9 +223,12 @@ class SyncNGOEPFClearRates extends Command
               AND t.STATUS IN (0, 1, 4) AND so.OFFER_STATUS = 10
               AND (t._FIVETRAN_DELETED = FALSE OR t._FIVETRAN_DELETED IS NULL)
               AND (c._FIVETRAN_DELETED = FALSE OR c._FIVETRAN_DELETED IS NULL)
+              AND (t1._FIVETRAN_DELETED = FALSE OR t1._FIVETRAN_DELETED IS NULL)
               AND (so._FIVETRAN_DELETED = FALSE OR so._FIVETRAN_DELETED IS NULL)
               AND (d._FIVETRAN_DELETED = FALSE OR d._FIVETRAN_DELETED IS NULL)
-              AND d.SETTLEMENT_DATE >= '{$startDate}' AND d.SETTLEMENT_DATE <= '{$endDate}'
+              AND t1.CONTACT_ID = d.CONTACT_ID AND c.ID = so.CONTACT_ID
+              AND c.COMPANY_ID = {$companyId}
+              AND d.SETTLEMENT_DATE >= '{$startDate}' AND d.SETTLEMENT_DATE < '{$nextMonth}'
               AND so.NEG_ID IN ({$uidList})
             GROUP BY so.NEG_ID
         ";
@@ -213,8 +236,16 @@ class SyncNGOEPFClearRates extends Command
         $result = $snowflake->query($sql);
 
         $sums = [];
+        if (($result['success'] ?? true) !== true || !is_array($result['data'] ?? null)
+            || !isset($result['rowCount']) || (int)$result['rowCount'] !== count($result['data'])) {
+            throw new \RuntimeException('EPF source is unavailable or incomplete. Existing rates were preserved.');
+        }
         foreach ($result['data'] ?? [] as $row) {
             $negId = (int) ($row['NEG_ID'] ?? 0);
+            if ($negId <= 0 || isset($sums[$negId]) || !is_numeric($row['EPF_SCHEDULED'] ?? null) || !is_numeric($row['EPF_CLEARED'] ?? null)
+                || (float)$row['EPF_SCHEDULED'] < 0 || (float)$row['EPF_CLEARED'] < 0) {
+                throw new \RuntimeException('EPF source contains ambiguous or invalid collection amounts.');
+            }
             $sums[$negId] = [
                 'scheduled' => (float) ($row['EPF_SCHEDULED'] ?? 0),
                 'cleared' => (float) ($row['EPF_CLEARED'] ?? 0),
@@ -235,13 +266,33 @@ class SyncNGOEPFClearRates extends Command
         string $uploadDate,
         array $row
     ): void {
-        $sqlServer->querySqlServer("
+        $result = $sqlServer->querySqlServer("
+            SET XACT_ABORT ON;
+            BEGIN TRY
+            BEGIN TRANSACTION;
+            DELETE FROM TblNGOEPFClearRates WITH (UPDLOCK, HOLDLOCK)
+            WHERE Start_Date = ? AND End_Date = ? AND Agent_ID = ? AND Source = ?;
             INSERT INTO TblNGOEPFClearRates (Start_Date, End_Date, Agent_ID, EPF_Scheduled, EPF_Cleared, EPF_Rate, Upload_Date, Source)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ", [$startDate, $endDate, $row['agent_id'], $row['scheduled'], $row['cleared'], $row['rate'], $uploadDate, $source]);
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+            COMMIT TRANSACTION;
+            END TRY
+            BEGIN CATCH
+              IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+              THROW;
+            END CATCH
+        ", [$startDate, $endDate, $row['agent_id'], $source,
+            $startDate, $endDate, $row['agent_id'], $row['scheduled'], $row['cleared'], $row['rate'], $uploadDate, $source]);
+        if (($result['success'] ?? false) !== true) {
+            throw new \RuntimeException('Collection rate replacement failed; the agent transaction was rolled back.');
+        }
     }
 
-    private function initializeSqlServerConnector(): DBConnector
+    protected function initializeSnowflakeConnector(string $source): DBConnector
+    {
+        return DBConnector::fromEnvironment($source);
+    }
+
+    protected function initializeSqlServerConnector(): DBConnector
     {
         $candidates = ['ldr', 'plaw', 'production', 'sandbox'];
         $errors = [];
