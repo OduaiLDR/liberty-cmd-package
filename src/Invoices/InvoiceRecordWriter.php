@@ -24,10 +24,19 @@ final class InvoiceRecordWriter
     public function write(string $series, string $number, array $fields, array $files): array
     {
         $def = InvoiceSeries::get($series);
-        $folder = InvoiceSeries::folder($series, $number);
+
+        return $this->writeAt(InvoiceSeries::folder($series, $number), $def['company'], $def['type'], $number, $fields, $files);
+    }
+
+    /**
+     * Same as write() but for an explicit folder, used by the legacy backfill (old numbers do not fit a series).
+     * A legacy record may have no amount (e.g. an advance request PDF); every other status needs one.
+     */
+    public function writeAt(string $folder, string $company, string $type, string $number, array $fields, array $files): array
+    {
         $amount = $fields['amount'] ?? null;
         $status = (string) ($fields['status'] ?? '');
-        if (! is_int($amount) && ! is_float($amount) || ! is_finite((float) $amount)) {
+        if (! ($status === 'legacy' && $amount === null) && (! is_int($amount) && ! is_float($amount) || ! is_finite((float) $amount))) {
             throw new InvoiceRegistryException('Invoice amount must be a number.');
         }
         if (! in_array($status, self::STATUSES, true)) {
@@ -47,9 +56,9 @@ final class InvoiceRecordWriter
         $record = $fields + ['generator' => 'cmd-runner', 'source' => 'system'];
         $record = array_merge($record, [
             'invoiceNumber' => $number,
-            'company' => $def['company'],
-            'type' => $def['type'],
-            'amount' => (float) $amount,
+            'company' => $company,
+            'type' => $type,
+            'amount' => $amount === null ? null : (float) $amount,
             'currency' => 'USD',
             'status' => $status,
             'revision' => 1,
