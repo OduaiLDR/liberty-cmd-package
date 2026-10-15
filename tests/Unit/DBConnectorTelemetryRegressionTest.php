@@ -76,7 +76,7 @@ final class DBConnectorTelemetryRegressionTest extends TestCase
         self::assertCount(3, $this->history); // metadata is fetched once, without recursive metadata queries
         self::assertStringContainsString('INFORMATION_SCHEMA.COLUMNS', $this->body(0)['statement']);
         self::assertSame(['1' => ['type' => 'TEXT', 'value' => 'READER']], $this->body(0)['bindings']);
-        self::assertSame(30, $this->body(0)['timeout']);
+        self::assertSame(120, $this->body(0)['timeout']);
         self::assertSame(['1' => ['type' => 'FIXED', 'value' => '42']], $this->body(1)['bindings']);
         self::assertSame(17, $this->body(1)['timeout']);
         self::assertSame(19, $this->body(2)['timeout']);
@@ -100,8 +100,8 @@ final class DBConnectorTelemetryRegressionTest extends TestCase
         try {
             $connector->query('SELECT ID FROM CONTACTS');
             self::fail('Metadata failure must not permit an unfiltered query.');
-        } catch (\GuzzleHttp\Exception\ClientException $e) {
-            self::assertSame(422, $e->getResponse()->getStatusCode());
+        } catch (\Cmd\Reports\Services\SnowflakeReadFailure $e) {
+            self::assertSame(422, $e->httpStatus);
         }
         self::assertCount(1, $this->history);
         self::assertFalse((new \ReflectionProperty(DBConnector::class, 'loadingFivetranDeletedTables'))->getValue($connector));
