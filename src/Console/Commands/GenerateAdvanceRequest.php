@@ -144,7 +144,7 @@ class GenerateAdvanceRequest extends Command
                     $this->error('[INVOICE REGISTRY] ' . $message);
                     Log::error('[INVOICE REGISTRY] ' . $message, $context);
                 });
-                $registeredNumber = $this->registration->reserve($request['company'], $monthLabel, $tranche);
+                $registeredNumber = $this->registration->reserve($request['company'], $monthLabel, $tranche, (string) $invoice['issue_date']);
                 if ($registeredNumber !== null) {
                     $invoice['invoice_number'] = $registeredNumber;
                 }
@@ -194,7 +194,7 @@ class GenerateAdvanceRequest extends Command
             }
             $sent = $sent && $wasSent;
             if ($registeredNumber !== null) {
-                $this->registration->record($request['company'], $registeredNumber, (float) $request['amount'], $wasSent ? 'sent' : 'issued', $pdfBytes, $monthLabel, $tranche);
+                $this->registration->record($request['company'], $registeredNumber, (float) $request['amount'], $wasSent ? 'sent' : 'issued', $pdfBytes, $monthLabel, $tranche, (string) $invoice['issue_date']);
             }
 
             if ($wasSent) {

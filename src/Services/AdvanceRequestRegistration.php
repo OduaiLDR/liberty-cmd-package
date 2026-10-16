@@ -23,17 +23,29 @@ final class AdvanceRequestRegistration
         return new self(InvoiceRegistryGate::forGenerator(self::SWITCH, alert: $alert));
     }
 
-    /** New-style number dated today in Pacific time; null keeps the old LDR-ADV-YYYYMMDD-tranche number. */
-    public function reserve(string $company, string $monthLabel, string $tranche): ?string
+    /**
+     * The advance number is dated by the PRINTED invoice date (Bryan, Oct 16), not by run time and not by the
+     * Pacific clock: pass the exact issue_date string the PDF prints ("November 1, 2026"). Returns Y-m-d, or the
+     * input unchanged when it cannot be read (the registry then rejects it, alerts, and the old number stays).
+     */
+    public static function printedDate(string $printed): string
     {
-        return $this->gate?->reserve(self::SERIES[$company], $this->gate->today(), ['generator' => 'advance-request', 'period' => $monthLabel, 'tranche' => $tranche]);
+        $date = \DateTimeImmutable::createFromFormat('!F j, Y', trim($printed));
+
+        return $date !== false && $date->format('F j, Y') === trim($printed) ? $date->format('Y-m-d') : $printed;
     }
 
-    public function record(string $company, string $number, float $amount, string $status, string $pdf, string $monthLabel, string $tranche): bool
+    /** New-style number dated by the printed issue date; null keeps the old LDR-ADV-YYYYMMDD-tranche number. */
+    public function reserve(string $company, string $monthLabel, string $tranche, string $printedIssueDate): ?string
+    {
+        return $this->gate?->reserve(self::SERIES[$company], self::printedDate($printedIssueDate), ['generator' => 'advance-request', 'period' => $monthLabel, 'tranche' => $tranche]);
+    }
+
+    public function record(string $company, string $number, float $amount, string $status, string $pdf, string $monthLabel, string $tranche, string $printedIssueDate): bool
     {
         return $this->gate?->record(self::SERIES[$company], $number, [
             'amount' => $amount,
-            'invoiceDate' => $this->gate->today(),
+            'invoiceDate' => self::printedDate($printedIssueDate),
             'status' => $status,
             'generator' => 'advance-request',
             'period' => $monthLabel,
