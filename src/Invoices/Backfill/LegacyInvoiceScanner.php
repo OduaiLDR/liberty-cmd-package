@@ -73,18 +73,10 @@ final class LegacyInvoiceScanner
         return $this->ptDate($recorded) ?? $this->ptDate($source->modifiedAt($path));
     }
 
-    /** A number from a JSON value, null for anything else (strings like "$1,234.50" are cleaned; arrays and junk are not numbers). */
+    /** Amounts go through the one strict parser (whole-string validation); anything unclear is null = unknown. */
     private function dollars(mixed $value): ?float
     {
-        if (is_int($value) || is_float($value)) {
-            return is_finite((float) $value) ? (float) $value : null;
-        }
-        if (! is_string($value)) {
-            return null;
-        }
-        $clean = preg_replace('/[^0-9.\-]/', '', $value);
-
-        return $clean === '' || ! is_numeric($clean) ? null : (float) $clean;
+        return AmountParser::dollars($value);
     }
 
     private function text(mixed $value): ?string
@@ -102,13 +94,32 @@ final class LegacyInvoiceScanner
         return $d !== false && $d->format('Y-m') === $yearMonth ? $d->format('F Y') : null;
     }
 
-    /** The decoded JSON object at a path, or null (with the reason recorded) when it is missing, malformed or not an object/array. */
+    /**
+     * The decoded JSON OBJECT at a path, or null (with the reason recorded). Must be an object: a list ([], [1,2], [{...}]),
+     * a scalar, null, invalid JSON, an empty file and an empty object ({}: no information, nothing to import) are all
+     * skipped, whether or not the file has a timestamp. Decoded once without assoc to tell {} from [] (both are [] with assoc).
+     */
     private function readJson(LegacySource $source, string $path, string $label): ?array
     {
         $raw = $source->read($path);
-        $decoded = $raw === null || trim($raw) === '' ? null : json_decode($raw, true);
-        if (! is_array($decoded)) {
-            $this->skipped[] = "{$label}: " . basename($path) . ' is empty, not valid JSON or not a JSON object; not imported.';
+        $why = null;
+        $decoded = null;
+        if ($raw === null || trim($raw) === '') {
+            $why = 'is empty';
+        } else {
+            $object = json_decode($raw, false);
+            if (json_last_error() !== JSON_ERROR_NONE) {
+                $why = 'is not valid JSON';
+            } elseif (! $object instanceof \stdClass) {
+                $why = is_array($object) ? 'is a JSON list, not an object' : 'is not a JSON object';
+            } elseif ((array) $object === []) {
+                $why = 'is an empty object';
+            } else {
+                $decoded = json_decode($raw, true);
+            }
+        }
+        if ($why !== null || ! is_array($decoded)) {
+            $this->skipped[] = "{$label}: " . basename($path) . ' ' . ($why ?? 'is not a JSON object') . '; not imported.';
 
             return null;
         }
@@ -235,12 +246,12 @@ final class LegacyInvoiceScanner
             if ($manifest === null) {
                 continue;
             }
-            if (! is_array($manifest['invoices'] ?? null)) {
+            if (! is_array($manifest['invoices'] ?? null) || ! array_is_list($manifest['invoices'])) {
                 $this->skipped[] = "{$label}: " . basename($path) . ' has no "invoices" list; not imported.';
                 continue;
             }
             foreach ($manifest['invoices'] as $index => $record) {
-                $number = is_array($record) ? $this->text($record['invoiceNumber'] ?? null) : null;
+                $number = is_array($record) && ! ($record !== [] && array_is_list($record)) ? $this->text($record['invoiceNumber'] ?? null) : null;
                 if ($number === null) {
                     $this->skipped[] = "{$label}: record #{$index} in " . basename($path) . ' has no usable invoiceNumber; not imported.';
                     continue;
