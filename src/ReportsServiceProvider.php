@@ -91,6 +91,7 @@ use Cmd\Reports\Console\Commands\GenerateLowBalanceReport\GenerateLowBalanceRepo
 use Cmd\Reports\Console\Commands\GenerateUnclearedSettlementPaymentsReport\GenerateUnclearedSettlementPaymentsReport;
 use Cmd\Reports\Console\Commands\GenerateOfferAuthorizationReport\GenerateOfferAuthorizationReport;
 use Cmd\Reports\Console\Commands\GenerateReconsiderationReport\GenerateReconsiderationReport;
+use Cmd\Reports\Console\Commands\GenerateMissingAssignmentsReport\GenerateMissingAssignmentsReport;
 use Cmd\Reports\Console\Commands\SyncEmployeeSfUids;
 use Cmd\Reports\Console\Commands\SyncDroppedStatus\SyncDroppedStatus;
 use Cmd\Reports\Console\Commands\SyncDroppedStatus\SyncDroppedStatusPreview;
@@ -228,6 +229,7 @@ class ReportsServiceProvider extends ServiceProvider
                 GenerateUnclearedSettlementPaymentsReport::class,
                 GenerateOfferAuthorizationReport::class,
                 GenerateReconsiderationReport::class,
+                GenerateMissingAssignmentsReport::class,
                 SyncDroppedStatusPreview::class,
                 SyncDroppedStatus::class,
                 SyncEmployeeSfUids::class,
