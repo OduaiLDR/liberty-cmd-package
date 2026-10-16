@@ -4,7 +4,7 @@ namespace Cmd\Reports\Invoices;
 
 /**
  * Number series and where each lands in the bucket: {company}/{type}/{YYYY}/{MM}/{number}/.
- * A number is {series}-{YYYYMMDD}-{NN}, e.g. LT-PL-20261015-01 or LDR-EXP-JOR-20261015-01.
+ * A number is {series}-{YYYYMMDD}-{NN}, e.g. LT-PL-20261015-01 or LDR-EXP-JO-20261015-01.
  * Folder names are lowercase slugs and must match what the Invoices page reads (Debt-Relief-App invoices-core).
  */
 final class InvoiceSeries
@@ -16,14 +16,14 @@ final class InvoiceSeries
         'LDR-PAR' => ['company' => 'paramount', 'type' => 'paramount'],
         'LDR-ADV' => ['company' => 'advance-request', 'type' => 'ldr'],
         'PLAW-ADV' => ['company' => 'advance-request', 'type' => 'progress-law'],
-        'COMB-EXP-JOR' => ['company' => 'expenses-jordan', 'type' => 'combined'],
-        'LDR-EXP-JOR' => ['company' => 'expenses-jordan', 'type' => 'ldr'],
-        'LT-EXP-JOR' => ['company' => 'expenses-jordan', 'type' => 'lt'],
-        'PLAW-EXP-JOR' => ['company' => 'expenses-jordan', 'type' => 'plaw'],
-        'COMB-EXP-GUA' => ['company' => 'expenses-guatemala', 'type' => 'combined'],
-        'LDR-EXP-GUA' => ['company' => 'expenses-guatemala', 'type' => 'ldr'],
-        'LT-EXP-GUA' => ['company' => 'expenses-guatemala', 'type' => 'lt'],
-        'PLAW-EXP-GUA' => ['company' => 'expenses-guatemala', 'type' => 'plaw'],
+        'COMB-EXP-JO' => ['company' => 'expenses-jordan', 'type' => 'combined'],
+        'LDR-EXP-JO' => ['company' => 'expenses-jordan', 'type' => 'ldr'],
+        'LT-EXP-JO' => ['company' => 'expenses-jordan', 'type' => 'lt'],
+        'PLAW-EXP-JO' => ['company' => 'expenses-jordan', 'type' => 'plaw'],
+        'COMB-EXP-GT' => ['company' => 'expenses-guatemala', 'type' => 'combined'],
+        'LDR-EXP-GT' => ['company' => 'expenses-guatemala', 'type' => 'ldr'],
+        'LT-EXP-GT' => ['company' => 'expenses-guatemala', 'type' => 'lt'],
+        'PLAW-EXP-GT' => ['company' => 'expenses-guatemala', 'type' => 'plaw'],
     ];
 
     /** @return array{company: string, type: string} */
