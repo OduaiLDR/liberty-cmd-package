@@ -3,11 +3,14 @@
 namespace Cmd\Reports\Console\Commands\GenerateRetentionBonusCommission;
 
 use Cmd\Reports\Services\DBConnector;
+use Cmd\Reports\Services\PayrollCommissionResultSnapshot;
 use Cmd\Reports\Services\CommissionAgentEmailFiles;
 use Cmd\Reports\Services\CommissionResultsWriter;
 use Cmd\Reports\Services\CommissionRosterProvider;
 use Cmd\Reports\Services\EmailSenderService;
 use Cmd\Reports\Services\RetentionAgentIdentity;
+use Cmd\Reports\Services\PayrollRetentionLookbackWriter;
+use Cmd\Reports\Services\PayrollReportArtifactArchive;
 use Cmd\Reports\Services\UnassignedCommissionAgents;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
@@ -64,12 +67,20 @@ class GenerateRetentionBonusCommission extends Command
             $this->error('period must be a valid YYYY-MM-01 date.');
             return Command::FAILURE;
         }
+        try {
+            // Both sources share the reserved runner id. A manual run receives a
+            // fresh id and cannot impersonate a separately verified pipeline run.
+            $runId = PayrollRetentionLookbackWriter::runIdFromEnvironment();
+        } catch (\InvalidArgumentException $error) {
+            $this->error($error->getMessage());
+            return Command::FAILURE;
+        }
         foreach ($sources as $src) {
             if (!isset(self::SOURCE_CONFIG[$src])) {
                 $this->error("Unknown source: $src");
                 return Command::FAILURE;
             }
-            if (!$this->runForSource($src, $period ?: null)) {
+            if (!$this->runForSource($src, $period ?: null, $runId)) {
                 return Command::FAILURE;
             }
         }
@@ -83,7 +94,7 @@ class GenerateRetentionBonusCommission extends Command
         return $date !== false && $date->format('Y-m-d') === $period && $date->format('d') === '01';
     }
 
-    private function runForSource(string $source, ?string $periodStart = null): bool
+    private function runForSource(string $source, ?string $periodStart = null, ?string $runId = null): bool
     {
         $cfg     = self::SOURCE_CONFIG[$source];
         $display = $cfg['display'];
@@ -306,12 +317,17 @@ class GenerateRetentionBonusCommission extends Command
             // rows. Reset and replacement then share one transaction.
             $persisted = $this->persistBonusResults(
                 $sql, $source, $reportStartDate, $bonusResults,
-                (bool) $this->option('no-azure-write')
+                (bool) $this->option('no-azure-write'), $rows, $runId
             );
             if ($persisted === null) {
                 $this->info("[INFO] [$display] --no-azure-write set; calculated results were not written to Azure.");
             } elseif ($notice = CommissionResultsWriter::failureNotice($persisted, $display)) {
                 $this->warn($notice);
+            }
+            if (!(bool) $this->option('no-azure-write')) {
+                $context = PayrollReportArtifactArchive::captureRequested()
+                    ? ['commissionResults' => PayrollCommissionResultSnapshot::component('retention', $source, $reportStartDate, 'bonusCommission', $bonusResults)] : [];
+                PayrollReportArtifactArchive::captureFromEnvironment('lookback', $source, $reportStartDate, $allFile, $context);
             }
 
             if ($allFile) {
@@ -408,19 +424,21 @@ class GenerateRetentionBonusCommission extends Command
         string $source,
         string $periodStart,
         array $bonusResults,
-        bool $noAzureWrite
+        bool $noAzureWrite,
+        array $lookbackRows = [],
+        ?string $runId = null
     ): ?array {
         if ($noAzureWrite) {
             return null;
         }
 
-        return CommissionResultsWriter::replaceComponent(
-            $sql,
-            'retention',
-            $source,
-            $periodStart,
-            'Bonus_Commission',
-            $bonusResults
+        // Validate every positive Sales deduction before either component writes.
+        // The existing bonus writer owns its transaction; feed rows and their
+        // completion marker own another atomic transaction. The runner marks the
+        // command complete only when both succeed, before any report delivery.
+        return PayrollRetentionLookbackWriter::replaceCalculatedResults(
+            $sql, $source, $periodStart, $runId ?? PayrollRetentionLookbackWriter::runIdFromEnvironment(),
+            $lookbackRows, $bonusResults
         );
     }
 

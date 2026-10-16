@@ -5,9 +5,12 @@ declare(strict_types=1);
 namespace Cmd\Reports\Console\Commands\GenerateRetentionCommissionReport;
 
 use Cmd\Reports\Services\DBConnector;
+use Cmd\Reports\Services\PayrollCommissionResultSnapshot;
 use Cmd\Reports\Services\CommissionAgentEmailFiles;
 use Cmd\Reports\Services\CommissionCompanyMatch;
 use Cmd\Reports\Services\CommissionResultsWriter;
+use Cmd\Reports\Services\PayrollReportArtifactArchive;
+use Cmd\Reports\Console\Commands\GenerateRetentionManagerCommission\GenerateRetentionManagerCommission;
 use Cmd\Reports\Services\CommissionRosterProvider;
 use Cmd\Reports\Services\EmailSenderService;
 use Cmd\Reports\Services\RetentionCommissionTierStore;
@@ -354,6 +357,9 @@ class GenerateRetentionCommissionReport extends Command
             foreach ($this->lastSummaryRows as $agentName => $sum) {
                 $retResults[] = ['agent' => (string) $agentName, 'amount' => $sum['commission'] ?? 0];
             }
+            $archiveContext = PayrollReportArtifactArchive::captureRequested()
+                ? (new GenerateRetentionManagerCommission)->buildPayrollRetentionContext($rows) : [];
+            if (PayrollReportArtifactArchive::captureRequested()) $archiveContext['commissionResults'] = PayrollCommissionResultSnapshot::component('retention', $source, $startDate, 'commission', $retResults);
             $persisted = CommissionResultsWriter::replaceComponent($sql, 'retention', $source, $startDate, 'Commission', $retResults);
             if ($notice = CommissionResultsWriter::failureNotice($persisted, $display)) {
                 $this->warn($notice);
@@ -386,6 +392,7 @@ class GenerateRetentionCommissionReport extends Command
 
                 $snapshotPath = $this->saveSnapshotCopy($file, $display, $startDate);
                 $this->info("[INFO] [$display] Snapshot saved: {$snapshotPath}");
+                PayrollReportArtifactArchive::captureFromEnvironment('retention', $source, $startDate, $file, $archiveContext);
                 $this->cleanupOldSnapshots($startDate);
 
                 if ($this->option('no-email')) {

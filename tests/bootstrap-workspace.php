@@ -16,7 +16,7 @@ declare(strict_types=1);
  */
 
 $package = dirname(__DIR__);
-$cmdRunnerAutoload = dirname($package) . '/cmd-runner/vendor/autoload.php';
+$cmdRunnerAutoload = getenv('CMD_RUNNER_TEST_AUTOLOAD') ?: dirname($package) . '/cmd-runner/vendor/autoload.php';
 
 if (!is_file($cmdRunnerAutoload)) {
     fwrite(STDERR, "bootstrap-workspace.php: {$cmdRunnerAutoload} not found; run `composer install` in cmd-runner first.\n");
