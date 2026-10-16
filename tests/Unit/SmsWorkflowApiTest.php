@@ -21,6 +21,7 @@ use Illuminate\Validation\Factory;
 use Illuminate\Validation\ValidationException;
 use Symfony\Component\HttpKernel\Exception\HttpException;
 use Symfony\Component\HttpKernel\Exception\MethodNotAllowedHttpException;
+use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
 
 beforeEach(function () {
     $this->previousContainer = Container::getInstance();
@@ -226,7 +227,8 @@ test('API routes are host gated and bind correct methods and CMD report permissi
     if (! class_exists($session)) class_alias(SmsApiTestSessionGuard::class, $session);
     if (! class_exists($policy)) class_alias(SmsApiTestPolicyGuard::class, $policy);
     require __DIR__.'/../../routes/sms-api.php';
-    expect($router->getRoutes()->count())->toBe(7);
+    expect($router->getRoutes()->count())->toBe(16);
+    $run = '3f2a9c1b-0000-4000-8000-000000000001';
     foreach ([
         ['GET', 'mail-drop-export-report/preview', 'cmd.mail_drop_export.preview'],
         ['POST', 'mail-drop-export-report/export', 'cmd.mail_drop_export.export'],
@@ -235,11 +237,27 @@ test('API routes are host gated and bind correct methods and CMD report permissi
         ['GET', 'mail-drop-export-report/selection-status', 'cmd.mail_drop_export.selection_status'],
         ['GET', 'marketing-report/sms-history', 'cmd.marketing.sms_history'],
         ['POST', 'marketing-report/invoice', 'cmd.marketing.invoice'],
-    ] as [$method, $path, $name]) {
+        ['GET', 'mail-drop-export-report/runs', 'cmd.mail_drop_export.runs', false],
+        ['POST', 'mail-drop-export-report/runs', 'cmd.mail_drop_export.runs.store', false],
+        ['GET', 'mail-drop-export-report/runs/availability', 'cmd.mail_drop_export.runs.availability'],
+        ['GET', "mail-drop-export-report/runs/{$run}", 'cmd.mail_drop_export.runs.show'],
+        ['GET', "mail-drop-export-report/runs/{$run}/link", 'cmd.mail_drop_export.runs.link'],
+        ['POST', "mail-drop-export-report/runs/{$run}/file", 'cmd.mail_drop_export.runs.file'],
+        ['POST', "mail-drop-export-report/runs/{$run}/sent", 'cmd.mail_drop_export.runs.sent'],
+        ['POST', "mail-drop-export-report/runs/{$run}/discard", 'cmd.mail_drop_export.runs.discard'],
+        ['POST', "mail-drop-export-report/runs/{$run}/retry", 'cmd.mail_drop_export.runs.retry'],
+    ] as $expected) {
+        [$method, $path, $name] = $expected;
         $route = $router->getRoutes()->match(Request::create('/api/cmd/'.$path, $method));
         expect($route->getName())->toBe($name);
         expect($route->gatherMiddleware())->toBe(['api', $session, $policy]);
-        expect(fn () => $router->getRoutes()->match(Request::create('/api/cmd/'.$path, $method === 'GET' ? 'POST' : 'GET')))
-            ->toThrow(MethodNotAllowedHttpException::class);
+        // runs answers GET (list) and POST (start); every other path takes one method.
+        if ($expected[3] ?? true) {
+            expect(fn () => $router->getRoutes()->match(Request::create('/api/cmd/'.$path, $method === 'GET' ? 'POST' : 'GET')))
+                ->toThrow(MethodNotAllowedHttpException::class);
+        }
     }
+    // A run ID must be a UUID.
+    expect(fn () => $router->getRoutes()->match(Request::create('/api/cmd/mail-drop-export-report/runs/not-a-uuid/file', 'POST')))
+        ->toThrow(NotFoundHttpException::class);
 });

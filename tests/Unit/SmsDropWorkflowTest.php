@@ -850,6 +850,29 @@ test('successful phone sync atomically replaces only its own source', function (
     }
 });
 
+test('phone sync stores the contact creation date once TblPhoneNumbers has the column', function () {
+    $this->db->getSchemaBuilder()->table('TblPhoneNumbers', function (Blueprint $table) {
+        $table->string('Source')->nullable();
+        $table->integer('CID')->nullable();
+        $table->date('Created_Date')->nullable();
+    });
+    $pdo = $this->db->getPdo();
+    $command = \Mockery::mock(\Cmd\Reports\Console\Commands\SyncPhoneNumbers::class)->makePartial();
+    $command->shouldReceive('info')->andReturnNull();
+    (new ReflectionProperty($command, 'withCreatedDate'))->setValue($command, true);
+    $path = tempnam(sys_get_temp_dir(), 'sms-sync-test-');
+    file_put_contents($path, json_encode(['phone' => '2025550199', 'cid' => 1, 'created' => '2026-10-14'])."\n"
+        .json_encode(['phone' => '2025550198', 'cid' => 2, 'created' => 'not a date'])."\n");
+    try {
+        (new ReflectionMethod($command, 'replacePhonesFromFile'))->invoke($command, $pdo, $path, 10);
+        expect($this->db->table('TblPhoneNumbers')->orderBy('Phone')->pluck('Created_Date', 'Phone')->all())
+            ->toBe(['2025550198' => null, '2025550199' => '2026-10-14']);
+    } finally {
+        unlink($path);
+        \Mockery::close();
+    }
+});
+
 test('manual export uses only the chosen whole drops', function () {
     smsFixture($this->db, 1, 'T1', '2026-09-28', ['2025550101', '2025550102']);
     smsFixture($this->db, 2, 'T2', '2026-10-05', ['2025550103']);

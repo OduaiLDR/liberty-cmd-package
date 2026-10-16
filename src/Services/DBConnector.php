@@ -128,7 +128,7 @@ class DBConnector
             }
         ));
 
-        return new Client([
+        return new \Cmd\Reports\Observability\ObservedClient([
             'handler' => $stack,
             'timeout' => 60,
             'connect_timeout' => 10,
@@ -427,6 +427,38 @@ class DBConnector
      */
     public function query(string $sql, array $bindings = [], ?int $timeoutSeconds = null): array
     {
+        return \Cmd\Reports\Observability\Telemetry::measure('database', 'query', 'snowflake',
+            fn () => $this->queryObserved($sql, $bindings, $timeoutSeconds));
+    }
+
+    /** For trusted SELECT/CTE callers only; ordinary query() never retries cancelled statements. */
+    public function queryReadOnly(string $sql, array $bindings = [], int $timeoutSeconds = 60): array
+    {
+        return $this->queryReadWithRetry($sql, $bindings, $timeoutSeconds, 'source read');
+    }
+
+    private function queryReadWithRetry(string $sql, array $bindings, int $timeoutSeconds, string $operation): array
+    {
+        for ($attempt = 1; $attempt <= 3; $attempt++) {
+            try {
+                return $this->query($sql, $bindings, $timeoutSeconds);
+            } catch (SnowflakeReadFailure $error) {
+                // Metadata has its own budget. Never multiply it with the enclosing read's retries.
+                throw $error;
+            } catch (\Throwable $error) {
+                $failure = SnowflakeReadFailure::fromError($error, $operation, $attempt);
+                if (!$failure->isCancelledTimeout() || $attempt === 3) {
+                    throw $failure;
+                }
+                // Only a confirmed server-cancelled read is resubmitted (1s, 2s plus jitter).
+                usleep((2 ** ($attempt - 1)) * 1000000 + random_int(0, 500000));
+            }
+        }
+        throw new \LogicException('Unreachable Snowflake read retry state.');
+    }
+
+    private function queryObserved(string $sql, array $bindings = [], ?int $timeoutSeconds = null): array
+    {
         $queryHead = preg_replace('/\A(?:(?:\s+)|(?:--[^\r\n]*(?:\r?\n|$))|(?:\/\*.*?\*\/))*/s', '', $sql) ?? $sql;
         if (!$this->loadingFivetranDeletedTables
             && preg_match('/^(?:SELECT|WITH)\b/i', $queryHead)
@@ -685,7 +717,7 @@ class DBConnector
 
         $this->loadingFivetranDeletedTables = true;
         try {
-            $result = $this->query($metadataSql, [$this->schema], 30);
+            $result = $this->queryReadWithRetry($metadataSql, [$this->schema], 120, 'deletion-marker metadata');
         } finally {
             $this->loadingFivetranDeletedTables = false;
         }
@@ -698,9 +730,10 @@ class DBConnector
         $tables = [];
         foreach ($rows as $row) {
             $table = $row['TABLE_NAME'] ?? $row['table_name'] ?? null;
-            if (is_string($table) && $table !== '') {
-                $tables[] = strtoupper($table);
+            if (!is_string($table) || $table === '') {
+                throw new Exception('Snowflake returned an invalid deletion-marker table name.');
             }
+            $tables[] = strtoupper($table);
         }
 
         $this->fivetranDeletedTables = array_values(array_unique($tables));
@@ -1032,7 +1065,7 @@ class DBConnector
                 $options[PDO::SQLSRV_ATTR_QUERY_TIMEOUT] = $this->sqlServerQueryTimeout();
             }
 
-            $this->sqlServerConnection = new PDO(
+            $this->sqlServerConnection = new \Cmd\Reports\Observability\ObservedPDO(
                 $dsn,
                 $this->sqlServerConfig['username'],
                 $this->sqlServerConfig['password'],

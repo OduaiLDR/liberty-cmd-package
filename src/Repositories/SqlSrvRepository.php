@@ -17,6 +17,28 @@ abstract class SqlSrvRepository
         return DB::connection($this->connection);
     }
 
+    /**
+     * Runs $callback with a longer SQL Server query timeout (cmd-runner's default is
+     * CMD_DB_QUERY_TIMEOUT, 300 s), then puts the previous one back. For queue jobs and
+     * commands only; keep it below their own time limits.
+     */
+    protected function withQueryTimeout(int $seconds, callable $callback): mixed
+    {
+        $connection = $this->connection();
+        $attribute = defined('PDO::SQLSRV_ATTR_QUERY_TIMEOUT') ? constant('PDO::SQLSRV_ATTR_QUERY_TIMEOUT') : null;
+        if ($attribute === null || ! method_exists($connection, 'getDriverName') || $connection->getDriverName() !== 'sqlsrv') {
+            return $callback();
+        }
+        $pdo = $connection->getPdo();
+        $previous = $pdo->getAttribute($attribute);
+        $pdo->setAttribute($attribute, $seconds);
+        try {
+            return $callback();
+        } finally {
+            $pdo->setAttribute($attribute, $previous);
+        }
+    }
+
     protected function table(string $table, ?string $as = null): Builder
     {
         $name = $as ? "{$table} as {$as}" : $table;

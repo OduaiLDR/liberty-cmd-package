@@ -207,7 +207,7 @@ class Formatter
             $username = $config['username'];
             $password = $config['password'];
 
-            $pdo = new PDO(
+            $pdo = new \Cmd\Reports\Observability\ObservedPDO(
                 $dsn,
                 $username,
                 $password,
