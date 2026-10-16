@@ -83,7 +83,7 @@ trait LendingTowerHarness
     {
         Facade::clearResolvedInstances();
         Facade::setFacadeApplication($this->savedFacade);
-        exec('rm -rf ' . escapeshellarg($this->root));
+        TestFiles::removeTree($this->root);
     }
 
     protected function command(array $options = []): LendingTowerUnderTest

@@ -3,6 +3,7 @@
 namespace Cmd\Reports\Tests\Unit\Invoices;
 
 use Cmd\Reports\Invoices\Backfill\LegacyInvoiceScanner;
+use Cmd\Reports\Invoices\Backfill\LegacySource;
 use Cmd\Reports\Invoices\Backfill\LocalDirectorySource;
 use PHPUnit\Framework\TestCase;
 
@@ -80,6 +81,58 @@ final class LegacyInvoiceScannerTest extends TestCase
             '2026-10: already registered as LDR-PAR-20261031-01',
             '2026-07-LT-D1: manifest lists it but the file is not on this host',
         ], $scanner->skipped);
+    }
+
+    /** A host whose directory listing uses backslashes (Windows), like LocalDirectorySource there. */
+    private function windowsView(FakeLegacySource $inner): LegacySource
+    {
+        return new class($inner) implements LegacySource {
+            public function __construct(private readonly FakeLegacySource $inner)
+            {
+            }
+
+            public function files(string $dir): array
+            {
+                return array_map(static fn (string $p) => str_replace('/', '\\', $p), $this->inner->files($dir));
+            }
+
+            public function read(string $path): ?string
+            {
+                return $this->inner->read(str_replace('\\', '/', $path));
+            }
+
+            public function modifiedAt(string $path): ?int
+            {
+                return $this->inner->modifiedAt(str_replace('\\', '/', $path));
+            }
+        };
+    }
+
+    public function test_backslash_paths_from_a_windows_host_are_found_exactly_like_unix_ones(): void
+    {
+        $unix = new LegacyInvoiceScanner(new FakeLegacySource(self::hostFiles()), new FakeLegacySource($this->advanceFiles()));
+        $win = new LegacyInvoiceScanner($this->windowsView(new FakeLegacySource(self::hostFiles())), $this->windowsView(new FakeLegacySource($this->advanceFiles())));
+        $numbers = static fn (array $c): array => array_map(static fn (array $x) => $x['number'], $c);
+        $found = $win->scan();
+        self::assertSame($numbers($unix->scan()), $numbers($found));
+        self::assertCount(6, $found, 'LT, Paramount, advance and Jordan invoices are all found');
+        self::assertSame($unix->scan(), $found, 'same candidates (files, dates, amounts) as on Unix');
+        self::assertSame($unix->skipped, $win->skipped);
+    }
+
+    public function test_local_directory_source_lists_forward_slash_paths_for_nested_folders(): void
+    {
+        $root = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'legacy-nested-' . bin2hex(random_bytes(3));
+        mkdir($root . DIRECTORY_SEPARATOR . 'a' . DIRECTORY_SEPARATOR . 'b', 0777, true);
+        file_put_contents($root . DIRECTORY_SEPARATOR . 'a' . DIRECTORY_SEPARATOR . 'b' . DIRECTORY_SEPARATOR . 'x.txt', 'hi');
+        try {
+            $src = new LocalDirectorySource($root . '/');
+            self::assertSame(['a/b/x.txt'], $src->files('a'), 'never a backslash in a listed path');
+            self::assertSame('hi', $src->read('a/b/x.txt'));
+            self::assertSame('hi', $src->read('a\\b\\x.txt'), 'a backslash path reads the same file');
+        } finally {
+            TestFiles::removeTree($root);
+        }
     }
 
     public function test_local_directory_source_is_read_only_and_cannot_leave_its_folder(): void

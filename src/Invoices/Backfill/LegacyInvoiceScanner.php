@@ -36,6 +36,17 @@ final class LegacyInvoiceScanner
         return array_merge($this->lendingTower(), $this->paramount(), $this->advance(), $this->jordan());
     }
 
+    /**
+     * File paths from a source, always with forward slashes: a Windows host lists backslash paths, and every pattern
+     * below (and the paths we read back) uses '/'.
+     *
+     * @return list<string>
+     */
+    private function listed(LegacySource $source, string $dir): array
+    {
+        return array_map(static fn (string $path): string => str_replace('\\', '/', $path), $source->files($dir));
+    }
+
     private function ptDate(int|string|null $when): string
     {
         $instant = is_int($when) ? (new \DateTimeImmutable())->setTimestamp($when) : new \DateTimeImmutable((string) $when);
@@ -54,7 +65,7 @@ final class LegacyInvoiceScanner
     private function lendingTower(): array
     {
         $out = [];
-        foreach ($this->private->files('cmd/lending-tower-invoices') as $path) {
+        foreach ($this->listed($this->private, 'cmd/lending-tower-invoices') as $path) {
             if (preg_match('#^cmd/lending-tower-invoices/(\d{4}-\d{2})/(LT-PL|LT-LDR)-\d{4}-\d{2}\.sent\.json$#', $path, $m) !== 1) {
                 continue;
             }
@@ -83,7 +94,7 @@ final class LegacyInvoiceScanner
     private function paramount(): array
     {
         $out = [];
-        foreach ($this->private->files('cmd/paramount-invoices') as $path) {
+        foreach ($this->listed($this->private, 'cmd/paramount-invoices') as $path) {
             if (preg_match('#^cmd/paramount-invoices/(\d{4}-\d{2})\.sent\.json$#', $path, $m) !== 1) {
                 continue;
             }
@@ -104,7 +115,7 @@ final class LegacyInvoiceScanner
     private function advance(): array
     {
         $out = [];
-        foreach ($this->advance->files('') as $path) {
+        foreach ($this->listed($this->advance, '') as $path) {
             if (preg_match('/^(LDR|PLAW)-ADV-(\d{4})(\d{2})(\d{2})-([A-Za-z0-9-]+)\.pdf$/', basename($path), $m) !== 1) {
                 continue;
             }
@@ -122,7 +133,7 @@ final class LegacyInvoiceScanner
     private function jordan(): array
     {
         $latest = [];
-        foreach ($this->private->files($this->jordanPrefix) as $path) {
+        foreach ($this->listed($this->private, $this->jordanPrefix) as $path) {
             if (preg_match('#/invoices/manifests/[^/]+\.json$#', $path) !== 1) {
                 continue;
             }

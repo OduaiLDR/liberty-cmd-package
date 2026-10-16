@@ -16,10 +16,12 @@ final class LocalDirectorySource implements LegacySource
             return [];
         }
         $out = [];
+        $root = rtrim(str_replace('\\', '/', $this->root), '/');
         $it = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($base, \FilesystemIterator::SKIP_DOTS));
         foreach ($it as $file) {
             if ($file->isFile()) {
-                $out[] = ltrim(substr($file->getPathname(), strlen(rtrim($this->root, '/')) + 1), '/');
+                // Forward slashes on every OS (Windows returns backslashes).
+                $out[] = ltrim(substr(str_replace('\\', '/', $file->getPathname()), strlen($root) + 1), '/');
             }
         }
         sort($out);
@@ -43,10 +45,11 @@ final class LocalDirectorySource implements LegacySource
 
     private function resolve(string $relative): ?string
     {
+        $relative = str_replace('\\', '/', $relative);
         if (str_contains($relative, '..')) {
             return null;
         }
 
-        return rtrim($this->root, '/') . '/' . ltrim($relative, '/');
+        return rtrim(str_replace('\\', '/', $this->root), '/') . '/' . ltrim($relative, '/');
     }
 }
