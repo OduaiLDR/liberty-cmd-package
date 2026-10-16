@@ -16,6 +16,11 @@ final class FakeInvoiceStore implements InvoiceObjectStore
     public array $transientFailures = [];
     public bool $failAlways = false;
 
+    public function get(string $key): ?string
+    {
+        return $this->objects[$key] ?? null;
+    }
+
     public function putIfAbsent(string $key, string $body, string $contentType): bool
     {
         if (Fiber::getCurrent() !== null) {

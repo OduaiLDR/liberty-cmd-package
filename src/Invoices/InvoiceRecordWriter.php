@@ -49,7 +49,9 @@ final class InvoiceRecordWriter
         $listed = [];
         foreach ($files as $file) {
             $key = $folder . $file['name'];
-            $this->store->putIfAbsent($key, $file['bytes'], $file['contentType']);
+            if (! $this->store->putIfAbsent($key, $file['bytes'], $file['contentType'])) {
+                $this->assertSameStoredFile($folder, $key, $number, $file['bytes']);
+            }
             $listed[] = ['name' => $file['name'], 'kind' => $file['kind'], 'key' => $key, 'sha256' => hash('sha256', $file['bytes']), 'bytes' => strlen($file['bytes'])];
         }
 
@@ -70,5 +72,24 @@ final class InvoiceRecordWriter
         }
 
         return $record;
+    }
+
+    /**
+     * A file is already there (an earlier attempt uploaded it, then the record failed). Keep it only when it is byte-for-byte
+     * the file we are about to describe; otherwise the record would carry a checksum for a file that is not the stored one.
+     * Nothing is overwritten (create-only bucket): a mismatch fails loudly and the generator keeps its old number.
+     */
+    private function assertSameStoredFile(string $folder, string $key, string $number, string $bytes): void
+    {
+        $stored = $this->store->get($key);
+        if ($stored !== null && hash_equals(hash('sha256', $stored), hash('sha256', $bytes))) {
+            return;
+        }
+        if ($this->store->get($folder . 'record.json') !== null) {
+            throw new InvoiceRegistryException("{$number} already has a record.json; refusing to overwrite it.");
+        }
+        throw new InvoiceRegistryException($stored === null
+            ? "{$key} exists but could not be read back, so it cannot be verified; not recording {$number}."
+            : "{$key} already holds a different file (sha256 " . hash('sha256', $stored) . ', ' . strlen($stored) . ' bytes) than this attempt (sha256 ' . hash('sha256', $bytes) . ', ' . strlen($bytes) . " bytes); not recording {$number}.");
     }
 }

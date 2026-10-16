@@ -13,4 +13,11 @@ interface InvoiceObjectStore
      * @throws InvoiceStoreTransientException when S3 asks for a retry (409 conflict, 5xx, throttling)
      */
     public function putIfAbsent(string $key, string $body, string $contentType): bool;
+
+    /**
+     * Read an object back (used to verify a file left by an earlier, half-finished attempt). null when the key does not exist.
+     *
+     * @throws InvoiceRegistryException when the object cannot be read (for example access denied): callers treat that as "cannot verify"
+     */
+    public function get(string $key): ?string;
 }

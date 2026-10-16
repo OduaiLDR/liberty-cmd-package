@@ -18,6 +18,18 @@ final class S3InvoiceObjectStore implements InvoiceObjectStore
         return new self(new S3Client(['version' => 'latest', 'region' => $config->region]), $config->bucket);
     }
 
+    public function get(string $key): ?string
+    {
+        try {
+            return (string) $this->client->getObject(['Bucket' => $this->bucket, 'Key' => $key])['Body'];
+        } catch (AwsException $e) {
+            if ((int) $e->getStatusCode() === 404 || $e->getAwsErrorCode() === 'NoSuchKey') {
+                return null;
+            }
+            throw new InvoiceRegistryException("S3 could not read {$key}: {$e->getAwsErrorCode()} {$e->getAwsErrorMessage()}", 0, $e);
+        }
+    }
+
     public function putIfAbsent(string $key, string $body, string $contentType): bool
     {
         try {

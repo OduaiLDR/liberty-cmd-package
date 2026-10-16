@@ -97,6 +97,79 @@ final class InvoiceRecordAndGateTest extends TestCase
         return InvoiceRegistryConfig::fromReader(static fn (string $k) => $env[$k] ?? null);
     }
 
+    public function test_s3_adapter_reads_back_an_object_maps_404_to_null_and_refuses_when_unreadable(): void
+    {
+        $mock = new MockHandler();
+        $mock->append(new Result(['Body' => \GuzzleHttp\Psr7\Utils::streamFor('PKfake')]));
+        $mock->append(new AwsException('Missing', new Command('GetObject'), ['response' => new \GuzzleHttp\Psr7\Response(404), 'code' => 'NoSuchKey']));
+        $mock->append(new AwsException('Denied', new Command('GetObject'), ['response' => new \GuzzleHttp\Psr7\Response(403), 'code' => 'AccessDenied']));
+        $store = new S3InvoiceObjectStore(new S3Client(['version' => 'latest', 'region' => 'us-east-2', 'credentials' => ['key' => 'fake', 'secret' => 'fake'], 'handler' => $mock]), 'ff-development-invoices');
+        self::assertSame('PKfake', $store->get('k'));
+        self::assertNull($store->get('k'));
+        $this->expectException(InvoiceRegistryException::class);
+        $store->get('k');
+    }
+
+    private function halfFinishedAttempt(FakeInvoiceStore $store, string $workbook): string
+    {
+        $folder = 'lending-tower/progress-law/2026/10/LT-PL-20261015-01/';
+        $store->transientFailures = [$folder . 'record.json'];
+        $files = $this->files();
+        $files[1]['bytes'] = $workbook;
+        try {
+            (new InvoiceRecordWriter($store))->write('LT-PL', 'LT-PL-20261015-01', ['amount' => 100.0] + $this->fields(), $files);
+            self::fail('the first attempt should have died on record.json');
+        } catch (\Cmd\Reports\Invoices\InvoiceStoreTransientException) {
+        }
+        self::assertArrayNotHasKey($folder . 'record.json', $store->objects);
+
+        return $folder;
+    }
+
+    public function test_retry_with_a_different_workbook_never_records_a_checksum_for_the_wrong_file(): void
+    {
+        $store = new FakeInvoiceStore();
+        $folder = $this->halfFinishedAttempt($store, 'PK-workbook-100-dollars');
+        $files = $this->files();
+        $files[1]['bytes'] = 'PK-workbook-200-dollars';
+        try {
+            (new InvoiceRecordWriter($store))->write('LT-PL', 'LT-PL-20261015-01', ['amount' => 200.0] + $this->fields(), $files);
+            self::fail('a retry whose workbook differs from the stored one must fail loudly');
+        } catch (InvoiceRegistryException $e) {
+            self::assertStringContainsString('already holds a different file', $e->getMessage());
+            self::assertStringContainsString(hash('sha256', 'PK-workbook-100-dollars'), $e->getMessage());
+        }
+        self::assertArrayNotHasKey($folder . 'record.json', $store->objects, 'no record for the mismatched retry');
+        self::assertSame('PK-workbook-100-dollars', $store->objects[$folder . 'LT-PL-20261015-01-backup.xlsx'], 'the stored file is never overwritten');
+    }
+
+    public function test_retry_with_the_same_files_completes_and_the_checksums_match_what_is_stored(): void
+    {
+        $store = new FakeInvoiceStore();
+        $folder = $this->halfFinishedAttempt($store, 'PK-workbook-100-dollars');
+        $files = $this->files();
+        $files[1]['bytes'] = 'PK-workbook-100-dollars';
+        $record = (new InvoiceRecordWriter($store))->write('LT-PL', 'LT-PL-20261015-01', ['amount' => 100.0] + $this->fields(), $files);
+        foreach ($record['files'] as $entry) {
+            self::assertSame(hash('sha256', $store->objects[$entry['key']]), $entry['sha256'], $entry['name']);
+            self::assertSame(strlen($store->objects[$entry['key']]), $entry['bytes']);
+        }
+        self::assertEquals(100.0, json_decode($store->objects[$folder . 'record.json'], true)['amount']);
+    }
+
+    public function test_gate_reports_a_mismatched_retry_as_not_recorded_and_the_generator_carries_on(): void
+    {
+        $store = new FakeInvoiceStore();
+        $this->halfFinishedAttempt($store, 'PK-old');
+        $alerts = [];
+        $gate = new InvoiceRegistryGate(new InvoiceRegistry($store), static function (string $m) use (&$alerts): void { $alerts[] = $m; });
+        $files = $this->files();
+        $files[1]['bytes'] = 'PK-new';
+        self::assertFalse($gate->record('LT-PL', 'LT-PL-20261015-01', ['amount' => 200.0] + $this->fields(), $files), 'false = keep invoicing, nothing recorded');
+        self::assertCount(1, $alerts);
+        self::assertStringContainsString('different file', $alerts[0]);
+    }
+
     public function test_gate_is_null_when_off_and_never_throws_when_s3_fails(): void
     {
         $alerts = [];
