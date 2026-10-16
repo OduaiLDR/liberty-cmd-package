@@ -83,6 +83,30 @@ final class LegacyInvoiceScannerTest extends TestCase
         ], $scanner->skipped);
     }
 
+    public function test_guatemala_manifests_are_imported_verbatim_but_a_number_that_Jordan_already_uses_is_skipped_not_shadowed(): void
+    {
+        $gt = ['invoices' => [
+            ['invoiceNumber' => '2026-07-LDR-D1', 'companyKey' => 'ldr', 'month' => '2026-07', 'invoiceSet' => 'D1', 'totalUsd' => 55.0, 'generatedAt' => '2026-08-28T10:00:00+00:00', 'storageKey' => 'cmd/guatemala-expenses/2026-07/invoices/files/a.xls'],
+            ['invoiceNumber' => '2026-08-PLAW-S2', 'companyKey' => 'plaw', 'month' => '2026-08', 'invoiceSet' => 'S2', 'totalUsd' => 66.0, 'generatedAt' => '2026-09-28T10:00:00+00:00', 'storageKey' => 'cmd/guatemala-expenses/2026-08/invoices/files/b.xls'],
+        ]];
+        $files = self::hostFiles() + [
+            'cmd/guatemala-expenses/2026-07/invoices/manifests/set-1.json' => [json_encode($gt)],
+            'cmd/guatemala-expenses/2026-07/invoices/files/a.xls' => ['<gt-a/>'],
+            'cmd/guatemala-expenses/2026-08/invoices/files/b.xls' => ['<gt-b/>'],
+        ];
+        $scanner = new LegacyInvoiceScanner(new FakeLegacySource($files), new FakeLegacySource([]));
+        $found = [];
+        foreach ($scanner->scan() as $c) {
+            $found[$c['company'] . '|' . $c['number']] = $c;
+        }
+        self::assertArrayHasKey('expenses-guatemala|2026-08-PLAW-S2', $found);
+        self::assertSame(['expenses-guatemala', 'plaw', 66.0, '2026-09-28'], [$found['expenses-guatemala|2026-08-PLAW-S2']['company'], $found['expenses-guatemala|2026-08-PLAW-S2']['type'], $found['expenses-guatemala|2026-08-PLAW-S2']['amount'], $found['expenses-guatemala|2026-08-PLAW-S2']['invoiceDate']]);
+        self::assertSame(['<gt-b/>'], array_column($found['expenses-guatemala|2026-08-PLAW-S2']['files'], 'bytes'));
+        self::assertArrayHasKey('expenses-jordan|2026-07-LDR-D1', $found, 'Jordan keeps its number');
+        self::assertArrayNotHasKey('expenses-guatemala|2026-07-LDR-D1', $found, 'the page opens a number by name only, so a duplicate would hide one of the two files');
+        self::assertContains('2026-07-LDR-D1: Guatemala has the same historical number as Jordan; not imported (numbers are never renamed). Needs a decision.', $scanner->skipped);
+    }
+
     /** A host whose directory listing uses backslashes (Windows), like LocalDirectorySource there. */
     private function windowsView(FakeLegacySource $inner): LegacySource
     {
