@@ -92,4 +92,36 @@ final class LegacyBackfillTest extends TestCase
         self::assertStringContainsString('INVOICE_S3_BUCKET is not set', $buffer->fetch());
         self::assertCount(5, (new LegacyBackfill())->plan($this->scanner()->scan()));
     }
+    /** Mirror of the Invoices page allowlist (invoices-core isInvoiceNumber): ASCII letters, digits, single dashes, case kept. */
+    private function viewerAccepts(string $number): bool
+    {
+        return strlen($number) <= 48 && preg_match('/^[A-Za-z0-9]+(?:-[A-Za-z0-9]+){1,7}$/', $number) === 1;
+    }
+
+    public function test_mixed_case_expense_numbers_are_imported_verbatim_and_the_page_can_open_every_imported_number(): void
+    {
+        $manifest = ['invoices' => array_map(static fn (string $n, string $key) => [
+            'invoiceNumber' => $n, 'companyKey' => $key, 'month' => '2026-07', 'invoiceSet' => substr($n, -2), 'totalUsd' => 10.0,
+            'generatedAt' => '2026-08-27T10:00:00+00:00', 'storageKey' => "cmd/jordan-expenses/2026-07/invoices/files/{$n}.xls",
+        ], ['2026-07-Combined-S2', '2026-07-PLAW-S1', '2026-07-LT-D2'], ['combined', 'plaw', 'lt'])];
+        $files = LegacyInvoiceScannerTest::hostFiles() + ['cmd/jordan-expenses/2026-07/invoices/manifests/set-9.json' => [json_encode($manifest)]];
+        foreach (['2026-07-Combined-S2', '2026-07-PLAW-S1', '2026-07-LT-D2'] as $n) {
+            $files["cmd/jordan-expenses/2026-07/invoices/files/{$n}.xls"] = ['<xml/>'];
+        }
+        $scanner = new LegacyInvoiceScanner(new FakeLegacySource($files), new FakeLegacySource(['LDR-ADV-20260901-53.pdf' => ['%PDF', strtotime('2026-10-01 17:35:00 UTC')]]));
+        $candidates = $scanner->scan();
+        $store = new FakeInvoiceStore();
+        $result = (new LegacyBackfill())->apply($store, $candidates);
+        self::assertSame([], $result['failed']);
+        self::assertContains('2026-07-Combined-S2', $result['written'], 'the printed number is kept exactly, not upper-cased or renamed');
+        $folder = 'expenses-jordan/combined/2026/08/2026-07-Combined-S2/';
+        self::assertSame('2026-07-Combined-S2', json_decode($store->objects[$folder . 'record.json'], true)['invoiceNumber']);
+        self::assertArrayHasKey($folder . '2026-07-Combined-S2.xls', $store->objects);
+        foreach ($result['written'] as $number) {
+            self::assertTrue($this->viewerAccepts($number), "the Invoices page must accept the imported number {$number}");
+        }
+        foreach (array_keys($store->objects) as $key) {
+            self::assertStringStartsNotWith('_', $key, 'the backfill never reserves a number');
+        }
+    }
 }
