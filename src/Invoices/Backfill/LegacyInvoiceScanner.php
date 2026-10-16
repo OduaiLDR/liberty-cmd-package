@@ -24,7 +24,7 @@ final class LegacyInvoiceScanner
      * @param  LegacySource  $private  storage/app/private (cmd/lending-tower-invoices, cmd/paramount-invoices, cmd/jordan-expenses)
      * @param  LegacySource  $advance  storage/app/advance-request-invoices
      */
-    public function __construct(private readonly LegacySource $private, private readonly LegacySource $advance, private readonly string $jordanPrefix = 'cmd/jordan-expenses')
+    public function __construct(private readonly LegacySource $private, private readonly LegacySource $advance, private readonly string $jordanPrefix = 'cmd/jordan-expenses', private readonly string $guatemalaPrefix = 'cmd/guatemala-expenses')
     {
     }
 
@@ -33,7 +33,11 @@ final class LegacyInvoiceScanner
     {
         $this->skipped = [];
 
-        return array_merge($this->lendingTower(), $this->paramount(), $this->advance(), $this->jordan());
+        $first = array_merge($this->lendingTower(), $this->paramount(), $this->advance());
+        $jordan = $this->expenses($this->jordanPrefix, 'expenses-jordan', 'jordan-expenses', 'Jordan', []);
+        $taken = array_column($jordan, 'number');
+
+        return array_merge($first, $jordan, $this->expenses($this->guatemalaPrefix, 'expenses-guatemala', 'guatemala-expenses', 'Guatemala', $taken));
     }
 
     /**
@@ -129,11 +133,18 @@ final class LegacyInvoiceScanner
         return $out;
     }
 
-    /** @return list<array<string, mixed>> */
-    private function jordan(): array
+    /**
+     * Old expense invoices (Jordan or Guatemala). Both locations used the same numbers (2026-07-LDR-D1) and the page opens a
+     * number by name only, so a number already taken by an earlier location is skipped and reported instead of importing a
+     * second record that would shadow (or be shadowed by) the first. Numbers are never renamed.
+     *
+     * @param  list<string>  $taken  numbers already claimed by another location
+     * @return list<array<string, mixed>>
+     */
+    private function expenses(string $prefix, string $company, string $source, string $label, array $taken): array
     {
         $latest = [];
-        foreach ($this->listed($this->private, $this->jordanPrefix) as $path) {
+        foreach ($this->listed($this->private, $prefix) as $path) {
             if (preg_match('#/invoices/manifests/[^/]+\.json$#', $path) !== 1) {
                 continue;
             }
@@ -148,12 +159,16 @@ final class LegacyInvoiceScanner
         $out = [];
         ksort($latest);
         foreach ($latest as $number => $record) {
+            if (in_array($number, $taken, true)) {
+                $this->skipped[] = "{$number}: {$label} has the same historical number as Jordan; not imported (numbers are never renamed). Needs a decision.";
+                continue;
+            }
             $bytes = $this->private->read((string) ($record['storageKey'] ?? ''));
             if ($bytes === null) {
                 $this->skipped[] = "{$number}: manifest lists it but the file is not on this host";
                 continue;
             }
-            $out[] = $this->candidate($number, 'expenses-jordan', (string) $record['companyKey'], $this->ptDate($record['generatedAt'] ?? null), (float) ($record['totalUsd'] ?? 0), (string) $record['month'], 'jordan-expenses', [
+            $out[] = $this->candidate($number, $company, (string) $record['companyKey'], $this->ptDate($record['generatedAt'] ?? null), (float) ($record['totalUsd'] ?? 0), (string) $record['month'], $source, [
                 ['name' => "{$number}.xls", 'kind' => 'backup', 'bytes' => $bytes, 'contentType' => 'application/vnd.ms-excel'],
             ], ['generatedBy' => $record['generatedBy'] ?? null, 'notes' => "Legacy import: expense invoice {$record['invoiceSet']}."]);
         }
