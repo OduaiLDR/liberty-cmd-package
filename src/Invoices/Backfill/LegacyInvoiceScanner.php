@@ -51,18 +51,80 @@ final class LegacyInvoiceScanner
         return array_map(static fn (string $path): string => str_replace('\\', '/', $path), $source->files($dir));
     }
 
-    private function ptDate(int|string|null $when): string
+    /** Pacific Y-m-d for an instant given as unix time or a date string; null when it cannot be read (never "now"). */
+    private function ptDate(mixed $when): ?string
     {
-        $instant = is_int($when) ? (new \DateTimeImmutable())->setTimestamp($when) : new \DateTimeImmutable((string) $when);
+        try {
+            if (is_int($when)) {
+                return PacificTime::date((new \DateTimeImmutable())->setTimestamp($when));
+            }
+            if (is_string($when) && trim($when) !== '') {
+                return PacificTime::date(new \DateTimeImmutable($when));
+            }
+        } catch (\Throwable) {
+        }
 
-        return PacificTime::date($instant);
+        return null;
     }
 
-    private function dollars(mixed $text): ?float
+    /** First readable date of: the record's own value, then the file's modified time. */
+    private function dateOf(mixed $recorded, LegacySource $source, string $path): ?string
     {
-        $clean = preg_replace('/[^0-9.\-]/', '', (string) $text);
+        return $this->ptDate($recorded) ?? $this->ptDate($source->modifiedAt($path));
+    }
 
-        return $clean === '' || ! is_numeric($clean) ? null : (float) $clean;
+    /** Amounts go through the one strict parser (whole-string validation); anything unclear is null = unknown. */
+    private function dollars(mixed $value): ?float
+    {
+        return AmountParser::dollars($value);
+    }
+
+    private function text(mixed $value): ?string
+    {
+        $text = is_string($value) || is_int($value) ? trim((string) $value) : '';
+
+        return $text === '' ? null : $text;
+    }
+
+    /** "2026-07" -> "July 2026"; null when it is not a real year-month. */
+    private function monthLabel(string $yearMonth): ?string
+    {
+        $d = \DateTimeImmutable::createFromFormat('!Y-m', $yearMonth);
+
+        return $d !== false && $d->format('Y-m') === $yearMonth ? $d->format('F Y') : null;
+    }
+
+    /**
+     * The decoded JSON OBJECT at a path, or null (with the reason recorded). Must be an object: a list ([], [1,2], [{...}]),
+     * a scalar, null, invalid JSON, an empty file and an empty object ({}: no information, nothing to import) are all
+     * skipped, whether or not the file has a timestamp. Decoded once without assoc to tell {} from [] (both are [] with assoc).
+     */
+    private function readJson(LegacySource $source, string $path, string $label): ?array
+    {
+        $raw = $source->read($path);
+        $why = null;
+        $decoded = null;
+        if ($raw === null || trim($raw) === '') {
+            $why = 'is empty';
+        } else {
+            $object = json_decode($raw, false);
+            if (json_last_error() !== JSON_ERROR_NONE) {
+                $why = 'is not valid JSON';
+            } elseif (! $object instanceof \stdClass) {
+                $why = is_array($object) ? 'is a JSON list, not an object' : 'is not a JSON object';
+            } elseif ((array) $object === []) {
+                $why = 'is an empty object';
+            } else {
+                $decoded = json_decode($raw, true);
+            }
+        }
+        if ($why !== null || ! is_array($decoded)) {
+            $this->skipped[] = "{$label}: " . basename($path) . ' ' . ($why ?? 'is not a JSON object') . '; not imported.';
+
+            return null;
+        }
+
+        return $decoded;
     }
 
     /** @return list<array<string, mixed>> */
@@ -73,10 +135,19 @@ final class LegacyInvoiceScanner
             if (preg_match('#^cmd/lending-tower-invoices/(\d{4}-\d{2})/(LT-PL|LT-LDR)-\d{4}-\d{2}\.sent\.json$#', $path, $m) !== 1) {
                 continue;
             }
-            $marker = json_decode((string) $this->private->read($path), true) ?: [];
             $number = basename($path, '.sent.json');
+            $marker = $this->readJson($this->private, $path, $number);
+            if ($marker === null) {
+                continue;
+            }
             if (isset($marker['invoice_number'])) {
-                $this->skipped[] = "{$number}: already registered as {$marker['invoice_number']}";
+                $this->skipped[] = "{$number}: already registered as " . (is_scalar($marker['invoice_number']) ? $marker['invoice_number'] : 'a registry number');
+                continue;
+            }
+            $period = $this->monthLabel($m[1]);
+            $date = $this->dateOf($marker['sent_at'] ?? null, $this->private, $path);
+            if ($period === null || $date === null) {
+                $this->skipped[] = "{$number}: " . ($period === null ? "'{$m[1]}' is not a real month" : 'no usable sent_at and no file time to date it') . '; not imported.';
                 continue;
             }
             $dir = dirname($path);
@@ -88,7 +159,7 @@ final class LegacyInvoiceScanner
                 }
             }
             $type = $m[2] === 'LT-PL' ? 'progress-law' : 'ldr';
-            $out[] = $this->candidate($number, 'lending-tower', $type, $this->ptDate($marker['sent_at'] ?? $this->private->modifiedAt($path)), $this->dollars($marker['total_due'] ?? null), (new \DateTimeImmutable($m[1] . '-01'))->format('F Y'), 'lending-tower-invoices', $files, ['sentAt' => $marker['sent_at'] ?? null]);
+            $out[] = $this->candidate($number, 'lending-tower', $type, $date, $this->dollars($marker['total_due'] ?? null), $period, 'lending-tower-invoices', $files, ['sentAt' => $this->text($marker['sent_at'] ?? null)]);
         }
 
         return $out;
@@ -102,14 +173,23 @@ final class LegacyInvoiceScanner
             if (preg_match('#^cmd/paramount-invoices/(\d{4}-\d{2})\.sent\.json$#', $path, $m) !== 1) {
                 continue;
             }
-            $marker = json_decode((string) $this->private->read($path), true) ?: [];
-            $invoice = (string) ($marker['invoice'] ?? '');
+            $marker = $this->readJson($this->private, $path, $m[1]);
+            if ($marker === null) {
+                continue;
+            }
+            $invoice = $this->text($marker['invoice'] ?? null) ?? '';
             if (preg_match('/^LDR-PAR-\d{8}-\d{2}\.pdf$/', $invoice) === 1) {
                 $this->skipped[] = "{$m[1]}: already registered as " . basename($invoice, '.pdf');
                 continue;
             }
+            $period = $this->monthLabel($m[1]);
+            $date = $this->dateOf($marker['sent_at'] ?? null, $this->private, $path);
+            if ($period === null || $date === null) {
+                $this->skipped[] = "{$m[1]}: " . ($period === null ? 'not a real month' : 'no usable sent_at and no file time to date it') . '; not imported.';
+                continue;
+            }
             // No PDF is kept on the host for Paramount, so only the record is imported.
-            $out[] = $this->candidate('LDR-PAR-' . $m[1], 'paramount', 'paramount', $this->ptDate($marker['sent_at'] ?? $this->private->modifiedAt($path)), isset($marker['payment']) ? (float) $marker['payment'] : null, (new \DateTimeImmutable($m[1] . '-01'))->format('F Y'), 'paramount-invoices', [], ['sentAt' => $marker['sent_at'] ?? null, 'notes' => 'Legacy import: no PDF was kept on the Runner host.']);
+            $out[] = $this->candidate('LDR-PAR-' . $m[1], 'paramount', 'paramount', $date, $this->dollars($marker['payment'] ?? null), $period, 'paramount-invoices', [], ['sentAt' => $this->text($marker['sent_at'] ?? null), 'notes' => 'Legacy import: no PDF was kept on the Runner host.']);
         }
 
         return $out;
@@ -124,8 +204,15 @@ final class LegacyInvoiceScanner
                 continue;
             }
             $number = basename($path, '.pdf');
+            $period = checkdate((int) $m[3], (int) $m[4], (int) $m[2]) ? $this->monthLabel("{$m[2]}-{$m[3]}") : null;
+            if ($period === null) {
+                $this->skipped[] = "{$number}: the date in the number ({$m[2]}{$m[3]}{$m[4]}) is not a real date; not imported.";
+                continue;
+            }
+            // The file time when there is one, else the date printed in the number itself.
+            $date = $this->ptDate($this->advance->modifiedAt($path)) ?? "{$m[2]}-{$m[3]}-{$m[4]}";
             $bytes = (string) $this->advance->read($path);
-            $out[] = $this->candidate($number, 'advance-request', $m[1] === 'LDR' ? 'ldr' : 'progress-law', $this->ptDate($this->advance->modifiedAt($path)), null, (new \DateTimeImmutable("{$m[2]}-{$m[3]}-01"))->format('F Y'), 'advance-request', [
+            $out[] = $this->candidate($number, 'advance-request', $m[1] === 'LDR' ? 'ldr' : 'progress-law', $date, null, $period, 'advance-request', [
                 ['name' => "{$number}.pdf", 'kind' => 'pdf', 'bytes' => $bytes, 'contentType' => 'application/pdf'],
             ], ['notes' => "Legacy import: amount is on the PDF; tranche {$m[5]}."]);
         }
@@ -133,10 +220,16 @@ final class LegacyInvoiceScanner
         return $out;
     }
 
+    private const COMPANY_KEYS = ['ldr' => 'ldr', 'lt' => 'lt', 'plaw' => 'plaw', 'combined' => 'combined'];
+
     /**
      * Old expense invoices (Jordan or Guatemala). Both locations used the same numbers (2026-07-LDR-D1) and the page opens a
      * number by name only, so a number already taken by an earlier location is skipped and reported instead of importing a
      * second record that would shadow (or be shadowed by) the first. Numbers are never renamed.
+     *
+     * Every manifest record is untrusted: only invoiceNumber is required. Missing companyKey, month and invoiceSet are inferred
+     * from the number (2026-07-LDR-D1 = month 2026-07, company ldr, set D1) only when that is unambiguous; a missing
+     * storageKey, an undatable record or an uninferable company is skipped with the reason, never fatal.
      *
      * @param  list<string>  $taken  numbers already claimed by another location
      * @return list<array<string, mixed>>
@@ -144,33 +237,74 @@ final class LegacyInvoiceScanner
     private function expenses(string $prefix, string $company, string $source, string $label, array $taken): array
     {
         $latest = [];
+        $paths = [];
         foreach ($this->listed($this->private, $prefix) as $path) {
             if (preg_match('#/invoices/manifests/[^/]+\.json$#', $path) !== 1) {
                 continue;
             }
-            $manifest = json_decode((string) $this->private->read($path), true) ?: [];
-            foreach ($manifest['invoices'] ?? [] as $record) {
-                $key = $record['invoiceNumber'] ?? null;
-                if ($key !== null && ($latest[$key]['generatedAt'] ?? '') <= ($record['generatedAt'] ?? '')) {
-                    $latest[$key] = $record;
+            $manifest = $this->readJson($this->private, $path, $label);
+            if ($manifest === null) {
+                continue;
+            }
+            if (! is_array($manifest['invoices'] ?? null) || ! array_is_list($manifest['invoices'])) {
+                $this->skipped[] = "{$label}: " . basename($path) . ' has no "invoices" list; not imported.';
+                continue;
+            }
+            foreach ($manifest['invoices'] as $index => $record) {
+                $number = is_array($record) && ! ($record !== [] && array_is_list($record)) ? $this->text($record['invoiceNumber'] ?? null) : null;
+                if ($number === null) {
+                    $this->skipped[] = "{$label}: record #{$index} in " . basename($path) . ' has no usable invoiceNumber; not imported.';
+                    continue;
+                }
+                $at = is_string($record['generatedAt'] ?? null) ? $record['generatedAt'] : '';
+                if (! isset($latest[$number]) || ($latest[$number]['generatedAt'] ?? '') <= $at) {
+                    $latest[$number] = $record;
+                    $paths[$number] = $path;
                 }
             }
         }
         $out = [];
         ksort($latest);
         foreach ($latest as $number => $record) {
+            $number = (string) $number;
             if (in_array($number, $taken, true)) {
                 $this->skipped[] = "{$number}: {$label} has the same historical number as Jordan; not imported (numbers are never renamed). Needs a decision.";
                 continue;
             }
-            $bytes = $this->private->read((string) ($record['storageKey'] ?? ''));
+            $storageKey = $this->text($record['storageKey'] ?? null);
+            if ($storageKey === null) {
+                $this->skipped[] = "{$number}: manifest record has no storageKey, so there is no file to import.";
+                continue;
+            }
+            $bytes = $this->private->read($storageKey);
             if ($bytes === null) {
                 $this->skipped[] = "{$number}: manifest lists it but the file is not on this host";
                 continue;
             }
-            $out[] = $this->candidate($number, $company, (string) $record['companyKey'], $this->ptDate($record['generatedAt'] ?? null), (float) ($record['totalUsd'] ?? 0), (string) $record['month'], $source, [
+            $tokens = explode('-', $number);
+            $key = $this->text($record['companyKey'] ?? null) ?? ($tokens[2] ?? '');
+            $key = self::COMPANY_KEYS[strtolower($key)] ?? null;
+            if ($key === null) {
+                $this->skipped[] = "{$number}: cannot tell which company this is (no companyKey, and the number does not name LDR, LT, PLAW or Combined); not imported.";
+                continue;
+            }
+            $month = $this->text($record['month'] ?? null);
+            $month = $month !== null && $this->monthLabel($month) !== null ? $month : (preg_match('/^(\d{4}-\d{2})-/', $number, $mm) === 1 && $this->monthLabel($mm[1]) !== null ? $mm[1] : (preg_match('#/(\d{4}-\d{2})/invoices/#', $paths[$number], $pm) === 1 && $this->monthLabel($pm[1]) !== null ? $pm[1] : null));
+            if ($month === null) {
+                $this->skipped[] = "{$number}: no usable month in the record, the number or the manifest path; not imported.";
+                continue;
+            }
+            $date = $this->dateOf($record['generatedAt'] ?? null, $this->private, $storageKey);
+            if ($date === null) {
+                $this->skipped[] = "{$number}: no usable generatedAt and no file time to date it; not imported.";
+                continue;
+            }
+            // The set (D1, D2, S1, S2) only labels the note: from the record, else the number's own suffix, else left out.
+            $set = $this->text($record['invoiceSet'] ?? null);
+            $set ??= preg_match('/-([DS][12])$/i', $number, $sm) === 1 ? strtoupper($sm[1]) : null;
+            $out[] = $this->candidate($number, $company, $key, $date, $this->dollars($record['totalUsd'] ?? null), $month, $source, [
                 ['name' => "{$number}.xls", 'kind' => 'backup', 'bytes' => $bytes, 'contentType' => 'application/vnd.ms-excel'],
-            ], ['generatedBy' => $record['generatedBy'] ?? null, 'notes' => "Legacy import: expense invoice {$record['invoiceSet']}."]);
+            ], ['generatedBy' => $this->text($record['generatedBy'] ?? null), 'notes' => 'Legacy import: expense invoice' . ($set !== null ? " {$set}" : '') . '.']);
         }
 
         return $out;
