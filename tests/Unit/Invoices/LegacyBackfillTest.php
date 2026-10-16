@@ -124,4 +124,166 @@ final class LegacyBackfillTest extends TestCase
             self::assertStringStartsNotWith('_', $key, 'the backfill never reserves a number');
         }
     }
+    /** @return array{0: LegacyInvoiceScanner, 1: string} */
+    private function dupScanner(array $jordan, array $guatemala, array $extra = []): LegacyInvoiceScanner
+    {
+        $entry = static fn (string $n, string $key, string $name) => ['invoiceNumber' => $n, 'companyKey' => $key, 'month' => '2026-07', 'invoiceSet' => 'D1', 'totalUsd' => 5.0, 'generatedAt' => '2026-08-27T10:00:00+00:00', 'storageKey' => $name];
+        $files = $extra;
+        foreach (['jordan' => $jordan, 'guatemala' => $guatemala] as $site => $numbers) {
+            $list = [];
+            foreach ($numbers as $n) {
+                $list[] = $entry($n, 'ldr', "cmd/{$site}-expenses/2026-07/invoices/files/{$n}.xls");
+                $files["cmd/{$site}-expenses/2026-07/invoices/files/{$n}.xls"] = ["<{$site}-{$n}/>"];
+            }
+            if ($list !== []) {
+                $files["cmd/{$site}-expenses/2026-07/invoices/manifests/m.json"] = [json_encode(['invoices' => $list])];
+            }
+        }
+
+        return new LegacyInvoiceScanner(new FakeLegacySource($files), new FakeLegacySource([]));
+    }
+
+    private function runBackfill(LegacyInvoiceScanner $scanner, FakeInvoiceStore $store, bool $write): array
+    {
+        $backfill = new LegacyBackfill();
+        $resolved = $backfill->resolve($scanner->scan(), $store);
+        $written = $write ? $backfill->apply($store, $resolved['candidates']) : null;
+
+        return [$resolved, $written];
+    }
+
+    public function test_a_number_already_in_the_bucket_from_another_location_is_skipped_and_never_duplicated(): void
+    {
+        $store = new FakeInvoiceStore();
+        [, $first] = $this->runBackfill($this->dupScanner(['2026-07-LDR-D1', '2026-07-LDR-D2'], []), $store, true);
+        self::assertSame(['2026-07-LDR-D1', '2026-07-LDR-D2'], $first['written']);
+
+        // Later run: Guatemala now has the same number, and Jordan's files are gone from the host.
+        [$resolved, $second] = $this->runBackfill($this->dupScanner([], ['2026-07-LDR-D1', '2026-07-LDR-D3']), $store, true);
+        self::assertSame(['2026-07-LDR-D3'], $second['written'], 'the non-colliding Guatemala number still imports');
+        self::assertSame([], $second['existing'] + $second['failed']);
+        self::assertCount(1, $resolved['skipped']);
+        self::assertStringContainsString('2026-07-LDR-D1', $resolved['skipped'][0]);
+        self::assertStringContainsString('already in the invoice bucket', $resolved['skipped'][0]);
+        self::assertArrayNotHasKey('expenses-guatemala/ldr/2026/08/2026-07-LDR-D1/record.json', $store->objects);
+        self::assertSame(1, count(array_filter(array_keys($store->objects), static fn (string $k) => str_ends_with($k, '/2026-07-LDR-D1/record.json'))), 'exactly one record per number');
+    }
+
+    public function test_reversed_order_guatemala_first_then_jordan_is_also_skipped(): void
+    {
+        $store = new FakeInvoiceStore();
+        $this->runBackfill($this->dupScanner([], ['2026-07-LDR-D1']), $store, true);
+        [$resolved, $result] = $this->runBackfill($this->dupScanner(['2026-07-LDR-D1', '2026-07-LDR-D9'], []), $store, true);
+        self::assertSame(['2026-07-LDR-D9'], $result['written']);
+        self::assertStringContainsString('2026-07-LDR-D1', $resolved['skipped'][0]);
+        self::assertArrayHasKey('expenses-guatemala/ldr/2026/08/2026-07-LDR-D1/record.json', $store->objects);
+    }
+
+    public function test_the_same_number_from_two_sources_in_one_scan_imports_once_whatever_the_sources(): void
+    {
+        // A Paramount record and an advance-request file claiming the same number, plus the Jordan/Guatemala pair.
+        $candidate = static fn (string $n, string $company) => ['number' => $n, 'company' => $company, 'type' => 'ldr', 'invoiceDate' => '2026-09-01', 'amount' => 1.0, 'period' => 'x', 'source' => $company, 'files' => [], 'fields' => []];
+        $store = new FakeInvoiceStore();
+        $resolved = (new LegacyBackfill())->resolve([$candidate('LDR-X-1', 'paramount'), $candidate('LDR-X-1', 'advance-request'), $candidate('LDR-X-2', 'advance-request')], $store);
+        self::assertSame(['paramount', 'advance-request'], array_column($resolved['candidates'], 'company'));
+        self::assertSame(['LDR-X-1', 'LDR-X-2'], array_column($resolved['candidates'], 'number'));
+        self::assertCount(1, $resolved['skipped']);
+        self::assertStringContainsString('LDR-X-1', $resolved['skipped'][0]);
+        self::assertStringContainsString('already used by paramount', $resolved['skipped'][0]);
+    }
+
+    public function test_numbers_that_differ_only_by_case_count_as_taken_but_the_stored_case_is_never_changed(): void
+    {
+        $store = new FakeInvoiceStore();
+        $this->runBackfill($this->dupScanner(['2026-07-Combined-S2'], []), $store, true);
+        $candidate = ['number' => '2026-07-COMBINED-S2', 'company' => 'expenses-guatemala', 'type' => 'combined', 'invoiceDate' => '2026-08-27', 'amount' => 1.0, 'period' => 'x', 'source' => 'g', 'files' => [], 'fields' => []];
+        $resolved = (new LegacyBackfill())->resolve([$candidate], $store);
+        self::assertSame([], $resolved['candidates']);
+        self::assertStringContainsString('differs only by letter case', $resolved['skipped'][0]);
+        self::assertArrayHasKey('expenses-jordan/ldr/2026/08/2026-07-Combined-S2/record.json', $store->objects, 'the first number keeps its exact case');
+    }
+
+    public function test_dry_run_and_real_run_make_the_same_skip_decisions_and_the_dry_run_writes_nothing(): void
+    {
+        $store = new FakeInvoiceStore();
+        $this->runBackfill($this->dupScanner(['2026-07-LDR-D1'], []), $store, true);
+        $before = $store->objects;
+        $scanner = $this->dupScanner([], ['2026-07-LDR-D1', '2026-07-LDR-D3']);
+        [$dry] = $this->runBackfill($scanner, $store, false);
+        self::assertSame($before, $store->objects, 'a dry run never writes');
+        [$real] = $this->runBackfill($scanner, $store, true);
+        self::assertSame($dry['skipped'], $real['skipped']);
+        self::assertSame(array_column($dry['candidates'], 'number'), array_column($real['candidates'], 'number'));
+    }
+
+    public function test_rerun_of_the_same_record_is_existing_not_a_collision(): void
+    {
+        $store = new FakeInvoiceStore();
+        $scanner = $this->dupScanner(['2026-07-LDR-D1'], []);
+        $this->runBackfill($scanner, $store, true);
+        [$resolved, $again] = $this->runBackfill($scanner, $store, true);
+        self::assertSame([], $resolved['skipped'], 'the same location/folder is not "another location"');
+        self::assertSame(['2026-07-LDR-D1'], $again['existing']);
+        self::assertSame([], $again['written'] + $again['failed']);
+    }
+
+    public function test_when_the_bucket_cannot_be_listed_nothing_is_decided_and_the_error_is_loud(): void
+    {
+        $store = new FakeInvoiceStore();
+        $store->listDenied = true;
+        $this->expectException(\Cmd\Reports\Invoices\InvoiceRegistryException::class);
+        $this->expectExceptionMessage('AccessDenied');
+        (new LegacyBackfill())->resolve($this->dupScanner(['2026-07-LDR-D1'], [])->scan(), $store);
+    }
+
+    public function test_bucket_index_is_built_once_per_run_and_ignores_reservations_and_audit_keys(): void
+    {
+        $store = new FakeInvoiceStore();
+        $store->objects['_reservations/LT-PL/20261015/01.json'] = '{}';
+        $store->objects['_audit/downloads/2026/10/15/x-LT-PL-20261015-01-0.json'] = '{}';
+        $store->objects['lending-tower/progress-law/2026/10/LT-PL-20261015-01/record.json'] = '{}';
+        $store->objects['lending-tower/progress-law/2026/10/LT-PL-20261015-01/LT-PL-20261015-01.pdf'] = 'x';
+        $scanner = $this->dupScanner(['2026-07-LDR-D1', '2026-07-LDR-D2', '2026-07-LDR-D3'], []);
+        $resolved = (new LegacyBackfill())->resolve($scanner->scan(), $store);
+        self::assertSame(1, $store->lists, 'one listing for the whole run, not one per invoice');
+        self::assertCount(3, $resolved['candidates']);
+        $taken = (new LegacyBackfill())->resolve([['number' => 'LT-PL-20261015-01', 'company' => 'x', 'type' => 'y', 'invoiceDate' => '2026-10-15', 'amount' => 1.0, 'period' => 'p', 'source' => 's', 'files' => [], 'fields' => []]], $store);
+        self::assertSame([], $taken['candidates'], 'a number the registry already issued is taken too');
+    }
+    private function command(LegacyInvoiceScanner $scanner, FakeInvoiceStore $store, bool $write, ?string &$output): int
+    {
+        $cmd = new BackfillLegacyInvoices();
+        $cmd->store = $store;
+        $cmd->scanner = $scanner;
+        $cmd->setInput(new ArrayInput($write ? ['--write' => true] : [], $cmd->getDefinition()));
+        $cmd->setOutput(new OutputStyle(new ArrayInput([]), $buffer = new BufferedOutput()));
+        $code = $cmd->handle();
+        $output = $buffer->fetch();
+
+        return $code;
+    }
+
+    public function test_command_dry_run_and_write_print_the_same_skip_lines_and_a_failed_listing_blocks_writing(): void
+    {
+        $store = new FakeInvoiceStore();
+        $this->runBackfill($this->dupScanner(['2026-07-LDR-D1'], []), $store, true);
+        $scanner = $this->dupScanner([], ['2026-07-LDR-D1', '2026-07-LDR-D3']);
+        $skips = static fn (string $out): array => array_values(array_filter(explode("\n", $out), static fn (string $l) => str_starts_with($l, '[SKIP]') || str_contains($l, '[SKIP]')));
+        $puts = $store->puts;
+        self::assertSame(0, $this->command($scanner, $store, false, $dry));
+        self::assertSame($puts, $store->puts, 'dry run wrote nothing');
+        self::assertSame(0, $this->command($scanner, $store, true, $real));
+        self::assertNotSame([], $skips($dry));
+        self::assertSame($skips($dry), $skips($real));
+        self::assertStringContainsString('already in the invoice bucket', $dry);
+
+        $denied = new FakeInvoiceStore();
+        $denied->listDenied = true;
+        $puts = $denied->puts;
+        self::assertSame(1, $this->command($this->dupScanner(['2026-07-LDR-D1'], []), $denied, true, $out));
+        self::assertSame($puts, $denied->puts, 'nothing is written when the collision check cannot run');
+        self::assertStringContainsString('Refusing to write without that check', $out);
+        self::assertSame(0, $this->command($this->dupScanner(['2026-07-LDR-D1'], []), $denied, false, $out), 'a dry run still shows the plan');
+        self::assertStringContainsString('did NOT check the bucket', $out);
+    }
 }
