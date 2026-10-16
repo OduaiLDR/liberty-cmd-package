@@ -99,6 +99,7 @@ use Cmd\Reports\Console\Commands\SyncDroppedStatus\SyncDroppedStatusPreview;
 use Cmd\Reports\Console\Commands\GenerateAdvanceRecoupReport\GenerateAdvanceRecoupReport;
 use Cmd\Reports\Console\Commands\GenerateParamountEpfSummary\GenerateParamountEpfSummary;
 use Cmd\Reports\Console\Commands\GenerateAdvanceRequest;
+use Cmd\Reports\Console\Commands\BackfillLegacyInvoices;
 
 class ReportsServiceProvider extends ServiceProvider
 {
@@ -239,6 +240,7 @@ class ReportsServiceProvider extends ServiceProvider
                 GenerateAdvanceRecoupReport::class,
                 GenerateParamountEpfSummary::class,
                 GenerateAdvanceRequest::class,
+                BackfillLegacyInvoices::class,
             ]);
         }
 

@@ -2,6 +2,7 @@
 
 namespace Cmd\Reports\Console\Commands\GenerateLendingTowerInvoices;
 
+use Cmd\Reports\Invoices\InvoiceRegistryGate;
 use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\EmailSenderService;
 use Cmd\Reports\Services\GraphMailboxClient;
@@ -76,6 +77,17 @@ class GenerateLendingTowerInvoices extends Command
 
     private const INVOICE_PREFIX = ['PLAW' => 'LT-PL', 'LDR' => 'LT-LDR'];
 
+    /**
+     * Invoice registry (TASK-006). Each invoice has its OWN switch, default off; when off, the number,
+     * files, email and marker are exactly what they were before. Only live sends are registered.
+     */
+    private const REGISTRY_SERIES = ['PLAW' => 'LT-PL', 'LDR' => 'LT-LDR'];
+
+    private const REGISTRY_SWITCH = ['PLAW' => 'INVOICE_LT_PL_ENABLED', 'LDR' => 'INVOICE_LT_LDR_ENABLED'];
+
+    /** @var array<string, InvoiceRegistryGate|null> */
+    private array $gates = [];
+
     /** TblReports.Report_Name rows holding each invoice's To / CC / BCC for live sends. */
     private const REPORT_NAMES = [
         'PLAW' => 'Lending Tower Invoice - Progress Law',
@@ -139,6 +151,69 @@ class GenerateLendingTowerInvoices extends Command
           AND (e.Cancel_Date IS NULL OR e.Cancel_Date >= ? OR e.Cancel_Date < ?)
         ORDER BY e.LLG_ID
         SQL;
+
+    /** Inject a registry gate (tests); null forces the old behaviour for that company. */
+    public function useInvoiceGate(string $company, ?InvoiceRegistryGate $gate): void
+    {
+        $this->gates[$company] = $gate;
+    }
+
+    private function invoiceGate(string $company): ?InvoiceRegistryGate
+    {
+        if (! isset(self::REGISTRY_SWITCH[$company])) {
+            return null;
+        }
+
+        return $this->gates[$company] ??= InvoiceRegistryGate::forGenerator(
+            self::REGISTRY_SWITCH[$company],
+            alert: function (string $message, array $context): void {
+                $this->error('[INVOICE REGISTRY] ' . $message);
+                Log::error('[INVOICE REGISTRY] ' . $message, $context);
+            }
+        );
+    }
+
+    /** Marker of a live send, named for the period (not the number) so reruns and billingStart() keep working. */
+    private function sentMarker(string $company, array $period): string
+    {
+        return self::ARCHIVE_PREFIX . '/' . $period['suffix'] . '/' . self::INVOICE_PREFIX[$company] . '-' . $period['suffix'] . '.sent.json';
+    }
+
+    /**
+     * Reserve the new-style number for a live send that is really going out. Null (old number, nothing
+     * changes) when the switch is off, the invoice was already sent, or the registry fails.
+     *
+     * @return array{gate: InvoiceRegistryGate, series: string, number: string, date: string}|null
+     */
+    private function registerNumber(string $company, array $period): ?array
+    {
+        $gate = $this->invoiceGate($company);
+        if ($gate === null || (Storage::disk('local')->exists($this->sentMarker($company, $period)) && ! $this->option('force'))) {
+            return null;
+        }
+        // Dated like the invoice itself (the day after the period ends, Pacific), so the number matches the printed date.
+        $date = (new DateTimeImmutable($period['last_day']))->modify('+1 day')->format('Y-m-d');
+        $series = self::REGISTRY_SERIES[$company];
+        $number = $gate->reserve($series, $date, ['generator' => 'lending-tower-invoices', 'company' => $company, 'period' => $period['month']]);
+
+        return $number === null ? null : ['gate' => $gate, 'series' => $series, 'number' => $number, 'date' => $date];
+    }
+
+    /** @param array<string, string> $files */
+    private function recordRegistered(array $registered, string $status, array $files, array $period, int $cents, array $extra = []): void
+    {
+        $number = $registered['number'];
+        $registered['gate']->record($registered['series'], $number, [
+            'amount' => $cents / 100,
+            'invoiceDate' => $registered['date'],
+            'status' => $status,
+            'generator' => 'lending-tower-invoices',
+            'period' => $period['month'],
+        ] + $extra, [
+            ['name' => "{$number}.pdf", 'kind' => 'pdf', 'bytes' => $files["{$number}.pdf"], 'contentType' => 'application/pdf'],
+            ['name' => "{$number}-backup.xlsx", 'kind' => 'backup', 'bytes' => $files["{$number} backup.xlsx"], 'contentType' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],
+        ]);
+    }
 
     public function handle(): int
     {
@@ -321,9 +396,9 @@ class GenerateLendingTowerInvoices extends Command
     }
 
     /** @return array<string, mixed> The invoice as InvoicePdf expects it. */
-    private function progressLawDocument(array $invoice, array $period): array
+    private function progressLawDocument(array $invoice, array $period, ?string $registered = null): array
     {
-        $number = self::INVOICE_PREFIX['PLAW'] . '-' . $period['suffix'];
+        $number = $registered ?? self::INVOICE_PREFIX['PLAW'] . '-' . $period['suffix'];
 
         return $this->documentBase('PLAW', $number, $period) + [
             'columns' => ['quantity' => 'Leads', 'rate' => 'Rate'],
@@ -521,9 +596,9 @@ class GenerateLendingTowerInvoices extends Command
     }
 
     /** @return array<string, mixed> The invoice as InvoicePdf expects it. */
-    private function ldrDocument(array $invoice, array $period): array
+    private function ldrDocument(array $invoice, array $period, ?string $registered = null): array
     {
-        $number = self::INVOICE_PREFIX['LDR'] . '-' . $period['suffix'];
+        $number = $registered ?? self::INVOICE_PREFIX['LDR'] . '-' . $period['suffix'];
         $rate = $this->ldrRateLabel();
 
         return $this->documentBase('LDR', $number, $period) + [
@@ -646,9 +721,10 @@ class GenerateLendingTowerInvoices extends Command
         $this->newLine();
 
         foreach ($invoices as $company => $invoice) {
+            $registered = $live ? $this->registerNumber($company, $period) : null;
             $document = $company === 'PLAW'
-                ? $this->progressLawDocument($invoice, $period)
-                : $this->ldrDocument($invoice, $period);
+                ? $this->progressLawDocument($invoice, $period, $registered['number'] ?? null)
+                : $this->ldrDocument($invoice, $period, $registered['number'] ?? null);
             $document['logo_data_uri'] = $logo;
             $number = $document['number'];
 
@@ -668,7 +744,7 @@ class GenerateLendingTowerInvoices extends Command
             if ($testTo !== '') {
                 $allSent = $this->sendTest($company, $document, $files, $period, $testTo) && $allSent;
             } elseif ($live) {
-                $allSent = $this->sendLive($company, $document, $files, $period, $azure) && $allSent;
+                $allSent = $this->sendLive($company, $document, $files, $period, $azure, $registered === null ? null : $registered + ['cents' => (int) $invoice['total_cents']]) && $allSent;
             }
         }
 
@@ -702,12 +778,12 @@ class GenerateLendingTowerInvoices extends Command
     }
 
     /** @param array<string, string> $files */
-    private function sendLive(string $company, array $document, array $files, array $period, DBConnector $azure): bool
+    private function sendLive(string $company, array $document, array $files, array $period, DBConnector $azure, ?array $registered = null): bool
     {
         $number = $document['number'];
         $disk = Storage::disk('local');
         $folder = self::ARCHIVE_PREFIX . '/' . $period['suffix'];
-        $marker = "{$folder}/{$number}.sent.json";
+        $marker = $this->sentMarker($company, $period);
 
         if ($disk->exists($marker) && ! $this->option('force')) {
             $this->warn("[SKIP] {$number} was already sent (see storage/app/private/{$marker}). Use --force to send it again.");
@@ -734,6 +810,10 @@ class GenerateLendingTowerInvoices extends Command
                 self::REPORT_NAMES[$company],
                 $this->liveSender()
             ));
+            if ($registered !== null) {
+                // The number is spent even though the email failed; show it in the log as issued, not sent.
+                $this->recordRegistered($registered, 'issued', $files, $period, $registered['cents'], ['notes' => 'Email was not sent.']);
+            }
 
             return false;
         }
@@ -748,7 +828,10 @@ class GenerateLendingTowerInvoices extends Command
             'total_due' => $document['total_due'],
             'report_name' => self::REPORT_NAMES[$company],
             'from' => $this->liveSender(),
-        ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+        ] + ($registered === null ? [] : ['invoice_number' => $number]), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+        if ($registered !== null) {
+            $this->recordRegistered($registered, 'sent', $files, $period, $registered['cents'], ['sentAt' => (new DateTimeImmutable('now', new DateTimeZone(self::TIMEZONE)))->format(DATE_ATOM)]);
+        }
 
         Log::info('GenerateLendingTowerInvoices: invoice sent', ['number' => $number, 'total_due' => $document['total_due']]);
         $this->info("[SENT] {$number} ({$document['total_due']})");
@@ -829,7 +912,7 @@ class GenerateLendingTowerInvoices extends Command
      * Microsoft 365 tenant, which only its app registration can send from (GRAPH_LT_*, the one the
      * Monevo reader already uses); any other sender goes through the Liberty app (GRAPH_*).
      */
-    private function mailer(): EmailSenderService
+    protected function mailer(): EmailSenderService
     {
         $prefix = str_ends_with(strtolower($this->liveSender()), '@lendingtower.com') ? 'GRAPH_LT' : 'GRAPH';
 
@@ -841,7 +924,7 @@ class GenerateLendingTowerInvoices extends Command
         return new EmailSenderService($prefix);
     }
 
-    private function logoDataUri(): ?string
+    protected function logoDataUri(): ?string
     {
         $path = __DIR__ . '/assets/lending-tower-logo.png';
 

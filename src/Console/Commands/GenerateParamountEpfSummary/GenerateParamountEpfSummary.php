@@ -24,6 +24,14 @@ class GenerateParamountEpfSummary extends Command
 
     private const REPORT_NAME = 'LT Invoices ParamountLaw';
 
+    private ?ParamountRegistration $registration = null;
+
+    /** Inject a registration (tests). */
+    public function useRegistration(?ParamountRegistration $registration): void
+    {
+        $this->registration = $registration;
+    }
+
     public function handle(): int
     {
         $lock = null;
@@ -90,8 +98,18 @@ class GenerateParamountEpfSummary extends Command
             );
             $output = $this->copyOutput($report['path']);
             $invoicePath = null;
+            $registration = new ParamountRegistration(null);
+            $registeredNumber = null;
+            $pdf = '';
             if ($invoiceMode) {
-                $document = ParamountInvoice::document($window, $totalDebt, $tier, $payment, $billTo);
+                if ($this->option('send')) {
+                    $registration = $this->registration ??= ParamountRegistration::fromEnv(function (string $message, array $context): void {
+                        $this->error('[INVOICE REGISTRY] ' . $message);
+                        Log::error('[INVOICE REGISTRY] ' . $message, $context);
+                    });
+                    $registeredNumber = $registration->reserve($window);
+                }
+                $document = ParamountInvoice::document($window, $totalDebt, $tier, $payment, $billTo, $registeredNumber);
                 $invoicePath = dirname($output ?? $report['path']) . '/' . $document['number'] . '.pdf';
                 $pdf = (new InvoicePdf(sys_get_temp_dir() . '/paramount-invoice-pdf'))->render($document);
                 if (file_put_contents($invoicePath, $pdf) === false) {
@@ -103,21 +121,32 @@ class GenerateParamountEpfSummary extends Command
             $this->info(sprintf('[INFO] EPF debt: $%s; tier: T%d; payment: $%s', number_format($totalDebt, 2), $tier, number_format($payment, 2)));
 
             if ($this->option('send') || $this->option('jacob-only') || $testTo !== '') {
-                $this->sendReport(
-                    $report,
-                    $window['label'],
-                    $totalDebt,
-                    $tier,
-                    $payment,
-                    (bool) $this->option('jacob-only'),
-                    $testTo,
-                    $invoicePath
-                );
+                try {
+                    $this->sendReport(
+                        $report,
+                        $window['label'],
+                        $totalDebt,
+                        $tier,
+                        $payment,
+                        (bool) $this->option('jacob-only'),
+                        $testTo,
+                        $invoicePath
+                    );
+                } catch (\Throwable $e) {
+                    // The number is spent even though the email failed; show it in the log as issued, not sent.
+                    if ($registeredNumber !== null) {
+                        $registration->record($registeredNumber, $window, $payment, 'issued', $pdf, (string) file_get_contents($report['path']), 'Email was not sent.');
+                    }
+                    throw $e;
+                }
                 if ($invoiceMode && $this->option('send')) {
                     if (!is_dir(dirname($marker))) { mkdir(dirname($marker), 0775, true); }
                     if (file_put_contents($marker, json_encode(['sent_at' => now()->toIso8601String(),
                         'invoice' => basename($invoicePath), 'payment' => $payment])) === false) {
                         throw new \RuntimeException('Email sent, but send record could not be saved. Do not retry without checking delivery.');
+                    }
+                    if ($registeredNumber !== null) {
+                        $registration->record($registeredNumber, $window, $payment, 'sent', $pdf, (string) file_get_contents($report['path']));
                     }
                 }
             } else {
