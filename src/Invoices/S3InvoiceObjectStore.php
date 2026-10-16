@@ -30,6 +30,22 @@ final class S3InvoiceObjectStore implements InvoiceObjectStore
         }
     }
 
+    public function listKeys(string $prefix = ''): array
+    {
+        $keys = [];
+        try {
+            foreach ($this->client->getPaginator('ListObjectsV2', ['Bucket' => $this->bucket, 'Prefix' => $prefix]) as $page) {
+                foreach ($page['Contents'] ?? [] as $object) {
+                    $keys[] = (string) $object['Key'];
+                }
+            }
+        } catch (AwsException $e) {
+            throw new InvoiceRegistryException("S3 could not list the invoice bucket: {$e->getAwsErrorCode()} {$e->getAwsErrorMessage()}", 0, $e);
+        }
+
+        return $keys;
+    }
+
     public function putIfAbsent(string $key, string $body, string $contentType): bool
     {
         try {

@@ -16,6 +16,21 @@ final class FakeInvoiceStore implements InvoiceObjectStore
     public array $transientFailures = [];
     public bool $failAlways = false;
 
+    public bool $listDenied = false;
+    public int $lists = 0;
+
+    public function listKeys(string $prefix = ''): array
+    {
+        $this->lists++;
+        if ($this->listDenied) {
+            throw new \Cmd\Reports\Invoices\InvoiceRegistryException('S3 could not list the invoice bucket: AccessDenied');
+        }
+        $keys = array_values(array_filter(array_keys($this->objects), static fn (string $k) => $prefix === '' || str_starts_with($k, $prefix)));
+        sort($keys);
+
+        return $keys;
+    }
+
     public function get(string $key): ?string
     {
         return $this->objects[$key] ?? null;
