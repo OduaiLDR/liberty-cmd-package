@@ -36,30 +36,55 @@ class BackfillLegacyInvoices extends Command
     {
         $scanner = $this->scanner ?? $this->hostScanner(rtrim((string) ($this->option('root') ?: storage_path('app')), '/'));
         $candidates = $scanner->scan();
+        $write = (bool) $this->option('write');
+        $config = InvoiceRegistryConfig::fromEnv();
+        if ($write && $this->store === null && $config->bucket === '') {
+            $this->error('INVOICE_S3_BUCKET is not set; refusing to write.');
+
+            return self::FAILURE;
+        }
+
+        // Numbers already in the bucket (any location) or repeated in this scan are taken: decided before the plan so a dry
+        // run shows exactly what a real run would do. Needs s3:ListBucket (read only).
+        $store = $this->store;
+        $skippedHere = [];
+        try {
+            $store ??= $config->bucket !== '' ? S3InvoiceObjectStore::fromConfig($config) : null;
+            if ($store === null) {
+                $this->warn('INVOICE_S3_BUCKET is not set: this dry run did NOT check the bucket for numbers that are already taken.');
+            }
+            $resolved = (new LegacyBackfill())->resolve($candidates, $store);
+            $candidates = $resolved['candidates'];
+            $skippedHere = $resolved['skipped'];
+        } catch (\Throwable $e) {
+            $this->error('Cannot check the invoice bucket for numbers that are already taken: ' . $e->getMessage());
+            if ($write) {
+                $this->error('Refusing to write without that check.');
+
+                return self::FAILURE;
+            }
+            $this->warn('This dry run did NOT check the bucket; a real run would refuse until the check works (needs s3:ListBucket).');
+            $store = null;
+        }
         $plan = (new LegacyBackfill())->plan($candidates);
 
         foreach ($plan as $p) {
             $this->line(sprintf('%-26s %-18s %-14s %s  %s  files=%d  -> %s', $p['number'], $p['company'], $p['type'], $p['invoiceDate'], $p['amount'] === null ? '(amount on PDF)' : '$' . number_format($p['amount'], 2), $p['files'], $p['folder']));
         }
-        foreach ($scanner->skipped as $why) {
+        $skipped = array_merge($scanner->skipped, $skippedHere);
+        foreach ($skipped as $why) {
             $this->warn("[SKIP] {$why}");
         }
-        $this->info(count($plan) . ' invoice(s) found, ' . count($scanner->skipped) . ' skipped.');
+        $this->info(count($plan) . ' invoice(s) found, ' . count($skipped) . ' skipped.');
 
-        if (! $this->option('write')) {
+        if (! $write) {
             $this->info('DRY RUN: nothing was written. Re-run with --write to import these as legacy records.');
 
             return self::SUCCESS;
         }
 
-        $config = InvoiceRegistryConfig::fromEnv();
-        if ($this->store === null && $config->bucket === '') {
-            $this->error('INVOICE_S3_BUCKET is not set; refusing to write.');
-
-            return self::FAILURE;
-        }
         $this->warn('WRITING to ' . ($this->store === null ? $config->bucket : 'the injected store') . '.');
-        $result = (new LegacyBackfill())->apply($this->store ?? S3InvoiceObjectStore::fromConfig($config), $candidates);
+        $result = (new LegacyBackfill())->apply($store, $candidates);
         $this->info(sprintf('Imported %d, already imported %d, failed %d.', count($result['written']), count($result['existing']), count($result['failed'])));
         foreach ($result['failed'] as $number => $why) {
             $this->error("[FAILED] {$number}: {$why}");

@@ -23,7 +23,20 @@ final class InvoiceRegistryTest extends TestCase
         self::assertSame('LT-PL-20261015-02', $registry->reserve('LT-PL', '2026-10-15'));
         self::assertSame('LT-PL-20261016-01', $registry->reserve('LT-PL', '2026-10-16'), 'a new day starts at 01');
         self::assertSame('LDR-PAR-20261015-01', $registry->reserve('LDR-PAR', '2026-10-15'), 'each series counts on its own');
-        self::assertSame('LDR-EXP-JOR-20261015-01', $registry->reserve('LDR-EXP-JOR', '2026-10-15'));
+        self::assertSame('LDR-EXP-JO-20261015-01', $registry->reserve('LDR-EXP-JO', '2026-10-15'));
+        self::assertSame('LDR-EXP-GT-20261015-01', $registry->reserve('LDR-EXP-GT', '2026-10-15'), 'Guatemala counts on its own');
+        self::assertSame('LDR-EXP-JO-20261015-02', $registry->reserve('LDR-EXP-JO', '2026-10-15'));
+        foreach (['LDR-EXP-JOR', 'COMB-EXP-GUA'] as $retired) {
+            try {
+                $registry->reserve($retired, '2026-10-15');
+                self::fail("{$retired} is no longer a series");
+            } catch (\Cmd\Reports\Invoices\InvoiceRegistryException) {
+            }
+        }
+        foreach (['COMB', 'LDR', 'LT', 'PLAW'] as $c) {
+            self::assertSame(['expenses-jordan', 'expenses-guatemala'], [\Cmd\Reports\Invoices\InvoiceSeries::get("{$c}-EXP-JO")['company'], \Cmd\Reports\Invoices\InvoiceSeries::get("{$c}-EXP-GT")['company']]);
+        }
+        self::assertSame('expenses-guatemala/ldr/2026/10/LDR-EXP-GT-20261015-01/', \Cmd\Reports\Invoices\InvoiceSeries::folder('LDR-EXP-GT', 'LDR-EXP-GT-20261015-01'));
         self::assertSame('2026-10-15', $registry->today());
         $reservation = json_decode($store->objects['_reservations/LT-PL/20261015/02.json'], true);
         self::assertSame(['reserved', 'LT-PL', '2026-10-15'], [$reservation['status'], $reservation['series'], $reservation['invoiceDate']]);

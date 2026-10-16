@@ -20,4 +20,13 @@ interface InvoiceObjectStore
      * @throws InvoiceRegistryException when the object cannot be read (for example access denied): callers treat that as "cannot verify"
      */
     public function get(string $key): ?string;
+
+    /**
+     * Every object key in the bucket (all pages), optionally under a prefix. Read-only; needs s3:ListBucket.
+     *
+     * @return list<string>
+     *
+     * @throws InvoiceRegistryException when the listing is not allowed or fails (callers must not assume "empty")
+     */
+    public function listKeys(string $prefix = ''): array;
 }

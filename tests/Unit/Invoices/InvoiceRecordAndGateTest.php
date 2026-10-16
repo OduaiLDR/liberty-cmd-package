@@ -110,6 +110,19 @@ final class InvoiceRecordAndGateTest extends TestCase
         $store->get('k');
     }
 
+    public function test_s3_adapter_lists_every_page_and_refuses_when_listing_is_denied(): void
+    {
+        $mock = new MockHandler();
+        $mock->append(new Result(['Contents' => [['Key' => 'a/record.json'], ['Key' => 'b/x.pdf']], 'IsTruncated' => true, 'NextContinuationToken' => 't']));
+        $mock->append(new Result(['Contents' => [['Key' => 'c/record.json']], 'IsTruncated' => false]));
+        $mock->append(new AwsException('Denied', new Command('ListObjectsV2'), ['response' => new \GuzzleHttp\Psr7\Response(403), 'code' => 'AccessDenied']));
+        $store = new S3InvoiceObjectStore(new S3Client(['version' => 'latest', 'region' => 'us-east-2', 'credentials' => ['key' => 'fake', 'secret' => 'fake'], 'handler' => $mock]), 'ff-development-invoices');
+        self::assertSame(['a/record.json', 'b/x.pdf', 'c/record.json'], $store->listKeys());
+        $this->expectException(InvoiceRegistryException::class);
+        $this->expectExceptionMessage('AccessDenied');
+        $store->listKeys();
+    }
+
     private function halfFinishedAttempt(FakeInvoiceStore $store, string $workbook): string
     {
         $folder = 'lending-tower/progress-law/2026/10/LT-PL-20261015-01/';
