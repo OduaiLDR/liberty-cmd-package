@@ -4,7 +4,11 @@
 `AGENT_DEDUCTION` for each eligible client. It does not change the existing
 Lookback formulas or write `TblRetentionAdjustments`.
 
-The writer runs only when `--no-azure-write` is absent. Before writing either
+Feed publication runs only when `--no-azure-write` is absent and the trusted runner
+supplies its validated reserved `PAYROLL_COMMISSION_RUN_ID`. An unset ID keeps
+ordinary scheduled/manual runs on their existing bonus writer, without any feed
+identity queries, table creation, replacement, or completion-marker writes. A
+supplied blank or malformed ID fails closed. Before a correlated run writes either
 component, it checks duplicate clients, positive amounts, the single matching
 `TblEnrollment` assignment and the unique canonical `TblEmployees.PK`. A positive
 deduction without a proven employee identity fails the command.
@@ -61,8 +65,8 @@ to declare the command pipeline successful.
 
 `payroll:commission-run` supplies `PAYROLL_COMMISSION_RUN_ID` to each subprocess.
 When source is `both`, LDR and Progress Law publish the same parent run id.
-Manual report runs receive a fresh id and cannot satisfy a different reserved
-runner request.
+Uncorrelated manual/scheduled report runs do not create an ID or publish this feed.
+They retain the existing bonus result replacement and report delivery behavior.
 
 The deduction feed does not depend on the Customer Service aggregate workbook
 bundle. Only a runner request explicitly reserved with `capturePayrollBundle: true`

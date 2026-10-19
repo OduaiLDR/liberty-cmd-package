@@ -20,14 +20,15 @@ final class PayrollRetentionLookbackWriter
         return $result;
     }
 
-    public static function runIdFromEnvironment(): string
+    /** Only a trusted correlated worker opts in; ordinary report runs retain their existing writer. */
+    public static function runIdFromEnvironment(): ?string
     {
         $configured = getenv('PAYROLL_COMMISSION_RUN_ID');
-        $runId = $configured === false || $configured === '' ? bin2hex(random_bytes(16)) : $configured;
-        if (!preg_match('/^[a-f0-9]{32}$/', $runId)) {
+        if ($configured === false) return null;
+        if (!preg_match('/\A[a-f0-9]{32}\z/', $configured)) {
             throw new \InvalidArgumentException('PAYROLL_COMMISSION_RUN_ID must be the reserved 32 character lowercase hexadecimal run id.');
         }
-        return $runId;
+        return $configured;
     }
 
     /** Read-only validation happens before either Azure result component is replaced. */
@@ -150,7 +151,7 @@ final class PayrollRetentionLookbackWriter
     {
         $date = \DateTimeImmutable::createFromFormat('!Y-m-d', $periodStart);
         if (!in_array($source, ['ldr', 'plaw'], true) || !$date || $date->format('Y-m-d') !== $periodStart
-            || $date->format('d') !== '01' || !preg_match('/^[a-f0-9]{32}$/', $runId)) {
+            || $date->format('d') !== '01' || !preg_match('/\A[a-f0-9]{32}\z/', $runId)) {
             throw new \InvalidArgumentException('Lookback deduction feed requires a source, first-of-month period, and reserved run id.');
         }
     }

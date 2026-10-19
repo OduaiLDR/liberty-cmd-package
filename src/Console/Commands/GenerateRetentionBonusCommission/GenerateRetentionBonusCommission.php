@@ -68,8 +68,8 @@ class GenerateRetentionBonusCommission extends Command
             return Command::FAILURE;
         }
         try {
-            // Both sources share the reserved runner id. A manual run receives a
-            // fresh id and cannot impersonate a separately verified pipeline run.
+            // Both sources share the trusted worker's reserved run id. Ordinary
+            // scheduled/manual runs keep the existing bonus writer without the payroll feed.
             $runId = PayrollRetentionLookbackWriter::runIdFromEnvironment();
         } catch (\InvalidArgumentException $error) {
             $this->error($error->getMessage());
@@ -432,12 +432,17 @@ class GenerateRetentionBonusCommission extends Command
             return null;
         }
 
+        $correlatedRunId = $runId ?? PayrollRetentionLookbackWriter::runIdFromEnvironment();
+        if ($correlatedRunId === null) {
+            return CommissionResultsWriter::replaceComponent($sql, 'retention', $source, $periodStart, 'Bonus_Commission', $bonusResults);
+        }
+
         // Validate every positive Sales deduction before either component writes.
         // The existing bonus writer owns its transaction; feed rows and their
         // completion marker own another atomic transaction. The runner marks the
         // command complete only when both succeed, before any report delivery.
         return PayrollRetentionLookbackWriter::replaceCalculatedResults(
-            $sql, $source, $periodStart, $runId ?? PayrollRetentionLookbackWriter::runIdFromEnvironment(),
+            $sql, $source, $periodStart, $correlatedRunId,
             $lookbackRows, $bonusResults
         );
     }

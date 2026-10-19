@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Cmd\Reports\Tests\Unit;
 
 use Cmd\Reports\Services\DBConnector;
+use Cmd\Reports\Console\Commands\GenerateRetentionBonusCommission\GenerateRetentionBonusCommission;
 use Cmd\Reports\Services\PayrollRetentionLookbackWriter;
 use Cmd\Reports\Tests\TestCase;
 use Illuminate\Support\Facades\Log;
@@ -111,6 +112,52 @@ class PayrollRetentionLookbackWriterTest extends TestCase
         }
     }
 
+    public function test_uncorrelated_legacy_command_writes_bonus_without_any_feed_validation_or_queries(): void
+    {
+        Log::swap(new NullLogger);
+        $previous = getenv('PAYROLL_COMMISSION_RUN_ID');
+        putenv('PAYROLL_COMMISSION_RUN_ID');
+        try {
+            $sql = new LookbackFeedConnector;
+            $beforeFeed = [$sql->pdo->rows, $sql->pdo->markers];
+            $command = new GenerateRetentionBonusCommission;
+            $result = (new \ReflectionMethod($command, 'persistBonusResults'))->invoke($command,
+                $sql, 'ldr', '2098-09-01', [['agent' => 'Retention Earner', 'amount' => 80.50]], false,
+                [['ID' => 'invalid-for-feed', 'AGENT' => null, 'AGENT_DEDUCTION' => 125.25]]);
+            $this->assertSame(['attempted' => 1, 'written' => 1, 'failed' => 0], $result);
+            $this->assertSame(80.50, $sql->pdo->bonusRows['Retention Earner']);
+            $this->assertSame($beforeFeed, [$sql->pdo->rows, $sql->pdo->markers]);
+            $this->assertSame(1, $sql->pdo->commits);
+            foreach ($sql->queries as $query) {
+                $this->assertStringNotContainsString('TblPayrollRetentionLookback', $query);
+                $this->assertStringNotContainsString('TblEnrollment', $query);
+                $this->assertStringNotContainsString('TblEmployees', $query);
+            }
+        } finally { $previous === false ? putenv('PAYROLL_COMMISSION_RUN_ID') : putenv('PAYROLL_COMMISSION_RUN_ID=' . $previous); }
+    }
+
+    public function test_correlated_sales_command_publishes_feed_with_customer_service_capture_disabled(): void
+    {
+        Log::swap(new NullLogger);
+        $previousRun = getenv('PAYROLL_COMMISSION_RUN_ID');
+        $previousCapture = getenv('PAYROLL_CAPTURE_CUSTOMER_SERVICE_CONTEXT');
+        putenv('PAYROLL_COMMISSION_RUN_ID=' . self::RUN_ID);
+        putenv('PAYROLL_CAPTURE_CUSTOMER_SERVICE_CONTEXT=0');
+        try {
+            $sql = new LookbackFeedConnector;
+            $command = new GenerateRetentionBonusCommission;
+            (new \ReflectionMethod($command, 'persistBonusResults'))->invoke($command,
+                $sql, 'ldr', '2098-09-01', [['agent' => 'Retention Earner', 'amount' => 80.50]], false,
+                [['ID' => '101', 'AGENT' => 'Alice Sales', 'AGENT_DEDUCTION' => 125.25]]);
+            $this->assertSame(self::RUN_ID, $sql->pdo->markers['ldr']['runId']);
+            $this->assertSame(2, $sql->pdo->commits);
+            $this->assertSame(125.25, $sql->pdo->rows['ldr'][0][6]);
+        } finally {
+            $previousRun === false ? putenv('PAYROLL_COMMISSION_RUN_ID') : putenv('PAYROLL_COMMISSION_RUN_ID=' . $previousRun);
+            $previousCapture === false ? putenv('PAYROLL_CAPTURE_CUSTOMER_SERVICE_CONTEXT') : putenv('PAYROLL_CAPTURE_CUSTOMER_SERVICE_CONTEXT=' . $previousCapture);
+        }
+    }
+
     public function test_ambiguous_or_unassigned_positive_deductions_fail_before_any_write(): void
     {
         foreach (['missing-agent', 'duplicate-cid', 'duplicate-enrollment', 'changed-enrollment', 'duplicate-employee', 'missing-employee', 'invalid-amount'] as $problem) {
@@ -151,13 +198,30 @@ class PayrollRetentionLookbackWriterTest extends TestCase
             putenv('PAYROLL_COMMISSION_RUN_ID=' . self::RUN_ID);
             $this->assertSame(self::RUN_ID, PayrollRetentionLookbackWriter::runIdFromEnvironment());
             putenv('PAYROLL_COMMISSION_RUN_ID');
-            $this->assertMatchesRegularExpression('/^[a-f0-9]{32}$/', PayrollRetentionLookbackWriter::runIdFromEnvironment());
+            $this->assertNull(PayrollRetentionLookbackWriter::runIdFromEnvironment());
             putenv('PAYROLL_COMMISSION_RUN_ID=invalid');
             $this->expectException(\InvalidArgumentException::class);
             PayrollRetentionLookbackWriter::runIdFromEnvironment();
         } finally {
             $previous === false ? putenv('PAYROLL_COMMISSION_RUN_ID') : putenv('PAYROLL_COMMISSION_RUN_ID=' . $previous);
         }
+    }
+
+    public function test_supplied_blank_or_invalid_run_identity_cannot_fall_back_to_legacy_writes(): void
+    {
+        $previous = getenv('PAYROLL_COMMISSION_RUN_ID');
+        try {
+            foreach (['', 'invalid', str_repeat('A', 32), self::RUN_ID . "\n"] as $invalid) {
+                putenv('PAYROLL_COMMISSION_RUN_ID=' . $invalid);
+                $sql = new LookbackFeedConnector;
+                $command = new GenerateRetentionBonusCommission;
+                try {
+                    (new \ReflectionMethod($command, 'persistBonusResults'))->invoke($command,
+                        $sql, 'ldr', '2098-09-01', [['agent' => 'Retention Earner', 'amount' => 80.50]], false, []);
+                    $this->fail('A supplied invalid identity must not silently enter the legacy path.');
+                } catch (\InvalidArgumentException) { $this->assertSame([], $sql->queries); }
+            }
+        } finally { $previous === false ? putenv('PAYROLL_COMMISSION_RUN_ID') : putenv('PAYROLL_COMMISSION_RUN_ID=' . $previous); }
     }
 }
 
@@ -185,10 +249,12 @@ final class LookbackFeedConnector extends DBConnector
     public array $employees = [['PK' => 701, 'Employee_Name' => 'Alice Sales']];
     public string $failure = '';
     public int $writes = 0;
+    public array $queries = [];
     public function __construct() { $this->pdo = new LookbackFeedPDO; }
     public function getSqlServerConnection(): PDO { return $this->pdo; }
     public function querySqlServer(string $sql, array $params = []): array
     {
+        $this->queries[] = $sql;
         if (str_starts_with($sql, 'SELECT LLG_ID')) return ['success' => true, 'data' => $this->enrollments];
         if (str_starts_with($sql, 'SELECT PK')) return ['success' => true, 'data' => $this->employees];
         if (str_starts_with($sql, 'SELECT Source')) return ['success' => true, 'data' => []];
