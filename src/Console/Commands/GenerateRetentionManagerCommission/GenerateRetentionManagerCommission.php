@@ -51,6 +51,86 @@ class GenerateRetentionManagerCommission extends Command
     protected $description = 'Generate Rama - Customer Support Manager, Nick - Retention Team Leader, and/or Anthony - NSF Team Leader workbooks.';
 
     private bool $hadFailures = false;
+    private ?string $payrollOutputDirectory = null;
+
+    /** Freeze the existing Rama tranche/cutoff inputs when the source report completes. */
+    public function buildPayrollRetentionContext(array $rows): array
+    {
+        $this->applyTrancheAssignments($rows, true);
+        $context = [];
+        foreach ($rows as $row) {
+            $id = trim((string) $this->col($row, 'ID', ''));
+            if (!preg_match('/^[1-9]\d*$/', $id) || isset($context['LLG-' . $id])) throw new \RuntimeException('Retention leadership context requires unique client identities.');
+            $context['LLG-' . $id] = array_intersect_key($row, array_flip(['TRANCHE', 'CUT_OFF', 'MADE_CUT_OFF', 'BONUS_FLAG']));
+        }
+        return ['trancheContextReady' => true, 'trancheByClient' => $context];
+    }
+
+    /** Actual leadership workbooks and matching JSON from archived source bytes only. No email or database lookup. */
+    public function buildPayrollReviewWorkbookBundle(string $startDate, string $endDate, array $artifacts, string $outputDirectory): array
+    {
+        $retentionRows = [];
+        foreach (['ldr' => 'LDR', 'plaw' => 'Progress Law'] as $source => $display) {
+            $artifact = $artifacts['retention_' . $source] ?? [];
+            $context = $artifact['context'] ?? [];
+            if (($context['trancheContextReady'] ?? false) !== true || !is_array($context['trancheByClient'] ?? null)) throw new \RuntimeException('Archived retention leadership context is missing. Rerun the correlated source.');
+            $rows = $this->loadRetentionReportRowsFromXlsx($artifact['path'] ?? '', $display);
+            foreach ($rows as &$row) {
+                $cid = 'LLG-' . (string) $this->col($row, 'ID', '');
+                if (!array_key_exists($cid, $context['trancheByClient'])) throw new \RuntimeException('Archived retention workbook and leadership context do not match.');
+                $row = [...$row, ...$context['trancheByClient'][$cid]];
+            }
+            unset($row);
+            $retentionRows = array_merge($retentionRows, $rows);
+        }
+        $retentionRows = $this->filterRetentionRowsForPeriod($retentionRows, $startDate, $endDate);
+        $retentionRows = $this->dedupeRetentionRowsByContactId($retentionRows);
+        $this->sortRetentionRows($retentionRows);
+        $nsfRows = [];
+        $roster = [];
+        $readinessIds = [];
+        foreach (['ldr' => 'LDR', 'plaw' => 'Progress Law'] as $source => $display) {
+            $path = $artifacts['nsf_' . $source]['path'] ?? '';
+            $nsfRows = array_merge($nsfRows, $this->loadNsfCommissionRowsFromXlsx($path, $display, $readinessIds, $source));
+            foreach ($this->archivedNsfRoster($path) as $name) $roster[$this->anthonyAgentKey($name)] = $name;
+        }
+        $priorOutput = $this->payrollOutputDirectory;
+        $priorRoster = $this->anthonyRosterCache;
+        $this->payrollOutputDirectory = $outputDirectory;
+        $this->anthonyRosterCache = array_values($roster);
+        try {
+            $reports = ['retention_manager' => $this->buildRamaPayrollSnapshot($retentionRows),
+                'retention_team_leader' => $this->buildNickPayrollSnapshot($retentionRows, $startDate, $endDate),
+                'nsf_team_leader' => $this->buildAnthonyPayrollSnapshot($nsfRows)];
+            $reports['nsf_team_leader']['nsfReadinessRunIds'] = $readinessIds;
+            return ['reports' => $reports, 'files' => [
+                'customer_support_manager' => $this->buildWorkbook('rama', 'Customer Support Manager', $retentionRows, $startDate, $endDate),
+                'retention_team_leader' => $this->buildWorkbook('nick', 'Retention Team Leader', $retentionRows, $startDate, $endDate),
+                'nsf_team_leader' => $this->buildAnthonyWorkbook('NSF Team Leader', $nsfRows),
+            ]];
+        } finally {
+            $this->payrollOutputDirectory = $priorOutput;
+            $this->anthonyRosterCache = $priorRoster;
+        }
+    }
+
+    private function archivedNsfRoster(string $path): array
+    {
+        $reader = IOFactory::createReaderForFile($path);
+        $reader->setReadDataOnly(true);
+        $book = $reader->load($path);
+        try {
+            $sheet = $book->getSheetByName('Agent Summary');
+            if (!$sheet || trim((string) $sheet->getCell('A1')->getValue()) !== 'NSF Agent') throw new \RuntimeException('Archived NSF roster summary is missing.');
+            $names = [];
+            for ($row = 2; $row <= $sheet->getHighestDataRow(); $row++) {
+                $name = trim((string) $sheet->getCell('A' . $row)->getValue());
+                if ($name === '' || strcasecmp($name, 'Unassigned Agents') === 0) break;
+                $names[] = $name;
+            }
+            return $names;
+        } finally { $book->disconnectWorksheets(); }
+    }
 
     private function reportInfo(string $message): void
     {
@@ -107,6 +187,7 @@ class GenerateRetentionManagerCommission extends Command
         $bonusCommission = $this->ramaCommission($ngf['pct'], true);
 
         return [
+            'reportKind' => 'retention_manager',
             'managerName' => 'Rama Davis',
             'commissionType' => $this->managerSheetTitle('rama'),
             'company' => 'LDR / Progress Law',
@@ -138,6 +219,7 @@ class GenerateRetentionManagerCommission extends Command
         $commission = $this->computeNickCommission($rows);
 
         return [
+            'reportKind' => 'retention_team_leader',
             'managerName' => 'Nick Jones',
             'commissionType' => 'Retention Team Leader',
             'company' => 'LDR / Progress Law',
@@ -201,6 +283,7 @@ class GenerateRetentionManagerCommission extends Command
         $commission = round($totalClears * $rate, 2);
 
         return [
+            'reportKind' => 'nsf_team_leader',
             'managerName' => 'Anthony Clark',
             'commissionType' => 'NSF Team Leader',
             'company' => 'LDR / Progress Law',
@@ -1765,7 +1848,7 @@ class GenerateRetentionManagerCommission extends Command
         return $count;
     }
 
-    private function applyTrancheAssignments(array &$rows): void
+    private function applyTrancheAssignments(array &$rows, bool $strict = false): void
     {
         if (empty($rows)) {
             return;
@@ -1790,9 +1873,11 @@ class GenerateRetentionManagerCommission extends Command
                      LEFT JOIN TblDebtTrancheSales ts ON e.Tranche = ts.Tranche
                      WHERE e.LLG_ID IN (" . implode(',', $chunk) . ")"
                 );
+                if ($strict && (($res['success'] ?? false) !== true || !is_array($res['data'] ?? null))) throw new \RuntimeException('Tranche source lookup was not verified.');
                 foreach ($res['data'] ?? [] as $record) {
                     $llg = strtoupper((string) ($record['LLG_ID'] ?? $record['llg_id'] ?? ''));
                     if ($llg !== '') {
+                        if ($strict && isset($map[$llg])) throw new \RuntimeException('Tranche source has ambiguous client assignments.');
                         $map[$llg] = [
                             'tranche' => $record['Tranche'] ?? $record['tranche'] ?? '',
                             'payment_date' => $this->toDate($record['Payment_Date'] ?? $record['payment_date'] ?? null),
@@ -1801,6 +1886,7 @@ class GenerateRetentionManagerCommission extends Command
                 }
             }
         } catch (\Throwable $e) {
+            if ($strict) throw new \RuntimeException('Retention leadership context could not be frozen: ' . $e->getMessage(), 0, $e);
             $this->warn('Tranche assignment lookup failed: ' . $e->getMessage());
         }
 
@@ -1982,6 +2068,7 @@ class GenerateRetentionManagerCommission extends Command
 
     private function downloadReportFolder(string $reportName): string
     {
+        if ($this->payrollOutputDirectory !== null) return rtrim($this->payrollOutputDirectory, '/\\') . '/' . $reportName;
         $home = rtrim((string) (getenv('USERPROFILE') ?: getenv('HOME') ?: storage_path('app')), DIRECTORY_SEPARATOR . '/');
         $downloads = $home . DIRECTORY_SEPARATOR . 'Downloads';
 
