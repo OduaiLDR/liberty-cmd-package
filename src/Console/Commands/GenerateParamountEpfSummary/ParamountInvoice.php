@@ -11,14 +11,14 @@ final class ParamountInvoice
     public const SENDER = 'invoices@libertydebtrelief.com';
     public const BILL_TO_ADDRESS = '1504 Brookhollow Drive Suite 112|Santa Ana, CA 92705|emcmurtrey@Higbee.law';
 
-    public static function document(array $window, float $debt, int $tier, float $payment, array $billTo): array
+    public static function document(array $window, float $debt, int $tier, float $payment, array $billTo, ?string $number = null): array
     {
         if (!is_finite($debt) || !is_finite($payment) || $debt < 0 || $payment < 0 || $tier < 0) {
             throw new InvalidArgumentException('Invalid EPF invoice figures.');
         }
         $first = new DateTimeImmutable($window['start']);
         $issue = new DateTimeImmutable($window['endExclusive']);
-        $number = 'LDR-PAR-' . $first->format('Y-m');
+        $number ??= 'LDR-PAR-' . $first->format('Y-m'); // a registry number replaces the period number when the switch is on
         $money = static fn (float $amount): string => '$' . number_format($amount, 2);
         $notes = [
             'Payment is based on the EPF tier shown in the attached EPF Summary workbook.',
