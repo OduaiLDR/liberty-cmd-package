@@ -111,6 +111,36 @@ final class ApprovalCommandIntegrationTest extends TestCase
         self::assertSame(['fake-forth-' . $company], array_values(array_unique($transport->forthKeys)));
     }
 
+    #[DataProvider('approvalBranches')]
+    public function test_preview_reads_nested_forth_status_without_side_effects(string $company, int $paymentType, string $target): void
+    {
+        $transport = new ApprovalIntegrationTransport($company, $paymentType);
+        [$command, $sql] = $this->command($transport);
+        [$exit, $output] = $this->dispatch($command, $company, live: false);
+
+        self::assertSame(0, $exit, $output);
+        $label = in_array($paymentType, [15, 16, 132], true) ? 'Accepted' : 'Client complete/ P-Creditor';
+        self::assertStringContainsString('would_approve -> ' . $label, $output);
+        self::assertSame([], $transport->effects);
+        self::assertSame([], $sql->queries);
+        self::assertSame(0, $this->database->getConnection()->table(DatabaseApprovalLedger::TABLE)->count());
+        self::assertFalse($transport->archived);
+    }
+
+    public function test_preview_skips_nested_ineligible_status_without_reading_payment_details(): void
+    {
+        $transport = new ApprovalIntegrationTransport('LDR', 15);
+        $transport->status = '2075';
+        $transport->omitPaymentType = true;
+        [$command] = $this->command($transport);
+        [$exit, $output] = $this->dispatch($command, 'LDR', live: false);
+
+        self::assertSame(0, $exit, $output);
+        self::assertStringContainsString('would_skip', $output);
+        self::assertSame([], $transport->effects);
+        self::assertSame(0, $this->database->getConnection()->table(DatabaseApprovalLedger::TABLE)->count());
+    }
+
     public function test_archive_failure_then_duplicate_message_does_not_repeat_any_crm_or_mail_effect(): void
     {
         $transport = new ApprovalIntegrationTransport('LDR', 16);
@@ -220,13 +250,13 @@ final class ApprovalCommandIntegrationTest extends TestCase
         return [$command, $sql];
     }
 
-    private function dispatch(ProcessSettlementApprovalEmails $command, string $company): array
+    private function dispatch(ProcessSettlementApprovalEmails $command, string $company, bool $live = true): array
     {
         $console = new Application();
         $console->setAutoExit(false);
         $console->add($command);
         $output = new BufferedOutput();
-        $exit = $console->run(new ArrayInput(['command' => 'settlement-approval:process', '--live' => true, '--company' => strtolower($company)]), $output);
+        $exit = $console->run(new ArrayInput(['command' => 'settlement-approval:process', $live ? '--live' : '--dry-run' => true, '--company' => strtolower($company)]), $output);
         return [$exit, $output->fetch()];
     }
 }
@@ -239,6 +269,7 @@ final class ApprovalIntegrationTransport
     public bool $archived = false;
     public bool $failArchiveOnce = false;
     public bool $failNotification = false;
+    public bool $omitPaymentType = false;
     public array $effects = [];
     public array $statusPayload = [];
     public array $notePayload = [];
@@ -262,7 +293,12 @@ final class ApprovalIntegrationTransport
         if ($host === 'api.forthcrm.com') {
             $this->forthKeys[] = $request->getHeaderLine('Api-Key');
             if ($method === 'GET' && $path === '/v1/settlement_offers/456') {
-                return $this->json(['response' => ['id' => '456', 'contact_id' => '123', 'offer_status' => $this->status, 'json' => ['pay_type' => $this->paymentType]]]);
+                // Forth's live offer response nests the numeric ID under status_id.
+                return $this->json(['response' => [
+                    'id' => '456', 'contact_id' => '123',
+                    'offer_status' => ['object' => 'settlement_offer_status', 'status_id' => $this->status, 'label' => 'Fixture status'],
+                    'json' => $this->omitPaymentType ? [] : ['pay_type' => $this->paymentType],
+                ]]);
             }
             if ($method === 'GET' && $path === '/v1/settlement_offer_status') {
                 return $this->json(['response' => [

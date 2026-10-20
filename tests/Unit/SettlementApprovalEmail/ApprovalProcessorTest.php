@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Cmd\Reports\Tests\Unit\SettlementApprovalEmail;
 
 use Cmd\Reports\SettlementApprovalEmail\{ApprovalEmail, ApprovalGateway, ApprovalLedger, ApprovalNotifier, ApprovalProcessor};
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use RuntimeException;
 
@@ -52,6 +53,59 @@ final class ApprovalProcessorTest extends TestCase
         self::assertSame([], $mail->sent);
         $crm->record = null;
         self::assertSame(['outcome' => 'retry_offer_missing'], $flow->preview($this->email()));
+    }
+
+    public static function offerStatusFormats(): array
+    {
+        return [
+            'Forth numeric status_id' => [['object' => 'settlement_offer_status', 'status_id' => 1194, 'label' => 'Fixture']],
+            'Forth string status_id' => [['object' => 'settlement_offer_status', 'status_id' => '1194', 'label' => 'Fixture']],
+            'legacy numeric id' => [['id' => 1194]],
+            'legacy string id' => [['id' => '1194']],
+            'flat numeric status' => [1194],
+            'flat string status' => ['1194'],
+        ];
+    }
+
+    #[DataProvider('offerStatusFormats')]
+    public function test_preview_accepts_forth_and_legacy_numeric_status_formats(mixed $status): void
+    {
+        [$flow, $crm, $ledger, $mail] = $this->setupFlow();
+        $crm->record['offer_status'] = $status;
+
+        self::assertSame(['outcome' => 'would_approve', 'target' => 'Accepted'], $flow->preview($this->email()));
+        self::assertSame([], $ledger->rows);
+        self::assertSame([], $crm->writes);
+        self::assertSame([], $mail->sent);
+    }
+
+    public static function invalidNestedStatuses(): array
+    {
+        return [
+            'missing ID' => [['label' => '1194']],
+            'null ID' => [['status_id' => null]],
+            'boolean ID' => [['status_id' => true]],
+            'float ID' => [['status_id' => 1194.0]],
+            'array ID' => [['status_id' => ['id' => 1194]]],
+            'label instead of ID' => [['status_id' => 'Accepted']],
+            'negative ID' => [['status_id' => '-1194']],
+        ];
+    }
+
+    #[DataProvider('invalidNestedStatuses')]
+    public function test_invalid_nested_status_stops_before_crm_or_notification_writes(array $status): void
+    {
+        [$flow, $crm, $ledger, $mail] = $this->setupFlow();
+        $crm->record['offer_status'] = $status;
+        try {
+            $flow->process($this->email(), 'body');
+            self::fail('Expected invalid status rejection.');
+        } catch (RuntimeException $error) {
+            self::assertSame('Offer status is missing or invalid.', $error->getMessage());
+        }
+        self::assertSame([], $crm->writes);
+        self::assertSame([], $mail->sent);
+        self::assertSame('ready', $ledger->rows[$this->email()->key()]['stage']);
     }
 
     public function test_missing_offer_is_retryable_without_note_or_notification(): void

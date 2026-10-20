@@ -103,7 +103,8 @@ final class ApprovalProcessor
         $contact = $offer['contact_id'] ?? null;
         $offerId = $offer['id'] ?? null;
         $status = $offer['offer_status'] ?? null;
-        if (is_array($status)) $status = $status['id'] ?? null;
+        // Live Forth offers use status_id; keep legacy id and flat fixtures supported.
+        if (is_array($status)) $status = $status['status_id'] ?? $status['id'] ?? null;
         if ((!is_int($offerId) && !is_string($offerId)) || (string) $offerId !== $email->settlementId
             || (!is_int($contact) && !is_string($contact)) || (string) $contact !== $email->contactId) {
             throw new RuntimeException('Settlement/customer mismatch; no approval will be applied.');
