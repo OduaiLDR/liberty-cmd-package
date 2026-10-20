@@ -2,6 +2,7 @@
 
 namespace Cmd\Reports\Repositories;
 
+use Cmd\Reports\Services\SmsWorkflowLock;
 use InvalidArgumentException;
 
 /**
@@ -39,7 +40,7 @@ WITH Source AS (
         '(', ''), ')', ''), '-', ''), ' ', ''), '.', ''), '+', '') AS Digits) d
     CROSS APPLY (SELECT CASE WHEN LEN(d.Digits) = 11 AND LEFT(d.Digits, 1) = '1' THEN SUBSTRING(d.Digits, 2, 10) ELSE d.Digits END AS Digits) d10
     CROSS APPLY (SELECT CASE WHEN LEN(d10.Digits) = 10 AND d10.Digits NOT LIKE '%[^0-9]%' THEN CAST(d10.Digits AS varchar(10)) END AS Phone) ph
-    OUTER APPLY (SELECT TOP 1 u.Debt_Tier FROM TblMailersUnique u WHERE u.External_ID = e.External_ID AND u.Drop_Name = e.Drop_Name) t
+    OUTER APPLY (SELECT TOP 1 u.Debt_Tier FROM TblMailersUnique u WHERE u.External_ID = e.External_ID AND u.Drop_Name = e.Drop_Name ORDER BY u.PK DESC) t
     WHERE e.Drop_Name = ?
 ),
 People AS (
@@ -79,7 +80,7 @@ SQL;
     public function loadDrop(string $dropName, ?string $sendDate, bool $dryRun = false, bool $fill = true): array
     {
         // A large or busy drop can take longer than the default 5-minute query limit.
-        return $this->withQueryTimeout(self::DROP_QUERY_TIMEOUT, fn (): array => $this->loadDropNow($dropName, $sendDate, $dryRun, $fill));
+        return SmsWorkflowLock::run('prospect-admission', fn () => $this->withQueryTimeout(self::DROP_QUERY_TIMEOUT, fn (): array => $this->loadDropNow($dropName, $sendDate, $dryRun, $fill)));
     }
 
     /** @return array{people:?int, added:int, filled:int} */
@@ -95,13 +96,18 @@ SQL;
         }
 
         return $db->transaction(function () use ($db, $dropName, $sendDate, $fill): array {
-            $added = $db->affectingStatement(self::SOURCE_SQL.<<<'SQL'
+            // Old deployments remain usable until the additive workflow migration is applied.
+            $legacy = $db->getSchemaBuilder()->hasTable('TblSMSLegacySends')
+                ? "UNION ALL SELECT Send_Date FROM TblSMSLegacySends WHERE Phone = p.Phone" : '';
+            $added = $db->affectingStatement(self::SOURCE_SQL.<<<SQL
 
 INSERT INTO TblProspects (Creation_Date, Client, Address, City, State, Zip, Tier, Phone, Email, Latest_Export_Date, SMS_Attempts)
 SELECT ?, p.Client, p.Address, p.City, p.State, p.Zip, p.Tier, p.Phone, p.Email, x.Sent, CASE WHEN x.Sent IS NULL THEN 0 ELSE 1 END
 FROM People p
-OUTER APPLY (SELECT CAST(MAX(m.SMS_Last_Export_Date) AS date) AS Sent FROM TblMarketing m
-             WHERE m.Drop_Name = ? AND m.Debt_Tier = p.Tier) x
+OUTER APPLY (SELECT MAX(d.Sent) AS Sent FROM (
+    SELECT CAST(m.SMS_Last_Export_Date AS date) AS Sent FROM TblMarketing m WHERE m.Drop_Name = ? AND m.Debt_Tier = p.Tier
+    {$legacy}
+) d) x
 WHERE p.Person_Rank = 1
   AND NOT EXISTS (SELECT 1 FROM TblProspects q WHERE q.Client = p.Client AND q.Address = p.Address AND q.Zip = p.Zip)
 SQL, [$dropName, $sendDate, $dropName]);
@@ -143,6 +149,15 @@ SQL, [$dropName]);
             }
             // Literal varchar values (checked above) keep the filtered Phone index usable.
             $list = "'".implode("','", $chunk)."'";
+            if (! $dryRun && $this->connection()->getSchemaBuilder()->hasTable('TblSMSLegacySends')) {
+                // Retain the actual historical phone/date even when its prospect has not been
+                // loaded yet. Replaying the original file is idempotent and never records Oct 15.
+                $known = $this->table('TblSMSLegacySends')->where('Send_Date', $sentDate)->whereIn('Phone', $chunk)->pluck('Phone')->all();
+                $new = array_values(array_diff($chunk, $known));
+                foreach (array_chunk($new, 500) as $insert) {
+                    if ($insert) $this->table('TblSMSLegacySends')->insert(array_map(fn ($phone) => ['Phone' => $phone, 'Send_Date' => $sentDate], $insert));
+                }
+            }
             $where = "WHERE Contacted = 0 AND Phone IN ({$list}) AND (Latest_Export_Date IS NULL OR Latest_Export_Date < ?)";
             $marked += $dryRun
                 ? (int) $this->connection()->selectOne("SELECT COUNT(*) AS n FROM TblProspects {$where}", [$sentDate])->n

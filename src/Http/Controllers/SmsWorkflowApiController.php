@@ -296,14 +296,20 @@ class SmsWorkflowApiController extends Controller
         $this->ensureSchemaReady();
         $week = Carbon::parse($data['week'])->startOfWeek(Carbon::MONDAY)->toDateString();
         $exports = $this->marketing->smsExports($week);
-        $sources = DB::connection('sqlsrv')->table('TblSmsExportSources as s')
-            ->leftJoin('TblMarketing as m', 'm.PK', '=', 's.Marketing_PK')
-            ->whereIn('s.SMS_Export_PK', $exports->pluck('PK')->all())
-            ->orderBy('s.Marketing_PK')
-            ->get(['s.SMS_Export_PK', 's.Marketing_PK', 'm.Drop_Name', 's.SMS_Count'])
-            ->groupBy('SMS_Export_PK');
+        $legacyIds = $exports->filter(fn (object $export): bool => ($export->Source_Table ?? 'TblSmsExports') === 'TblSmsExports')
+            ->map(fn (object $export) => $export->Source_PK ?? $export->PK)->unique()->values();
+        $sources = collect();
+        foreach ($legacyIds->chunk(1000) as $ids) {
+            $sources = $sources->concat(DB::connection('sqlsrv')->table('TblSmsExportSources as s')
+                ->leftJoin('TblMarketing as m', 'm.PK', '=', 's.Marketing_PK')
+                ->whereIn('s.SMS_Export_PK', $ids->all())
+                ->orderBy('s.Marketing_PK')
+                ->get(['s.SMS_Export_PK', 's.Marketing_PK', 'm.Drop_Name', 's.SMS_Count']));
+        }
+        $sources = $sources->groupBy('SMS_Export_PK');
         foreach ($exports as $export) {
-            $export->sources = $sources->get($export->PK, collect())->map(fn ($source) => [
+            if (($export->Source_Table ?? 'TblSmsExports') !== 'TblSmsExports') continue;
+            $export->sources = $sources->get($export->Source_PK ?? $export->PK, collect())->map(fn ($source) => [
                 'Marketing_PK' => $source->Marketing_PK, 'Drop_Name' => $source->Drop_Name,
                 'SMS_Count' => $source->SMS_Count,
             ])->values();

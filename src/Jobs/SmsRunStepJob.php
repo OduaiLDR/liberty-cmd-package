@@ -4,6 +4,9 @@ namespace Cmd\Reports\Jobs;
 
 use Cmd\Reports\Services\SmsExportQueue;
 use Cmd\Reports\Services\SmsRunService;
+use Cmd\Reports\Services\SmsWorkflowBusyException;
+use DateTimeImmutable;
+use DateTimeInterface;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -12,18 +15,28 @@ use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Log;
 use Throwable;
 
-/** One long step of an SMS run: prepare (select, debts, drops), file, or send. One attempt only. */
+/** One long step; retry lock contention, but fail on the first real exception. */
 class SmsRunStepJob implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
-    public int $tries = 1;
+    public int $tries = 0;
+
+    public int $maxExceptions = 1;
+
+    public int $createdAt;
 
     public int $timeout = SmsExportQueue::JOB_TIMEOUT;
 
     public function __construct(public string $requestId, public string $step)
     {
-        $this->onQueue('tu-export');
+        $this->createdAt = now()->getTimestamp();
+        $this->onQueue((string) config('sms-exports.queue', 'tu-export'));
+    }
+
+    public function retryUntil(): DateTimeInterface
+    {
+        return (new DateTimeImmutable('@'.$this->createdAt))->modify('+3 hours');
     }
 
     public function handle(SmsRunService $runs): void
@@ -33,7 +46,10 @@ class SmsRunStepJob implements ShouldQueue
                 'prepare' => $runs->prepare($this->requestId),
                 'file' => $runs->buildFile($this->requestId),
                 'send' => $runs->markSent($this->requestId),
+                'reverse' => $runs->reverseSent($this->requestId),
             };
+        } catch (SmsWorkflowBusyException $error) {
+            $this->release(5);
         } catch (Throwable $error) {
             Log::error('SMS run step failed', ['request_id' => $this->requestId, 'step' => $this->step, 'error' => $error->getMessage()]);
             $runs->fail($this->requestId, $this->step, $error->getMessage());

@@ -9,6 +9,11 @@ return [
     'local_root' => $privateRoot ? rtrim((string) $privateRoot, '/\\').'/sms-exports' : null,
     // Default to one CSV; enable only when the recipient needs capped parts.
     'split_csv' => env('CMD_SMS_EXPORT_SPLIT_CSV', false),
+    // Enable only after BOTH the package's enrichment ledger and CMD intake-job migration
+    // have been applied. This routes the existing daily TU command into the new workflow.
+    'prospect_enrichment_enabled' => env('CMD_SMS_PROSPECT_ENRICHMENT_ENABLED', false),
+    'queue' => env('CMD_SMS_QUEUE', 'tu-export'),
+    'demo' => env('CMD_SMS_DEMO', false),
     // CMD runner already configures an S3 disk for exports. Reuse it
     // unless operations deliberately chooses a dedicated SMS bucket.
     'bucket' => $dedicatedBucket ?: config('filesystems.disks.s3.bucket'),

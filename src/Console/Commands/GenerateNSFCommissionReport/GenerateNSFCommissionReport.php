@@ -2,7 +2,10 @@
 
 namespace Cmd\Reports\Console\Commands\GenerateNSFCommissionReport;
 
+use Cmd\Reports\Services\PayrollReportArtifactArchive;
+
 use Cmd\Reports\Services\DBConnector;
+use Cmd\Reports\Services\PayrollCommissionResultSnapshot;
 use Cmd\Reports\Services\CommissionAgentEmailFiles;
 use Cmd\Reports\Services\CommissionResultsWriter;
 use Cmd\Reports\Services\CommissionReportRunLock;
@@ -200,15 +203,16 @@ class GenerateNSFCommissionReport extends Command
 
             // Verify a staged snapshot before SQL, then publish only after SQL commits.
             // This is ordered publication, not a filesystem/database transaction.
-            $snapshotPath = $this->persistWithSnapshot($allFile, $startDate, function () use ($sql, $source, $startDate, $commissionRows): void {
+            $nsfResults = array_map(fn ($r) => ['agent' => $r['agent'], 'amount' => $r['commission']], $commissionRows);
+            $snapshotPath = $this->persistWithSnapshot($allFile, $startDate, function () use ($sql, $source, $startDate, $nsfResults): void {
                 CommissionResultsWriter::replaceComponent(
                     $sql, 'nsf', $source, $startDate, 'Commission',
-                    array_map(
-                        fn ($r) => ['agent' => $r['agent'], 'amount' => $r['commission']],
-                        $commissionRows
-                    )
+                    $nsfResults
                 );
             });
+            $context = PayrollReportArtifactArchive::captureRequested()
+                ? ['commissionResults' => PayrollCommissionResultSnapshot::component('nsf', $source, $startDate, 'commission', $nsfResults)] : [];
+            PayrollReportArtifactArchive::captureFromEnvironment('nsf', $source, $startDate, $allFile, $context);
             NsfReportReadiness::complete($sql, $readiness);
             $this->info("[INFO] [$display] Snapshot saved: {$snapshotPath}");
             $this->cleanupOldSnapshots($startDate);

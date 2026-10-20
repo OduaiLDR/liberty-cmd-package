@@ -2,7 +2,7 @@
 
 namespace Cmd\Reports\Http\Controllers;
 
-use Cmd\Reports\Repositories\SmsProspectExportRepository;
+use Cmd\Reports\Services\SmsAvailabilityService;
 use Cmd\Reports\Services\SmsRunService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -34,12 +34,14 @@ class SmsRunController extends Controller
         return $this->json($overview);
     }
 
-    /** How many people a new run could take now. Read-only, may take a few seconds. */
-    public function availability(SmsProspectExportRepository $export): JsonResponse
+    /** Return a cached aggregate or queue one; never run the full count in HTTP. */
+    public function availability(Request $request, SmsAvailabilityService $availability): JsonResponse
     {
+        $data = Validator::make($request->query(), ['refresh' => ['sometimes', 'boolean']])->validate();
         $this->ensureSchemaReady();
-
-        return $this->json($export->availability());
+        $demo = \Cmd\Reports\Services\SmsDemoGuard::enabled();
+        $snapshot = $availability->snapshot((bool) ($data['refresh'] ?? false));
+        return $this->json($snapshot + ['demo' => $demo], $snapshot['state'] === 'pending' ? 202 : 200);
     }
 
     public function store(Request $request): JsonResponse
@@ -67,6 +69,7 @@ class SmsRunController extends Controller
 
     public function file(string $requestId): JsonResponse
     {
+        $this->ensureSchemaReady();
         return $this->json($this->runs->requestFile($requestId), 202);
     }
 
@@ -77,16 +80,33 @@ class SmsRunController extends Controller
 
     public function sent(Request $request, string $requestId): JsonResponse
     {
+        $this->ensureSchemaReady();
+        $request->validate(['confirmed_sent' => ['required', 'accepted']]);
         return $this->json($this->runs->requestSent($requestId, $this->actor($request)), 202);
+    }
+
+    public function reviewOnly(Request $request, string $requestId): JsonResponse
+    {
+        $this->ensureSchemaReady();
+        return $this->json($this->runs->reviewOnly($requestId, $this->actor($request)));
+    }
+
+    public function notSent(Request $request, string $requestId): JsonResponse
+    {
+        $this->ensureSchemaReady();
+        $data = $request->validate(['confirmed_not_sent' => ['required', 'accepted'], 'reason' => ['required', 'string', 'min:10', 'max:500']]);
+        return $this->json($this->runs->requestNotSent($requestId, $this->actor($request), $data['reason']), 202);
     }
 
     public function discard(string $requestId): JsonResponse
     {
+        $this->ensureSchemaReady();
         return $this->json($this->runs->discard($requestId));
     }
 
     public function retry(string $requestId): JsonResponse
     {
+        $this->ensureSchemaReady();
         return $this->json($this->runs->retry($requestId), 202);
     }
 
@@ -106,8 +126,9 @@ class SmsRunController extends Controller
     {
         $schema = DB::connection('sqlsrv')->getSchemaBuilder();
         if (! $schema->hasTable('TblSMSRuns') || ! $schema->hasTable('TblProspects') || ! $schema->hasTable('TblProspectsExport')
-            || ! $schema->hasTable('TblSMSHistory')) {
-            throw new HttpException(503, 'The new SMS tables are not set up on this server yet.');
+            || ! $schema->hasTable('TblSMSHistory') || ! $schema->hasTable('TblSMSAttemptAudit')
+            || ! $schema->hasColumn('TblSMSRuns', 'Progress_Step')) {
+            throw new HttpException(503, 'Apply the 19 Oct SMS workflow migration on this server before using the new page.');
         }
     }
 

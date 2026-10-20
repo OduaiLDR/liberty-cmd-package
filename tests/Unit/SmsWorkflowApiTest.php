@@ -103,6 +103,12 @@ test('API preview returns whole-drop counts and an actionable shortfall without 
     expect($response->headers->get('Cache-Control'))->toContain('no-store');
 });
 
+test('legacy drop preview retains safe targets above ten million', function () {
+    $this->drops->shouldReceive('selectDrops')->once()->with(10000001)->andReturn(collect());
+    $data = $this->controller->preview(Request::create('/', 'GET', ['target' => 10000001]))->getData(true);
+    expect($data['target'])->toBe(10000001)->and($data['shortfall'])->toBe(10000001);
+});
+
 test('API browse reports whether another page actually exists', function () {
     $this->drops->shouldReceive('allDrops')->once()->with(2)->andReturn(collect([(object) ['Amount_Dropped' => 5]]));
     $this->drops->shouldReceive('allDrops')->once()->with(3)->andReturn(collect());
@@ -126,7 +132,7 @@ test('API input rejects invalid targets identifiers dates and invoice costs befo
         ->toThrow(ValidationException::class);
 })->with([
     ['preview', ['target' => 0]],
-    ['preview', ['target' => 10000001]],
+    ['preview', ['target' => 9007199254740992]],
     ['preview', ['page' => -1]],
     ['preview', ['drop_pks' => []]],
     ['preview', ['drop_pks' => [1, 1]]],
@@ -227,7 +233,7 @@ test('API routes are host gated and bind correct methods and CMD report permissi
     if (! class_exists($session)) class_alias(SmsApiTestSessionGuard::class, $session);
     if (! class_exists($policy)) class_alias(SmsApiTestPolicyGuard::class, $policy);
     require __DIR__.'/../../routes/sms-api.php';
-    expect($router->getRoutes()->count())->toBe(16);
+    expect($router->getRoutes()->count())->toBe(24);
     $run = '3f2a9c1b-0000-4000-8000-000000000001';
     foreach ([
         ['GET', 'mail-drop-export-report/preview', 'cmd.mail_drop_export.preview'],
@@ -246,6 +252,14 @@ test('API routes are host gated and bind correct methods and CMD report permissi
         ['POST', "mail-drop-export-report/runs/{$run}/sent", 'cmd.mail_drop_export.runs.sent'],
         ['POST', "mail-drop-export-report/runs/{$run}/discard", 'cmd.mail_drop_export.runs.discard'],
         ['POST', "mail-drop-export-report/runs/{$run}/retry", 'cmd.mail_drop_export.runs.retry'],
+        ['POST', "mail-drop-export-report/runs/{$run}/review-only", 'cmd.mail_drop_export.runs.review_only'],
+        ['POST', "mail-drop-export-report/runs/{$run}/not-sent", 'cmd.mail_drop_export.runs.not_sent'],
+        ['GET', 'mail-drop-export-report/workflow', 'cmd.mail_drop_export.workflow'],
+        ['POST', 'mail-drop-export-report/workflow/feedback', 'cmd.mail_drop_export.workflow.feedback'],
+        ['POST', 'mail-drop-export-report/workflow/enrichment', 'cmd.mail_drop_export.workflow.enrichment'],
+        ['POST', "mail-drop-export-report/workflow/enrichment/{$run}/retry", 'cmd.mail_drop_export.workflow.enrichment_retry'],
+        ['POST', 'mail-drop-export-report/workflow/load', 'cmd.mail_drop_export.workflow.load'],
+        ['POST', "mail-drop-export-report/workflow/load/{$run}/retry", 'cmd.mail_drop_export.workflow.load_retry'],
     ] as $expected) {
         [$method, $path, $name] = $expected;
         $route = $router->getRoutes()->match(Request::create('/api/cmd/'.$path, $method));

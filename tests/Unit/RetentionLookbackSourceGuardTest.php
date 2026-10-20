@@ -31,9 +31,11 @@ class RetentionLookbackSourceGuardTest extends TestCase
         $source = new LookbackGuardConnector([]);
         $persist = new ReflectionMethod($command, 'persistBonusResults');
 
-        $this->assertNull($persist->invoke($command, $source, 'ldr', '2098-01-01', [
-            ['agent' => 'Alice Smith', 'amount' => 50.0],
-        ], true));
+        foreach ([null, '40fa42ab6e184576aa34ccd880b45529'] as $runId) {
+            $this->assertNull($persist->invoke($command, $source, 'ldr', '2098-01-01', [
+                ['agent' => 'Alice Smith', 'amount' => 50.0],
+            ], true, [['ID' => 'invalid-for-feed', 'AGENT_DEDUCTION' => 125]], $runId));
+        }
         $this->assertSame(0, $source->reads);
         $this->assertSame(0, $source->writes);
     }
