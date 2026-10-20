@@ -115,6 +115,12 @@ FROM Eligible WHERE Phone_Rank = 1
         return ['eligible' => $eligible, 'never_texted' => $never, 'texted_before' => $eligible - $never];
     }
 
+    /** Background aggregate only: restore the connection's normal timeout even on failure. */
+    public function availabilityWithTimeout(): array
+    {
+        return $this->withQueryTimeout(600, fn (): array => $this->availability());
+    }
+
     /**
      * Prospects a run may take, one per phone (Phone_Rank = 1 is the phone's best prospect):
      * a 10-digit phone that is not a contact, not on SHARED_PHONE_ADDRESSES or more addresses,

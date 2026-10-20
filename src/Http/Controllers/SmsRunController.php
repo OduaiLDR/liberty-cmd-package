@@ -2,7 +2,7 @@
 
 namespace Cmd\Reports\Http\Controllers;
 
-use Cmd\Reports\Repositories\SmsProspectExportRepository;
+use Cmd\Reports\Services\SmsAvailabilityService;
 use Cmd\Reports\Services\SmsRunService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -34,12 +34,14 @@ class SmsRunController extends Controller
         return $this->json($overview);
     }
 
-    /** How many people a new run could take now. Read-only, may take a few seconds. */
-    public function availability(SmsProspectExportRepository $export): JsonResponse
+    /** Return a cached aggregate or queue one; never run the full count in HTTP. */
+    public function availability(Request $request, SmsAvailabilityService $availability): JsonResponse
     {
+        $data = Validator::make($request->query(), ['refresh' => ['sometimes', 'boolean']])->validate();
         $this->ensureSchemaReady();
-
-        return $this->json($export->availability() + ['demo' => \Cmd\Reports\Services\SmsDemoGuard::enabled()]);
+        $demo = \Cmd\Reports\Services\SmsDemoGuard::enabled();
+        $snapshot = $availability->snapshot((bool) ($data['refresh'] ?? false));
+        return $this->json($snapshot + ['demo' => $demo], $snapshot['state'] === 'pending' ? 202 : 200);
     }
 
     public function store(Request $request): JsonResponse
