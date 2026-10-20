@@ -5,6 +5,7 @@ namespace Cmd\Reports\Console\Commands;
 use Cmd\Reports\Repositories\SmsProspectExportRepository;
 use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\SmsWorkflowLock;
+use Cmd\Reports\Services\SmsAvailabilityRefresh;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -133,6 +134,9 @@ class SyncPhoneNumbers extends Command
             $inserted = $this->insertPhonesFromFile($connection, $stagePath, $batchSize);
             $cleaned = $this->cleanupEmptyPhones($connection);
             $connection->commit();
+            // Eligibility reads this table directly; notify at its commit boundary,
+            // before a later prospect-flagging failure can skip the refresh.
+            SmsAvailabilityRefresh::afterCommit(DB::connection('sqlsrv'));
             return [$deleted, $inserted, $cleaned];
         } catch (\Throwable $exception) {
             if ($connection->inTransaction()) {

@@ -3,10 +3,12 @@
 use Carbon\Carbon;
 use Cmd\Reports\Repositories\SmsProspectExportRepository;
 use Cmd\Reports\Services\SmsFeedbackService;
+use Cmd\Reports\Services\SmsAvailabilityService;
 use Cmd\Reports\Services\SmsRunService;
 use Illuminate\Config\Repository;
 use Illuminate\Container\Container;
 use Illuminate\Database\Capsule\Manager;
+use Illuminate\Database\DatabaseTransactionsManager;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Facade;
 use Illuminate\Support\Str;
@@ -27,6 +29,14 @@ beforeEach(function () {
     $container->instance('validator', new Factory(new Translator(new ArrayLoader, 'en'), $container));
     Facade::clearResolvedInstances(); Facade::setFacadeApplication($container);
     $this->db = $capsule->getConnection('sqlsrv');
+    $this->db->setTransactionManager(new DatabaseTransactionsManager);
+    $this->summaryTransactionLevels = [];
+    $this->summary = Mockery::mock(SmsAvailabilityService::class);
+    $this->summary->shouldReceive('invalidate')->andReturnUsing(function (): array {
+        $this->summaryTransactionLevels[] = $this->db->transactionLevel();
+        return ['state' => 'pending'];
+    });
+    $container->instance(SmsAvailabilityService::class, $this->summary);
     $this->db->getSchemaBuilder()->create('TblPhoneNumbers', fn (Blueprint $t) => $t->string('Phone'));
     (require __DIR__.'/../../database/sms-migrations/2026_10_12_000001_create_sms_prospects_tables.php')->up();
     (require __DIR__.'/../../database/sms-migrations/2026_10_19_000001_complete_sms_workflow.php')->up();
@@ -44,6 +54,8 @@ beforeEach(function () {
 });
 
 afterEach(function () {
+    foreach ($this->summaryTransactionLevels as $level) expect($level)->toBe(0);
+    Mockery::close();
     Carbon::setTestNow(); Facade::clearResolvedInstances();
     Container::setInstance($this->previousContainer); Facade::setFacadeApplication($this->previousContainer);
 });
@@ -76,6 +88,7 @@ test('saving a review copy retains file metadata and releases people without a s
     expect((int) $this->db->table('TblProspects')->value('SMS_Attempts'))->toBe(0);
     expect($this->service->overview()['open'])->toBeNull();
     expect($this->service->overview()['recent'][0]->drops)->toHaveCount(1);
+    $this->summary->shouldHaveReceived('invalidate')->once();
 });
 
 test('legacy sent runs have no guessed undo and remain unchanged', function () {
@@ -107,6 +120,22 @@ test('feedback rejects changed chunk replays and retains both suppression flags'
     $feedback->import($this->id, 1, [['phone' => '2025550101', 'status' => 'invalid_phone']], 'test@example.invalid');
     $row = $this->db->table('TblSMSSuppressions')->first();
     expect([(int) $row->Opt_Out, (int) $row->Invalid_Phone])->toBe([1, 1]);
+    $this->summary->shouldHaveReceived('invalidate')->twice();
+});
+
+test('feedback replay does not refresh unchanged eligibility and rollback does not notify', function () {
+    $feedback = new SmsFeedbackService;
+    $rows = [['phone' => '2025550101', 'status' => 'opt_out']];
+    $feedback->import($this->id, 0, $rows, 'test@example.invalid');
+    $replay = $feedback->import($this->id, 0, $rows, 'test@example.invalid');
+    expect($replay['replayed'])->toBeTrue();
+    $this->summary->shouldHaveReceived('invalidate')->once();
+    expect(fn () => $this->db->transaction(function () use ($feedback): void {
+        $feedback->import($this->id, 1, [['phone' => '2025550102', 'status' => 'invalid_phone']], 'test@example.invalid');
+        throw new RuntimeException('Synthetic rollback');
+    }))->toThrow(RuntimeException::class, 'Synthetic rollback');
+    $this->summary->shouldHaveReceived('invalidate')->once();
+    expect($this->db->table('TblSMSSuppressions')->where('Phone', '2025550102')->exists())->toBeFalse();
 });
 
 test('the completed workflow migration refuses destructive rollback', function () {

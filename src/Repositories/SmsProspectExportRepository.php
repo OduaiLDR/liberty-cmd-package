@@ -4,6 +4,7 @@ namespace Cmd\Reports\Repositories;
 
 use Carbon\Carbon;
 use Cmd\Reports\Services\SmsProspectValues;
+use Cmd\Reports\Services\SmsAvailabilityRefresh;
 use Illuminate\Validation\ValidationException;
 use RuntimeException;
 
@@ -56,7 +57,7 @@ class SmsProspectExportRepository extends SqlSrvRepository
         $phone = self::CONTACT_PHONE;
         $hashJoins = self::HASH_JOINS;
 
-        return $this->connection()->update(<<<SQL
+        $changed = $this->connection()->update(<<<SQL
 WITH Contacts AS (
     SELECT {$phone} AS Phone, MIN(Created_Date) AS Created_Date
     FROM TblPhoneNumbers
@@ -69,6 +70,8 @@ JOIN Contacts c ON c.Phone = p.Phone
 WHERE (p.Contacted = 0 OR p.Response_Date IS NULL OR c.Created_Date < p.Response_Date) AND p.Phone IS NOT NULL
 {$hashJoins}
 SQL);
+        if ($changed > 0) SmsAvailabilityRefresh::afterCommit($this->connection());
+        return $changed;
     }
 
     /** @return array{selected:int, target:int, shortfall:int, contacted_flagged:int} */
@@ -93,6 +96,7 @@ WHERE Phone_Rank = 1
 ORDER BY {$priority}
 {$hashJoins}
 SQL, [self::SHARED_PHONE_ADDRESSES, $target, $requestId]);
+            if ($selected > 0) SmsAvailabilityRefresh::afterCommit($this->connection());
 
             return ['selected' => $selected, 'target' => $target, 'shortfall' => max(0, $target - $selected), 'contacted_flagged' => $flagged];
         });
@@ -366,7 +370,7 @@ SQL, [$requestId]);
 
         $hashJoins = self::HASH_JOINS;
 
-        return $this->withQueryTimeout(self::STEP_QUERY_TIMEOUT, fn (): int => $db->transaction(function () use ($db, $requestId, $sentAt, $hashJoins): int {
+        $moved = $this->withQueryTimeout(self::STEP_QUERY_TIMEOUT, fn (): int => $db->transaction(function () use ($db, $requestId, $sentAt, $hashJoins): int {
             // Record the exact old values in the SAME update/transaction as the increment.
             // A legacy send without this audit must never be automatically reversed.
             $db->update(<<<SQL
@@ -395,6 +399,8 @@ SQL, [$sentAt->toDateTimeString(), $requestId]);
 
             return $moved;
         }));
+        if ($moved > 0) SmsAvailabilityRefresh::afterCommit($db);
+        return $moved;
     }
 
     /** Keep the review file/drops, release its people, and do NOT record any send. */
@@ -403,13 +409,15 @@ SQL, [$sentAt->toDateTimeString(), $requestId]);
         if ($this->hasRows('TblSMSHistory', $requestId)) {
             throw ValidationException::withMessages(['request_id' => 'This run already has send history. It needs a send correction, not review-only.']);
         }
-        return $this->table('TblProspectsExport')->where('Request_ID', $requestId)->delete();
+        $released = $this->table('TblProspectsExport')->where('Request_ID', $requestId)->delete();
+        if ($released > 0) SmsAvailabilityRefresh::afterCommit($this->connection());
+        return $released;
     }
 
     /** Reversal is allowed only with complete, unchanged before-values, never a guessed date. */
     public function reverseSent(string $requestId): int
     {
-        return $this->withQueryTimeout(self::STEP_QUERY_TIMEOUT, fn (): int => $this->connection()->transaction(function () use ($requestId): int {
+        $restored = $this->withQueryTimeout(self::STEP_QUERY_TIMEOUT, fn (): int => $this->connection()->transaction(function () use ($requestId): int {
             $db = $this->connection();
             $audit = $db->table('TblSMSAttemptAudit')->where('Request_ID', $requestId);
             if (! $audit->exists()) throw ValidationException::withMessages(['request_id' => 'This older send has no before-values. Restore-point reconciliation is required; no dates or counts were changed.']);
@@ -429,6 +437,8 @@ SQL, [$requestId]);
             $db->table('TblSMSLegacySends')->where('Request_ID', $requestId)->delete();
             return $restored;
         }));
+        if ($restored > 0) SmsAvailabilityRefresh::afterCommit($this->connection());
+        return $restored;
     }
 
     /** Removes a run that was not sent (its rows and SMS drops), so its people can be selected again. */
@@ -436,7 +446,7 @@ SQL, [$requestId]);
     {
         $db = $this->connection();
 
-        return $db->transaction(function () use ($db, $requestId): int {
+        $deleted = $db->transaction(function () use ($db, $requestId): int {
             if ($this->hasRows('TblSMSHistory', $requestId)) {
                 throw ValidationException::withMessages(['request_id' => 'This run was already sent and cannot be discarded.']);
             }
@@ -447,6 +457,8 @@ SQL, [$requestId]);
 
             return $deleted;
         });
+        if ($deleted > 0) SmsAvailabilityRefresh::afterCommit($db);
+        return $deleted;
     }
 
     /** @return array<int, array{PK:int, Drop_Name:string, Debt_Tier:?string, Amount_Dropped:int}> */

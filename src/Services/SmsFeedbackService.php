@@ -24,7 +24,7 @@ class SmsFeedbackService
             $rows[] = ['phone' => $phone, 'status' => $status];
         }
         $hash = hash('sha256', json_encode($rows, JSON_THROW_ON_ERROR));
-        return SmsWorkflowLock::run('phone-suppression', fn () => DB::connection('sqlsrv')->transaction(function () use ($requestId, $chunk, $rows, $hash, $actor): array {
+        $result = SmsWorkflowLock::run('phone-suppression', fn () => DB::connection('sqlsrv')->transaction(function () use ($requestId, $chunk, $rows, $hash, $actor): array {
             $db = DB::connection('sqlsrv');
             $log = $db->table('TblSMSFeedbackImports')->where('Request_ID', $requestId)->where('Chunk', $chunk)->first();
             if ($log) {
@@ -55,5 +55,7 @@ class SmsFeedbackService
                 'Records' => count($rows), 'Matched' => $matched, 'Updated' => $updated, 'Created_By' => $actor, 'Created_At' => now()->toDateTimeString()]);
             return ['records' => count($rows), 'matched' => $matched, 'updated' => $updated, 'replayed' => false];
         }));
+        if (! $result['replayed']) SmsAvailabilityRefresh::afterCommit(DB::connection('sqlsrv'));
+        return $result;
     }
 }

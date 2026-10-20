@@ -6,14 +6,17 @@ namespace Cmd\Reports\Tests\Unit;
 
 use Carbon\CarbonImmutable;
 use Cmd\Reports\Repositories\SmsEnrichmentRepository;
+use Cmd\Reports\Services\SmsAvailabilityService;
 use Illuminate\Config\Repository;
 use Illuminate\Container\Container;
 use Illuminate\Database\Capsule\Manager;
 use Illuminate\Database\Connection;
 use Illuminate\Database\DatabaseManager;
+use Illuminate\Database\DatabaseTransactionsManager;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\Facade;
 use PHPUnit\Framework\TestCase;
+use Mockery;
 use ReflectionMethod;
 use Symfony\Component\HttpKernel\Exception\HttpException;
 
@@ -30,6 +33,8 @@ final class SmsEnrichmentWorkflowTest extends TestCase
     private Connection $db;
     private SmsEnrichmentRepository $repository;
     private object $migration;
+    private int $refreshes;
+    private array $refreshTransactionLevels;
 
     protected function setUp(): void
     {
@@ -43,6 +48,16 @@ final class SmsEnrichmentWorkflowTest extends TestCase
         $capsule->getDatabaseManager()->setDefaultConnection('sqlsrv');
         $container->instance('db', $capsule->getDatabaseManager());
         $this->db = $capsule->getConnection('sqlsrv');
+        $this->db->setTransactionManager(new DatabaseTransactionsManager);
+        $this->refreshes = 0;
+        $this->refreshTransactionLevels = [];
+        $summary = Mockery::mock(SmsAvailabilityService::class);
+        $summary->shouldReceive('invalidate')->andReturnUsing(function (): array {
+            $this->refreshTransactionLevels[] = $this->db->transactionLevel();
+            $this->refreshes++;
+            return ['state' => 'pending'];
+        });
+        $container->instance(SmsAvailabilityService::class, $summary);
         $container->instance('db.schema', $this->db->getSchemaBuilder());
         Facade::clearResolvedInstances();
         Facade::setFacadeApplication($container);
@@ -59,6 +74,8 @@ final class SmsEnrichmentWorkflowTest extends TestCase
 
     protected function tearDown(): void
     {
+        foreach ($this->refreshTransactionLevels as $level) self::assertSame(0, $level);
+        Mockery::close();
         CarbonImmutable::setTestNow();
         $this->db->disconnect();
         Facade::clearResolvedInstances();
@@ -123,6 +140,27 @@ final class SmsEnrichmentWorkflowTest extends TestCase
         $summary = $this->repository->summary('main');
         self::assertSame([2, 1, 1, 1], $this->counts($summary, ['returned', 'phone', 'neither', 'closed_unreturned']));
         self::assertSame('completed', $summary['status']);
+        self::assertSame(1, $this->refreshes, 'Only a newly admitted contact requests a refresh, not replays or empty returns.');
+    }
+
+    public function test_return_refresh_waits_for_the_outer_write_and_is_discarded_on_rollback(): void
+    {
+        $this->repository->stage('main', [$this->record('One')], 'operator');
+        $id = $this->rows('main')[0]['Record_ID'];
+        $result = ['Record_ID' => $id, 'Phone' => '2025550101'];
+        try {
+            $this->db->transaction(function () use ($result): void {
+                $this->repository->returned('main', [$result], false, false);
+                self::assertSame(0, $this->refreshes);
+                throw new \RuntimeException('Synthetic rollback');
+            });
+        } catch (\RuntimeException $error) {
+            self::assertSame('Synthetic rollback', $error->getMessage());
+        }
+        self::assertSame(0, $this->refreshes);
+        self::assertSame(0, $this->db->table('TblProspects')->count());
+        $this->repository->returned('main', [$result]);
+        self::assertSame(1, $this->refreshes, 'The summary-returning API also notifies once after a successful commit.');
     }
 
     public function test_export_freezes_membership_and_keeps_the_same_vendor_contract_after_returns(): void
@@ -207,6 +245,37 @@ final class SmsEnrichmentWorkflowTest extends TestCase
         self::assertSame(0, $this->db->table('TblProspects')->count());
         $summary = $this->repository->stage('repurchase', [$this->record('One', ['Mailer_PK' => 900001]), $this->record('Two', ['Mailer_PK' => 900002])], 'operator');
         self::assertSame(2, $summary['submitted']);
+    }
+
+    public function test_one_usable_contact_is_enough_and_discarded_returns_remain_auditable(): void
+    {
+        $this->repository->stage('contact-rule', array_map(fn (string $name): array => $this->record($name),
+            ['Phone survives', 'Email survives', 'Neither survives']), 'operator');
+        $rows = $this->rows('contact-rule');
+        $results = [
+            ['Record_ID' => $rows[0]['Record_ID'], 'Phone' => '+1 (202) 555-0101', 'Email' => 'not-an-email'],
+            ['Record_ID' => $rows[1]['Record_ID'], 'Phone' => '123', 'Email' => '  usable@example.test  '],
+            ['Record_ID' => $rows[2]['Record_ID'], 'Phone' => '123', 'Email' => 'not-an-email'],
+        ];
+
+        $summary = $this->repository->returned('contact-rule', $results, true);
+        self::assertSame([3, 1, 1, 0, 1, 2], $this->counts($summary, ['returned', 'phone', 'email', 'both', 'neither', 'added']));
+        self::assertSame(['Email survives', 'Phone survives'],
+            $this->db->table('TblProspects')->orderBy('Client')->pluck('Client')->all());
+        $emailOnly = $this->db->table('TblProspects')->where('Client', 'Email survives')->first();
+        self::assertNull($emailOnly->Phone);
+        self::assertSame('usable@example.test', $emailOnly->Email);
+        self::assertSame(3, $this->db->table('TblSMSEnrichmentPeople')->whereNotNull('Returned_At')->count(),
+            'Discarding a return from the prospect pool must not erase its return ledger.');
+        $discarded = $this->db->table('TblSMSEnrichmentPeople')->where('Client', 'Neither survives')->first();
+        self::assertNull($discarded->Prospect_PK);
+        self::assertNull($discarded->Active_Key);
+        self::assertSame('returned', $discarded->Status);
+        self::assertSame(1, $this->refreshes);
+
+        self::assertSame($summary, $this->repository->returned('contact-rule', $results, true));
+        self::assertSame(2, $this->db->table('TblProspects')->count());
+        self::assertSame(1, $this->refreshes, 'Replaying the same return must not admit it again or request another refresh.');
     }
 
     public function test_a_no_result_never_resubmits_the_same_purchase_but_a_new_purchase_can_retry(): void

@@ -7,6 +7,7 @@ namespace Cmd\Reports\Repositories;
 use Carbon\CarbonImmutable;
 use Cmd\Reports\Services\SmsProspectValues;
 use Cmd\Reports\Services\SmsWorkflowLock;
+use Cmd\Reports\Services\SmsAvailabilityRefresh;
 use Illuminate\Database\Query\Builder;
 use Symfony\Component\HttpKernel\Exception\HttpException;
 
@@ -272,6 +273,7 @@ final class SmsEnrichmentRepository extends SqlSrvRepository
                 $this->table(self::BATCHES)->where('Batch_ID', $batchId)->update(['Status' => 'returning', 'Updated_At' => $now]);
             }
 
+            if ($counts['added'] + $counts['filled'] > 0) SmsAvailabilityRefresh::afterCommit($this->connection());
             return $withSummary ? $this->summary($batchId) : $counts;
         }));
     }

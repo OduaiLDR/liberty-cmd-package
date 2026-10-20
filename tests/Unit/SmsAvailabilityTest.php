@@ -104,7 +104,7 @@ class SmsAvailabilityTest extends TestCase
     private function publicationFailures(array $states, bool $throw, bool $afterWrite = false): ArrayStore
     {
         $store = new class($states, $throw, $afterWrite) extends ArrayStore {
-            public function __construct(private array $failures, private bool $throw, private bool $afterWrite) { parent::__construct(); }
+            public function __construct(public array $failures, private bool $throw, public bool $afterWrite) { parent::__construct(); }
             public function put($key, $value, $seconds)
             {
                 if (($value['response']['state'] ?? null) === ($this->failures[0] ?? null) && $this->failures !== []) {
@@ -272,7 +272,12 @@ class SmsAvailabilityTest extends TestCase
         self::assertSame(200, $response->getStatusCode());
         self::assertSame('failed', $response->getData(true)['state']);
         self::assertStringNotContainsString('PRIVATE', $response->getContent());
-        self::assertSame(['generation', 'response'], array_keys($this->cache->store()->get($this->jobs[0]->scope.':snapshot')));
+        $entry = $this->cache->store()->get($this->jobs[0]->scope.':snapshot');
+        self::assertSame(['generation', 'response', 'revision', 'count_revision', 'valid_until', 'last_good'], array_keys($entry));
+        self::assertSame(0, $entry['revision']);
+        self::assertSame(0, $entry['count_revision']);
+        self::assertNull($entry['last_good'], 'A rejected ready publication is not a successful snapshot.');
+        self::assertArrayNotHasKey('owner', $entry, 'A published failure is terminal and releases ownership.');
         $replacement = $this->service->snapshot(true);
         self::assertSame('pending', $replacement['state']);
         self::assertTrue($replacement['queued_now']);
@@ -468,6 +473,343 @@ class SmsAvailabilityTest extends TestCase
         $entry = $this->cache->store()->get($this->jobs[0]->scope.':snapshot');
         self::assertStringNotContainsString('PRIVATE', json_encode($entry));
         self::assertSame(['state', 'eligible', 'never_texted', 'texted_before', 'counted_at'], array_keys($entry['response']));
+    }
+
+    private function assertStale(array $response, array $good, string $state): void
+    {
+        self::assertSame($state, $response['state']);
+        self::assertTrue($response['stale']);
+        foreach (['eligible', 'never_texted', 'texted_before', 'counted_at'] as $key) {
+            self::assertSame($good[$key], $response[$key], $key.' must retain its last successful value.');
+        }
+        self::assertSame([], array_diff(array_keys($response), [
+            'state', 'requested_at', 'queued_now', 'message', 'eligible', 'never_texted', 'texted_before', 'counted_at', 'stale',
+        ]));
+    }
+
+    public function test_a_new_reader_retains_last_good_indefinitely_across_freshness_and_pending_lease_expiry(): void
+    {
+        $this->service->snapshot();
+        $this->finishFirst();
+        $good = $this->service->snapshot();
+        Carbon::setTestNow(now()->addYears(2));
+        $reader = new SmsAvailabilityService;
+        $this->assertStale($reader->snapshot(), $good, 'pending');
+        self::assertCount(2, $this->jobs);
+        Carbon::setTestNow(now()->addSeconds(SmsAvailabilityService::LEASE_SECONDS + 61));
+        $this->assertStale((new SmsAvailabilityService)->snapshot(), $good, 'pending');
+        self::assertCount(3, $this->jobs);
+        $this->jobs[1]->failed(null);
+        $this->assertStale($reader->snapshot(), $good, 'pending');
+        self::assertTrue($this->cache->store()->getStore()->restoreLock($this->jobs[2]->scope.':count', $this->jobs[2]->owner)->isOwnedByCurrentProcess());
+    }
+
+    public function test_pending_and_failed_refreshes_keep_the_original_counted_time_until_a_successful_replacement(): void
+    {
+        $this->service->snapshot();
+        $this->finishFirst();
+        $good = $this->service->snapshot();
+        Carbon::setTestNow(now()->addMinutes(1));
+        $this->assertStale($this->service->snapshot(true), $good, 'pending');
+        try {
+            $this->jobs[1]->handle($this->service, $this->export(fn () => throw new RuntimeException('PRIVATE SQL')));
+            self::fail('Expected refresh query failure.');
+        } catch (RuntimeException) {}
+        $this->jobs[1]->failed(null);
+        $this->assertStale((new SmsAvailabilityService)->snapshot(), $good, 'failed');
+        Carbon::setTestNow(now()->addSeconds(61));
+        $this->assertStale($this->service->snapshot(), $good, 'pending');
+        $next = ['eligible' => 6, 'never_texted' => 2, 'texted_before' => 4];
+        $this->jobs[2]->handle($this->service, $this->export(fn () => $next));
+        self::assertSame(['state' => 'ready'] + $next + ['counted_at' => now()->toIso8601String()], $this->service->snapshot());
+    }
+
+    public function test_zero_is_a_real_last_good_snapshot_and_not_an_absent_count(): void
+    {
+        $this->service->snapshot();
+        $this->finishFirst(fn () => ['eligible' => 0, 'never_texted' => 0, 'texted_before' => 0]);
+        $good = $this->service->snapshot();
+        $this->assertStale($this->service->snapshot(true), $good, 'pending');
+        $this->jobs[1]->failed(null);
+        $this->assertStale($this->service->snapshot(), $good, 'failed');
+    }
+
+    public function test_last_good_and_stale_responses_store_only_allowlisted_aggregate_fields(): void
+    {
+        $this->service->snapshot();
+        $this->finishFirst(fn () => $this->counts + ['phone' => 'PRIVATE', 'rows' => [['name' => 'PRIVATE']]]);
+        $good = $this->service->snapshot();
+        $this->assertStale($this->service->snapshot(true), $good, 'pending');
+        $this->jobs[1]->failed(null);
+        $this->assertStale($this->service->snapshot(), $good, 'failed');
+        self::assertStringNotContainsString('PRIVATE', json_encode($this->cache->store()->getStore()->all()));
+    }
+
+    public function test_invalidations_before_the_worker_starts_coalesce_into_one_count(): void
+    {
+        $this->service->invalidate();
+        $this->service->invalidate();
+        (new SmsAvailabilityService)->invalidate();
+        self::assertCount(1, $this->jobs);
+        self::assertSame('pending', $this->service->snapshot()['state']);
+        self::assertArrayNotHasKey('eligible', $this->service->snapshot());
+        $this->finishFirst();
+        self::assertCount(1, $this->jobs);
+        self::assertSame('ready', $this->service->snapshot()['state']);
+    }
+
+    public function test_mid_count_dirty_notifications_automatically_queue_one_follow_up_and_never_publish_stale_as_current(): void
+    {
+        $this->service->snapshot();
+        $this->dispatchHook = function ($job): void {
+            $mutex = $this->cache->store()->getStore()->lock($job->scope.':state', 30);
+            self::assertTrue($mutex->get(), 'Follow-up dispatch must happen after releasing the state mutex.');
+            $mutex->release();
+            $this->assertStale($this->service->snapshot(), $this->counts + ['counted_at' => now()->toIso8601String()], 'pending');
+        };
+        $this->finishFirst(function (): array {
+            $this->service->invalidate();
+            (new SmsAvailabilityService)->invalidate();
+            self::assertCount(1, $this->jobs, 'A running query must not overlap its follow-up.');
+            return $this->counts;
+        });
+        self::assertCount(2, $this->jobs);
+        self::assertSame('pending', $this->service->snapshot()['state']);
+        $next = ['eligible' => 3, 'never_texted' => 1, 'texted_before' => 2];
+        $this->jobs[1]->handle($this->service, $this->export(fn () => $next));
+        self::assertSame(['state' => 'ready'] + $next + ['counted_at' => now()->toIso8601String()], $this->service->snapshot());
+        self::assertCount(2, $this->jobs);
+    }
+
+    public function test_each_count_consumes_only_notifications_committed_before_it_starts(): void
+    {
+        $this->service->invalidate();
+        $this->finishFirst(function (): array {
+            $this->service->invalidate();
+            return $this->counts;
+        });
+        $this->service->invalidate(); // Queued, not started: absorbed by the second count.
+        self::assertCount(2, $this->jobs);
+        $this->jobs[1]->handle($this->service, $this->export(function (): array {
+            $this->service->invalidate(); // Already started: requires a third count.
+            return $this->counts;
+        }));
+        self::assertCount(3, $this->jobs);
+        $this->jobs[2]->handle($this->service, $this->export());
+        self::assertCount(3, $this->jobs);
+        self::assertSame('ready', $this->service->snapshot()['state']);
+    }
+
+    public function test_invalidation_dispatch_happens_outside_the_mutex_and_can_receive_another_notification(): void
+    {
+        $this->dispatchHook = function ($job): void {
+            $mutex = $this->cache->store()->getStore()->lock($job->scope.':state', 30);
+            self::assertTrue($mutex->get());
+            $mutex->release();
+            $this->service->invalidate();
+        };
+        $this->service->invalidate();
+        self::assertCount(1, $this->jobs);
+        $this->finishFirst();
+        self::assertCount(1, $this->jobs);
+        self::assertSame('ready', $this->service->snapshot()['state']);
+    }
+
+    public function test_mid_count_invalidation_follow_up_also_runs_after_a_query_failure(): void
+    {
+        $this->service->snapshot();
+        $this->finishFirst();
+        $good = $this->service->snapshot();
+        $this->service->snapshot(true);
+        try {
+            $this->jobs[1]->handle($this->service, $this->export(function (): array {
+                $this->service->invalidate();
+                throw new RuntimeException('PRIVATE failing query');
+            }));
+            self::fail('Expected query failure.');
+        } catch (RuntimeException) {}
+        self::assertCount(3, $this->jobs);
+        $this->jobs[1]->failed(null);
+        $this->assertStale($this->service->snapshot(), $good, 'pending');
+        $this->jobs[2]->handle($this->service, $this->export());
+        self::assertSame('ready', $this->service->snapshot()['state']);
+    }
+
+    #[DataProvider('publicationFailureModes')]
+    public function test_ready_and_failed_publication_failures_retain_last_good_and_dirty_revision_until_callback_retry(bool $throw): void
+    {
+        $store = $this->publicationFailures([], $throw);
+        $this->service->snapshot();
+        $this->finishFirst();
+        $good = $this->service->snapshot();
+        $this->service->snapshot(true);
+        $store->failures = ['ready', 'failed'];
+        try {
+            $this->jobs[1]->handle($this->service, $this->export(function (): array {
+                $this->service->invalidate();
+                return ['eligible' => 1, 'never_texted' => 1, 'texted_before' => 0];
+            }));
+            self::fail('Expected both publications to fail.');
+        } catch (RuntimeException) {}
+        self::assertSame([], $store->failures, 'Both atomic publication failures must have been exercised.');
+        self::assertCount(2, $this->jobs);
+        self::assertTrue($store->restoreLock($this->jobs[1]->scope.':count', $this->jobs[1]->owner)->isOwnedByCurrentProcess());
+        $this->assertStale((new SmsAvailabilityService)->snapshot(), $good, 'pending');
+        $this->jobs[1]->failed(null);
+        self::assertCount(3, $this->jobs, 'The callback must preserve and schedule the dirty revision.');
+        $this->assertStale($this->service->snapshot(), $good, 'pending');
+        self::assertFalse($store->restoreLock($this->jobs[1]->scope.':count', $this->jobs[1]->owner)->isOwnedByCurrentProcess());
+        $this->jobs[2]->handle($this->service, $this->export());
+        self::assertSame('ready', $this->service->snapshot()['state']);
+    }
+
+    public function test_dispatch_failure_retains_last_good_and_invalidation_can_retry_without_waiting_for_cooldown(): void
+    {
+        $this->service->snapshot();
+        $this->finishFirst();
+        $good = $this->service->snapshot();
+        $this->dispatchHook = fn () => throw new RuntimeException('PRIVATE dispatch failure');
+        $this->service->invalidate();
+        $failed = (new SmsAvailabilityService)->snapshot();
+        $this->assertStale($failed, $good, 'failed');
+        self::assertArrayNotHasKey('queued_now', $failed);
+        self::assertStringNotContainsString('PRIVATE', json_encode($failed));
+        $this->dispatchHook = null;
+        $this->service->invalidate();
+        self::assertCount(3, $this->jobs);
+        $this->assertStale($this->service->snapshot(), $good, 'pending');
+    }
+
+    #[DataProvider('publicationFailureModes')]
+    public function test_pending_publication_failure_preserves_last_good_and_the_notification_for_retry(bool $throw): void
+    {
+        $store = $this->publicationFailures([], $throw);
+        $this->service->snapshot();
+        $this->finishFirst();
+        $good = $this->service->snapshot();
+        $store->failures = ['pending'];
+        $failed = $this->service->snapshot(true);
+        $this->assertStale($failed, $good, 'failed');
+        self::assertCount(1, $this->jobs);
+        $this->service->invalidate();
+        self::assertCount(2, $this->jobs);
+        $this->assertStale($this->service->snapshot(), $good, 'pending');
+    }
+
+    #[DataProvider('publicationFailureModes')]
+    public function test_pending_commit_followed_by_a_cache_error_does_not_strand_an_undispatched_job(bool $throw): void
+    {
+        $store = $this->publicationFailures([], $throw);
+        $this->service->snapshot();
+        $this->finishFirst();
+        $good = $this->service->snapshot();
+        $store->failures = ['pending'];
+        $store->afterWrite = true;
+        $this->assertStale($this->service->snapshot(true), $good, 'failed');
+        self::assertCount(1, $this->jobs, 'Failed pending publication must not dispatch.');
+        $this->assertStale((new SmsAvailabilityService)->snapshot(), $good, 'pending');
+        self::assertCount(2, $this->jobs, 'The released lease must permit immediate replacement.');
+        $this->jobs[1]->handle($this->service, $this->export());
+        self::assertSame('ready', $this->service->snapshot()['state']);
+    }
+
+    #[DataProvider('publicationFailureModes')]
+    public function test_repeated_callback_publication_errors_and_expired_leases_retain_last_good_and_dirty_notifications(bool $throw): void
+    {
+        $store = $this->publicationFailures([], $throw);
+        $this->service->snapshot();
+        $this->finishFirst();
+        $good = $this->service->snapshot();
+        $this->service->snapshot(true);
+        $store->failures = ['ready', 'failed', 'failed'];
+        try {
+            $this->jobs[1]->handle($this->service, $this->export(function (): array {
+                $this->service->invalidate();
+                return $this->counts;
+            }));
+            self::fail('Expected failed ready and failure publications.');
+        } catch (RuntimeException) {}
+        try { $this->jobs[1]->failed(null); self::fail('Expected another failed callback publication.'); }
+        catch (RuntimeException) {}
+        self::assertSame([], $store->failures);
+        $this->assertStale($this->service->snapshot(), $good, 'pending');
+        Carbon::setTestNow(now()->addSeconds(SmsAvailabilityService::LEASE_SECONDS + 1));
+        $this->assertStale((new SmsAvailabilityService)->snapshot(), $good, 'pending');
+        self::assertCount(3, $this->jobs);
+        $this->jobs[1]->failed(null);
+        $this->assertStale($this->service->snapshot(), $good, 'pending');
+        $this->jobs[2]->handle($this->service, $this->export());
+        self::assertSame('ready', $this->service->snapshot()['state']);
+        self::assertCount(3, $this->jobs);
+    }
+
+    #[DataProvider('publicationFailureModes')]
+    public function test_failed_invalidation_is_not_silently_acknowledged_or_allowed_to_delete_last_good(bool $throw): void
+    {
+        $store = $this->publicationFailures([], $throw);
+        $this->service->snapshot();
+        $this->finishFirst();
+        $before = $this->cache->store()->get($this->jobs[0]->scope.':snapshot');
+        $store->failures = ['ready']; // invalidate rewrites the ready record with a new revision.
+        try {
+            $this->service->invalidate();
+            self::fail('A failed dirty write must be reported so its caller can retry.');
+        } catch (RuntimeException $error) {
+            self::assertSame('Availability invalidation could not be saved. Retry the notification.', $error->getMessage());
+        }
+        self::assertSame($before, $this->cache->store()->get($this->jobs[0]->scope.':snapshot'));
+        self::assertCount(1, $this->jobs);
+        $this->service->invalidate();
+        self::assertCount(2, $this->jobs);
+        $this->assertStale($this->service->snapshot(), $before['response'], 'pending');
+    }
+
+    public function test_a_committed_dirty_write_with_a_transport_error_cannot_be_reused_as_fresh(): void
+    {
+        $store = $this->publicationFailures([], true);
+        $this->service->snapshot();
+        $this->finishFirst();
+        $good = $this->service->snapshot();
+        $store->failures = ['ready'];
+        $store->afterWrite = true;
+        try { $this->service->invalidate(); self::fail('Expected uncertain invalidation acknowledgement.'); }
+        catch (RuntimeException) {}
+        $this->assertStale((new SmsAvailabilityService)->snapshot(), $good, 'pending');
+        self::assertCount(2, $this->jobs);
+        $this->jobs[1]->handle($this->service, $this->export());
+        self::assertSame('ready', $this->service->snapshot()['state']);
+    }
+
+    public function test_a_committed_stale_completion_with_a_transport_error_still_queues_its_follow_up(): void
+    {
+        $store = $this->publicationFailures([], true);
+        $this->service->snapshot();
+        $store->failures = ['ready'];
+        $store->afterWrite = true;
+        try {
+            $this->finishFirst(function (): array {
+                $this->service->invalidate();
+                return $this->counts;
+            });
+            self::fail('Expected uncertain ready acknowledgement.');
+        } catch (RuntimeException) {}
+        self::assertCount(2, $this->jobs);
+        $this->assertStale($this->service->snapshot(), $this->counts + ['counted_at' => now()->toIso8601String()], 'pending');
+        $this->jobs[1]->handle($this->service, $this->export());
+        self::assertSame('ready', $this->service->snapshot()['state']);
+    }
+
+    public function test_last_good_remains_scoped_to_database_and_demo_environment(): void
+    {
+        $this->service->snapshot();
+        $this->finishFirst();
+        config(['sms-exports.demo' => true]);
+        $other = $this->service->snapshot();
+        self::assertSame('pending', $other['state']);
+        self::assertArrayNotHasKey('eligible', $other);
+        $this->jobs[0]->failed(null);
+        config(['sms-exports.demo' => false]);
+        self::assertSame('ready', $this->service->snapshot()['state']);
     }
 
     public static function invalidCounts(): array

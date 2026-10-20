@@ -26,36 +26,39 @@ class SmsAvailabilityService
     private const FAILURE_SECONDS = 60;
     private const FAILURE_MESSAGE = 'Could not count available people. Refresh the count to try again.';
 
-    /** @return array{state:string, requested_at?:string, queued_now?:bool, counted_at?:string, eligible?:int, never_texted?:int, texted_before?:int, message?:string} */
+    /** @return array{state:string, requested_at?:string, queued_now?:bool, counted_at?:string, eligible?:int, never_texted?:int, texted_before?:int, stale?:bool, message?:string} */
     public function snapshot(bool $refresh = false): array
     {
+        $entry = null;
         try {
             $cache = $this->cache();
             $scope = $this->scope();
             $entry = $cache->get($scope.':snapshot');
-            if ($this->reusable($entry, $refresh)) return $entry['response'];
+            if ($this->reusable($cache, $scope, $entry, $refresh)) return $this->response($entry);
 
             $mutex = $cache->getStore()->lock($scope.':state', self::MUTEX_SECONDS);
             if (! $mutex->get()) {
                 $entry = $cache->get($scope.':snapshot');
-                return $this->reusable($entry, $refresh) ? $entry['response'] : $this->pending();
+                return $this->reusable($cache, $scope, $entry, $refresh) ? $this->response($entry) : $this->withLastGood($entry, $this->pending());
             }
             $job = null;
             try {
                 $entry = $cache->get($scope.':snapshot');
-                if ($this->reusable($entry, $refresh)) return $entry['response'];
+                if ($this->reusable($cache, $scope, $entry, $refresh)) return $this->response($entry);
                 app(SmsExportQueue::class)->assertReady();
                 $lease = $cache->getStore()->lock($scope.':count', self::LEASE_SECONDS);
-                if (! $lease->get()) return $this->pending();
+                if (! $lease->get()) return $this->withLastGood($entry, $this->pending());
                 $generation = (string) Str::uuid();
                 $owner = $lease->owner();
-                $response = $this->pending();
+                $response = $this->withLastGood($entry, $this->pending());
                 try {
                     $this->put($cache, $scope, [
                         'generation' => $generation, 'owner' => $owner,
                         'lease_until' => now()->getTimestamp() + self::LEASE_SECONDS,
                         'started_at' => null, 'response' => $response,
-                    ], self::LEASE_SECONDS + 60);
+                        'revision' => $entry['revision'] ?? 0, 'count_revision' => $entry['revision'] ?? 0,
+                        'last_good' => $this->lastGood($entry),
+                    ]);
                 } catch (Throwable $error) {
                     $lease->release();
                     throw $error;
@@ -70,14 +73,42 @@ class SmsAvailabilityService
                 app(Dispatcher::class)->dispatch($job);
             } catch (Throwable $error) {
                 $this->fail($scope, $generation, $owner);
-                return $cache->get($scope.':snapshot')['response'] ?? $this->failure();
+                $entry = $cache->get($scope.':snapshot');
+                return $this->reusable($cache, $scope, $entry, false) ? $this->response($entry) : $this->withLastGood($entry, $this->failure());
             }
             // Per-caller freshness acknowledgement, deliberately absent from the shared snapshot.
             return $response + ['queued_now' => true];
         } catch (Throwable $error) {
             // Configuration, cache and queue details must not reach the client.
-            return $this->failure();
+            return $this->withLastGood($entry, $this->failure());
         }
+    }
+
+    /**
+     * Notify AFTER the writer's outermost commit. Queueing coalesces with existing work;
+     * a notification during the query requires another count. Persistence errors propagate
+     * safely so the writer can retry rather than silently acknowledge a lost notification.
+     */
+    public function invalidate(): void
+    {
+        try {
+            $cache = $this->cache();
+            $scope = $this->scope();
+            $mutex = $cache->getStore()->lock($scope.':state', self::MUTEX_SECONDS);
+            $mutex->block(self::MUTEX_SECONDS);
+            try {
+                $entry = $cache->get($scope.':snapshot') ?? [];
+                $entry['revision'] = ($entry['revision'] ?? 0) + 1;
+                $this->put($cache, $scope, $entry);
+            } finally {
+                $mutex->release();
+            }
+        } catch (Throwable $error) {
+            throw new RuntimeException('Availability invalidation could not be saved. Retry the notification.', 0, $error);
+        }
+
+        // snapshot() only coordinates background work; it never counts inline.
+        $this->snapshot();
     }
 
     public function count(string $scope, string $generation, string $owner, SmsProspectExportRepository $export): void
@@ -95,7 +126,10 @@ class SmsAvailabilityService
             if (! $lease->get()) throw new RuntimeException('Availability lease could not be renewed.');
             $entry['lease_until'] = now()->getTimestamp() + self::LEASE_SECONDS;
             $entry['started_at'] = now()->toIso8601String();
-            $this->put($cache, $scope, $entry, self::LEASE_SECONDS + 60);
+            // Include every write committed before the query actually starts, not just
+            // those known when this job was queued (possibly hours earlier).
+            $entry['count_revision'] = $entry['revision'];
+            $this->put($cache, $scope, $entry);
         } finally {
             $mutex->release();
         }
@@ -118,6 +152,7 @@ class SmsAvailabilityService
     /** Also called by the worker's failed() callback, including timeout/max-attempt failures. */
     public function fail(string $scope, string $generation, string $owner): void
     {
+        if ($scope !== $this->scope()) return;
         $this->finish($this->cache(), $scope, $generation, $owner, $this->failure(), self::FAILURE_SECONDS);
     }
 
@@ -125,23 +160,36 @@ class SmsAvailabilityService
     {
         $mutex = $cache->getStore()->lock($scope.':state', self::MUTEX_SECONDS);
         if (! $mutex->get()) throw new RuntimeException('Availability state is busy.');
+        $followUp = false;
         try {
             $entry = $cache->get($scope.':snapshot');
             // A cache transport can report an error after committing a terminal snapshot.
             $published = ($entry['generation'] ?? null) === $generation
                 && in_array($entry['response']['state'] ?? null, ['ready', 'failed'], true);
             if ($this->owns($cache, $scope, $entry, $generation, $owner)) {
-                $this->put($cache, $scope, ['generation' => $generation, 'response' => $response], $ttl);
+                // One atomic record: a failed ready publication cannot destroy the
+                // previous successful aggregate or clear a concurrent dirty revision.
+                $entry = [
+                    'generation' => $generation, 'response' => $response,
+                    'revision' => $entry['revision'], 'count_revision' => $entry['count_revision'],
+                    'valid_until' => now()->getTimestamp() + $ttl,
+                    'last_good' => $response['state'] === 'ready' ? $this->aggregate($response) : $this->lastGood($entry),
+                ];
+                $this->put($cache, $scope, $entry);
                 $published = true;
             }
             if ($published) {
                 // Keep ownership on publication failure so fail()/failed() can still publish.
                 // Owned release only: an old delivery cannot release a newer generation's lease.
                 $cache->getStore()->restoreLock($scope.':count', $owner)->release();
+                $followUp = $this->dirty($entry);
             }
         } finally {
             $mutex->release();
         }
+        // A dirty terminal response is never reusable as fresh. Publish the next
+        // pending generation under the mutex, then dispatch only after unlocking.
+        if ($followUp) $this->snapshot();
     }
 
     private function owns(Repository $cache, string $scope, mixed $entry, string $generation, string $owner): bool
@@ -152,11 +200,44 @@ class SmsAvailabilityService
             && $cache->getStore()->restoreLock($scope.':count', $owner)->isOwnedByCurrentProcess();
     }
 
-    private function reusable(mixed $entry, bool $refresh): bool
+    private function reusable(Repository $cache, string $scope, mixed $entry, bool $refresh): bool
     {
         if (! is_array($entry)) return false;
-        if (($entry['response']['state'] ?? null) === 'pending') return ($entry['lease_until'] ?? 0) > now()->getTimestamp();
-        return ! $refresh && in_array($entry['response']['state'] ?? null, ['ready', 'failed'], true);
+        if (($entry['response']['state'] ?? null) === 'pending') {
+            // A pending write may commit and then report failure before dispatch. Its
+            // released lease makes that orphan recoverable without waiting hours.
+            return ($entry['lease_until'] ?? 0) > now()->getTimestamp() && isset($entry['owner'])
+                && $cache->getStore()->restoreLock($scope.':count', $entry['owner'])->isOwnedByCurrentProcess();
+        }
+        return ! $refresh && ! $this->dirty($entry) && ($entry['valid_until'] ?? 0) > now()->getTimestamp()
+            && in_array($entry['response']['state'] ?? null, ['ready', 'failed'], true);
+    }
+
+    private function dirty(array $entry): bool
+    {
+        return ($entry['revision'] ?? 0) !== ($entry['count_revision'] ?? 0);
+    }
+
+    private function response(array $entry): array
+    {
+        return $entry['response']['state'] === 'ready' ? $entry['response'] : $this->withLastGood($entry, $entry['response']);
+    }
+
+    private function withLastGood(mixed $entry, array $response): array
+    {
+        $lastGood = $this->lastGood($entry);
+        return $lastGood === null ? $response : $response + $lastGood + ['stale' => true];
+    }
+
+    private function lastGood(mixed $entry): ?array
+    {
+        return is_array($entry['last_good'] ?? null) ? $this->aggregate($entry['last_good']) : null;
+    }
+
+    /** Copy only the aggregate contract; no source rows or other payload fields. */
+    private function aggregate(array $counts): array
+    {
+        return array_intersect_key($counts, array_flip(['eligible', 'never_texted', 'texted_before', 'counted_at']));
     }
 
     private function pending(): array
@@ -169,9 +250,11 @@ class SmsAvailabilityService
         return ['state' => 'failed', 'message' => self::FAILURE_MESSAGE];
     }
 
-    private function put(Repository $cache, string $scope, array $entry, int $ttl): void
+    private function put(Repository $cache, string $scope, array $entry): void
     {
-        if (! $cache->put($scope.':snapshot', $entry, $ttl)) throw new RuntimeException('Availability cache write failed.');
+        // Freshness/failure cooldown and pending leases expire independently of the
+        // last successful aggregate and dirty revision, which have no cache TTL.
+        if (! $cache->forever($scope.':snapshot', $entry)) throw new RuntimeException('Availability cache write failed.');
     }
 
     protected function cache(): Repository
@@ -189,7 +272,8 @@ class SmsAvailabilityService
     protected function scope(): string
     {
         // A shared cache must not mix databases/environments, including the isolated demo.
-        return 'sms:availability:v1:'.hash('sha256', json_encode([
+        // Older workers use expiring v1 entries and cannot preserve these revisions.
+        return 'sms:availability:v2:'.hash('sha256', json_encode([
             config('app.env'), config('database.connections.sqlsrv.host'),
             config('database.connections.sqlsrv.port'), config('database.connections.sqlsrv.database'),
             (bool) config('sms-exports.demo', false),
