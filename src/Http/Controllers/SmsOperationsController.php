@@ -43,6 +43,7 @@ class SmsOperationsController extends Controller
     public function retryEnrichment(string $requestId): JsonResponse
     {
         $this->ready();
+        if (! config('sms-exports.prospect_enrichment_enabled', false)) throw new HttpException(503, 'Prospect enrichment is not enabled on this CMD server.');
         if (! class_exists(\App\Services\SmsProspectIntakeService::class)) throw new HttpException(503, 'Prospect enrichment transport is not installed.');
         return $this->json(app(\App\Services\SmsProspectIntakeService::class)->retry($requestId), 202);
     }
@@ -74,6 +75,7 @@ class SmsOperationsController extends Controller
         return SmsWorkflowLock::run('maintenance-start', function () use ($requestId): JsonResponse {
             $table = DB::connection('sqlsrv')->table('TblSMSMaintenanceJobs');
             if ((clone $table)->whereIn('Status', ['queued', 'running'])->exists()) throw new HttpException(409, 'A prospect load is already running.');
+            app(SmsExportQueue::class)->assertReady();
             if ((clone $table)->where('Request_ID', $requestId)->where('Status', 'failed')->update(['Status' => 'queued', 'Error' => null, 'Updated_At' => now()->toDateTimeString()]) !== 1) {
                 throw new HttpException(409, 'Only a failed load can be retried.');
             }
