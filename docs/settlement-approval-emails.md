@@ -68,6 +68,52 @@ operators must investigate recurring failures. `--message-id` selects an exact m
 message for a controlled test. `--keep-in-inbox` suppresses mark/archive, but in live mode still
 allows CRM writes and notifications. It is not a substitute for preview.
 
+## Run logs and troubleshooting
+
+Every invocation prints a fresh run ID and a final summary, including failed runs. A skipped
+preview now explains the rule, for example:
+
+```text
+LDR settlement 456: would_skip (current_status=2075 required_status=1194 reason=status_not_1194)
+```
+
+Add Laravel's standard `-v` option for individual steps in the terminal:
+
+```sh
+php artisan settlement-approval:process --dry-run --company=plaw --limit=5 -v
+```
+
+The same structured events are written through Laravel's configured log channel at info, warning,
+or error level, prefixed `settlement_approval.`. With CMD Runner's default single-file channel,
+they are in `storage/logs/laravel.log`; installations using daily, stderr or remote channels should
+use their configured destination. The channel must allow info messages to retain the full trace.
+
+```sh
+grep 'settlement_approval\.' storage/logs/laravel.log | tail -n 100
+grep 'RUN_ID_FROM_OUTPUT' storage/logs/laravel.log
+```
+
+Events include page requests/results, filtered-message reasons, offer status versus required
+status, payment type and target, ledger reuse/review, status verification, note creation,
+notification acceptance, mark-read and Archive results. A provider accepting a notification does
+not prove delivery. Each event carries the run ID, mode and elapsed milliseconds. Message events
+use a hashed `message_ref` plus validated company/settlement ID, so repeated emails for the same
+settlement can be distinguished without printing raw Graph or Internet message IDs.
+
+Summaries count pages, scanned/selected/filtered messages, each processing outcome, errors,
+archives and selected messages kept in Inbox. `scanned` includes a matching message encountered
+just beyond the run limit; `selected` counts only attempted messages. `completed` describes the
+processing result, while `archived` separately confirms mailbox completion. An archive failure can
+therefore report `completed=1 errors=1 archived=0 kept_in_inbox=1`. Empty previews report zero
+selected messages and are not evidence that an approval was exercised.
+
+These events omit email bodies, subjects, creditor/account/contact details, addresses, credentials,
+pagination URLs/tokens, raw provider responses, SQL bindings and exception stack traces. Known
+application validation errors remain readable; unknown exceptions report their type and failed
+step, and HTTP status when available. Failures writing these new events emit one console warning
+and do not interrupt the approval/recovery flow. Preview may write diagnostic logs but still performs no business,
+ledger or mailbox mutations.
+
 ## Deployment configuration (not performed by this change)
 
 1. Publish the dedicated migration using the package's existing opt-in approach:
