@@ -17,7 +17,7 @@ use Illuminate\Support\Facades\Facade;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Psr\Http\Message\RequestInterface;
-use Psr\Log\NullLogger;
+use Psr\Log\AbstractLogger;
 use ReflectionClass;
 use RuntimeException;
 use Symfony\Component\Console\Application;
@@ -34,6 +34,7 @@ final class ApprovalCommandIntegrationTest extends TestCase
     private mixed $previousLive;
     private Container $app;
     private Manager $database;
+    private ApprovalTestLogger $logger;
 
     protected function setUp(): void
     {
@@ -47,7 +48,8 @@ final class ApprovalCommandIntegrationTest extends TestCase
         $this->database->addConnection(['driver' => 'sqlite', 'database' => ':memory:', 'prefix' => '']);
         $this->app->instance('db', $this->database->getDatabaseManager());
         $this->app->instance('db.schema', $this->database->getConnection()->getSchemaBuilder());
-        $this->app->instance('log', new NullLogger());
+        $this->logger = new ApprovalTestLogger();
+        $this->app->instance('log', $this->logger);
         foreach (['db', 'db.schema', 'log'] as $accessor) Facade::clearResolvedInstance($accessor);
         Facade::setFacadeApplication($this->app);
         $migration = require dirname(__DIR__, 3) . '/database/settlement-approval-email-migrations/2026_10_19_000001_create_settlement_approval_email_jobs.php';
@@ -109,6 +111,20 @@ final class ApprovalCommandIntegrationTest extends TestCase
         self::assertSame(['destinationId' => 'archive'], $transport->archivePayload);
         self::assertSame(['isRead' => true], $transport->readPayload);
         self::assertSame(['fake-forth-' . $company], array_values(array_unique($transport->forthKeys)));
+        $events = array_column($this->logger->records, 'message');
+        $expectedSteps = [
+            'status_update_started', 'status_verified', 'note_create_started', 'note_created',
+            'notification_send_started', 'notification_accepted', 'message_marked_read', 'message_archived',
+        ];
+        $positions = array_map(fn ($step) => array_search('settlement_approval.' . $step, $events, true), $expectedSteps);
+        self::assertNotContains(false, $positions);
+        $sorted = $positions;
+        sort($sorted);
+        self::assertSame($sorted, $positions, 'The audit sequence must match the actual effect order.');
+        $summary = $this->logger->last('run_finished')['context'];
+        self::assertSame(1, $summary['counts']['completed']);
+        self::assertSame(1, $summary['counts']['archived']);
+        self::assertSame(0, $summary['counts']['errors']);
     }
 
     #[DataProvider('approvalBranches')]
@@ -137,8 +153,14 @@ final class ApprovalCommandIntegrationTest extends TestCase
 
         self::assertSame(0, $exit, $output);
         self::assertStringContainsString('would_skip', $output);
+        self::assertStringContainsString('current_status=2075 required_status=1194 reason=status_not_1194', $output);
         self::assertSame([], $transport->effects);
         self::assertSame(0, $this->database->getConnection()->table(DatabaseApprovalLedger::TABLE)->count());
+        $decision = $this->logger->last('approval_decision')['context'];
+        self::assertSame(2075, $decision['current_status']);
+        self::assertSame(1194, $decision['required_status']);
+        self::assertSame('status_not_1194', $decision['reason']);
+        self::assertSame(1, $this->logger->last('run_finished')['context']['counts']['would_skip']);
     }
 
     public function test_plaw_preview_reaches_the_next_page_after_fifty_ldr_messages(): void
@@ -148,7 +170,7 @@ final class ApprovalCommandIntegrationTest extends TestCase
         $transport->approvalNextLink = "https://graph.microsoft.com/v1.0/users/automation@libertydebtrelief.com/mailFolders('inbox')/messages"
             . '?%24select=id%2CinternetMessageId%2Csubject%2Csender%2Cfrom&%24top=50&%24filter=startswith%28subject%2C%27Settlement%20Approval%20Data%3A%27%29&%24skip=50';
         [$command, $sql] = $this->command($transport);
-        [$exit, $output] = $this->dispatch($command, 'PLAW', live: false, limit: 5);
+        [$exit, $output] = $this->dispatch($command, 'PLAW', live: false, limit: 5, verbose: true);
 
         self::assertSame(0, $exit, $output);
         self::assertStringContainsString('PLAW settlement 456: would_approve -> Accepted', $output);
@@ -159,6 +181,18 @@ final class ApprovalCommandIntegrationTest extends TestCase
         self::assertSame([], $transport->effects);
         self::assertSame([], $sql->queries);
         self::assertSame(0, $this->database->getConnection()->table(DatabaseApprovalLedger::TABLE)->count());
+        self::assertStringContainsString('[settlement-approval] inbox_page_received', $output);
+        self::assertStringContainsString('"payment_type":132', $output);
+        self::assertStringContainsString('Summary: pages=2 scanned=51 selected=1 filtered=50', $output);
+        $summary = $this->logger->last('run_finished')['context'];
+        self::assertSame(2, $summary['counts']['pages']);
+        self::assertSame(50, $summary['counts']['filtered']);
+        self::assertSame(1, $summary['counts']['kept_in_inbox']);
+        foreach (['original-message', 'Bank <script>', 'Last 4 Account Number', 'LLG-123', 'fixture-secret', '%24skip=50'] as $privateValue) {
+            self::assertStringNotContainsString($privateValue, $output);
+            self::assertStringNotContainsString($privateValue, json_encode($this->logger->records));
+        }
+        self::assertCount(1, array_unique(array_column(array_column($this->logger->records, 'context'), 'run_id')));
     }
 
     public function test_archive_failure_then_duplicate_message_does_not_repeat_any_crm_or_mail_effect(): void
@@ -170,6 +204,10 @@ final class ApprovalCommandIntegrationTest extends TestCase
         self::assertSame(1, $exit, $output);
         self::assertFalse($transport->archived);
         $this->assertCompletedLedger('LDR');
+        $failure = $this->logger->last('message_failed')['context'];
+        self::assertSame('message_archive_started', $failure['stage']);
+        self::assertSame(503, $failure['http_status']);
+        self::assertSame(1, $this->logger->last('run_finished')['context']['counts']['errors']);
         $forthReads = count($transport->forthKeys);
 
         [$exit, $output] = $this->dispatch($command, 'LDR');
@@ -185,6 +223,79 @@ final class ApprovalCommandIntegrationTest extends TestCase
         self::assertSame($forthReads, count($transport->forthKeys), 'Completed jobs must not call Forth again.');
         self::assertSame(['status', 'note', 'notification', 'read', 'archive_failed', 'read', 'archive', 'read', 'archive'], $transport->effects);
         self::assertSame(1, $this->database->getConnection()->table(DatabaseApprovalLedger::TABLE)->count());
+        self::assertSame('previously_processed', $this->logger->last('ledger_terminal')['context']['reason']);
+        $runs = array_filter($this->logger->records, fn ($record) => $record['message'] === 'settlement_approval.run_started');
+        self::assertCount(3, array_unique(array_column(array_column($runs, 'context'), 'run_id')));
+    }
+
+    public function test_pagination_error_has_a_summary_without_exposing_the_next_link(): void
+    {
+        $transport = new ApprovalIntegrationTransport('PLAW', 132);
+        $transport->approvalNextLink = 'https://untrusted.example/inbox?token=private-cursor';
+        [$command] = $this->command($transport);
+        [$exit, $output] = $this->dispatch($command, 'PLAW', live: false, verbose: true);
+
+        self::assertSame(1, $exit);
+        self::assertStringContainsString('Unexpected Graph approval pagination URL.', $output);
+        self::assertStringContainsString('stage=inbox_page_requested', $output);
+        self::assertStringNotContainsString('private-cursor', $output);
+        self::assertStringNotContainsString('untrusted.example', json_encode($this->logger->records));
+        $summary = $this->logger->last('run_finished')['context'];
+        self::assertSame('error', $summary['stop_reason']);
+        self::assertSame(1, $summary['counts']['pages']);
+        self::assertSame(50, $summary['counts']['scanned']);
+        self::assertSame(0, $summary['counts']['selected']);
+        self::assertSame(1, $summary['counts']['errors']);
+        self::assertSame([], $transport->effects);
+    }
+
+    public function test_verbose_http_failure_redacts_provider_details_and_identifies_the_message(): void
+    {
+        $transport = new ApprovalIntegrationTransport('LDR', 15);
+        $transport->failArchiveOnce = true;
+        [$command] = $this->command($transport);
+        [$exit, $output] = $this->dispatch($command, 'LDR', verbose: true);
+
+        self::assertSame(1, $exit);
+        $failure = $this->logger->last('message_failed')['context'];
+        self::assertSame('message_archive_started', $failure['stage']);
+        self::assertSame('456', $failure['settlement_id']);
+        self::assertSame(substr(hash('sha256', 'original-message'), 0, 16), $failure['message_ref']);
+        self::assertSame(503, $failure['http_status']);
+        foreach (['private-provider-details', 'original-message', 'fixture-token', 'fixture-secret', 'Bank <script>', 'LLG-123'] as $value) {
+            self::assertStringNotContainsString($value, $output);
+            self::assertStringNotContainsString($value, json_encode($this->logger->records));
+        }
+        self::assertSame(1, $this->logger->last('run_finished')['context']['counts']['kept_in_inbox']);
+    }
+
+    public function test_approval_log_sink_failure_does_not_interrupt_or_duplicate_live_effects(): void
+    {
+        $this->logger->fail = true;
+        $transport = new ApprovalIntegrationTransport('LDR', 15);
+        [$command] = $this->command($transport);
+        [$exit, $output] = $this->dispatch($command, 'LDR', verbose: true);
+
+        self::assertSame(0, $exit, $output);
+        self::assertSame(['status', 'note', 'notification', 'read', 'archive'], $transport->effects);
+        $this->assertCompletedLedger('LDR');
+        self::assertSame(1, substr_count($output, 'Settlement approval logging unavailable'));
+        self::assertStringContainsString('[settlement-approval] run_finished', $output);
+        self::assertStringNotContainsString('private-logger-details', $output);
+    }
+
+    public function test_empty_preview_has_zero_counts_and_no_offer_reads(): void
+    {
+        $transport = new ApprovalIntegrationTransport('PLAW', 15);
+        $transport->archived = true;
+        [$command] = $this->command($transport);
+        [$exit, $output] = $this->dispatch($command, 'PLAW', live: false);
+
+        self::assertSame(0, $exit);
+        self::assertStringContainsString('Summary: pages=1 scanned=0 selected=0', $output);
+        self::assertSame([], $transport->forthKeys);
+        self::assertSame([], $transport->effects);
+        self::assertSame('exhausted', $this->logger->last('run_finished')['context']['stop_reason']);
     }
 
     public function test_failed_notification_keeps_message_and_uncertain_send_is_not_replayed(): void
@@ -270,12 +381,12 @@ final class ApprovalCommandIntegrationTest extends TestCase
         return [$command, $sql];
     }
 
-    private function dispatch(ProcessSettlementApprovalEmails $command, string $company, bool $live = true, int $limit = 100): array
+    private function dispatch(ProcessSettlementApprovalEmails $command, string $company, bool $live = true, int $limit = 100, bool $verbose = false): array
     {
         $console = new Application();
         $console->setAutoExit(false);
         $console->add($command);
-        $output = new BufferedOutput();
+        $output = new BufferedOutput($verbose ? BufferedOutput::VERBOSITY_VERBOSE : BufferedOutput::VERBOSITY_NORMAL);
         $exit = $console->run(new ArrayInput(['command' => 'settlement-approval:process', $live ? '--live' : '--dry-run' => true, '--company' => strtolower($company), '--limit' => $limit]), $output);
         return [$exit, $output->fetch()];
     }
@@ -372,7 +483,7 @@ final class ApprovalIntegrationTransport
                 if ($this->failArchiveOnce) {
                     $this->failArchiveOnce = false;
                     $this->effects[] = 'archive_failed';
-                    return $this->json(['error' => ['code' => 'ServiceUnavailable']], 503);
+                    return $this->json(['error' => ['code' => 'ServiceUnavailable', 'message' => 'private-provider-details']], 503);
                 }
                 $this->effects[] = 'archive';
                 $this->archived = true;
@@ -401,5 +512,28 @@ final class ApprovalIntegrationTransport
     private function json(array $data, int $status = 200): Response
     {
         return new Response($status, ['Content-Type' => 'application/json'], json_encode($data, JSON_THROW_ON_ERROR));
+    }
+}
+
+final class ApprovalTestLogger extends AbstractLogger
+{
+    public array $records = [];
+    public bool $fail = false;
+
+    public function log($level, string|\Stringable $message, array $context = []): void
+    {
+        // Fault only the new tracing writes; the shared email sender has independent existing logs.
+        if ($this->fail && str_starts_with((string) $message, 'settlement_approval.')) {
+            throw new RuntimeException('private-logger-details');
+        }
+        $this->records[] = ['level' => $level, 'message' => (string) $message, 'context' => $context];
+    }
+
+    public function last(string $event): array
+    {
+        foreach (array_reverse($this->records) as $record) {
+            if ($record['message'] === 'settlement_approval.' . $event) return $record;
+        }
+        throw new RuntimeException('Expected log event missing: ' . $event);
     }
 }

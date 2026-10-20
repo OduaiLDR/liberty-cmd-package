@@ -27,12 +27,14 @@ final class ProcessSettlementApprovalEmailsTest extends TestCase
         $this->previousLive = Env::getRepository()->get('SETTLEMENT_APPROVAL_EMAIL_LIVE_ENABLED');
         Env::getRepository()->set('SETTLEMENT_APPROVAL_EMAIL_LIVE_ENABLED', 'false');
         $app = new Container();
+        $app->instance('log', new \Psr\Log\NullLogger());
         $app->instance('db', new class {
             public function connection() { return $this; }
             public function getSchemaBuilder() { return $this; }
             public function hasTable($name) { return true; }
         });
         Facade::clearResolvedInstance('db');
+        Facade::clearResolvedInstance('log');
         Facade::setFacadeApplication($app);
     }
 
@@ -41,6 +43,7 @@ final class ProcessSettlementApprovalEmailsTest extends TestCase
         if ($this->previousLive === null) Env::getRepository()->clear('SETTLEMENT_APPROVAL_EMAIL_LIVE_ENABLED');
         else Env::getRepository()->set('SETTLEMENT_APPROVAL_EMAIL_LIVE_ENABLED', $this->previousLive);
         Facade::clearResolvedInstance('db');
+        Facade::clearResolvedInstance('log');
         Facade::setFacadeApplication($this->previousApp);
     }
 
@@ -154,6 +157,23 @@ final class ProcessSettlementApprovalEmailsTest extends TestCase
         self::assertSame(1, $command->handle());
     }
 
+    public function test_run_limit_summary_counts_only_attempted_messages(): void
+    {
+        $command = $this->command([['messages' => [
+            $this->message('first'), $this->message('second'), $this->message('third'),
+        ], 'next' => null]]);
+        $command->options['limit'] = 2;
+        $output = new BufferedOutput();
+        $command->setOutput(new OutputStyle(new ArrayInput([]), $output));
+
+        self::assertSame(0, $command->handle());
+        self::assertSame(['first', 'second'], $command->mail->fetched);
+        $text = $output->fetch();
+        self::assertStringContainsString('Summary: pages=1 scanned=3 selected=2 filtered=0 would_approve=2', $text);
+        self::assertStringContainsString('kept_in_inbox=2 stop=limit exit_code=0', $text);
+        self::assertSame([], $command->mail->writes);
+    }
+
     public function test_real_offline_preview_needs_no_mailbox_database_or_credentials(): void
     {
         $bodyFile = tempnam(sys_get_temp_dir(), 'approval-body-');
@@ -195,11 +215,14 @@ final class ProcessSettlementApprovalEmailsTest extends TestCase
             $input = new ArrayInput([
                 'command' => 'settlement-approval:process', '--dry-run' => true,
                 '--file' => $bodyFile, '--offer-file' => $offerFile,
-                '--sender' => 'no-reply@progresslaw.com', '--company' => 'plaw',
+                '--sender' => 'no-reply@progresslaw.com', '--company' => 'plaw', '--verbose' => true,
             ]);
             $output = new BufferedOutput();
             self::assertSame(0, $app->run($input, $output));
-            self::assertStringContainsString('PLAW settlement 456: would_approve -> Accepted', $output->fetch());
+            $text = $output->fetch();
+            self::assertStringContainsString('PLAW settlement 456: would_approve -> Accepted', $text);
+            self::assertStringContainsString('[settlement-approval] offer_checked', $text);
+            self::assertStringContainsString('"payment_type":15', $text);
         } finally {
             unlink($bodyFile); unlink($offerFile);
         }
