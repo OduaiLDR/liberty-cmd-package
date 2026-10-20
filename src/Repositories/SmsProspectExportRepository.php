@@ -3,6 +3,7 @@
 namespace Cmd\Reports\Repositories;
 
 use Carbon\Carbon;
+use Cmd\Reports\Services\SmsProspectValues;
 use Illuminate\Validation\ValidationException;
 use RuntimeException;
 
@@ -19,7 +20,7 @@ use RuntimeException;
  */
 class SmsProspectExportRepository extends SqlSrvRepository
 {
-    /** A phone on this many different addresses is a business or junk number: never sent. */
+    /** Suppress phones shared by this many addresses (Jacob's shared-number rule). */
     public const SHARED_PHONE_ADDRESSES = 3;
 
     public const CSV_HEADER = ['First name', 'address', 'debt load', 'phone1', 'phone2', 'phone3', 'phone4', 'phone5', 'send date'];
@@ -62,10 +63,10 @@ WITH Contacts AS (
     WHERE Phone IS NOT NULL
     GROUP BY {$phone}
 )
-UPDATE p SET Contacted = 1, Response_Date = COALESCE(p.Response_Date, c.Created_Date)
+UPDATE p SET Contacted = 1, Response_Date = CASE WHEN p.Response_Date IS NULL OR c.Created_Date < p.Response_Date THEN c.Created_Date ELSE p.Response_Date END
 FROM TblProspects p
 JOIN Contacts c ON c.Phone = p.Phone
-WHERE p.Contacted = 0 AND p.Phone IS NOT NULL
+WHERE (p.Contacted = 0 OR p.Response_Date IS NULL OR c.Created_Date < p.Response_Date) AND p.Phone IS NOT NULL
 {$hashJoins}
 SQL);
     }
@@ -85,8 +86,8 @@ SQL);
             $hashJoins = self::HASH_JOINS;
             $selected = $this->connection()->affectingStatement($this->eligibleSql().<<<SQL
 
-INSERT INTO TblProspectsExport (Request_ID, Prospect_PK, Phone, Debt_Tier)
-SELECT TOP (?) ?, PK, Phone, Tier
+INSERT INTO TblProspectsExport (Request_ID, Prospect_PK, Phone, Debt_Tier, Client, Address, City, State, Zip, Email)
+SELECT TOP (?) ?, PK, Phone, Tier, Client, Address, City, State, Zip, Email
 FROM Eligible
 WHERE Phone_Rank = 1
 ORDER BY {$priority}
@@ -136,13 +137,25 @@ SharedPhones AS (
     GROUP BY Phone
     HAVING COUNT(DISTINCT CONCAT(Address, '|', Zip)) >= ?
 ),
+PhoneHistory AS (
+    SELECT Phone, MAX(Send_Date) AS Sent FROM TblSMSLegacySends GROUP BY Phone
+),
+Prospects AS (
+    SELECT p.PK, p.Phone, p.Tier, p.Creation_Date, p.Client, p.Address, p.City, p.State, p.Zip, p.Email,
+        p.Contacted, p.Invalid_Phone, p.Opt_Out,
+        CASE WHEN h.Sent IS NOT NULL AND (p.Latest_Export_Date IS NULL OR h.Sent > p.Latest_Export_Date)
+            THEN h.Sent ELSE p.Latest_Export_Date END AS Latest_Export_Date
+    FROM TblProspects p LEFT JOIN PhoneHistory h ON h.Phone = p.Phone
+),
 Eligible AS (
     SELECT p.PK, p.Phone, p.Tier, p.Latest_Export_Date, p.Creation_Date,
+        p.Client, p.Address, p.City, p.State, p.Zip, p.Email,
         ROW_NUMBER() OVER (PARTITION BY p.Phone ORDER BY {$priority}) AS Phone_Rank
-    FROM TblProspects p
-    WHERE p.Phone IS NOT NULL AND LEN(p.Phone) = 10
+    FROM Prospects p
+    WHERE p.Phone IS NOT NULL AND LEN(p.Phone) = 10 AND p.Phone NOT LIKE '%[^0-9]%'
       AND p.Contacted = 0 AND p.Invalid_Phone = 0 AND p.Opt_Out = 0
       AND NOT EXISTS (SELECT 1 FROM Contacts c WHERE c.Phone = p.Phone)
+      AND NOT EXISTS (SELECT 1 FROM TblSMSSuppressions s WHERE s.Phone = p.Phone AND (s.Opt_Out = 1 OR s.Invalid_Phone = 1))
       AND NOT EXISTS (SELECT 1 FROM SharedPhones s WHERE s.Phone = p.Phone)
       AND NOT EXISTS (SELECT 1 FROM TblProspectsExport x WHERE x.Prospect_PK = p.PK)
       AND NOT EXISTS (SELECT 1 FROM TblProspectsExport x WHERE x.Phone = p.Phone)
@@ -160,13 +173,13 @@ SQL;
      * @param array<string, float|int|string> $tierDebts Debt_Tier => default debt
      * @return array{TblTUData:int, TblMailers:int, Tier:int, None:int}
      */
-    public function lookupDebts(string $requestId, array $tierDebts = []): array
+    public function lookupDebts(string $requestId, array $tierDebts = [], ?callable $progress = null): array
     {
-        return $this->withQueryTimeout(self::STEP_QUERY_TIMEOUT, fn (): array => $this->lookupDebtsNow($requestId, $tierDebts));
+        return $this->withQueryTimeout(self::STEP_QUERY_TIMEOUT, fn (): array => $this->lookupDebtsNow($requestId, $tierDebts, $progress));
     }
 
     /** @return array{TblTUData:int, TblMailers:int, Tier:int, None:int} */
-    private function lookupDebtsNow(string $requestId, array $tierDebts): array
+    private function lookupDebtsNow(string $requestId, array $tierDebts, ?callable $progress): array
     {
         $this->assertOpenRun($requestId);
         $db = $this->connection();
@@ -176,7 +189,8 @@ SQL;
         $hashJoins = self::HASH_JOINS;
         $tu = $db->update(<<<SQL
 WITH Wanted AS (
-    SELECT x.PK AS Export_PK, p.Address, p.Zip, p.Client
+    SELECT x.PK AS Export_PK, COALESCE(x.Address, p.Address) AS Address,
+        COALESCE(x.Zip, p.Zip) AS Zip, COALESCE(x.Client, p.Client) AS Client
     FROM TblProspectsExport x
     JOIN TblProspects p ON p.PK = x.Prospect_PK
     WHERE x.Request_ID = ? AND x.Debt_Source IS NULL
@@ -187,8 +201,8 @@ Matches AS (
     FROM Wanted w
     JOIN TblTUData t ON t.ncoaAddr_addrLine1Txt = w.Address AND LEFT(t.ncoaAddr_zipCde, 5) = w.Zip
     WHERE t.ncoaAddr_frstNme <> '' AND t.ncoaAddr_lastNme <> ''
-      AND w.Client LIKE t.ncoaAddr_frstNme + ' %'
-      AND w.Client LIKE '% ' + t.ncoaAddr_lastNme
+      AND LEFT(w.Client, LEN(t.ncoaAddr_frstNme) + 1) = t.ncoaAddr_frstNme + ' '
+      AND RIGHT(w.Client, LEN(t.ncoaAddr_lastNme) + 1) = ' ' + t.ncoaAddr_lastNme
       AND t.derivedFields1_unsecdebtbalance > 0
 )
 UPDATE x SET Debt_Amount = m.Debt, Debt_Source = 'TblTUData', Debt_Source_PK = m.PK,
@@ -197,6 +211,7 @@ FROM TblProspectsExport x
 JOIN Matches m ON m.Export_PK = x.PK AND m.Match_Rank = 1
 {$hashJoins}
 SQL, [$requestId]);
+        $progress && $progress('mailers');
 
         // One indexed search per person: TblMailers (107M rows) has an index on (Client, Zip).
         // It keeps Client and Address at 50 characters.
@@ -208,12 +223,18 @@ JOIN TblProspects p ON p.PK = x.Prospect_PK
 CROSS APPLY (
     SELECT TOP 1 m.PK, m.Debt_Amount, m.Debt_Tier
     FROM TblMailers m
-    WHERE m.Client = LEFT(p.Client, 50) AND m.Address = LEFT(p.Address, 50)
-      AND LEFT(m.Zip, 5) = p.Zip AND m.Debt_Amount > 0
+    WHERE m.Client = COALESCE(x.Client, p.Client) AND m.Address = COALESCE(x.Address, p.Address)
+      AND LEFT(m.Zip, 5) = COALESCE(x.Zip, p.Zip) AND m.Debt_Amount > 0
     ORDER BY m.PK DESC
 ) m
 WHERE x.Request_ID = ? AND x.Debt_Source IS NULL
 SQL, [$requestId]);
+
+        $progress && $progress('tiers');
+        // TU calls these Tier1..Tier9. Canonicalize before fallback and grouping, not after
+        // creating drops (otherwise one run incorrectly gets 18 drops instead of nine).
+        $tierSql = SmsProspectValues::tierSql('Debt_Tier');
+        $db->update("UPDATE TblProspectsExport SET Debt_Tier = {$tierSql} WHERE Request_ID = ?", [$requestId]);
 
         $fromTier = 0;
         foreach ($tierDebts as $tier => $debt) {
@@ -254,7 +275,7 @@ SQL, [$requestId]);
             foreach ($tiers as $tier) {
                 $name = 'SMS'.str_pad((string) $next++, 4, '0', STR_PAD_LEFT);
                 $pk = $db->table('TblSMSDrops')->insertGetId([
-                    'Drop_Name' => $name, 'Debt_Tier' => $tier->Debt_Tier, 'Drop_Date' => $dropDate->toDateString(),
+                'Drop_Name' => $name, 'Debt_Tier' => $tier->Debt_Tier, 'Drop_Date' => $dropDate->toDateString(), 'Request_ID' => $requestId,
                     'Amount_Dropped' => (int) $tier->Records, 'Created_At' => $now,
                 ]);
                 $rows = $db->table('TblProspectsExport')->where('Request_ID', $requestId);
@@ -278,6 +299,23 @@ SQL, [$requestId]);
         if ($this->table('TblProspectsExport')->where('Request_ID', $requestId)->whereNull('SMS_Drop_PK')->exists()) {
             throw new RuntimeException('Assign the SMS drops before writing the file.');
         }
+        // Feedback/contact synchronization may have changed since review. Do not silently
+        // ship a stale file or change the reviewed count; ask for a fresh selection instead.
+        $blocked = $this->connection()->selectOne(<<<'SQL'
+WITH Contacts AS (
+    SELECT CASE WHEN LEN(Phone) = 11 AND LEFT(Phone, 1) = '1' THEN SUBSTRING(Phone, 2, 10) ELSE Phone END AS Phone
+    FROM TblPhoneNumbers GROUP BY CASE WHEN LEN(Phone) = 11 AND LEFT(Phone, 1) = '1' THEN SUBSTRING(Phone, 2, 10) ELSE Phone END
+)
+SELECT COUNT(*) AS n FROM TblProspectsExport x
+JOIN TblProspects p ON p.PK = x.Prospect_PK
+LEFT JOIN Contacts c ON c.Phone = x.Phone
+LEFT JOIN TblSMSSuppressions s ON s.Phone = x.Phone
+WHERE x.Request_ID = ? AND (p.Contacted = 1 OR p.Invalid_Phone = 1 OR p.Opt_Out = 1
+    OR x.Debt_Amount IS NULL OR x.Debt_Amount <= 0
+    OR s.Opt_Out = 1 OR s.Invalid_Phone = 1 OR c.Phone IS NOT NULL)
+OPTION (HASH JOIN)
+SQL, [$requestId]);
+        if ((int) $blocked->n > 0) throw new RuntimeException('The reviewed list now contains a contact, suppressed phone or missing debt. Discard it and choose a fresh list.');
         $out = fopen($path, 'wb');
         if ($out === false) throw new RuntimeException('Unable to open the SMS export file.');
         $count = 0;
@@ -288,7 +326,7 @@ SQL, [$requestId]);
                 ->join('TblSMSDrops as d', 'd.PK', '=', 'x.SMS_Drop_PK')
                 ->where('x.Request_ID', $requestId)
                 ->orderBy('d.Drop_Name')->orderBy('x.PK')
-                ->select(['x.Phone', 'x.Debt_Amount', 'p.Client', 'p.Address', 'd.Drop_Date'])
+                ->selectRaw('x.Phone, x.Debt_Amount, COALESCE(x.Client, p.Client) AS Client, COALESCE(x.Address, p.Address) AS Address, d.Drop_Date')
                 ->cursor();
             foreach ($rows as $row) {
                 $this->writeCsvRow($out, [
@@ -323,23 +361,67 @@ SQL, [$requestId]);
         $hashJoins = self::HASH_JOINS;
 
         return $this->withQueryTimeout(self::STEP_QUERY_TIMEOUT, fn (): int => $db->transaction(function () use ($db, $requestId, $sentAt, $hashJoins): int {
+            // Record the exact old values in the SAME update/transaction as the increment.
+            // A legacy send without this audit must never be automatically reversed.
             $db->update(<<<SQL
 UPDATE p SET SMS_Attempts = p.SMS_Attempts + 1, Latest_Export_Date = ?
+OUTPUT ?, deleted.PK, deleted.Latest_Export_Date, deleted.SMS_Attempts, inserted.Latest_Export_Date, inserted.SMS_Attempts
+INTO TblSMSAttemptAudit (Request_ID, Prospect_PK, Previous_Date, Previous_Attempts, Recorded_Date, Recorded_Attempts)
 FROM TblProspects p
 WHERE EXISTS (SELECT 1 FROM TblProspectsExport x WHERE x.Request_ID = ? AND x.Phone = p.Phone)
 {$hashJoins}
-SQL, [$sentAt->copy()->setTimezone(self::TIMEZONE)->toDateString(), $requestId]);
+SQL, [$sentAt->copy()->setTimezone(self::TIMEZONE)->toDateString(), $requestId, $requestId]);
+
+            $db->insert(<<<'SQL'
+INSERT INTO TblSMSLegacySends (Phone, Send_Date, Request_ID)
+SELECT x.Phone, ?, ? FROM TblProspectsExport x
+WHERE x.Request_ID = ? AND NOT EXISTS (SELECT 1 FROM TblSMSLegacySends s WHERE s.Phone = x.Phone AND s.Send_Date = ?)
+SQL, [$sentAt->copy()->setTimezone(self::TIMEZONE)->toDateString(), $requestId, $requestId, $sentAt->copy()->setTimezone(self::TIMEZONE)->toDateString()]);
 
             $moved = $db->affectingStatement(<<<'SQL'
 INSERT INTO TblSMSHistory (Request_ID, SMS_Drop_PK, Drop_Name, Prospect_PK, Phone, Export_Date,
-    Debt_Amount, Debt_Tier, Debt_Source, Debt_Source_PK)
-SELECT Request_ID, SMS_Drop_PK, Drop_Name, Prospect_PK, Phone, ?, Debt_Amount, Debt_Tier, Debt_Source, Debt_Source_PK
+    Debt_Amount, Debt_Tier, Debt_Source, Debt_Source_PK, Client, Address, City, State, Zip, Email)
+SELECT Request_ID, SMS_Drop_PK, Drop_Name, Prospect_PK, Phone, ?, Debt_Amount, Debt_Tier, Debt_Source, Debt_Source_PK, Client, Address, City, State, Zip, Email
 FROM TblProspectsExport
 WHERE Request_ID = ?
 SQL, [$sentAt->toDateTimeString(), $requestId]);
             $db->table('TblProspectsExport')->where('Request_ID', $requestId)->delete();
 
             return $moved;
+        }));
+    }
+
+    /** Keep the review file/drops, release its people, and do NOT record any send. */
+    public function releaseReview(string $requestId): int
+    {
+        if ($this->hasRows('TblSMSHistory', $requestId)) {
+            throw ValidationException::withMessages(['request_id' => 'This run already has send history. It needs a send correction, not review-only.']);
+        }
+        return $this->table('TblProspectsExport')->where('Request_ID', $requestId)->delete();
+    }
+
+    /** Reversal is allowed only with complete, unchanged before-values, never a guessed date. */
+    public function reverseSent(string $requestId): int
+    {
+        return $this->withQueryTimeout(self::STEP_QUERY_TIMEOUT, fn (): int => $this->connection()->transaction(function () use ($requestId): int {
+            $db = $this->connection();
+            $audit = $db->table('TblSMSAttemptAudit')->where('Request_ID', $requestId);
+            if (! $audit->exists()) throw ValidationException::withMessages(['request_id' => 'This older send has no before-values. Restore-point reconciliation is required; no dates or counts were changed.']);
+            $changed = $db->selectOne(<<<'SQL'
+SELECT COUNT(*) AS n FROM TblSMSAttemptAudit a
+LEFT JOIN TblProspects p WITH (UPDLOCK, HOLDLOCK) ON p.PK = a.Prospect_PK
+WHERE a.Request_ID = ? AND (p.PK IS NULL OR p.SMS_Attempts <> a.Recorded_Attempts
+    OR p.Latest_Export_Date IS NULL OR p.Latest_Export_Date <> a.Recorded_Date)
+SQL, [$requestId]);
+            if ((int) $changed->n > 0) throw ValidationException::withMessages(['request_id' => 'Prospect send history changed after this run. Reconcile it before correcting the send. Nothing was changed.']);
+            // Keep TblSMSHistory and the audit as evidence; only Status=sent counts in reporting.
+            $restored = $db->update(<<<'SQL'
+UPDATE p SET SMS_Attempts = a.Previous_Attempts, Latest_Export_Date = a.Previous_Date
+FROM TblProspects p JOIN TblSMSAttemptAudit a ON a.Prospect_PK = p.PK
+WHERE a.Request_ID = ?
+SQL, [$requestId]);
+            $db->table('TblSMSLegacySends')->where('Request_ID', $requestId)->delete();
+            return $restored;
         }));
     }
 
@@ -367,7 +449,9 @@ SQL, [$sentAt->toDateTimeString(), $requestId]);
         $table = $this->hasRows('TblProspectsExport', $requestId) ? 'TblProspectsExport' : 'TblSMSHistory';
 
         return $this->table('TblSMSDrops', 'd')
-            ->whereIn('d.PK', $this->table($table)->where('Request_ID', $requestId)->whereNotNull('SMS_Drop_PK')->select('SMS_Drop_PK'))
+            ->where(function ($q) use ($table, $requestId): void {
+                $q->where('d.Request_ID', $requestId)->orWhereIn('d.PK', $this->table($table)->where('Request_ID', $requestId)->whereNotNull('SMS_Drop_PK')->select('SMS_Drop_PK'));
+            })
             ->orderBy('d.Drop_Name')->get(['d.PK', 'd.Drop_Name', 'd.Debt_Tier', 'd.Amount_Dropped'])
             ->map(fn ($d) => ['PK' => (int) $d->PK, 'Drop_Name' => (string) $d->Drop_Name, 'Debt_Tier' => $d->Debt_Tier, 'Amount_Dropped' => (int) $d->Amount_Dropped])
             ->all();

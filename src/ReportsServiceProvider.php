@@ -106,6 +106,9 @@ class ReportsServiceProvider extends ServiceProvider
     public function boot()
     {
         $this->mergeConfigFrom(__DIR__ . '/../config/sms-exports.php', 'sms-exports');
+        // Fail before routes, commands, or queue workers can touch any data if demo
+        // simulation was accidentally enabled against a real connection.
+        \Cmd\Reports\Services\SmsDemoGuard::enabled();
         $this->loadRoutesFrom(__DIR__ . '/../routes/web.php');
         $this->loadRoutesFrom(__DIR__ . '/../routes/pmod.php');
         $this->loadRoutesFrom(__DIR__ . '/../routes/sms-api.php');
@@ -117,6 +120,8 @@ class ReportsServiceProvider extends ServiceProvider
             __DIR__ . '/../database/sms-migrations/2026_10_07_000001_add_sms_export_requests.php' => database_path('migrations/2026_10_07_000001_add_sms_export_requests.php'),
             __DIR__ . '/../database/sms-migrations/2026_10_07_000002_add_sms_selection_requests.php' => database_path('migrations/2026_10_07_000002_add_sms_selection_requests.php'),
             __DIR__ . '/../database/sms-migrations/2026_10_12_000001_create_sms_prospects_tables.php' => database_path('migrations/2026_10_12_000001_create_sms_prospects_tables.php'),
+            __DIR__ . '/../database/sms-migrations/2026_10_19_000001_complete_sms_workflow.php' => database_path('migrations/2026_10_19_000001_complete_sms_workflow.php'),
+            __DIR__ . '/../database/sms-migrations/2026_10_19_000002_create_sms_enrichment_tables.php' => database_path('migrations/2026_10_19_000002_create_sms_enrichment_tables.php'),
         ], 'reports-sms-migrations');
         // PMOD migrations ship with the package but are NOT auto-loaded.
         // Consumers must explicitly opt in by publishing them:
@@ -220,6 +225,7 @@ class ReportsServiceProvider extends ServiceProvider
                 ProcessAgentTrainingCompletions::class,
                 SyncPhoneNumbers::class,
                 LoadSmsProspects::class,
+                \Cmd\Reports\Console\Commands\SmsReadinessCommand::class,
                 SyncCalls::class,
                 SyncNegotiatorPayrollData::class,
                 RefreshForthApiTokens::class,

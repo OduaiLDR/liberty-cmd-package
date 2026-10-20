@@ -4,6 +4,7 @@ namespace Cmd\Reports\Console\Commands;
 
 use Cmd\Reports\Repositories\SmsProspectExportRepository;
 use Cmd\Reports\Services\DBConnector;
+use Cmd\Reports\Services\SmsWorkflowLock;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -24,6 +25,17 @@ class SyncPhoneNumbers extends Command
     protected bool $withCreatedDate = false;
 
     public function handle(): int
+    {
+        if ($this->option('dry-run')) return $this->syncNow();
+        try {
+            return SmsWorkflowLock::run('contact-sync', fn (): int => $this->syncNow());
+        } catch (\Symfony\Component\HttpKernel\Exception\HttpException $error) {
+            $this->warn($error->getMessage());
+            return Command::FAILURE;
+        }
+    }
+
+    protected function syncNow(): int
     {
         $this->info('[INFO] SyncPhoneNumbers: starting.');
         Log::info('SyncPhoneNumbers command started.', ['source' => self::SOURCE]);
