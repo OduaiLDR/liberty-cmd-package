@@ -5,6 +5,7 @@ namespace Cmd\Reports;
 use Illuminate\Support\ServiceProvider;
 use Cmd\Reports\Console\Commands\ImportCompanyHolidays;
 use Cmd\Reports\Console\Commands\ReferralCommissions\ProcessReferralCommissions;
+use Cmd\Reports\Console\Commands\SettlementApprovalEmails\ProcessSettlementApprovalEmails;
 use Cmd\Reports\Console\Commands\TestDatabaseConnections;
 use Cmd\Reports\Console\Commands\SyncBalances;
 use Cmd\Reports\Console\Commands\SyncBalancesHistory;
@@ -106,6 +107,10 @@ class ReportsServiceProvider extends ServiceProvider
     public function boot()
     {
         $this->mergeConfigFrom(__DIR__ . '/../config/sms-exports.php', 'sms-exports');
+        $this->publishes([
+            __DIR__ . '/../database/settlement-approval-email-migrations/2026_10_19_000001_create_settlement_approval_email_jobs.php'
+                => database_path('migrations/2026_10_19_000001_create_settlement_approval_email_jobs.php'),
+        ], 'settlement-approval-email-migrations');
         $this->loadRoutesFrom(__DIR__ . '/../routes/web.php');
         $this->loadRoutesFrom(__DIR__ . '/../routes/pmod.php');
         $this->loadRoutesFrom(__DIR__ . '/../routes/sms-api.php');
@@ -213,6 +218,7 @@ class ReportsServiceProvider extends ServiceProvider
                 GenerateLendingTowerInvoices::class,
                 ImportCompanyHolidays::class,
                 ProcessReferralCommissions::class,
+                ProcessSettlementApprovalEmails::class,
                 SyncContactsData::class,
                 SyncCollectionCompanies::class,
                 SyncLastDepositDate::class,
