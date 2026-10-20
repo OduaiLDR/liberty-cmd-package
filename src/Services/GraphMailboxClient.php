@@ -153,12 +153,20 @@ class GraphMailboxClient
         ]];
         if ($nextLink !== null) {
             $url = parse_url($nextLink);
+            $nextPath = $url['path'] ?? '';
+            // Graph can return the same Inbox using OData key syntax in @odata.nextLink.
+            $allowedPaths = [
+                rawurldecode('/v1.0' . $path),
+                "/v1.0/users/{$mailbox}/mailFolders('inbox')/messages",
+            ];
             if (($url['scheme'] ?? '') !== 'https' || ($url['host'] ?? '') !== 'graph.microsoft.com'
-                || isset($url['user']) || isset($url['pass']) || isset($url['port'])
-                || rawurldecode($url['path'] ?? '') !== rawurldecode('/v1.0' . $path)) {
+                || isset($url['user']) || isset($url['pass']) || isset($url['port']) || isset($url['fragment'])
+                || !str_starts_with($nextPath, '/v1.0/')
+                || !in_array(rawurldecode($nextPath), $allowedPaths, true)) {
                 throw new RuntimeException('Unexpected Graph approval pagination URL.');
             }
-            $path .= '?' . ($url['query'] ?? '');
+            // Preserve the validated continuation path and opaque query exactly as Graph sent them.
+            $path = substr($nextPath, strlen('/v1.0')) . '?' . ($url['query'] ?? '');
             unset($options['query']);
         }
         $data = $this->request('GET', $path, $options);

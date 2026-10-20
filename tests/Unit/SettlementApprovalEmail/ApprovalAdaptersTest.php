@@ -13,6 +13,7 @@ use GuzzleHttp\HandlerStack;
 use GuzzleHttp\Middleware;
 use GuzzleHttp\Psr7\Request;
 use GuzzleHttp\Psr7\Response;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use RuntimeException;
 
@@ -156,9 +157,57 @@ final class ApprovalAdaptersTest extends TestCase
         $gateway->addNote(new ApprovalEmail('LDR', '123', '456', 'Bank', '0012'));
     }
 
+    public static function approvalPaginationPaths(): array
+    {
+        return [
+            'server OData path' => ["/v1.0/users/automation@libertydebtrelief.com/mailFolders('inbox')/messages"],
+            'encoded OData path' => ['/v1.0/users/automation%40libertydebtrelief.com/mailFolders%28%27inbox%27%29/messages'],
+            'slash path' => ['/v1.0/users/automation@libertydebtrelief.com/mailFolders/inbox/messages'],
+            'encoded slash path' => ['/v1.0/users/automation%40libertydebtrelief.com/mailFolders/inbox/messages'],
+        ];
+    }
+
+    #[DataProvider('approvalPaginationPaths')]
+    public function test_graph_follows_equivalent_inbox_paths_without_rewriting_the_continuation(string $path): void
+    {
+        $history = [];
+        $next = 'https://graph.microsoft.com' . $path
+            . '?%24select=id%2Csubject&%24top=50&%24filter=startswith%28subject%2C%27Settlement%20Approval%20Data%3A%27%29&%24skiptoken=opaque%2Bpage%2Fcursor%3D';
+        $mail = new GraphMailboxClient('tenant', 'client', 'fake-secret', $this->client([
+            $this->json(['access_token' => 'fake-token']),
+            $this->json(['value' => [], '@odata.nextLink' => $next]),
+            $this->json(['value' => [['id' => 'next-page-message']]]),
+        ], $history));
+
+        $first = $mail->approvalInboxPage('automation@libertydebtrelief.com', ApprovalEmail::SUBJECT_PREFIX);
+        $second = $mail->approvalInboxPage('automation@libertydebtrelief.com', ApprovalEmail::SUBJECT_PREFIX, $first['next']);
+
+        self::assertSame([['id' => 'next-page-message']], $second['messages']);
+        self::assertNull($second['next']);
+        self::assertCount(3, $history);
+        self::assertSame($next, (string) $history[2]['request']->getUri());
+        self::assertSame('GET', $history[2]['request']->getMethod());
+        self::assertSame('IdType="ImmutableId"', $history[2]['request']->getHeaderLine('Prefer'));
+    }
+
     public function test_graph_rejects_external_or_other_mailbox_pagination_before_sending_credentials(): void
     {
-        foreach (['https://evil.example/v1.0/users/a/mailFolders/inbox/messages', 'https://graph.microsoft.com/v1.0/users/other/mailFolders/inbox/messages'] as $next) {
+        $inbox = "/v1.0/users/automation@libertydebtrelief.com/mailFolders('inbox')/messages";
+        foreach ([
+            'https://evil.example/v1.0/users/a/mailFolders/inbox/messages',
+            'https://graph.microsoft.com/v1.0/users/other/mailFolders/inbox/messages',
+            'https://evil.example' . $inbox,
+            'https://graph.microsoft.com.evil.example' . $inbox,
+            'http://graph.microsoft.com' . $inbox,
+            'https://user:password@graph.microsoft.com' . $inbox,
+            'https://graph.microsoft.com:8443' . $inbox,
+            "https://graph.microsoft.com/v1.0/users/other/mailFolders('inbox')/messages",
+            "https://graph.microsoft.com/v1.0/users/automation@libertydebtrelief.com/mailFolders('archive')/messages",
+            'https://graph.microsoft.com' . $inbox . '/delta',
+            'https://graph.microsoft.com' . $inbox . '/../../sendMail',
+            'https://graph.microsoft.com' . $inbox . '#fragment',
+            'https://graph.microsoft.com/beta' . substr($inbox, strlen('/v1.0')),
+        ] as $next) {
             $history = [];
             $mail = new GraphMailboxClient('tenant', 'client', 'secret', $this->client([], $history));
             try { $mail->approvalInboxPage('automation@libertydebtrelief.com', ApprovalEmail::SUBJECT_PREFIX, $next); self::fail('Expected URL rejection.'); }

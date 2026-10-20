@@ -141,6 +141,26 @@ final class ApprovalCommandIntegrationTest extends TestCase
         self::assertSame(0, $this->database->getConnection()->table(DatabaseApprovalLedger::TABLE)->count());
     }
 
+    public function test_plaw_preview_reaches_the_next_page_after_fifty_ldr_messages(): void
+    {
+        $transport = new ApprovalIntegrationTransport('PLAW', 132);
+        // Path captured on the target CMD Runner; query values are synthetic.
+        $transport->approvalNextLink = "https://graph.microsoft.com/v1.0/users/automation@libertydebtrelief.com/mailFolders('inbox')/messages"
+            . '?%24select=id%2CinternetMessageId%2Csubject%2Csender%2Cfrom&%24top=50&%24filter=startswith%28subject%2C%27Settlement%20Approval%20Data%3A%27%29&%24skip=50';
+        [$command, $sql] = $this->command($transport);
+        [$exit, $output] = $this->dispatch($command, 'PLAW', live: false, limit: 5);
+
+        self::assertSame(0, $exit, $output);
+        self::assertStringContainsString('PLAW settlement 456: would_approve -> Accepted', $output);
+        self::assertStringNotContainsString('LDR settlement', $output);
+        self::assertCount(2, $transport->approvalPageUrls);
+        self::assertSame($transport->approvalNextLink, $transport->approvalPageUrls[1]);
+        self::assertSame(['fake-forth-PLAW'], $transport->forthKeys);
+        self::assertSame([], $transport->effects);
+        self::assertSame([], $sql->queries);
+        self::assertSame(0, $this->database->getConnection()->table(DatabaseApprovalLedger::TABLE)->count());
+    }
+
     public function test_archive_failure_then_duplicate_message_does_not_repeat_any_crm_or_mail_effect(): void
     {
         $transport = new ApprovalIntegrationTransport('LDR', 16);
@@ -250,13 +270,13 @@ final class ApprovalCommandIntegrationTest extends TestCase
         return [$command, $sql];
     }
 
-    private function dispatch(ProcessSettlementApprovalEmails $command, string $company, bool $live = true): array
+    private function dispatch(ProcessSettlementApprovalEmails $command, string $company, bool $live = true, int $limit = 100): array
     {
         $console = new Application();
         $console->setAutoExit(false);
         $console->add($command);
         $output = new BufferedOutput();
-        $exit = $console->run(new ArrayInput(['command' => 'settlement-approval:process', $live ? '--live' : '--dry-run' => true, '--company' => strtolower($company)]), $output);
+        $exit = $console->run(new ArrayInput(['command' => 'settlement-approval:process', $live ? '--live' : '--dry-run' => true, '--company' => strtolower($company), '--limit' => $limit]), $output);
         return [$exit, $output->fetch()];
     }
 }
@@ -270,6 +290,8 @@ final class ApprovalIntegrationTransport
     public bool $failArchiveOnce = false;
     public bool $failNotification = false;
     public bool $omitPaymentType = false;
+    public ?string $approvalNextLink = null;
+    public array $approvalPageUrls = [];
     public array $effects = [];
     public array $statusPayload = [];
     public array $notePayload = [];
@@ -321,7 +343,20 @@ final class ApprovalIntegrationTransport
         }
         if ($host === 'graph.microsoft.com') {
             $mailPath = '/v1.0/users/automation@libertydebtrelief.com';
+            if ($method === 'GET' && $this->approvalNextLink !== null && (string) $request->getUri() === $this->approvalNextLink) {
+                $this->approvalPageUrls[] = (string) $request->getUri();
+                return $this->json(['value' => [$this->message()]]);
+            }
             if ($method === 'GET' && $path === $mailPath . '/mailFolders/inbox/messages') {
+                $this->approvalPageUrls[] = (string) $request->getUri();
+                if ($this->approvalNextLink !== null) {
+                    $otherCompanyMessages = array_map(fn (int $index) => [
+                        'id' => 'ldr-message-' . $index,
+                        'subject' => ApprovalEmail::SUBJECT_PREFIX . ' ' . $index,
+                        'sender' => ['emailAddress' => ['address' => 'no-reply@libertydebtrelief.com']],
+                    ], range(1, 50));
+                    return $this->json(['value' => $otherCompanyMessages, '@odata.nextLink' => $this->approvalNextLink]);
+                }
                 return $this->json(['value' => $this->archived ? [] : [$this->message()]]);
             }
             if ($method === 'GET' && $path === $mailPath . '/messages/' . $this->messageId) {
