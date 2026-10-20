@@ -140,6 +140,53 @@ class GraphMailboxClient
         }
     }
 
+    /**
+     * Bounded paging for the settlement approval reader. Existing attachment readers are unchanged.
+     * Immutable IDs survive moves, and pagination URLs must stay on this exact Inbox resource.
+     */
+    public function approvalInboxPage(string $mailbox, string $subjectPrefix, ?string $nextLink = null): array
+    {
+        $path = "/users/{$this->encode($mailbox)}/mailFolders/inbox/messages";
+        $options = ['headers' => ['Prefer' => 'IdType="ImmutableId"'], 'query' => [
+            '$select' => 'id,internetMessageId,subject,sender,from', '$top' => '50',
+            '$filter' => "startswith(subject,'" . str_replace("'", "''", $subjectPrefix) . "')",
+        ]];
+        if ($nextLink !== null) {
+            $url = parse_url($nextLink);
+            if (($url['scheme'] ?? '') !== 'https' || ($url['host'] ?? '') !== 'graph.microsoft.com'
+                || isset($url['user']) || isset($url['pass']) || isset($url['port'])
+                || rawurldecode($url['path'] ?? '') !== rawurldecode('/v1.0' . $path)) {
+                throw new RuntimeException('Unexpected Graph approval pagination URL.');
+            }
+            $path .= '?' . ($url['query'] ?? '');
+            unset($options['query']);
+        }
+        $data = $this->request('GET', $path, $options);
+        if (!isset($data['value']) || !is_array($data['value'])) throw new RuntimeException('Graph Inbox response is missing messages.');
+        return ['messages' => $data['value'], 'next' => $data['@odata.nextLink'] ?? null];
+    }
+
+    public function approvalMessage(string $mailbox, string $messageId): array
+    {
+        $data = $this->request('GET', "/users/{$this->encode($mailbox)}/messages/{$this->encode($messageId)}", [
+            'headers' => ['Prefer' => 'IdType="ImmutableId", outlook.body-content-type="text"'],
+            'query' => ['$select' => 'id,internetMessageId,subject,sender,from,body'],
+        ]);
+        if (!isset($data['body']['content']) || !is_string($data['body']['content'])) {
+            throw new RuntimeException('Approval email body is missing.');
+        }
+        return $data;
+    }
+
+    /** The scheduled CMD uses the mailbox's sibling Archive folder, not Inbox\\Archive. */
+    public function moveToArchive(string $mailbox, string $messageId): void
+    {
+        $this->request('POST', "/users/{$this->encode($mailbox)}/messages/{$this->encode($messageId)}/move", [
+            'headers' => ['Prefer' => 'IdType="ImmutableId"'],
+            'json' => ['destinationId' => 'archive'],
+        ]);
+    }
+
     public function markRead(string $mailbox, string $messageId): void
     {
         $this->request('PATCH', "/users/{$this->encode($mailbox)}/messages/{$this->encode($messageId)}", [
