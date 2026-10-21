@@ -27,7 +27,7 @@ class SmsRunController extends Controller
     {
         $this->ensureSchemaReady();
         $overview = $this->runs->overview();
-        if ($overview['open'] && in_array($overview['open']->status, ['file_ready', 'sending', 'sent'], true)) {
+        if ($overview['open'] && in_array($overview['open']->status, ['file_ready', 'sending', 'sent', 'approving', 'approved'], true)) {
             $overview['open']->download_ready = true;
         }
 
@@ -85,6 +85,19 @@ class SmsRunController extends Controller
         return $this->json($this->runs->requestSent($requestId, $this->actor($request)), 202);
     }
 
+    public function approve(Request $request, string $requestId): JsonResponse
+    {
+        $this->ensureSchemaReady();
+        Validator::make($request->all(), ['confirmed_approval' => ['required', 'accepted']])->validate();
+        return $this->json($this->runs->requestApprove($requestId, $this->actor($request)), 202);
+    }
+
+    public function details(string $requestId): JsonResponse
+    {
+        $this->ensureSchemaReady();
+        return $this->json($this->runs->details($requestId));
+    }
+
     public function reviewOnly(Request $request, string $requestId): JsonResponse
     {
         $this->ensureSchemaReady();
@@ -130,6 +143,7 @@ class SmsRunController extends Controller
             || ! $schema->hasColumn('TblSMSRuns', 'Progress_Step')) {
             throw new HttpException(503, 'Apply the 19 Oct SMS workflow migration on this server before using the new page.');
         }
+        if (\Cmd\Reports\Services\SmsRecordPolicy::enabled()) \Cmd\Reports\Services\SmsRecordPolicy::assertReady();
     }
 
     protected function actor(Request $request): string

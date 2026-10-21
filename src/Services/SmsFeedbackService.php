@@ -24,7 +24,7 @@ class SmsFeedbackService
             $rows[] = ['phone' => $phone, 'status' => $status];
         }
         $hash = hash('sha256', json_encode($rows, JSON_THROW_ON_ERROR));
-        $result = SmsWorkflowLock::run('phone-suppression', fn () => DB::connection('sqlsrv')->transaction(function () use ($requestId, $chunk, $rows, $hash, $actor): array {
+        return SmsWorkflowLock::run('phone-suppression', fn () => DB::connection('sqlsrv')->transaction(function () use ($requestId, $chunk, $rows, $hash, $actor): array {
             $db = DB::connection('sqlsrv');
             $log = $db->table('TblSMSFeedbackImports')->where('Request_ID', $requestId)->where('Chunk', $chunk)->first();
             if ($log) {
@@ -42,6 +42,13 @@ class SmsFeedbackService
             }
             // Keep suppressions even when no prospect exists yet. A later purchase/import of
             // the same number must not make an opted-out phone eligible again.
+            $suppressionChanged = false;
+            foreach ($flags as $phone => $flag) {
+                $before = $suppressed->get($phone);
+                if ($before === null || (int) $before->Opt_Out !== $flag['Opt_Out'] || (int) $before->Invalid_Phone !== $flag['Invalid_Phone']) {
+                    $suppressionChanged = true;
+                }
+            }
             foreach (array_chunk(array_values($flags), 250) as $part) {
                 $db->table('TblSMSSuppressions')->upsert($part, ['Phone'], ['Opt_Out', 'Invalid_Phone', 'Updated_At']);
             }
@@ -53,9 +60,8 @@ class SmsFeedbackService
             }
             $db->table('TblSMSFeedbackImports')->insert(['Request_ID' => $requestId, 'Chunk' => $chunk, 'Content_Hash' => $hash,
                 'Records' => count($rows), 'Matched' => $matched, 'Updated' => $updated, 'Created_By' => $actor, 'Created_At' => now()->toDateTimeString()]);
+            if (! SmsAvailabilityRefresh::durableEnabled() || $updated > 0 || $suppressionChanged) SmsAvailabilityRefresh::afterCommit($db);
             return ['records' => count($rows), 'matched' => $matched, 'updated' => $updated, 'replayed' => false];
         }));
-        if (! $result['replayed']) SmsAvailabilityRefresh::afterCommit(DB::connection('sqlsrv'));
-        return $result;
     }
 }

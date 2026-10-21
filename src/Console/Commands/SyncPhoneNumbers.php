@@ -128,22 +128,34 @@ class SyncPhoneNumbers extends Command
     /** @return array{int, int, int} */
     protected function replacePhonesFromFile(PDO $connection, string $stagePath, int $batchSize): array
     {
-        $connection->beginTransaction();
+        $durable = SmsAvailabilityRefresh::durableEnabled();
+        if ($durable && (DB::connection('sqlsrv')->getPdo() !== $connection || DB::connection('sqlsrv')->transactionLevel() !== 0)) {
+            throw new \LogicException('Native phone replacement must use the sqlsrv PDO outside Laravel transactions.');
+        }
+        $begun = $connection->beginTransaction();
+        if ($durable && ! $begun) throw new \RuntimeException('SQL Server phone replacement transaction could not start.');
         try {
             $deleted = $this->deleteExistingPhones($connection);
             $inserted = $this->insertPhonesFromFile($connection, $stagePath, $batchSize);
             $cleaned = $this->cleanupEmptyPhones($connection);
-            $connection->commit();
-            // Eligibility reads this table directly; notify at its commit boundary,
-            // before a later prospect-flagging failure can skip the refresh.
-            SmsAvailabilityRefresh::afterCommit(DB::connection('sqlsrv'));
-            return [$deleted, $inserted, $cleaned];
+            $changed = $deleted > 0 || $inserted > 0 || $cleaned > 0;
+            if ($durable && $changed) SmsAvailabilityRefresh::beforeNativeCommit(DB::connection('sqlsrv'), $connection);
+            $committed = $connection->commit();
+            if ($durable && ! $committed) throw new \RuntimeException('SQL Server phone replacement commit failed.');
         } catch (\Throwable $exception) {
             if ($connection->inTransaction()) {
                 $connection->rollBack();
             }
             throw $exception;
         }
+        // Eligibility reads this table directly; request before later flagging can fail.
+        // Keep postcommit dispatch outside the rollback handler.
+        if ($durable) {
+            if ($changed) SmsAvailabilityRefresh::afterNativeCommit();
+        } else {
+            SmsAvailabilityRefresh::afterCommit(DB::connection('sqlsrv'));
+        }
+        return [$deleted, $inserted, $cleaned];
     }
 
     private function stagePhonesFromSnowflake(DBConnector $snowflake): array

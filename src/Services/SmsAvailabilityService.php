@@ -29,6 +29,9 @@ class SmsAvailabilityService
     /** @return array{state:string, requested_at?:string, queued_now?:bool, counted_at?:string, eligible?:int, never_texted?:int, texted_before?:int, stale?:bool, message?:string} */
     public function snapshot(bool $refresh = false): array
     {
+        if (config('sms-exports.durable_availability_enabled', false)) {
+            return app(SmsDurableAvailabilityService::class)->request($refresh);
+        }
         $entry = null;
         try {
             $cache = $this->cache();
@@ -91,6 +94,12 @@ class SmsAvailabilityService
      */
     public function invalidate(): void
     {
+        if (config('sms-exports.durable_availability_enabled', false)) {
+            // Durable writers persist the revision inside their business transaction.
+            // This method remains a post-commit coordination entry point, not a write.
+            app(SmsDurableAvailabilityService::class)->request(true);
+            return;
+        }
         try {
             $cache = $this->cache();
             $scope = $this->scope();
@@ -113,6 +122,7 @@ class SmsAvailabilityService
 
     public function count(string $scope, string $generation, string $owner, SmsProspectExportRepository $export): void
     {
+        if (config('sms-exports.durable_availability_enabled', false)) return;
         if ($scope !== $this->scope()) return;
         $cache = $this->cache();
         $mutex = $cache->getStore()->lock($scope.':state', self::MUTEX_SECONDS);
@@ -152,6 +162,7 @@ class SmsAvailabilityService
     /** Also called by the worker's failed() callback, including timeout/max-attempt failures. */
     public function fail(string $scope, string $generation, string $owner): void
     {
+        if (config('sms-exports.durable_availability_enabled', false)) return;
         if ($scope !== $this->scope()) return;
         $this->finish($this->cache(), $scope, $generation, $owner, $this->failure(), self::FAILURE_SECONDS);
     }

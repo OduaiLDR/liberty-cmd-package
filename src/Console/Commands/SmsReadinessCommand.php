@@ -19,10 +19,15 @@ class SmsReadinessCommand extends Command
         $this->info('READ ONLY: no data or schema will be changed.');
         $this->line(json_encode($db->selectOne('SELECT @@SERVERNAME AS Server_Name, DB_NAME() AS Database_Name'), JSON_THROW_ON_ERROR));
         $schema = $db->getSchemaBuilder();
-        foreach (['TblProspects', 'TblProspectsExport', 'TblSMSHistory', 'TblSMSRuns', 'TblSMSAttemptAudit', 'TblSMSSuppressions', 'TblSMSEnrichmentBatches'] as $name) {
+        foreach (['TblProspects', 'TblProspectsExport', 'TblSMSHistory', 'TblSMSRuns', 'TblSMSAttemptAudit', 'TblSMSSuppressions', 'TblSMSEnrichmentBatches', 'TblSMSAvailabilitySummary'] as $name) {
             $count = $db->selectOne('SELECT SUM(row_count) AS Rows FROM sys.dm_db_partition_stats WHERE object_id = OBJECT_ID(?) AND index_id IN (0,1)', ['dbo.'.$name]);
             $this->line($name.': '.($schema->hasTable($name) ? number_format((int) ($count->Rows ?? 0)).' rows (metadata)' : 'not installed'));
         }
+        $snapshot = $db->selectOne('SELECT snapshot_isolation_state_desc AS Snapshot_Isolation FROM sys.databases WHERE database_id = DB_ID()');
+        $this->line('Durable SMS summary: '.json_encode([
+            'enabled' => (bool) config('sms-exports.durable_availability_enabled', false),
+            'snapshot_isolation' => $snapshot->Snapshot_Isolation ?? 'unknown',
+        ], JSON_THROW_ON_ERROR));
         if ($schema->hasTable('tu_repair_20261014.Control')) {
             $repair = $db->selectOne(<<<'SQL'
 SELECT c.Status AS Repair_Status,

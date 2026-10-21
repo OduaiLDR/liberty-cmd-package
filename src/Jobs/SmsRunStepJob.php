@@ -47,6 +47,7 @@ class SmsRunStepJob implements ShouldQueue
                 'file' => $runs->buildFile($this->requestId),
                 'send' => $runs->markSent($this->requestId),
                 'reverse' => $runs->reverseSent($this->requestId),
+                'approve' => $runs->markApproved($this->requestId),
             };
         } catch (SmsWorkflowBusyException $error) {
             $this->release(5);

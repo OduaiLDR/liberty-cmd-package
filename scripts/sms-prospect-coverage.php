@@ -246,7 +246,9 @@ final class SmsProspectCoverage
                     if ($conflict && ! $known['contact_conflict']) {
                         $c['unique_contact_conflicts']++; if ($exists === 0) $c['missing_contact_conflicts']++;
                     }
-                    $journal->prepare('UPDATE identities SET source_rows=source_rows+1,contact_conflict=MAX(contact_conflict,?) WHERE id=?')->execute([(int) $conflict, $id]);
+                    $update = $journal->prepare('UPDATE identities SET source_rows=source_rows+1,contact_conflict=MAX(contact_conflict,?) WHERE id=?');
+                    // SQLite MAX orders TEXT above INTEGER; bind integers so an agreement cannot clear a conflict.
+                    $update->bindValue(1, (int) $conflict, PDO::PARAM_INT); $update->bindValue(2, $id, PDO::PARAM_INT); $update->execute();
                 }
             }
             unset($c);

@@ -127,6 +127,9 @@ class ReportsServiceProvider extends ServiceProvider
             __DIR__ . '/../database/sms-migrations/2026_10_12_000001_create_sms_prospects_tables.php' => database_path('migrations/2026_10_12_000001_create_sms_prospects_tables.php'),
             __DIR__ . '/../database/sms-migrations/2026_10_19_000001_complete_sms_workflow.php' => database_path('migrations/2026_10_19_000001_complete_sms_workflow.php'),
             __DIR__ . '/../database/sms-migrations/2026_10_19_000002_create_sms_enrichment_tables.php' => database_path('migrations/2026_10_19_000002_create_sms_enrichment_tables.php'),
+            __DIR__ . '/../database/sms-migrations/2026_10_20_000001_create_sms_availability_summary.php' => database_path('migrations/2026_10_20_000001_create_sms_availability_summary.php'),
+            __DIR__ . '/../database/sms-migrations/2026_10_20_000002_create_sms_prospect_backfill_ledger.php' => database_path('migrations/2026_10_20_000002_create_sms_prospect_backfill_ledger.php'),
+            __DIR__ . '/../database/sms-migrations/2026_10_20_000003_add_sms_record_approval.php' => database_path('migrations/2026_10_20_000003_add_sms_record_approval.php'),
         ], 'reports-sms-migrations');
         // PMOD migrations ship with the package but are NOT auto-loaded.
         // Consumers must explicitly opt in by publishing them:
@@ -232,6 +235,7 @@ class ReportsServiceProvider extends ServiceProvider
                 SyncPhoneNumbers::class,
                 LoadSmsProspects::class,
                 \Cmd\Reports\Console\Commands\SmsReadinessCommand::class,
+                \Cmd\Reports\Console\Commands\RefreshSmsAvailability::class,
                 SyncCalls::class,
                 SyncNegotiatorPayrollData::class,
                 RefreshForthApiTokens::class,

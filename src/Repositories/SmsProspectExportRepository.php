@@ -5,6 +5,7 @@ namespace Cmd\Reports\Repositories;
 use Carbon\Carbon;
 use Cmd\Reports\Services\SmsProspectValues;
 use Cmd\Reports\Services\SmsAvailabilityRefresh;
+use Cmd\Reports\Services\SmsRecordPolicy;
 use Illuminate\Validation\ValidationException;
 use RuntimeException;
 
@@ -54,10 +55,12 @@ class SmsProspectExportRepository extends SqlSrvRepository
      */
     public function markContacted(): int
     {
+        $db = $this->connection();
         $phone = self::CONTACT_PHONE;
         $hashJoins = self::HASH_JOINS;
 
-        $changed = $this->connection()->update(<<<SQL
+        return SmsAvailabilityRefresh::transaction($db, function () use ($db, $phone, $hashJoins): int {
+            $changed = $db->update(<<<SQL
 WITH Contacts AS (
     SELECT {$phone} AS Phone, MIN(Created_Date) AS Created_Date
     FROM TblPhoneNumbers
@@ -70,13 +73,15 @@ JOIN Contacts c ON c.Phone = p.Phone
 WHERE (p.Contacted = 0 OR p.Response_Date IS NULL OR c.Created_Date < p.Response_Date) AND p.Phone IS NOT NULL
 {$hashJoins}
 SQL);
-        if ($changed > 0) SmsAvailabilityRefresh::afterCommit($this->connection());
-        return $changed;
+            if ($changed > 0) SmsAvailabilityRefresh::afterCommit($db);
+            return $changed;
+        });
     }
 
     /** @return array{selected:int, target:int, shortfall:int, contacted_flagged:int} */
     public function select(string $requestId, int $target): array
     {
+        if ($this->isRecordRun($requestId)) return app(SmsRecordExportRepository::class)->select($requestId, $target);
         if ($target < 1) {
             throw ValidationException::withMessages(['target' => 'Enter a positive number of records.']);
         }
@@ -87,7 +92,9 @@ SQL);
             $flagged = $this->markContacted();
             $priority = self::PRIORITY;
             $hashJoins = self::HASH_JOINS;
-            $selected = $this->connection()->affectingStatement($this->eligibleSql().<<<SQL
+            $db = $this->connection();
+            $selected = SmsAvailabilityRefresh::transaction($db, function () use ($db, $priority, $hashJoins, $requestId, $target): int {
+                $selected = $db->affectingStatement($this->eligibleSql().<<<SQL
 
 INSERT INTO TblProspectsExport (Request_ID, Prospect_PK, Phone, Debt_Tier, Client, Address, City, State, Zip, Email)
 SELECT TOP (?) ?, PK, Phone, Tier, Client, Address, City, State, Zip, Email
@@ -96,7 +103,9 @@ WHERE Phone_Rank = 1
 ORDER BY {$priority}
 {$hashJoins}
 SQL, [self::SHARED_PHONE_ADDRESSES, $target, $requestId]);
-            if ($selected > 0) SmsAvailabilityRefresh::afterCommit($this->connection());
+                if ($selected > 0) SmsAvailabilityRefresh::afterCommit($db);
+                return $selected;
+            });
 
             return ['selected' => $selected, 'target' => $target, 'shortfall' => max(0, $target - $selected), 'contacted_flagged' => $flagged];
         });
@@ -109,6 +118,7 @@ SQL, [self::SHARED_PHONE_ADDRESSES, $target, $requestId]);
      */
     public function availability(): array
     {
+        if (SmsRecordPolicy::enabled()) return app(SmsRecordExportRepository::class)->availability();
         $row = $this->connection()->selectOne($this->eligibleSql().'
 SELECT COUNT(*) AS Eligible, COALESCE(SUM(CASE WHEN Latest_Export_Date IS NULL THEN 1 ELSE 0 END), 0) AS Never_Texted
 FROM Eligible WHERE Phone_Rank = 1
@@ -123,6 +133,12 @@ FROM Eligible WHERE Phone_Rank = 1
     public function availabilityWithTimeout(): array
     {
         return $this->withQueryTimeout(600, fn (): array => $this->availability());
+    }
+
+    /** Durable workers count a consistent snapshot; legacy callers keep their existing path. */
+    public function availabilitySnapshotWithTimeout(): array
+    {
+        return $this->withReadSnapshot(fn (): array => $this->availabilityWithTimeout());
     }
 
     /**
@@ -300,6 +316,9 @@ SQL, [$requestId]);
     /** Writes the vendor file from the run's rows; returns the number of records written. */
     public function writeCsv(string $requestId, string $path): int
     {
+        if ($this->isRecordRun($requestId)) {
+            return $this->withQueryTimeout(self::STEP_QUERY_TIMEOUT, fn () => app(SmsRecordExportRepository::class)->writeCsv($requestId, $path));
+        }
         return $this->withQueryTimeout(self::STEP_QUERY_TIMEOUT, fn (): int => $this->writeCsvNow($requestId, $path));
     }
 
@@ -362,6 +381,7 @@ SQL, [$requestId]);
      */
     public function markSent(string $requestId, Carbon $sentAt): int
     {
+        if ($this->isRecordRun($requestId)) throw new RuntimeException('Record batches must use immutable approval, not legacy phone-based sending.');
         $db = $this->connection();
         if (! $this->hasRows('TblProspectsExport', $requestId)) {
             if ($this->hasRows('TblSMSHistory', $requestId)) return 0;
@@ -397,9 +417,9 @@ WHERE Request_ID = ?
 SQL, [$sentAt->toDateTimeString(), $requestId]);
             $db->table('TblProspectsExport')->where('Request_ID', $requestId)->delete();
 
+            if ($moved > 0) SmsAvailabilityRefresh::afterCommit($db);
             return $moved;
         }));
-        if ($moved > 0) SmsAvailabilityRefresh::afterCommit($db);
         return $moved;
     }
 
@@ -409,9 +429,12 @@ SQL, [$sentAt->toDateTimeString(), $requestId]);
         if ($this->hasRows('TblSMSHistory', $requestId)) {
             throw ValidationException::withMessages(['request_id' => 'This run already has send history. It needs a send correction, not review-only.']);
         }
-        $released = $this->table('TblProspectsExport')->where('Request_ID', $requestId)->delete();
-        if ($released > 0) SmsAvailabilityRefresh::afterCommit($this->connection());
-        return $released;
+        $db = $this->connection();
+        return SmsAvailabilityRefresh::transaction($db, function () use ($db, $requestId): int {
+            $released = $db->table('TblProspectsExport')->where('Request_ID', $requestId)->delete();
+            if ($released > 0) SmsAvailabilityRefresh::afterCommit($db);
+            return $released;
+        });
     }
 
     /** Reversal is allowed only with complete, unchanged before-values, never a guessed date. */
@@ -435,9 +458,9 @@ FROM TblProspects p JOIN TblSMSAttemptAudit a ON a.Prospect_PK = p.PK
 WHERE a.Request_ID = ?
 SQL, [$requestId]);
             $db->table('TblSMSLegacySends')->where('Request_ID', $requestId)->delete();
+            if ($restored > 0) SmsAvailabilityRefresh::afterCommit($db);
             return $restored;
         }));
-        if ($restored > 0) SmsAvailabilityRefresh::afterCommit($this->connection());
         return $restored;
     }
 
@@ -455,9 +478,9 @@ SQL, [$requestId]);
             $deleted = $db->table('TblProspectsExport')->where('Request_ID', $requestId)->delete();
             if ($drops !== []) $db->table('TblSMSDrops')->whereIn('PK', $drops)->delete();
 
+            if ($deleted > 0) SmsAvailabilityRefresh::afterCommit($db);
             return $deleted;
         });
-        if ($deleted > 0) SmsAvailabilityRefresh::afterCommit($db);
         return $deleted;
     }
 
@@ -478,6 +501,15 @@ SQL, [$requestId]);
     private function hasRows(string $table, string $requestId): bool
     {
         return $this->table($table)->where('Request_ID', $requestId)->exists();
+    }
+
+    private function isRecordRun(string $requestId): bool
+    {
+        // Do not query new columns in old deployments. Service boundaries independently
+        // reject record-run mutations if this coordinated feature has been disabled.
+        if (! SmsRecordPolicy::enabled()) return false;
+        $run = $this->table('TblSMSRuns')->where('Request_ID', $requestId)->first();
+        return $run !== null && SmsRecordPolicy::isRecord($run);
     }
 
     private function assertOpenRun(string $requestId): void
