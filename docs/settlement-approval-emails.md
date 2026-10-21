@@ -142,6 +142,67 @@ ledger or mailbox mutations.
 The ledger migration is published separately and is not automatically run or loaded with PMOD migrations.
 No schedule is created or enabled by installing this package change. Scheduling belongs in CMD Runner.
 
+### Completing the LDR / Progress Law server configuration
+
+A successful package update or dry run does not configure the live prerequisites above. The command
+`settlement-approval:process --live --company=all --limit=100 -v` stops before mailbox access when
+`SETTLEMENT_APPROVAL_EMAIL_LIVE_ENABLED` is missing or false. The same error also rejects combining
+`--live` with `--dry-run`; check the saved automation command before changing the switch.
+
+Use [the environment example](../config/settlement-approval-email.env.example) to merge these entries
+into CMD Runner's existing environment. Replace existing entries for these keys rather than adding
+duplicates, and preserve the rest of the environment file:
+
+```dotenv
+SETTLEMENT_APPROVAL_EMAIL_NOTE_TYPE_LDR=1
+SETTLEMENT_APPROVAL_EMAIL_NOTE_PUBLIC_LDR=false
+SETTLEMENT_APPROVAL_EMAIL_NOTE_TYPE_PLAW=1
+SETTLEMENT_APPROVAL_EMAIL_NOTE_PUBLIC_PLAW=true
+SETTLEMENT_APPROVAL_EMAIL_LIVE_ENABLED=false
+```
+
+These note settings were verified on 2026-10-20 against historical notes containing the VBA
+authorization text, directly in each Forth account. Both use type `1` (**General**); LDR samples are
+private (`public=0`) and Progress Law samples are public (`public=1`). Treat these as the verified
+configuration for these two accounts, and recheck before using the example in another account.
+The worker still requires explicit settings; the example is not loaded automatically.
+
+The [recipient setup SQL](../database/settlement-approval-email-setup/configure-recipients.sql)
+defaults to a SELECT-only preview. Run the complete file in a SQL client against the shared SQL Server
+database used by `DBConnector::fromEnvironment('plaw')`. It displays the existing matching rows
+and these two proposed inserts:
+
+| Report_Name | Company | To | CC / BCC | Schedule |
+| --- | --- | --- | --- | --- |
+| Settlement Approval | LDR | Five legacy recipients below | Empty | NULL |
+| Settlement Approval | PLAW | Five legacy recipients below | Empty | NULL |
+
+The VBA sends both companies' notifications to `jennifer@libertydebtrelief.com`,
+`rama@libertydebtrelief.com`, `lana@libertydebtrelief.com`, `jace@libertydebtrelief.com`, and
+`adrian@libertydebtrelief.com`. Confirm that these remain the intended recipients before applying.
+The worker combines matching rows and deduplicates addresses, yielding five To recipients.
+These rows configure recipients; scheduling continues to belong to CMD Runner.
+
+After reviewing and approving the exact preview, set `@Apply = 1` in a local copy of the SQL file
+and run the complete file. The transaction inserts exactly two rows and aborts if any row already
+exists under either supported report name. It does not replace existing configuration. On a rerun,
+use the default preview to inspect the configured rows rather than applying again. This file is
+outside the migrations folder and is never executed by Composer, the service provider or Artisan migrations.
+
+After saving environment changes, gracefully restart the long-running queue workers:
+
+```sh
+php artisan queue:restart
+```
+
+The current command reads these settings directly with `env()`. If Laravel configuration is cached,
+`.env` values are not loaded for those calls; supply the settings through the worker's process
+environment or clear the config cache as part of the deployment before restarting workers. Keep
+the live switch false while preparing configuration. Coordinate the legacy handler stop and the
+controlled test below before setting it true; an active schedule can start processing as soon as
+its worker sees that switch. Applying settings alone is not evidence of a successful approval,
+notification delivery or mailbox archive.
+
 ## Controlled validation and cutover
 
 Before replacing Selenium, verify API effects on approved test offers in both accounts and both
