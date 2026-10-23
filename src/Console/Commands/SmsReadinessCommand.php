@@ -2,6 +2,8 @@
 
 namespace Cmd\Reports\Console\Commands;
 
+use Cmd\Reports\Services\SmsReleaseReadiness;
+use Cmd\Reports\Services\SmsTestEnvironmentProbe;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Throwable;
@@ -19,11 +21,106 @@ class SmsReadinessCommand extends Command
         $this->info('READ ONLY: no data or schema will be changed.');
         $this->line(json_encode($db->selectOne('SELECT @@SERVERNAME AS Server_Name, DB_NAME() AS Database_Name'), JSON_THROW_ON_ERROR));
         $schema = $db->getSchemaBuilder();
-        foreach (['TblProspects', 'TblProspectsExport', 'TblSMSHistory', 'TblSMSRuns', 'TblSMSAttemptAudit', 'TblSMSSuppressions', 'TblSMSEnrichmentBatches', 'TblSMSAvailabilitySummary'] as $name) {
+        $testEnvironment = (new SmsTestEnvironmentProbe)->report();
+        $this->line('SMS authenticated test environment: '.json_encode($testEnvironment, JSON_THROW_ON_ERROR));
+        foreach ($testEnvironment['blockers'] as $blocker) $this->warn($blocker['message']);
+        foreach (['TblProspects', 'TblProspectsExport', 'TblSMSHistory', 'TblSMSRuns', 'TblSMSAttemptAudit', 'TblSMSSuppressions', 'TblSMSEnrichmentBatches', 'TblSMSAvailabilitySummary', 'TblSMSResponseAttribution'] as $name) {
             $count = $db->selectOne('SELECT SUM(row_count) AS Rows FROM sys.dm_db_partition_stats WHERE object_id = OBJECT_ID(?) AND index_id IN (0,1)', ['dbo.'.$name]);
             $this->line($name.': '.($schema->hasTable($name) ? number_format((int) ($count->Rows ?? 0)).' rows (metadata)' : 'not installed'));
         }
+        $has = static fn (string $table, array $columns): bool => $schema->hasTable($table) && $schema->hasColumns($table, $columns);
+        $recordSchema = $has('TblProspects', ['Last_SMS_Date', 'Contacted_Date'])
+            && $has('TblSMSRuns', ['Selection_Policy', 'Never_Texted', 'Previously_Texted', 'Approved_At', 'Approved_By', 'File_Cleanup_Path'])
+            && $has('TblProspectsExport', ['Was_Previously_Texted', 'Last_SMS_Date_At_Selection'])
+            && $has('TblSMSHistory', ['Was_Previously_Texted', 'Last_SMS_Date_At_Selection'])
+            && $has('TblSMSResponseAttribution', ['Prospect_PK', 'Request_ID', 'Contact_At_UTC', 'Contacted_Date', 'Created_At']);
+        $fileSchema = $has('TblSMSRuns', ['Run_Options_JSON', 'Artifact_Manifest_JSON']);
+        $durableSummarySchema = $has('TblSMSAvailabilitySummary', [
+            'scope', 'revision', 'published_revision', 'eligible', 'never_texted', 'texted_before', 'counted_at', 'latest_data_date',
+        ]);
+        $tuDateSchema = $durableSummarySchema && $has('TblSMSAvailabilitySummary', ['tu_date_verified']);
+        $contactSchema = $recordSchema
+            && $has('TblSMSRuns', ['Approved_At_Precision'])
+            && $has('TblSMSResponseAttribution', ['Contact_At_UTC_Exact', 'Source_System', 'Source_Contact_ID', 'Source_Contract_SHA256', 'Source_Candidate_Count']);
+        foreach (['TblSMSHistory', 'TblProspectsExport'] as $table) {
+            if (! $schema->hasTable($table)) {
+                $contactSchema = false;
+                continue;
+            }
+            $matches = array_filter($schema->getIndexes($table), static fn (array $index): bool =>
+                strtolower($index['name']) === strtolower('IX_'.$table.'_Contact_Attribution')
+                && array_map('strtolower', $index['columns']) === ['prospect_pk', 'phone', 'request_id']);
+            $contactSchema = $contactSchema && count($matches) === 1;
+        }
         $snapshot = $db->selectOne('SELECT snapshot_isolation_state_desc AS Snapshot_Isolation FROM sys.databases WHERE database_id = DB_ID()');
+        $release = SmsReleaseReadiness::report([
+            'mailer_recency_date' => config('sms-exports.mailer_recency_date', 'Send_Date'),
+            'single_phone_csv' => config('sms-exports.single_phone_csv', false),
+            'snapshot_isolation_enabled' => strtoupper((string) ($snapshot->Snapshot_Isolation ?? '')) === 'ON',
+            'prospect_enrichment_enabled' => config('sms-exports.prospect_enrichment_enabled', false),
+            'durable_availability_enabled' => config('sms-exports.durable_availability_enabled', false),
+            'record_workflow_enabled' => config('sms-exports.record_workflow_enabled', false),
+            'run_file_options_enabled' => config('sms-exports.run_file_options_enabled', false),
+            'tier_selection_enabled' => config('sms-exports.tier_selection_enabled', false),
+            'tu_completion_date_enabled' => config('sms-exports.tu_completion_date_enabled', false),
+            'contact_attribution_enabled' => config('sms-exports.contact_attribution_enabled', false),
+            'contact_source_system' => config('sms-exports.contact_source_system'),
+            'contact_source_contract_sha256' => config('sms-exports.contact_source_contract_sha256'),
+            'run_archive_enabled' => config('sms-exports.run_archive_enabled', false),
+            'run_archive_policy_sha256' => config('sms-exports.run_archive_policy_sha256'),
+            'email_handoff_enabled' => config('sms-exports.email_handoff_enabled', false),
+            'email_report_name' => config('sms-exports.email_report_name', 'SMS Export'),
+            'email_report_company' => config('sms-exports.email_report_company'),
+            'email_report_source' => config('sms-exports.email_report_source', 'plaw'),
+            'email_allowed_link_hosts' => config('sms-exports.email_allowed_link_hosts', []),
+            'file_publication_enabled' => config('sms-exports.file_publication_enabled', false),
+            'email_sender_configured' => config('sms-exports.email_handoff_enabled', false) === true
+                && \Cmd\Reports\Services\GraphMailboxClient::isConfigured('GRAPH_LT'),
+            'run_archive_provider_fields_present' => count(array_filter(array_map(
+                static fn (string $field) => config('sms-exports.run_archive_'.$field),
+                ['bucket', 'prefix', 'region', 'expected_owner', 'encryption']
+            ), static fn ($value): bool => is_string($value) && trim($value) !== '')) === 5,
+        ], [
+            'durable_summary' => $durableSummarySchema,
+            'record_workflow' => $recordSchema,
+            'file_options' => $fileSchema,
+            'tu_date_proof' => $tuDateSchema,
+            'contact_attribution' => $contactSchema,
+            'archive_receipt' => $fileSchema && $has('TblSMSRuns', ['Archive_Receipt_JSON']),
+            'email_outbox' => $has('TblSMSEmailOutbox', ['Request_ID', 'Run_Sha256', 'Payload_JSON', 'Payload_Sha256',
+                'State', 'Created_By', 'Created_At', 'Attempted_At', 'Accepted_At', 'Error_Code']),
+            'file_publication' => $has('TblSMSFilePublications', ['Request_ID', 'Run_Sha256', 'Plan_JSON', 'Plan_Sha256', 'State', 'Created_By', 'Created_At', 'Completed_At', 'Error_Code'])
+                && $has('TblSMSFilePublicationParts', ['Request_ID', 'Part_Number', 'State', 'Attempted_At', 'Completed_At', 'Receipt_JSON', 'Receipt_Sha256', 'Error_Code']),
+        ], class_exists(\ZipArchive::class) && method_exists(\ZipArchive::class, 'setMtimeName'));
+        $this->line('SMS delivery policy: '.json_encode($release['delivery_policy'], JSON_THROW_ON_ERROR));
+        $this->line('SMS feature gates: '.json_encode($release['feature_gates'], JSON_THROW_ON_ERROR));
+        $this->line('SMS controlled core production test: '.json_encode($release['controlled_core_test'], JSON_THROW_ON_ERROR));
+        $this->line('SMS artifact storage: '.json_encode($release['artifact_storage'], JSON_THROW_ON_ERROR));
+        $this->line('SMS email handoff: '.json_encode($release['email_handoff'], JSON_THROW_ON_ERROR));
+        if ($release['email_handoff']['enabled'] && ! $release['email_handoff']['local_prerequisites_present']) {
+            $this->warn('SMS email is enabled without the outbox schema, explicit table scope, allowed link hosts or Lending Tower sender configuration.');
+        }
+        $this->line('External release acceptance still required: '.json_encode($release['external_release_acceptance'], JSON_THROW_ON_ERROR));
+        $archive = $release['artifact_storage'];
+        if ($archive['archive_enabled'] && (! $archive['archive_receipt_schema_ready']
+            || ! $archive['archive_policy_hash_configured'] || ! $archive['archive_provider_fields_present'])) {
+            $this->warn('SMS archival is enabled without its explicit receipt schema, policy hash or provider fields.');
+        }
+        if ($release['delivery_policy']['mailer_clock'] === 'UNCONFIRMED') {
+            $this->warn('New debt lookup is blocked by an obsolete mailer-clock override; Jacob confirmed TblMarketing.Send_Date.');
+        }
+        foreach ($release['feature_gates'] as $name => $gate) {
+            if ($gate['enabled'] && ! $gate['configuration_schema_ready']) {
+                $this->warn($name.' is enabled without all required local configuration/schema prerequisites. Disable it until the coordinated release is complete.');
+            }
+        }
+        $coreTest = $release['controlled_core_test'];
+        if (! $coreTest['core_configuration_schema_ready']) {
+            $this->warn('The four core SMS workflow gates are not ready together with the required schema/runtime prerequisites.');
+        }
+        if (! $coreTest['external_integrations_disabled']) {
+            $this->warn('A controlled core test is not isolated: disable unconfigured TU enrichment/date, contact attribution, archive, publication and email integrations.');
+        }
         $this->line('Durable SMS summary: '.json_encode([
             'enabled' => (bool) config('sms-exports.durable_availability_enabled', false),
             'snapshot_isolation' => $snapshot->Snapshot_Isolation ?? 'unknown',

@@ -50,6 +50,7 @@ final class SmsDurableAvailabilityTest extends TestCase
         $this->db = $capsule->getConnection('sqlsrv');
         $this->db->setTransactionManager(new DatabaseTransactionsManager);
         (require dirname(__DIR__, 2).'/database/sms-migrations/2026_10_20_000001_create_sms_availability_summary.php')->up();
+        (require dirname(__DIR__, 2).'/database/sms-migrations/2026_10_22_000002_add_sms_tu_summary_date_proof.php')->up();
         $this->ledger = new SmsAvailabilityLedger;
         $this->service = new SmsDurableAvailabilityService($this->ledger);
         $this->app->instance(SmsAvailabilityLedger::class, $this->ledger);
@@ -113,6 +114,7 @@ final class SmsDurableAvailabilityTest extends TestCase
         self::assertSame(4, $result['texted_before']);
         self::assertSame('2026-10-20T12:00:00+00:00', $result['counted_at']);
         self::assertNull($result['latest_data_date']);
+        self::assertFalse($result['latest_data_date_available']);
         self::assertCount(1, $this->jobs);
         self::assertFalse($this->app->bound('cache'));
     }
@@ -136,6 +138,148 @@ final class SmsDurableAvailabilityTest extends TestCase
         self::assertCount(3, $this->jobs);
         $this->jobs[2]->handle($this->service, $this->export());
         self::assertSame('ready', $this->service->request()['state']);
+    }
+
+    private function withDate(?string $date): array
+    {
+        return self::COUNTS + ['latest_data_date' => $date];
+    }
+
+    private function goodDate(?string $date): array
+    {
+        config(['sms-exports.tu_completion_date_enabled' => true]);
+        $this->service->request();
+        $this->jobs[0]->handle($this->service, $this->export(fn () => $this->withDate($date)));
+        return $this->service->request();
+    }
+
+    public function test_completed_tu_date_and_counts_publish_together_and_remain_distinct_from_count_time(): void
+    {
+        $result = $this->goodDate('2026-10-13');
+        self::assertSame('ready', $result['state']);
+        self::assertSame('2026-10-13', $result['latest_data_date']);
+        self::assertTrue($result['latest_data_date_available']);
+        self::assertSame('2026-10-20T12:00:00+00:00', $result['counted_at']);
+        self::assertSame(11, $result['eligible']);
+    }
+
+    public function test_before_first_completed_batch_date_remains_null_even_with_successful_counts(): void
+    {
+        $result = $this->goodDate(null);
+        self::assertSame('ready', $result['state']); self::assertNull($result['latest_data_date']);
+        self::assertTrue($result['latest_data_date_available']);
+        self::assertSame(11, $result['eligible']);
+    }
+
+    public function test_missing_invalid_or_regressed_date_keeps_the_entire_previous_summary(): void
+    {
+        $good = $this->goodDate('2026-10-13');
+        foreach ([[], ['latest_data_date' => '2026-02-29'], ['latest_data_date' => null], ['latest_data_date' => '2026-10-06']] as $data) {
+            $this->service->request(true);
+            $job = $this->jobs[array_key_last($this->jobs)];
+            try {
+                $job->handle($this->service, $this->export(fn () => ['eligible' => 99, 'never_texted' => 90, 'texted_before' => 9] + $data));
+                self::fail('Expected invalid completion evidence refusal.');
+            } catch (\InvalidArgumentException|\LogicException) { self::assertTrue(true); }
+            $failed = $this->service->request();
+            self::assertSame('failed', $failed['state']);
+            foreach (['eligible', 'never_texted', 'texted_before', 'counted_at', 'latest_data_date'] as $key) self::assertSame($good[$key], $failed[$key]);
+            Carbon::setTestNow(now()->addSeconds(SmsAvailabilityLedger::RETRY_SECONDS + 1));
+        }
+    }
+
+    public function test_completion_racing_count_invalidates_the_whole_tuple_then_retries_with_new_date(): void
+    {
+        $good = $this->goodDate('2026-10-13');
+        $this->service->request(true);
+        $this->jobs[1]->handle($this->service, $this->export(function (): array {
+            $this->db->transaction(fn () => $this->ledger->dirty($this->db));
+            return ['eligible' => 99, 'never_texted' => 90, 'texted_before' => 9, 'latest_data_date' => '2026-10-20'];
+        }));
+        $pending = $this->service->request();
+        self::assertSame('pending', $pending['state']);
+        foreach (['eligible', 'counted_at', 'latest_data_date'] as $key) self::assertSame($good[$key], $pending[$key]);
+        $this->jobs[2]->handle($this->service, $this->export(fn () => $this->withDate('2026-10-20')));
+        self::assertSame('2026-10-20', $this->service->request()['latest_data_date']);
+    }
+
+    public function test_flag_rollback_does_not_clear_a_previously_verified_date_or_accept_injected_dates(): void
+    {
+        $this->goodDate('2026-10-13');
+        config(['sms-exports.tu_completion_date_enabled' => false]);
+        $this->service->request(true);
+        $this->jobs[1]->handle($this->service, $this->export(fn () => $this->withDate('2099-01-01')));
+        $result = $this->service->request();
+        self::assertSame('2026-10-13', $result['latest_data_date']);
+        self::assertFalse($result['latest_data_date_available']);
+    }
+
+    public function test_missing_completion_source_fails_the_real_snapshot_and_retains_the_last_tuple(): void
+    {
+        $good = $this->goodDate('2026-10-13');
+        $this->service->request(true);
+        $export = new class extends SmsProspectExportRepository {
+            public function availabilityWithTimeout(): array { return ['eligible' => 99, 'never_texted' => 90, 'texted_before' => 9]; }
+        };
+        try { $this->jobs[1]->handle($this->service, $export); self::fail('Missing TU schema must fail the snapshot.'); }
+        catch (RuntimeException $error) { self::assertStringContainsString('completion schema', $error->getMessage()); }
+        $failed = $this->service->request();
+        self::assertSame('failed', $failed['state']);
+        foreach (['eligible', 'never_texted', 'texted_before', 'counted_at', 'latest_data_date'] as $key) self::assertSame($good[$key], $failed[$key]);
+        self::assertSame(0, $this->db->transactionLevel());
+    }
+
+    public function test_enabling_date_reporting_never_relabels_old_cached_counts_as_no_data_imported(): void
+    {
+        $this->good();
+        config(['sms-exports.tu_completion_date_enabled' => true]);
+        $old = $this->service->request();
+        self::assertSame('ready', $old['state']); self::assertNull($old['latest_data_date']);
+        self::assertFalse($old['latest_data_date_available']);
+        $this->service->request(true);
+        $this->jobs[1]->handle($this->service, $this->export(fn () => $this->withDate(null)));
+        self::assertTrue($this->service->request()['latest_data_date_available']);
+    }
+
+    public function test_disabled_recount_invalidates_date_proof_before_a_later_reenable(): void
+    {
+        $this->goodDate('2026-10-13');
+        config(['sms-exports.tu_completion_date_enabled' => false]);
+        $this->service->request(true);
+        $this->jobs[1]->handle($this->service, $this->export());
+        config(['sms-exports.tu_completion_date_enabled' => true]);
+        $result = $this->service->request();
+        self::assertSame('2026-10-13', $result['latest_data_date']);
+        self::assertFalse($result['latest_data_date_available']);
+    }
+
+    public function test_missing_date_proof_migration_fails_closed_without_losing_legacy_counts(): void
+    {
+        $good = $this->good();
+        $this->db->getSchemaBuilder()->table(SmsAvailabilityLedger::TABLE, fn ($t) => $t->dropColumn('tu_date_verified'));
+        config(['sms-exports.tu_completion_date_enabled' => true]);
+        $this->service->request(true);
+        try { $this->jobs[1]->handle($this->service, $this->export(fn () => $this->withDate(null))); self::fail('Expected migration guard.'); }
+        catch (\LogicException $error) { self::assertStringContainsString('date-proof migration', $error->getMessage()); }
+        $failed = $this->service->request();
+        self::assertSame('failed', $failed['state']); self::assertFalse($failed['latest_data_date_available']);
+        self::assertSame($good['eligible'], $failed['eligible']); self::assertSame($good['counted_at'], $failed['counted_at']);
+    }
+
+    public function test_additive_date_proof_migration_retains_existing_summary_without_claiming_verification(): void
+    {
+        $good = $this->good();
+        $this->db->getSchemaBuilder()->table(SmsAvailabilityLedger::TABLE, fn ($t) => $t->dropColumn('tu_date_verified'));
+        $migration = require dirname(__DIR__, 2).'/database/sms-migrations/2026_10_22_000002_add_sms_tu_summary_date_proof.php';
+        $migration->up();
+        self::assertSame(0, (int) $this->ledger->read()['tu_date_verified']);
+        self::assertSame($good['eligible'], $this->service->request()['eligible']);
+        self::assertSame($good['counted_at'], $this->service->request()['counted_at']);
+        try { $migration->up(); self::fail('An already installed date-proof schema must be refused.'); }
+        catch (RuntimeException $error) { self::assertStringContainsString('already exists', $error->getMessage()); }
+        try { $migration->down(); self::fail('Date proof must be retained.'); }
+        catch (RuntimeException $error) { self::assertStringContainsString('Retain', $error->getMessage()); }
+        self::assertSame(0, (int) $this->ledger->read()['tu_date_verified']);
     }
 
     public function test_dirty_mid_query_discards_sample_and_coalesces_one_follow_up(): void

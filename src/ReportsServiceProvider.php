@@ -130,6 +130,12 @@ class ReportsServiceProvider extends ServiceProvider
             __DIR__ . '/../database/sms-migrations/2026_10_20_000001_create_sms_availability_summary.php' => database_path('migrations/2026_10_20_000001_create_sms_availability_summary.php'),
             __DIR__ . '/../database/sms-migrations/2026_10_20_000002_create_sms_prospect_backfill_ledger.php' => database_path('migrations/2026_10_20_000002_create_sms_prospect_backfill_ledger.php'),
             __DIR__ . '/../database/sms-migrations/2026_10_20_000003_add_sms_record_approval.php' => database_path('migrations/2026_10_20_000003_add_sms_record_approval.php'),
+            __DIR__ . '/../database/sms-migrations/2026_10_22_000001_add_sms_run_file_options.php' => database_path('migrations/2026_10_22_000001_add_sms_run_file_options.php'),
+            __DIR__ . '/../database/sms-migrations/2026_10_22_000002_add_sms_tu_summary_date_proof.php' => database_path('migrations/2026_10_22_000002_add_sms_tu_summary_date_proof.php'),
+            __DIR__ . '/../database/sms-migrations/2026_10_23_000001_add_sms_contact_attribution_evidence.php' => database_path('migrations/2026_10_23_000001_add_sms_contact_attribution_evidence.php'),
+            __DIR__ . '/../database/sms-migrations/2026_10_23_000002_add_sms_run_archive_receipt.php' => database_path('migrations/2026_10_23_000002_add_sms_run_archive_receipt.php'),
+            __DIR__ . '/../database/sms-migrations/2026_10_23_000003_create_sms_email_outbox.php' => database_path('migrations/2026_10_23_000003_create_sms_email_outbox.php'),
+            __DIR__ . '/../database/sms-migrations/2026_10_23_000004_create_sms_file_publications.php' => database_path('migrations/2026_10_23_000004_create_sms_file_publications.php'),
         ], 'reports-sms-migrations');
         // PMOD migrations ship with the package but are NOT auto-loaded.
         // Consumers must explicitly opt in by publishing them:
@@ -235,6 +241,9 @@ class ReportsServiceProvider extends ServiceProvider
                 SyncPhoneNumbers::class,
                 LoadSmsProspects::class,
                 \Cmd\Reports\Console\Commands\SmsReadinessCommand::class,
+                \Cmd\Reports\Console\Commands\SmsRunArchiveCommand::class,
+                \Cmd\Reports\Console\Commands\SmsRunEmailCommand::class,
+                \Cmd\Reports\Console\Commands\SmsRunPublicationCommand::class,
                 \Cmd\Reports\Console\Commands\RefreshSmsAvailability::class,
                 SyncCalls::class,
                 SyncNegotiatorPayrollData::class,
@@ -274,6 +283,29 @@ class ReportsServiceProvider extends ServiceProvider
 
     public function register()
     {
+        // Lightweight until explicitly preparing/sending a handoff. Reading run
+        // status must not resolve a recipient database or contact Graph.
+        $this->app->bind(\Cmd\Reports\Services\SmsRunEmailGateway::class,
+            static fn () => new \Cmd\Reports\Services\SmsTableRunEmailGateway());
+        $this->app->bind(\Cmd\Reports\Services\SmsRunLinkPublisher::class,
+            static fn () => new \Cmd\Reports\Services\SmsDropboxRunLinkPublisher());
+        // Lazy and disabled by default. Never reuse the legacy export disk's destination.
+        $this->app->bind(\Cmd\Reports\Services\SmsRunArchiveStore::class, static function () {
+            $region = config('sms-exports.run_archive_region');
+            $policy = config('sms-exports.run_archive_policy_sha256');
+            if (! config('sms-exports.run_archive_enabled', false) || ! is_string($region)
+                || ! preg_match('/^[a-z]{2}(?:-[a-z]+)+-\d$/D', $region) || ! is_string($policy)
+                || ! preg_match('/^[a-f0-9]{64}$/D', $policy)) {
+                throw new \RuntimeException('The SMS archive provider requires its reviewed explicit configuration.');
+            }
+            return new \Cmd\Reports\Services\SmsS3RunArchiveStore(
+                new \Aws\S3\S3Client(['version' => 'latest', 'region' => $region]),
+                (string) config('sms-exports.run_archive_bucket'),
+                (string) config('sms-exports.run_archive_expected_owner'),
+                (string) config('sms-exports.run_archive_encryption'),
+                config('sms-exports.run_archive_kms_key_arn')
+            );
+        });
         // Bind the Forth CRM/Pay execution gateway as the default implementation.
         // Host apps that need a different gateway can override this binding in their
         // own service provider after calling parent::register().

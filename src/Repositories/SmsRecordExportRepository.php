@@ -6,8 +6,12 @@ namespace Cmd\Reports\Repositories;
 
 use Carbon\Carbon;
 use Cmd\Reports\Services\SmsAvailabilityRefresh;
-use Cmd\Reports\Services\SmsProspectValues;
 use Cmd\Reports\Services\SmsRecordPolicy;
+use Cmd\Reports\Services\SmsDeliveryPolicy;
+use Cmd\Reports\Services\SmsRunArtifactBundle;
+use Cmd\Reports\Services\SmsRunOptions;
+use Cmd\Reports\Services\SmsRunArtifactFilename;
+use Cmd\Reports\Services\SmsTierSelectionSql;
 use Illuminate\Database\Query\Builder;
 use RuntimeException;
 use Symfony\Component\HttpKernel\Exception\HttpException;
@@ -48,15 +52,20 @@ class SmsRecordExportRepository extends SqlSrvRepository
     {
         SmsRecordPolicy::assertReady();
         if ($target < 1 || $target > 10000000) throw new HttpException(422, 'Enter a positive whole-number quantity up to 10,000,000.');
+        $initial = $this->table('TblSMSRuns')->where('Request_ID', $requestId)->useWritePdo()->first();
+        $options = $initial ? $this->tierSelectionOptions($initial, $target) : null;
+        if ($options !== null) {
+            if ($this->connection()->getDriverName() !== 'sqlsrv') throw new RuntimeException('Source-tier selection requires SQL Server SNAPSHOT; no alternate selector was substituted.');
+            return $this->withQueryTimeout(SmsProspectExportRepository::STEP_QUERY_TIMEOUT,
+                fn () => $this->withReadSnapshot(fn (): array => $this->selectTiersNow($requestId, $target, $options)));
+        }
         return $this->withQueryTimeout(SmsProspectExportRepository::STEP_QUERY_TIMEOUT, fn () => $this->connection()->transaction(function () use ($requestId, $target): array {
             $run = $this->table('TblSMSRuns')->where('Request_ID', $requestId)->lockForUpdate()->first();
             if (! $run || ! SmsRecordPolicy::isRecord($run) || $run->Status !== 'selecting') throw new HttpException(409, 'This record batch is not selecting.');
+            if ($this->tierSelectionOptions($run, $target) !== null) throw new HttpException(409, 'The frozen selector changed before selection; no membership was written.');
             if ($this->table('TblProspectsExport')->where('Request_ID', $requestId)->exists()
                 || $this->table('TblSMSHistory')->where('Request_ID', $requestId)->exists()) throw new HttpException(409, 'This batch already has frozen membership.');
-            $clean = "UPPER(REPLACE(TRIM(Tier),' ',''))";
-            $tier = $this->connection()->getDriverName() === 'sqlsrv' ? SmsProspectValues::tierSql('Tier')
-                : "CASE WHEN {$clean} GLOB 'T[1-9]' THEN {$clean} WHEN {$clean} GLOB 'TIER[1-9]' THEN 'T'||substr({$clean},-1) WHEN {$clean} GLOB '[1-9]' THEN 'T'||{$clean} END";
-            $rows = $this->eligible()->selectRaw("? AS Request_ID, PK AS Prospect_PK, Phone, {$tier} AS Debt_Tier,
+            $rows = $this->eligible()->selectRaw("? AS Request_ID, PK AS Prospect_PK, Phone, NULL AS Debt_Tier,
                 Client,Address,City,State,Zip,Email,
                 CASE WHEN Last_SMS_Date IS NULL THEN 0 ELSE 1 END AS Was_Previously_Texted,
                 Last_SMS_Date AS Last_SMS_Date_At_Selection", [$requestId])
@@ -71,6 +80,51 @@ class SmsRecordExportRepository extends SqlSrvRepository
         }));
     }
 
+    /** NULL selector preserves every old optionless/four-key run, including all-tier runs. */
+    private function tierSelectionOptions(object $run, int $target): ?array
+    {
+        if ((int) $run->Target !== $target) throw new HttpException(409, 'Selection quantity differs from its frozen run.');
+        $options = SmsRunOptions::fromStored($run->Run_Options_JSON ?? null, $target);
+        if ($options !== null && ! isset($options['tier_selection_policy']) && $options['tiers'] !== SmsRunOptions::TIERS) {
+            throw new RuntimeException('Unversioned tier subsets cannot be selected.');
+        }
+        return isset($options['tier_selection_policy']) ? $options : null;
+    }
+
+    /** One logical resolve/filter/priority/TOP and frozen insert in a consistent source snapshot. */
+    private function selectTiersNow(string $requestId, int $target, array $options): array
+    {
+        $run = $this->table('TblSMSRuns')->where('Request_ID', $requestId)->lockForUpdate()->first();
+        if (! $run || ! SmsRecordPolicy::isRecord($run) || $run->Status !== 'selecting'
+            || $this->tierSelectionOptions($run, $target) !== $options) throw new HttpException(409, 'The frozen source-tier batch is not selecting.');
+        if ($run->Selected !== null || $this->table('TblProspectsExport')->where('Request_ID', $requestId)->exists()
+            || $this->table('TblSMSHistory')->where('Request_ID', $requestId)->exists()) throw new HttpException(409, 'This batch already has frozen membership.');
+        $eligible = $this->eligible()->select(['PK','Phone','Client','Address','City','State','Zip','Email','Creation_Date','Last_SMS_Date']);
+        $sql = SmsTierSelectionSql::select($eligible->toSql(), $options['tiers'], (string) config('sms-exports.mailer_recency_date', 'Send_Date'));
+        $this->connection()->affectingStatement($sql, [...$eligible->getBindings(), $target, $requestId, ...$options['tiers']]);
+        $this->assertTierPrices($requestId, $options);
+        $counts = $this->composition($requestId);
+        if ($counts['selected'] > $target) throw new RuntimeException('Tier selection exceeded its frozen quantity.');
+        $this->table('TblSMSRuns')->where('Request_ID', $requestId)->update([
+            // NULL means not selected yet. Zero is a durable completed selection too.
+            'Selected' => $counts['selected'], 'Never_Texted' => $counts['never_texted'], 'Previously_Texted' => $counts['previously_texted'],
+        ]);
+        return ['selected' => $counts['selected'], 'target' => $target, 'shortfall' => max(0, $target - $counts['selected']), 'contacted_flagged' => 0];
+    }
+
+    /** Validate immutable selected prices, never look up current sources again. */
+    public function assertTierPrices(string $requestId, array $options): void
+    {
+        if (($options['tier_selection_policy'] ?? null) !== SmsRunOptions::TIER_SELECTION_POLICY) throw new RuntimeException('An explicit source-tier selector is required.');
+        if ($this->table('TblProspectsExport')->where('Request_ID', $requestId)->where(function (Builder $q) use ($options): void {
+            $q->whereNull('Debt_Tier')->orWhereNotIn('Debt_Tier', $options['tiers'])
+                ->orWhereNull('Debt_Amount')->orWhere('Debt_Amount', '<=', 0)
+                ->orWhereRaw('Debt_Amount <> CAST(Debt_Amount / 1000 AS bigint) * 1000')
+                ->orWhereNull('Debt_Source')->orWhereNotIn('Debt_Source', ['TblTUData','TblMailers','Tier'])
+                ->orWhereNull('Debt_Source_PK')->orWhere('Debt_Source_PK', '<=', 0);
+        })->exists()) throw new RuntimeException('Frozen source-tier membership or price provenance does not reconcile.');
+    }
+
     public function composition(string $requestId): array
     {
         $row = $this->table('TblProspectsExport')->where('Request_ID', $requestId)->selectRaw('COUNT(*) AS Selected,
@@ -80,14 +134,54 @@ class SmsRecordExportRepository extends SqlSrvRepository
     }
 
     /** Validate frozen content, not current eligibility. Upturn owns live suppression after generation. */
-    public function assertFrozen(string $requestId, int $expected): void
+    public function assertFrozen(string $requestId, int $expected, bool $pendingIds = false): void
     {
+        $run = $this->table('TblSMSRuns')->where('Request_ID', $requestId)->first();
+        if ($pendingIds) {
+            $stored = $run ? SmsRunOptions::fromStored($run->Run_Options_JSON ?? null, (int) $run->Target) : null;
+            if (($stored['filename_version'] ?? null) !== SmsRunOptions::APPROVAL_FILENAME_VERSION
+                || $this->table('TblSMSDrops')->where('Request_ID', $requestId)->exists()
+                || $this->table('TblSMSHistory')->where('Request_ID', $requestId)->exists()) {
+                throw new RuntimeException('Pending SMS IDs require the explicit approval workflow and no saved drops/history.');
+            }
+        }
+        if ($run && ($options = $this->tierSelectionOptions($run, (int) $run->Target)) !== null) $this->assertTierPrices($requestId, $options);
         $rows = $this->table('TblProspectsExport')->where('Request_ID', $requestId);
         if ((clone $rows)->count() !== $expected || $expected < 1
-            || (clone $rows)->where(function ($q): void {
-                $q->whereNull('SMS_Drop_PK')->orWhereNull('Debt_Tier')->orWhereNotIn('Debt_Tier', ['T1','T2','T3','T4','T5','T6','T7','T8','T9'])
+            || (clone $rows)->where(function ($q) use ($pendingIds): void {
+                if ($pendingIds) $q->whereNotNull('SMS_Drop_PK')->orWhereNotNull('Drop_Name');
+                else $q->whereNull('SMS_Drop_PK');
+                $q->orWhereNull('Debt_Tier')->orWhereNotIn('Debt_Tier', ['T1','T2','T3','T4','T5','T6','T7','T8','T9'])
+                    ->orWhereRaw('Debt_Amount <> CAST(Debt_Amount / 1000 AS bigint) * 1000')
                     ->orWhereNull('Debt_Amount')->orWhere('Debt_Amount', '<=', 0)->orWhereNull('Was_Previously_Texted')->orWhereNotIn('Was_Previously_Texted', [0,1]);
             })->exists()) throw new RuntimeException('Frozen SMS membership, tier, debt or count does not reconcile.');
+    }
+
+    /** Allocation is committed separately; every saved tier/member reference must reconcile on replay. */
+    public function assertAllocatedDrops(string $requestId, int $expected, array $options): string
+    {
+        if (($options['filename_version'] ?? null) !== SmsRunOptions::APPROVAL_FILENAME_VERSION) throw new RuntimeException('Approval-time SMS allocation requires its explicit version.');
+        $this->assertFrozen($requestId, $expected);
+        if ($this->table('TblSMSHistory')->where('Request_ID', $requestId)->exists()) throw new RuntimeException('An uncommitted SMS approval cannot already contain history.');
+        $bad = $this->table('TblProspectsExport', 'x')->leftJoin('TblSMSDrops as d', 'd.PK', '=', 'x.SMS_Drop_PK')
+            ->where('x.Request_ID', $requestId)->where(function (Builder $q) use ($requestId, $options): void {
+                $q->whereNull('x.Drop_Name')->orWhereNull('d.PK')->orWhereNull('d.Request_ID')->orWhere('d.Request_ID', '<>', $requestId)
+                    ->orWhereNull('d.Debt_Tier')->orWhereColumn('d.Debt_Tier', '<>', 'x.Debt_Tier')
+                    ->orWhereColumn('d.Drop_Name', '<>', 'x.Drop_Name')->orWhereNull('d.Drop_Date')->orWhere('d.Drop_Date', '<>', $options['send_date']);
+            })->exists();
+        if ($bad) throw new RuntimeException('Saved SMS drop allocation does not match its frozen members and planned date.');
+        $tiers = $this->table('TblProspectsExport')->where('Request_ID', $requestId)->groupBy('Debt_Tier')->selectRaw('Debt_Tier,COUNT(*) AS Records')->get()->keyBy('Debt_Tier');
+        $drops = $this->table('TblSMSDrops')->where('Request_ID', $requestId)->get(['PK','Drop_Name','Debt_Tier','Amount_Dropped']);
+        if ($drops->count() !== $tiers->count()) throw new RuntimeException('Saved SMS drop count does not match the frozen tiers.');
+        $seen = [];
+        foreach ($drops as $drop) {
+            if (isset($seen[$drop->Debt_Tier]) || ! isset($tiers[$drop->Debt_Tier]) || (int) $drop->Amount_Dropped !== (int) $tiers[$drop->Debt_Tier]->Records
+                || $this->table('TblProspectsExport')->where('Request_ID', $requestId)->where('SMS_Drop_PK', $drop->PK)->count() !== (int) $drop->Amount_Dropped) {
+                throw new RuntimeException('Saved SMS tier/drop composition does not reconcile.');
+            }
+            $seen[$drop->Debt_Tier] = true;
+        }
+        return SmsRunArtifactFilename::rangeFromDrops($drops->map(static fn ($drop): array => ['Drop_Name' => $drop->Drop_Name])->all());
     }
 
     /** Stream exact frozen values; no mutable prospect join or post-generation eligibility check. */
@@ -100,15 +194,15 @@ class SmsRecordExportRepository extends SqlSrvRepository
         $file = fopen($path, 'wb');
         if ($file === false) throw new RuntimeException('Unable to open the SMS record export.');
         $count = 0;
+        $singlePhone = (bool) config('sms-exports.single_phone_csv', false);
         try {
-            if (fputcsv($file, SmsProspectExportRepository::CSV_HEADER, ',', '"', '', "\r\n") === false) throw new RuntimeException('Unable to write the SMS header.');
+            if (fputcsv($file, SmsDeliveryPolicy::header($singlePhone), ',', '"', '', "\r\n") === false) throw new RuntimeException('Unable to write the SMS header.');
             $rows = $this->table('TblProspectsExport', 'x')->join('TblSMSDrops as d', 'd.PK', '=', 'x.SMS_Drop_PK')
                 ->where('x.Request_ID', $requestId)->orderBy('d.Drop_Name')->orderBy('x.Prospect_PK')
                 ->select(['x.Client','x.Address','x.Debt_Amount','x.Phone','d.Drop_Date'])->cursor();
             foreach ($rows as $row) {
-                $debt = rtrim(rtrim(number_format((float) $row->Debt_Amount, 2, '.', ''), '0'), '.');
-                $cells = [explode(' ', trim((string) $row->Client))[0], (string) $row->Address, $debt,
-                    (string) $row->Phone, '', '', '', '', Carbon::parse($row->Drop_Date)->toDateString()];
+                $cells = SmsDeliveryPolicy::row((string) $row->Client, (string) $row->Address,
+                    $row->Debt_Amount, (string) $row->Phone, Carbon::parse($row->Drop_Date)->toDateString(), $singlePhone);
                 $cells = array_map(fn (string $cell): string => preg_match('/^[=+@\-\t\r\n]/', $cell) ? "'".$cell : $cell, $cells);
                 if (fputcsv($file, $cells, ',', '"', '', "\r\n") === false) throw new RuntimeException('Unable to write a frozen SMS record.');
                 $count++;
@@ -116,6 +210,34 @@ class SmsRecordExportRepository extends SqlSrvRepository
             if (! fflush($file)) throw new RuntimeException('Unable to finish the SMS record export.');
         } finally { fclose($file); }
         return $count;
+    }
+
+    /** Stream the immutable record snapshot into one atomic, versioned CSV/ZIP bundle. */
+    public function writeVersionedBundle(string $requestId, string $runDirectory, string $stem, array $options): array
+    {
+        return $this->withQueryTimeout(SmsProspectExportRepository::STEP_QUERY_TIMEOUT, function () use ($requestId, $runDirectory, $stem, $options): array {
+            SmsRecordPolicy::assertReady();
+            $run = $this->table('TblSMSRuns')->where('Request_ID', $requestId)->first();
+            if (! $run || ! SmsRecordPolicy::isRecord($run) || $run->Status !== 'building_file'
+                || SmsRunOptions::fromStored($run->Run_Options_JSON ?? null, (int) $run->Target) !== $options) {
+                throw new HttpException(409, 'This batch has no matching frozen file options.');
+            }
+            $pendingIds = ($options['filename_version'] ?? null) === SmsRunOptions::APPROVAL_FILENAME_VERSION;
+            $this->assertFrozen($requestId, (int) $run->Selected, $pendingIds);
+            $cells = (function () use ($requestId, $options): \Generator {
+                $pendingIds = ($options['filename_version'] ?? null) === SmsRunOptions::APPROVAL_FILENAME_VERSION;
+                $query = $this->table('TblProspectsExport', 'x')->where('x.Request_ID', $requestId);
+                $rows = $pendingIds
+                    ? $query->orderBy('x.Debt_Tier')->orderBy('x.Prospect_PK')->select(['x.Client', 'x.Address', 'x.Debt_Amount', 'x.Phone'])->cursor()
+                    : $query->join('TblSMSDrops as d', 'd.PK', '=', 'x.SMS_Drop_PK')->orderBy('d.Drop_Name')->orderBy('x.Prospect_PK')
+                        ->select(['x.Client', 'x.Address', 'x.Debt_Amount', 'x.Phone', 'd.Drop_Date'])->cursor();
+                foreach ($rows as $row) {
+                    yield SmsDeliveryPolicy::rowForFormat($options['csv_format'], (string) $row->Client, (string) $row->Address,
+                        $row->Debt_Amount, (string) $row->Phone, $pendingIds ? $options['send_date'] : Carbon::parse($row->Drop_Date)->toDateString());
+                }
+            })();
+            return (new SmsRunArtifactBundle)->build($runDirectory, $stem, $cells, (int) $run->Selected, $options);
+        });
     }
 
     /** Called in the service's same approval transaction, with the run row already locked. */
@@ -145,7 +267,8 @@ class SmsRecordExportRepository extends SqlSrvRepository
         foreach ($tierCounts as $tier) {
             $drop = $this->table('TblSMSDrops')->where('Request_ID', $requestId)->where('Debt_Tier', $tier->Debt_Tier);
             if ((clone $drop)->count() !== 1) throw new RuntimeException('The approved tier drop does not reconcile.');
-            $drop->update(['Drop_Date' => $date, 'Amount_Dropped' => (int) $tier->Records]);
+            // Keep the planned CSV send date; approval time is stored separately in history.
+            $drop->update(['Amount_Dropped' => (int) $tier->Records]);
         }
         if ($this->table('TblSMSHistory')->where('Request_ID', $requestId)->count() !== $expected) throw new RuntimeException('Approved history count does not reconcile.');
         $this->table('TblProspectsExport')->where('Request_ID', $requestId)->delete();

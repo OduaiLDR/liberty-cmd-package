@@ -3,9 +3,13 @@
 namespace Cmd\Reports\Repositories;
 
 use Carbon\Carbon;
-use Cmd\Reports\Services\SmsProspectValues;
 use Cmd\Reports\Services\SmsAvailabilityRefresh;
 use Cmd\Reports\Services\SmsRecordPolicy;
+use Cmd\Reports\Services\SmsCurrentDebtSql;
+use Cmd\Reports\Services\SmsDeliveryPolicy;
+use Cmd\Reports\Services\SmsTuCompletionDate;
+use Cmd\Reports\Services\SmsWorkflowLock;
+use Cmd\Reports\Services\SmsRunOptions;
 use Illuminate\Validation\ValidationException;
 use RuntimeException;
 
@@ -97,7 +101,7 @@ SQL);
                 $selected = $db->affectingStatement($this->eligibleSql().<<<SQL
 
 INSERT INTO TblProspectsExport (Request_ID, Prospect_PK, Phone, Debt_Tier, Client, Address, City, State, Zip, Email)
-SELECT TOP (?) ?, PK, Phone, Tier, Client, Address, City, State, Zip, Email
+SELECT TOP (?) ?, PK, Phone, NULL, Client, Address, City, State, Zip, Email
 FROM Eligible
 WHERE Phone_Rank = 1
 ORDER BY {$priority}
@@ -138,7 +142,15 @@ FROM Eligible WHERE Phone_Rank = 1
     /** Durable workers count a consistent snapshot; legacy callers keep their existing path. */
     public function availabilitySnapshotWithTimeout(): array
     {
-        return $this->withReadSnapshot(fn (): array => $this->availabilityWithTimeout());
+        return $this->withReadSnapshot(function (): array {
+            $counts = $this->availabilityWithTimeout();
+            if (SmsTuCompletionDate::enabled()) {
+                // Do not read TU metadata after ending the count snapshot, or attach
+                // a newer completed dataset date to counts from an older dataset.
+                $counts['latest_data_date'] = app(SmsTuCompletionDate::class)->latest($this->connection());
+            }
+            return $counts;
+        });
     }
 
     /**
@@ -167,14 +179,14 @@ PhoneHistory AS (
     SELECT Phone, MAX(Send_Date) AS Sent FROM TblSMSLegacySends GROUP BY Phone
 ),
 Prospects AS (
-    SELECT p.PK, p.Phone, p.Tier, p.Creation_Date, p.Client, p.Address, p.City, p.State, p.Zip, p.Email,
+    SELECT p.PK, p.Phone, p.Creation_Date, p.Client, p.Address, p.City, p.State, p.Zip, p.Email,
         p.Contacted, p.Invalid_Phone, p.Opt_Out,
         CASE WHEN h.Sent IS NOT NULL AND (p.Latest_Export_Date IS NULL OR h.Sent > p.Latest_Export_Date)
             THEN h.Sent ELSE p.Latest_Export_Date END AS Latest_Export_Date
     FROM TblProspects p LEFT JOIN PhoneHistory h ON h.Phone = p.Phone
 ),
 Eligible AS (
-    SELECT p.PK, p.Phone, p.Tier, p.Latest_Export_Date, p.Creation_Date,
+    SELECT p.PK, p.Phone, p.Latest_Export_Date, p.Creation_Date,
         p.Client, p.Address, p.City, p.State, p.Zip, p.Email,
         ROW_NUMBER() OVER (PARTITION BY p.Phone ORDER BY {$priority}) AS Phone_Rank
     FROM Prospects p
@@ -190,13 +202,11 @@ SQL;
     }
 
     /**
-     * Debt for each selected row (Jacob, 14 Oct): TblTUData (first + last name, address, 5-digit
-     * zip; newest Creation_Date), else TblMailers (same person: Client, Address, 5-digit zip; newest
-     * PK), else the tier's default amount, recorded as source Tier with no source key. Rows still
-     * without an amount are recorded as None and stay blank. Only positive debts count: IWCO mailer
-     * rows were saved as 0.
+     * Resolve TU first, positive-debt mailers second, then the approved mailer-tier amount.
+     * Missing dates, conflicting same-date revisions and invalid latest values remain held.
+     * The tier-default argument is retained for caller compatibility; the resolver uses
+     * the approved fixed tier table, not arbitrary caller-supplied amounts.
      *
-     * @param array<string, float|int|string> $tierDebts Debt_Tier => default debt
      * @return array{TblTUData:int, TblMailers:int, Tier:int, None:int}
      */
     public function lookupDebts(string $requestId, array $tierDebts = [], ?callable $progress = null): array
@@ -204,75 +214,25 @@ SQL;
         return $this->withQueryTimeout(self::STEP_QUERY_TIMEOUT, fn (): array => $this->lookupDebtsNow($requestId, $tierDebts, $progress));
     }
 
-    /** @return array{TblTUData:int, TblMailers:int, Tier:int, None:int} */
     private function lookupDebtsNow(string $requestId, array $tierDebts, ?callable $progress): array
     {
         $this->assertOpenRun($requestId);
+        // Validate the confirmed mailer clock before any mutation.
+        $sql = SmsCurrentDebtSql::resolve((string) config('sms-exports.mailer_recency_date', 'Send_Date'));
         $db = $this->connection();
-        // One pass over TblTUData for the whole run. Production's copy is 26.5M rows (52 GB) with no
-        // index, so a lookup per person would read all of it each time. With a covering index on
-        // address the hash join reads that index instead of the table.
-        $hashJoins = self::HASH_JOINS;
-        $tu = $db->update(<<<SQL
-WITH Wanted AS (
-    SELECT x.PK AS Export_PK, COALESCE(x.Address, p.Address) AS Address,
-        COALESCE(x.Zip, p.Zip) AS Zip, COALESCE(x.Client, p.Client) AS Client
-    FROM TblProspectsExport x
-    JOIN TblProspects p ON p.PK = x.Prospect_PK
-    WHERE x.Request_ID = ? AND x.Debt_Source IS NULL
-),
-Matches AS (
-    SELECT w.Export_PK, t.PK, t.derivedFields1_unsecdebtbalance AS Debt, t.Tier_Tag,
-        ROW_NUMBER() OVER (PARTITION BY w.Export_PK ORDER BY t.Creation_Date DESC, t.PK DESC) AS Match_Rank
-    FROM Wanted w
-    JOIN TblTUData t ON t.ncoaAddr_addrLine1Txt = w.Address AND LEFT(t.ncoaAddr_zipCde, 5) = w.Zip
-    WHERE t.ncoaAddr_frstNme <> '' AND t.ncoaAddr_lastNme <> ''
-      AND LEFT(w.Client, LEN(t.ncoaAddr_frstNme) + 1) = t.ncoaAddr_frstNme + ' '
-      AND RIGHT(w.Client, LEN(t.ncoaAddr_lastNme) + 1) = ' ' + t.ncoaAddr_lastNme
-      AND t.derivedFields1_unsecdebtbalance > 0
-)
-UPDATE x SET Debt_Amount = m.Debt, Debt_Source = 'TblTUData', Debt_Source_PK = m.PK,
-    Debt_Tier = COALESCE(x.Debt_Tier, NULLIF(m.Tier_Tag, ''))
-FROM TblProspectsExport x
-JOIN Matches m ON m.Export_PK = x.PK AND m.Match_Rank = 1
-{$hashJoins}
-SQL, [$requestId]);
-        $progress && $progress('mailers');
-
-        // One indexed search per person: TblMailers (107M rows) has an index on (Client, Zip).
-        // It keeps Client and Address at 50 characters.
-        $mailers = $db->update(<<<'SQL'
-UPDATE x SET Debt_Amount = m.Debt_Amount, Debt_Source = 'TblMailers', Debt_Source_PK = m.PK,
-    Debt_Tier = COALESCE(x.Debt_Tier, NULLIF(m.Debt_Tier, ''))
-FROM TblProspectsExport x
-JOIN TblProspects p ON p.PK = x.Prospect_PK
-CROSS APPLY (
-    SELECT TOP 1 m.PK, m.Debt_Amount, m.Debt_Tier
-    FROM TblMailers m
-    WHERE m.Client = COALESCE(x.Client, p.Client) AND m.Address = COALESCE(x.Address, p.Address)
-      AND LEFT(m.Zip, 5) = COALESCE(x.Zip, p.Zip) AND m.Debt_Amount > 0
-    ORDER BY m.PK DESC
-) m
-WHERE x.Request_ID = ? AND x.Debt_Source IS NULL
-SQL, [$requestId]);
-
-        $progress && $progress('tiers');
-        // TU calls these Tier1..Tier9. Canonicalize before fallback and grouping, not after
-        // creating drops (otherwise one run incorrectly gets 18 drops instead of nine).
-        $tierSql = SmsProspectValues::tierSql('Debt_Tier');
-        $db->update("UPDATE TblProspectsExport SET Debt_Tier = {$tierSql} WHERE Request_ID = ?", [$requestId]);
-
-        $fromTier = 0;
-        foreach ($tierDebts as $tier => $debt) {
-            if (! is_numeric($debt) || (float) $debt <= 0) {
-                throw ValidationException::withMessages(['tier_debts' => "The default debt for tier {$tier} must be a positive number."]);
+        return $db->transaction(function () use ($db, $sql, $requestId, $progress): array {
+            if (! $db->table('TblProspectsExport')->where('Request_ID', $requestId)->whereNotNull('SMS_Drop_PK')->exists()) {
+                $progress && $progress('current_sources');
+                $db->update($sql, [$requestId]);
+                $db->update("UPDATE TblProspectsExport SET Debt_Source='None',Debt_Amount=NULL,Debt_Tier=NULL,Debt_Source_PK=NULL WHERE Request_ID=? AND Debt_Source IS NULL", [$requestId]);
             }
-            $fromTier += $db->update("UPDATE TblProspectsExport SET Debt_Source = 'Tier', Debt_Source_PK = NULL, Debt_Amount = CAST(? AS decimal(12,2))
-                WHERE Request_ID = ? AND Debt_Source IS NULL AND Debt_Tier = ?", [number_format((float) $debt, 2, '.', ''), $requestId, (string) $tier]);
-        }
-        $none = $db->update("UPDATE TblProspectsExport SET Debt_Source = 'None' WHERE Request_ID = ? AND Debt_Source IS NULL", [$requestId]);
-
-        return ['TblTUData' => $tu, 'TblMailers' => $mailers, 'Tier' => $fromTier, 'None' => $none];
+            $counts = ['TblTUData' => 0, 'TblMailers' => 0, 'Tier' => 0, 'None' => 0];
+            foreach ($db->table('TblProspectsExport')->where('Request_ID', $requestId)
+                ->groupBy('Debt_Source')->selectRaw('Debt_Source,COUNT(*) AS Records')->get() as $row) {
+                if (array_key_exists($row->Debt_Source, $counts)) $counts[$row->Debt_Source] = (int) $row->Records;
+            }
+            return $counts;
+        });
     }
 
     /**
@@ -285,8 +245,14 @@ SQL, [$requestId]);
     {
         $this->assertOpenRun($requestId);
         $db = $this->connection();
+        $run = $db->table('TblSMSRuns')->where('Request_ID', $requestId)->first();
+        $options = $run ? SmsRunOptions::fromStored($run->Run_Options_JSON ?? null, (int) $run->Target) : null;
+        if (($options['filename_version'] ?? null) === SmsRunOptions::APPROVAL_FILENAME_VERSION
+            && ($run->Status !== 'approving' || ! $run->Approved_At || ! $run->Approved_By || $dropDate->toDateString() !== $options['send_date'])) {
+            throw ValidationException::withMessages(['request_id' => 'Approval-time SMS IDs can only be assigned after accepted approval, on the frozen planned date.']);
+        }
 
-        return $db->transaction(function () use ($db, $requestId, $dropDate): array {
+        return SmsWorkflowLock::run('drop-numbering', fn () => $db->transaction(function () use ($db, $requestId, $dropDate): array {
             if ($db->table('TblProspectsExport')->where('Request_ID', $requestId)->whereNotNull('SMS_Drop_PK')->exists()) {
                 return $this->drops($requestId);
             }
@@ -310,7 +276,7 @@ SQL, [$requestId]);
             }
 
             return $this->drops($requestId);
-        });
+        }));
     }
 
     /** Writes the vendor file from the run's rows; returns the number of records written. */
@@ -341,15 +307,17 @@ LEFT JOIN Contacts c ON c.Phone = x.Phone
 LEFT JOIN TblSMSSuppressions s ON s.Phone = x.Phone
 WHERE x.Request_ID = ? AND (p.Contacted = 1 OR p.Invalid_Phone = 1 OR p.Opt_Out = 1
     OR x.Debt_Amount IS NULL OR x.Debt_Amount <= 0
+    OR x.Debt_Amount <> CAST(x.Debt_Amount / 1000 AS bigint) * 1000
     OR s.Opt_Out = 1 OR s.Invalid_Phone = 1 OR c.Phone IS NOT NULL)
 OPTION (HASH JOIN)
 SQL, [$requestId]);
-        if ((int) $blocked->n > 0) throw new RuntimeException('The reviewed list now contains a contact, suppressed phone or missing debt. Discard it and choose a fresh list.');
+        if ((int) $blocked->n > 0) throw new RuntimeException('The reviewed list contains a contact, suppressed phone, missing debt or an old unrounded debt snapshot. Discard it and choose a fresh list.');
         $out = fopen($path, 'wb');
         if ($out === false) throw new RuntimeException('Unable to open the SMS export file.');
         $count = 0;
+        $singlePhone = (bool) config('sms-exports.single_phone_csv', false);
         try {
-            if (fwrite($out, implode(',', self::CSV_HEADER)."\r\n") === false) throw new RuntimeException('Unable to write the SMS export.');
+            if (fwrite($out, implode(',', SmsDeliveryPolicy::header($singlePhone))."\r\n") === false) throw new RuntimeException('Unable to write the SMS export.');
             $rows = $this->table('TblProspectsExport', 'x')
                 ->join('TblProspects as p', 'p.PK', '=', 'x.Prospect_PK')
                 ->join('TblSMSDrops as d', 'd.PK', '=', 'x.SMS_Drop_PK')
@@ -358,11 +326,8 @@ SQL, [$requestId]);
                 ->selectRaw('x.Phone, x.Debt_Amount, COALESCE(x.Client, p.Client) AS Client, COALESCE(x.Address, p.Address) AS Address, d.Drop_Date')
                 ->cursor();
             foreach ($rows as $row) {
-                $this->writeCsvRow($out, [
-                    explode(' ', trim((string) $row->Client))[0], (string) $row->Address,
-                    $row->Debt_Amount === null ? '' : $this->formatDebt($row->Debt_Amount),
-                    (string) $row->Phone, '', '', '', '', Carbon::parse($row->Drop_Date)->toDateString(),
-                ]);
+                $this->writeCsvRow($out, SmsDeliveryPolicy::row((string) $row->Client, (string) $row->Address,
+                    $row->Debt_Amount, (string) $row->Phone, Carbon::parse($row->Drop_Date)->toDateString(), $singlePhone));
                 $count++;
             }
             if (! fflush($out)) throw new RuntimeException('Unable to finish the SMS export.');
@@ -527,16 +492,6 @@ SQL, [$requestId]);
         }
 
         return (int) $names->map(fn ($name) => preg_match('/^SMS(\d+)$/i', (string) $name, $m) ? (int) $m[1] : 0)->max();
-    }
-
-    private function formatDebt(mixed $value): string
-    {
-        $text = trim((string) $value);
-        if (! preg_match('/^(-?)(\d*)(?:\.(\d+))?$/D', $text, $m)) return $text;
-        $integer = ltrim($m[2], '0');
-        $fraction = rtrim($m[3] ?? '', '0');
-
-        return $m[1].($integer === '' ? '0' : $integer).($fraction === '' ? '' : '.'.$fraction);
     }
 
     /** @param resource $out @param array<int, string> $values */

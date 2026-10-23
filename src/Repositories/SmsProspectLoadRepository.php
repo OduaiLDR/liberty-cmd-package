@@ -13,8 +13,7 @@ use InvalidArgumentException;
  * row can still fill a missing phone or email). Safe to stop and run again. SQL Server only.
  *
  * Earlier SMS sends count as texted, so the next file starts with people who have not had one: the
- * drop and tier's TblMarketing.SMS_Last_Export_Date while loading, and markTexted() for the phones in
- * a sent file.
+ * verified phone send ledger while loading, and markTexted() for the phones in a sent file.
  */
 class SmsProspectLoadRepository extends SqlSrvRepository
 {
@@ -22,7 +21,7 @@ class SmsProspectLoadRepository extends SqlSrvRepository
     public const DROP_QUERY_TIMEOUT = 1800;
 
     /**
-     * The drop's people, cleaned: phone as 10 digits, 5-digit zip, tier T1-T9, sizes of TblProspects.
+     * The drop's people, cleaned: phone as 10 digits, 5-digit zip, sizes of TblProspects.
      * No index hints: forcing seeks made production read a whole drop once per person (15 Oct).
      */
     private const SOURCE_SQL = <<<'SQL'
@@ -34,14 +33,12 @@ WITH Source AS (
         CASE WHEN LEN(LTRIM(RTRIM(e.State))) = 2 THEN CAST(UPPER(LTRIM(RTRIM(e.State))) AS char(2)) END AS State,
         CAST(COALESCE(NULLIF(LTRIM(RTRIM(e.Zip5_Normalized)), ''), LEFT(LTRIM(e.Zip), 5)) AS varchar(10)) AS Zip,
         ph.Phone,
-        CASE WHEN LTRIM(RTRIM(e.Email)) LIKE '_%@_%._%' THEN CAST(LEFT(LTRIM(RTRIM(e.Email)), 254) AS varchar(254)) END AS Email,
-        CASE WHEN t.Debt_Tier LIKE 'T[1-9]' THEN CAST(UPPER(t.Debt_Tier) AS varchar(2)) END AS Tier
+        CASE WHEN LTRIM(RTRIM(e.Email)) LIKE '_%@_%._%' THEN CAST(LEFT(LTRIM(RTRIM(e.Email)), 254) AS varchar(254)) END AS Email
     FROM TblMailersUniqueEnriched e
     CROSS APPLY (SELECT REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(LTRIM(RTRIM(e.Phone)),
         '(', ''), ')', ''), '-', ''), ' ', ''), '.', ''), '+', '') AS Digits) d
     CROSS APPLY (SELECT CASE WHEN LEN(d.Digits) = 11 AND LEFT(d.Digits, 1) = '1' THEN SUBSTRING(d.Digits, 2, 10) ELSE d.Digits END AS Digits) d10
     CROSS APPLY (SELECT CASE WHEN LEN(d10.Digits) = 10 AND d10.Digits NOT LIKE '%[^0-9]%' THEN CAST(d10.Digits AS varchar(10)) END AS Phone) ph
-    OUTER APPLY (SELECT TOP 1 u.Debt_Tier FROM TblMailersUnique u WHERE u.External_ID = e.External_ID AND u.Drop_Name = e.Drop_Name ORDER BY u.PK DESC) t
     WHERE e.Drop_Name = ?
 ),
 People AS (
@@ -99,19 +96,18 @@ SQL;
         return $db->transaction(function () use ($db, $dropName, $sendDate, $fill): array {
             // Old deployments remain usable until the additive workflow migration is applied.
             $legacy = $db->getSchemaBuilder()->hasTable('TblSMSLegacySends')
-                ? "UNION ALL SELECT Send_Date FROM TblSMSLegacySends WHERE Phone = p.Phone" : '';
+                ? "SELECT Send_Date AS Sent FROM TblSMSLegacySends WHERE Phone = p.Phone" : 'SELECT CAST(NULL AS date) AS Sent';
             $added = $db->affectingStatement(self::SOURCE_SQL.<<<SQL
 
-INSERT INTO TblProspects (Creation_Date, Client, Address, City, State, Zip, Tier, Phone, Email, Latest_Export_Date, SMS_Attempts)
-SELECT ?, p.Client, p.Address, p.City, p.State, p.Zip, p.Tier, p.Phone, p.Email, x.Sent, CASE WHEN x.Sent IS NULL THEN 0 ELSE 1 END
+INSERT INTO TblProspects (Creation_Date, Client, Address, City, State, Zip, Phone, Email, Latest_Export_Date, SMS_Attempts)
+SELECT ?, p.Client, p.Address, p.City, p.State, p.Zip, p.Phone, p.Email, x.Sent, CASE WHEN x.Sent IS NULL THEN 0 ELSE 1 END
 FROM People p
 OUTER APPLY (SELECT MAX(d.Sent) AS Sent FROM (
-    SELECT CAST(m.SMS_Last_Export_Date AS date) AS Sent FROM TblMarketing m WHERE m.Drop_Name = ? AND m.Debt_Tier = p.Tier
     {$legacy}
 ) d) x
 WHERE p.Person_Rank = 1
   AND NOT EXISTS (SELECT 1 FROM TblProspects q WHERE q.Client = p.Client AND q.Address = p.Address AND q.Zip = p.Zip)
-SQL, [$dropName, $sendDate, $dropName]);
+SQL, [$dropName, $sendDate]);
             // The fill reads the drop a second time; --no-fill leaves it for a later run.
             $filled = ! $fill ? 0 : $db->affectingStatement(self::SOURCE_SQL.<<<'SQL'
 

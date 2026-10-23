@@ -357,8 +357,8 @@ LEFT JOIN dbo.TblSMSSuppressions s WITH(UPDLOCK,HOLDLOCK) ON s.Phone=n.Phone
 OUTER APPLY(SELECT MAX(Send_Date) AS Latest_Export_Date,COUNT(*) AS SMS_Attempts FROM #BFEvents e WHERE e.Phone=n.Phone) h OPTION(MAXDOP 1);
 CREATE TABLE #BFAdded(Source_PK int PRIMARY KEY,Prospect_PK int NOT NULL);
 MERGE dbo.TblProspects AS target USING #BFReady AS source ON 1=0
-WHEN NOT MATCHED THEN INSERT(Creation_Date,Client,Address,City,State,Zip,Tier,Phone,Email,Contacted,Response_Date,Invalid_Phone,Opt_Out,Latest_Export_Date,SMS_Attempts)
- VALUES(source.Creation_Date,source.Client,source.Address,source.City,source.State,source.Zip,source.Tier,source.Phone,source.Email,source.Contacted,NULL,source.Invalid_Phone,source.Opt_Out,source.Latest_Export_Date,source.SMS_Attempts)
+WHEN NOT MATCHED THEN INSERT(Creation_Date,Client,Address,City,State,Zip,Phone,Email,Contacted,Response_Date,Invalid_Phone,Opt_Out,Latest_Export_Date,SMS_Attempts)
+ VALUES(source.Creation_Date,source.Client,source.Address,source.City,source.State,source.Zip,source.Phone,source.Email,source.Contacted,NULL,source.Invalid_Phone,source.Opt_Out,source.Latest_Export_Date,source.SMS_Attempts)
 OUTPUT source.Source_PK,inserted.PK INTO #BFAdded;
 INSERT dbo.TblSMSProspectBackfillRows(Run_ID,Source_PK,Unique_Source_PK,Prospect_PK,Decision,Reason,Source_SHA256,After_SHA256,History_SHA256)
 SELECT @run,i.Source_PK,i.Unique_Source_PK,COALESCE(a.Prospect_PK,x.PK),
