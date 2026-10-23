@@ -42,7 +42,16 @@ class SmsRecordExportRepository extends SqlSrvRepository
     public function availability(): array
     {
         SmsRecordPolicy::assertReady();
-        $row = $this->eligible()->selectRaw('COUNT(*) AS Eligible, COALESCE(SUM(CASE WHEN Last_SMS_Date IS NULL THEN 1 ELSE 0 END),0) AS Never_Texted')->first();
+        $query = $this->eligible()->selectRaw('COUNT(*) AS Eligible, COALESCE(SUM(CASE WHEN Last_SMS_Date IS NULL THEN 1 ELSE 0 END),0) AS Never_Texted');
+        if ($this->connection()->getDriverName() === 'sqlsrv') {
+            // The production record aggregate otherwise chose nested-loop anti joins
+            // over millions of rows. Keep the same predicates/bindings and first-row
+            // shape, without relying on a Query Store hint for one query identity.
+            $query->limit(1);
+            $row = $this->connection()->selectOne($query->toSql().' OPTION (HASH JOIN)', $query->getBindings());
+        } else {
+            $row = $query->first();
+        }
         $all = (int) $row->Eligible;
         $never = (int) $row->Never_Texted;
         return ['eligible' => $all, 'never_texted' => $never, 'texted_before' => $all - $never];
