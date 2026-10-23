@@ -37,7 +37,7 @@ try {
     Container::setInstance($container);
     $container->instance('config', new Repository(['database' => ['default' => 'sqlsrv']]));
     $durable = in_array('--durable-summary', $argv, true);
-    config(['sms-exports.durable_availability_enabled' => $durable]);
+    config(['sms-exports.durable_availability_enabled' => $durable, 'sms-exports.mailer_recency_date' => 'Send_Date']);
     $capsule = new Manager($container);
     $capsule->addConnection(['driver' => 'sqlsrv', 'host' => '127.0.0.1,14330', 'database' => $database,
         'username' => 'sa', 'password' => 'LocalDev!2026Pass', 'encrypt' => 'no', 'trust_server_certificate' => 'yes'], 'sqlsrv');
@@ -60,19 +60,22 @@ try {
     $db->unprepared(<<<'SQL'
 CREATE TABLE TblTUData (PK int IDENTITY PRIMARY KEY, Creation_Date date, ncoaAddr_frstNme varchar(100), ncoaAddr_lastNme varchar(100),
  ncoaAddr_addrLine1Txt varchar(255), ncoaAddr_zipCde varchar(10), derivedFields1_unsecdebtbalance decimal(18,2), Tier_Tag varchar(30));
-CREATE TABLE TblMailers (PK int PRIMARY KEY, Client nvarchar(50), Address nvarchar(50), Zip nvarchar(50), Debt_Amount decimal(12,2), Debt_Tier nvarchar(5));
+CREATE TABLE TblMailers (PK int PRIMARY KEY, Client nvarchar(50), Address nvarchar(50), Zip nvarchar(50), Debt_Amount decimal(12,2), Debt_Tier nvarchar(5), Drop_Name nvarchar(50));
+CREATE TABLE TblMarketing (Drop_Name nvarchar(50), Debt_Tier nvarchar(5), Send_Date date, SMS_Last_Export_Date date);
+INSERT INTO TblMarketing VALUES ('debt-fixture','T2','2026-10-20',NULL);
 INSERT INTO TblTUData VALUES ('2026-01-01','Ann','Lee','1 Test St','90210',9000,'Tier1'),
  ('2026-09-01','Ann','Lee','1 Test St','90210-1234',11000,'Tier1'),
- ('2026-10-01','Ann','Lee','1 Test St','90210',0,'Tier9');
-INSERT INTO TblMailers VALUES (1,'Bob Ray','2 Test St','90210',15000,'T2'),(2,'Bob Ray','2 Test St','90210',0,'T2');
+ ('2026-10-01','Ann','Lee','1 Test St','90210',11000.01,'Tier1'),
+ ('2026-10-01','Cal','Reed','3 Test St','90210',10500,'Tier1');
+INSERT INTO TblMailers VALUES (1,'Bob Ray','2 Test St','90210',15000,'T2','debt-fixture'),(2,'Bob Ray','2 Test St','90210',15500,'T2','debt-fixture');
 INSERT INTO TblPhoneNumbers VALUES ('12025550110','2026-10-01');
 SQL);
     Carbon::setTestNow('2026-10-19 20:00:00');
     $person = function (string $name, string $address, string $phone, string $date, array $extra = []) use ($db): int {
-        return (int) $db->table('TblProspects')->insertGetId($extra + ['Client' => $name, 'Address' => $address, 'Zip' => '90210', 'Phone' => $phone, 'Creation_Date' => $date, 'Tier' => 'T1']);
+        return (int) $db->table('TblProspects')->insertGetId($extra + ['Client' => $name, 'Address' => $address, 'Zip' => '90210', 'Phone' => $phone, 'Creation_Date' => $date]);
     };
-    $ann = $person('Ann Lee', '1 Test St', '2025550101', '2026-10-19', ['Tier' => null]);
-    $bob = $person('Bob Ray', '2 Test St', '2025550102', '2026-10-18', ['Tier' => 'T2']);
+    $ann = $person('Ann Lee', '1 Test St', '2025550101', '2026-10-19');
+    $bob = $person('Bob Ray', '2 Test St', '2025550102', '2026-10-18');
     $cal = $person('Cal Reed', '3 Test St', '2025550103', '2026-10-17');
     $household = $person('Dan Reed', '3 Test St', '2025550103', '2026-10-16');
     $person('Eve Repeat', '5 Test St', '2025550105', '2026-10-19', ['Latest_Export_Date' => '2026-10-07', 'SMS_Attempts' => 1]);
@@ -87,9 +90,9 @@ SQL);
     $check($db->table('TblProspectsExport')->orderBy('PK')->pluck('Prospect_PK')->map(fn ($n) => (int) $n)->all() === [$ann, $bob, $cal], 'never texted and newest first');
     $repo->lookupDebts($run, ['T1' => 10000, 'T2' => 13500]);
     $priced = $db->table('TblProspectsExport')->orderBy('PK')->get();
-    $check(array_map(fn ($r) => $r->Debt_Source, $priced->all()) === ['TblTUData', 'TblMailers', 'Tier'], 'positive TU -> positive mailer -> tier waterfall');
-    $check((float) $priced[0]->Debt_Amount === 11000.0 && (int) $priced[0]->Debt_Source_PK === 2, 'newest positive TU debt and exact FK');
-    $drops = $repo->assignDrops($run, Carbon::today(SmsProspectExportRepository::TIMEZONE));
+    $check(array_map(fn ($r) => $r->Debt_Source, $priced->all()) === ['TblTUData', 'TblMailers', 'TblTUData'], 'current dated source only; no fabricated tier debt');
+    $check((float) $priced[0]->Debt_Amount === 12000.0 && (int) $priced[0]->Debt_Source_PK === 3, 'newest TU revision, upward rounding and exact FK');
+    $drops = $repo->assignDrops($run, \Cmd\Reports\Services\SmsDeliveryPolicy::followingMonday());
     $check(count($drops) === 2 && $drops[0]['Debt_Tier'] === 'T1', 'Tier1 is canonical T1, no duplicate tier drops');
     $file = tempnam(sys_get_temp_dir(), 'sms-workflow-test-'); $files[] = $file;
     $db->table('TblProspects')->where('PK', $ann)->update(['Client' => 'Changed Name', 'Address' => 'Changed Address']);
@@ -144,7 +147,6 @@ SQL);
     $db->unprepared(<<<'SQL'
 CREATE TABLE TblMailersUnique (PK int PRIMARY KEY, Drop_Name nvarchar(50), External_ID nvarchar(50), Debt_Tier nvarchar(5));
 CREATE TABLE TblEnrichedDropNames (Drop_Name nvarchar(50), Imported int);
-CREATE TABLE TblMarketing (Drop_Name nvarchar(50), Debt_Tier nvarchar(5), Send_Date date, SMS_Last_Export_Date date);
 CREATE TABLE TblMailersUniqueEnriched (PK int PRIMARY KEY, Drop_Name nvarchar(50), External_ID nvarchar(50), Client nvarchar(150), Address nvarchar(255), City nvarchar(100), State nvarchar(50), Zip nvarchar(20), Zip5_Normalized nvarchar(5), Phone nvarchar(50), Email nvarchar(255));
 INSERT INTO TblMailersUnique VALUES (1,'fixture-drop','u1','T1');
 INSERT INTO TblMarketing VALUES ('fixture-drop','T1','2026-10-12',NULL);

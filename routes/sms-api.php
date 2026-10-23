@@ -3,14 +3,17 @@
 use Cmd\Reports\Http\Controllers\SmsRunController;
 use Cmd\Reports\Http\Controllers\SmsOperationsController;
 use Cmd\Reports\Http\Controllers\SmsWorkflowApiController;
+use Cmd\Reports\Http\Middleware\SmsPermission;
+use Cmd\Reports\Http\Middleware\SmsFreshSession;
 use Illuminate\Support\Facades\Route;
 
 // Other consumers retain their Blade routes. CMD hosts must provide both authorization guards.
 if (class_exists(\App\Http\Middleware\VerifyCmdSession::class)
     && class_exists(\App\Http\Middleware\EnforceReportPolicy::class)) {
     Route::prefix('api/cmd')->middleware([
-        'api', \App\Http\Middleware\VerifyCmdSession::class,
+        'api', SmsFreshSession::class, \App\Http\Middleware\VerifyCmdSession::class,
         \App\Http\Middleware\EnforceReportPolicy::class,
+        SmsPermission::class,
     ])->group(function () {
         Route::get('mail-drop-export-report/preview', [SmsWorkflowApiController::class, 'preview'])->name('cmd.mail_drop_export.preview');
         Route::post('mail-drop-export-report/export', [SmsWorkflowApiController::class, 'export'])->name('cmd.mail_drop_export.export');
@@ -26,6 +29,7 @@ if (class_exists(\App\Http\Middleware\VerifyCmdSession::class)
         Route::post('mail-drop-export-report/workflow/enrichment/{requestId}/retry', [SmsOperationsController::class, 'retryEnrichment'])->whereUuid('requestId')->name('cmd.mail_drop_export.workflow.enrichment_retry');
         Route::get('mail-drop-export-report/runs', [SmsRunController::class, 'index'])->name('cmd.mail_drop_export.runs');
         Route::get('mail-drop-export-report/runs/availability', [SmsRunController::class, 'availability'])->name('cmd.mail_drop_export.runs.availability');
+        Route::get('mail-drop-export-report/runs/history', [SmsRunController::class, 'history'])->name('cmd.mail_drop_export.runs.history');
         Route::post('mail-drop-export-report/runs', [SmsRunController::class, 'store'])->name('cmd.mail_drop_export.runs.store');
         Route::get('mail-drop-export-report/runs/{requestId}', [SmsRunController::class, 'show'])->whereUuid('requestId')->name('cmd.mail_drop_export.runs.show');
         Route::get('mail-drop-export-report/runs/{requestId}/link', [SmsRunController::class, 'link'])->whereUuid('requestId')->name('cmd.mail_drop_export.runs.link');

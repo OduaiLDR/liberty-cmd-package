@@ -131,9 +131,14 @@ final class SmsAvailabilityLedger
         if ($counts['eligible'] !== $counts['never_texted'] + $counts['texted_before']) {
             throw new InvalidArgumentException('Availability counts must add up to eligible.');
         }
+        $publishDate = SmsTuCompletionDate::enabled();
+        if ($publishDate && ! array_key_exists('latest_data_date', $counts)) {
+            throw new InvalidArgumentException('The SMS snapshot must include its verified TU completion date.');
+        }
+        $dataDate = $publishDate ? SmsTuCompletionDate::validate($counts['latest_data_date']) : null;
         if ($scope !== $this->scope()) return false;
 
-        return $this->transaction(function (ConnectionInterface $db) use ($scope, $generation, $counts): bool {
+        return $this->transaction(function (ConnectionInterface $db) use ($scope, $generation, $counts, $publishDate, $dataDate): bool {
             $row = $this->locked($db, $scope);
             $now = Carbon::now('UTC');
             if (! $this->owns($row, $generation, ['running'], $now)) return false;
@@ -151,6 +156,13 @@ final class SmsAvailabilityLedger
                 return false;
             }
 
+            if ($publishDate && ! array_key_exists('tu_date_verified', $row)) {
+                throw new LogicException('Apply the reviewed SMS TU summary date-proof migration before activation.');
+            }
+            if ($publishDate && $row['latest_data_date'] !== null
+                && ($dataDate === null || $dataDate < $row['latest_data_date'])) {
+                throw new LogicException('The verified TU data date regressed. Keep the last complete SMS summary.');
+            }
             $this->row($db, $scope)->update([
                 'eligible' => $counts['eligible'],
                 'never_texted' => $counts['never_texted'],
@@ -161,7 +173,8 @@ final class SmsAvailabilityLedger
                 'lease_until' => null,
                 'retry_at' => null,
                 'error_code' => null,
-            ]);
+            ] + ($publishDate ? ['latest_data_date' => $dataDate, 'tu_date_verified' => true]
+                : (array_key_exists('tu_date_verified', $row) ? ['tu_date_verified' => false] : [])));
 
             return true;
         });

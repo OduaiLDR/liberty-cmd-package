@@ -23,7 +23,7 @@ try {
     unset($password);
     $db->exec(<<<'SQL'
 CREATE TABLE dbo.TblProspects (PK int NOT NULL PRIMARY KEY,Client varchar(150),Address varchar(200),City varchar(100),State char(2),Zip varchar(10),
- Phone varchar(10),Email varchar(254),Creation_Date date,Tier varchar(2),Contacted bit NOT NULL DEFAULT 0,Response_Date date,
+ Phone varchar(10),Email varchar(254),Creation_Date date,Contacted bit NOT NULL DEFAULT 0,Response_Date date,
  Invalid_Phone bit NOT NULL DEFAULT 0,Opt_Out bit NOT NULL DEFAULT 0,Latest_Export_Date date,SMS_Attempts int NOT NULL DEFAULT 0);
 CREATE INDEX IX_Identity ON dbo.TblProspects(Client,Address,Zip);
 CREATE TABLE dbo.TblMailersUniqueEnriched (PK int NOT NULL PRIMARY KEY,Client nvarchar(150),Address nvarchar(255),City nvarchar(100),State nvarchar(50),

@@ -34,7 +34,7 @@ final class SmsProspectReconciliation
             OBJECT_NAME(c.object_id) AS Table_Name,c.name AS Column_Name,TYPE_NAME(c.user_type_id) AS Data_Type,c.max_length
             FROM sys.columns c WHERE c.object_id IN (OBJECT_ID('dbo.TblProspects'),OBJECT_ID('dbo.TblMailersUniqueEnriched'),
                 OBJECT_ID('tu_repair_20261014.Lineage')) ORDER BY c.object_id,c.column_id");
-        foreach (['TblProspects' => ['PK','Client','Address','City','State','Zip','Phone','Email','Creation_Date','Tier',
+        foreach (['TblProspects' => ['PK','Client','Address','City','State','Zip','Phone','Email','Creation_Date',
             'Contacted','Response_Date','Invalid_Phone','Opt_Out','Latest_Export_Date','SMS_Attempts'],
             'TblMailersUniqueEnriched' => ['PK','Client','Address','City','State','Zip','Zip5_Normalized','Phone','Email','Drop_Name']] as $table => $required) {
             $present = array_column(array_values(array_filter($columns, fn ($c) => $c['Schema_Name'] === 'dbo' && $c['Table_Name'] === $table)), 'Column_Name');
@@ -88,7 +88,7 @@ final class SmsProspectReconciliation
         $db->beginTransaction();
         try {
             $rows = self::select($db, "WITH Scope AS (
-                SELECT TOP ({$size}) PK,Client,Address,City,State,Zip,Phone,Email,Creation_Date,Tier,
+                SELECT TOP ({$size}) PK,Client,Address,City,State,Zip,Phone,Email,Creation_Date,
                     Contacted,Response_Date,Invalid_Phone,Opt_Out,Latest_Export_Date,SMS_Attempts
                 FROM dbo.TblProspects WHERE PK>? AND PK<=? ORDER BY PK
             )

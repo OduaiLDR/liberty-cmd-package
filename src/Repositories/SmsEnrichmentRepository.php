@@ -226,9 +226,10 @@ final class SmsEnrichmentRepository extends SqlSrvRepository
                     $existing = $prospects[$item->Person_Key] ?? null;
                     if ($existing === null) {
                         $source = [];
-                        foreach (['Client', 'Address', 'City', 'State', 'Zip', 'Tier', 'Creation_Date'] as $field) {
+                        foreach (['Client', 'Address', 'City', 'State', 'Zip', 'Creation_Date'] as $field) {
                             $source[$field] = $item->{$field};
                         }
+                        // Tier stays in source evidence, never on the live prospect.
                         $pk = $this->table('TblProspects')->insertGetId($source + [
                             'Phone' => $contact['Phone'], 'Email' => $contact['Email'],
                         ], 'PK');
