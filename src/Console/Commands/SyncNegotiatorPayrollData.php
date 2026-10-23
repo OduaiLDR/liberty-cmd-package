@@ -2,13 +2,14 @@
 
 namespace Cmd\Reports\Console\Commands;
 
+use Cmd\Reports\Contracts\NgoPayrollEvidenceSync;
 use Cmd\Reports\Services\DBConnector;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
 
 class SyncNegotiatorPayrollData extends Command
 {
-    protected $signature = 'Sync:negotiator-payroll-data';
+    protected $signature = 'Sync:negotiator-payroll-data {--period= : NGO earnings period YYYY-MM} {--payout-date= : Optional payout date in the following month YYYY-MM-DD}';
 
     protected $description = 'Sync negotiator payroll data from Snowflake to SQL Server for LDR and PLAW';
 
@@ -17,8 +18,7 @@ class SyncNegotiatorPayrollData extends Command
         $this->info('[INFO] Syncing negotiator payroll data: starting.');
 
         try {
-            $sqlConnector = DBConnector::fromEnvironment('ldr');
-            $sqlConnector->initializeSqlServer();
+            $sqlConnector = $this->initializeSqlServerConnector();
         } catch (\Throwable $e) {
             $this->error('SQL Server connection failed: ' . $e->getMessage());
             Log::error('SyncNegotiatorPayrollData: SQL Server connection failed', ['exception' => $e]);
@@ -34,10 +34,14 @@ class SyncNegotiatorPayrollData extends Command
 
         $this->info("[INFO] Date range: {$startDateString} to {$endDateString}");
 
+        $successfulSources = [];
+
         // Process LDR
         $this->info('[INFO] Processing LDR data...');
         try {
-            $this->syncForSource('LDR', $sqlConnector, $startDateString, $endDateString);
+            $ldrSnowflake = $this->initializeSnowflakeConnector('ldr');
+            $this->syncForSource('LDR', $sqlConnector, $ldrSnowflake, $startDateString, $endDateString);
+            $successfulSources['LDR'] = $ldrSnowflake;
             $this->info('[INFO] LDR negotiator payroll data synced successfully.');
         } catch (\Throwable $e) {
             $this->error('LDR sync failed: ' . $e->getMessage());
@@ -47,20 +51,112 @@ class SyncNegotiatorPayrollData extends Command
         // Process PLAW
         $this->info('[INFO] Processing PLAW data...');
         try {
-            $this->syncForSource('PLAW', $sqlConnector, $startDateString, $endDateString);
+            $plawSnowflake = $this->initializeSnowflakeConnector('plaw');
+            $this->syncForSource('PLAW', $sqlConnector, $plawSnowflake, $startDateString, $endDateString);
+            $successfulSources['PLAW'] = $plawSnowflake;
             $this->info('[INFO] PLAW negotiator payroll data synced successfully.');
         } catch (\Throwable $e) {
             $this->error('PLAW sync failed: ' . $e->getMessage());
             Log::error('SyncNegotiatorPayrollData: PLAW sync failed', ['exception' => $e]);
         }
 
+        // Both original source paths finish before the optional, isolated evidence import.
+        $evidenceFailed = false;
+        if ($this->ngoEvidenceEnabled()) {
+            try {
+                [$evidencePeriod, $payoutDate] = $this->resolveEvidenceScope();
+                foreach ($successfulSources as $source => $snowflake) {
+                    try {
+                        $this->syncNgoEvidence($sqlConnector, $snowflake, $source, $evidencePeriod, $payoutDate);
+                    } catch (\Throwable $e) {
+                        $evidenceFailed = true;
+                        $this->error("{$source} NGO evidence sync failed. Legacy summaries were preserved.");
+                        Log::error('SyncNegotiatorPayrollData: NGO evidence sync failed', ['source' => $source, 'exceptionType' => get_class($e)]);
+                    }
+                }
+            } catch (\InvalidArgumentException $e) {
+                $evidenceFailed = true;
+                $this->error($e->getMessage());
+            }
+        }
+
         $this->info('[INFO] Negotiator payroll data sync completed.');
-        return Command::SUCCESS;
+        return $evidenceFailed ? Command::FAILURE : Command::SUCCESS;
     }
 
-    private function syncForSource(string $source, DBConnector $sqlConnector, string $startDate, string $endDate): void
+    /** @return array{0: string, 1: ?string} */
+    private function resolveEvidenceScope(): array
     {
-        $snowflake = DBConnector::fromEnvironment(strtolower($source));
+        $periodOption = $this->option('period');
+        $payoutOption = $this->option('payout-date');
+
+        if ($periodOption !== null && (!is_string($periodOption)
+            || !preg_match('/^(\d{4})-(0[1-9]|1[0-2])$/D', $periodOption, $matches)
+            || (int) $matches[1] < 1)) {
+            throw new \InvalidArgumentException('period must be a valid YYYY-MM value with year 0001 or later.');
+        }
+
+        if ($payoutOption !== null) {
+            if (!is_string($payoutOption)
+                || !preg_match('/^(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/D', $payoutOption, $matches)
+                || (int) $matches[1] < 1) {
+                throw new \InvalidArgumentException('payout-date must be a valid YYYY-MM-DD value.');
+            }
+            if ($periodOption === null) {
+                throw new \InvalidArgumentException('period is required when payout-date is provided.');
+            }
+
+            $payout = \DateTimeImmutable::createFromFormat('!Y-m-d', $payoutOption);
+            $dateErrors = \DateTimeImmutable::getLastErrors();
+            if (!$payout || $payout->format('Y-m-d') !== $payoutOption
+                || ($dateErrors !== false && ($dateErrors['warning_count'] > 0 || $dateErrors['error_count'] > 0))) {
+                throw new \InvalidArgumentException('payout-date must be a valid YYYY-MM-DD value.');
+            }
+
+            $nextMonth = (new \DateTimeImmutable($periodOption . '-01'))->modify('+1 month')->format('Y-m');
+            if ($payout->format('Y-m') !== $nextMonth) {
+                throw new \InvalidArgumentException('payout-date must be in the month after period.');
+            }
+        }
+
+        if ($periodOption === null) {
+            // Keep the same host timezone and day-of-month cutoff as SyncNGOEPFClearRates.
+            $today = new \DateTimeImmutable('today');
+            $target = (int) $today->format('j') < 6
+                ? $today->modify('first day of last month')
+                : $today->modify('first day of this month');
+            $periodOption = $target->format('Y-m');
+        }
+
+        return [$periodOption, $payoutOption];
+    }
+
+    protected function ngoEvidenceEnabled(): bool
+    {
+        return $this->laravel !== null && $this->laravel->bound('config')
+            && $this->laravel->make('config')->get('payroll.ngo_azure_evidence_sync_enabled', false) === true
+            && $this->laravel->bound(NgoPayrollEvidenceSync::class);
+    }
+
+    /** Optional hook supplied by cmd-runner; standalone package hosts keep legacy-only behavior. */
+    protected function syncNgoEvidence(
+        DBConnector $sqlServer,
+        DBConnector $snowflake,
+        string $source,
+        string $period,
+        ?string $payoutDate
+    ): void {
+        if (!$this->ngoEvidenceEnabled()) {
+            return;
+        }
+
+        /** @var NgoPayrollEvidenceSync $sync */
+        $sync = $this->laravel->make(NgoPayrollEvidenceSync::class);
+        $sync->sync($sqlServer, $snowflake, $source, $period, $payoutDate);
+    }
+
+    private function syncForSource(string $source, DBConnector $sqlConnector, DBConnector $snowflake, string $startDate, string $endDate): void
+    {
         $deleteSources = $this->buildDeleteSources($source);
         $deleteSourceList = $this->implodeSourceList($deleteSources);
 
@@ -156,6 +252,18 @@ class SyncNegotiatorPayrollData extends Command
         
         // Log to TblLog
         $this->insertLogRow($sqlConnector, $source, 'SUCCESS', count($rows1), count($rows2));
+    }
+
+    protected function initializeSqlServerConnector(): DBConnector
+    {
+        $connector = DBConnector::fromEnvironment('ldr');
+        $connector->initializeSqlServer();
+        return $connector;
+    }
+
+    protected function initializeSnowflakeConnector(string $environment): DBConnector
+    {
+        return DBConnector::fromEnvironment($environment);
     }
 
     private function insertEPFSummaryBatch(DBConnector $connector, array $rows, string $source): void
