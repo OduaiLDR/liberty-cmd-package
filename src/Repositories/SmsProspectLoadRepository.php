@@ -81,9 +81,7 @@ SQL;
     public function loadDrop(string $dropName, ?string $sendDate, bool $dryRun = false, bool $fill = true): array
     {
         // A large or busy drop can take longer than the default 5-minute query limit.
-        $result = SmsWorkflowLock::run('prospect-admission', fn () => $this->withQueryTimeout(self::DROP_QUERY_TIMEOUT, fn (): array => $this->loadDropNow($dropName, $sendDate, $dryRun, $fill)));
-        if (! $dryRun && $result['added'] + $result['filled'] > 0) SmsAvailabilityRefresh::afterCommit($this->connection());
-        return $result;
+        return SmsWorkflowLock::run('prospect-admission', fn () => $this->withQueryTimeout(self::DROP_QUERY_TIMEOUT, fn (): array => $this->loadDropNow($dropName, $sendDate, $dryRun, $fill)));
     }
 
     /** @return array{people:?int, added:int, filled:int} */
@@ -123,6 +121,7 @@ JOIN People p ON p.Person_Rank = 1 AND q.Client = p.Client AND q.Address = p.Add
 WHERE (q.Phone IS NULL AND p.Phone IS NOT NULL) OR (q.Email IS NULL AND p.Email IS NOT NULL)
 SQL, [$dropName]);
 
+            if ($added + $filled > 0) SmsAvailabilityRefresh::afterCommit($db);
             return ['people' => null, 'added' => $added, 'filled' => $filled];
         });
     }
@@ -159,9 +158,12 @@ SQL, [$dropName]);
                 $new = array_values(array_diff($chunk, $known));
                 foreach (array_chunk($new, 500) as $insert) {
                     if ($insert) {
-                        $this->table('TblSMSLegacySends')->insert(array_map(fn ($phone) => ['Phone' => $phone, 'Send_Date' => $sentDate], $insert));
-                        // Each insert may autocommit before a later insert/update fails.
-                        SmsAvailabilityRefresh::afterCommit($this->connection());
+                        $db = $this->connection();
+                        // Each chunk keeps its own commit even if a later insert/update fails.
+                        SmsAvailabilityRefresh::transaction($db, function () use ($db, $insert, $sentDate): void {
+                            $db->table('TblSMSLegacySends')->insert(array_map(fn ($phone) => ['Phone' => $phone, 'Send_Date' => $sentDate], $insert));
+                            SmsAvailabilityRefresh::afterCommit($db);
+                        });
                     }
                 }
             }
@@ -169,9 +171,13 @@ SQL, [$dropName]);
             if ($dryRun) {
                 $marked += (int) $this->connection()->selectOne("SELECT COUNT(*) AS n FROM TblProspects {$where}", [$sentDate])->n;
             } else {
-                $changed = $this->connection()->update("UPDATE TblProspects SET SMS_Attempts = SMS_Attempts + 1, Latest_Export_Date = ? {$where}", [$sentDate, $sentDate]);
+                $db = $this->connection();
+                $changed = SmsAvailabilityRefresh::transaction($db, function () use ($db, $where, $sentDate): int {
+                    $changed = $db->update("UPDATE TblProspects SET SMS_Attempts = SMS_Attempts + 1, Latest_Export_Date = ? {$where}", [$sentDate, $sentDate]);
+                    if ($changed > 0) SmsAvailabilityRefresh::afterCommit($db);
+                    return $changed;
+                });
                 $marked += $changed;
-                if ($changed > 0) SmsAvailabilityRefresh::afterCommit($this->connection());
             }
         }
 

@@ -46,6 +46,38 @@ abstract class SqlSrvRepository
         return $this->connection()->table($name);
     }
 
+    /** A worker-only consistent read; restore pooled session settings on every exit. */
+    protected function withReadSnapshot(callable $callback): mixed
+    {
+        $db = $this->connection();
+        if ($db->transactionLevel() !== 0 || $db->getPdo()->inTransaction()) {
+            throw new \RuntimeException('A summary snapshot must start outside a business transaction.');
+        }
+        if ($db->getDriverName() !== 'sqlsrv') return $db->transaction($callback);
+
+        $settings = $db->selectOne('SELECT transaction_isolation_level AS isolation_level FROM sys.dm_exec_sessions WHERE session_id = @@SPID', [], false);
+        $levels = [1 => 'READ UNCOMMITTED', 2 => 'READ COMMITTED', 3 => 'REPEATABLE READ', 4 => 'SERIALIZABLE', 5 => 'SNAPSHOT'];
+        $previous = $levels[(int) ($settings->isolation_level ?? 0)] ?? null;
+        if ($previous === null) throw new \RuntimeException('Cannot determine the summary connection isolation level.');
+
+        $db->unprepared('SET TRANSACTION ISOLATION LEVEL SNAPSHOT');
+        $snapshotPdo = $db->getPdo();
+        try {
+            // SQL Server deliberately fails if ALLOW_SNAPSHOT_ISOLATION is not enabled;
+            // do not silently downgrade to a read that can combine different versions.
+            return $db->transaction(function () use ($db, $snapshotPdo, $callback): mixed {
+                // Laravel can reconnect and retry beginTransaction(). That replacement
+                // session did not receive SET SNAPSHOT: fail before reading any source.
+                if ($db->getPdo() !== $snapshotPdo) {
+                    throw new \RuntimeException('The summary connection changed before its snapshot began. Retry the refresh.');
+                }
+                return $callback();
+            });
+        } finally {
+            $db->unprepared('SET TRANSACTION ISOLATION LEVEL '.$previous);
+        }
+    }
+
     protected function clampPerPage(int $perPage, int $default = 25, int $max = 1000): int
     {
         return $perPage > 0 && $perPage <= $max ? $perPage : $default;

@@ -185,7 +185,7 @@ class MarketingReportRepository extends SqlSrvRepository
 
         // Sent_At is stored in UTC. Convert both CA midnights separately so DST weeks
         // are correct, and leave the column bare for an indexed range lookup.
-        $runs = $this->table('TblSMSRuns')->where('Status', 'sent')
+        $runs = $this->table('TblSMSRuns')->whereIn('Status', ['sent', 'approved'])
             ->where('Sent_At', '>=', $start->copy()->utc()->toDateTimeString())
             ->where('Sent_At', '<', $start->copy()->addWeek()->utc()->toDateTimeString())
             ->orderBy('Request_ID');

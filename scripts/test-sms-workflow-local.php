@@ -16,6 +16,7 @@ use Cmd\Reports\Services\SmsRunService;
 use Illuminate\Config\Repository;
 use Illuminate\Container\Container;
 use Illuminate\Database\Capsule\Manager;
+use Illuminate\Database\DatabaseTransactionsManager;
 use Illuminate\Support\Facades\Facade;
 use Illuminate\Support\Str;
 use Illuminate\Translation\ArrayLoader;
@@ -35,6 +36,8 @@ try {
     $container = new Container;
     Container::setInstance($container);
     $container->instance('config', new Repository(['database' => ['default' => 'sqlsrv']]));
+    $durable = in_array('--durable-summary', $argv, true);
+    config(['sms-exports.durable_availability_enabled' => $durable]);
     $capsule = new Manager($container);
     $capsule->addConnection(['driver' => 'sqlsrv', 'host' => '127.0.0.1,14330', 'database' => $database,
         'username' => 'sa', 'password' => 'LocalDev!2026Pass', 'encrypt' => 'no', 'trust_server_certificate' => 'yes'], 'sqlsrv');
@@ -43,6 +46,14 @@ try {
     $container->instance('validator', new Factory(new Translator(new ArrayLoader, 'en'), $container));
     Facade::clearResolvedInstances(); Facade::setFacadeApplication($container);
     $db = $capsule->getConnection('sqlsrv');
+    $db->setTransactionManager(new DatabaseTransactionsManager);
+    if ($durable) {
+        (require dirname(__DIR__).'/database/sms-migrations/2026_10_20_000001_create_sms_availability_summary.php')->up();
+        // This test checks business SQL + atomic dirty markers, not queue infrastructure.
+        $refresh = Mockery::mock(\Cmd\Reports\Services\SmsDurableAvailabilityService::class);
+        $refresh->shouldReceive('request')->andReturn(['state' => 'pending']);
+        $container->instance(\Cmd\Reports\Services\SmsDurableAvailabilityService::class, $refresh);
+    }
     $db->unprepared('CREATE TABLE TblPhoneNumbers (Phone nvarchar(50), Created_Date date)');
     (require dirname(__DIR__).'/database/sms-migrations/2026_10_12_000001_create_sms_prospects_tables.php')->up();
     (require dirname(__DIR__).'/database/sms-migrations/2026_10_19_000001_complete_sms_workflow.php')->up();
@@ -147,6 +158,16 @@ SQL);
     $loaded = $load->loadDrop('fixture-drop', '2026-10-12');
     $check($loaded['added'] === 1 && $load->loadDrop('fixture-drop', '2026-10-12')['added'] === 0, 'repaired-source load deduplicates within and across reruns');
     $check($db->table('TblProspects')->where('Phone', '2025550140')->value('Latest_Export_Date') === '2026-10-08', 'newly loaded people inherit durable historical phone send dates');
+    if ($durable) {
+        $ledger = new \Cmd\Reports\Services\SmsAvailabilityLedger;
+        $row = $ledger->read();
+        $check($row !== null && (int) $row['revision'] >= 6 && $row['counted_at'] === null,
+            'business writes persisted summary revisions without inventing counts');
+        $before = (int) $row['revision'];
+        $feedback->import($feedbackId, 0, $input, 'test@example.invalid');
+        $load->loadDrop('fixture-drop', '2026-10-12');
+        $check((int) $ledger->read()['revision'] === $before, 'unchanged feedback and source-load replays do not dirty the summary');
+    }
     echo "{$checks} local SQL Server checks passed.\n";
 } finally {
     foreach ($files as $file) if (is_file($file)) unlink($file);

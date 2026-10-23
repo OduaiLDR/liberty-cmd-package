@@ -356,8 +356,8 @@ final class SmsHistoryInvoiceIntegrationTest extends TestCase
         $runQueries = array_filter($queries, fn (array $q): bool => str_contains($q['query'], 'from "TblSMSRuns"'));
         self::assertCount(1, $runQueries);
         $runIndex = array_key_first($runQueries);
-        self::assertStringContainsString('"Status" = ? and "Sent_At" >= ? and "Sent_At" < ?', $queries[$runIndex]['query']);
-        self::assertSame(['sent', '2026-10-19 07:00:00', '2026-10-26 07:00:00'], $queries[$runIndex]['bindings']);
+        self::assertStringContainsString('"Status" in (?, ?) and "Sent_At" >= ? and "Sent_At" < ?', $queries[$runIndex]['query']);
+        self::assertSame(['sent', 'approved', '2026-10-19 07:00:00', '2026-10-26 07:00:00'], $queries[$runIndex]['bindings']);
         $candidateQueries = array_filter($queries, fn (array $q): bool => str_starts_with($q['query'], 'select distinct "h"."SMS_Drop_PK"'));
         self::assertCount(2, $candidateQueries);
         foreach ($candidateQueries as $index => $query) {
