@@ -228,8 +228,8 @@ final class SmsEnrichmentWorkflowTest extends TestCase
         ]]);
         self::assertSame([1, 1, 1, 1, 0, 1], $this->counts($summary, ['returned', 'phone', 'email', 'both', 'neither', 'added']));
         $prospect = $this->db->table('TblProspects')->first();
-        self::assertSame(['Original Person', '10 Test Way', '00123', 'T4', '2026-10-12', '2025550101', 'source@example.test'],
-            [$prospect->Client, $prospect->Address, $prospect->Zip, $prospect->Tier, $prospect->Creation_Date, $prospect->Phone, $prospect->Email]);
+        self::assertSame(['Original Person', '10 Test Way', '00123', '2026-10-12', '2025550101', 'source@example.test'],
+            [$prospect->Client, $prospect->Address, $prospect->Zip, $prospect->Creation_Date, $prospect->Phone, $prospect->Email]);
         self::assertSame([0, 0, 0, 0, null], [(int) $prospect->Contacted, (int) $prospect->Invalid_Phone, (int) $prospect->Opt_Out, (int) $prospect->SMS_Attempts, $prospect->Latest_Export_Date]);
     }
 
@@ -454,7 +454,7 @@ final class SmsEnrichmentWorkflowTest extends TestCase
         $this->repository->stage('main', [$this->record('One')], 'operator');
         $id = $this->rows('main')[0]['Record_ID'];
         $pk = $this->db->table('TblProspects')->insertGetId([
-            'Client' => 'ONE', 'Address' => '10 TEST WAY', 'Zip' => '00123', 'Tier' => 'T9',
+            'Client' => 'ONE', 'Address' => '10 TEST WAY', 'Zip' => '00123',
             'Phone' => '2025550199', 'Email' => null, 'Contacted' => 1, 'Invalid_Phone' => 1, 'Opt_Out' => 1,
             'Response_Date' => '2026-09-20', 'Latest_Export_Date' => '2026-10-01', 'SMS_Attempts' => 8,
         ]);

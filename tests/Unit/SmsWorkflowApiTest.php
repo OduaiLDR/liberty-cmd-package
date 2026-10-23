@@ -213,11 +213,42 @@ test('API status never gives another actor a download URL', function () {
     $other->attributes->set('cmd_user', ['email' => 'other@example.com']);
     expect(fn () => $this->controller->exportStatus($other, $artifacts))->toThrow(HttpException::class);
     $owner = Request::create('/', 'GET', ['request_id' => $id]);
-    $owner->attributes->set('cmd_user', ['email' => 'one@example.com']);
+    $owner->attributes->set('cmd_user', ['email' => 'one@example.com', 'permissionIds' => ['cmd_sms_download']]);
     expect($this->controller->exportStatus($owner, $artifacts)->getData(true)['download_url'])->toBe('https://example.com/signed');
 });
-class SmsApiTestSessionGuard {}
-class SmsApiTestPolicyGuard {}
+test('download-only legacy status reads never recover or mutate incomplete tracking', function () {
+    $id = 'd983d923-1d9d-4099-a80c-1d9d7e5fdb7d';
+    $this->db->table('TblSmsExportRequests')->insert(['Request_ID' => $id, 'Actor_Email' => 'one@example.com',
+        'Status' => 'queued', 'Target' => 1, 'Created_At' => '2026-10-22', 'Updated_At' => '2026-10-22']);
+    $this->db->table('TblSmsExports')->insert(['PK' => 1]);
+    $artifacts = Mockery::mock(SmsExportArtifacts::class);
+    $artifacts->shouldNotReceive('recover'); $artifacts->shouldNotReceive('temporaryUrl');
+    $request = Request::create('/', 'GET', ['request_id' => $id]);
+    $request->attributes->set('cmd_user', ['email' => 'one@example.com', 'permissionIds' => ['cmd_sms_download']]);
+    $this->db->enableQueryLog(); $this->db->flushQueryLog();
+    expect($this->controller->exportStatus($request, $artifacts)->getData(true))->toBe(['request_id' => $id, 'status' => 'queued']);
+    expect(implode("\n", array_column($this->db->getQueryLog(), 'query')))->not->toMatch('/\b(?:UPDATE|INSERT|DELETE)\b/i');
+    $this->db->disableQueryLog();
+    expect($this->db->table('TblSmsExportRequests')->value('Status'))->toBe('queued');
+});
+
+test('explicit SMS manager retains owner-scoped legacy artifact recovery', function () {
+    $id = 'd983d923-1d9d-4099-a80c-1d9d7e5fdb7d';
+    $this->db->getSchemaBuilder()->table('TblSmsExports', function (Blueprint $table) {
+        $table->string('Request_ID')->nullable(); $table->integer('SMS_Count')->nullable();
+    });
+    $this->db->table('TblSmsExports')->insert(['PK' => 1, 'Request_ID' => $id, 'SMS_Count' => 1]);
+    $this->db->table('TblSmsExportRequests')->insert(['Request_ID' => $id, 'Actor_Email' => 'one@example.com',
+        'Status' => 'queued', 'Target' => 1, 'Created_At' => '2026-10-22', 'Updated_At' => '2026-10-22']);
+    $artifacts = Mockery::mock(SmsExportArtifacts::class);
+    $artifacts->shouldReceive('recover')->once()->with($id, 1)->andReturn(['key' => 'sms-exports/fixture.csv', 'format' => 'csv', 'bytes' => 100, 'count' => 1, 'part_count' => 1]);
+    $artifacts->shouldReceive('temporaryUrl')->once()->with('sms-exports/fixture.csv', 100)->andReturn('https://fixture.invalid/short-lived-legacy-link');
+    $request = Request::create('/', 'GET', ['request_id' => $id]);
+    $request->attributes->set('cmd_user', ['email' => 'one@example.com', 'permissionIds' => ['cmd_sms_manage']]);
+    $result = $this->controller->exportStatus($request, $artifacts)->getData(true);
+    expect($result['status'])->toBe('ready')->and($result['download_url'])->toBe('https://fixture.invalid/short-lived-legacy-link')
+        ->and($this->db->table('TblSmsExportRequests')->value('Status'))->toBe('ready');
+});
 
 test('API routes are host gated and bind correct methods and CMD report permissions', function () {
     $container = Container::getInstance();
@@ -228,14 +259,16 @@ test('API routes are host gated and bind correct methods and CMD report permissi
     $policy = 'App\\Http\\Middleware\\EnforceReportPolicy';
     if (! class_exists($session) || ! class_exists($policy)) {
         require __DIR__.'/../../routes/sms-api.php';
+        require __DIR__.'/../../routes/sms-download.php';
         expect($router->getRoutes()->count())->toBe(0);
     }
-    if (! class_exists($session)) class_alias(SmsApiTestSessionGuard::class, $session);
-    if (! class_exists($policy)) class_alias(SmsApiTestPolicyGuard::class, $policy);
+    // Definitions only (no host bootstrap). Avoid process-global fake class aliases
+    // that could make later real middleware tests depend on file execution order.
+    if (! class_exists($session)) require_once dirname(__DIR__, 3).'/cmd-runner/app/Http/Middleware/VerifyCmdSession.php';
+    if (! class_exists($policy)) require_once dirname(__DIR__, 3).'/cmd-runner/app/Http/Middleware/EnforceReportPolicy.php';
     require __DIR__.'/../../routes/sms-api.php';
-    expect($router->getRoutes()->count())->toBe(24);
     $run = '3f2a9c1b-0000-4000-8000-000000000001';
-    foreach ([
+    $expectedRoutes = [
         ['GET', 'mail-drop-export-report/preview', 'cmd.mail_drop_export.preview'],
         ['POST', 'mail-drop-export-report/export', 'cmd.mail_drop_export.export'],
         ['GET', 'mail-drop-export-report/export-status', 'cmd.mail_drop_export.export_status'],
@@ -246,10 +279,13 @@ test('API routes are host gated and bind correct methods and CMD report permissi
         ['GET', 'mail-drop-export-report/runs', 'cmd.mail_drop_export.runs', false],
         ['POST', 'mail-drop-export-report/runs', 'cmd.mail_drop_export.runs.store', false],
         ['GET', 'mail-drop-export-report/runs/availability', 'cmd.mail_drop_export.runs.availability'],
+        ['GET', 'mail-drop-export-report/runs/history', 'cmd.mail_drop_export.runs.history'],
         ['GET', "mail-drop-export-report/runs/{$run}", 'cmd.mail_drop_export.runs.show'],
         ['GET', "mail-drop-export-report/runs/{$run}/link", 'cmd.mail_drop_export.runs.link'],
         ['POST', "mail-drop-export-report/runs/{$run}/file", 'cmd.mail_drop_export.runs.file'],
         ['POST', "mail-drop-export-report/runs/{$run}/sent", 'cmd.mail_drop_export.runs.sent'],
+        ['POST', "mail-drop-export-report/runs/{$run}/approve", 'cmd.mail_drop_export.runs.approve'],
+        ['GET', "mail-drop-export-report/runs/{$run}/details", 'cmd.mail_drop_export.runs.details'],
         ['POST', "mail-drop-export-report/runs/{$run}/discard", 'cmd.mail_drop_export.runs.discard'],
         ['POST', "mail-drop-export-report/runs/{$run}/retry", 'cmd.mail_drop_export.runs.retry'],
         ['POST', "mail-drop-export-report/runs/{$run}/review-only", 'cmd.mail_drop_export.runs.review_only'],
@@ -260,11 +296,14 @@ test('API routes are host gated and bind correct methods and CMD report permissi
         ['POST', "mail-drop-export-report/workflow/enrichment/{$run}/retry", 'cmd.mail_drop_export.workflow.enrichment_retry'],
         ['POST', 'mail-drop-export-report/workflow/load', 'cmd.mail_drop_export.workflow.load'],
         ['POST', "mail-drop-export-report/workflow/load/{$run}/retry", 'cmd.mail_drop_export.workflow.load_retry'],
-    ] as $expected) {
+    ];
+    // Every registered route must have an explicit method/name/guard assertion.
+    expect($router->getRoutes()->count())->toBe(count($expectedRoutes));
+    foreach ($expectedRoutes as $expected) {
         [$method, $path, $name] = $expected;
         $route = $router->getRoutes()->match(Request::create('/api/cmd/'.$path, $method));
         expect($route->getName())->toBe($name);
-        expect($route->gatherMiddleware())->toBe(['api', $session, $policy]);
+        expect($route->gatherMiddleware())->toBe(['api', \Cmd\Reports\Http\Middleware\SmsFreshSession::class, $session, $policy, \Cmd\Reports\Http\Middleware\SmsPermission::class]);
         // runs answers GET (list) and POST (start); every other path takes one method.
         if ($expected[3] ?? true) {
             expect(fn () => $router->getRoutes()->match(Request::create('/api/cmd/'.$path, $method === 'GET' ? 'POST' : 'GET')))
@@ -272,6 +311,15 @@ test('API routes are host gated and bind correct methods and CMD report permissi
         }
     }
     // A run ID must be a UUID.
-    expect(fn () => $router->getRoutes()->match(Request::create('/api/cmd/mail-drop-export-report/runs/not-a-uuid/file', 'POST')))
-        ->toThrow(NotFoundHttpException::class);
+    foreach ([['POST', 'file'], ['POST', 'approve'], ['GET', 'details']] as [$method, $action]) {
+        expect(fn () => $router->getRoutes()->match(Request::create('/api/cmd/mail-drop-export-report/runs/not-a-uuid/'.$action, $method)))
+            ->toThrow(NotFoundHttpException::class);
+    }
+    require __DIR__.'/../../routes/sms-download.php';
+    foreach (['download' => 'cmd.sms_export.download', "runs/$run/download" => 'cmd.sms_run.download'] as $suffix => $name) {
+        $route = $router->getRoutes()->match(Request::create('/api/cmd/mail-drop-export-report/'.$suffix, 'GET'));
+        expect($route->getName())->toBe($name);
+        expect($route->gatherMiddleware())->toBe(['api', 'signed:relative', \Cmd\Reports\Http\Middleware\SmsFreshSession::class,
+            $session, \Cmd\Reports\Http\Middleware\SmsPermission::class.':download']);
+    }
 });

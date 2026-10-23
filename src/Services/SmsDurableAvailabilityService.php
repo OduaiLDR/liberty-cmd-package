@@ -70,7 +70,10 @@ class SmsDurableAvailabilityService
         $state = $unavailable || $status === 'failed' ? 'failed' : ($fresh ? 'ready' : 'pending');
         $response = ['state' => $state, 'summary_storage' => 'database',
             'selection_policy' => SmsRecordPolicy::current(),
-            // Kept unknown until a validated TU-completion contract supplies the date.
+            // Published with the counts, only from the opt-in TU completion checkpoint.
+            // An old cached count with a null date must not become "No data imported"
+            // merely because a flag changed before the first verified recount.
+            'latest_data_date_available' => SmsTuCompletionDate::enabled() && (bool) ($row['tu_date_verified'] ?? false),
             'latest_data_date' => $row['latest_data_date'] ?? null];
         if ($state === 'failed') $response['message'] = 'Could not refresh available people. The background refresh will retry.';
         if ($row !== null && $row['requested_at'] !== null) $response['requested_at'] = $this->iso($row['requested_at']);

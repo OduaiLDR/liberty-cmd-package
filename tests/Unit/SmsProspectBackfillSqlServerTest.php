@@ -117,7 +117,7 @@ final class SmsProspectBackfillSqlServerTest extends TestCase
         self::assertSame([0, 0, 0], array_map('intval', [$email['Contacted'], $email['Opt_Out'], $email['Invalid_Phone']]));
         foreach ($rows as $row) {
             self::assertSame('2026-09-12', $row['Creation_Date'], 'MAX mailer Send_Date, never the SMS marketing/export date.');
-            self::assertSame('T2', $row['Tier']);
+            self::assertArrayNotHasKey('Debt_Tier', $row);
             self::assertSame('00123', $row['Zip']);
             self::assertSame('Test City', $row['City']);
             self::assertSame('CA', $row['State']);
@@ -143,8 +143,8 @@ final class SmsProspectBackfillSqlServerTest extends TestCase
         $f = self::$fixture;
         [$proof, $candidates] = $this->begin([3]);
         self::assertSame(100, $proof['prospect_watermark_pk']);
-        $pk = $f->rows("INSERT dbo.TblProspects(Client,Address,Zip,Phone,Email,Tier,Creation_Date,Contacted,Opt_Out,Invalid_Phone,Response_Date,Latest_Export_Date,SMS_Attempts)
-            OUTPUT INSERTED.PK VALUES('CASE PERSON','3 TEST ST','00123','2025550198','keep@example.test','T8','2020-01-01',1,1,1,'2026-01-01','2026-01-02',23)")[0]['PK'];
+        $pk = $f->rows("INSERT dbo.TblProspects(Client,Address,Zip,Phone,Email,Creation_Date,Contacted,Opt_Out,Invalid_Phone,Response_Date,Latest_Export_Date,SMS_Attempts)
+            OUTPUT INSERTED.PK VALUES('CASE PERSON','3 TEST ST','00123','2025550198','keep@example.test','2020-01-01',1,1,1,'2026-01-01','2026-01-02',23)")[0]['PK'];
         self::assertGreaterThan(100, (int) $pk);
         self::assertSame($proof['source_guard'], SmsProspectCoverage::sourceGuard(SmsProspectCoverage::metadata($f->db)));
         $business = $f->snapshot();
@@ -446,7 +446,7 @@ SQL);
             self::assertSame(1, (int) $f->rows("SELECT COUNT(*) AS n FROM sys.indexes WHERE object_id=OBJECT_ID('dbo.TblMailersUnique') AND index_id=0")[0]['n']);
             $f->db->exec("INSERT dbo.TblMailersUnique VALUES(9001,'another-drop','external-1','T8'),(9002,'fixture-drop','external-1','T9')");
             self::assertSame(1, SmsProspectBackfill::applyBatch($f->db, self::RUN, 0, [$candidates[0]])['added']);
-            self::assertSame('T2', $f->rows('SELECT Tier FROM dbo.TblProspects WHERE PK>100')[0]['Tier']);
+            self::assertSame(1, (int) $f->rows('SELECT COUNT(*) AS n FROM dbo.TblProspects WHERE PK>100')[0]['n']);
             $f->db->exec("INSERT dbo.TblMailersUnique VALUES(1002,'fixture-drop','external-2','T9')");
             self::assertSame(1, SmsProspectBackfill::applyBatch($f->db, self::RUN, 1, [$candidates[1]])['deferred']);
             self::assertSame([['Prospect_PK' => null, 'Reason' => 'unresolved_source_owner']],

@@ -62,7 +62,7 @@ final class SmsRecordWorkflowTest extends TestCase
         $export = new class extends SmsProspectExportRepository {
             public function lookupDebts(string $id, array $debts = [], ?callable $progress = null): array
             {
-                $this->table('TblProspectsExport')->where('Request_ID', $id)->update(['Debt_Amount' => 10000, 'Debt_Source' => 'Tier']);
+                $this->table('TblProspectsExport')->where('Request_ID', $id)->update(['Debt_Amount' => 10000, 'Debt_Tier' => 'T1', 'Debt_Source' => 'TblTUData']);
                 return [];
             }
         };
@@ -94,7 +94,7 @@ final class SmsRecordWorkflowTest extends TestCase
     private function prospect(array $values = []): int
     {
         return (int) $this->db->table('TblProspects')->insertGetId($values + ['Client' => 'Synthetic Person', 'Address' => '1 Fixture St',
-            'City' => 'Test', 'State' => 'CA', 'Zip' => '00123', 'Phone' => '2025550100', 'Tier' => 'T1', 'Creation_Date' => '2026-10-01']);
+            'City' => 'Test', 'State' => 'CA', 'Zip' => '00123', 'Phone' => '2025550100', 'Creation_Date' => '2026-10-01']);
     }
 
     private function prepare(int $target = 10): object
@@ -130,6 +130,15 @@ final class SmsRecordWorkflowTest extends TestCase
         self::assertSame(['eligible' => 2, 'never_texted' => 2, 'texted_before' => 0], $this->records->availability(), 'Pending membership does not change eligibility.');
         self::assertSame(0, $this->db->table('TblSMSHistory')->count());
         self::assertSame(0, (int) $this->db->table('TblProspects')->sum('SMS_Attempts'));
+    }
+
+    public function test_selection_uses_source_debt_tier_without_a_live_tier_column(): void
+    {
+        $this->prospect();
+        $this->prepare(1);
+        self::assertSame('T1', $this->db->table('TblProspectsExport')->value('Debt_Tier'));
+        self::assertFalse($this->db->getSchemaBuilder()->hasColumn('TblProspects', 'Debt_Tier'));
+        self::assertFalse($this->db->getSchemaBuilder()->hasColumn('TblProspects', 'Tier'));
     }
 
     public function test_order_uses_creation_only_for_never_texted_then_date_and_pk_for_previous(): void
@@ -210,6 +219,49 @@ final class SmsRecordWorkflowTest extends TestCase
         $this->refuses(fn () => $this->runs->start(self::ID, 2, 'editor@example.invalid'));
     }
 
+    public function test_five_column_file_keeps_rounded_snapshot_and_ready_file_is_not_rebuilt(): void
+    {
+        config(['sms-exports.single_phone_csv' => true]);
+        $this->prospect(); $this->prepare(1);
+        $this->db->table('TblProspectsExport')->update(['Debt_Amount' => 14000]);
+        $this->runs->requestFile(self::ID); $this->runs->buildFile(self::ID);
+        $path = $this->runs->filePath(self::ID);
+        $before = hash_file('sha256', $path);
+        $stream = fopen($path, 'rb');
+        try {
+            self::assertSame(['First name','address','debt load','phone1','send date'], fgetcsv($stream, escape: ''));
+            $row = fgetcsv($stream, escape: '');
+            self::assertCount(5, $row); self::assertSame('14000', $row[2]);
+            self::assertSame('2026-10-26', $row[4]);
+        } finally { fclose($stream); }
+        config(['sms-exports.single_phone_csv' => false]);
+        Carbon::setTestNow(Carbon::parse('2026-11-04T12:00:00Z'));
+        $this->runs->buildFile(self::ID);
+        self::assertSame($before, hash_file('sha256', $this->runs->filePath(self::ID)));
+    }
+
+    public function test_generation_in_a_later_week_requires_new_batch_instead_of_rewriting_review(): void
+    {
+        $this->prospect(); $this->prepare(1);
+        $this->runs->requestFile(self::ID);
+        Carbon::setTestNow(Carbon::parse('2026-11-04T12:00:00Z'));
+        try { $this->runs->buildFile(self::ID); self::fail('Stale planned Monday was exported.'); }
+        catch (\RuntimeException $e) { self::assertStringContainsString('Start a fresh batch', $e->getMessage()); }
+        self::assertSame('2026-10-26', $this->db->table('TblSMSDrops')->value('Drop_Date'));
+        self::assertNull($this->db->table('TblSMSRuns')->value('File_Path'));
+    }
+
+    public function test_old_exact_debt_snapshot_cannot_silently_diverge_from_the_generated_file(): void
+    {
+        $this->prospect(); $this->prepare(1);
+        $this->db->table('TblProspectsExport')->update(['Debt_Amount' => '13500.01']);
+        $this->runs->requestFile(self::ID);
+        try { $this->runs->buildFile(self::ID); self::fail('Old exact debt was exported.'); }
+        catch (\RuntimeException $e) { self::assertStringContainsString('does not reconcile', $e->getMessage()); }
+        self::assertNull($this->db->table('TblSMSRuns')->value('File_Path'));
+        self::assertSame('13500.01', (string) $this->db->table('TblProspectsExport')->value('Debt_Amount'));
+    }
+
     public function test_approval_updates_only_selected_ids_uses_acceptance_date_and_is_immutable(): void
     {
         $selected = $this->prospect(['Creation_Date' => '2026-10-10']);
@@ -229,11 +281,35 @@ final class SmsRecordWorkflowTest extends TestCase
         self::assertSame(0, $this->db->table('TblSMSLegacySends')->count(), 'Record approval must not invent phone-level sends.');
         self::assertSame('approved', $this->runs->show(self::ID)->status);
         self::assertSame($at, $this->db->table('TblSMSRuns')->value('Approved_At'));
+        self::assertSame('2026-10-26', $this->db->table('TblSMSDrops')->value('Drop_Date'), 'Approval must not replace the CSV planned Monday with its acceptance date.');
         self::assertSame('approver@example.invalid', $this->db->table('TblSMSRuns')->value('Approved_By'));
         foreach ([fn () => $this->runs->discard(self::ID), fn () => $this->runs->requestSent(self::ID, 'actor'),
             fn () => $this->runs->reviewOnly(self::ID, 'actor'), fn () => $this->runs->requestNotSent(self::ID, 'actor', 'A sufficiently long correction reason')] as $action) $this->refuses($action);
         self::assertFalse($this->runs->show(self::ID)->can_correct_send);
         self::assertNull($this->runs->overview()['open']); self::assertSame('approved', $this->runs->overview()['recent'][0]->status);
+    }
+
+    public function test_confirmed_j4_uses_california_acceptance_day_not_monday_and_freezes_microseconds(): void
+    {
+        (require dirname(__DIR__, 2).'/database/sms-migrations/2026_10_23_000001_add_sms_contact_attribution_evidence.php')->up();
+        config(['sms-exports.contact_attribution_enabled' => true, 'sms-exports.contact_source_system' => 'fixture.contacts',
+            'sms-exports.contact_source_contract_sha256' => str_repeat('a', 64)]);
+        $pk = $this->prospect(); $this->fileReady(1);
+        $bytes = file_get_contents($this->runs->filePath(self::ID));
+        Carbon::setTestNow(Carbon::parse('2026-10-22T06:59:59.987654Z'));
+        $this->runs->requestApprove(self::ID, 'first@example.invalid');
+        self::assertSame('2026-10-22 06:59:59.987654', $this->db->table('TblSMSRuns')->value('Approved_At'));
+        self::assertSame(6, (int) $this->db->table('TblSMSRuns')->value('Approved_At_Precision'));
+        Carbon::setTestNow(Carbon::parse('2026-10-24T12:00:00Z'));
+        $this->runs->requestApprove(self::ID, 'later@example.invalid');
+        $this->runs->markApproved(self::ID); $this->runs->markApproved(self::ID);
+        self::assertSame('2026-10-21', $this->db->table('TblProspects')->where('PK', $pk)->value('Last_SMS_Date'));
+        self::assertSame('2026-10-26', $this->db->table('TblSMSDrops')->value('Drop_Date'));
+        self::assertSame('2026-10-22 06:59:59.987654', $this->db->table('TblSMSRuns')->value('Approved_At'));
+        self::assertSame('first@example.invalid', $this->db->table('TblSMSRuns')->value('Approved_By'));
+        self::assertSame($bytes, file_get_contents($this->runs->filePath(self::ID)));
+        self::assertSame(1, (int) $this->db->table('TblProspects')->value('SMS_Attempts'));
+        self::assertNull($this->db->table('TblProspects')->value('Contacted_Date'));
     }
 
     public function test_frozen_file_and_approval_do_not_recheck_live_eligibility(): void
@@ -244,7 +320,7 @@ final class SmsRecordWorkflowTest extends TestCase
             'Invalid_Phone' => 1, 'Updated_At' => '2026-10-20']);
         $this->db->table('TblPhoneNumbers')->insert(['Phone' => '12025550100']);
         $this->db->table('TblProspects')->where('PK', $pk)->update(['Client' => 'Changed Name', 'Address' => 'Changed Address',
-            'Contacted' => 1, 'Opt_Out' => 1, 'Invalid_Phone' => 1, 'Tier' => 'T9', 'Phone' => '2025550199']);
+            'Contacted' => 1, 'Opt_Out' => 1, 'Invalid_Phone' => 1, 'Phone' => '2025550199']);
         $this->runs->requestFile(self::ID); $this->runs->buildFile(self::ID);
         $text = file_get_contents($this->runs->filePath(self::ID));
         self::assertStringContainsString('Original', $text); self::assertStringContainsString('Original Address', $text);
@@ -348,9 +424,13 @@ final class SmsRecordWorkflowTest extends TestCase
 
     public function test_report_uses_frozen_tiers_and_does_not_invent_unimplemented_response_metrics(): void
     {
-        $a = $this->prospect(['Tier' => 'T2']); $b = $this->prospect(['Tier' => 'T2']);
-        $this->fileReady(2); $this->runs->requestApprove(self::ID, 'actor'); $this->runs->markApproved(self::ID);
-        $this->db->table('TblProspects')->update(['Tier' => 'T9','Contacted' => 1,'Opt_Out' => 1,'Invalid_Phone' => 1]);
+        $a = $this->prospect(); $b = $this->prospect();
+        $this->prepare(2);
+        $this->db->table('TblProspectsExport')->update(['Debt_Tier' => 'T2']);
+        $this->db->table('TblSMSDrops')->update(['Debt_Tier' => 'T2']);
+        $this->runs->requestFile(self::ID); $this->runs->buildFile(self::ID);
+        $this->runs->requestApprove(self::ID, 'actor'); $this->runs->markApproved(self::ID);
+        $this->db->table('TblProspects')->update(['Contacted' => 1,'Opt_Out' => 1,'Invalid_Phone' => 1]);
         $this->db->table('TblSMSResponseAttribution')->insert(['Prospect_PK' => $a, 'Request_ID' => self::ID,
             'Contact_At_UTC' => '2026-10-21 12:00:00', 'Contacted_Date' => '2026-10-21', 'Created_At' => '2026-10-21 13:00:00']);
         $report = $this->runs->details(self::ID);

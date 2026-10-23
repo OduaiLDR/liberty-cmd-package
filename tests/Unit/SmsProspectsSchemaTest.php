@@ -38,6 +38,14 @@ afterEach(function () {
 
 const PROSPECT_TABLES = ['TblProspects', 'TblProspectsExport', 'TblSMSDrops', 'TblSMSRuns', 'TblSMSHistory'];
 
+test('live prospects contain neither debt nor tier while snapshots retain them', function () {
+    $schema = $this->db->getSchemaBuilder();
+    expect($schema->hasColumn('TblProspects', 'Debt_Tier'))->toBeFalse();
+    expect($schema->hasColumn('TblProspects', 'Tier'))->toBeFalse();
+    expect($schema->hasColumn('TblProspects', 'Debt_Amount'))->toBeFalse();
+    expect($schema->hasColumn('TblProspectsExport', 'Debt_Tier'))->toBeTrue();
+});
+
 test('prospect tables are created and dropped together; TblPhoneNumbers keeps its rows', function () {
     $schema = $this->db->getSchemaBuilder();
     foreach (PROSPECT_TABLES as $table) expect($schema->hasTable($table))->toBeTrue();
@@ -51,7 +59,7 @@ test('prospect tables are created and dropped together; TblPhoneNumbers keeps it
 
 test('a new prospect starts eligible: flags 0, no attempts, never exported', function () {
     $this->db->table('TblProspects')->insert(['Client' => 'Jane Doe', 'Address' => '1 Main St', 'Zip' => '90210',
-        'Creation_Date' => '2026-10-12', 'Phone' => '2025550101', 'Tier' => 'T1']);
+        'Creation_Date' => '2026-10-12', 'Phone' => '2025550101']);
     $row = $this->db->table('TblProspects')->first();
     expect([(int) $row->SMS_Attempts, (int) $row->Contacted, (int) $row->Invalid_Phone, (int) $row->Opt_Out, $row->Latest_Export_Date, $row->Response_Date])
         ->toBe([0, 0, 0, 0, null, null]);
