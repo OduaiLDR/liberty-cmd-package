@@ -24,9 +24,9 @@ use Throwable;
  */
 class SmsRunService
 {
-    public const BUSY = ['queued', 'selecting', 'building_file', 'sending', 'reversing', 'approving'];
+    public const BUSY = ['queued', 'selecting', 'building_file', 'sending', 'reversing', 'approving', 'external_registering'];
 
-    public const CLOSED = ['sent', 'discarded', 'review_only', 'not_sent', 'approved'];
+    public const CLOSED = ['sent', 'discarded', 'review_only', 'not_sent', 'approved', 'external_sent'];
 
     public const MAX_TARGET = 10000000;
 
@@ -42,6 +42,7 @@ class SmsRunService
             throw ValidationException::withMessages(['target' => 'Enter a number of records from 1 to 10,000,000.']);
         }
         $existing = $this->run($requestId);
+        if ($existing !== null) SmsRecordPolicy::assertOrdinary($existing);
         $options = $this->normalizeFileOptions($target, $fileOptions, $existing);
         if ($existing) {
             $this->assertSameStart($existing, $target, $options);
@@ -55,7 +56,9 @@ class SmsRunService
         $created = SmsWorkflowLock::run('new-run', fn () => DB::connection('sqlsrv')->transaction(function () use ($requestId, $target, $actor, $options): string {
             // Another identical POST may have completed while this caller waited for the lock.
             $existing = $this->runs()->where('Request_ID', $requestId)->lockForUpdate()->first();
-            if ($existing) { $this->assertSameStart($existing, $target, $options); return 'existing'; }
+            if ($existing) { SmsRecordPolicy::assertOrdinary($existing); $this->assertSameStart($existing, $target, $options); return 'existing'; }
+            if (SmsExternalEventService::pending()) throw new HttpException(409, 'Finish the historical SMS registration before starting another campaign.');
+            if (! SmsRecordPolicy::enabled() && SmsExternalEventService::exists()) throw new HttpException(409, 'Historical exact-record sends require the record workflow; legacy phone-based creation is unavailable.');
             $open = $this->runs()->whereNotIn('Status', self::CLOSED)->lockForUpdate()->first();
             if ($open) return 'busy';
             $now = $this->now();
@@ -248,6 +251,8 @@ class SmsRunService
     public function requestApprove(string $requestId, string $actor): object
     {
         $preflight = $this->mustRun($requestId);
+        SmsRecordPolicy::assertOrdinary($preflight);
+        if (SmsExternalEventService::pending()) throw new HttpException(409, 'Historical SMS registration must finish before another approval.');
         $newFiles = $this->approvalFilenames($this->fileOptions($preflight));
         // Slow hashing stays outside SQL/contact coordination. The locked
         // transaction below compares the same immutable publication receipt.
@@ -286,6 +291,8 @@ class SmsRunService
 
     public function markApproved(string $requestId): void
     {
+        SmsRecordPolicy::assertOrdinary($this->mustRun($requestId));
+        if (SmsExternalEventService::pending()) throw new HttpException(409, 'Historical SMS registration must finish before another approval.');
         if ($this->approvalFilenames($this->fileOptions($this->mustRun($requestId)))) {
             $this->markApprovedFiles($requestId);
             return;
@@ -419,6 +426,7 @@ class SmsRunService
     public function details(string $requestId): array
     {
         $run = $this->mustRun($requestId);
+        if (SmsRecordPolicy::isExternal($run)) return SmsExternalEventProjection::details($run);
         $this->assertPolicyReady($run);
         return app(SmsRecordExportRepository::class)->details($requestId);
     }
@@ -476,6 +484,7 @@ class SmsRunService
 
     public function discard(string $requestId): object
     {
+        SmsRecordPolicy::assertOrdinary($this->mustRun($requestId));
         return SmsWorkflowLock::run('run:'.$requestId, function () use ($requestId): object {
             if (SmsRecordPolicy::isRecord($this->mustRun($requestId))) return $this->discardRecord($requestId);
             return DB::connection('sqlsrv')->transaction(fn () => $this->discardNow($requestId));
@@ -485,6 +494,7 @@ class SmsRunService
     protected function discardNow(string $requestId): object
     {
         $run = $this->mustRun($requestId);
+        SmsRecordPolicy::assertOrdinary($run);
         if (! in_array($run->Status, ['review', 'file_ready', 'failed'], true)) {
             throw new HttpException(409, $run->Status === 'sent'
                 ? 'This run was sent and cannot be discarded.'
@@ -558,6 +568,7 @@ class SmsRunService
     public function cleanupDeletedFile(string $requestId): void
     {
         $run = $this->mustRun($requestId);
+        SmsRecordPolicy::assertOrdinary($run);
         if (! SmsRecordPolicy::isRecord($run) || $run->Status !== 'discarded' || ! ($run->File_Cleanup_Path ?? null)) return;
         $path = (string) $run->File_Cleanup_Path;
         if ($this->fileOptions($run) !== null) {
@@ -604,6 +615,8 @@ class SmsRunService
 
     public function fail(string $requestId, string $job, string $message): void
     {
+        $run = $this->run($requestId);
+        if ($run !== null) SmsRecordPolicy::assertOrdinary($run);
         $step = ['prepare' => 'select', 'file' => 'file', 'send' => 'send', 'reverse' => 'reverse', 'approve' => 'approve'][$job] ?? $job;
         $from = ['prepare' => ['queued', 'selecting'], 'file' => ['building_file'], 'send' => ['sending'], 'reverse' => ['reversing'], 'approve' => ['approving']][$job] ?? [];
         $this->move($requestId, $from, 'failed', ['Failed_Step' => $step, 'Error' => mb_substr($message, 0, 500)]);
@@ -612,6 +625,7 @@ class SmsRunService
     public function show(string $requestId): object
     {
         $run = $this->mustRun($requestId);
+        if (SmsRecordPolicy::isExternal($run)) return (object) SmsExternalEventProjection::forRun($run);
         $view = [
             'request_id' => strtolower((string) $run->Request_ID), 'status' => $run->Status, 'target' => (int) $run->Target,
             'options' => $this->fileOptions($run),
@@ -668,6 +682,7 @@ class SmsRunService
 
     private function historyView(object $run): object
     {
+        if (SmsRecordPolicy::isExternal($run)) return (object) SmsExternalEventProjection::forRun($run);
         $view = [
             'request_id' => strtolower((string) $run->Request_ID), 'status' => $run->Status,
             'target' => (int) $run->Target, 'selected' => $run->Selected === null ? null : (int) $run->Selected,
@@ -692,8 +707,9 @@ class SmsRunService
     public function downloadUrl(string $requestId): string
     {
         $run = $this->mustRun($requestId);
+        if (SmsRecordPolicy::isExternal($run)) SmsExternalEventProjection::assertComplete($run);
         if ($this->approvalFilenames($this->fileOptions($run)) && $run->Status === 'approving') throw new HttpException(409, 'SMS files are being finalized after approval.');
-        if (! in_array($run->Status, ['file_ready', 'sending', 'sent', 'review_only', 'not_sent', 'approving', 'approved'], true) || ! $run->File_Path || ! is_file($run->File_Path)) {
+        if (! in_array($run->Status, ['file_ready', 'sending', 'sent', 'review_only', 'not_sent', 'approving', 'approved', 'external_sent'], true) || ! $run->File_Path || ! is_file($run->File_Path)) {
             throw new HttpException(409, 'The file is not ready, or it is no longer on the server.');
         }
         $origin = rtrim((string) config('app.url'), '/');
@@ -707,6 +723,11 @@ class SmsRunService
     public function filePath(string $requestId): string
     {
         $run = $this->mustRun($requestId);
+        if (SmsRecordPolicy::isExternal($run)) {
+            $header = SmsExternalEventProjection::assertComplete($run);
+            try { return SmsExternalArtifact::verify($run, $header); }
+            catch (\Throwable $error) { throw new HttpException(409, 'Original external files are unavailable or do not match their receipt.', $error); }
+        }
         if (SmsRecordPolicy::isRecord($run) && ! in_array($run->Status, ['file_ready','approving','approved'], true)) throw new HttpException(404, 'This batch has no downloadable file.');
         if ($this->approvalFilenames($this->fileOptions($run)) && $run->Status === 'approving') throw new HttpException(409, 'SMS files are being finalized after approval.');
         return $this->verifiedRunArtifact($run, $this->artifactGeneration($run));
@@ -801,12 +822,14 @@ class SmsRunService
 
     private function assertPolicyReady(object $run): void
     {
+        SmsRecordPolicy::assertOrdinary($run);
         $this->fileOptions($run);
         if (SmsRecordPolicy::isRecord($run)) SmsRecordPolicy::assertReady();
     }
 
     private function assertLegacy(object $run): void
     {
+        SmsRecordPolicy::assertOrdinary($run);
         $this->fileOptions($run);
         if (SmsRecordPolicy::isRecord($run)) throw new HttpException(409, 'Record-based batches use immutable Approve/Delete actions, not legacy send correction or review-only.');
     }

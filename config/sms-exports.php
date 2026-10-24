@@ -35,6 +35,9 @@ return [
     'contact_source_contract_sha256' => env('CMD_SMS_CONTACT_SOURCE_CONTRACT_SHA256'),
     // Coordinated rollout only; schema and database-stored summaries are prerequisites.
     'record_workflow_enabled' => env('CMD_SMS_RECORD_WORKFLOW_ENABLED', false),
+    // Internal historical registration only, after its explicit ledger/readers/UI rollout.
+    // This never enables campaign sending, external publication or provider email.
+    'external_event_writer_enabled' => env('CMD_SMS_EXTERNAL_EVENT_WRITER_ENABLED', false),
     // New-format creation only, after the explicit file-options migration and coordinated release.
     // Existing versioned runs retain their stored format when this creation switch is off.
     'run_file_options_enabled' => env('CMD_SMS_RUN_FILE_OPTIONS_ENABLED', false),

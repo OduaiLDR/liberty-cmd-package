@@ -91,6 +91,9 @@ final class SmsContactAttribution
 
         return self::coordinate(fn (?\PDO $session) => $db->transaction(function () use ($db, $event, $now, $session): array {
             self::assertPinnedSession($session);
+            // A partial backdated registration may not have reached this exact PK
+            // yet. Keep its original contact retryable instead of persisting NULL.
+            if (SmsExternalEventService::pending()) return $this->hold('historical_registration_in_progress');
             // The outer coordination lock precedes both approval run locks and
             // prospect locks. Do not acquire an approval lock after this row lock.
             $prospect = $db->table('TblProspects')->useWritePdo()->where('PK', $event->prospectPk)->lockForUpdate()->first();
@@ -112,14 +115,34 @@ final class SmsContactAttribution
                     ->leftJoin('TblSMSRuns as r', 'r.Request_ID', '=', 'm.Request_ID')
                     ->where('m.Prospect_PK', $event->prospectPk)->where('m.Phone', $event->phone)
                     ->limit(self::MAX_MEMBERSHIPS + 1)
-                    ->get(['r.Request_ID', 'r.Selection_Policy', 'r.Status', 'r.Failed_Step', 'r.Approved_At', 'r.Approved_At_Precision']);
+                    ->get(['r.Request_ID', 'r.Selection_Policy', 'r.Status', 'r.Failed_Step', 'r.Approved_At', 'r.Approved_At_Precision',
+                        ...($table === 'TblSMSHistory' ? ['m.Export_Date AS History_Export_Date'] : [])]);
                 if ($rows->count() > self::MAX_MEMBERSHIPS) return $this->hold('membership_limit_exceeded');
                 foreach ($rows as $row) {
                     if ($row->Request_ID === null
-                        || ! in_array($row->Selection_Policy, [SmsRecordPolicy::RECORDS, SmsRecordPolicy::LEGACY], true)) {
+                        || ! in_array($row->Selection_Policy, [SmsRecordPolicy::RECORDS, SmsRecordPolicy::LEGACY, SmsRecordPolicy::EXTERNAL], true)) {
                         return $this->hold('unproven_membership_metadata');
                     }
-                    if ($row->Selection_Policy === SmsRecordPolicy::LEGACY || $row->Status === 'discarded') continue;
+                    if ($row->Selection_Policy === SmsRecordPolicy::LEGACY) continue;
+                    if ($row->Selection_Policy === SmsRecordPolicy::EXTERNAL) {
+                        if ($table !== 'TblSMSHistory' || $row->Status !== 'external_sent'
+                            || ! $db->getSchemaBuilder()->hasTable(SmsExternalEventService::MEMBERS)) return $this->hold('unproven_external_history');
+                        $external=$db->table(SmsExternalEventService::EVENTS)->where('Request_ID',$row->Request_ID)->first();
+                        $member=$db->table(SmsExternalEventService::MEMBERS)->where('Request_ID',$row->Request_ID)
+                            ->where('Prospect_PK',$event->prospectPk)->where('Original_Phone',$event->phone)->first();
+                        if (! $external || ! $member || $external->State!=='completed'
+                            || $external->Policy_Version!==SmsRecordPolicy::EXTERNAL || (int)$external->Occurred_Precision!==0
+                            || $row->Approved_At!==null || $member->Applied_Chunk===null
+                            || substr((string)$row->History_Export_Date,0,19)!==substr((string)$external->Occurred_At_UTC,0,19)) {
+                            return $this->hold('unproven_external_history');
+                        }
+                        // The ordering helper's internal clock field is shared; origin
+                        // and explicit second precision retain historical provenance.
+                        $approvedRows[]=['request_id'=>strtolower((string)$row->Request_ID),
+                            'approved_at'=>(string)$external->Occurred_At_UTC,'precision'=>0,'origin'=>'external'];
+                        continue;
+                    }
+                    if ($row->Status === 'discarded') continue;
                     $candidate = ['request_id' => strtolower((string) $row->Request_ID), 'approved_at' => $row->Approved_At,
                         'precision' => $row->Approved_At_Precision === null ? null : (int) $row->Approved_At_Precision];
                     if ($table === 'TblSMSHistory') {

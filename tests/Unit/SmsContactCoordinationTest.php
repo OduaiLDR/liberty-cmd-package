@@ -7,6 +7,7 @@ namespace Cmd\Reports\Tests\Unit;
 use Cmd\Reports\Repositories\SmsProspectExportRepository;
 use Cmd\Reports\Services\SmsContactAttribution;
 use Cmd\Reports\Services\SmsContactEvent;
+use Cmd\Reports\Services\SmsExternalEventService;
 use Cmd\Reports\Services\SmsRunService;
 use Cmd\Reports\Services\SmsWorkflowBusyException;
 use Cmd\Reports\Services\SmsWorkflowLock;
@@ -19,6 +20,7 @@ use PDOException;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use RuntimeException;
+use Symfony\Component\HttpKernel\Exception\HttpException;
 
 /** Real Laravel begin/reconnect/rollback control flow, entirely fake PDO/SQL. */
 final class SmsContactCoordinationTest extends TestCase
@@ -172,6 +174,8 @@ final class SmsContactCoordinationTest extends TestCase
             self::fail('The synthetic business sentinel must stop the callback without querying a database.');
         } catch (RuntimeException $error) { self::assertSame('Synthetic business sentinel.', $error->getMessage()); }
         self::assertSame(1, $db->businessActions);
+        self::assertSame([['level' => $action === 'record' ? 1 : 0, 'session' => 'original']], $db->externalChecks,
+            'An empty external ledger permits the real callback; contact checks stay inside its pinned transaction.');
         self::assertSame(1, $pdo->beginCalls);
         self::assertSame(1, $pdo->rollbackCalls);
         self::assertSame(0, $pdo->commitCalls);
@@ -210,8 +214,39 @@ final class SmsContactCoordinationTest extends TestCase
         self::assertFalse($replacement->active);
         self::assertSame(0, $db->transactionLevel());
         self::assertSame(0, $db->businessActions);
+        self::assertSame($action === 'record' ? [] : [['level' => 0, 'session' => 'original']], $db->externalChecks,
+            'A reconnected transaction must fail its pin guard before any in-transaction external or business read.');
         self::assertCount($locks, $db->acquired);
         self::assertSame(array_reverse($db->acquired), $db->released);
+    }
+
+    public function test_pending_external_header_holds_contact_attribution_inside_its_pinned_transaction(): void
+    {
+        $pdo = new ContactCoordinationPdo('original');
+        $db = new ContactCoordinationConnection($pdo); $db->pendingExternal = true; $this->bind($db);
+        self::assertSame(['outcome' => 'held', 'reason' => 'historical_registration_in_progress', 'request_id' => null], $this->action('record'));
+        self::assertSame([['level' => 1, 'session' => 'original']], $db->externalChecks);
+        self::assertSame(0, $db->businessActions);
+        self::assertSame(1, $pdo->beginCalls); self::assertSame(1, $pdo->commitCalls); self::assertSame(0, $pdo->rollbackCalls);
+        self::assertFalse($pdo->active); self::assertSame(0, $db->transactionLevel());
+        self::assertSame(['sms:contact-attribution'], $db->acquired); self::assertSame($db->acquired, $db->released);
+    }
+
+    public function test_pending_external_header_refuses_both_approval_entry_points_before_business_transactions(): void
+    {
+        foreach (['requestApprove', 'markApproved'] as $action) {
+            $pdo = new ContactCoordinationPdo('original');
+            $db = new ContactCoordinationConnection($pdo); $db->pendingExternal = true; $this->bind($db);
+            try { $this->action($action); self::fail('Pending historical registration must block another approval.'); }
+            catch (HttpException $error) {
+                self::assertSame(409, $error->getStatusCode());
+                self::assertSame('Historical SMS registration must finish before another approval.', $error->getMessage());
+            }
+            self::assertSame([['level' => 0, 'session' => 'original']], $db->externalChecks);
+            self::assertSame(0, $db->businessActions); self::assertSame(0, $pdo->beginCalls);
+            self::assertSame([], $db->acquired); self::assertSame([], $db->released);
+            self::assertFalse($pdo->active); self::assertSame(0, $db->transactionLevel());
+        }
     }
 
     #[DataProvider('approvalFilePhases')]
@@ -283,6 +318,8 @@ final class ContactCoordinationConnection extends SqlServerConnection
     public array $released = [];
     public int $businessActions = 0;
     public int $lockResult = 0;
+    public bool $pendingExternal = false;
+    public array $externalChecks = [];
     public ?PDO $replaceDuringAcquisition = null;
 
     public function __construct(ContactCoordinationPdo $pdo)
@@ -334,8 +371,33 @@ final class ContactCoordinationConnection extends SqlServerConnection
 
     public function table($table, $as = null)
     {
+        if ($table === SmsExternalEventService::EVENTS) {
+            return new class($this) {
+                private bool $pendingOnly = false;
+                public function __construct(private ContactCoordinationConnection $db) {}
+                public function where($column, $operator, $value): self
+                {
+                    TestCase::assertSame(['State', '<>', 'completed'], [$column, $operator, $value]);
+                    $this->pendingOnly = true;
+                    return $this;
+                }
+                public function exists(): bool
+                {
+                    TestCase::assertTrue($this->pendingOnly, 'Only the explicit pending-header probe is modeled.');
+                    return $this->db->externalProbe();
+                }
+            };
+        }
         $this->businessActions++;
         $this->trace[] = 'business';
         throw new RuntimeException('Synthetic business sentinel.');
+    }
+
+    public function externalProbe(): bool
+    {
+        // Observe fake state without adding a getPdo trace entry that could
+        // accidentally satisfy the separate first-business pin-guard assertion.
+        $this->externalChecks[] = ['level' => $this->transactionLevel(), 'session' => parent::getPdo()->label];
+        return $this->pendingExternal;
     }
 }

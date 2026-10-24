@@ -93,6 +93,31 @@ final class SmsProspectBackfillSqlServerTest extends TestCase
         }
     }
 
+    public function test_external_headers_hold_phone_wide_backfill_even_completed_but_empty_schema_remains_usable(): void
+    {
+        $f = self::$fixture; $f->assertOwnedDatabase();
+        $f->db->exec('CREATE TABLE dbo.TblSMSExternalEvents(Request_ID uniqueidentifier PRIMARY KEY,State varchar(16) NOT NULL)');
+        try {
+            [$proof, $candidates] = $this->begin([1]);
+            SmsProspectBackfill::applyBatch($f->db, self::RUN, 0, $candidates);
+            self::assertSame('completed', SmsProspectBackfill::finish($f->db, self::RUN)['status']);
+            $business = $f->snapshot(); $ledger = $f->ledger();
+            foreach (['registering','completed'] as $state) {
+                $query = $f->db->prepare('INSERT dbo.TblSMSExternalEvents VALUES(?,?)');
+                $query->execute(['99999999-8888-4777-8666-555555555555', $state]); $query->closeCursor();
+                foreach ([fn () => SmsProspectBackfill::begin($f->db, self::RUN, $proof, 'local-fixture@example.invalid', true),
+                    fn () => SmsProspectBackfill::applyBatch($f->db, self::RUN, 0, $candidates),
+                    fn () => SmsProspectBackfill::finish($f->db, self::RUN), fn () => SmsProspectBackfill::install($f->db)] as $work) {
+                    $this->refuses($work, 'does not support exact-PK external SMS events');
+                    $this->assertUnchanged($business, $ledger);
+                }
+                self::assertSame('completed', SmsProspectBackfill::status($f->db, self::RUN)['status']);
+                $f->db->exec('DELETE dbo.TblSMSExternalEvents');
+            }
+            self::assertSame('completed', SmsProspectBackfill::begin($f->db, self::RUN, $proof, 'local-fixture@example.invalid', true)['status']);
+        } finally { $f->db->exec('DROP TABLE dbo.TblSMSExternalEvents'); }
+    }
+
     public function test_phone_and_email_only_inserts_use_verified_history_mailer_date_and_lineage(): void
     {
         $f = self::$fixture;
