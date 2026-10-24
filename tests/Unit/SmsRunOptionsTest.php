@@ -71,13 +71,17 @@ test('source-first selector is explicit and never inferred for old options or th
     $old = SmsRunOptions::normalize(7, 3);
     $oldJson = json_encode($old, JSON_THROW_ON_ERROR);
     $new = SmsRunOptions::normalize(7, 3, ['T9', 'T2'], SmsRunOptions::TIER_SELECTION_POLICY);
-    expect(array_keys($new))->toBe(['target','rows_per_file','tiers','csv_format','tier_selection_policy'])
-        ->and($new['tiers'])->toBe(['T2','T9'])
+    expect(array_keys($new))->toBe(['target', 'rows_per_file', 'tiers', 'csv_format', 'tier_selection_policy'])
+        ->and($new['tiers'])->toBe(['T2', 'T9'])
         ->and(SmsRunOptions::fromStored(json_encode($new), 7))->toBe($new)
         ->and(SmsRunOptions::fromStored($oldJson, 7))->toBe($old)
         ->and(json_encode(SmsRunOptions::fromStored($oldJson, 7), JSON_THROW_ON_ERROR))->toBe($oldJson)
         ->and(SmsRunOptions::fromStored(null, 7))->toBeNull();
     expect(SmsRunOptions::normalize(7, 3, null, SmsRunOptions::TIER_SELECTION_POLICY)['tiers'])->toBe(SmsRunOptions::TIERS);
+    $windowed = SmsRunOptions::normalize(7, 3, ['T2'], SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY);
+    expect(SmsRunOptions::fromStored(json_encode($windowed), 7))->toBe($windowed)
+        ->and(SmsRunOptions::isTierSelectionPolicy(SmsRunOptions::TIER_SELECTION_POLICY))->toBeTrue()
+        ->and(SmsRunOptions::isTierSelectionPolicy(SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY))->toBeTrue();
     expect(fn () => SmsRunOptions::normalize(7, 3, ['T2'], 'unknown'))->toThrow(InvalidArgumentException::class);
 });
 

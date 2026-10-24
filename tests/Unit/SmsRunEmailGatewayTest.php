@@ -157,3 +157,47 @@ test('existing recipient reader remains backward compatible without explicit com
     $groups = $this->sender->recipientGroupsForReports($this->sql, ['Existing Report']);
     expect($groups['to'])->toHaveCount(3)->and($this->sql->queries[1])->not->toContain("IN ('fixture-company')");
 });
+
+test('deferred LT email activation template stays disabled without invented allowed domains', function (): void {
+    $path = dirname(__DIR__, 2).'/database/sms-email-setup/activate-later.env.example';
+    $values = parse_ini_file($path, false, INI_SCANNER_RAW);
+    expect($values)->toBeArray()
+        ->and($values['CMD_SMS_EMAIL_HANDOFF_ENABLED'])->toBe('false')
+        ->and($values['CMD_SMS_EMAIL_REPORT_SOURCE'])->toBe('plaw')
+        ->and($values['CMD_SMS_EMAIL_REPORT_NAME'])->toBe('SMS Export')
+        ->and($values['CMD_SMS_EMAIL_REPORT_COMPANY'])->toBe('LT')
+        ->and($values['CMD_SMS_EMAIL_ALLOWED_LINK_HOSTS'])->toBe('');
+});
+
+test('default SMS email gateway initializes the real SQL connector before reading LT recipients', function (): void {
+    if (!in_array('sqlsrv', PDO::getAvailableDrivers(), true)) $this->markTestSkipped('Loopback SQL Server PDO is required.');
+    $database = 'sms_email_gateway_test_'.bin2hex(random_bytes(8));
+    $admin = new PDO('sqlsrv:Server=127.0.0.1,14330;Database=master;Encrypt=no;TrustServerCertificate=yes',
+        'sa', 'LocalDev!2026Pass', [PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION, PDO::SQLSRV_ATTR_QUERY_TIMEOUT=>10]);
+    $admin->exec('CREATE DATABASE ['.$database.']');
+    $fixture = null;
+    try {
+        $dsn = 'sqlsrv:Server=127.0.0.1,14330;Database='.$database.';Encrypt=no;TrustServerCertificate=yes';
+        $fixture = new PDO($dsn, 'sa', 'LocalDev!2026Pass', [PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION, PDO::SQLSRV_ATTR_QUERY_TIMEOUT=>10]);
+        expect($fixture->query('SELECT DB_NAME()')->fetchColumn())->toBe($database);
+        $fixture->exec("CREATE TABLE dbo.TblReports (PK int IDENTITY PRIMARY KEY,Report_Name nvarchar(50),Company nvarchar(50),Send_To nvarchar(1000),Send_CC nvarchar(1000),Send_BCC nvarchar(1000),Schedule nvarchar(250));
+            INSERT dbo.TblReports (Report_Name,Company,Send_To,Send_CC,Send_BCC) VALUES
+            (N'SMS Export',N'LT',N'lt-fixture@example.invalid',N'',N''),
+            (N'SMS Export',N'PLAW',N'must-not-appear@example.invalid',N'',N'')");
+        $this->config->set('dbConfig', ['snowflake'=>['plaw'=>['account'=>'fixture-only','user'=>'fixture-only','private_key'=>'fixture-only']],
+            'sql_server'=>['sql_server_connection'=>['dsn'=>$dsn,'database'=>$database,'username'=>'sa','password'=>'LocalDev!2026Pass','query_timeout'=>10]]]);
+        $this->config->set('sms-exports.email_report_company', 'LT');
+        $gateway = new SmsTableRunEmailGateway(null, $this->sender);
+        expect($gateway->configuration())->toBe(['from'=>'admin@lendingtower.com','to'=>['lt-fixture@example.invalid'],
+            'cc'=>[],'bcc'=>[],'report_name'=>'SMS Export','companies'=>['LT']])
+            ->and($gateway->configuration()['to'])->toBe(['lt-fixture@example.invalid'])
+            ->and($this->sender->sends)->toBe([]);
+        unset($gateway);
+    } finally {
+        $fixture = null;
+        if (preg_match('/^sms_email_gateway_test_[a-f0-9]{16}$/D', $database)) {
+            $admin->exec('ALTER DATABASE ['.$database.'] SET SINGLE_USER WITH ROLLBACK IMMEDIATE');
+            $admin->exec('DROP DATABASE ['.$database.']');
+        }
+    }
+});

@@ -302,7 +302,7 @@ final class SmsRunArtifactBundle
         }
         if (! isset($options['target'], $options['rows_per_file'], $options['tiers'], $options['csv_format'])
             || ! is_int($options['target']) || ! is_int($options['rows_per_file']) || ! is_array($options['tiers'])
-            || (array_key_exists('tier_selection_policy', $options) && $options['tier_selection_policy'] !== SmsRunOptions::TIER_SELECTION_POLICY)
+            || (array_key_exists('tier_selection_policy', $options) && ! SmsRunOptions::isTierSelectionPolicy($options['tier_selection_policy']))
             || $options !== SmsRunOptions::normalize($options['target'], $options['rows_per_file'], $options['tiers'], $options['tier_selection_policy'] ?? null,
                 $options['options_version'] ?? null, $options['send_date'] ?? null, $options['filename_version'] ?? null)) {
             throw new RuntimeException('The SMS artifact requires complete canonical versioned run options.');

@@ -5,6 +5,7 @@ declare(strict_types=1);
 use Cmd\Reports\Services\SmsCurrentDebtSql;
 use Cmd\Reports\Services\SmsRunOptions;
 use Cmd\Reports\Services\SmsTierSelectionSql;
+use Cmd\Reports\Services\SmsTierWindowSelectionSql;
 
 test('tier selection reuses the exact source validity and monetary expressions before its only quantity limit', function (): void {
     $eligible = 'SELECT PK,Phone,Client,Address,City,State,Zip,Email,Creation_Date,Last_SMS_Date FROM TblProspects WHERE State=?';
@@ -27,8 +28,19 @@ test('all-tier selection still requires explicit requested tiers and binds every
     expect($sql)->not->toContain('DELETE ', 'TRUNCATE ', 'BEGIN TRAN', 'sp_getapplock');
 });
 
+test('windowed selection resolves only the connection-local ordered page without a global join hint', function (): void {
+    $sql = SmsTierWindowSelectionSql::insert(['T9','T2']);
+    expect($sql)->toContain('FROM #SmsTierWanted', SmsCurrentDebtSql::VALID_PREDICATE,
+        SmsCurrentDebtSql::ROUNDED_DEBT_SQL, 't.SMS_Zip5=w.Zip', 'm.SMS_Zip5=w.Zip',
+        'ORDER BY w.Window_Position ASC', 'OPTION (RECOMPILE)')
+        ->not->toContain('OPTION (HASH JOIN)', 'LEFT(t.ncoaAddr_zipCde,5)', 'LEFT(m.Zip,5)', 'TblProspects p', 'UPDATE TblProspects');
+    expect(substr_count($sql, '?'))->toBe(4)
+        ->and(strpos($sql, 'SELECT TOP (?) ?'))->toBeLessThan(strpos($sql, 'r.Tier IN (?,?)'));
+});
+
 test('invalid tier values lists and obsolete clocks fail before generating selection SQL', function (array $tiers): void {
     expect(fn () => SmsTierSelectionSql::select('SELECT * FROM TblProspects',$tiers))->toThrow(RuntimeException::class);
+    expect(fn () => SmsTierWindowSelectionSql::insert($tiers))->toThrow(RuntimeException::class);
 })->with([
     [[]], [['T2','T2']], [['T0']], [['t2']], [['Tier2']], [['T2; DROP TABLE x']], [[2]], [[null]], [['tier'=>'T2']], [[1=>'T2']],
 ]);

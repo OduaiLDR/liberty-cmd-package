@@ -65,7 +65,7 @@ class SmsRunController extends Controller
             'options_version' => ['sometimes', 'string', 'in:'.SmsRunOptions::PLANNED_DATE_VERSION],
             'filename_version' => ['sometimes', 'string', 'in:'.SmsRunOptions::DROP_RANGE_FILENAME_VERSION.','.SmsRunOptions::APPROVAL_FILENAME_VERSION],
             'send_date' => ['sometimes', 'string', 'date_format:Y-m-d'],
-            'tier_selection_policy' => ['sometimes', 'string', 'in:'.SmsRunOptions::TIER_SELECTION_POLICY],
+            'tier_selection_policy' => ['sometimes', 'string', 'in:'.implode(',', SmsRunOptions::TIER_SELECTION_POLICIES)],
             'rows_per_file' => ['sometimes', 'integer', 'min:1', 'max:'.SmsRunService::MAX_TARGET],
             'tiers' => ['sometimes', 'array', 'min:1'],
             'tiers.*' => ['required', 'string', 'distinct:strict', 'in:'.implode(',', SmsRunOptions::TIERS)],

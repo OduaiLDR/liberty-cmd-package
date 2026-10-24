@@ -12,6 +12,7 @@ use Cmd\Reports\Services\SmsContactAttribution;
 use Cmd\Reports\Services\SmsContactEvent;
 use Cmd\Reports\Services\SmsRunService;
 use Cmd\Reports\Services\SmsRunOptions;
+use Cmd\Reports\Services\SmsTierWindowSchema;
 use Illuminate\Config\Repository;
 use Illuminate\Container\Container;
 use Illuminate\Database\Capsule\Manager;
@@ -74,7 +75,7 @@ final class SmsRecordSqlServerTest extends TestCase
         $this->db->unprepared('SET LOCK_TIMEOUT 3000; SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
         $this->db->setTransactionManager(new DatabaseTransactionsManager);
         if (! $this->db->getSchemaBuilder()->hasTable('TblProspects')) {
-            $this->db->getSchemaBuilder()->create('TblPhoneNumbers', fn (Blueprint $t) => $t->string('Phone'));
+            $this->db->getSchemaBuilder()->create('TblPhoneNumbers', fn (Blueprint $t) => $t->string('Phone')->nullable()->index('IX_TblPhoneNumbers_SMS_Phone'));
             foreach (['2026_10_12_000001_create_sms_prospects_tables.php', '2026_10_19_000001_complete_sms_workflow.php',
                 '2026_10_20_000001_create_sms_availability_summary.php', '2026_10_20_000003_add_sms_record_approval.php'] as $file) {
                 (require dirname(__DIR__, 2).'/database/sms-migrations/'.$file)->up();
@@ -82,9 +83,10 @@ final class SmsRecordSqlServerTest extends TestCase
         }
         if (! $this->db->getSchemaBuilder()->hasColumn('TblSMSRuns', 'Run_Options_JSON')) {
             (require dirname(__DIR__, 2).'/database/sms-migrations/2026_10_22_000001_add_sms_run_file_options.php')->up();
-            $this->db->unprepared('CREATE TABLE dbo.TblTUData (PK bigint PRIMARY KEY, Creation_Date datetime NULL, ncoaAddr_frstNme varchar(100), ncoaAddr_lastNme varchar(100), ncoaAddr_addrLine1Txt varchar(200), ncoaAddr_zipCde varchar(10), derivedFields1_unsecdebtbalance decimal(18,2), Tier_Tag varchar(30));
-                CREATE TABLE dbo.TblMailers (PK bigint PRIMARY KEY, Client varchar(150), Address varchar(200), Zip varchar(10), Drop_Name varchar(50), Debt_Amount decimal(12,2), Debt_Tier varchar(30));
-                CREATE TABLE dbo.TblMarketing (Drop_Name varchar(50), Send_Date datetime NULL)');
+            $this->db->unprepared('CREATE TABLE dbo.TblTUData (PK int PRIMARY KEY, Creation_Date date NULL, ncoaAddr_frstNme varchar(100), ncoaAddr_lastNme varchar(100), ncoaAddr_addrLine1Txt nvarchar(255), ncoaAddr_zipCde nvarchar(10), SMS_Zip5 AS LEFT(ncoaAddr_zipCde,5), derivedFields1_unsecdebtbalance decimal(18,2), Tier_Tag varchar(30));
+                CREATE TABLE dbo.TblMailers (PK int PRIMARY KEY, Client nvarchar(50), Address nvarchar(50), Zip nvarchar(50), SMS_Zip5 AS LEFT(Zip,5), Drop_Name nvarchar(50), Debt_Amount decimal(10,2), Debt_Tier nvarchar(5));
+                CREATE TABLE dbo.TblMarketing (Drop_Name nvarchar(50), Send_Date date NULL)');
+            foreach ($this->windowIndexes() as $ddl) $this->db->unprepared($ddl);
         }
         if (! $this->db->getSchemaBuilder()->hasColumn('TblSMSAvailabilitySummary', 'tu_date_verified')) {
             (require dirname(__DIR__, 2).'/database/sms-migrations/2026_10_22_000002_add_sms_tu_summary_date_proof.php')->up();
@@ -137,6 +139,17 @@ final class SmsRecordSqlServerTest extends TestCase
             'Phone' => '0005550100','Zip' => '00123','Creation_Date' => '2026-10-01']);
     }
 
+    private function windowIndexes(): array
+    {
+        return [
+            'never' => 'CREATE INDEX IX_TblProspects_SMS_Never_Priority ON dbo.TblProspects(Creation_Date DESC,PK ASC) INCLUDE (Phone,Client,Address,City,State,Zip,Email,Last_SMS_Date) WHERE Contacted=0 AND Opt_Out=0 AND Invalid_Phone=0 AND Phone IS NOT NULL AND Last_SMS_Date IS NULL',
+            'previous' => 'CREATE INDEX IX_TblProspects_SMS_Previous_Priority ON dbo.TblProspects(Last_SMS_Date ASC,PK ASC) INCLUDE (Phone,Client,Address,City,State,Zip,Email,Creation_Date) WHERE Contacted=0 AND Opt_Out=0 AND Invalid_Phone=0 AND Phone IS NOT NULL AND Last_SMS_Date IS NOT NULL',
+            'tu' => 'CREATE INDEX IX_TblTUData_SMS_Identity ON dbo.TblTUData(ncoaAddr_addrLine1Txt,SMS_Zip5) INCLUDE (PK,Creation_Date,ncoaAddr_frstNme,ncoaAddr_lastNme,derivedFields1_unsecdebtbalance,Tier_Tag)',
+            'mailers' => 'CREATE INDEX IX_TblMailers_SMS_Identity ON dbo.TblMailers(Client,Address,SMS_Zip5) INCLUDE (PK,Drop_Name,Debt_Amount,Debt_Tier)',
+            'marketing' => 'CREATE INDEX IX_TblMarketing_SMS_Drop_SendDate ON dbo.TblMarketing(Drop_Name,Send_Date)',
+        ];
+    }
+
     private function selecting(int $target): SmsRecordExportRepository
     {
         $this->runs->start(self::ID, $target, 'synthetic@example.invalid');
@@ -153,8 +166,9 @@ final class SmsRecordSqlServerTest extends TestCase
 
     private function tierRun(int $target, array $tiers): array
     {
-        config(['sms-exports.run_file_options_enabled' => true, 'sms-exports.tier_selection_enabled' => true]);
-        $options = SmsRunOptions::normalize($target, 1, $tiers, SmsRunOptions::TIER_SELECTION_POLICY);
+        config(['sms-exports.run_file_options_enabled' => true, 'sms-exports.tier_selection_enabled' => true,
+            'sms-exports.tier_selection_windowed_enabled' => true, 'sms-exports.tier_selection_window_size' => 2]);
+        $options = SmsRunOptions::normalize($target, 1, $tiers, SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY);
         $this->runs->start(self::ID, $target, 'synthetic@example.invalid', $options);
         return $options;
     }
@@ -357,6 +371,284 @@ final class SmsRecordSqlServerTest extends TestCase
         self::assertSame([$a,$b], array_map('intval', $this->db->table('TblSMSHistory')->orderBy('Prospect_PK')->pluck('Prospect_PK')->all()));
         foreach ([$wrong,$previous,$invalid] as $pk) self::assertSame(0, (int) $this->db->table('TblProspects')->where('PK',$pk)->value('SMS_Attempts'));
         self::assertSame(2, (int) $this->db->table('TblProspects')->sum('SMS_Attempts'));
+    }
+
+    public function test_real_windowed_selector_matches_v1_exactly_across_rejected_pages_and_priority_phases(): void
+    {
+        $wrong = $this->person(['Address' => 'Diff wrong', 'Creation_Date' => '2026-10-22']);
+        $held = $this->person(['Address' => 'Diff held', 'Creation_Date' => '2026-10-21']);
+        $unresolved = $this->person(['Address' => 'Diff none', 'Creation_Date' => '2026-10-20']);
+        $first = $this->person(['Address' => 'Diff first', 'Creation_Date' => '2026-10-19']);
+        $second = $this->person(['Address' => 'Diff second', 'Creation_Date' => null]);
+        $previous = $this->person(['Address' => 'Diff previous', 'Creation_Date' => '2026-10-22', 'Last_SMS_Date' => '2026-01-01']);
+        $this->source(1, 'Diff wrong', 'T9');
+        $this->source(2, 'Diff held', 'T2', '0');
+        $this->source(3, 'Diff first');
+        $this->source(4, 'Diff second');
+        $this->source(5, 'Diff previous');
+        config(['sms-exports.run_file_options_enabled' => true, 'sms-exports.tier_selection_enabled' => true,
+            'sms-exports.tier_selection_windowed_enabled' => false, 'sms-exports.tier_selection_window_size' => 2]);
+
+        $v1 = SmsRunOptions::normalize(3, 3, ['T2'], SmsRunOptions::TIER_SELECTION_POLICY);
+        $this->runs->start(self::ID, 3, 'synthetic@example.invalid', $v1);
+        $this->db->table('TblSMSRuns')->where('Request_ID', self::ID)->update(['Status' => 'selecting']);
+        $repo = new SmsRecordExportRepository;
+        self::assertSame(3, $repo->select(self::ID, 3)['selected']);
+        $columns = ['Prospect_PK','Phone','Debt_Tier','Debt_Amount','Debt_Source','Debt_Source_PK','Client','Address','City','State','Zip','Email','Was_Previously_Texted','Last_SMS_Date_At_Selection'];
+        $expected = $this->db->table('TblProspectsExport')->where('Request_ID', self::ID)->orderBy('PK')->get($columns)->toJson();
+        self::assertSame([$first,$second,$previous], array_map('intval', $this->db->table('TblProspectsExport')->orderBy('PK')->pluck('Prospect_PK')->all()));
+        foreach ([$wrong,$held,$unresolved] as $pk) self::assertFalse($this->db->table('TblProspectsExport')->where('Prospect_PK', $pk)->exists());
+
+        $v2id = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff';
+        $this->db->table('TblSMSRuns')->where('Request_ID', self::ID)->update(['Status' => 'discarded']);
+        $this->db->table('TblProspectsExport')->where('Request_ID', self::ID)->delete();
+        config(['sms-exports.tier_selection_windowed_enabled' => true]);
+        $v2 = SmsRunOptions::normalize(3, 3, ['T2'], SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY);
+        $this->runs->start($v2id, 3, 'synthetic@example.invalid', $v2);
+        $this->db->table('TblSMSRuns')->where('Request_ID', $v2id)->update(['Status' => 'selecting']);
+        self::assertSame(3, $repo->select($v2id, 3)['selected']);
+        $actual = $this->db->table('TblProspectsExport')->where('Request_ID', $v2id)->orderBy('PK')->get($columns)->toJson();
+        self::assertSame($expected, $actual);
+    }
+
+    public function test_real_windowed_selector_fails_closed_when_a_seek_prerequisite_is_missing(): void
+    {
+        config(['sms-exports.run_file_options_enabled' => true, 'sms-exports.tier_selection_enabled' => true,
+            'sms-exports.tier_selection_windowed_enabled' => true]);
+        $this->db->unprepared('DROP INDEX IX_TblMarketing_SMS_Drop_SendDate ON dbo.TblMarketing');
+        try {
+            self::assertFalse($this->runs->overview()['capabilities']['tier_subset']);
+            $options = SmsRunOptions::normalize(1, 1, ['T2'], SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY);
+            try { $this->runs->start(self::ID, 1, 'synthetic@example.invalid', $options); self::fail('Expected missing seek schema refusal.'); }
+            catch (HttpException $error) { self::assertSame(503, $error->getStatusCode()); }
+            self::assertSame(0, $this->db->table('TblSMSRuns')->count());
+        } finally {
+            $this->db->unprepared('CREATE INDEX IX_TblMarketing_SMS_Drop_SendDate ON dbo.TblMarketing(Drop_Name,Send_Date)');
+        }
+    }
+
+    public function test_real_windowed_schema_rejects_altered_expression_filters_and_missing_coverage(): void
+    {
+        $indexes = $this->windowIndexes();
+        self::assertTrue(SmsTierWindowSchema::ready($this->db));
+        $this->db->unprepared('DROP INDEX IX_TblMailers_SMS_Identity ON dbo.TblMailers;
+            ALTER TABLE dbo.TblMailers DROP COLUMN SMS_Zip5;
+            ALTER TABLE dbo.TblMailers ADD SMS_Zip5 AS (LEFT(Zip,5)+N\'X\')');
+        try {
+            $this->db->unprepared($indexes['mailers']);
+            self::assertFalse(SmsTierWindowSchema::ready($this->db), 'A LEFT substring must not admit changed ZIP semantics.');
+        } finally {
+            $this->db->unprepared('DROP INDEX IX_TblMailers_SMS_Identity ON dbo.TblMailers;
+                ALTER TABLE dbo.TblMailers DROP COLUMN SMS_Zip5;
+                ALTER TABLE dbo.TblMailers ADD SMS_Zip5 AS LEFT(Zip,5)');
+            $this->db->unprepared($indexes['mailers']);
+        }
+        foreach ([
+            ['tu','IX_TblTUData_SMS_Identity','TblTUData',$indexes['tu'].' WHERE ncoaAddr_frstNme IS NOT NULL'],
+            ['never','IX_TblProspects_SMS_Never_Priority','TblProspects',$indexes['never'].' AND State=\'CA\''],
+            ['tu','IX_TblTUData_SMS_Identity','TblTUData',str_replace(',Tier_Tag)', ')', $indexes['tu'])],
+        ] as [$key,$index,$table,$replacement]) {
+            $this->db->unprepared('DROP INDEX '.$index.' ON dbo.'.$table);
+            try {
+                $this->db->unprepared($replacement);
+                self::assertFalse(SmsTierWindowSchema::ready($this->db), $replacement);
+            } finally {
+                $this->db->unprepared('DROP INDEX '.$index.' ON dbo.'.$table);
+                $this->db->unprepared($indexes[$key]);
+            }
+        }
+        $this->db->unprepared('ALTER INDEX IX_TblTUData_SMS_Identity ON dbo.TblTUData DISABLE');
+        try { self::assertFalse(SmsTierWindowSchema::ready($this->db)); }
+        finally { $this->db->unprepared('ALTER INDEX IX_TblTUData_SMS_Identity ON dbo.TblTUData REBUILD'); }
+        self::assertTrue(SmsTierWindowSchema::ready($this->db));
+    }
+
+    public function test_real_windowed_second_page_failure_rolls_back_the_first_page_and_replays_cleanly(): void
+    {
+        $first = $this->person(['Address' => 'First page', 'Creation_Date' => '2026-10-22']);
+        $second = $this->person(['Address' => 'Failure page2', 'Creation_Date' => '2026-10-21']);
+        $this->source(1, 'First page'); $this->source(2, 'Failure page2');
+        $this->tierRun(2, ['T2']); config(['sms-exports.tier_selection_window_size' => 1]);
+        $this->db->table('TblSMSRuns')->update(['Status' => 'selecting']);
+        $this->db->unprepared("CREATE TRIGGER dbo.SmsRecordRejectSelection ON dbo.TblProspectsExport AFTER INSERT AS BEGIN
+            IF EXISTS (SELECT 1 FROM inserted WHERE Address='Failure page2')
+            BEGIN
+                IF (SELECT COUNT(*) FROM dbo.TblProspectsExport)<>2 THROW 52903,'First page was not present.',1;
+                THROW 52902,'Synthetic second page failure.',1;
+            END
+        END");
+        $repo = new SmsRecordExportRepository;
+        $this->db->unprepared('SET NOCOUNT ON');
+        try { $repo->select(self::ID, 2); self::fail('Expected second page failure.'); }
+        catch (\Illuminate\Database\QueryException $error) { self::assertStringContainsString('Synthetic second page failure', $error->getMessage()); }
+        self::assertSame(0, $this->db->table('TblProspectsExport')->count());
+        self::assertNull($this->db->table('TblSMSRuns')->value('Selected'));
+        self::assertSame(0, $this->db->transactionLevel());
+        self::assertSame(512, (int) $this->db->selectOne('SELECT @@OPTIONS & 512 AS no_count')->no_count);
+        $this->db->unprepared('SET NOCOUNT OFF');
+        $this->db->unprepared('DROP TRIGGER dbo.SmsRecordRejectSelection');
+        self::assertSame(2, $repo->select(self::ID, 2)['selected']);
+        self::assertSame([$first,$second], array_map('intval', $this->db->table('TblProspectsExport')->orderBy('PK')->pluck('Prospect_PK')->all()));
+    }
+
+    public function test_real_windowed_pages_retain_one_snapshot_during_concurrent_source_and_population_changes(): void
+    {
+        $first = $this->person(['Address' => 'Snapshot first', 'Creation_Date' => '2026-10-22']);
+        $second = $this->person(['Address' => 'Snapshot second', 'Creation_Date' => '2026-10-21']);
+        $this->source(1, 'Snapshot first'); $this->source(2, 'Snapshot second');
+        $this->tierRun(3, ['T2']); config(['sms-exports.tier_selection_window_size' => 1]);
+        $this->db->table('TblSMSRuns')->update(['Status' => 'selecting']);
+        $writer = new PDO('sqlsrv:Server=127.0.0.1,14330;Database='.self::$database.';Encrypt=no;TrustServerCertificate=yes',
+            'sa', 'LocalDev!2026Pass', [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        $writer->exec('SET LOCK_TIMEOUT 3000');
+        $injected = false;
+        $this->db->setEventDispatcher(new \Illuminate\Events\Dispatcher(Container::getInstance()));
+        $this->db->listen(function ($event) use ($writer, &$injected): void {
+            if ($injected || ! str_starts_with(ltrim($event->sql), 'WITH Wanted AS')) return;
+            $injected = true;
+            $writer->exec("UPDATE dbo.TblTUData SET Tier_Tag='T9',derivedFields1_unsecdebtbalance=85000 WHERE PK=2;
+                INSERT dbo.TblProspects (Client,Address,Phone,Zip,Creation_Date) VALUES ('Synthetic Person','Concurrent newcomer','0005550100','00123','2026-10-23');
+                INSERT dbo.TblTUData (PK,Creation_Date,ncoaAddr_frstNme,ncoaAddr_lastNme,ncoaAddr_addrLine1Txt,ncoaAddr_zipCde,derivedFields1_unsecdebtbalance,Tier_Tag)
+                VALUES (3,'2026-10-01','Synthetic','Person','Concurrent newcomer','00123',13500,'T2')");
+        });
+        try { self::assertSame(2, (new SmsRecordExportRepository)->select(self::ID, 3)['selected']); }
+        finally { $this->db->unsetEventDispatcher(); }
+        self::assertTrue($injected);
+        self::assertSame([$first,$second], array_map('intval', $this->db->table('TblProspectsExport')->orderBy('PK')->pluck('Prospect_PK')->all()));
+        self::assertSame(['T2','T2'], $this->db->table('TblProspectsExport')->orderBy('PK')->pluck('Debt_Tier')->all());
+        self::assertSame('T9', $this->db->table('TblTUData')->where('PK', 2)->value('Tier_Tag'));
+        self::assertSame(3, $this->db->table('TblProspects')->count());
+    }
+
+    public function test_real_windowed_mailer_waterfall_and_null_previous_ties_match_v1_across_pages(): void
+    {
+        $expected = [];
+        foreach (['Null one','Null two','Null three'] as $i => $address) {
+            $expected[] = $this->person(['Address' => $address, 'Creation_Date' => null]); $this->source($i + 1, $address);
+        }
+        foreach (['Mailer positive','Mailer fallback','Mailer agreeing'] as $i => $address) {
+            $expected[] = $this->person(['Address' => $address, 'Last_SMS_Date' => '2026-01-01']);
+        }
+        foreach (['TU blocks mailer','Unknown date','Conflicting date'] as $address) $this->person(['Address' => $address, 'Creation_Date' => '2026-10-23']);
+        $this->source(4, 'TU blocks mailer', 'T2', '0');
+        $this->db->table('TblMarketing')->insert([
+            ['Drop_Name' => 'Known', 'Send_Date' => '2026-10-01'],
+            ['Drop_Name' => 'Newer', 'Send_Date' => '2026-10-20'],
+            ['Drop_Name' => 'Unknown', 'Send_Date' => null],
+            ['Drop_Name' => 'Conflict', 'Send_Date' => '2026-10-01'],
+            ['Drop_Name' => 'Conflict', 'Send_Date' => '2026-10-02'],
+        ]);
+        foreach ([
+            ['Mailer positive','Known',13500,'T2'], ['Mailer positive','Newer',null,'T9'],
+            ['Mailer fallback','Known',null,'T2'], ['Mailer agreeing','Known',13500,'T2'],
+            ['Mailer agreeing','Known',13500,'T2'], ['TU blocks mailer','Known',13500,'T2'],
+            ['Unknown date','Unknown',13500,'T2'], ['Conflicting date','Conflict',13500,'T2'],
+        ] as $i => [$address,$drop,$debt,$tier]) {
+            $this->db->table('TblMailers')->insert(['PK' => $i + 1, 'Client' => 'Synthetic Person', 'Address' => $address,
+                'Zip' => '00123-9999', 'Drop_Name' => $drop, 'Debt_Amount' => $debt, 'Debt_Tier' => $tier]);
+        }
+        config(['sms-exports.run_file_options_enabled' => true,'sms-exports.tier_selection_enabled' => true]);
+        $repo = new SmsRecordExportRepository;
+        $columns = ['Prospect_PK','Debt_Tier','Debt_Amount','Debt_Source','Debt_Source_PK','Was_Previously_Texted','Last_SMS_Date_At_Selection'];
+        $v1 = SmsRunOptions::normalize(9, 9, ['T2'], SmsRunOptions::TIER_SELECTION_POLICY);
+        $this->runs->start(self::ID, 9, 'synthetic@example.invalid', $v1);
+        $this->db->table('TblSMSRuns')->update(['Status' => 'selecting']);
+        self::assertSame(6, $repo->select(self::ID, 9)['selected']);
+        $baseline = $this->db->table('TblProspectsExport')->orderBy('PK')->get($columns)->toJson();
+        self::assertSame($expected, array_map('intval', $this->db->table('TblProspectsExport')->orderBy('PK')->pluck('Prospect_PK')->all()));
+        $this->db->table('TblProspectsExport')->delete(); $this->db->table('TblSMSRuns')->delete();
+        $this->tierRun(9, ['T2']); config(['sms-exports.tier_selection_window_size' => 1]);
+        $this->db->table('TblSMSRuns')->update(['Status' => 'selecting']);
+        self::assertSame(6, $repo->select(self::ID, 9)['selected']);
+        self::assertSame($baseline, $this->db->table('TblProspectsExport')->orderBy('PK')->get($columns)->toJson());
+    }
+
+    public function test_opt_in_windowed_scale_100_1000_and_100000(): void
+    {
+        if (getenv('SMS_SELECTION_SCALE') !== '1') self::markTestSkipped('Set SMS_SELECTION_SCALE=1 for disposable 100K or optional 3M scale evidence.');
+        $populationValue = getenv('SMS_SELECTION_SCALE_ROWS');
+        if ($populationValue === false) $populationValue = '100000';
+        if (! in_array($populationValue, ['100000','3000000'], true)) throw new \InvalidArgumentException('Scale population must be exactly 100000 or 3000000.');
+        $population = (int) $populationValue;
+        $this->db->statement("WITH n AS (SELECT TOP (?) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n FROM sys.all_objects a CROSS JOIN sys.all_objects b)
+            INSERT dbo.TblProspects (Client,Address,Phone,Zip,Creation_Date)
+            SELECT 'Synthetic Person',CONCAT('Scale ',n),'0005550100','00123',DATEADD(DAY,-CAST(n/1000 AS int),CAST('2026-10-22' AS date)) FROM n;
+            INSERT dbo.TblTUData (PK,Creation_Date,ncoaAddr_frstNme,ncoaAddr_lastNme,ncoaAddr_addrLine1Txt,ncoaAddr_zipCde,derivedFields1_unsecdebtbalance,Tier_Tag)
+            SELECT PK,'2026-10-01','Synthetic','Person',Address,'00123',13500,'T2' FROM dbo.TblProspects", [$population]);
+        self::assertSame($population, $this->db->table('TblProspects')->count());
+        self::assertSame($population, $this->db->table('TblTUData')->count());
+        config(['sms-exports.run_file_options_enabled' => true,'sms-exports.tier_selection_enabled' => true,
+            'sms-exports.tier_selection_windowed_enabled' => true,'sms-exports.tier_selection_window_size' => 5000]);
+        foreach (array_values(array_unique([100,1000,100000,$population])) as $target) {
+            $id = sprintf('%08d-bbbb-4ccc-8ddd-eeeeeeeeeeee', $target);
+            $options = SmsRunOptions::normalize($target, 100000, ['T2'], SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY);
+            $this->runs->start($id, $target, 'synthetic@example.invalid', $options);
+            $this->db->table('TblSMSRuns')->where('Request_ID', $id)->update(['Status' => 'selecting']);
+            $started = microtime(true); $result = (new SmsRecordExportRepository)->select($id, $target);
+            $seconds = microtime(true) - $started;
+            self::assertSame($target, $result['selected']);
+            self::assertSame($target, $this->db->table('TblProspectsExport')->where('Request_ID', $id)->count());
+            // Exact ordered membership is checked inside this disposable SQL
+            // database, avoiding two multi-million-row PHP result arrays.
+            $comparison = $this->db->selectOne('WITH expected AS (
+                SELECT TOP (?) PK,ROW_NUMBER() OVER (ORDER BY Creation_Date DESC,PK ASC) AS position
+                FROM dbo.TblProspects ORDER BY Creation_Date DESC,PK ASC
+            ), actual AS (
+                SELECT Prospect_PK,ROW_NUMBER() OVER (ORDER BY PK ASC) AS position
+                FROM dbo.TblProspectsExport WHERE Request_ID=?
+            ) SELECT COUNT_BIG(*) AS mismatches FROM expected e FULL OUTER JOIN actual a ON a.position=e.position
+                WHERE e.PK IS NULL OR a.Prospect_PK IS NULL OR e.PK<>a.Prospect_PK', [$target,$id]);
+            self::assertSame(0, (int) $comparison->mismatches);
+            fwrite(STDOUT, PHP_EOL.json_encode(['environment' => 'disposable-loopback-synthetic','population' => $population,
+                'target' => $target,'selected' => $result['selected'],'seconds' => round($seconds, 3),
+                'php_peak_memory_bytes' => memory_get_peak_usage(true), 'membership_check' => 'exact-ordered-sql']).PHP_EOL);
+            $this->db->table('TblSMSRuns')->where('Request_ID', $id)->update(['Status' => 'discarded']);
+            $this->db->table('TblProspectsExport')->where('Request_ID', $id)->delete();
+        }
+    }
+
+    public function test_real_windowed_contact_phone_seeks_match_v1_normalization_and_trailing_spaces(): void
+    {
+        $expected = [];
+        foreach (range(0, 6) as $i) {
+            $pk = $this->person(['Address' => 'Phone case '.$i, 'Phone' => '000555010'.$i]);
+            $this->source($i + 1, 'Phone case '.$i);
+            if ($i >= 4) $expected[] = $pk;
+        }
+        $this->db->table('TblPhoneNumbers')->insert([
+            ['Phone' => '0005550100'], ['Phone' => '10005550101'],
+            ['Phone' => '0005550102   '], ['Phone' => '10005550103   '],
+            ['Phone' => '110005550104'], ['Phone' => '00005550105'], ['Phone' => null],
+        ]);
+        config(['sms-exports.run_file_options_enabled' => true,'sms-exports.tier_selection_enabled' => true]);
+        $v1 = SmsRunOptions::normalize(7, 7, ['T2'], SmsRunOptions::TIER_SELECTION_POLICY);
+        $this->runs->start(self::ID, 7, 'synthetic@example.invalid', $v1);
+        $this->db->table('TblSMSRuns')->update(['Status' => 'selecting']);
+        $repo = new SmsRecordExportRepository;
+        self::assertSame(3, $repo->select(self::ID, 7)['selected']);
+        self::assertSame($expected, array_map('intval', $this->db->table('TblProspectsExport')->orderBy('PK')->pluck('Prospect_PK')->all()));
+        $this->db->table('TblProspectsExport')->delete(); $this->db->table('TblSMSRuns')->delete();
+        $this->tierRun(7, ['T2']); config(['sms-exports.tier_selection_window_size' => 1]);
+        $this->db->table('TblSMSRuns')->update(['Status' => 'selecting']);
+        self::assertSame(3, $repo->select(self::ID, 7)['selected']);
+        self::assertSame($expected, array_map('intval', $this->db->table('TblProspectsExport')->orderBy('PK')->pluck('Prospect_PK')->all()));
+    }
+
+    public function test_real_windowed_selection_counts_rows_when_a_reused_session_has_nocount_on(): void
+    {
+        foreach (['No count first','No count second','No count third'] as $i => $address) {
+            $this->person(['Address' => $address]); $this->source($i + 1, $address);
+        }
+        $this->tierRun(3, ['T2']); config(['sms-exports.tier_selection_window_size' => 1]);
+        $this->db->table('TblSMSRuns')->update(['Status' => 'selecting']);
+        $this->db->unprepared('SET NOCOUNT ON');
+        try {
+            self::assertSame(3, (new SmsRecordExportRepository)->select(self::ID, 3)['selected']);
+            self::assertSame(3, (int) $this->db->table('TblSMSRuns')->value('Selected'));
+            self::assertSame(512, (int) $this->db->selectOne('SELECT @@OPTIONS & 512 AS no_count')->no_count);
+        } finally {
+            $this->db->unprepared('SET NOCOUNT OFF');
+        }
     }
 
     public function test_real_committed_selection_retry_keeps_source_prices_after_creation_flag_and_sources_change(): void
