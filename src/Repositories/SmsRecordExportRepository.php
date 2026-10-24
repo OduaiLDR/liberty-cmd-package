@@ -272,6 +272,7 @@ class SmsRecordExportRepository extends SqlSrvRepository
     public function assertFrozen(string $requestId, int $expected, bool $pendingIds = false): void
     {
         $run = $this->table('TblSMSRuns')->where('Request_ID', $requestId)->first();
+        if ($run !== null) SmsRecordPolicy::assertOrdinary($run);
         if ($pendingIds) {
             $stored = $run ? SmsRunOptions::fromStored($run->Run_Options_JSON ?? null, (int) $run->Target) : null;
             if (($stored['filename_version'] ?? null) !== SmsRunOptions::APPROVAL_FILENAME_VERSION

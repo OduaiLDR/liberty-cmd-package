@@ -13,6 +13,26 @@ final class SmsRecordPolicy
     public const RECORDS = 'prospect-record-v1';
     public const LEGACY = 'legacy-phone-v1';
 
+    public const EXTERNAL = 'prospect-external-sent-v1';
+
+    public static function policy(object $run): string
+    {
+        $policy = $run->Selection_Policy ?? self::LEGACY;
+        if (! in_array($policy, [self::LEGACY, self::RECORDS, self::EXTERNAL], true)) {
+            throw new HttpException(409, 'Unknown SMS run policy; no workflow action was performed.');
+        }
+        return $policy;
+    }
+
+    public static function isExternal(object $run): bool { return self::policy($run) === self::EXTERNAL; }
+
+    public static function isLegacy(object $run): bool { return self::policy($run) === self::LEGACY; }
+
+    public static function assertOrdinary(object $run): void
+    {
+        if (self::isExternal($run)) throw new HttpException(409, 'Historical external events are immutable and cannot use ordinary SMS workflow actions.');
+    }
+
     public static function enabled(): bool
     {
         return (bool) config('sms-exports.record_workflow_enabled', false);
@@ -25,7 +45,7 @@ final class SmsRecordPolicy
 
     public static function isRecord(object $run): bool
     {
-        return ($run->Selection_Policy ?? self::LEGACY) === self::RECORDS;
+        return self::policy($run) === self::RECORDS;
     }
 
     public static function assertReady(): void

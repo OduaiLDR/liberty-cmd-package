@@ -108,6 +108,30 @@ final class SmsLegacyHistoryImportSqlServerTest extends TestCase
         self::assertSame($business, self::$fixture->snapshot());
     }
 
+    public function test_external_headers_hold_phone_day_writers_even_completed_but_empty_schema_remains_usable(): void
+    {
+        $f = self::$fixture; $f->assertOwnedDatabase();
+        $f->db->exec('CREATE TABLE dbo.TblSMSExternalEvents(Request_ID uniqueidentifier PRIMARY KEY,State varchar(16) NOT NULL)');
+        try {
+            $this->begin();
+            Import::applyBatch($f->db, self::RUN, 0, $this->events());
+            self::assertSame('completed', Import::finish($f->db, self::RUN)['status']);
+            $before = $this->checkpoint(); $business = $f->snapshot();
+            foreach (['registering','completed'] as $state) {
+                $query = $f->db->prepare('INSERT dbo.TblSMSExternalEvents VALUES(?,?)');
+                $query->execute(['99999999-8888-4777-8666-555555555555', $state]); $query->closeCursor();
+                foreach ([fn () => $this->begin(), fn () => Import::applyBatch($f->db, self::RUN, 0, $this->events()),
+                    fn () => Import::finish($f->db, self::RUN), fn () => Import::install($f->db)] as $work) {
+                    $this->refuses($work, 'does not support exact-PK external SMS events');
+                    self::assertSame($before, $this->checkpoint()); self::assertSame($business, $f->snapshot());
+                }
+                self::assertSame('completed', Import::status($f->db, self::RUN)['status'], 'Saved audit status stays readable.');
+                $f->db->exec('DELETE dbo.TblSMSExternalEvents');
+            }
+            self::assertSame('completed', Import::begin($f->db, self::RUN, $this->proof(), 'local-fixture@example.invalid', true)['status']);
+        } finally { $f->db->exec('DROP TABLE dbo.TblSMSExternalEvents'); }
+    }
+
     public function test_export_file_without_actual_send_confirmation_cannot_create_a_run(): void
     {
         $before = $this->checkpoint();

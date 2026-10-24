@@ -52,7 +52,7 @@ final class SmsContactAttributionPlan
         foreach ($pendingTimes as $row) {
             // An old receipt identifies only a second-wide interval. Even its
             // same-second possibility must settle before first attribution.
-            if ($row['precision'] === null ? strcmp($row['second'], $contactSecond) <= 0
+            if ($row['precision'] !== 6 ? strcmp($row['second'], $contactSecond) <= 0
                 : strcmp($row['utc'], $event->utcExact) <= 0) {
                 return self::hold('approval_in_progress');
             }
@@ -61,8 +61,8 @@ final class SmsContactAttributionPlan
         $candidates = [];
         foreach ($approvedTimes as $row) {
             $secondOrder = strcmp($row['second'], $contactSecond);
-            if ($row['precision'] === null) {
-                if ($secondOrder === 0) return self::hold('historical_approval_precision');
+            if ($row['precision'] !== 6) {
+                if ($secondOrder === 0) return self::hold($row['precision']===0?'historical_event_precision':'historical_approval_precision');
                 if ($secondOrder < 0) $candidates[] = $row;
             } elseif (strcmp($row['utc'], $event->utcExact) <= 0) {
                 $candidates[] = $row;
@@ -75,7 +75,7 @@ final class SmsContactAttributionPlan
         // cannot be compared as if the old zero fraction were a measured instant.
         $latestSecond = max(array_column($candidates, 'second'));
         $latest = array_values(array_filter($candidates, fn (array $row): bool => $row['second'] === $latestSecond));
-        $historical = array_values(array_filter($latest, fn (array $row): bool => $row['precision'] === null));
+        $historical = array_values(array_filter($latest, fn (array $row): bool => $row['precision'] !== 6));
         if ($historical !== []) {
             if (count($historical) !== count($latest)) return self::hold('ambiguous_approval_order');
             if (count($latest) !== 1) return self::hold('ambiguous_latest_approval');
@@ -100,10 +100,11 @@ final class SmsContactAttributionPlan
         } catch (InvalidArgumentException) {
             return self::hold('invalid_approval_metadata');
         }
-        if ($row['precision'] !== null && $row['precision'] !== 6) {
+        if ($row['precision'] !== null && $row['precision'] !== 6
+            && ! ($row['precision']===0 && ($row['origin']??null)==='external')) {
             return self::hold('unverified_approval_precision');
         }
-        if (($row['precision'] === null && substr($utc, 20, 9) !== '000000000')
+        if (($row['precision'] !== 6 && substr($utc, 20, 9) !== '000000000')
             // A measured microsecond cannot contain a nonzero 100-nanosecond digit.
             || ($row['precision'] === 6 && substr($utc, 26, 3) !== '000')) {
             return self::hold('unverified_approval_precision');

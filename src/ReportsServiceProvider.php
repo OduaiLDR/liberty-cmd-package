@@ -136,6 +136,7 @@ class ReportsServiceProvider extends ServiceProvider
             __DIR__ . '/../database/sms-migrations/2026_10_23_000002_add_sms_run_archive_receipt.php' => database_path('migrations/2026_10_23_000002_add_sms_run_archive_receipt.php'),
             __DIR__ . '/../database/sms-migrations/2026_10_23_000003_create_sms_email_outbox.php' => database_path('migrations/2026_10_23_000003_create_sms_email_outbox.php'),
             __DIR__ . '/../database/sms-migrations/2026_10_23_000004_create_sms_file_publications.php' => database_path('migrations/2026_10_23_000004_create_sms_file_publications.php'),
+            __DIR__ . '/../database/sms-migrations/2026_10_24_000001_create_sms_external_events.php' => database_path('migrations/2026_10_24_000001_create_sms_external_events.php'),
         ], 'reports-sms-migrations');
         // PMOD migrations ship with the package but are NOT auto-loaded.
         // Consumers must explicitly opt in by publishing them:
@@ -245,6 +246,7 @@ class ReportsServiceProvider extends ServiceProvider
                 \Cmd\Reports\Console\Commands\SmsRunEmailCommand::class,
                 \Cmd\Reports\Console\Commands\SmsRunPublicationCommand::class,
                 \Cmd\Reports\Console\Commands\RefreshSmsAvailability::class,
+                \Cmd\Reports\Console\Commands\RegisterJudeSmsEvent::class,
                 SyncCalls::class,
                 SyncNegotiatorPayrollData::class,
                 RefreshForthApiTokens::class,

@@ -26,6 +26,10 @@ class SmsFeedbackService
         $hash = hash('sha256', json_encode($rows, JSON_THROW_ON_ERROR));
         return SmsWorkflowLock::run('phone-suppression', fn () => DB::connection('sqlsrv')->transaction(function () use ($requestId, $chunk, $rows, $hash, $actor): array {
             $db = DB::connection('sqlsrv');
+            if ($db->getSchemaBuilder()->hasTable('TblSMSRuns')) {
+                $run = $db->table('TblSMSRuns')->where('Request_ID', $requestId)->lockForUpdate()->first();
+                if ($run !== null) SmsRecordPolicy::assertOrdinary($run);
+            }
             $log = $db->table('TblSMSFeedbackImports')->where('Request_ID', $requestId)->where('Chunk', $chunk)->first();
             if ($log) {
                 if (! hash_equals($log->Content_Hash, $hash)) throw new HttpException(409, 'This import chunk was already used for different feedback.');

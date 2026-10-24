@@ -270,4 +270,47 @@ final class SmsContactAttributionTest extends TestCase
         self::assertSame(1, $this->db->table('TblSMSHistory')->count());
         self::assertSame(0, $this->db->table('TblSMSResponseAttribution')->count());
     }
+
+    private function externalHeader(string $state='completed'): void
+    {
+        (require dirname(__DIR__,2).'/database/sms-migrations/2026_10_22_000001_add_sms_run_file_options.php')->up();
+        (require dirname(__DIR__,2).'/database/sms-migrations/2026_10_24_000001_create_sms_external_events.php')->up();
+        $this->db->table('TblSMSExternalEvents')->insert(['Request_ID'=>self::ID,'Event_Key'=>'jude-original-sms-2026-10-21',
+            'Policy_Version'=>SmsRecordPolicy::EXTERNAL,'State'=>$state,'Occurred_At_UTC'=>'2026-10-21 18:11:15','Occurred_Precision'=>0,
+            'Business_Date'=>'2026-10-21','Registered_By'=>'fixture@example.invalid','Started_At_UTC'=>'2026-10-23 00:00:00','Updated_At_UTC'=>'2026-10-23 00:00:00',
+            'Completed_At_UTC'=>$state==='completed'?'2026-10-23 00:00:00':null,'Expected_Rows'=>1,'Staged_Rows'=>1,'Applied_Rows'=>$state==='completed'?1:0,
+            'Plan_SHA256'=>self::SHA,'Membership_SHA256'=>self::SHA,'Preview_SHA256'=>self::SHA,'Before_State_SHA256'=>self::SHA,'Original_Artifacts_JSON'=>'{}']);
+    }
+
+    public function test_external_discarded_history_is_held_instead_of_permanently_freezing_null(): void
+    {
+        $pk=$this->person(); $this->member($pk,self::ID,['Selection_Policy'=>SmsRecordPolicy::EXTERNAL]);
+        $this->db->table('TblSMSRuns')->update(['Status'=>'discarded','Approved_At'=>null,'Approved_At_Precision'=>null]);
+        self::assertSame('unproven_external_history',$this->writer->record($this->event($pk))['reason']);
+        $this->assertUntouched($pk);
+    }
+
+    public function test_pending_external_registration_holds_before_any_member_has_been_staged(): void
+    {
+        $pk=$this->person(); $this->member($pk,self::ID,['Selection_Policy'=>SmsRecordPolicy::EXTERNAL,'Status'=>'external_registering']);
+        $this->externalHeader('held'); $this->db->table('TblProspectsExport')->delete();
+        self::assertSame('historical_registration_in_progress',$this->writer->record($this->event($pk))['reason']);
+        $this->assertUntouched($pk);
+    }
+
+    public function test_completed_external_history_uses_original_occurrence_and_holds_same_second(): void
+    {
+        $pk=$this->person(); $this->member($pk,self::ID,['Selection_Policy'=>SmsRecordPolicy::EXTERNAL]);
+        $this->db->table('TblSMSRuns')->update(['Status'=>'external_sent','Approved_At'=>null,'Approved_At_Precision'=>null]);
+        $this->db->table('TblSMSHistory')->update(['Export_Date'=>'2026-10-21 18:11:15']); $this->externalHeader();
+        $member=\Cmd\Reports\Services\SmsExternalEventSeal::member(['Prospect_PK'=>$pk,'Original_Phone'=>'0005550100','Original_First_Name'=>'Synthetic',
+            'Original_Address'=>'Fixture St','Original_Debt_Text'=>'13000','Original_Send_Date'=>'2026-10-21','Part_Number'=>1,'Part_Row'=>1,
+            'Expected_Attempts'=>0,'Expected_Last_SMS_Date'=>null,'Expected_Latest_Export_Date'=>null]);
+        $this->db->table('TblSMSExternalMembers')->insert(['Request_ID'=>self::ID,'Applied_Chunk'=>1,'Previous_Attempts'=>0,'Recorded_Attempts'=>1]+$member);
+        self::assertSame('historical_event_precision',$this->writer->record($this->event($pk,['explicitOriginalUtc'=>'2026-10-21T18:11:15.123456789Z']))['reason']);
+        $this->assertUntouched($pk);
+        self::assertSame(self::ID,$this->writer->record($this->event($pk,['explicitOriginalUtc'=>'2026-10-21T18:11:16Z']))['request_id']);
+        self::assertNull($this->db->table('TblSMSRuns')->value('Approved_At'));
+        self::assertSame('2026-10-21 18:11:15',$this->db->table('TblSMSHistory')->value('Export_Date'));
+    }
 }

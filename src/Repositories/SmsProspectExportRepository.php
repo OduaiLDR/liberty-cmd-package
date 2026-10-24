@@ -211,6 +211,7 @@ SQL;
      */
     public function lookupDebts(string $requestId, array $tierDebts = [], ?callable $progress = null): array
     {
+        $this->assertOrdinaryRun($requestId);
         return $this->withQueryTimeout(self::STEP_QUERY_TIMEOUT, fn (): array => $this->lookupDebtsNow($requestId, $tierDebts, $progress));
     }
 
@@ -243,6 +244,7 @@ SQL;
      */
     public function assignDrops(string $requestId, Carbon $dropDate): array
     {
+        $this->assertOrdinaryRun($requestId);
         $this->assertOpenRun($requestId);
         $db = $this->connection();
         $run = $db->table('TblSMSRuns')->where('Request_ID', $requestId)->first();
@@ -391,6 +393,7 @@ SQL, [$sentAt->toDateTimeString(), $requestId]);
     /** Keep the review file/drops, release its people, and do NOT record any send. */
     public function releaseReview(string $requestId): int
     {
+        $this->assertOrdinaryRun($requestId);
         if ($this->hasRows('TblSMSHistory', $requestId)) {
             throw ValidationException::withMessages(['request_id' => 'This run already has send history. It needs a send correction, not review-only.']);
         }
@@ -405,6 +408,7 @@ SQL, [$sentAt->toDateTimeString(), $requestId]);
     /** Reversal is allowed only with complete, unchanged before-values, never a guessed date. */
     public function reverseSent(string $requestId): int
     {
+        $this->assertOrdinaryRun($requestId);
         $restored = $this->withQueryTimeout(self::STEP_QUERY_TIMEOUT, fn (): int => $this->connection()->transaction(function () use ($requestId): int {
             $db = $this->connection();
             $audit = $db->table('TblSMSAttemptAudit')->where('Request_ID', $requestId);
@@ -432,6 +436,7 @@ SQL, [$requestId]);
     /** Removes a run that was not sent (its rows and SMS drops), so its people can be selected again. */
     public function discard(string $requestId): int
     {
+        $this->assertOrdinaryRun($requestId);
         $db = $this->connection();
 
         $deleted = $db->transaction(function () use ($db, $requestId): int {
@@ -470,11 +475,16 @@ SQL, [$requestId]);
 
     private function isRecordRun(string $requestId): bool
     {
-        // Do not query new columns in old deployments. Service boundaries independently
-        // reject record-run mutations if this coordinated feature has been disabled.
-        if (! SmsRecordPolicy::enabled()) return false;
-        $run = $this->table('TblSMSRuns')->where('Request_ID', $requestId)->first();
+        $run = $this->assertOrdinaryRun($requestId);
         return $run !== null && SmsRecordPolicy::isRecord($run);
+    }
+
+    private function assertOrdinaryRun(string $requestId): ?object
+    {
+        if (! $this->connection()->getSchemaBuilder()->hasTable('TblSMSRuns')) return null;
+        $run = $this->table('TblSMSRuns')->where('Request_ID', $requestId)->first();
+        if ($run !== null) SmsRecordPolicy::assertOrdinary($run);
+        return $run;
     }
 
     private function assertOpenRun(string $requestId): void

@@ -55,6 +55,7 @@ SQL;
     public static function install(PDO $db): void
     {
         self::dedicated($db);
+        self::assertNoExternalEvents($db);
         $db->beginTransaction();
         try {
             foreach (['Runs', 'Batches', 'Rows'] as $suffix) {
@@ -436,9 +437,18 @@ SQL, [$runId, (int) $historyReviewed, (int) $noPriorSends, $json])[0];
                 if ((int) $lock['result'] < 0) throw new RuntimeException('Another SMS workflow is active; no backfill chunk was started.');
                 $held[] = $name;
             }
+            self::assertNoExternalEvents($db);
             return $work();
         } finally {
             foreach (array_reverse($held) as $name) self::execute($db, "EXEC sys.sp_releaseapplock @Resource=?,@LockOwner='Session'", [$name]);
+        }
+    }
+
+    private static function assertNoExternalEvents(PDO $db): void
+    {
+        $object = self::rows($db, "SELECT OBJECT_ID(N'dbo.TblSMSExternalEvents',N'U') AS id")[0]['id'] ?? null;
+        if ($object !== null && self::rows($db, 'SELECT TOP(1) Request_ID FROM dbo.TblSMSExternalEvents WITH(HOLDLOCK)') !== []) {
+            throw new RuntimeException('This legacy phone/day writer does not support exact-PK external SMS events. Keep historical evidence unchanged and use the dedicated external-event workflow.');
         }
     }
 
