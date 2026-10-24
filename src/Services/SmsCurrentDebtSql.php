@@ -43,9 +43,11 @@ SQL;
     /**
      * Reusable, unchanged waterfall over a TRUSTED internal SELECT named Wanted.
      * Required columns: unique Export_PK, Client, Address and ZIP5 as Zip.
+     * Windowed v2 opts into reviewed SMS_Zip5 computed columns explicitly;
+     * legacy callers preserve the original LEFT(...,5) expressions.
      * Never pass request text or an unvalidated identifier as $wantedSql.
      */
-    public static function withResolved(string $wantedSql, string $mailerDate = 'Send_Date'): string
+    public static function withResolved(string $wantedSql, string $mailerDate = 'Send_Date', bool $seekableZipColumns = false): string
     {
         if ($mailerDate !== 'Send_Date') {
             throw new RuntimeException('SMS mailer ordering must use Jacob\'s confirmed TblMarketing.Send_Date. Remove any obsolete mailer-clock override.');
@@ -53,6 +55,8 @@ SQL;
         if (trim($wantedSql) === '') throw new RuntimeException('The SMS source resolver requires a trusted candidate SELECT.');
         $tuTier = SmsProspectValues::tierSql('t.Tier_Tag');
         $mailerTier = SmsProspectValues::tierSql('m.Debt_Tier');
+        $tuZip = $seekableZipColumns ? 't.SMS_Zip5' : 'LEFT(t.ncoaAddr_zipCde,5)';
+        $mailerZip = $seekableZipColumns ? 'm.SMS_Zip5' : 'LEFT(m.Zip,5)';
         $tierValues = implode(',', array_map(
             static fn (string $tier, int $amount): string => "('{$tier}',CAST({$amount} AS decimal(18,2)))",
             array_keys(self::TIER_AMOUNTS), array_values(self::TIER_AMOUNTS)
@@ -69,13 +73,13 @@ WITH Wanted AS (
 ), TU AS (
     SELECT w.Export_PK, t.PK AS Source_PK, t.Creation_Date AS Source_Date,
         t.derivedFields1_unsecdebtbalance AS Debt, {$tuTier} AS Tier
-    FROM Wanted w JOIN TblTUData t ON t.ncoaAddr_addrLine1Txt=w.Address AND LEFT(t.ncoaAddr_zipCde,5)=w.Zip
+    FROM Wanted w JOIN TblTUData t ON t.ncoaAddr_addrLine1Txt=w.Address AND {$tuZip}=w.Zip
     WHERE t.ncoaAddr_frstNme<>'' AND t.ncoaAddr_lastNme<>''
       AND LEFT(w.Client,LEN(t.ncoaAddr_frstNme)+1)=t.ncoaAddr_frstNme+' '
       AND RIGHT(w.Client,LEN(t.ncoaAddr_lastNme)+1)=' '+t.ncoaAddr_lastNme
 ), Mailers AS (
     SELECT w.Export_PK, m.PK AS Source_PK, d.Source_Date, m.Debt_Amount AS Debt, {$mailerTier} AS Tier
-    FROM Wanted w JOIN TblMailers m ON m.Client=w.Client AND m.Address=w.Address AND LEFT(m.Zip,5)=w.Zip
+    FROM Wanted w JOIN TblMailers m ON m.Client=w.Client AND m.Address=w.Address AND {$mailerZip}=w.Zip
     LEFT JOIN MailDates d ON d.Drop_Name=m.Drop_Name
     WHERE NOT EXISTS(SELECT 1 FROM TU t WHERE t.Export_PK=w.Export_PK)
 ), Candidates AS (

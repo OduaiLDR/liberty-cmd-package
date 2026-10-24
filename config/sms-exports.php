@@ -41,6 +41,10 @@ return [
     // Creation gate only. Source-first tier selection needs production schema/plan/scale acceptance.
     // Existing marked runs keep their frozen selector even when this switch is off.
     'tier_selection_enabled' => env('CMD_SMS_TIER_SELECTION_ENABLED', false),
+    // New-run policy only. Keep false until the reviewed seek indexes and bounded
+    // performance acceptance are complete; frozen v1 runs remain on v1.
+    'tier_selection_windowed_enabled' => env('CMD_SMS_TIER_SELECTION_WINDOWED_ENABLED', false),
+    'tier_selection_window_size' => env('CMD_SMS_TIER_SELECTION_WINDOW_SIZE', 5000),
     // Explicit operator archive/verify/restore only. No inherited legacy bucket,
     // chosen timing or deletion policy. Approve the complete contract before enabling.
     'run_archive_enabled' => env('CMD_SMS_RUN_ARCHIVE_ENABLED', false),

@@ -21,6 +21,14 @@ final class SmsRunOptions
 
     public const TIER_SELECTION_POLICY = 'current-source-tier-v1';
 
+    /** Exact-priority keyset windows; v1 remains readable/replayable for frozen runs. */
+    public const WINDOWED_TIER_SELECTION_POLICY = 'current-source-tier-windowed-v2';
+
+    public const TIER_SELECTION_POLICIES = [
+        self::TIER_SELECTION_POLICY,
+        self::WINDOWED_TIER_SELECTION_POLICY,
+    ];
+
     public const PLANNED_DATE_VERSION = 'sms-planned-date-v1';
 
     public const DROP_RANGE_FILENAME_VERSION = 'sms-drop-range-v1';
@@ -46,7 +54,7 @@ final class SmsRunOptions
             throw new InvalidArgumentException('A planned SMS date requires the explicit supported options version and frozen send date.');
         }
         if ($sendDate !== null) SmsDeliveryPolicy::plannedDate($sendDate);
-        if ($tierSelectionPolicy !== null && $tierSelectionPolicy !== self::TIER_SELECTION_POLICY) {
+        if ($tierSelectionPolicy !== null && ! in_array($tierSelectionPolicy, self::TIER_SELECTION_POLICIES, true)) {
             throw new InvalidArgumentException('Unknown SMS source-tier selection policy.');
         }
         if ($target < 1 || $target > self::MAX_TARGET) {
@@ -101,7 +109,7 @@ final class SmsRunOptions
         $keys = ['target', 'rows_per_file', 'tiers', 'csv_format'];
         if (is_array($stored) && array_key_exists('tier_selection_policy', $stored)) {
             $keys[] = 'tier_selection_policy';
-            if ($stored['tier_selection_policy'] !== self::TIER_SELECTION_POLICY) {
+            if (! in_array($stored['tier_selection_policy'], self::TIER_SELECTION_POLICIES, true)) {
                 throw new InvalidArgumentException('Stored SMS selector version is invalid.');
             }
         }
@@ -126,5 +134,10 @@ final class SmsRunOptions
             $stored['options_version'] ?? null, $stored['send_date'] ?? null, $stored['filename_version'] ?? null);
         if ($stored !== $canonical) throw new InvalidArgumentException('Stored SMS run options are not canonical.');
         return $canonical;
+    }
+
+    public static function isTierSelectionPolicy(mixed $policy): bool
+    {
+        return is_string($policy) && in_array($policy, self::TIER_SELECTION_POLICIES, true);
     }
 }

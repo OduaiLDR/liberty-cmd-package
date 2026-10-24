@@ -25,7 +25,13 @@ final class SmsTableRunEmailGateway implements SmsRunEmailGateway
         if (! is_string($source) || ! in_array($source, ['ldr', 'plaw'], true)) {
             throw new RuntimeException('Configure a supported source for the shared SMS email distribution table.');
         }
-        $this->connector ??= DBConnector::fromEnvironment($source);
+        if ($this->connector === null) {
+            $connector = DBConnector::fromEnvironment($source);
+            // fromEnvironment configures Snowflake only. The shared recipient
+            // reader requires an explicitly initialized SQL Server connection.
+            $connector->initializeSqlServer();
+            $this->connector = $connector;
+        }
         $this->sender ??= new EmailSenderService('GRAPH_LT');
         $groups = $this->sender->recipientGroupsForReports($this->connector, [$report], [$company], true);
         $configuration = ['from' => 'admin@lendingtower.com', 'to' => $groups['to'], 'cc' => $groups['cc'],

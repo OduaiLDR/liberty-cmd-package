@@ -12,6 +12,8 @@ use Cmd\Reports\Services\SmsRunArtifactBundle;
 use Cmd\Reports\Services\SmsRunOptions;
 use Cmd\Reports\Services\SmsRunArtifactFilename;
 use Cmd\Reports\Services\SmsTierSelectionSql;
+use Cmd\Reports\Services\SmsTierWindowSchema;
+use Cmd\Reports\Services\SmsTierWindowSelectionSql;
 use Illuminate\Database\Query\Builder;
 use RuntimeException;
 use Symfony\Component\HttpKernel\Exception\HttpException;
@@ -19,20 +21,37 @@ use Symfony\Component\HttpKernel\Exception\HttpException;
 /** PRD record membership. No phone deduplication, household expansion or inferred send date. */
 class SmsRecordExportRepository extends SqlSrvRepository
 {
-    private function eligible(): Builder
+    private function eligible(bool $seekContactPhones = false): Builder
     {
         $sqlServer = $this->connection()->getDriverName() === 'sqlsrv';
         $contactPhone = $sqlServer
             ? "CASE WHEN LEN(c.Phone) = 11 AND LEFT(c.Phone, 1) = '1' THEN SUBSTRING(c.Phone, 2, 10) ELSE c.Phone END"
             : "CASE WHEN length(c.Phone) = 11 AND substr(c.Phone, 1, 1) = '1' THEN substr(c.Phone, 2, 10) ELSE c.Phone END";
-        $query = $this->table('TblProspects')->where('Contacted', 0)->where('Opt_Out', 0)->where('Invalid_Phone', 0)
-            ->whereNotNull('Phone')
+        $query = $this->table('TblProspects');
+        if ($seekContactPhones && $sqlServer) {
+            // Fixed internal literals let cached plans prove the filtered-index
+            // predicate; these flags are never supplied by the caller.
+            $query->whereRaw('Contacted=0 AND Opt_Out=0 AND Invalid_Phone=0');
+        } else {
+            $query->where('Contacted', 0)->where('Opt_Out', 0)->where('Invalid_Phone', 0);
+        }
+        $query->whereNotNull('Phone')
             // Legacy loaders may leave prospect flags clear despite existing phone exclusions.
             ->whereNotExists(fn (Builder $q) => $q->selectRaw('1')->from('TblSMSSuppressions as s')
                 ->whereColumn('s.Phone', 'TblProspects.Phone')
-                ->where(fn (Builder $flags) => $flags->where('s.Opt_Out', 1)->orWhere('s.Invalid_Phone', 1)))
-            ->whereNotExists(fn (Builder $q) => $q->selectRaw('1')->from('TblPhoneNumbers as c')
+                ->where(fn (Builder $flags) => $flags->where('s.Opt_Out', 1)->orWhere('s.Invalid_Phone', 1)));
+        if ($seekContactPhones && $sqlServer) {
+            // Eligible prospects contain exactly ten digits. The legacy CASE
+            // therefore matches precisely the native ten-digit or 1+ten-digit
+            // contact key (including SQL Server's existing trailing-space rule).
+            $query->whereNotExists(fn (Builder $q) => $q->selectRaw('1')->from('TblPhoneNumbers as c')
+                ->whereColumn('c.Phone', 'TblProspects.Phone'))
+                ->whereNotExists(fn (Builder $q) => $q->selectRaw('1')->from('TblPhoneNumbers as c')
+                    ->whereRaw("c.Phone = '1' + TblProspects.Phone"));
+        } else {
+            $query->whereNotExists(fn (Builder $q) => $q->selectRaw('1')->from('TblPhoneNumbers as c')
                 ->whereNotNull('c.Phone')->whereRaw("{$contactPhone} = TblProspects.Phone"));
+        }
         if ($sqlServer) {
             return $query->whereRaw("DATALENGTH(Phone)=10 AND Phone NOT LIKE '%[^0-9]%'");
         }
@@ -100,7 +119,7 @@ class SmsRecordExportRepository extends SqlSrvRepository
         return isset($options['tier_selection_policy']) ? $options : null;
     }
 
-    /** One logical resolve/filter/priority/TOP and frozen insert in a consistent source snapshot. */
+    /** Versioned resolve/filter/priority and frozen insert in one consistent source snapshot. */
     private function selectTiersNow(string $requestId, int $target, array $options): array
     {
         $run = $this->table('TblSMSRuns')->where('Request_ID', $requestId)->lockForUpdate()->first();
@@ -108,9 +127,14 @@ class SmsRecordExportRepository extends SqlSrvRepository
             || $this->tierSelectionOptions($run, $target) !== $options) throw new HttpException(409, 'The frozen source-tier batch is not selecting.');
         if ($run->Selected !== null || $this->table('TblProspectsExport')->where('Request_ID', $requestId)->exists()
             || $this->table('TblSMSHistory')->where('Request_ID', $requestId)->exists()) throw new HttpException(409, 'This batch already has frozen membership.');
-        $eligible = $this->eligible()->select(['PK','Phone','Client','Address','City','State','Zip','Email','Creation_Date','Last_SMS_Date']);
-        $sql = SmsTierSelectionSql::select($eligible->toSql(), $options['tiers'], (string) config('sms-exports.mailer_recency_date', 'Send_Date'));
-        $this->connection()->affectingStatement($sql, [...$eligible->getBindings(), $target, $requestId, ...$options['tiers']]);
+        if ($options['tier_selection_policy'] === SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY) {
+            SmsTierWindowSchema::assertReady($this->connection());
+            $this->selectTierWindows($requestId, $target, $options);
+        } else {
+            $eligible = $this->eligible()->select(['PK','Phone','Client','Address','City','State','Zip','Email','Creation_Date','Last_SMS_Date']);
+            $sql = SmsTierSelectionSql::select($eligible->toSql(), $options['tiers'], (string) config('sms-exports.mailer_recency_date', 'Send_Date'));
+            $this->connection()->affectingStatement($sql, [...$eligible->getBindings(), $target, $requestId, ...$options['tiers']]);
+        }
         $this->assertTierPrices($requestId, $options);
         $counts = $this->composition($requestId);
         if ($counts['selected'] > $target) throw new RuntimeException('Tier selection exceeded its frozen quantity.');
@@ -121,10 +145,116 @@ class SmsRecordExportRepository extends SqlSrvRepository
         return ['selected' => $counts['selected'], 'target' => $target, 'shortfall' => max(0, $target - $counts['selected']), 'contacted_flagged' => 0];
     }
 
+    /** Walk the exact priority sequence; rejected/held rows advance the cursor too. */
+    private function selectTierWindows(string $requestId, int $target, array $options): void
+    {
+        $windowSize = (int) config('sms-exports.tier_selection_window_size', 5000);
+        if ($windowSize < 1 || $windowSize > 100000) {
+            throw new RuntimeException('SMS tier selection window size must be from 1 to 100,000.');
+        }
+        $db = $this->connection();
+        $db->unprepared('DROP TABLE IF EXISTS #SmsTierWanted');
+        $db->unprepared('CREATE TABLE #SmsTierWanted (
+            Window_Position bigint NOT NULL, Export_PK int NOT NULL, Phone varchar(10) COLLATE database_default NULL,
+            Client varchar(150) COLLATE database_default NULL, Address varchar(200) COLLATE database_default NULL, City varchar(100) COLLATE database_default NULL,
+            State char(2) COLLATE database_default NULL, Snapshot_Zip varchar(10) COLLATE database_default NULL, Zip varchar(5) COLLATE database_default NULL,
+            Email varchar(254) COLLATE database_default NULL, Creation_Date date NULL, Last_SMS_Date date NULL,
+            PRIMARY KEY CLUSTERED (Window_Position), UNIQUE (Export_PK)
+        )');
+
+        $sql = SmsTierWindowSelectionSql::insert($options['tiers'], (string) config('sms-exports.mailer_recency_date', 'Send_Date'));
+        $selected = 0;
+        $noCount = (int) $db->selectOne('SELECT CASE WHEN (@@OPTIONS & 512)=512 THEN 1 ELSE 0 END AS enabled')->enabled;
+        $db->unprepared('SET NOCOUNT ON');
+        try {
+            foreach ([0, 1] as $phase) {
+                $cursor = null;
+                while ($selected < $target) {
+                    $db->unprepared('TRUNCATE TABLE #SmsTierWanted');
+                    $window = $this->tierWindow($phase, $cursor, $windowSize);
+                    $db->table('#SmsTierWanted')->insertUsing([
+                        'Window_Position','Export_PK','Phone','Client','Address','City','State',
+                        'Snapshot_Zip','Zip','Email','Creation_Date','Last_SMS_Date',
+                    ], $window);
+                    $last = $db->table('#SmsTierWanted')->orderByDesc('Window_Position')->first([
+                        'Export_PK','Creation_Date','Last_SMS_Date',
+                    ]);
+                    if ($last === null) break;
+
+                    $remaining = $target - $selected;
+                    // Read the statement's own count on the server: shared worker
+                    // sessions/trigger NOCOUNT settings make PDO rowCount unreliable.
+                    $receipt = $db->selectOne($sql.'; SELECT CONVERT(int,@@ROWCOUNT) AS inserted_rows', [$remaining, $requestId, ...$options['tiers']]);
+                    $inserted = (int) $receipt->inserted_rows;
+                    if ($inserted < 0 || $inserted > $remaining) throw new RuntimeException('Invalid window selection count.');
+                    $selected += $inserted;
+                    $cursor = $last;
+                }
+                if ($selected >= $target) break;
+            }
+            $db->unprepared('DROP TABLE #SmsTierWanted');
+        } catch (\Throwable $error) {
+            // A failed SNAPSHOT transaction rolls its temp DDL back. If it is
+            // still committable, clear the connection-local table before reuse.
+            try {
+                $state = (int) ($db->selectOne('SELECT XACT_STATE() AS state')->state ?? -1);
+                if ($state === 1) $db->unprepared('DROP TABLE IF EXISTS #SmsTierWanted');
+            } catch (\Throwable) {
+                // Preserve the selector exception; the next attempt drops stale temp state first.
+            }
+            throw $error;
+        } finally {
+            $db->unprepared('SET NOCOUNT '.($noCount === 1 ? 'ON' : 'OFF'));
+        }
+    }
+
+    /** One keyset page from the original v1 ordering, including its NULL rules. */
+    private function tierWindow(int $phase, ?object $cursor, int $windowSize): Builder
+    {
+        $query = $this->eligible(true);
+        if ($phase === 0) {
+            $query->whereNull('Last_SMS_Date');
+            if ($cursor !== null) {
+                if ($cursor->Creation_Date === null) {
+                    $query->whereNull('Creation_Date')->where('PK', '>', (int) $cursor->Export_PK);
+                } else {
+                    $query->where(function (Builder $after) use ($cursor): void {
+                        $after->where('Creation_Date', '<', $cursor->Creation_Date)
+                            ->orWhereNull('Creation_Date')
+                            ->orWhere(function (Builder $same) use ($cursor): void {
+                                $same->where('Creation_Date', $cursor->Creation_Date)
+                                    ->where('PK', '>', (int) $cursor->Export_PK);
+                            });
+                    });
+                }
+            }
+            // SQL Server sorts NULL last for DESC, exactly matching v1 here.
+            $order = 'Creation_Date DESC, PK ASC';
+            $query->orderByRaw($order);
+        } else {
+            $query->whereNotNull('Last_SMS_Date');
+            if ($cursor !== null) {
+                $query->where(function (Builder $after) use ($cursor): void {
+                    $after->where('Last_SMS_Date', '>', $cursor->Last_SMS_Date)
+                        ->orWhere(function (Builder $same) use ($cursor): void {
+                            $same->where('Last_SMS_Date', $cursor->Last_SMS_Date)
+                                ->where('PK', '>', (int) $cursor->Export_PK);
+                        });
+                });
+            }
+            $order = 'Last_SMS_Date ASC, PK ASC';
+            $query->orderBy('Last_SMS_Date')->orderBy('PK');
+        }
+
+        return $query->selectRaw("ROW_NUMBER() OVER (ORDER BY {$order}) AS Window_Position,
+            PK AS Export_PK,Phone,Client,Address,City,State,Zip AS Snapshot_Zip,LEFT(Zip,5) AS Zip,
+            Email,Creation_Date,Last_SMS_Date")->limit($windowSize);
+    }
+
     /** Validate immutable selected prices, never look up current sources again. */
     public function assertTierPrices(string $requestId, array $options): void
     {
-        if (($options['tier_selection_policy'] ?? null) !== SmsRunOptions::TIER_SELECTION_POLICY) throw new RuntimeException('An explicit source-tier selector is required.');
+        if (! SmsRunOptions::isTierSelectionPolicy($options['tier_selection_policy'] ?? null)) throw new RuntimeException('An explicit source-tier selector is required.');
         if ($this->table('TblProspectsExport')->where('Request_ID', $requestId)->where(function (Builder $q) use ($options): void {
             $q->whereNull('Debt_Tier')->orWhereNotIn('Debt_Tier', $options['tiers'])
                 ->orWhereNull('Debt_Amount')->orWhere('Debt_Amount', '<=', 0)

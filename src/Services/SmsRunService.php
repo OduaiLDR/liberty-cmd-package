@@ -87,7 +87,7 @@ class SmsRunService
         $options = $this->fileOptions($run);
         if ($run->Status !== 'queued') return;
         if (isset($options['send_date'])) SmsDeliveryPolicy::assertNotPast($options['send_date']);
-        $sourceFirst = ($options['tier_selection_policy'] ?? null) === SmsRunOptions::TIER_SELECTION_POLICY;
+        $sourceFirst = SmsRunOptions::isTierSelectionPolicy($options['tier_selection_policy'] ?? null);
         if (! $this->move($requestId, ['queued'], 'selecting', ['Progress_Step' => 'contacts_and_selection'])) return;
         $hasRows = DB::connection('sqlsrv')->table('TblProspectsExport')->where('Request_ID', $requestId)->exists();
         $selectionCommitted = $sourceFirst && $this->mustRun($requestId)->Selected !== null;
@@ -820,7 +820,7 @@ class SmsRunService
                 || (isset($input['target']) && $input['target'] !== $target)
                 || (isset($input['rows_per_file']) && ! is_int($input['rows_per_file']))
                 || (isset($input['tiers']) && ! is_array($input['tiers']))
-                || (array_key_exists('tier_selection_policy', $input) && $input['tier_selection_policy'] !== SmsRunOptions::TIER_SELECTION_POLICY)
+                || (array_key_exists('tier_selection_policy', $input) && ! SmsRunOptions::isTierSelectionPolicy($input['tier_selection_policy']))
                 || (array_key_exists('options_version', $input) && $input['options_version'] !== SmsRunOptions::PLANNED_DATE_VERSION)
                 || (array_key_exists('filename_version', $input) && ! in_array($input['filename_version'], [SmsRunOptions::DROP_RANGE_FILENAME_VERSION, SmsRunOptions::APPROVAL_FILENAME_VERSION], true))
                 || (array_key_exists('send_date', $input) && ! is_string($input['send_date']))) {
@@ -864,9 +864,16 @@ class SmsRunService
         try { SmsRecordPolicy::assertReady(); } catch (HttpException) { return null; }
         if (! DB::connection('sqlsrv')->getSchemaBuilder()->hasColumns('TblSMSRuns', ['Run_Options_JSON', 'Artifact_Manifest_JSON'])
             || ! class_exists(\ZipArchive::class)) return null;
+        $tierSelection = (bool) config('sms-exports.tier_selection_enabled', false);
+        $windowed = (bool) config('sms-exports.tier_selection_windowed_enabled', false);
+        if ($tierSelection && $windowed && ! SmsTierWindowSchema::ready(DB::connection('sqlsrv'))) $tierSelection = false;
         $capabilities = ['csv_format' => SmsRunOptions::CSV_FORMAT, 'rows_per_file' => true,
-            'tier_subset' => (bool) config('sms-exports.tier_selection_enabled', false), 'max_parts' => SmsRunArtifactBundle::MAX_PARTS];
-        if ($capabilities['tier_subset']) $capabilities['tier_selection_policy'] = SmsRunOptions::TIER_SELECTION_POLICY;
+            'tier_subset' => $tierSelection, 'max_parts' => SmsRunArtifactBundle::MAX_PARTS];
+        if ($capabilities['tier_subset']) {
+            $capabilities['tier_selection_policy'] = $windowed
+                ? SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY
+                : SmsRunOptions::TIER_SELECTION_POLICY;
+        }
         $capabilities += ['options_version' => SmsRunOptions::PLANNED_DATE_VERSION, 'send_date' => true,
             'default_send_date' => SmsDeliveryPolicy::followingMonday()->toDateString(),
             'min_send_date' => Carbon::now(SmsDeliveryPolicy::TIMEZONE)->toDateString(), 'send_date_timezone' => SmsDeliveryPolicy::TIMEZONE,
@@ -882,10 +889,19 @@ class SmsRunService
         if (isset($options['tier_selection_policy']) && ! config('sms-exports.tier_selection_enabled', false)) {
             throw new HttpException(503, 'Source-tier selection requires its coordinated creation rollout.');
         }
+        if (($options['tier_selection_policy'] ?? null) === SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY) {
+            try { SmsTierWindowSchema::assertReady(DB::connection('sqlsrv')); }
+            catch (Throwable $error) { throw new HttpException(503, 'Windowed source-tier selection requires its reviewed seek schema.', $error); }
+        }
+        $capabilities = $this->fileCapabilities();
+        if (isset($options['tier_selection_policy'])
+            && ($capabilities['tier_selection_policy'] ?? null) !== $options['tier_selection_policy']) {
+            throw new HttpException(503, 'This source-tier selector version is not enabled for new runs.');
+        }
         if (intdiv($options['target'] + $options['rows_per_file'] - 1, $options['rows_per_file']) > SmsRunArtifactBundle::MAX_PARTS) {
             throw ValidationException::withMessages(['rows_per_file' => 'Choose rows per file that produce at most '.SmsRunArtifactBundle::MAX_PARTS.' files.']);
         }
-        if ($this->fileCapabilities() === null) {
+        if ($capabilities === null) {
             throw new HttpException(503, 'New SMS file options require the coordinated record workflow, file-options migration, ZIP support and creation flag.');
         }
     }
