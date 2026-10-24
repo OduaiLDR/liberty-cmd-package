@@ -602,9 +602,60 @@ final class SmsRecordSqlServerTest extends TestCase
             fwrite(STDOUT, PHP_EOL.json_encode(['environment' => 'disposable-loopback-synthetic','population' => $population,
                 'target' => $target,'selected' => $result['selected'],'seconds' => round($seconds, 3),
                 'php_peak_memory_bytes' => memory_get_peak_usage(true), 'membership_check' => 'exact-ordered-sql']).PHP_EOL);
+            $cached = $this->db->selectOne("SELECT TOP (1) s.execution_count,s.total_logical_reads,s.last_logical_reads,s.max_logical_reads,p.query_plan AS plan_xml
+                FROM sys.dm_exec_query_stats s CROSS APPLY sys.dm_exec_sql_text(s.sql_handle)t
+                CROSS APPLY sys.dm_exec_query_plan(s.plan_handle)p
+                WHERE EXISTS (SELECT 1 FROM sys.dm_exec_plan_attributes(s.plan_handle)a WHERE a.attribute='dbid' AND CONVERT(int,a.value)=DB_ID())
+                    AND CHARINDEX('insert into [#SmsTierWanted]',t.text)>0 AND CHARINDEX('union all',t.text)>0
+                    AND CHARINDEX('sys.dm_exec_query_stats',t.text)=0 ORDER BY s.total_worker_time DESC");
+            if ($cached !== null) {
+                $document = new \DOMDocument; $document->loadXML($cached->plan_xml);
+                $xpath = new \DOMXPath($document); $xpath->registerNamespace('s', 'http://schemas.microsoft.com/sqlserver/2004/07/showplan');
+                $access = [];
+                foreach ($xpath->query('//s:RelOp') as $operator) {
+                    $object = $xpath->query('s:IndexScan/s:Object', $operator)->item(0);
+                    if ($object === null || $object->getAttribute('Table') !== '[TblProspects]') continue;
+                    $access[] = ['physical' => $operator->getAttribute('PhysicalOp'), 'index' => $object->getAttribute('Index'),
+                        'has_seek_predicates' => $xpath->query('s:IndexScan/s:SeekPredicates', $operator)->length > 0];
+                }
+                fwrite(STDOUT, PHP_EOL.json_encode(['environment' => 'disposable-loopback-synthetic','candidate_union_plan' => $access,
+                    'execution_count' => (int) $cached->execution_count,'total_logical_reads' => (int) $cached->total_logical_reads,
+                    'last_logical_reads' => (int) $cached->last_logical_reads,'max_logical_reads' => (int) $cached->max_logical_reads]).PHP_EOL);
+            }
             $this->db->table('TblSMSRuns')->where('Request_ID', $id)->update(['Status' => 'discarded']);
             $this->db->table('TblProspectsExport')->where('Request_ID', $id)->delete();
         }
+    }
+
+    public function test_real_disjoint_cursor_ranges_match_v1_across_multiple_same_date_pages_and_null_phase(): void
+    {
+        $cases = [
+            ...array_fill(0, 7, ['Creation_Date' => '2026-10-22']),
+            ...array_fill(0, 2, ['Creation_Date' => '2026-10-21']),
+            ...array_fill(0, 3, ['Creation_Date' => null]),
+            ...array_fill(0, 4, ['Last_SMS_Date' => '2026-01-01']),
+            ...array_fill(0, 2, ['Last_SMS_Date' => '2026-01-02']),
+        ];
+        $expected = [];
+        foreach ($cases as $i => $values) {
+            $address = 'Disjoint case '.$i;
+            $pk = $this->person(['Address' => $address] + $values);
+            $this->source($i + 1, $address, $i === 4 ? 'T9' : 'T2', $i === 1 ? '0' : '13500');
+            if (! in_array($i, [1,4], true)) $expected[] = $pk;
+        }
+        config(['sms-exports.run_file_options_enabled' => true,'sms-exports.tier_selection_enabled' => true]);
+        $this->runs->start(self::ID, 18, 'synthetic@example.invalid', SmsRunOptions::normalize(18, 18, ['T2'], SmsRunOptions::TIER_SELECTION_POLICY));
+        $this->db->table('TblSMSRuns')->update(['Status' => 'selecting']);
+        $repo = new SmsRecordExportRepository;
+        self::assertSame(16, $repo->select(self::ID, 18)['selected']);
+        $columns = ['Prospect_PK','Phone','Debt_Tier','Debt_Amount','Debt_Source','Debt_Source_PK','Client','Address','City','State','Zip','Email','Was_Previously_Texted','Last_SMS_Date_At_Selection'];
+        $baseline = $this->db->table('TblProspectsExport')->orderBy('PK')->get($columns)->toJson();
+        self::assertSame($expected, array_map('intval', $this->db->table('TblProspectsExport')->orderBy('PK')->pluck('Prospect_PK')->all()));
+        $this->db->table('TblProspectsExport')->delete(); $this->db->table('TblSMSRuns')->delete();
+        $this->tierRun(18, ['T2']);
+        $this->db->table('TblSMSRuns')->update(['Status' => 'selecting']);
+        self::assertSame(16, $repo->select(self::ID, 18)['selected']);
+        self::assertSame($baseline, $this->db->table('TblProspectsExport')->orderBy('PK')->get($columns)->toJson());
     }
 
     public function test_real_windowed_contact_phone_seeks_match_v1_normalization_and_trailing_spaces(): void

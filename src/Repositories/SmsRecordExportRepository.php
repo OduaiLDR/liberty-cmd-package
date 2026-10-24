@@ -167,7 +167,7 @@ class SmsRecordExportRepository extends SqlSrvRepository
         $noCount = (int) $db->selectOne('SELECT CASE WHEN (@@OPTIONS & 512)=512 THEN 1 ELSE 0 END AS enabled')->enabled;
         $db->unprepared('SET NOCOUNT ON');
         try {
-            foreach ([0, 1] as $phase) {
+            foreach ([0, 1, 2] as $phase) {
                 $cursor = null;
                 while ($selected < $target) {
                     $db->unprepared('TRUNCATE TABLE #SmsTierWanted');
@@ -208,47 +208,43 @@ class SmsRecordExportRepository extends SqlSrvRepository
         }
     }
 
-    /** One keyset page from the original v1 ordering, including its NULL rules. */
+    /** Exact priority page with disjoint seek ranges; never rescan a cursor prefix. */
     private function tierWindow(int $phase, ?object $cursor, int $windowSize): Builder
     {
         $query = $this->eligible(true);
-        if ($phase === 0) {
+        if ($phase < 2) {
             $query->whereNull('Last_SMS_Date');
-            if ($cursor !== null) {
-                if ($cursor->Creation_Date === null) {
-                    $query->whereNull('Creation_Date')->where('PK', '>', (int) $cursor->Export_PK);
-                } else {
-                    $query->where(function (Builder $after) use ($cursor): void {
-                        $after->where('Creation_Date', '<', $cursor->Creation_Date)
-                            ->orWhereNull('Creation_Date')
-                            ->orWhere(function (Builder $same) use ($cursor): void {
-                                $same->where('Creation_Date', $cursor->Creation_Date)
-                                    ->where('PK', '>', (int) $cursor->Export_PK);
-                            });
-                    });
-                }
-            }
-            // SQL Server sorts NULL last for DESC, exactly matching v1 here.
+            if ($phase === 0) $query->whereNotNull('Creation_Date');
+            else $query->whereNull('Creation_Date');
+            // Separate NULL phase retains SQL Server's original DESC NULL-last order.
             $order = 'Creation_Date DESC, PK ASC';
-            $query->orderByRaw($order);
+            $date = 'Creation_Date';
         } else {
             $query->whereNotNull('Last_SMS_Date');
-            if ($cursor !== null) {
-                $query->where(function (Builder $after) use ($cursor): void {
-                    $after->where('Last_SMS_Date', '>', $cursor->Last_SMS_Date)
-                        ->orWhere(function (Builder $same) use ($cursor): void {
-                            $same->where('Last_SMS_Date', $cursor->Last_SMS_Date)
-                                ->where('PK', '>', (int) $cursor->Export_PK);
-                        });
-                });
-            }
             $order = 'Last_SMS_Date ASC, PK ASC';
-            $query->orderBy('Last_SMS_Date')->orderBy('PK');
+            $date = 'Last_SMS_Date';
+        }
+
+        if ($cursor !== null && $phase === 1) {
+            $query->where('PK', '>', (int) $cursor->Export_PK);
+        } elseif ($cursor !== null) {
+            // Each branch can seek its own simple (date, PK) range. TOP on
+            // both branches bounds the union to 2*windowSize before final TOP.
+            // An OR keyset predicate instead became a residual ordered scan
+            // and reread millions of already-visited records on every page.
+            $same = clone $query;
+            $otherDates = clone $query;
+            $columns = ['PK','Phone','Client','Address','City','State','Zip','Email','Creation_Date','Last_SMS_Date'];
+            $same->where($date, $cursor->$date)->where('PK', '>', (int) $cursor->Export_PK)
+                ->select($columns)->orderByRaw($order)->limit($windowSize);
+            $otherDates->where($date, $phase === 0 ? '<' : '>', $cursor->$date)
+                ->select($columns)->orderByRaw($order)->limit($windowSize);
+            $query = $this->connection()->query()->fromSub($same->unionAll($otherDates), 'SmsTierPage');
         }
 
         return $query->selectRaw("ROW_NUMBER() OVER (ORDER BY {$order}) AS Window_Position,
             PK AS Export_PK,Phone,Client,Address,City,State,Zip AS Snapshot_Zip,LEFT(Zip,5) AS Zip,
-            Email,Creation_Date,Last_SMS_Date")->limit($windowSize);
+            Email,Creation_Date,Last_SMS_Date")->orderByRaw($order)->limit($windowSize);
     }
 
     /** Validate immutable selected prices, never look up current sources again. */
