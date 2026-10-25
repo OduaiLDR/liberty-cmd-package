@@ -88,7 +88,7 @@ class SmsSelectionCancellation
         } catch (Throwable) { return false; }
     }
 
-    /** Gate OFF stops new requests, but an installed persistent receipt still governs recovery. */
+    /** The API creation gate never disables worker cooperation once the store is installed. */
     private function recoveryStoreExists(): bool
     {
         if (! self::configured()) return false;
@@ -102,7 +102,6 @@ class SmsSelectionCancellation
         if (! self::supports($run)) return false;
         if (! self::enabled() && ! $this->recoveryStoreExists()) return false;
         $this->assertReady();
-        if (! self::enabled() && $this->control($run->Request_ID) === null) return false;
         if (! in_array($run->Status, ['queued','selecting'], true)) return false;
         $this->fence($run, static fn (object $control): null => null);
         $this->checkpoint((string) $run->Request_ID);
@@ -116,6 +115,30 @@ class SmsSelectionCancellation
         if ($row === null) throw new RuntimeException('The selection cancellation receipt disappeared.');
         if (in_array($row->state, ['requested','cancelled'], true)) throw new SmsSelectionCancelledException;
         if ($row->state !== 'active') throw new RuntimeException('Selection cancellation control is not active.');
+    }
+
+    /** Caller holds the run SQL applock; release this short fence before bulk/file deletion. */
+    public function assertDiscardAllowed(object $run): void
+    {
+        if (! self::supports($run) || $run->Status !== 'failed' || ($run->Failed_Step ?? null) !== 'select') return;
+        if (! self::enabled() && ! $this->recoveryStoreExists()) return;
+        $source = DB::connection('sqlsrv');
+        if ($source->transactionLevel() !== 0 || $source->getPdo()->inTransaction()) {
+            throw new RuntimeException('Check cancellation before starting discard cleanup.');
+        }
+        $this->fence($run, function (object $control) use ($run): void {
+            $fresh = $this->readRunSnapshot((string) $run->Request_ID);
+            $this->assertOwnerScope($fresh, (string) $run->Created_By);
+            $this->assertReceipt($control, $fresh);
+            if ($fresh->Status !== 'failed' || ($fresh->Failed_Step ?? null) !== 'select') {
+                throw new HttpException(409, 'The failed selection changed. Refresh before deleting.');
+            }
+            if (in_array($control->state, ['requested','cancelled'], true)) {
+                throw new HttpException(409, 'Cancellation was accepted. Let its cleanup finish instead of deleting this run.');
+            }
+            if (! in_array($control->state, ['active','finished'], true)) throw new RuntimeException('Selection cancellation control changed.');
+            // No tombstone: failed deletion must leave ordinary retry available.
+        });
     }
 
     public function requestCancel(string $id, string $actor): object
