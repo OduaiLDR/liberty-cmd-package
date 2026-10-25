@@ -548,7 +548,11 @@ class SmsRunService
     {
         SmsRecordPolicy::assertOrdinary($this->mustRun($requestId));
         return SmsWorkflowLock::run('run:'.$requestId, function () use ($requestId): object {
-            if (SmsRecordPolicy::isRecord($this->mustRun($requestId))) return $this->discardRecord($requestId);
+            $run = $this->mustRun($requestId);
+            if (SmsRecordPolicy::isRecord($run)) {
+                app(SmsSelectionCancellation::class)->assertDiscardAllowed($run);
+                return $this->discardRecord($requestId);
+            }
             return DB::connection('sqlsrv')->transaction(fn () => $this->discardNow($requestId));
         });
     }

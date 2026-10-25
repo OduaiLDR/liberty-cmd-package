@@ -179,9 +179,22 @@ class SmsSelectionCancellationTest extends TestCase
     {
         $run=$this->makeRun();config(['sms-exports.selection_cancellation_enabled'=>false]);
         self::assertFalse($this->cancellation->availableForNewRequests());
-        self::assertFalse($this->cancellation->begin($run));
+        self::assertTrue($this->cancellation->begin($run));
         $this->assertRejected(503,fn()=>$this->cancellation->requestCancel(self::ID,'owner@example.invalid'));
-        self::assertSame(0,$this->control->table('jobs')->count());self::assertSame(0,$this->control->table(SmsSelectionCancellation::TABLE)->count());
+        self::assertSame(0,$this->control->table('jobs')->count());self::assertSame('active',$this->control->table(SmsSelectionCancellation::TABLE)->value('state'));
+        $this->cancellation->checkpoint(self::ID);
+        $published=false;$this->cancellation->finishSelection($run,function()use(&$published):void {$published=true;});
+        self::assertTrue($published);self::assertSame('finished',$this->control->table(SmsSelectionCancellation::TABLE)->value('state'));
+    }
+
+    public function testGateOffWithoutInstalledControlSchemaRetainsTheLegacyWorkerFallback():void
+    {
+        $run=$this->makeRun();config(['sms-exports.selection_cancellation_enabled'=>false]);
+        $this->control->getSchemaBuilder()->drop(SmsSelectionCancellation::TABLE);
+        self::assertFalse($this->cancellation->begin($run));
+        self::assertSame(0,$this->control->table('jobs')->count());
+        $this->source->table('TblSMSRuns')->where('Request_ID',self::ID)->update(['Status'=>'failed','Failed_Step'=>'select']);
+        self::assertSame('discarded',$this->runs->discard(self::ID)->status);
     }
 
     public function testUnknownControlCommitOutcomeRetriesTheSameAcceptedReceiptWithoutAnotherJob():void
@@ -365,5 +378,81 @@ class SmsSelectionCancellationTest extends TestCase
         self::assertSame('discarded',$this->source->table('TblSMSRuns')->value('Status'));
         self::assertNull($this->source->table('TblSMSRuns')->value('Error'));
         self::assertSame('cancelled',$this->control->table(SmsSelectionCancellation::TABLE)->value('state'));
+    }
+
+    public function testAcceptedCancelCleanupFailureCannotBeReplacedByOrdinaryDiscard():void
+    {
+        $this->makeRun();$this->cancellation->requestCancel(self::ID,'owner@example.invalid');
+        $this->source->table('TblProspectsExport')->insert(['Request_ID'=>self::ID,'Prospect_PK'=>1,'Phone'=>'2025550101']);
+        $bad=new class extends SmsSelectionCancellation {
+            public function complete(string $id):void {throw new RuntimeException('Synthetic transient cleanup failure');}
+        };
+        $this->container->instance(SmsSelectionCancellation::class,$bad);
+        try{$this->runs->prepare(self::ID);self::fail('Expected transient cancellation cleanup failure');}
+        catch(RuntimeException){}
+        $this->runs->fail(self::ID,'prepare','Synthetic queue failure callback');
+        self::assertSame('failed',$this->source->table('TblSMSRuns')->value('Status'));
+        self::assertSame('select',$this->source->table('TblSMSRuns')->value('Failed_Step'));
+        config(['sms-exports.selection_cancellation_enabled'=>false]); // Accepted work survives rollback of the API gate.
+        $this->assertRejected(409,fn()=>$this->runs->discard(self::ID));
+        self::assertSame('failed',$this->source->table('TblSMSRuns')->value('Status'));
+        self::assertSame('requested',$this->control->table(SmsSelectionCancellation::TABLE)->value('state'));
+        self::assertSame(1,$this->source->table('TblProspectsExport')->count());
+        self::assertSame(1,$this->control->table('jobs')->count());
+        $this->container->instance(SmsSelectionCancellation::class,$this->cancellation);
+        $this->runs->completeSelectionCancellation(self::ID);
+        self::assertSame('cancelled',$this->control->table(SmsSelectionCancellation::TABLE)->value('state'));
+        self::assertSame(SmsSelectionCancellation::CANCELLED_STEP,$this->source->table('TblSMSRuns')->value('Progress_Step'));
+        self::assertSame(0,$this->source->table('TblProspectsExport')->count());
+        self::assertSame(0,$this->source->table('TblSMSHistory')->count());self::assertSame(0,$this->source->table('TblSMSDrops')->count());
+    }
+
+    public function testOrdinaryDiscardWinsBeforeAStaleApiAttemptAndLeavesNoAcceptedCancellation():void
+    {
+        $this->makeRun('selecting');
+        $service=new class extends SmsSelectionCancellation {
+            public $afterFirstRead;
+            private int $reads=0;
+            protected function readRunSnapshot(string $id):object {
+                $run=parent::readRunSnapshot($id);
+                if(++$this->reads===1)($this->afterFirstRead)();
+                return $run;
+            }
+        };
+        $this->container->instance(SmsSelectionCancellation::class,$service);
+        $service->afterFirstRead=function():void {
+            $this->runs->fail(self::ID,'prepare','Synthetic selection failure');
+            self::assertSame('discarded',$this->runs->discard(self::ID)->status);
+        };
+        $this->assertRejected(409,fn()=>$service->requestCancel(self::ID,'owner@example.invalid'));
+        self::assertSame('discarded',$this->source->table('TblSMSRuns')->value('Status'));
+        self::assertNull($this->source->table('TblSMSRuns')->value('Progress_Step'));
+        self::assertSame('active',$this->control->table(SmsSelectionCancellation::TABLE)->value('state'));
+        self::assertSame(0,$this->control->table('jobs')->count());
+    }
+
+    public function testFailedOrdinaryDiscardRollsBackWithoutATombstoneAndSelectionCanRetry():void
+    {
+        $run=$this->makeRun('failed',['Failed_Step'=>'select']);$this->cancellation->begin((object)array_replace((array)$run,['Status'=>'selecting']));
+        $this->source->table('TblProspectsExport')->insert(['Request_ID'=>self::ID,'Prospect_PK'=>1,'Phone'=>'2025550101']);
+        $events=new \Illuminate\Events\Dispatcher($this->container);$failed=false;
+        $events->listen(\Illuminate\Database\Events\QueryExecuted::class,function($event)use(&$failed):void {
+            if(str_starts_with(strtolower($event->sql),'delete from')&&str_contains(strtolower($event->sql),'tblprospectsexport')) {
+                self::assertSame(0,$this->control->transactionLevel(),'Do not hold the cancellation fence across bulk discard');
+                $failed=true;throw new RuntimeException('Synthetic discard failure');
+            }
+        });
+        $this->source->setEventDispatcher($events);
+        try{$this->runs->discard(self::ID);self::fail('Expected discard rollback');}catch(RuntimeException){}
+        $this->source->unsetEventDispatcher();self::assertTrue($failed);
+        self::assertSame('failed',$this->source->table('TblSMSRuns')->value('Status'));
+        self::assertSame(1,$this->source->table('TblProspectsExport')->count());
+        self::assertSame('active',$this->control->table(SmsSelectionCancellation::TABLE)->value('state'));
+        self::assertSame('queued',$this->runs->retry(self::ID)->status);
+        $this->source->table('TblProspectsExport')->delete(); // Fixture export stub inserts a fresh whole selection.
+        $this->runs->prepare(self::ID);
+        self::assertSame('review',$this->source->table('TblSMSRuns')->value('Status'));
+        self::assertSame('finished',$this->control->table(SmsSelectionCancellation::TABLE)->value('state'));
+        self::assertSame(0,$this->control->table('jobs')->count());
     }
 }

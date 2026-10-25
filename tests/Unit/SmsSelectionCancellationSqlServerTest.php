@@ -77,7 +77,7 @@ final class SmsSelectionCancellationSqlServerTest extends SmsSelectionCancellati
         self::assertSame(1,$this->control->table('jobs')->count());
     }
 
-    public function testNativeWindowCheckpointSeesCancelDespiteTheOpenSourceSnapshot():void
+    public function testNativeGateOffWorkerSeesSeparateGateOnApiDespiteTheOpenSourceSnapshot():void
     {
         $this->windowSchema();$this->makeRun('selecting');
         for($i=1;$i<=2;$i++) {
@@ -86,13 +86,16 @@ final class SmsSelectionCancellationSqlServerTest extends SmsSelectionCancellati
             $this->source->table('TblTUData')->insert(['PK'=>$i,'Creation_Date'=>'2026-10-21','ncoaAddr_frstNme'=>'Synthetic','ncoaAddr_lastNme'=>'Person',
                 'ncoaAddr_addrLine1Txt'=>'Window '.$i,'ncoaAddr_zipCde'=>'90210','derivedFields1_unsecdebtbalance'=>13679,'Tier_Tag'=>'T1']);
         }
-        config(['sms-exports.tier_selection_window_size'=>1]);
+        config(['sms-exports.tier_selection_window_size'=>1,'sms-exports.selection_cancellation_enabled'=>false]);
         $cancellation=new class extends SmsSelectionCancellation {
             public int $checkpoints=0;
+            public $accept;
             public function checkpoint(string $id):void {
                 if(++$this->checkpoints===3) {
                     self::assertSourceSnapshotForFixture();
-                    $this->requestCancel($id,'owner@example.invalid');
+                    if(self::enabled())throw new \RuntimeException('Fixture worker gate must remain OFF');
+                    ($this->accept)($id);
+                    if(self::enabled())throw new \RuntimeException('Separate API must not alter worker configuration');
                 }
                 parent::checkpoint($id);
             }
@@ -100,10 +103,17 @@ final class SmsSelectionCancellationSqlServerTest extends SmsSelectionCancellati
                 if(!DB::connection('sqlsrv')->getPdo()->inTransaction())throw new \RuntimeException('Native fixture did not reach selection snapshot');
             }
         };
+        $cancellation->accept=function(string $id):void {
+            self::assertSame('active',$this->control->table(SmsSelectionCancellation::TABLE)->value('state'));
+            $receipt=$this->gateOnApiProcess($id);
+            self::assertSame('requested',$receipt['state']);self::assertTrue($receipt['api_gate']);
+            self::assertNotSame(getmypid(),$receipt['pid']);
+        };
         $this->container->instance(SmsSelectionCancellation::class,$cancellation);
         try{(new SmsRecordExportRepository)->select(self::ID,2);self::fail('Expected the first-window cooperative stop');}
         catch(SmsSelectionCancelledException){}
         self::assertSame(3,$cancellation->checkpoints);
+        self::assertFalse(SmsSelectionCancellation::enabled());
         self::assertSame(0,$this->source->table('TblProspectsExport')->count());
         self::assertNull($this->source->table('TblSMSRuns')->value('Selected'));
         self::assertFalse($this->source->getPdo()->inTransaction());self::assertSame(0,$this->source->transactionLevel());
@@ -114,6 +124,47 @@ final class SmsSelectionCancellationSqlServerTest extends SmsSelectionCancellati
         self::assertSame('cancelled',$this->control->table(SmsSelectionCancellation::TABLE)->value('state'));
         self::assertSame(0,$this->source->table('TblSMSHistory')->count());self::assertSame(0,$this->source->table('TblSMSDrops')->count());
         self::assertSame(0,(int)$this->source->table('TblProspects')->sum('SMS_Attempts'));
+    }
+
+    /** A genuinely separate API process has gate ON while the selecting worker stays OFF. */
+    private function gateOnApiProcess(string $id):array
+    {
+        $configuration=['app'=>['env'=>'testing'],
+            'database'=>['default'=>'control','connections'=>['sqlsrv'=>$this->sourceConfig(),'control'=>$this->controlConfig()]],
+            'queue'=>['default'=>'database','connections'=>['database'=>['driver'=>'database','connection'=>'control','table'=>'jobs','queue'=>'tu-export','retry_after'=>7201,'after_commit'=>true]]],
+            'sms-exports'=>['selection_cancellation_enabled'=>true,'selection_cancellation_connection'=>'control','queue'=>'tu-export']];
+        $bootstrap=dirname(__DIR__,2).'/tests/bootstrap-workspace.php';
+        $source='<?php require '.var_export($bootstrap,true).';$configuration='.var_export($configuration,true).';$id='.var_export($id,true).';'.<<<'PHP'
+try {
+    $container=new class extends \Illuminate\Container\Container {
+        public function environment(...$values):string|bool {return $values===[]?'testing':in_array('testing',$values,true);}
+    };
+    \Illuminate\Container\Container::setInstance($container);
+    $container->instance('config',new \Illuminate\Config\Repository($configuration));
+    $capsule=new \Illuminate\Database\Capsule\Manager($container);
+    foreach($configuration['database']['connections'] as $name=>$config)$capsule->addConnection($config,$name);
+    $capsule->getDatabaseManager()->setDefaultConnection('control');$container->instance('db',$capsule->getDatabaseManager());
+    \Illuminate\Support\Facades\Facade::setFacadeApplication($container);
+    $control=$capsule->getConnection('control');$control->setTransactionManager(new \Illuminate\Database\DatabaseTransactionsManager);
+    $queue=new \Illuminate\Queue\DatabaseQueue($control,'jobs','tu-export',7201,true);$queue->setContainer($container);
+    $container->instance('queue',new class($queue) {
+        public function __construct(private \Illuminate\Queue\DatabaseQueue $queue){}
+        public function connection($name):\Illuminate\Queue\DatabaseQueue{return $this->queue;}
+    });
+    $service=new \Cmd\Reports\Services\SmsSelectionCancellation;
+    $receipt=$service->requestCancel($id,'owner@example.invalid');
+    echo json_encode(['state'=>$receipt->cancellation['state'],'api_gate'=>\Cmd\Reports\Services\SmsSelectionCancellation::enabled(),'pid'=>getmypid()],JSON_THROW_ON_ERROR);
+} catch(\Throwable $error) {fwrite(STDERR,get_class($error));exit(1);}
+PHP;
+        $path=$this->directory.'/gate-on-api.php';file_put_contents($path,$source);
+        $process=proc_open([PHP_BINARY,$path],[0=>['pipe','r'],1=>['file',$this->directory.'/api.stdout','w'],2=>['file',$this->directory.'/api.stderr','w']],$pipes);
+        self::assertIsResource($process);fclose($pipes[0]);$deadline=microtime(true)+20;
+        do {$status=proc_get_status($process);if(!$status['running'])break;usleep(10000);}while(microtime(true)<$deadline);
+        if($status['running'])proc_terminate($process); // This fixture's own child only; no SQL cancellation.
+        $closed=proc_close($process);$exit=$status['exitcode']>=0?$status['exitcode']:$closed;
+        self::assertFalse($status['running'],'The disposable API process exceeded its bound');
+        self::assertSame(0,$exit,'Separate fixture API failed with sanitized class '.file_get_contents($this->directory.'/api.stderr'));
+        return json_decode(file_get_contents($this->directory.'/api.stdout'),true,8,JSON_THROW_ON_ERROR);
     }
 
     public function testReadCommittedPollReadsUpdlockButWaitsOnUncommittedCompletionWhenRcsiIsOff():void
