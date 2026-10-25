@@ -90,14 +90,32 @@ class SmsRunService
         $options = $this->fileOptions($run);
         if ($run->Status !== 'queued') return;
         if (isset($options['send_date'])) SmsDeliveryPolicy::assertNotPast($options['send_date']);
+        $cancellation = app(SmsSelectionCancellation::class);
+        try {
+            $cancellable = $cancellation->begin($run);
+            $this->prepareQueuedSelection($requestId, $run, $options, $cancellation, $cancellable);
+        } catch (SmsSelectionCancelledException) {
+            // The repository's source snapshot has unwound before this terminal cleanup.
+            $cancellation->complete($requestId);
+        }
+    }
+
+    private function prepareQueuedSelection(string $requestId, object $run, ?array $options,
+        SmsSelectionCancellation $cancellation, bool $cancellable): void
+    {
+        $checkpoint = static function () use ($cancellation, $cancellable, $requestId): void {
+            if ($cancellable) $cancellation->checkpoint($requestId);
+        };
         $sourceFirst = SmsRunOptions::isTierSelectionPolicy($options['tier_selection_policy'] ?? null);
         if (! $this->move($requestId, ['queued'], 'selecting', ['Progress_Step' => 'contacts_and_selection'])) return;
+        $checkpoint();
         $hasRows = DB::connection('sqlsrv')->table('TblProspectsExport')->where('Request_ID', $requestId)->exists();
         $selectionCommitted = $sourceFirst && $this->mustRun($requestId)->Selected !== null;
         if ($sourceFirst && $hasRows && ! $selectionCommitted) throw new RuntimeException('Source-tier membership has no atomic completion count; reconcile before retrying.');
         if (! $hasRows && ! $selectionCommitted) {
             $this->export->select($requestId, (int) $this->run($requestId)->Target);
         }
+        $checkpoint();
         $selected = DB::connection('sqlsrv')->table('TblProspectsExport')->where('Request_ID', $requestId)->count();
         if ($sourceFirst) {
             $completed = $this->mustRun($requestId)->Selected;
@@ -115,6 +133,7 @@ class SmsRunService
                     $this->move($requestId, ['selecting'], 'selecting', ['Progress_Step' => $step.'_debts']);
                 });
             }
+            $checkpoint();
             if (! $this->approvalFilenames($options)) {
                 $this->move($requestId, ['selecting'], 'selecting', ['Progress_Step' => 'numbering_drops']);
                 $this->export->assignDrops($requestId, isset($options['send_date'])
@@ -128,7 +147,50 @@ class SmsRunService
             $counts = ['Selected' => $selected, 'Debt_TU' => (int) $sources->TU, 'Debt_Mailers' => (int) $sources->Mailers,
                 'Debt_Tier_Default' => (int) $sources->TierDefault, 'Debt_Missing' => (int) $sources->Missing];
         }
-        $this->move($requestId, ['selecting'], 'review', $counts + ['Progress_Step' => 'review']);
+        $checkpoint();
+        if ($cancellable) {
+            $cancellation->finishSelection($run,
+                fn () => $this->publishSelectionReview($requestId, $counts));
+        } else {
+            $this->move($requestId, ['selecting'], 'review', $counts + ['Progress_Step' => 'review']);
+        }
+    }
+
+    /** The recovery command shares the same per-run lock as the selection worker. */
+    public function completeSelectionCancellation(string $requestId): void
+    {
+        SmsWorkflowLock::run('run:'.$requestId,
+            fn () => app(SmsSelectionCancellation::class)->complete($requestId));
+    }
+
+    /** A short conditional update; never wait on a SQL row while holding the MySQL finish fence. */
+    private function publishSelectionReview(string $requestId, array $counts): void
+    {
+        $db = DB::connection('sqlsrv');
+        if ($db->transactionLevel() !== 0 || $db->getPdo()->inTransaction()) {
+            throw new RuntimeException('Complete the source snapshot before publishing review.');
+        }
+        $native = $db->getDriverName() === 'sqlsrv';
+        $pdo = $db->getPdo();
+        $timeout = $native ? $pdo->getAttribute(\PDO::SQLSRV_ATTR_QUERY_TIMEOUT) : null;
+        $lockTimeout = $native ? (int) $db->selectOne('SELECT @@LOCK_TIMEOUT AS value')->value : null;
+        if ($native) {
+            $pdo->setAttribute(\PDO::SQLSRV_ATTR_QUERY_TIMEOUT, 5);
+            $db->unprepared('SET LOCK_TIMEOUT 0');
+        }
+        try {
+            $db->transaction(function () use ($requestId, $counts, $db, $pdo): void {
+                if ($db->getPdo() !== $pdo || ! $this->move($requestId, ['selecting'], 'review',
+                    $counts + ['Progress_Step' => 'review'])) {
+                    throw new RuntimeException('The selecting run changed before review publication.');
+                }
+            }, 1);
+        } finally {
+            if ($native) {
+                $db->unprepared('SET LOCK_TIMEOUT '.$lockTimeout);
+                $pdo->setAttribute(\PDO::SQLSRV_ATTR_QUERY_TIMEOUT, $timeout);
+            }
+        }
     }
 
     public function requestFile(string $requestId): object
@@ -650,6 +712,9 @@ class SmsRunService
         ];
 
         $view += $this->approvalFileView($run, $view['options']);
+        if (($run->Progress_Step ?? null) === SmsSelectionCancellation::CANCELLED_STEP) $view['selection_cancelled'] = true;
+        $cancellation = app(SmsSelectionCancellation::class)->projection($run);
+        if ($cancellation !== null) $view['selection_cancellation'] = $cancellation;
         $view['handoff'] = SmsRunEmailProjection::forRun($view);
         return (object) $view;
     }
@@ -699,6 +764,9 @@ class SmsRunService
             'drops' => $run->Status !== 'discarded' ? $this->export->drops((string) $run->Request_ID) : [],
         ];
         $view += $this->approvalFileView($run, $view['options']);
+        if (($run->Progress_Step ?? null) === SmsSelectionCancellation::CANCELLED_STEP) $view['selection_cancelled'] = true;
+        $cancellation = app(SmsSelectionCancellation::class)->projection($run);
+        if ($cancellation !== null) $view['selection_cancellation'] = $cancellation;
         $view['handoff'] = SmsRunEmailProjection::forRun($view);
         return (object) $view;
     }
@@ -901,6 +969,10 @@ class SmsRunService
             'default_send_date' => SmsDeliveryPolicy::followingMonday()->toDateString(),
             'min_send_date' => Carbon::now(SmsDeliveryPolicy::TIMEZONE)->toDateString(), 'send_date_timezone' => SmsDeliveryPolicy::TIMEZONE,
             'filename_version' => SmsRunOptions::APPROVAL_FILENAME_VERSION];
+        if (($capabilities['tier_selection_policy'] ?? null) === SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY
+            && app(SmsSelectionCancellation::class)->availableForNewRequests()) {
+            $capabilities['selection_cancellation'] = true;
+        }
         return $capabilities;
     }
 

@@ -34,6 +34,7 @@ if (class_exists(\App\Http\Middleware\VerifyCmdSession::class)
         Route::get('mail-drop-export-report/runs/{requestId}', [SmsRunController::class, 'show'])->whereUuid('requestId')->name('cmd.mail_drop_export.runs.show');
         Route::get('mail-drop-export-report/runs/{requestId}/link', [SmsRunController::class, 'link'])->whereUuid('requestId')->name('cmd.mail_drop_export.runs.link');
         Route::post('mail-drop-export-report/runs/{requestId}/file', [SmsRunController::class, 'file'])->whereUuid('requestId')->name('cmd.mail_drop_export.runs.file');
+        Route::post('mail-drop-export-report/runs/{requestId}/cancel-selection', [SmsRunController::class, 'cancelSelection'])->whereUuid('requestId')->name('cmd.mail_drop_export.runs.cancel_selection');
         Route::post('mail-drop-export-report/runs/{requestId}/sent', [SmsRunController::class, 'sent'])->whereUuid('requestId')->name('cmd.mail_drop_export.runs.sent');
         Route::post('mail-drop-export-report/runs/{requestId}/approve', [SmsRunController::class, 'approve'])->whereUuid('requestId')->name('cmd.mail_drop_export.runs.approve');
         Route::get('mail-drop-export-report/runs/{requestId}/details', [SmsRunController::class, 'details'])->whereUuid('requestId')->name('cmd.mail_drop_export.runs.details');

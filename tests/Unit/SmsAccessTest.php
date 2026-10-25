@@ -82,7 +82,7 @@ final class SmsAccessTest extends TestCase
         foreach (['export', 'selection', 'runs', 'workflow/load', "workflow/load/$id/retry", 'workflow/feedback', 'workflow/enrichment', "workflow/enrichment/$id/retry", 'tu-source/uploads', "tu-source/uploads/$id/finalize"] as $path) {
             $rows[] = ['mail-drop-export-report/'.$path, 'POST', [], 'manage'];
         }
-        foreach (['file', 'sent', 'approve', 'review-only', 'not-sent', 'discard', 'retry'] as $action) {
+        foreach (['file', 'sent', 'approve', 'review-only', 'not-sent', 'discard', 'retry', 'cancel-selection'] as $action) {
             $rows[] = ["mail-drop-export-report/runs/$id/$action", 'POST', [], 'manage'];
         }
         foreach ($rows as [$path, $method, $input, $need]) {
@@ -95,6 +95,16 @@ final class SmsAccessTest extends TestCase
         foreach (['mail', 'data'] as $kind) self::assertSame(204, $this->permissionStatus($this->request('marketing-report/invoice', 'POST', ['kind' => $kind])));
         self::assertSame(401, $this->permissionStatus($this->request('mail-drop-export-report/runs', 'POST', ['siteAdmin' => true, 'permissionIds' => ['*'], 'email' => 'forged@example.invalid'])));
         self::assertSame(403, $this->permissionStatus($this->request('mail-drop-export-report/runs', 'GET', [], $this->actor(['*'])), 'unknown'));
+    }
+
+    public function test_selection_cancellation_requires_fresh_manage_access(): void
+    {
+        $request = $this->request('mail-drop-export-report/runs/id/cancel-selection', 'POST', [], $this->actor([SmsAccess::MANAGE]));
+        (new SmsFreshSession)->handle($request, fn () => new Response);
+        self::assertTrue($request->attributes->get('cmd_session_fresh'));
+        self::assertSame(204, $this->permissionStatus($request));
+        $request->attributes->set('cmd_user', $this->actor([SmsAccess::DOWNLOAD]));
+        self::assertSame(403, $this->permissionStatus($request));
     }
 
     public function test_download_marker_and_permission_are_independent_requirements(): void
