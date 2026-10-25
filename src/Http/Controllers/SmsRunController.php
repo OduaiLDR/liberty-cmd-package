@@ -109,9 +109,20 @@ class SmsRunController extends Controller
         return $this->json($this->runs->requestFile($requestId), 202);
     }
 
-    public function link(string $requestId): JsonResponse
+    public function cancelSelection(Request $request, string $requestId): JsonResponse
     {
-        return $this->json(['download_url' => $this->runs->downloadUrl($requestId)]);
+        $this->ensureSchemaReady();
+        return $this->json(app(\Cmd\Reports\Services\SmsSelectionCancellation::class)
+            ->requestCancel($requestId, $this->actor($request)), 202);
+    }
+
+    public function link(Request $request, string $requestId): JsonResponse
+    {
+        $link = ['download_url' => $this->runs->downloadUrl($requestId)];
+        if (config('sms-exports.download_continuation_enabled', false) === true) {
+            $link['download_request'] = app(\Cmd\Reports\Services\SmsDownloadContinuation::class)->issue($request, $requestId);
+        }
+        return $this->json($link);
     }
 
     public function sent(Request $request, string $requestId): JsonResponse

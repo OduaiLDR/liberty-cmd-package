@@ -22,6 +22,8 @@ return [
     // have been applied. This routes the existing daily TU command into the new workflow.
     'prospect_enrichment_enabled' => env('CMD_SMS_PROSPECT_ENRICHMENT_ENABLED', false),
     'queue' => env('CMD_SMS_QUEUE', 'tu-export'),
+    // Enable after the matching runner's mandatory grant/child-entry telemetry exclusion is verified.
+    'download_continuation_enabled' => env('CMD_SMS_DOWNLOAD_CONTINUATION_ENABLED', false),
     // Opt in only after the additive summary migration, all eligibility writers and
     // the refresh scheduler have been deployed together. No live rollout is implicit.
     'durable_availability_enabled' => env('CMD_SMS_DURABLE_AVAILABILITY_ENABLED', false),
@@ -38,6 +40,8 @@ return [
     // Internal historical registration only, after its explicit ledger/readers/UI rollout.
     // This never enables campaign sending, external publication or provider email.
     'external_event_writer_enabled' => env('CMD_SMS_EXTERNAL_EVENT_WRITER_ENABLED', false),
+    // New-run selection cancellation requires the separate durable MySQL control schema.
+    'selection_cancellation_enabled' => env('CMD_SMS_SELECTION_CANCELLATION_ENABLED', false),
     // New-format creation only, after the explicit file-options migration and coordinated release.
     // Existing versioned runs retain their stored format when this creation switch is off.
     'run_file_options_enabled' => env('CMD_SMS_RUN_FILE_OPTIONS_ENABLED', false),

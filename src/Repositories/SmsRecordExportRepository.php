@@ -14,6 +14,7 @@ use Cmd\Reports\Services\SmsRunArtifactFilename;
 use Cmd\Reports\Services\SmsTierSelectionSql;
 use Cmd\Reports\Services\SmsTierWindowSchema;
 use Cmd\Reports\Services\SmsTierWindowSelectionSql;
+use Cmd\Reports\Services\SmsSelectionCancellation;
 use Illuminate\Database\Query\Builder;
 use RuntimeException;
 use Symfony\Component\HttpKernel\Exception\HttpException;
@@ -82,10 +83,12 @@ class SmsRecordExportRepository extends SqlSrvRepository
         if ($target < 1 || $target > 10000000) throw new HttpException(422, 'Enter a positive whole-number quantity up to 10,000,000.');
         $initial = $this->table('TblSMSRuns')->where('Request_ID', $requestId)->useWritePdo()->first();
         $options = $initial ? $this->tierSelectionOptions($initial, $target) : null;
+        $cancellation = app(SmsSelectionCancellation::class);
+        $cancellable = $initial !== null && $cancellation->begin($initial);
         if ($options !== null) {
             if ($this->connection()->getDriverName() !== 'sqlsrv') throw new RuntimeException('Source-tier selection requires SQL Server SNAPSHOT; no alternate selector was substituted.');
             return $this->withQueryTimeout(SmsProspectExportRepository::STEP_QUERY_TIMEOUT,
-                fn () => $this->withReadSnapshot(fn (): array => $this->selectTiersNow($requestId, $target, $options)));
+                fn () => $this->withReadSnapshot(fn (): array => $this->selectTiersNow($requestId, $target, $options, $cancellable ? $cancellation : null)));
         }
         return $this->withQueryTimeout(SmsProspectExportRepository::STEP_QUERY_TIMEOUT, fn () => $this->connection()->transaction(function () use ($requestId, $target): array {
             $run = $this->table('TblSMSRuns')->where('Request_ID', $requestId)->lockForUpdate()->first();
@@ -120,7 +123,7 @@ class SmsRecordExportRepository extends SqlSrvRepository
     }
 
     /** Versioned resolve/filter/priority and frozen insert in one consistent source snapshot. */
-    private function selectTiersNow(string $requestId, int $target, array $options): array
+    private function selectTiersNow(string $requestId, int $target, array $options, ?SmsSelectionCancellation $cancellation = null): array
     {
         $run = $this->table('TblSMSRuns')->where('Request_ID', $requestId)->lockForUpdate()->first();
         if (! $run || ! SmsRecordPolicy::isRecord($run) || $run->Status !== 'selecting'
@@ -129,13 +132,14 @@ class SmsRecordExportRepository extends SqlSrvRepository
             || $this->table('TblSMSHistory')->where('Request_ID', $requestId)->exists()) throw new HttpException(409, 'This batch already has frozen membership.');
         if ($options['tier_selection_policy'] === SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY) {
             SmsTierWindowSchema::assertReady($this->connection());
-            $this->selectTierWindows($requestId, $target, $options);
+            $this->selectTierWindows($requestId, $target, $options, $cancellation);
         } else {
             $eligible = $this->eligible()->select(['PK','Phone','Client','Address','City','State','Zip','Email','Creation_Date','Last_SMS_Date']);
             $sql = SmsTierSelectionSql::select($eligible->toSql(), $options['tiers'], (string) config('sms-exports.mailer_recency_date', 'Send_Date'));
             $this->connection()->affectingStatement($sql, [...$eligible->getBindings(), $target, $requestId, ...$options['tiers']]);
         }
         $this->assertTierPrices($requestId, $options);
+        $cancellation?->checkpoint($requestId);
         $counts = $this->composition($requestId);
         if ($counts['selected'] > $target) throw new RuntimeException('Tier selection exceeded its frozen quantity.');
         $this->table('TblSMSRuns')->where('Request_ID', $requestId)->update([
@@ -146,7 +150,7 @@ class SmsRecordExportRepository extends SqlSrvRepository
     }
 
     /** Walk the exact priority sequence; rejected/held rows advance the cursor too. */
-    private function selectTierWindows(string $requestId, int $target, array $options): void
+    private function selectTierWindows(string $requestId, int $target, array $options, ?SmsSelectionCancellation $cancellation = null): void
     {
         $windowSize = (int) config('sms-exports.tier_selection_window_size', 5000);
         if ($windowSize < 1 || $windowSize > 100000) {
@@ -170,6 +174,7 @@ class SmsRecordExportRepository extends SqlSrvRepository
             foreach ([0, 1, 2] as $phase) {
                 $cursor = null;
                 while ($selected < $target) {
+                    $cancellation?->checkpoint($requestId);
                     $db->unprepared('TRUNCATE TABLE #SmsTierWanted');
                     $window = $this->tierWindow($phase, $cursor, $windowSize);
                     $db->table('#SmsTierWanted')->insertUsing([
@@ -189,6 +194,7 @@ class SmsRecordExportRepository extends SqlSrvRepository
                     if ($inserted < 0 || $inserted > $remaining) throw new RuntimeException('Invalid window selection count.');
                     $selected += $inserted;
                     $cursor = $last;
+                    $cancellation?->checkpoint($requestId);
                 }
                 if ($selected >= $target) break;
             }

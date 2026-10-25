@@ -811,12 +811,14 @@ final class SmsRecordSqlServerTest extends TestCase
             require_once dirname(__DIR__, 3).'/cmd-runner/'.$file;
         }
         config(['app.url' => 'https://cmd.fixture.invalid', 'sms-exports.queue' => 'tu-export',
+            'sms-exports.download_continuation_enabled' => true,
             'sms-exports.run_file_options_enabled' => true, 'sms-exports.tier_selection_enabled' => true,
             'queue.default' => 'database', 'queue.connections.database.retry_after' => 15000,
             'services.cmd' => ['auth_enabled' => true, 'auth_validate_url' => 'https://identity.fixture.invalid', 'auth_cache_ttl' => 60],
             'cache' => ['default' => 'array', 'stores' => ['array' => ['driver' => 'array']]]]);
         $container->instance(\Illuminate\Contracts\Container\Container::class, $container);
         $container->instance('cache', new \Illuminate\Cache\CacheManager($container));
+        $container->instance('encrypter', new \Illuminate\Encryption\Encrypter(str_repeat('x', 32), 'AES-256-CBC'));
         $container->instance(\Illuminate\Http\Client\Factory::class, new \Illuminate\Http\Client\Factory);
         $container->instance('validator', new \Illuminate\Validation\Factory(new \Illuminate\Translation\Translator(new \Illuminate\Translation\ArrayLoader, 'en'), $container));
         $container->instance('log', new \Psr\Log\NullLogger);
@@ -848,16 +850,19 @@ final class SmsRecordSqlServerTest extends TestCase
         $actors = ['manager' => ['email' => 'manager@example.invalid', 'permissionIds' => ['cmd_sms_manage']],
             'agent' => ['email' => 'agent@example.invalid', 'permissionIds' => ['cmd_report_mail_drop_export', 'cmd_sms_download']],
             'viewer' => ['email' => 'viewer@example.invalid', 'permissionIds' => ['cmd_report_mail_drop_export']]];
-        $actor = $actors['manager'];
         \Illuminate\Support\Facades\Http::preventStrayRequests();
-        \Illuminate\Support\Facades\Http::fake(['identity.fixture.invalid/*' => static function () use (&$actor) {
-            return \Illuminate\Support\Facades\Http::response($actor);
+        \Illuminate\Support\Facades\Http::fake(['identity.fixture.invalid/*' => static function ($request) use ($actors) {
+            $cookie = $request->header('Cookie')[0] ?? '';
+            if (! preg_match('/\Aisolated-session=(manager|agent|viewer)\z/', $cookie, $match)) {
+                return \Illuminate\Support\Facades\Http::response([], 401);
+            }
+            return \Illuminate\Support\Facades\Http::response($actors[$match[1]]);
         }]);
-        $http = function (string $method, string $path, array $data = [], string $role = 'manager') use ($container, $router, $actors, &$actor) {
-            $actor = $actors[$role];
+        $http = function (string $method, string $path, array $data = [], string $role = 'manager', bool $browserCookie = true) use ($container, $router) {
             $url = str_starts_with($path, 'https://') ? $path : 'https://cmd.fixture.invalid/api/cmd/mail-drop-export-report/'.$path;
             $request = \Illuminate\Http\Request::create($url, $method, $data);
-            $request->headers->set('Cookie', 'isolated-session='.$role); $request->headers->set('Accept', 'application/json');
+            if ($browserCookie) $request->headers->set('Cookie', 'isolated-session='.$role);
+            $request->headers->set('Accept', 'application/json');
             $container->instance('request', $request); $container->instance(\Illuminate\Http\Request::class, $request);
             try { return $router->dispatch($request); }
             catch (\Symfony\Component\HttpKernel\Exception\HttpExceptionInterface $error) { return new \Illuminate\Http\JsonResponse(['message' => $error->getMessage()], $error->getStatusCode()); }
@@ -902,12 +907,32 @@ final class SmsRecordSqlServerTest extends TestCase
         self::assertSame(0, $this->db->table('TblSMSDrops')->count());
         self::assertSame(0, (int) $this->db->table('TblProspects')->sum('SMS_Attempts'));
         self::assertSame(403, $http('GET', 'runs/'.self::ID.'/link', [], 'viewer')->getStatusCode());
-        $link = $http('GET', 'runs/'.self::ID.'/link', [], 'agent')->getData(true)['download_url'];
-        $download = $http('GET', $link, [], 'agent');
+        $linkResponse = $http('GET', 'runs/'.self::ID.'/link', [], 'agent');
+        self::assertSame(200, $linkResponse->getStatusCode(), $linkResponse->getContent());
+        $linkPayload = $linkResponse->getData(true); $link = $linkPayload['download_url']; $continuation = $linkPayload['download_request'];
+        self::assertSame(['method', 'url', 'fields'], array_keys($continuation)); self::assertSame('POST', $continuation['method']);
+        self::assertSame(['grant'], array_keys($continuation['fields'])); self::assertMatchesRegularExpression('/\A[a-f0-9]{64}\z/', $continuation['fields']['grant']);
+        self::assertSame('/api/cmd/mail-drop-export-report/runs/'.self::ID.'/download', parse_url($continuation['url'], PHP_URL_PATH));
+        self::assertStringNotContainsString($continuation['fields']['grant'], $continuation['url']);
+        self::assertStringNotContainsString('isolated-session', json_encode($linkPayload, JSON_THROW_ON_ERROR));
+        $identityReads = \Illuminate\Support\Facades\Http::recorded()->count();
+        // Model the actual cross-origin browser transport: no runner Cookie is
+        // present; the consumed grant must inject its saved session for a fresh identity read.
+        $download = $http('POST', $continuation['url'], $continuation['fields'], 'agent', false);
         self::assertSame(200, $download->getStatusCode());
         self::assertInstanceOf(\Symfony\Component\HttpFoundation\BinaryFileResponse::class, $download);
+        self::assertSame($identityReads + 1, \Illuminate\Support\Facades\Http::recorded()->count());
+        self::assertSame(['isolated-session=agent'], \Illuminate\Support\Facades\Http::recorded()->last()[0]->header('Cookie'));
+        self::assertSame(410, $http('POST', $continuation['url'], $continuation['fields'], 'agent', false)->getStatusCode());
+        // Existing signed GET remains a separate compatibility path, requiring
+        // its own actual runner session rather than accepting the URL alone.
+        self::assertSame(401, $http('GET', $link, [], 'agent', false)->getStatusCode());
+        $signedGet = $http('GET', $link, [], 'agent'); self::assertSame(200, $signedGet->getStatusCode());
+        self::assertInstanceOf(\Symfony\Component\HttpFoundation\BinaryFileResponse::class, $signedGet);
+        self::assertSame($download->getFile()->getPathname(), $signedGet->getFile()->getPathname());
         $fileHash = hash_file('sha256', $download->getFile()->getPathname());
         $manifest = json_decode($this->db->table('TblSMSRuns')->where('Request_ID', self::ID)->value('Artifact_Manifest_JSON'), true);
+        self::assertSame($manifest['download']['sha256'], $fileHash);
         self::assertSame([2, 1], array_column($manifest['parts'], 'rows'));
         self::assertSame(['SMS Export - 2026-10-26 - ID Pending - Part 1 of 2.csv', 'SMS Export - 2026-10-26 - ID Pending - Part 2 of 2.csv'], array_column($manifest['parts'], 'name'));
         $zip = new \ZipArchive; self::assertTrue($zip->open($download->getFile()->getPathname()));
@@ -950,9 +975,13 @@ final class SmsRecordSqlServerTest extends TestCase
         self::assertSame(array_column($manifest['parts'], 'sha256'), array_column($finalManifest['parts'], 'sha256'));
         self::assertSame(array_column($manifest['parts'], 'bytes'), array_column($finalManifest['parts'], 'bytes'));
         self::assertSame(['SMS Export - 2026-10-26 - SMS0001-SMS0001 - Part 1 of 2.csv', 'SMS Export - 2026-10-26 - SMS0001-SMS0001 - Part 2 of 2.csv'], array_column($finalManifest['parts'], 'name'));
-        $finalLink = $http('GET', 'runs/'.self::ID.'/link', [], 'agent')->getData(true)['download_url'];
-        $finalDownload = $http('GET', $finalLink, [], 'agent');
+        $finalLinkResponse = $http('GET', 'runs/'.self::ID.'/link', [], 'agent');
+        self::assertSame(200, $finalLinkResponse->getStatusCode(), $finalLinkResponse->getContent());
+        $finalContinuation = $finalLinkResponse->getData(true)['download_request'];
+        self::assertSame('POST', $finalContinuation['method']);
+        $finalDownload = $http('POST', $finalContinuation['url'], $finalContinuation['fields'], 'agent', false);
         self::assertSame(200, $finalDownload->getStatusCode());
+        self::assertSame($finalManifest['download']['sha256'], hash_file('sha256', $finalDownload->getFile()->getPathname()));
         self::assertStringContainsString('/v2/published/', str_replace('\\', '/', $finalDownload->getFile()->getPathname()));
         self::assertSame($fileHash, hash_file('sha256', $download->getFile()->getPathname()));
         // Publication and email use real SQL app locks, migrations and serialized

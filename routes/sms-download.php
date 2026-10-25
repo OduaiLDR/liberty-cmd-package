@@ -2,6 +2,8 @@
 
 use Cmd\Reports\Http\Controllers\SmsExportDownloadController;
 use Cmd\Reports\Http\Controllers\SmsRunController;
+use Cmd\Reports\Http\Controllers\SmsRunDownloadContinuationController;
+use Cmd\Reports\Http\Middleware\SmsDownloadSessionBridge;
 use Cmd\Reports\Http\Middleware\SmsFreshSession;
 use Cmd\Reports\Http\Middleware\SmsPermission;
 use Illuminate\Support\Facades\Route;
@@ -15,5 +17,12 @@ if (class_exists(\App\Http\Middleware\VerifyCmdSession::class)
         Route::get('api/cmd/mail-drop-export-report/download', SmsExportDownloadController::class)->name('cmd.sms_export.download');
         Route::get('api/cmd/mail-drop-export-report/runs/{requestId}/download', [SmsRunController::class, 'download'])
             ->whereUuid('requestId')->name('cmd.sms_run.download');
+    });
+    // Body-only continuation bridges the separately hosted login. The signed GET above still
+    // requires a real runner session; this POST always consumes a one-use server-side grant.
+    Route::middleware(['api', 'signed:relative', SmsDownloadSessionBridge::class, SmsFreshSession::class,
+        \App\Http\Middleware\VerifyCmdSession::class, SmsPermission::class.':download'])->group(function (): void {
+        Route::post('api/cmd/mail-drop-export-report/runs/{requestId}/download', SmsRunDownloadContinuationController::class)
+            ->whereUuid('requestId')->name('cmd.sms_run.download_continue');
     });
 }
