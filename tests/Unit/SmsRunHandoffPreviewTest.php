@@ -47,7 +47,7 @@ test('planned SMS handoff is an honest preview with dynamic recipients unresolve
         ->and($result['debtplete_import']['processed'])->toBeNull()
         ->and($result['debtplete_import']['total'])->toBe(3)
         ->and($result['email']['note'])->toContain('does not send email', 'does not establish past email activity')
-        ->and($result['debtplete_import']['note'])->toContain('No records have been uploaded')
+        ->and($result['debtplete_import']['note'])->toContain('does not verify past manual imports')
         ->and($view)->toBe(smsHandoffPreviewFixture());
 });
 

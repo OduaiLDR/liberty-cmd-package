@@ -15,6 +15,7 @@ use Illuminate\Database\Capsule\Manager;
 use Illuminate\Database\DatabaseTransactionsManager;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Facade;
 use Illuminate\Translation\ArrayLoader;
 use Illuminate\Translation\Translator;
@@ -69,6 +70,14 @@ beforeEach(function (): void {
         public bool $interruptAfterApprovalFiles = false;
         public bool $interruptAllocationCommit = false;
         public ?string $clockAfterFileVerification = null;
+        public array $importQueueRequests = [];
+        protected function requestDebtPleteImport(string $id): void
+        {
+            if (config('sms-exports.debtplete_import_enabled') !== true || config('sms-exports.debtplete_import_automatic') !== true) return;
+            expect(DB::connection('sqlsrv')->transactionLevel())->toBe(0);
+            $this->importQueueRequests[] = $id;
+        }
+        public function requestRealImportQueueForTest(string $id): void { parent::requestDebtPleteImport($id); }
         protected function dispatch(string $id, string $job): void { $this->queued[] = [$id, $job]; }
         protected function move(string $id, array $from, string $to, array $values = []): bool
         {
@@ -753,4 +762,100 @@ test('older historical runs retain frozen file metadata and download exact bytes
     expect(fn () => $this->service->filePath($row->request_id))->toThrow(HttpException::class);
     expect((int) $this->db->table('TblProspects')->sum('SMS_Attempts'))->toBe($attempts)
         ->and($this->service->show($this->id)->status)->toBe('approved');
+});
+
+
+/** Closed import gateway: approval capture may inspect identity but must never transfer a file. */
+function smsVersionedBindImportWorkflow(): \Cmd\Reports\Services\SmsRunDebtPleteImportWorkflow
+{
+    $gateway = new class implements \Cmd\Reports\Services\SmsDebtPleteImportGateway {
+        public function identity(): array
+        {
+            return ['protocol' => 'debtplete-sms-import-v1', 'origin' => 'https://tenant.example.invalid',
+                'tenant_id' => 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', 'client_id' => 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'];
+        }
+        public function register(array $payload): array { throw new RuntimeException('Approval must not call the receiver.'); }
+        public function upload(string $id, int $part, string $sha, mixed $stream): array { throw new RuntimeException('Approval must not upload bytes.'); }
+        public function status(string $id): array { throw new RuntimeException('A saved read must not poll the receiver.'); }
+    };
+    $workflow = new \Cmd\Reports\Services\SmsRunDebtPleteImportWorkflow($gateway, new \Cmd\Reports\Services\SmsRunArtifactPartReader);
+    app()->instance(\Cmd\Reports\Services\SmsRunDebtPleteImportWorkflow::class, $workflow);
+    return $workflow;
+}
+
+test('automatic import outbox commits with approval once and queue intent follows the commit', function (): void {
+    ($this->prepareApprovalVersion)();
+    (require dirname(__DIR__, 2).'/database/sms-migrations/2026_10_25_000001_create_sms_debtplete_imports.php')->up();
+    config(['sms-exports.debtplete_import_enabled' => true, 'sms-exports.debtplete_import_automatic' => true]);
+    smsVersionedBindImportWorkflow();
+    $this->service->requestApprove($this->id, 'editor@example.invalid');
+    $this->service->markApproved($this->id);
+    $receipt = $this->db->table('TblSMSDebtPleteImports')->first();
+    expect($receipt->Request_ID)->toBe($this->id)->and($receipt->State)->toBe('queued')
+        ->and($receipt->Remote_Receipt_JSON)->toBeNull()->and($this->service->importQueueRequests)->toBe([$this->id])
+        ->and($this->db->table('TblSMSRuns')->value('Status'))->toBe('approved')
+        ->and((int) $this->db->table('TblProspects')->sum('SMS_Attempts'))->toBe(5);
+    $this->service->markApproved($this->id);
+    expect($this->db->table('TblSMSDebtPleteImports')->count())->toBe(1)
+        ->and($this->service->importQueueRequests)->toBe([$this->id])
+        ->and($this->db->table('TblSMSHistory')->count())->toBe(5);
+    $view = $this->service->show($this->id);
+    expect($view->handoff['debtplete_import']['status'])->toBe('queued')
+        ->and($view->handoff['debtplete_import']['processed'])->toBeNull();
+});
+
+test('failed automatic outbox insert rolls back approval attempts and history while retaining finalized files for the same retry', function (): void {
+    ($this->prepareApprovalVersion)();
+    (require dirname(__DIR__, 2).'/database/sms-migrations/2026_10_25_000001_create_sms_debtplete_imports.php')->up();
+    config(['sms-exports.debtplete_import_enabled' => true, 'sms-exports.debtplete_import_automatic' => true]);
+    smsVersionedBindImportWorkflow();
+    $this->db->statement("CREATE TRIGGER block_import_capture BEFORE INSERT ON TblSMSDebtPleteImports BEGIN SELECT RAISE(ABORT, 'Synthetic outbox failure'); END");
+    $this->service->requestApprove($this->id, 'editor@example.invalid');
+    expect(fn () => $this->service->markApproved($this->id))->toThrow(RuntimeException::class);
+    expect($this->db->table('TblSMSDebtPleteImports')->count())->toBe(0)
+        ->and($this->db->table('TblSMSRuns')->value('Status'))->toBe('approving')
+        ->and($this->db->table('TblSMSHistory')->count())->toBe(0)
+        ->and((int) $this->db->table('TblProspects')->sum('SMS_Attempts'))->toBe(0)
+        ->and($this->service->importQueueRequests)->toBe([]);
+    $manifest = str_replace('\\', '/', $this->versionedDirectory).'/runs/'.$this->id.'/v2/published/manifest.json';
+    expect(is_file($manifest))->toBeTrue();
+    $before = hash_file('sha256', $manifest);
+    $this->db->statement('DROP TRIGGER block_import_capture');
+    $this->service->markApproved($this->id);
+    expect($this->db->table('TblSMSDebtPleteImports')->count())->toBe(1)
+        ->and(hash_file('sha256', $manifest))->toBe($before)
+        ->and($this->db->table('TblSMSHistory')->count())->toBe(5)
+        ->and((int) $this->db->table('TblProspects')->sum('SMS_Attempts'))->toBe(5);
+});
+
+test('enabling import does not retroactively enqueue an earlier approved run', function (): void {
+    ($this->prepareApprovalVersion)();
+    $this->service->requestApprove($this->id, 'editor@example.invalid'); $this->service->markApproved($this->id);
+    (require dirname(__DIR__, 2).'/database/sms-migrations/2026_10_25_000001_create_sms_debtplete_imports.php')->up();
+    config(['sms-exports.debtplete_import_enabled' => true, 'sms-exports.debtplete_import_automatic' => true]);
+    smsVersionedBindImportWorkflow();
+    $this->service->markApproved($this->id);
+    expect($this->db->table('TblSMSDebtPleteImports')->count())->toBe(0)
+        ->and($this->service->importQueueRequests)->toBe([])
+        ->and($this->service->show($this->id)->handoff['debtplete_import']['status'])->toBe('not_requested');
+});
+
+test('queue or logging failure after approval leaves the committed outbox and business state intact', function (): void {
+    ($this->prepareApprovalVersion)();
+    (require dirname(__DIR__, 2).'/database/sms-migrations/2026_10_25_000001_create_sms_debtplete_imports.php')->up();
+    config(['sms-exports.debtplete_import_enabled' => true, 'sms-exports.debtplete_import_automatic' => true]);
+    smsVersionedBindImportWorkflow();
+    $this->service->requestApprove($this->id, 'editor@example.invalid'); $this->service->markApproved($this->id);
+    $before = $this->db->table('TblSMSDebtPleteImports')->first();
+    $logger = Mockery::mock(\Psr\Log\LoggerInterface::class);
+    $logger->shouldReceive('warning')->once()->withArgs(function (string $message, array $context): bool {
+        expect(\Cmd\Reports\Services\SmsDebtPleteImportPrivacy::active())->toBeTrue();
+        return $context === ['request_id' => '11111111-2222-4333-8444-555555555555'];
+    })->andThrow(new RuntimeException('Synthetic unavailable logger.'));
+    app()->instance('log', $logger);
+    // This fixture has no dispatcher/cache bindings: acknowledgement fails before any queue write.
+    $this->service->requestRealImportQueueForTest($this->id);
+    expect($this->db->table('TblSMSDebtPleteImports')->first())->toEqual($before)
+        ->and($this->db->table('TblSMSRuns')->value('Status'))->toBe('approved')
+        ->and((int) $this->db->table('TblProspects')->sum('SMS_Attempts'))->toBe(5);
 });

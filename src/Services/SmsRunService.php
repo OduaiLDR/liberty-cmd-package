@@ -455,8 +455,36 @@ class SmsRunService
                         'Artifact_Manifest_JSON' => json_encode($bundle['manifest'], JSON_THROW_ON_ERROR), 'File_At' => $this->now(),
                         'Sent_By' => $run->Approved_By, 'Sent_At' => $at->format('Y-m-d H:i:s'), 'Progress_Step' => 'approved',
                     ])) throw new RuntimeException('Approval status changed; all business changes were rolled back.');
+                    $this->captureDebtPleteImport($this->mustRun($requestId));
                 });
             });
+        });
+        $this->requestDebtPleteImport($requestId);
+    }
+
+    /** Import evidence commits with the first approval; no upload runs in this transaction. */
+    protected function captureDebtPleteImport(object $run): void
+    {
+        if (config('sms-exports.debtplete_import_enabled', false) !== true
+            || config('sms-exports.debtplete_import_automatic', false) !== true) return;
+        SmsDebtPleteImportPrivacy::run(fn () => app(SmsRunDebtPleteImportWorkflow::class)->captureApproved($run));
+    }
+
+    /** Queue acknowledgement is separate from the committed approval and durable outbox. */
+    protected function requestDebtPleteImport(string $requestId): void
+    {
+        if (config('sms-exports.debtplete_import_enabled', false) !== true
+            || config('sms-exports.debtplete_import_automatic', false) !== true) return;
+        SmsDebtPleteImportPrivacy::run(function () use ($requestId): void {
+            try {
+                $status = app(SmsRunDebtPleteImportWorkflow::class)->status($requestId);
+                if ($status === null || in_array($status['status'], ['completed', 'held'], true)) return;
+                \Cmd\Reports\Jobs\SmsRunDebtPleteImportJob::dispatch($requestId)->afterCommit();
+            } catch (Throwable) {
+                try {
+                    \Illuminate\Support\Facades\Log::warning('SMS approval committed; import queue acknowledgement is pending.', ['request_id' => $requestId]);
+                } catch (Throwable) {}
+            }
         });
     }
 
@@ -719,7 +747,7 @@ class SmsRunService
         if (($run->Progress_Step ?? null) === SmsSelectionCancellation::CANCELLED_STEP) $view['selection_cancelled'] = true;
         $cancellation = app(SmsSelectionCancellation::class)->projection($run);
         if ($cancellation !== null) $view['selection_cancellation'] = $cancellation;
-        $view['handoff'] = SmsRunEmailProjection::forRun($view);
+        $view['handoff'] = SmsRunDebtPleteImportProjection::forRun($view, SmsRunEmailProjection::forRun($view));
         return (object) $view;
     }
 
@@ -771,7 +799,7 @@ class SmsRunService
         if (($run->Progress_Step ?? null) === SmsSelectionCancellation::CANCELLED_STEP) $view['selection_cancelled'] = true;
         $cancellation = app(SmsSelectionCancellation::class)->projection($run);
         if ($cancellation !== null) $view['selection_cancellation'] = $cancellation;
-        $view['handoff'] = SmsRunEmailProjection::forRun($view);
+        $view['handoff'] = SmsRunDebtPleteImportProjection::forRun($view, SmsRunEmailProjection::forRun($view));
         return (object) $view;
     }
 

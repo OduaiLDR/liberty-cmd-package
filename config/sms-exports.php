@@ -72,6 +72,14 @@ return [
     // Separate from private archives. No recipient data is published until the
     // approved account, namespace, existing folder and sharing policy are explicit.
     'file_publication_enabled' => env('CMD_SMS_FILE_PUBLICATION_ENABLED', false),
+    // Independent opt-in import. Never infer a tenant, destination or credential.
+    'debtplete_import_enabled' => env('CMD_SMS_DEBTPLETE_IMPORT_ENABLED', false),
+    'debtplete_import_automatic' => env('CMD_SMS_DEBTPLETE_IMPORT_AUTOMATIC', false),
+    'debtplete_import_origin' => env('CMD_SMS_DEBTPLETE_IMPORT_ORIGIN'),
+    'debtplete_import_allowed_hosts' => array_values(array_filter(array_map('trim', explode(',', (string) env('CMD_SMS_DEBTPLETE_IMPORT_ALLOWED_HOSTS', ''))))),
+    'debtplete_import_tenant_id' => env('CMD_SMS_DEBTPLETE_IMPORT_TENANT_ID'),
+    'debtplete_import_client_id' => env('CMD_SMS_DEBTPLETE_IMPORT_CLIENT_ID'),
+    'debtplete_import_api_key' => env('CMD_SMS_DEBTPLETE_IMPORT_API_KEY'),
     'dropbox_account_id' => env('CMD_SMS_DROPBOX_ACCOUNT_ID'),
     'dropbox_namespace_id' => env('CMD_SMS_DROPBOX_NAMESPACE_ID'),
     'dropbox_folder_id' => env('CMD_SMS_DROPBOX_FOLDER_ID'),
