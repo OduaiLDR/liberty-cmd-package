@@ -32,7 +32,7 @@ final class SmsRunHandoffPreview
             ],
             'debtplete_import' => [
                 'status' => 'not_configured', 'processed' => null, 'total' => $selected,
-                'note' => 'No records have been uploaded. The authenticated DebtPlete import and its progress tracking are not connected.',
+                'note' => 'Automatic import is not connected for this run. This view does not verify past manual imports.',
             ],
         ];
 
