@@ -6,9 +6,11 @@ namespace Cmd\Reports\Tests\Unit;
 
 use Cmd\Reports\Console\Commands\SyncPhoneNumbers;
 use Cmd\Reports\Services\DBConnector;
+use Cmd\Reports\Services\SmsDebtPleteImportPrivacy;
 use Illuminate\Config\Repository;
 use Illuminate\Container\Container;
 use Illuminate\Support\Facades\Facade;
+use Illuminate\Support\Env;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
@@ -22,7 +24,11 @@ final class SmsPhoneCompanySourceTest extends TestCase
     {
         $this->previous=Container::getInstance();$app=new Container;Container::setInstance($app);
         $app->instance('config',new Repository([]));
-        $this->logger=new class {public array $contexts=[];public function info($message,array $context=[]):void {$this->contexts[]=$context;}};
+        $this->logger=new class {
+            public array $contexts=[];public array $failures=[];
+            public function info($message,array $context=[]):void {$this->contexts[]=$context;}
+            public function error($message,array $context=[]):void {$this->failures[]=[$message,$context];}
+        };
         $app->instance('log',$this->logger);Facade::clearResolvedInstances();Facade::setFacadeApplication($app);
     }
 
@@ -37,6 +43,8 @@ final class SmsPhoneCompanySourceTest extends TestCase
             public array $environments=[];
             public array $errors=[];
             public int $sqlInitializations=0;
+            public bool $failSource=false;
+            public array $privacyStates=[];
             public function __construct(public mixed $selected) {parent::__construct();}
             public function option($key=null) {return ['source'=>$this->selected,'dry-run'=>true,'batch-size'=>1000][$key]??null;}
             public function info($string,$verbosity=null) {}
@@ -45,9 +53,11 @@ final class SmsPhoneCompanySourceTest extends TestCase
             protected function initializeSqlServerConnection(): \PDO {++$this->sqlInitializations;throw new \RuntimeException('Unexpected SQL initialization.');}
             protected function createSnowflakeConnector(): DBConnector {
                 $this->environments[]=$this->sourceEnvironment;
-                return new class extends DBConnector {
-                    public function __construct() {}
+                $this->privacyStates[]=[SmsDebtPleteImportPrivacy::active(),env('SNOWFLAKE_DEBUG',false)];
+                return new class($this->failSource) extends DBConnector {
+                    public function __construct(private bool $fail) {}
                     public function query(string $sql,array $bindings=[],?int $timeoutSeconds=null):array {
+                        if ($this->fail) throw new \RuntimeException('PRIVATE_PHONE_TOKEN_SQL_BINDINGS');
                         return ['data'=>[['SOURCE_ROWS'=>1,'NORMALIZED_ROWS'=>1,'CONTACTS'=>1]]];
                     }
                 };
@@ -64,6 +74,8 @@ final class SmsPhoneCompanySourceTest extends TestCase
         self::assertSame(0,$command->handle());self::assertSame([$source],$command->environments);
         self::assertSame(0,$command->sqlInitializations);self::assertSame([],$command->errors);
         self::assertSame([$label,$label],array_column($this->logger->contexts,'source'));
+        self::assertSame([[true,false]],$command->privacyStates);
+        self::assertFalse(SmsDebtPleteImportPrivacy::active());
     }
 
     public function test_existing_unqualified_schedule_keeps_lt_and_reused_command_does_not_keep_previous_company(): void
@@ -83,5 +95,47 @@ final class SmsPhoneCompanySourceTest extends TestCase
         self::assertSame([],$command->environments);self::assertSame(0,$command->sqlInitializations);
         self::assertSame([],$this->logger->contexts);
         self::assertSame(['Choose one company source: lt, ldr, or plaw. No synchronization was started.'],$command->errors);
+    }
+
+    public static function priorDebugValues():array {return [['true'],['false'],[null]];}
+
+    #[DataProvider('priorDebugValues')]
+    public function test_private_scope_and_debug_are_restored_after_source_failure_without_exposing_values(?string $value):void
+    {
+        $repo=Env::getRepository();$had=$repo->has('SNOWFLAKE_DEBUG');$old=$repo->get('SNOWFLAKE_DEBUG');
+        try {
+            if($value===null)$repo->clear('SNOWFLAKE_DEBUG');else $repo->set('SNOWFLAKE_DEBUG',$value);
+            $command=$this->command('plaw');$command->failSource=true;
+            self::assertSame(1,$command->handle());self::assertSame([[true,false]],$command->privacyStates);
+            self::assertSame($value,$repo->get('SNOWFLAKE_DEBUG'));self::assertSame($value!==null,$repo->has('SNOWFLAKE_DEBUG'));
+            self::assertFalse(SmsDebtPleteImportPrivacy::active());
+            self::assertSame(['SyncPhoneNumbers stopped during source_summary. Phone snapshot committed: no.'],$command->errors);
+            self::assertStringNotContainsString('PRIVATE_PHONE_TOKEN_SQL_BINDINGS',json_encode([$command->errors,$this->logger->contexts,$this->logger->failures]));
+            self::assertSame('source_summary',$this->logger->failures[0][1]['phase']);
+            self::assertArrayNotHasKey('exception',$this->logger->failures[0][1]);
+        } finally {if($had)$repo->set('SNOWFLAKE_DEBUG',$old);else $repo->clear('SNOWFLAKE_DEBUG');}
+    }
+
+    public function test_debug_is_restored_after_success_for_the_next_job_in_the_same_worker():void
+    {
+        $repo=Env::getRepository();$had=$repo->has('SNOWFLAKE_DEBUG');$old=$repo->get('SNOWFLAKE_DEBUG');
+        try {
+            $repo->set('SNOWFLAKE_DEBUG','true');$command=$this->command('ldr');
+            self::assertSame(0,$command->handle());self::assertSame([[true,false]],$command->privacyStates);
+            self::assertSame('true',$repo->get('SNOWFLAKE_DEBUG'));self::assertFalse(SmsDebtPleteImportPrivacy::active());
+        } finally {if($had)$repo->set('SNOWFLAKE_DEBUG',$old);else $repo->clear('SNOWFLAKE_DEBUG');}
+    }
+
+    public static function commitStates():array {return [[false,'no'],[true,'yes']];}
+
+    #[DataProvider('commitStates')]
+    public function test_failure_reports_commit_state_without_claiming_rollback_after_a_commit(bool $committed,string $word):void
+    {
+        $command=$this->command();
+        (new \ReflectionMethod($command,'reportFailure'))->invoke($command,new \RuntimeException('PRIVATE_PHONE_TOKEN_SQL_BINDINGS'),'contact_flags',$committed);
+        self::assertSame(['SyncPhoneNumbers stopped during contact_flags. Phone snapshot committed: '.$word.'.'],$command->errors);
+        self::assertSame($committed,$this->logger->failures[0][1]['phone_snapshot_committed']);
+        self::assertStringNotContainsString('PRIVATE_PHONE_TOKEN_SQL_BINDINGS',json_encode([$command->errors,$this->logger->failures]));
+        self::assertArrayNotHasKey('exception',$this->logger->failures[0][1]);
     }
 }

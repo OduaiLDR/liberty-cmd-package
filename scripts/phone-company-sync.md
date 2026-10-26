@@ -6,4 +6,6 @@ The command retains original decimal contact IDs and the existing California con
 
 This implementation is prepared for review. Do not add source jobs, invoke a production replacement, or change the current LT automation until bounded source/target evidence and the relevant data acceptance are complete. Current generic-DP ownership and full CID/date coverage remain unproved. There is deliberately no `all` or generic-DP source option.
 
+The command runs inside the host telemetry privacy scope and disables Snowflake debug only for that invocation. It restores the exact previous process value, including an unset key, before a long-lived worker handles another job. It never edits the environment file. Failures report the fixed phase, safe error class/SQLSTATE, source label and whether the phone snapshot committed; exception messages, objects, SQL values and connector token fragments are excluded from command output and application error-log context. A later contact-flag failure must not claim that the already committed phone snapshot rolled back.
+
 `--dry-run` reads a whole-source aggregate, so it is not a bounded production diagnostic. Use the separately reviewed private admission/sample tools for diagnosis. No scheduler, provider, integration gate, schema, environment, or separate DebtPlete application change is part of this patch.

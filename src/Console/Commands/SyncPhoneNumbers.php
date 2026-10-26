@@ -6,7 +6,9 @@ use Cmd\Reports\Repositories\SmsProspectExportRepository;
 use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\SmsWorkflowLock;
 use Cmd\Reports\Services\SmsAvailabilityRefresh;
+use Cmd\Reports\Services\SmsDebtPleteImportPrivacy;
 use Illuminate\Console\Command;
+use Illuminate\Support\Env;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use PDO;
@@ -34,13 +36,26 @@ class SyncPhoneNumbers extends Command
             return Command::FAILURE;
         }
         $this->sourceEnvironment = $source;
-        if ($this->option('dry-run')) return $this->syncNow();
-        try {
-            return SmsWorkflowLock::run('contact-sync', fn (): int => $this->syncNow());
-        } catch (\Symfony\Component\HttpKernel\Exception\HttpException $error) {
-            $this->warn($error->getMessage());
-            return Command::FAILURE;
-        }
+        return SmsDebtPleteImportPrivacy::run(function (): int {
+            $environment = Env::getRepository();
+            $debugWasSet = $environment->has('SNOWFLAKE_DEBUG');
+            $previousDebug = $environment->get('SNOWFLAKE_DEBUG');
+            try {
+                $environment->set('SNOWFLAKE_DEBUG', 'false');
+                if (env('SNOWFLAKE_DEBUG', false)) throw new \RuntimeException('Source debug could not be disabled.');
+                if ($this->option('dry-run')) return $this->syncNow();
+                try {
+                    return SmsWorkflowLock::run('contact-sync', fn (): int => $this->syncNow());
+                } catch (\Symfony\Component\HttpKernel\Exception\HttpException $error) {
+                    $this->warn('Contact synchronization could not obtain its workflow lock. Retry after the active SMS operation completes.');
+                    return Command::FAILURE;
+                }
+            } finally {
+                // A long-lived worker must retain its prior environment, including an unset key.
+                if ($debugWasSet) $environment->set('SNOWFLAKE_DEBUG', $previousDebug);
+                else $environment->clear('SNOWFLAKE_DEBUG');
+            }
+        });
     }
 
     private function sourceLabel(): string
@@ -63,6 +78,8 @@ class SyncPhoneNumbers extends Command
         $batchSize = min(max(1, $batchSize), 1000);
 
         $stagePath = null;
+        $phase = 'connectors';
+        $snapshotCommitted = false;
 
         try {
             $company = strtoupper($this->sourceEnvironment);
@@ -79,13 +96,13 @@ class SyncPhoneNumbers extends Command
                 $this->info('[DEBUG] LDR SQL Server OK.');
             }
         } catch (\Throwable $e) {
-            $this->error('Failed to initialize connectors: ' . $e->getMessage());
-            Log::error('SyncPhoneNumbers: connector init failed', ['exception' => $e]);
+            $this->reportFailure($e, $phase, false);
             return Command::FAILURE;
         }
 
         try {
             if ($this->option('dry-run')) {
+                $phase = 'source_summary';
                 $summary = $this->fetchDryRunSummary($snowflake);
                 $sourceRows = (int) ($summary['SOURCE_ROWS'] ?? 0);
                 $normalizedRows = (int) ($summary['NORMALIZED_ROWS'] ?? 0);
@@ -107,6 +124,7 @@ class SyncPhoneNumbers extends Command
                 return Command::SUCCESS;
             }
 
+            $phase = 'source_staging';
             [$stagePath, $sourceCount, $normalizedCount] = $this->stagePhonesFromSnowflake($snowflake);
             $this->info("[INFO] Fetched {$sourceCount} phone rows from Snowflake.");
             $this->info("[INFO] Normalized to {$normalizedCount} non-empty phones (matches VBA, duplicates preserved).");
@@ -118,8 +136,11 @@ class SyncPhoneNumbers extends Command
             }
 
             $this->withCreatedDate = DB::connection('sqlsrv')->getSchemaBuilder()->hasColumn('TblPhoneNumbers', 'Created_Date');
+            $phase = 'phone_replacement';
             [$deleted, $inserted, $cleaned] = $this->replacePhonesFromFile($sqlServer, $stagePath, $batchSize);
+            $snapshotCommitted = true;
             $this->info("[INFO] Replaced {$deleted} existing phone rows with {$inserted} rows.");
+            $phase = 'contact_flags';
             $flagged = $this->flagContactedProspects();
             if ($flagged !== null) $this->info("[INFO] Marked {$flagged} SMS prospects as contacted.");
             Log::info('SyncPhoneNumbers command finished.', [
@@ -130,8 +151,7 @@ class SyncPhoneNumbers extends Command
                 'prospects_contacted' => $flagged,
             ]);
         } catch (\Throwable $e) {
-            $this->error('SyncPhoneNumbers failed: ' . $e->getMessage());
-            Log::error('SyncPhoneNumbers: exception', ['exception' => $e]);
+            $this->reportFailure($e, $phase, $snapshotCommitted);
             return Command::FAILURE;
         } finally {
             if ($stagePath !== null && is_file($stagePath)) {
@@ -141,6 +161,15 @@ class SyncPhoneNumbers extends Command
 
         $this->info('[SUCCESS] SyncPhoneNumbers completed successfully!');
         return Command::SUCCESS;
+    }
+
+    private function reportFailure(\Throwable $error, string $phase, bool $snapshotCommitted): void
+    {
+        $code = (string) $error->getCode();
+        $this->error('SyncPhoneNumbers stopped during '.$phase.'. Phone snapshot committed: '.($snapshotCommitted ? 'yes' : 'no').'.');
+        Log::error('SyncPhoneNumbers stopped.', ['source' => $this->sourceLabel(), 'phase' => $phase,
+            'phone_snapshot_committed' => $snapshotCommitted, 'error_class' => get_class($error),
+            'sqlstate' => preg_match('/\A[A-Z0-9]{5}\z/D', $code) ? $code : null]);
     }
 
     /** @return array{int, int, int} */
