@@ -58,4 +58,3 @@ return new class extends Migration
         throw new RuntimeException('Retain SMS import evidence; roll back application code instead.');
     }
 };
-

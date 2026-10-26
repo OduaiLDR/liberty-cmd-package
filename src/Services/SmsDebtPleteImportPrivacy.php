@@ -18,4 +18,3 @@ final class SmsDebtPleteImportPrivacy
 
     public static function active(): bool { return self::$depth > 0; }
 }
-

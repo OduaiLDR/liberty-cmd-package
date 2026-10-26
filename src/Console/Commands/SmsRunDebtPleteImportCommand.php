@@ -62,4 +62,3 @@ class SmsRunDebtPleteImportCommand extends Command
     protected function workflow(): SmsRunDebtPleteImportWorkflow { return app(SmsRunDebtPleteImportWorkflow::class); }
     protected function enqueue(string $id): void { SmsRunDebtPleteImportJob::dispatch($id)->afterCommit(); }
 }
-

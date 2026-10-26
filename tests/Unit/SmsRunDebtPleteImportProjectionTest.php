@@ -103,4 +103,3 @@ test('failed saved reads expose only static status and unwind privacy', function
         ->and(json_encode($result))->not->toContain('PRIVATE', '0555010101')
         ->and(SmsDebtPleteImportPrivacy::active())->toBeFalse();
 });
-

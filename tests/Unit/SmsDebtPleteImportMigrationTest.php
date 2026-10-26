@@ -120,4 +120,3 @@ final class SmsDebtPleteImportMigrationTest extends TestCase
         } finally { $this->db->rollBack(); }
     }
 }
-
