@@ -50,6 +50,9 @@ class SmsProspectExportRepository extends SqlSrvRepository
      */
     public const STEP_QUERY_TIMEOUT = 3600;
 
+    /** Raise a short finite default without narrowing an existing caller's longer allowance. */
+    public const CONTACT_FLAG_QUERY_TIMEOUT = 1800;
+
     /** A contact phone as 10 digits: '12025551234' and '2025551234' are the same number. */
     private const CONTACT_PHONE = "CASE WHEN LEN(Phone) = 11 AND LEFT(Phone, 1) = '1' THEN SUBSTRING(Phone, 2, 10) ELSE Phone END";
 
@@ -66,7 +69,7 @@ class SmsProspectExportRepository extends SqlSrvRepository
         $hashJoins = self::HASH_JOINS;
         $withResponseDate = $db->getSchemaBuilder()->hasColumn('TblProspects', 'Response_Date');
 
-        return SmsAvailabilityRefresh::transaction($db, function () use ($db, $phone, $hashJoins, $withResponseDate): int {
+        return $this->withContactFlagQueryBudget(fn (): int => SmsAvailabilityRefresh::transaction($db, function () use ($db, $phone, $hashJoins, $withResponseDate): int {
             $sql = $withResponseDate ? <<<SQL
 WITH Contacts AS (
     SELECT {$phone} AS Phone, MIN(Created_Date) AS Created_Date
@@ -94,7 +97,19 @@ SQL;
             $changed = $db->update($sql);
             if ($changed > 0) SmsAvailabilityRefresh::afterCommit($db);
             return $changed;
-        });
+        }));
+    }
+
+    private function withContactFlagQueryBudget(callable $callback): int
+    {
+        $db = $this->connection();
+        $attribute = defined('PDO::SQLSRV_ATTR_QUERY_TIMEOUT') ? constant('PDO::SQLSRV_ATTR_QUERY_TIMEOUT') : null;
+        if ($attribute === null || ! method_exists($db, 'getDriverName') || $db->getDriverName() !== 'sqlsrv') return $callback();
+        $current = $db->getPdo()->getAttribute($attribute);
+        if (! is_int($current) || $current < 0) throw new RuntimeException('Unexpected SQL Server query timeout.');
+        // Zero means unlimited. Legacy selection already supplies its own 3,600-second scope.
+        if ($current === 0 || $current >= self::CONTACT_FLAG_QUERY_TIMEOUT) return $callback();
+        return $this->withQueryTimeout(self::CONTACT_FLAG_QUERY_TIMEOUT, $callback);
     }
 
     /** @return array{selected:int, target:int, shortfall:int, contacted_flagged:int} */

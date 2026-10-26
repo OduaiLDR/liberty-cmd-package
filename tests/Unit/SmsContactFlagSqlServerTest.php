@@ -138,6 +138,64 @@ final class SmsContactFlagSqlServerTest extends TestCase
         self::assertSame(1,$this->requests->calls);
     }
 
+    public function test_contact_query_uses_its_scoped_budget_and_restores_the_previous_connection_timeout(): void
+    {
+        $this->db->table('TblProspects')->insert(['PK'=>1,'Phone'=>'2025550101']);
+        $this->db->table('TblPhoneNumbers')->insert(['Phone'=>'12025550101']);
+        $pdo=$this->db->getPdo();$attribute=PDO::SQLSRV_ATTR_QUERY_TIMEOUT;$previous=$pdo->getAttribute($attribute);
+        $pdo->setAttribute($attribute,17);$observed=[];
+        $this->db->beforeExecuting(function(string $sql,array $bindings,Connection $db)use(&$observed,$attribute):void {
+            if(str_contains($sql,'UPDATE p SET Contacted = 1'))$observed[]=$db->getPdo()->getAttribute($attribute);
+        });
+        try {
+            self::assertSame(1,(new SmsProspectExportRepository)->markContacted());
+            self::assertSame([1800],$observed);
+            self::assertSame(17,$pdo->getAttribute($attribute));
+            self::assertSame(0,(new SmsProspectExportRepository)->markContacted());
+            self::assertSame([1800,1800],$observed);
+            self::assertSame(17,$pdo->getAttribute($attribute));
+            self::assertSame(1,$this->requests->calls);
+        } finally {$pdo->setAttribute($attribute,$previous);}
+    }
+
+    public function test_contact_query_error_rolls_back_and_restores_the_previous_timeout(): void
+    {
+        $this->db->statement('DROP TABLE dbo.TblPhoneNumbers');
+        $pdo=$this->db->getPdo();$attribute=PDO::SQLSRV_ATTR_QUERY_TIMEOUT;$previous=$pdo->getAttribute($attribute);
+        $pdo->setAttribute($attribute,17);$observed=[];
+        $this->db->beforeExecuting(function(string $sql,array $bindings,Connection $db)use(&$observed,$attribute):void {
+            if(str_contains($sql,'UPDATE p SET Contacted = 1'))$observed[]=$db->getPdo()->getAttribute($attribute);
+        });
+        try {
+            try {(new SmsProspectExportRepository)->markContacted();self::fail('Expected the synthetic missing-table error.');}
+            catch(\Illuminate\Database\QueryException $error){self::assertSame('42S02',(string)$error->getCode());}
+            self::assertSame([1800],$observed);
+            self::assertSame(17,$pdo->getAttribute($attribute));
+            self::assertSame(0,$this->db->transactionLevel());
+            self::assertFalse($pdo->inTransaction());
+            self::assertSame(0,$this->ledger->calls);self::assertSame(0,$this->requests->calls);
+        } finally {$pdo->setAttribute($attribute,$previous);}
+    }
+
+    public static function existingContactQueryBudgets(): array {return [[3600],[0]];}
+
+    #[DataProvider('existingContactQueryBudgets')]
+    public function test_contact_flagging_preserves_an_existing_longer_or_unlimited_caller_budget(int $budget): void
+    {
+        $this->db->table('TblProspects')->insert(['PK'=>1,'Phone'=>'2025550101']);
+        $this->db->table('TblPhoneNumbers')->insert(['Phone'=>'12025550101']);
+        $pdo=$this->db->getPdo();$attribute=PDO::SQLSRV_ATTR_QUERY_TIMEOUT;$previous=$pdo->getAttribute($attribute);
+        $pdo->setAttribute($attribute,$budget);$observed=[];
+        $this->db->beforeExecuting(function(string $sql,array $bindings,Connection $db)use(&$observed,$attribute):void {
+            if(str_contains($sql,'UPDATE p SET Contacted = 1'))$observed[]=$db->getPdo()->getAttribute($attribute);
+        });
+        try {
+            self::assertSame(1,(new SmsProspectExportRepository)->markContacted());
+            self::assertSame([$budget],$observed);
+            self::assertSame($budget,$pdo->getAttribute($attribute));
+        } finally {$pdo->setAttribute($attribute,$previous);}
+    }
+
     public function test_current_schema_rolls_back_flags_and_revision_together_on_failure(): void
     {
         $this->db->table('TblProspects')->insert(['PK'=>1,'Phone'=>'2025550101']);
