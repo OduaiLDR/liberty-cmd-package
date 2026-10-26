@@ -142,6 +142,10 @@ class ReportsServiceProvider extends ServiceProvider
             __DIR__ . '/../database/sms-migrations/2026_10_25_000001_create_sms_debtplete_imports.php'
                 => database_path('migrations/2026_10_25_000001_create_sms_debtplete_imports.php'),
         ], 'reports-sms-import-migrations');
+        $this->publishes([
+            __DIR__ . '/../database/sms-migrations/2026_10_26_000001_create_sms_automatic_handoffs.php'
+                => database_path('migrations/2026_10_26_000001_create_sms_automatic_handoffs.php'),
+        ], 'reports-sms-automatic-handoff-migrations');
         // PMOD migrations ship with the package but are NOT auto-loaded.
         // Consumers must explicitly opt in by publishing them:
         //     php artisan vendor:publish --tag=pmod-migrations
@@ -251,6 +255,7 @@ class ReportsServiceProvider extends ServiceProvider
                 \Cmd\Reports\Console\Commands\SmsRunPublicationCommand::class,
                 \Cmd\Reports\Console\Commands\SmsRunDebtPleteImportCommand::class,
                 \Cmd\Reports\Console\Commands\RecoverSmsRunDebtPleteImports::class,
+                \Cmd\Reports\Console\Commands\RecoverSmsAutomaticHandoffs::class,
                 \Cmd\Reports\Console\Commands\RefreshSmsAvailability::class,
                 \Cmd\Reports\Console\Commands\RegisterJudeSmsEvent::class,
                 SyncCalls::class,

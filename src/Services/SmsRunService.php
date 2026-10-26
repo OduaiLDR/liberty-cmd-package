@@ -456,10 +456,41 @@ class SmsRunService
                         'Sent_By' => $run->Approved_By, 'Sent_At' => $at->format('Y-m-d H:i:s'), 'Progress_Step' => 'approved',
                     ])) throw new RuntimeException('Approval status changed; all business changes were rolled back.');
                     $this->captureDebtPleteImport($this->mustRun($requestId));
+                    $this->captureAutomaticHandoff($this->mustRun($requestId));
                 });
             });
         });
         $this->requestDebtPleteImport($requestId);
+        $this->requestAutomaticHandoff($requestId);
+    }
+
+    protected function captureAutomaticHandoff(object $run): void
+    {
+        if (! $this->automaticHandoffEnabled()) return;
+        SmsDebtPleteImportPrivacy::run(fn () => app(SmsRunAutomaticHandoffWorkflow::class)->captureApproved($run));
+    }
+
+    /** Its dispatch acknowledgement cannot undo approval or suppress the independent import. */
+    protected function requestAutomaticHandoff(string $requestId): void
+    {
+        if (! $this->automaticHandoffEnabled()) return;
+        SmsDebtPleteImportPrivacy::run(function () use ($requestId): void {
+            try {
+                $status = app(SmsRunAutomaticHandoffWorkflow::class)->status($requestId);
+                if ($status === null || in_array($status['status'], ['completed', 'held'], true)) return;
+                \Cmd\Reports\Jobs\SmsRunAutomaticHandoffJob::dispatch($requestId)->afterCommit();
+            } catch (Throwable) {
+                try { \Illuminate\Support\Facades\Log::warning('SMS approval committed; automatic handoff queue acknowledgement is pending.', ['request_id' => $requestId]); }
+                catch (Throwable) {}
+            }
+        });
+    }
+
+    private function automaticHandoffEnabled(): bool
+    {
+        return config('sms-exports.handoff_automatic', false) === true
+            && config('sms-exports.file_publication_enabled', false) === true
+            && config('sms-exports.email_handoff_enabled', false) === true;
     }
 
     /** Import evidence commits with the first approval; no upload runs in this transaction. */
