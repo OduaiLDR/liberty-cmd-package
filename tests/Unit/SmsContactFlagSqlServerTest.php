@@ -8,6 +8,7 @@ use Cmd\Reports\Repositories\SmsProspectExportRepository;
 use Cmd\Reports\Console\Commands\SyncPhoneNumbers;
 use Cmd\Reports\Services\SmsAvailabilityLedger;
 use Cmd\Reports\Services\SmsDurableAvailabilityService;
+use Cmd\Reports\Services\SmsAvailabilityService;
 use Illuminate\Config\Repository;
 use Illuminate\Container\Container;
 use Illuminate\Database\Capsule\Manager;
@@ -16,6 +17,7 @@ use Illuminate\Database\DatabaseTransactionsManager;
 use Illuminate\Support\Facades\Facade;
 use PDO;
 use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
 use RuntimeException;
 
 /** Real engine regression for the observed schema; hard-coded loopback, random owned DB only. */
@@ -191,5 +193,36 @@ final class SmsContactFlagSqlServerTest extends TestCase
             self::assertFalse($this->db->getPdo()->inTransaction());
             self::assertSame(0,$this->requests->calls);
         } finally { unlink($stage); }
+    }
+
+    public static function companies(): array {return [['lt','DP_LT'],['ldr','DP_LDR'],['plaw','DP_PLAW']];}
+
+    #[DataProvider('companies')]
+    public function test_explicit_company_replaces_and_cleans_only_its_own_label(string $environment,string $label): void
+    {
+        config(['sms-exports.durable_availability_enabled'=>false]);
+        Container::getInstance()->instance(SmsAvailabilityService::class,new class {public function invalidate():void {}});
+        foreach(['DP','DP_LT','DP_LDR','DP_PLAW','UNKNOWN'] as $source) {
+            $this->db->table('TblPhoneNumbers')->insert(['Phone'=>'','Source'=>$source,'CID'=>null,'Created_Date'=>null]);
+        }
+        $others=$this->db->table('TblPhoneNumbers')->where('Source','<>',$label)->orderBy('Source')->get()->toJson();
+        $command=new class($environment) extends SyncPhoneNumbers {
+            public function __construct(private string $selected) {parent::__construct();}
+            public function option($key=null) {return ['source'=>$this->selected,'dry-run'=>true][$key]??null;}
+            protected function syncNow():int {return 0;}
+            public function info($string,$verbosity=null) {}
+        };
+        self::assertSame(0,$command->handle());
+        (new \ReflectionProperty($command,'withCreatedDate'))->setValue($command,true);
+        $stage=tempnam(sys_get_temp_dir(),'sms-company-native-');self::assertNotFalse($stage);
+        $cid='12345678901234567890123456789012345678';
+        file_put_contents($stage,json_encode(['phone'=>'2025550191','cid'=>$cid,'created'=>'2026-10-12'])."\n".json_encode(['phone'=>'','cid'=>'17','created'=>null])."\n");
+        try {
+            self::assertSame([1,2,1],(new \ReflectionMethod($command,'replacePhonesFromFile'))->invoke($command,$this->db->getPdo(),$stage,1));
+            self::assertSame($others,$this->db->table('TblPhoneNumbers')->where('Source','<>',$label)->orderBy('Source')->get()->toJson());
+            $own=$this->db->table('TblPhoneNumbers')->where('Source',$label)->get();self::assertCount(1,$own);
+            self::assertSame('2025550191',$own[0]->Phone);self::assertSame($cid,$own[0]->CID);self::assertSame('2026-10-12',$own[0]->Created_Date);
+            self::assertFalse($this->db->getPdo()->inTransaction());
+        } finally {unlink($stage);}
     }
 }
