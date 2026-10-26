@@ -50,6 +50,9 @@ class SmsProspectExportRepository extends SqlSrvRepository
      */
     public const STEP_QUERY_TIMEOUT = 3600;
 
+    /** Leave room for phone staging/replacement inside the normal one-hour automation. */
+    public const CONTACT_FLAG_QUERY_TIMEOUT = 1800;
+
     /** A contact phone as 10 digits: '12025551234' and '2025551234' are the same number. */
     private const CONTACT_PHONE = "CASE WHEN LEN(Phone) = 11 AND LEFT(Phone, 1) = '1' THEN SUBSTRING(Phone, 2, 10) ELSE Phone END";
 
@@ -66,7 +69,7 @@ class SmsProspectExportRepository extends SqlSrvRepository
         $hashJoins = self::HASH_JOINS;
         $withResponseDate = $db->getSchemaBuilder()->hasColumn('TblProspects', 'Response_Date');
 
-        return SmsAvailabilityRefresh::transaction($db, function () use ($db, $phone, $hashJoins, $withResponseDate): int {
+        return $this->withQueryTimeout(self::CONTACT_FLAG_QUERY_TIMEOUT, fn (): int => SmsAvailabilityRefresh::transaction($db, function () use ($db, $phone, $hashJoins, $withResponseDate): int {
             $sql = $withResponseDate ? <<<SQL
 WITH Contacts AS (
     SELECT {$phone} AS Phone, MIN(Created_Date) AS Created_Date
@@ -94,7 +97,7 @@ SQL;
             $changed = $db->update($sql);
             if ($changed > 0) SmsAvailabilityRefresh::afterCommit($db);
             return $changed;
-        });
+        }));
     }
 
     /** @return array{selected:int, target:int, shortfall:int, contacted_flagged:int} */

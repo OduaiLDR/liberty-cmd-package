@@ -10,4 +10,6 @@ The command runs inside the host telemetry privacy scope and disables Snowflake 
 
 Commit status is captured immediately when the native transaction commits, before postcommit refresh work. It resets for each invocation and replacement, so a reused command cannot carry a previous successful commit into a later failure report.
 
+The matched-contact update uses its own 1,800-second SQL query budget and restores the connection's previous timeout on success or failure. This leaves room for staging/replacement within the observed 3,600-second normal automation limit; the general export-step allowance is not used as the contact-sync budget. It does not change the global database timeout or automation configuration. This budget is not a performance or full-run completion guarantee, and it does not authorize a manual production replay.
+
 `--dry-run` reads a whole-source aggregate, so it is not a bounded production diagnostic. Use the separately reviewed private admission/sample tools for diagnosis. No scheduler, provider, integration gate, schema, environment, or separate DebtPlete application change is part of this patch.
