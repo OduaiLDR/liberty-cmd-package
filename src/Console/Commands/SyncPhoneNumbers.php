@@ -14,19 +14,26 @@ use PDO;
 class SyncPhoneNumbers extends Command
 {
     protected $signature = 'Sync:phone-numbers
+        {--source=lt : Company source: lt, ldr, or plaw (default keeps the existing LT schedule)}
         {--batch-size=1000 : Number of rows per INSERT (SQL Server maximum)}
         {--dry-run : Read and normalize the source data without changing SQL Server}';
 
-    protected $description = 'Sync LT phone numbers from Snowflake CONTACTS into LDR SQL Server TblPhoneNumbers.';
+    protected $description = 'Sync company phone numbers from Snowflake CONTACTS into SQL Server TblPhoneNumbers.';
 
-    private const SOURCE = 'DP_LT';
-    private const SNOWFLAKE_ENV = 'lt';
+    private const SOURCE_LABELS = ['lt' => 'DP_LT', 'ldr' => 'DP_LDR', 'plaw' => 'DP_PLAW'];
+    protected string $sourceEnvironment = 'lt';
 
     /** Set once TblPhoneNumbers has the contact's creation date (the SMS prospects migration adds it). */
     protected bool $withCreatedDate = false;
 
     public function handle(): int
     {
+        $source = $this->option('source');
+        if (! is_string($source) || ! array_key_exists($source, self::SOURCE_LABELS)) {
+            $this->error('Choose one company source: lt, ldr, or plaw. No synchronization was started.');
+            return Command::FAILURE;
+        }
+        $this->sourceEnvironment = $source;
         if ($this->option('dry-run')) return $this->syncNow();
         try {
             return SmsWorkflowLock::run('contact-sync', fn (): int => $this->syncNow());
@@ -36,10 +43,20 @@ class SyncPhoneNumbers extends Command
         }
     }
 
+    private function sourceLabel(): string
+    {
+        return self::SOURCE_LABELS[$this->sourceEnvironment];
+    }
+
+    protected function createSnowflakeConnector(): DBConnector
+    {
+        return DBConnector::fromEnvironment($this->sourceEnvironment);
+    }
+
     protected function syncNow(): int
     {
         $this->info('[INFO] SyncPhoneNumbers: starting.');
-        Log::info('SyncPhoneNumbers command started.', ['source' => self::SOURCE]);
+        Log::info('SyncPhoneNumbers command started.', ['source' => $this->sourceLabel()]);
 
         $batchSize = (int) $this->option('batch-size');
         // SQL Server permits at most 1,000 row constructors in one INSERT.
@@ -48,9 +65,10 @@ class SyncPhoneNumbers extends Command
         $stagePath = null;
 
         try {
-            $this->info('[DEBUG] Initializing LT Snowflake connector...');
-            $snowflake = DBConnector::fromEnvironment(self::SNOWFLAKE_ENV);
-            $this->info('[DEBUG] LT Snowflake connector OK.');
+            $company = strtoupper($this->sourceEnvironment);
+            $this->info("[DEBUG] Initializing {$company} Snowflake connector...");
+            $snowflake = $this->createSnowflakeConnector();
+            $this->info("[DEBUG] {$company} Snowflake connector OK.");
 
             $sqlServer = null;
             if ($this->option('dry-run')) {
@@ -81,7 +99,7 @@ class SyncPhoneNumbers extends Command
                     $batchSize
                 ));
                 Log::info('SyncPhoneNumbers dry run finished.', [
-                    'source' => self::SOURCE,
+                    'source' => $this->sourceLabel(),
                     'source_rows' => $sourceRows,
                     'normalized_rows' => $normalizedRows,
                     'contacts' => $contacts,
@@ -105,7 +123,7 @@ class SyncPhoneNumbers extends Command
             $flagged = $this->flagContactedProspects();
             if ($flagged !== null) $this->info("[INFO] Marked {$flagged} SMS prospects as contacted.");
             Log::info('SyncPhoneNumbers command finished.', [
-                'source' => self::SOURCE,
+                'source' => $this->sourceLabel(),
                 'deleted' => $deleted,
                 'inserted' => $inserted,
                 'cleaned' => $cleaned,
@@ -273,7 +291,7 @@ class SyncPhoneNumbers extends Command
 
     private function deleteExistingPhones(PDO $connection): int
     {
-        $source = $this->esc(self::SOURCE);
+        $source = $this->esc($this->sourceLabel());
         $sql = "DELETE FROM TblPhoneNumbers WHERE Source = '{$source}'";
         return $this->executeSqlServerWrite($connection, $sql, 'delete existing phones');
     }
@@ -315,7 +333,7 @@ class SyncPhoneNumbers extends Command
 
     private function insertPhoneBatch(PDO $connection, array $chunk, int $batchNumber): int
     {
-        $sourceEsc = $this->esc(self::SOURCE);
+        $sourceEsc = $this->esc($this->sourceLabel());
         $values = [];
 
         foreach ($chunk as $item) {
@@ -352,7 +370,7 @@ class SyncPhoneNumbers extends Command
 
     private function cleanupEmptyPhones(PDO $connection): int
     {
-        $source = $this->esc(self::SOURCE);
+        $source = $this->esc($this->sourceLabel());
         $sql = "DELETE FROM TblPhoneNumbers WHERE Source = '{$source}' AND Phone = ''";
         return $this->executeSqlServerWrite($connection, $sql, 'cleanup empty phones');
     }
