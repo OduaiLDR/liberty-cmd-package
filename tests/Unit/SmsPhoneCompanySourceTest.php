@@ -11,6 +11,7 @@ use Illuminate\Config\Repository;
 use Illuminate\Container\Container;
 use Illuminate\Support\Facades\Facade;
 use Illuminate\Support\Env;
+use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
@@ -124,6 +125,36 @@ final class SmsPhoneCompanySourceTest extends TestCase
             self::assertSame(0,$command->handle());self::assertSame([[true,false]],$command->privacyStates);
             self::assertSame('true',$repo->get('SNOWFLAKE_DEBUG'));self::assertFalse(SmsDebtPleteImportPrivacy::active());
         } finally {if($had)$repo->set('SNOWFLAKE_DEBUG',$old);else $repo->clear('SNOWFLAKE_DEBUG');}
+    }
+
+    public function test_postcommit_connection_failure_keeps_true_commit_receipt_and_next_failed_replacement_resets_it():void
+    {
+        $pdo=new \PDO('sqlite::memory:');
+        $pdo->exec('CREATE TABLE TblPhoneNumbers (Phone TEXT, Source TEXT, CID TEXT)');
+        $path=tempnam(sys_get_temp_dir(),'sms-phone-commit-fixture-');
+        self::assertNotFalse($path);
+        $command=$this->command();
+        $manager=\Mockery::mock();
+        $manager->shouldReceive('connection')->once()->with('sqlsrv')->andThrow(new \RuntimeException('PRIVATE_POSTCOMMIT_CONNECTION'));
+        DB::swap($manager);
+        try {
+            file_put_contents($path,json_encode(['phone'=>'2025550199','cid'=>'123'])."\n");
+            try {(new \ReflectionMethod($command,'replacePhonesFromFile'))->invoke($command,$pdo,$path,1);self::fail('Expected postcommit failure.');}
+            catch(\RuntimeException $error){self::assertSame('PRIVATE_POSTCOMMIT_CONNECTION',$error->getMessage());}
+            self::assertSame(1,(int)$pdo->query('SELECT COUNT(*) FROM TblPhoneNumbers')->fetchColumn());
+            self::assertFalse($pdo->inTransaction());
+            $receipt=new \ReflectionProperty($command,'phoneSnapshotCommitted');
+            self::assertTrue($receipt->getValue($command));
+            (new \ReflectionMethod($command,'reportFailure'))->invoke($command,new \RuntimeException('PRIVATE_POSTCOMMIT_CONNECTION'),'phone_replacement',$receipt->getValue($command));
+            self::assertSame(['SyncPhoneNumbers stopped during phone_replacement. Phone snapshot committed: yes.'],$command->errors);
+            self::assertStringNotContainsString('PRIVATE_POSTCOMMIT_CONNECTION',json_encode([$command->errors,$this->logger->failures]));
+            file_put_contents($path,"invalid json\n");
+            try {(new \ReflectionMethod($command,'replacePhonesFromFile'))->invoke($command,$pdo,$path,1);self::fail('Expected rollback.');}
+            catch(\JsonException){}
+            self::assertFalse($receipt->getValue($command));
+            self::assertSame(1,(int)$pdo->query('SELECT COUNT(*) FROM TblPhoneNumbers')->fetchColumn());
+            self::assertFalse($pdo->inTransaction());
+        } finally {unlink($path);\Mockery::close();}
     }
 
     public static function commitStates():array {return [[false,'no'],[true,'yes']];}

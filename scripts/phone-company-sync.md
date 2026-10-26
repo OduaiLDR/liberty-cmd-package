@@ -8,4 +8,6 @@ This implementation is prepared for review. Do not add source jobs, invoke a pro
 
 The command runs inside the host telemetry privacy scope and disables Snowflake debug only for that invocation. It restores the exact previous process value, including an unset key, before a long-lived worker handles another job. It never edits the environment file. Failures report the fixed phase, safe error class/SQLSTATE, source label and whether the phone snapshot committed; exception messages, objects, SQL values and connector token fragments are excluded from command output and application error-log context. A later contact-flag failure must not claim that the already committed phone snapshot rolled back.
 
+Commit status is captured immediately when the native transaction commits, before postcommit refresh work. It resets for each invocation and replacement, so a reused command cannot carry a previous successful commit into a later failure report.
+
 `--dry-run` reads a whole-source aggregate, so it is not a bounded production diagnostic. Use the separately reviewed private admission/sample tools for diagnosis. No scheduler, provider, integration gate, schema, environment, or separate DebtPlete application change is part of this patch.

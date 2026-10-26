@@ -27,9 +27,12 @@ class SyncPhoneNumbers extends Command
 
     /** Set once TblPhoneNumbers has the contact's creation date (the SMS prospects migration adds it). */
     protected bool $withCreatedDate = false;
+    /** Set at the native commit boundary, before any postcommit refresh can fail. */
+    protected bool $phoneSnapshotCommitted = false;
 
     public function handle(): int
     {
+        $this->phoneSnapshotCommitted = false;
         $source = $this->option('source');
         if (! is_string($source) || ! array_key_exists($source, self::SOURCE_LABELS)) {
             $this->error('Choose one company source: lt, ldr, or plaw. No synchronization was started.');
@@ -79,7 +82,6 @@ class SyncPhoneNumbers extends Command
 
         $stagePath = null;
         $phase = 'connectors';
-        $snapshotCommitted = false;
 
         try {
             $company = strtoupper($this->sourceEnvironment);
@@ -138,7 +140,6 @@ class SyncPhoneNumbers extends Command
             $this->withCreatedDate = DB::connection('sqlsrv')->getSchemaBuilder()->hasColumn('TblPhoneNumbers', 'Created_Date');
             $phase = 'phone_replacement';
             [$deleted, $inserted, $cleaned] = $this->replacePhonesFromFile($sqlServer, $stagePath, $batchSize);
-            $snapshotCommitted = true;
             $this->info("[INFO] Replaced {$deleted} existing phone rows with {$inserted} rows.");
             $phase = 'contact_flags';
             $flagged = $this->flagContactedProspects();
@@ -151,7 +152,7 @@ class SyncPhoneNumbers extends Command
                 'prospects_contacted' => $flagged,
             ]);
         } catch (\Throwable $e) {
-            $this->reportFailure($e, $phase, $snapshotCommitted);
+            $this->reportFailure($e, $phase, $this->phoneSnapshotCommitted);
             return Command::FAILURE;
         } finally {
             if ($stagePath !== null && is_file($stagePath)) {
@@ -175,6 +176,7 @@ class SyncPhoneNumbers extends Command
     /** @return array{int, int, int} */
     protected function replacePhonesFromFile(PDO $connection, string $stagePath, int $batchSize): array
     {
+        $this->phoneSnapshotCommitted = false;
         $durable = SmsAvailabilityRefresh::durableEnabled();
         if ($durable && (DB::connection('sqlsrv')->getPdo() !== $connection || DB::connection('sqlsrv')->transactionLevel() !== 0)) {
             throw new \LogicException('Native phone replacement must use the sqlsrv PDO outside Laravel transactions.');
@@ -189,6 +191,7 @@ class SyncPhoneNumbers extends Command
             if ($durable && $changed) SmsAvailabilityRefresh::beforeNativeCommit(DB::connection('sqlsrv'), $connection);
             $committed = $connection->commit();
             if ($durable && ! $committed) throw new \RuntimeException('SQL Server phone replacement commit failed.');
+            $this->phoneSnapshotCommitted = $committed;
         } catch (\Throwable $exception) {
             if ($connection->inTransaction()) {
                 $connection->rollBack();
@@ -387,8 +390,8 @@ class SyncPhoneNumbers extends Command
     }
 
     /**
-     * SMS prospects whose phone is now a contact are flagged with the contact's creation date
-     * (Jacob, 14 Oct). Null until the SMS prospects tables exist.
+     * Mark matching SMS prospects as contacted using the repository's schema-compatible path.
+     * This does not activate separate Contacted_Date attribution. Null until the table exists.
      */
     protected function flagContactedProspects(): ?int
     {
