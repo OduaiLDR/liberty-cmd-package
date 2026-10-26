@@ -71,6 +71,15 @@ beforeEach(function (): void {
         public bool $interruptAllocationCommit = false;
         public ?string $clockAfterFileVerification = null;
         public array $importQueueRequests = [];
+        public array $automaticQueueRequests = [];
+        protected function requestAutomaticHandoff(string $id): void
+        {
+            if (config('sms-exports.handoff_automatic') !== true || config('sms-exports.file_publication_enabled') !== true
+                || config('sms-exports.email_handoff_enabled') !== true) return;
+            expect(DB::connection('sqlsrv')->transactionLevel())->toBe(0);
+            $this->automaticQueueRequests[] = $id;
+        }
+        public function requestRealAutomaticQueueForTest(string $id): void { parent::requestAutomaticHandoff($id); }
         protected function requestDebtPleteImport(string $id): void
         {
             if (config('sms-exports.debtplete_import_enabled') !== true || config('sms-exports.debtplete_import_automatic') !== true) return;
@@ -858,4 +867,86 @@ test('queue or logging failure after approval leaves the committed outbox and bu
     expect($this->db->table('TblSMSDebtPleteImports')->first())->toEqual($before)
         ->and($this->db->table('TblSMSRuns')->value('Status'))->toBe('approved')
         ->and((int) $this->db->table('TblProspects')->sum('SMS_Attempts'))->toBe(5);
+});
+
+/** Uses the real metadata capture; every publication/email operation is a closed tripwire. */
+function smsVersionedBindAutomaticHandoff(): void
+{
+    foreach (['2026_10_23_000003_create_sms_email_outbox.php', '2026_10_23_000004_create_sms_file_publications.php',
+        '2026_10_26_000001_create_sms_automatic_handoffs.php'] as $file) {
+        (require dirname(__DIR__, 2).'/database/sms-migrations/'.$file)->up();
+    }
+    config(['sms-exports.handoff_automatic' => true, 'sms-exports.file_publication_enabled' => true,
+        'sms-exports.email_handoff_enabled' => true, 'sms-exports.email_report_source' => 'plaw',
+        'sms-exports.email_report_name' => 'Synthetic SMS', 'sms-exports.email_report_company' => 'FIXTURE',
+        'sms-exports.email_allowed_link_hosts' => ['download.example.invalid']]);
+    $publisher = new class implements \Cmd\Reports\Services\SmsRunLinkPublisher {
+        public function identity(): string { return 'closed-fixture'; }
+        public function policy(string $date): array { return ['version' => 1, 'send_date' => $date]; }
+        public function publish(string $id, array $part, mixed $stream, array $policy): array { throw new RuntimeException('Approval must not publish.'); }
+        public function verify(string $id, array $part, array $receipt, array $policy): void { throw new RuntimeException('Approval must not contact a provider.'); }
+    };
+    $mail = new class implements \Cmd\Reports\Services\SmsRunEmailGateway {
+        public function configuration(): array { throw new RuntimeException('Approval must not look up recipients.'); }
+        public function assertReady(): void { throw new RuntimeException('Approval must not contact mail.'); }
+        public function send(array $message): bool { throw new RuntimeException('Approval must not send.'); }
+    };
+    app()->instance(\Cmd\Reports\Services\SmsRunAutomaticHandoffWorkflow::class,
+        new \Cmd\Reports\Services\SmsRunAutomaticHandoffWorkflow($publisher, new \Cmd\Reports\Services\SmsRunArtifactPartReader, $mail));
+}
+
+test('automatic publication and email intent commits only with the first approval and dispatches afterward', function (): void {
+    ($this->prepareApprovalVersion)(); smsVersionedBindAutomaticHandoff();
+    $this->service->requestApprove($this->id, 'editor@example.invalid'); $this->service->markApproved($this->id);
+    $row = $this->db->table('TblSMSAutomaticHandoffs')->first();
+    expect($row->Request_ID)->toBe($this->id)->and($row->State)->toBe('queued')->and($row->Phase)->toBe('publish')
+        ->and($this->db->table('TblSMSEmailOutbox')->count())->toBe(0)
+        ->and($this->db->table('TblSMSFilePublications')->count())->toBe(0)
+        ->and($this->service->automaticQueueRequests)->toBe([$this->id])
+        ->and($this->service->importQueueRequests)->toBe([]);
+    $this->service->markApproved($this->id);
+    expect($this->db->table('TblSMSAutomaticHandoffs')->first())->toEqual($row)
+        ->and($this->service->automaticQueueRequests)->toBe([$this->id])
+        ->and($this->db->table('TblSMSHistory')->count())->toBe(5);
+});
+
+test('automatic handoff intent failure rolls back both intents attempts and history without republishing files', function (): void {
+    ($this->prepareApprovalVersion)(); smsVersionedBindAutomaticHandoff();
+    (require dirname(__DIR__, 2).'/database/sms-migrations/2026_10_25_000001_create_sms_debtplete_imports.php')->up();
+    config(['sms-exports.debtplete_import_enabled' => true, 'sms-exports.debtplete_import_automatic' => true]);
+    smsVersionedBindImportWorkflow();
+    $this->db->statement("CREATE TRIGGER block_auto_capture BEFORE INSERT ON TblSMSAutomaticHandoffs BEGIN SELECT RAISE(ABORT, 'Synthetic intent failure'); END");
+    $this->service->requestApprove($this->id, 'editor@example.invalid');
+    expect(fn () => $this->service->markApproved($this->id))->toThrow(RuntimeException::class);
+    expect($this->db->table('TblSMSAutomaticHandoffs')->count())->toBe(0)
+        ->and($this->db->table('TblSMSDebtPleteImports')->count())->toBe(0)
+        ->and($this->db->table('TblSMSHistory')->count())->toBe(0)
+        ->and((int) $this->db->table('TblProspects')->sum('SMS_Attempts'))->toBe(0)
+        ->and($this->service->automaticQueueRequests)->toBe([])->and($this->service->importQueueRequests)->toBe([]);
+    $manifest = str_replace('\\', '/', $this->versionedDirectory).'/runs/'.$this->id.'/v2/published/manifest.json';
+    $hash = hash_file('sha256', $manifest);
+    $this->db->statement('DROP TRIGGER block_auto_capture'); $this->service->markApproved($this->id);
+    expect($this->db->table('TblSMSAutomaticHandoffs')->count())->toBe(1)
+        ->and($this->db->table('TblSMSDebtPleteImports')->count())->toBe(1)
+        ->and(hash_file('sha256', $manifest))->toBe($hash)
+        ->and($this->service->automaticQueueRequests)->toBe([$this->id])->and($this->service->importQueueRequests)->toBe([$this->id]);
+});
+
+test('enabling automatic handoff never adopts earlier approved history', function (): void {
+    ($this->prepareApprovalVersion)();
+    $this->service->requestApprove($this->id, 'editor@example.invalid'); $this->service->markApproved($this->id);
+    smsVersionedBindAutomaticHandoff(); $this->service->markApproved($this->id);
+    expect($this->db->table('TblSMSAutomaticHandoffs')->count())->toBe(0)->and($this->service->automaticQueueRequests)->toBe([]);
+});
+
+test('automatic queue and logging failures preserve committed approval and its recoverable intent', function (): void {
+    ($this->prepareApprovalVersion)(); smsVersionedBindAutomaticHandoff();
+    $this->service->requestApprove($this->id, 'editor@example.invalid'); $this->service->markApproved($this->id);
+    $before = $this->db->table('TblSMSAutomaticHandoffs')->first();
+    $logger = Mockery::mock(); $logger->shouldReceive('warning')->andThrow(new RuntimeException('Synthetic logger outage'));
+    app()->instance('log', $logger); Facade::clearResolvedInstance('log'); config(['queue.connections' => []]);
+    $this->service->requestRealAutomaticQueueForTest($this->id);
+    expect($this->db->table('TblSMSAutomaticHandoffs')->first())->toEqual($before)
+        ->and($this->db->table('TblSMSRuns')->value('Status'))->toBe('approved')
+        ->and($this->db->table('TblSMSHistory')->count())->toBe(5);
 });

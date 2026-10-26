@@ -72,6 +72,8 @@ return [
     // Separate from private archives. No recipient data is published until the
     // approved account, namespace, existing folder and sharing policy are explicit.
     'file_publication_enabled' => env('CMD_SMS_FILE_PUBLICATION_ENABLED', false),
+    // Captures only new approvals. Existing publication/email receipts stay independent.
+    'handoff_automatic' => env('CMD_SMS_HANDOFF_AUTOMATIC', false),
     // Independent opt-in import. Never infer a tenant, destination or credential.
     'debtplete_import_enabled' => env('CMD_SMS_DEBTPLETE_IMPORT_ENABLED', false),
     'debtplete_import_automatic' => env('CMD_SMS_DEBTPLETE_IMPORT_AUTOMATIC', false),
