@@ -61,12 +61,12 @@ final class InvoicePdf
     public function html(array $invoice): string
     {
         $e = static fn ($value): string => htmlspecialchars((string) $value, ENT_QUOTES, 'UTF-8');
-        $dark = self::BRAND_DARK;
-        $green = self::BRAND_GREEN;
+        $dark = $invoice['brand']['dark'] ?? self::BRAND_DARK;
+        $green = $invoice['brand']['accent'] ?? self::BRAND_GREEN;
         $band = $invoice['brand']['accent'] ?? $dark;
         $rule = $invoice['brand']['accent'] ?? $green;
         $dueBackground = $invoice['brand']['light'] ?? $green;
-        foreach ([$band, $rule, $dueBackground] as $color) {
+        foreach ([$dark, $band, $rule, $dueBackground] as $color) {
             if (!is_string($color) || !preg_match('/^#[0-9a-fA-F]{6}$/', $color)) {
                 throw new RuntimeException('Invoice brand colors must be six-digit hex colors.');
             }
@@ -116,6 +116,7 @@ final class InvoicePdf
         foreach ($invoice['notes'] as $note) {
             $notes .= '<p>' . $e($note) . '</p>';
         }
+        $totalLabel = $e($invoice['total_label'] ?? 'Total due');
 
         return <<<HTML
 <!DOCTYPE html>
@@ -210,7 +211,7 @@ final class InvoicePdf
                 {$totals}
             </table>
             <div class="due">
-                <table><tr><td class="totals-label">Total due</td><td class="num">{$e($invoice['total_due'])}</td></tr></table>
+                <table><tr><td class="totals-label">{$totalLabel}</td><td class="num">{$e($invoice['total_due'])}</td></tr></table>
             </div>
         </td>
     </tr>

@@ -4,6 +4,7 @@ namespace Cmd\Reports\Console\Commands\GenerateAdvanceRecoupReport;
 
 use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\EmailSenderService;
+use Cmd\Reports\Console\Commands\GenerateLendingTowerInvoices\InvoicePdf;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
 
@@ -34,6 +35,7 @@ class GenerateAdvanceRecoupReport extends Command
 {
     protected $signature = 'Generate:advance-recoup-report
                             {--test : Send only to oduai@libertydebtrelief.com instead of TblReports recipients}
+                            {--local-only : Generate the workbook and invoice locally without sending email}
                             {--month= : Month to report on as YYYY-MM (defaults to last full calendar month)}';
 
     protected $description = 'Email the monthly Advances/Refunds/Recoups EPF adjustments workbook.';
@@ -47,6 +49,13 @@ class GenerateAdvanceRecoupReport extends Command
     public function handle(): int
     {
         $this->info('[INFO] Advance/Recoup report: starting.');
+
+        $isTest = (bool) $this->option('test');
+        $isLocalOnly = (bool) $this->option('local-only');
+        if ($isTest && $isLocalOnly) {
+            $this->error('Choose either --test (email to yourself) or --local-only (no email).');
+            return Command::FAILURE;
+        }
 
         try {
             $snowflake = $this->initializeSnowflakeConnector();
@@ -131,7 +140,18 @@ class GenerateAdvanceRecoupReport extends Command
         $report = $formatter->buildWorkbook($sheets, $summaryRows, $window['label']);
         $this->info('[INFO] Workbook written to: ' . $report['path']);
 
-        $isTest = (bool) $this->option('test');
+        $totalRow = end($summaryRows);
+        if (!is_array($totalRow) || ($totalRow['category'] ?? null) !== 'Total') {
+            throw new \RuntimeException('The EPF summary did not produce a total balance for invoicing.');
+        }
+        $invoiceDate = \Carbon\Carbon::parse($window['endExclusive'])->subDay()->format('Y-m-d');
+        $invoice = AdvanceRecoupInvoice::document($window, (float) ($totalRow['amount'] ?? 0), $invoiceDate);
+        $invoicePath = storage_path('app/' . $invoice['number'] . '.pdf');
+        $invoiceBytes = (new InvoicePdf(sys_get_temp_dir() . '/progress-law-epf-invoice-pdf'))->render($invoice);
+        if (file_put_contents($invoicePath, $invoiceBytes) === false) {
+            throw new \RuntimeException('Could not save the Progress Law EPF invoice PDF.');
+        }
+        $this->info('[INFO] Invoice written to: ' . $invoicePath);
 
         $subject = ($isTest ? '[TEST] ' : '') . 'EPF Adjustments - ' . $window['label'];
         $body = $this->buildSummaryEmailBody($summaryRows, $window['label']);
@@ -140,12 +160,21 @@ class GenerateAdvanceRecoupReport extends Command
             'name' => $report['filename'],
             'contentType' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             'contentBytes' => base64_encode(file_get_contents($report['path'])),
+        ], [
+            'name' => basename($invoicePath),
+            'contentType' => 'application/pdf',
+            'contentBytes' => base64_encode(file_get_contents($invoicePath)),
         ]];
 
-        $email = new EmailSenderService();
+        if ($isLocalOnly) {
+            $this->info('[INFO] Local-only mode: email not sent. Workbook and invoice are saved locally.');
+            return Command::SUCCESS;
+        }
+
+        $email = $this->emailSender();
         if ($isTest) {
             $recipients = [self::TEST_RECIPIENT];
-            $sent = $email->sendMailHtml($subject, $body, $recipients, [], [], $attachments);
+            $sent = $email->sendMailHtml($subject, $body, $recipients, [], [], $attachments, AdvanceRecoupInvoice::SENDER);
         } else {
             $sent = $email->sendMailUsingTblReportsHtml(
                 $sqlServer,
@@ -155,7 +184,8 @@ class GenerateAdvanceRecoupReport extends Command
                 $body,
                 $attachments,
                 false,
-                true
+                true,
+                AdvanceRecoupInvoice::SENDER
             );
         }
 
@@ -454,7 +484,7 @@ class GenerateAdvanceRecoupReport extends Command
      * 'ldr' connects fine but has 0 matching rows; 'plaw' has 420k+).
      * 'plaw' must be tried first, not just any environment that connects.
      */
-    private function initializeSnowflakeConnector(): DBConnector
+    protected function initializeSnowflakeConnector(): DBConnector
     {
         $candidates = ['plaw', 'ldr'];
         $errors = [];
@@ -470,7 +500,7 @@ class GenerateAdvanceRecoupReport extends Command
         throw new \RuntimeException('Unable to initialize Snowflake connector. Tried: ' . implode('; ', $errors));
     }
 
-    private function initializeSqlServerConnector(): DBConnector
+    protected function initializeSqlServerConnector(): DBConnector
     {
         $candidates = ['ldr', 'plaw', 'production', 'sandbox'];
         $errors = [];
@@ -486,6 +516,11 @@ class GenerateAdvanceRecoupReport extends Command
         }
 
         throw new \RuntimeException('Unable to initialize SQL Server connector. Tried: ' . implode('; ', $errors));
+    }
+
+    protected function emailSender(): EmailSenderService
+    {
+        return new EmailSenderService();
     }
 
     private function esc(string $value): string
