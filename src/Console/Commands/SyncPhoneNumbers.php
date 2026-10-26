@@ -175,6 +175,7 @@ class SyncPhoneNumbers extends Command
             throw new \RuntimeException('Unable to open temporary phone staging file.');
         }
 
+        $staged = false;
         try {
             do {
                 $rows = $this->fetchPhonePage($snowflake, $pageSize, $offset);
@@ -188,8 +189,10 @@ class SyncPhoneNumbers extends Command
                 $normalizedCount += count($normalized);
                 $offset += $pageSize;
             } while (count($rows) === $pageSize);
+            $staged = true;
         } finally {
             fclose($handle);
+            if (! $staged) @unlink($stagePath);
         }
 
         return [$stagePath, $sourceCount, $normalizedCount];
@@ -199,7 +202,7 @@ class SyncPhoneNumbers extends Command
     {
         // Query only one page so DBConnector never has to hold the full result set.
         $sql = "
-            SELECT c.ID, phone_values.VALUE::STRING AS PHONE,
+            SELECT c.ID::VARCHAR AS ID, phone_values.VALUE::STRING AS PHONE,
                 TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', c.CREATED)::DATE, 'YYYY-MM-DD') AS CREATED_DATE
             FROM CONTACTS AS c,
                  LATERAL FLATTEN(
@@ -251,11 +254,21 @@ class SyncPhoneNumbers extends Command
             $created = (string) ($row['CREATED_DATE'] ?? '');
             $normalized[] = [
                 'phone' => str_pad($digits, 10, '0', STR_PAD_LEFT),
-                'cid'   => isset($row['ID']) ? (int) $row['ID'] : null,
+                'cid'   => $this->contactId($row['ID'] ?? null),
                 'created' => preg_match('/^\d{4}-\d{2}-\d{2}$/', $created) ? $created : null,
             ];
         }
         return $normalized;
+    }
+
+    /** Snowflake NUMBER(38,0) does not fit a PHP integer; retain its original decimal text. */
+    private function contactId(mixed $id): ?string
+    {
+        if ($id === null) return null;
+        if ((! is_string($id) && ! is_int($id)) || ! preg_match('/\A-?[0-9]{1,38}\z/D', (string) $id)) {
+            throw new \RuntimeException('Unexpected contact ID format; the phone snapshot was not replaced.');
+        }
+        return (string) $id;
     }
 
     private function deleteExistingPhones(PDO $connection): int
@@ -307,7 +320,8 @@ class SyncPhoneNumbers extends Command
 
         foreach ($chunk as $item) {
             $phoneEsc = $this->esc($item['phone']);
-            $cid = $item['cid'] !== null ? (int) $item['cid'] : 'NULL';
+            $contactId = $this->contactId($item['cid'] ?? null);
+            $cid = $contactId !== null ? "'{$contactId}'" : 'NULL';
             if (! $this->withCreatedDate) {
                 $values[] = "('{$phoneEsc}', '{$sourceEsc}', {$cid})";
                 continue;
