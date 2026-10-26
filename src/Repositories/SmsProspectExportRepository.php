@@ -55,16 +55,19 @@ class SmsProspectExportRepository extends SqlSrvRepository
 
     /**
      * Prospects whose phone is now a synced contact (TblPhoneNumbers) get Contacted = 1 and the
-     * contact's creation date as Response_Date. Run after each phone sync and before each selection.
+     * contact's creation date as Response_Date when that legacy column exists. Contacted_Date is
+     * separate attribution evidence and is never inferred here. Run after each phone sync and
+     * before each legacy selection.
      */
     public function markContacted(): int
     {
         $db = $this->connection();
         $phone = self::CONTACT_PHONE;
         $hashJoins = self::HASH_JOINS;
+        $withResponseDate = $db->getSchemaBuilder()->hasColumn('TblProspects', 'Response_Date');
 
-        return SmsAvailabilityRefresh::transaction($db, function () use ($db, $phone, $hashJoins): int {
-            $changed = $db->update(<<<SQL
+        return SmsAvailabilityRefresh::transaction($db, function () use ($db, $phone, $hashJoins, $withResponseDate): int {
+            $sql = $withResponseDate ? <<<SQL
 WITH Contacts AS (
     SELECT {$phone} AS Phone, MIN(Created_Date) AS Created_Date
     FROM TblPhoneNumbers
@@ -76,7 +79,19 @@ FROM TblProspects p
 JOIN Contacts c ON c.Phone = p.Phone
 WHERE (p.Contacted = 0 OR p.Response_Date IS NULL OR c.Created_Date < p.Response_Date) AND p.Phone IS NOT NULL
 {$hashJoins}
-SQL);
+SQL : <<<SQL
+WITH Contacts AS (
+    SELECT DISTINCT {$phone} AS Phone
+    FROM TblPhoneNumbers
+    WHERE Phone IS NOT NULL
+)
+UPDATE p SET Contacted = 1
+FROM TblProspects p
+JOIN Contacts c ON c.Phone = p.Phone
+WHERE p.Contacted = 0 AND p.Phone IS NOT NULL
+{$hashJoins}
+SQL;
+            $changed = $db->update($sql);
             if ($changed > 0) SmsAvailabilityRefresh::afterCommit($db);
             return $changed;
         });

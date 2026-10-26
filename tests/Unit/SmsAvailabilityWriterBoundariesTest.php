@@ -311,7 +311,7 @@ final class SmsAvailabilityWriterBoundariesTest extends TestCase
         self::assertSame(['begin', 'delete', 'insert', 'cleanup', 'commit', 'invalidate'], $trace->events);
         self::assertSame([false], $activeAtNotification);
         self::assertSame([0], $this->notificationLevels);
-        self::assertStringContainsString("('2025550199', 'DP_LT', 1)", $trace->statements[1]);
+        self::assertStringContainsString("('2025550199', 'DP_LT', '1')", $trace->statements[1]);
         $error = null;
         try { $command->flagAfterReplacement(); } catch (RuntimeException $error) {}
 
