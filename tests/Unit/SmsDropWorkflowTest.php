@@ -862,11 +862,11 @@ test('phone sync stores the contact creation date once TblPhoneNumbers has the c
     (new ReflectionProperty($command, 'withCreatedDate'))->setValue($command, true);
     $path = tempnam(sys_get_temp_dir(), 'sms-sync-test-');
     file_put_contents($path, json_encode(['phone' => '2025550199', 'cid' => 1, 'created' => '2026-10-14'])."\n"
-        .json_encode(['phone' => '2025550198', 'cid' => 2, 'created' => 'not a date'])."\n");
+        .json_encode(['phone' => '2025550198', 'cid' => 2, 'created' => '2026-10-13'])."\n");
     try {
         (new ReflectionMethod($command, 'replacePhonesFromFile'))->invoke($command, $pdo, $path, 10);
         expect($this->db->table('TblPhoneNumbers')->orderBy('Phone')->pluck('Created_Date', 'Phone')->all())
-            ->toBe(['2025550198' => null, '2025550199' => '2026-10-14']);
+            ->toBe(['2025550198' => '2026-10-13', '2025550199' => '2026-10-14']);
     } finally {
         unlink($path);
         \Mockery::close();
