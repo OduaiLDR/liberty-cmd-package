@@ -197,6 +197,46 @@ final class SmsRecordSqlServerTest extends TestCase
             'fixture.contacts', 'fixture-1', str_repeat('a', 64), 1, true);
     }
 
+    public function test_live_contacted_details_use_only_exact_frozen_pks_and_all_tiers_without_writes(): void
+    {
+        $members = [];
+        for ($i = 1; $i <= 10; $i++) $members[] = $this->person(['Client' => 'Synthetic Member '.$i]);
+        $this->readyApproval(10); $this->runs->markApproved(self::ID);
+        foreach ($members as $index => $pk) {
+            // Install the synthetic frozen tier distribution before the read-only proof.
+            $this->db->table('TblSMSHistory')->where('Request_ID', self::ID)->where('Prospect_PK', $pk)
+                ->update(['Debt_Tier' => 'T'.min($index + 1, 9)]);
+        }
+        $this->person(['Contacted' => 1]); // Same phone as every member, but never selected.
+        $this->db->table('TblProspects')->whereIn('PK', [$members[0], $members[2], $members[9]])
+            ->update(['Contacted' => 1, 'Opt_Out' => 1, 'Invalid_Phone' => 1]);
+        $this->db->table('TblProspects')->where('PK', $members[9])->delete(); // Missing current row still belongs to the frozen denominator.
+        $snapshot = fn (): array => array_map(fn ($table) => $this->db->table($table)->orderBy(match ($table) {
+            'TblSMSResponseAttribution' => 'Prospect_PK', 'TblSMSAvailabilitySummary' => 'scope', default => 'PK',
+        })->get()->toJson(),
+            ['TblProspects','TblSMSHistory','TblSMSRuns','TblSMSDrops','TblProspectsExport','TblSMSResponseAttribution','TblSMSAvailabilitySummary']);
+        $before = $snapshot(); $pdo = $this->db->getPdo();
+        $this->db->enableQueryLog(); $this->db->flushQueryLog(); $this->db->beginTransaction();
+        try {
+            $report = $this->runs->details(self::ID);
+            self::assertSame(['records' => 10, 'opt_out' => 2, 'invalid' => 2, 'contacted' => 2, 'response_rate' => null], $report['total']);
+            self::assertSame(['T1','T2','T3','T4','T5','T6','T7','T8','T9'], array_column($report['tiers'], 'tier'));
+            self::assertSame([1,1,1,1,1,1,1,1,2], array_column($report['tiers'], 'records'));
+            self::assertSame([1,0,1,0,0,0,0,0,0], array_column($report['tiers'], 'contacted'));
+            self::assertTrue($report['contacted_metrics_available']); self::assertSame('current_prospect_flag', $report['contacted_metrics_basis']);
+            self::assertFalse($report['response_metrics_available']);
+            self::assertSame(array_fill(0, 9, null), array_column($report['tiers'], 'response_rate'));
+            self::assertSame($before, $snapshot()); self::assertSame($pdo, $this->db->getPdo());
+            $queries = array_column($this->db->getQueryLog(), 'query');
+            self::assertNotEmpty($queries);
+            foreach ($queries as $query) self::assertMatchesRegularExpression('/\ASELECT\b/i', ltrim($query));
+        } finally { $this->db->rollBack(); $this->db->disableQueryLog(); }
+        self::assertSame($before, $snapshot()); self::assertSame(0, $this->db->transactionLevel()); self::assertFalse($pdo->inTransaction());
+        $this->db->table('TblProspects')->where('PK', $members[0])->update(['Contacted' => 0]);
+        $changed = $snapshot();
+        self::assertSame(1, $this->runs->details(self::ID)['total']['contacted']); self::assertSame($changed, $snapshot());
+    }
+
     public function test_real_contact_evidence_preserves_nine_digits_and_updates_only_one_pk_atomically(): void
     {
         $pk = $this->person(['Creation_Date' => '2026-10-10', 'Response_Date' => '2026-10-01']);
