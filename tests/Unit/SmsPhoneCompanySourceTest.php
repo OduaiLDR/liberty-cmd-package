@@ -130,15 +130,16 @@ final class SmsPhoneCompanySourceTest extends TestCase
     public function test_postcommit_connection_failure_keeps_true_commit_receipt_and_next_failed_replacement_resets_it():void
     {
         $pdo=new \PDO('sqlite::memory:');
-        $pdo->exec('CREATE TABLE TblPhoneNumbers (Phone TEXT, Source TEXT, CID TEXT)');
+        $pdo->exec('CREATE TABLE TblPhoneNumbers (Phone TEXT, Source TEXT, CID TEXT, Created_Date TEXT)');
         $path=tempnam(sys_get_temp_dir(),'sms-phone-commit-fixture-');
         self::assertNotFalse($path);
         $command=$this->command();
+        (new \ReflectionProperty($command,'withCreatedDate'))->setValue($command,true);
         $manager=\Mockery::mock();
         $manager->shouldReceive('connection')->once()->with('sqlsrv')->andThrow(new \RuntimeException('PRIVATE_POSTCOMMIT_CONNECTION'));
         DB::swap($manager);
         try {
-            file_put_contents($path,json_encode(['phone'=>'2025550199','cid'=>'123'])."\n");
+            file_put_contents($path,json_encode(['phone'=>'2025550199','cid'=>'123','created'=>'2026-10-12'])."\n");
             try {(new \ReflectionMethod($command,'replacePhonesFromFile'))->invoke($command,$pdo,$path,1);self::fail('Expected postcommit failure.');}
             catch(\RuntimeException $error){self::assertSame('PRIVATE_POSTCOMMIT_CONNECTION',$error->getMessage());}
             self::assertSame(1,(int)$pdo->query('SELECT COUNT(*) FROM TblPhoneNumbers')->fetchColumn());
@@ -158,6 +159,58 @@ final class SmsPhoneCompanySourceTest extends TestCase
     }
 
     public static function commitStates():array {return [[false,'no'],[true,'yes']];}
+
+    public static function invalidSourceSnapshots(): array
+    {
+        return [[null, '2026-10-12',true], ['123', null,true], ['123', '2026-02-30',true],['123','2026-10-12',false]];
+    }
+
+    #[DataProvider('invalidSourceSnapshots')]
+    public function test_late_invalid_source_page_fails_before_replacement_and_removes_staging(mixed $id, mixed $date,bool $schemaReady): void
+    {
+        $app=Container::getInstance();
+        $capsule=new \Illuminate\Database\Capsule\Manager($app);
+        $capsule->addConnection(['driver'=>'sqlite','database'=>':memory:'] ,'sqlsrv');
+        $app->instance('db',$capsule->getDatabaseManager());
+        $db=$capsule->getConnection('sqlsrv');
+        $db->statement('CREATE TABLE TblPhoneNumbers (Phone TEXT,Source TEXT,CID TEXT'.($schemaReady?',Created_Date TEXT':'').')');
+        $db->table('TblPhoneNumbers')->insert(['Phone'=>'2025550101','Source'=>'DP_LT','CID'=>'old']);
+        $before=$db->table('TblPhoneNumbers')->get()->toJson();
+        $files=glob(sys_get_temp_dir().'/sync-phone-*');
+        $command=new class($db->getPdo(),$id,$date) extends SyncPhoneNumbers {
+            public int $queries=0;
+            public array $errors=[];
+            public function __construct(private \PDO $pdo,public mixed $id,public mixed $date) {parent::__construct();}
+            public function option($key=null) {return ['source'=>'lt','dry-run'=>false,'batch-size'=>1000][$key]??null;}
+            public function info($string,$verbosity=null) {}
+            public function warn($string,$verbosity=null) {}
+            public function error($string,$verbosity=null) {$this->errors[]=$string;}
+            protected function initializeSqlServerConnection(): \PDO {return $this->pdo;}
+            protected function flagContactedProspects(): ?int {throw new \LogicException('Flagging must not start.');}
+            protected function createSnowflakeConnector(): DBConnector {
+                return new class($this) extends DBConnector {
+                    public function __construct(private object $command) {}
+                    public function query(string $sql,array $bindings=[],?int $timeoutSeconds=null):array {
+                        ++$this->command->queries;
+                        return ['data'=>$this->command->queries===1
+                            ? array_fill(0,5000,['PHONE'=>'2025550199','ID'=>'123','CREATED_DATE'=>'2026-10-12'])
+                            : [['PHONE'=>'2025550198','ID'=>$this->command->id,'CREATED_DATE'=>$this->command->date]]];
+                    }
+                };
+            }
+        };
+        try {
+            self::assertSame(1,$command->handle());
+            self::assertSame($schemaReady?2:0,$command->queries);
+            self::assertSame($before,$db->table('TblPhoneNumbers')->get()->toJson());
+            self::assertFalse($db->getPdo()->inTransaction());
+            $phase=$schemaReady?'source_staging':'target_schema';
+            self::assertSame(['SyncPhoneNumbers stopped during '.$phase.'. Phone snapshot committed: no.'],$command->errors);
+            self::assertSame([],array_values(array_diff(glob(sys_get_temp_dir().'/sync-phone-*'),$files)));
+            self::assertFalse(SmsDebtPleteImportPrivacy::active());
+            self::assertStringNotContainsString('2025550199',json_encode($this->logger->failures));
+        } finally {$db->disconnect();}
+    }
 
     #[DataProvider('commitStates')]
     public function test_failure_reports_commit_state_without_claiming_rollback_after_a_commit(bool $committed,string $word):void

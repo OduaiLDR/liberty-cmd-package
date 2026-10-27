@@ -484,6 +484,7 @@ final class SmsDurableWriterBoundariesTest extends TestCase
     private function phoneCommand(): SyncPhoneNumbers
     {
         return new class extends SyncPhoneNumbers {
+            public function __construct() { parent::__construct(); $this->withCreatedDate = true; }
             public function info($string, $verbosity = null): void {}
             public function replace(PDO $pdo, string $path): array { return $this->replacePhonesFromFile($pdo, $path, 1); }
         };
@@ -494,7 +495,7 @@ final class SmsDurableWriterBoundariesTest extends TestCase
         $path = tempnam(sys_get_temp_dir(), 'sms-durable-boundary-');
         if ($path === false) throw new RuntimeException('Unable to create fixture.');
         $this->files[] = $path;
-        file_put_contents($path, $empty ? '' : json_encode(['phone' => '3035550001', 'cid' => 1], JSON_THROW_ON_ERROR)."\n");
+        file_put_contents($path, $empty ? '' : json_encode(['phone' => '3035550001', 'cid' => 1, 'created' => '2026-10-12'], JSON_THROW_ON_ERROR)."\n");
         return $path;
     }
 

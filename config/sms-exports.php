@@ -27,6 +27,9 @@ return [
     // Opt in only after the additive summary migration, all eligibility writers and
     // the refresh scheduler have been deployed together. No live rollout is implicit.
     'durable_availability_enabled' => env('CMD_SMS_DURABLE_AVAILABILITY_ENABLED', false),
+    // Flag-only path, opt in only after explicit Unicode index installation, all-writer
+    // SET-option review and actual production scale/plan acceptance. Legacy Response_Date stays unchanged.
+    'contact_flag_seek_enabled' => env('CMD_SMS_CONTACT_FLAG_SEEK_ENABLED', false),
     // Coordinated package/runner rollout only, after TU data-date provenance and
     // completion contracts are approved. Never derive this date from upload/count time.
     'tu_completion_date_enabled' => env('CMD_SMS_TU_COMPLETION_DATE_ENABLED', false),
