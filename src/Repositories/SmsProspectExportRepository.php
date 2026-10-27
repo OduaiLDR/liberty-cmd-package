@@ -4,6 +4,7 @@ namespace Cmd\Reports\Repositories;
 
 use Carbon\Carbon;
 use Cmd\Reports\Services\SmsAvailabilityRefresh;
+use Cmd\Reports\Services\SmsContactFlagSeek;
 use Cmd\Reports\Services\SmsRecordPolicy;
 use Cmd\Reports\Services\SmsCurrentDebtSql;
 use Cmd\Reports\Services\SmsDeliveryPolicy;
@@ -65,6 +66,15 @@ class SmsProspectExportRepository extends SqlSrvRepository
         $phone = self::CONTACT_PHONE;
         $hashJoins = self::HASH_JOINS;
         $withResponseDate = $db->getSchemaBuilder()->hasColumn('TblProspects', 'Response_Date');
+
+        if (! $withResponseDate && config('sms-exports.contact_flag_seek_enabled', false)) {
+            return SmsAvailabilityRefresh::transaction($db, function () use ($db): int {
+                SmsContactFlagSeek::assertReady($db);
+                $changed=$db->update(SmsContactFlagSeek::SQL);
+                if ($changed>0) SmsAvailabilityRefresh::afterCommit($db);
+                return $changed;
+            });
+        }
 
         return SmsAvailabilityRefresh::transaction($db, function () use ($db, $phone, $hashJoins, $withResponseDate): int {
             $sql = $withResponseDate ? <<<SQL

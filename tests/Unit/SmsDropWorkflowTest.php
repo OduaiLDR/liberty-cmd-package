@@ -808,13 +808,15 @@ test('failed phone sync preserves the previous suppression snapshot', function (
     $this->db->getSchemaBuilder()->table('TblPhoneNumbers', function (Blueprint $table) {
         $table->string('Source')->nullable();
         $table->integer('CID')->nullable();
+        $table->date('Created_Date')->nullable();
     });
     $this->db->table('TblPhoneNumbers')->insert(['Phone' => '2025550101', 'Source' => 'DP_LT']);
     $pdo = $this->db->getPdo();
     $command = \Mockery::mock(\Cmd\Reports\Console\Commands\SyncPhoneNumbers::class)->makePartial();
     $command->shouldReceive('info')->andReturnNull();
+    (new ReflectionProperty($command, 'withCreatedDate'))->setValue($command, true);
     $path = tempnam(sys_get_temp_dir(), 'sms-sync-test-');
-    file_put_contents($path, json_encode(['phone' => '2025550199', 'cid' => 1])."\ninvalid json\n");
+    file_put_contents($path, json_encode(['phone' => '2025550199', 'cid' => 1, 'created' => '2026-10-12'])."\ninvalid json\n");
     try {
         $method = new ReflectionMethod($command, 'replacePhonesFromFile');
         expect(fn () => $method->invoke($command, $pdo, $path, 1))->toThrow(JsonException::class);
@@ -830,6 +832,7 @@ test('successful phone sync atomically replaces only its own source', function (
     $this->db->getSchemaBuilder()->table('TblPhoneNumbers', function (Blueprint $table) {
         $table->string('Source')->nullable();
         $table->integer('CID')->nullable();
+        $table->date('Created_Date')->nullable();
     });
     $this->db->table('TblPhoneNumbers')->insert([
         ['Phone' => '2025550101', 'Source' => 'DP_LT'],
@@ -838,8 +841,9 @@ test('successful phone sync atomically replaces only its own source', function (
     $pdo = $this->db->getPdo();
     $command = \Mockery::mock(\Cmd\Reports\Console\Commands\SyncPhoneNumbers::class)->makePartial();
     $command->shouldReceive('info')->andReturnNull();
+    (new ReflectionProperty($command, 'withCreatedDate'))->setValue($command, true);
     $path = tempnam(sys_get_temp_dir(), 'sms-sync-test-');
-    file_put_contents($path, json_encode(['phone' => '2025550199', 'cid' => 1])."\n");
+    file_put_contents($path, json_encode(['phone' => '2025550199', 'cid' => 1, 'created' => '2026-10-12'])."\n");
     try {
         $result = (new ReflectionMethod($command, 'replacePhonesFromFile'))->invoke($command, $pdo, $path, 1);
         expect($result)->toBe([1, 1, 0]);
@@ -850,7 +854,7 @@ test('successful phone sync atomically replaces only its own source', function (
     }
 });
 
-test('phone sync stores the contact creation date once TblPhoneNumbers has the column', function () {
+test('phone sync rejects invalid staged creation dates and rolls back the whole replacement', function () {
     $this->db->getSchemaBuilder()->table('TblPhoneNumbers', function (Blueprint $table) {
         $table->string('Source')->nullable();
         $table->integer('CID')->nullable();
@@ -864,9 +868,10 @@ test('phone sync stores the contact creation date once TblPhoneNumbers has the c
     file_put_contents($path, json_encode(['phone' => '2025550199', 'cid' => 1, 'created' => '2026-10-14'])."\n"
         .json_encode(['phone' => '2025550198', 'cid' => 2, 'created' => 'not a date'])."\n");
     try {
-        (new ReflectionMethod($command, 'replacePhonesFromFile'))->invoke($command, $pdo, $path, 10);
-        expect($this->db->table('TblPhoneNumbers')->orderBy('Phone')->pluck('Created_Date', 'Phone')->all())
-            ->toBe(['2025550198' => null, '2025550199' => '2026-10-14']);
+        expect(fn () => (new ReflectionMethod($command, 'replacePhonesFromFile'))->invoke($command, $pdo, $path, 1))
+            ->toThrow(RuntimeException::class, 'Unexpected contact creation date; the phone snapshot was not replaced.');
+        expect($this->db->table('TblPhoneNumbers')->count())->toBe(0);
+        expect($pdo->inTransaction())->toBeFalse();
     } finally {
         unlink($path);
         \Mockery::close();

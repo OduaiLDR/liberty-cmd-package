@@ -117,6 +117,7 @@ class SyncPhoneNumbers extends Command
                     $normalizedRows,
                     $batchSize
                 ));
+                $this->warn('[DRY RUN] Counts only; CID/date completeness is validated during full source staging, not by this summary.');
                 Log::info('SyncPhoneNumbers dry run finished.', [
                     'source' => $this->sourceLabel(),
                     'source_rows' => $sourceRows,
@@ -126,6 +127,11 @@ class SyncPhoneNumbers extends Command
                 return Command::SUCCESS;
             }
 
+            $phase = 'target_schema';
+            $this->withCreatedDate = DB::connection('sqlsrv')->getSchemaBuilder()->hasColumn('TblPhoneNumbers', 'Created_Date');
+            if (! $this->withCreatedDate) {
+                throw new \RuntimeException('Phone synchronization requires the Created_Date target column.');
+            }
             $phase = 'source_staging';
             [$stagePath, $sourceCount, $normalizedCount] = $this->stagePhonesFromSnowflake($snowflake);
             $this->info("[INFO] Fetched {$sourceCount} phone rows from Snowflake.");
@@ -137,7 +143,6 @@ class SyncPhoneNumbers extends Command
                 return Command::SUCCESS;
             }
 
-            $this->withCreatedDate = DB::connection('sqlsrv')->getSchemaBuilder()->hasColumn('TblPhoneNumbers', 'Created_Date');
             $phase = 'phone_replacement';
             [$deleted, $inserted, $cleaned] = $this->replacePhonesFromFile($sqlServer, $stagePath, $batchSize);
             $this->info("[INFO] Replaced {$deleted} existing phone rows with {$inserted} rows.");
@@ -177,6 +182,9 @@ class SyncPhoneNumbers extends Command
     protected function replacePhonesFromFile(PDO $connection, string $stagePath, int $batchSize): array
     {
         $this->phoneSnapshotCommitted = false;
+        if (! $this->withCreatedDate) {
+            throw new \RuntimeException('Phone synchronization requires the Created_Date target column.');
+        }
         $durable = SmsAvailabilityRefresh::durableEnabled();
         if ($durable && (DB::connection('sqlsrv')->getPdo() !== $connection || DB::connection('sqlsrv')->transactionLevel() !== 0)) {
             throw new \LogicException('Native phone replacement must use the sqlsrv PDO outside Laravel transactions.');
@@ -222,6 +230,7 @@ class SyncPhoneNumbers extends Command
 
         $handle = fopen($stagePath, 'wb');
         if ($handle === false) {
+            @unlink($stagePath);
             throw new \RuntimeException('Unable to open temporary phone staging file.');
         }
 
@@ -233,12 +242,16 @@ class SyncPhoneNumbers extends Command
                 $normalized = $this->normalizePhones($rows);
 
                 foreach ($normalized as $phone) {
-                    fwrite($handle, json_encode($phone, JSON_THROW_ON_ERROR) . PHP_EOL);
+                    $line = json_encode($phone, JSON_THROW_ON_ERROR) . PHP_EOL;
+                    if (fwrite($handle, $line) !== strlen($line)) {
+                        throw new \RuntimeException('Unable to complete temporary phone staging.');
+                    }
                 }
 
                 $normalizedCount += count($normalized);
                 $offset += $pageSize;
             } while (count($rows) === $pageSize);
+            if (! fflush($handle)) throw new \RuntimeException('Unable to complete temporary phone staging.');
             $staged = true;
         } finally {
             fclose($handle);
@@ -301,24 +314,31 @@ class SyncPhoneNumbers extends Command
             if ($digits === '') {
                 continue;
             }
-            $created = (string) ($row['CREATED_DATE'] ?? '');
             $normalized[] = [
                 'phone' => str_pad($digits, 10, '0', STR_PAD_LEFT),
                 'cid'   => $this->contactId($row['ID'] ?? null),
-                'created' => preg_match('/^\d{4}-\d{2}-\d{2}$/', $created) ? $created : null,
+                'created' => $this->createdDate($row['CREATED_DATE'] ?? null),
             ];
         }
         return $normalized;
     }
 
     /** Snowflake NUMBER(38,0) does not fit a PHP integer; retain its original decimal text. */
-    private function contactId(mixed $id): ?string
+    private function contactId(mixed $id): string
     {
-        if ($id === null) return null;
         if ((! is_string($id) && ! is_int($id)) || ! preg_match('/\A-?[0-9]{1,38}\z/D', (string) $id)) {
             throw new \RuntimeException('Unexpected contact ID format; the phone snapshot was not replaced.');
         }
         return (string) $id;
+    }
+
+    private function createdDate(mixed $date): string
+    {
+        if (! is_string($date) || ! preg_match('/\A([0-9]{4})-([0-9]{2})-([0-9]{2})\z/D', $date, $parts)
+            || ! checkdate((int) $parts[2], (int) $parts[3], (int) $parts[1])) {
+            throw new \RuntimeException('Unexpected contact creation date; the phone snapshot was not replaced.');
+        }
+        return $date;
     }
 
     private function deleteExistingPhones(PDO $connection): int
@@ -352,6 +372,8 @@ class SyncPhoneNumbers extends Command
                 $batch = [];
             }
 
+            if (! feof($handle)) throw new \RuntimeException('Unable to complete reading temporary phone staging.');
+
             if ($batch !== []) {
                 $batchNumber++;
                 $totalInserted += $this->insertPhoneBatch($connection, $batch, $batchNumber);
@@ -371,16 +393,12 @@ class SyncPhoneNumbers extends Command
         foreach ($chunk as $item) {
             $phoneEsc = $this->esc($item['phone']);
             $contactId = $this->contactId($item['cid'] ?? null);
-            $cid = $contactId !== null ? "'{$contactId}'" : 'NULL';
-            if (! $this->withCreatedDate) {
-                $values[] = "('{$phoneEsc}', '{$sourceEsc}', {$cid})";
-                continue;
-            }
-            $created = isset($item['created']) && preg_match('/^\d{4}-\d{2}-\d{2}$/', (string) $item['created']) ? "'{$item['created']}'" : 'NULL';
+            $cid = "'{$contactId}'";
+            $created = "'".$this->createdDate($item['created'] ?? null)."'";
             $values[] = "('{$phoneEsc}', '{$sourceEsc}', {$cid}, {$created})";
         }
 
-        $columns = $this->withCreatedDate ? 'Phone, Source, CID, Created_Date' : 'Phone, Source, CID';
+        $columns = 'Phone, Source, CID, Created_Date';
         $sql = "INSERT INTO TblPhoneNumbers ({$columns}) VALUES " . implode(', ', $values);
         $affected = $this->executeSqlServerWrite($connection, $sql, 'insert phone batch ' . $batchNumber);
         $inserted = $affected > 0 ? $affected : count($chunk);
