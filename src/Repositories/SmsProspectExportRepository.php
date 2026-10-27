@@ -11,6 +11,7 @@ use Cmd\Reports\Services\SmsDeliveryPolicy;
 use Cmd\Reports\Services\SmsTuCompletionDate;
 use Cmd\Reports\Services\SmsWorkflowLock;
 use Cmd\Reports\Services\SmsRunOptions;
+use Cmd\Reports\Services\SmsStatePolicy;
 use Illuminate\Validation\ValidationException;
 use RuntimeException;
 
@@ -189,6 +190,7 @@ FROM Eligible WHERE Phone_Rank = 1
     {
         $priority = self::PRIORITY;
         $phone = self::CONTACT_PHONE;
+        $state = SmsStatePolicy::sqlPredicate('p.State', 'sqlsrv');
 
         return <<<SQL
 WITH Contacts AS (
@@ -217,6 +219,7 @@ Eligible AS (
     FROM Prospects p
     WHERE p.Phone IS NOT NULL AND LEN(p.Phone) = 10 AND p.Phone NOT LIKE '%[^0-9]%'
       AND p.Contacted = 0 AND p.Invalid_Phone = 0 AND p.Opt_Out = 0
+      AND {$state}
       AND NOT EXISTS (SELECT 1 FROM Contacts c WHERE c.Phone = p.Phone)
       AND NOT EXISTS (SELECT 1 FROM TblSMSSuppressions s WHERE s.Phone = p.Phone AND (s.Opt_Out = 1 OR s.Invalid_Phone = 1))
       AND NOT EXISTS (SELECT 1 FROM SharedPhones s WHERE s.Phone = p.Phone)
@@ -323,7 +326,10 @@ SQL;
         }
         // Feedback/contact synchronization may have changed since review. Do not silently
         // ship a stale file or change the reviewed count; ask for a fresh selection instead.
-        $blocked = $this->connection()->selectOne(<<<'SQL'
+        $state = SmsStatePolicy::sqlPredicate('p.State', 'sqlsrv');
+        $frozenState = SmsStatePolicy::sqlPredicate('x.State', 'sqlsrv');
+        $sameState = SmsStatePolicy::normalizedSql('p.State', 'sqlsrv').' = '.SmsStatePolicy::normalizedSql('x.State', 'sqlsrv');
+        $blocked = $this->connection()->selectOne(<<<SQL
 WITH Contacts AS (
     SELECT CASE WHEN LEN(Phone) = 11 AND LEFT(Phone, 1) = '1' THEN SUBSTRING(Phone, 2, 10) ELSE Phone END AS Phone
     FROM TblPhoneNumbers GROUP BY CASE WHEN LEN(Phone) = 11 AND LEFT(Phone, 1) = '1' THEN SUBSTRING(Phone, 2, 10) ELSE Phone END
@@ -333,6 +339,7 @@ JOIN TblProspects p ON p.PK = x.Prospect_PK
 LEFT JOIN Contacts c ON c.Phone = x.Phone
 LEFT JOIN TblSMSSuppressions s ON s.Phone = x.Phone
 WHERE x.Request_ID = ? AND (p.Contacted = 1 OR p.Invalid_Phone = 1 OR p.Opt_Out = 1
+    OR NOT ({$state}) OR NOT ({$frozenState}) OR NOT ({$sameState})
     OR x.Debt_Amount IS NULL OR x.Debt_Amount <= 0
     OR x.Debt_Amount <> CAST(x.Debt_Amount / 1000 AS bigint) * 1000
     OR s.Opt_Out = 1 OR s.Invalid_Phone = 1 OR c.Phone IS NOT NULL)
@@ -361,8 +368,15 @@ SQL, [$requestId]);
         } finally {
             fclose($out);
         }
+        $this->assertCurrentStates($requestId);
 
         return $count;
+    }
+
+    /** Compatibility entry point for final State and contact/phone suppression checks. */
+    public function assertCurrentStates(string $requestId): void
+    {
+        \Cmd\Reports\Services\SmsFrozenEligibility::assertPending($this->connection(), $requestId);
     }
 
     /**

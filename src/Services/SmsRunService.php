@@ -48,6 +48,7 @@ class SmsRunService
             $this->assertSameStart($existing, $target, $options);
             return $this->show($requestId);
         }
+        SmsApprovalCreationPolicy::assertNewRun($options);
         if ($options !== null) $this->assertNewFileOptionsReady($options);
         if (isset($options['send_date'])) {
             try { SmsDeliveryPolicy::assertNotPast($options['send_date']); }
@@ -57,6 +58,7 @@ class SmsRunService
             // Another identical POST may have completed while this caller waited for the lock.
             $existing = $this->runs()->where('Request_ID', $requestId)->lockForUpdate()->first();
             if ($existing) { SmsRecordPolicy::assertOrdinary($existing); $this->assertSameStart($existing, $target, $options); return 'existing'; }
+            SmsApprovalCreationPolicy::assertNewRun($options);
             if (SmsExternalEventService::pending()) throw new HttpException(409, 'Finish the historical SMS registration before starting another campaign.');
             if (! SmsRecordPolicy::enabled() && SmsExternalEventService::exists()) throw new HttpException(409, 'Historical exact-record sends require the record workflow; legacy phone-based creation is unavailable.');
             $open = $this->runs()->whereNotIn('Status', self::CLOSED)->lockForUpdate()->first();
@@ -288,6 +290,7 @@ class SmsRunService
     public function requestSent(string $requestId, string $actor): object
     {
         $this->assertLegacy($this->mustRun($requestId));
+        $this->export->assertCurrentStates($requestId);
         if (! $this->move($requestId, ['file_ready'], 'sending', ['Sent_By' => $actor])) {
             throw new HttpException(409, 'A run can be marked as sent once its file is ready.');
         }
@@ -302,6 +305,7 @@ class SmsRunService
             $this->assertLegacy($this->mustRun($requestId));
             if ($this->run($requestId)?->Status !== 'sending') return;
             DB::connection('sqlsrv')->transaction(function () use ($requestId): void {
+                $this->export->assertCurrentStates($requestId);
                 $sentAt = Carbon::now();
                 $this->export->markSent($requestId, $sentAt);
                 $this->move($requestId, ['sending'], 'sent', ['Sent_At' => $sentAt->toDateTimeString()]);
@@ -367,7 +371,7 @@ class SmsRunService
             if (! SmsRecordPolicy::isRecord($run) || $run->Status !== 'approving' || ! $run->Approved_At || ! $run->Approved_By) {
                 throw new HttpException(409, 'No accepted record approval is waiting for this batch.');
             }
-            // Do not reevaluate Contacted/Opt_Out/Invalid_Phone: selection is frozen.
+            // Membership/prices remain frozen; current suppressions can hold the approval.
             $at = Carbon::parse($run->Approved_At, 'UTC');
             app(SmsRecordExportRepository::class)->approve($requestId, $at, (int) $run->Selected);
             if (! $this->move($requestId, ['approving'], 'approved', ['Sent_By' => $run->Approved_By,
@@ -860,8 +864,23 @@ class SmsRunService
             catch (\Throwable $error) { throw new HttpException(409, 'Original external files are unavailable or do not match their receipt.', $error); }
         }
         if (SmsRecordPolicy::isRecord($run) && ! in_array($run->Status, ['file_ready','approving','approved'], true)) throw new HttpException(404, 'This batch has no downloadable file.');
+        if (SmsRecordPolicy::isRecord($run) && in_array($run->Status, ['file_ready','approving'], true)) {
+            app(SmsRecordExportRepository::class)->assertCurrentStates($requestId);
+        }
+        if (! SmsRecordPolicy::isRecord($run) && in_array($run->Status, ['file_ready','sending'], true)) {
+            $this->export->assertCurrentStates($requestId);
+        }
         if ($this->approvalFilenames($this->fileOptions($run)) && $run->Status === 'approving') throw new HttpException(409, 'SMS files are being finalized after approval.');
-        return $this->verifiedRunArtifact($run, $this->artifactGeneration($run));
+        $path = $this->verifiedRunArtifact($run, $this->artifactGeneration($run));
+        // Hashing can take time for a large bundle. Check again immediately before
+        // releasing a pending download, using the same frozen membership.
+        if (SmsRecordPolicy::isRecord($run) && in_array($run->Status, ['file_ready','approving'], true)) {
+            app(SmsRecordExportRepository::class)->assertCurrentStates($requestId);
+        }
+        if (! SmsRecordPolicy::isRecord($run) && in_array($run->Status, ['file_ready','sending'], true)) {
+            $this->export->assertCurrentStates($requestId);
+        }
+        return $path;
     }
 
     private function verifiedRunArtifact(object $run, string $generation): string
@@ -1020,19 +1039,22 @@ class SmsRunService
             || ! class_exists(\ZipArchive::class)) return null;
         $tierSelection = (bool) config('sms-exports.tier_selection_enabled', false);
         $windowed = (bool) config('sms-exports.tier_selection_windowed_enabled', false);
-        if ($tierSelection && $windowed && ! SmsTierWindowSchema::ready(DB::connection('sqlsrv'))) $tierSelection = false;
+        $leanHistory = $windowed && (bool) config('sms-exports.lean_history_enabled', false);
+        $windowSchemaReady = ! $tierSelection || ! $windowed || (SmsTierWindowSchema::ready(DB::connection('sqlsrv'))
+            && (! $leanHistory || SmsLeanHistorySchema::ready(DB::connection('sqlsrv'))));
+        if ($tierSelection && ! $windowSchemaReady) $tierSelection = false;
         $capabilities = ['csv_format' => SmsRunOptions::CSV_FORMAT, 'rows_per_file' => true,
             'tier_subset' => $tierSelection, 'max_parts' => SmsRunArtifactBundle::MAX_PARTS];
         if ($capabilities['tier_subset']) {
             $capabilities['tier_selection_policy'] = $windowed
-                ? SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY
+                ? ($leanHistory ? SmsRunOptions::LEAN_WINDOWED_TIER_SELECTION_POLICY : SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY)
                 : SmsRunOptions::TIER_SELECTION_POLICY;
         }
         $capabilities += ['options_version' => SmsRunOptions::PLANNED_DATE_VERSION, 'send_date' => true,
             'default_send_date' => SmsDeliveryPolicy::followingMonday()->toDateString(),
             'min_send_date' => Carbon::now(SmsDeliveryPolicy::TIMEZONE)->toDateString(), 'send_date_timezone' => SmsDeliveryPolicy::TIMEZONE,
             'filename_version' => SmsRunOptions::APPROVAL_FILENAME_VERSION];
-        if (($capabilities['tier_selection_policy'] ?? null) === SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY
+        if (SmsRunOptions::isWindowedTierSelectionPolicy($capabilities['tier_selection_policy'] ?? null)
             && app(SmsSelectionCancellation::class)->availableForNewRequests()) {
             $capabilities['selection_cancellation'] = true;
         }
@@ -1047,9 +1069,13 @@ class SmsRunService
         if (isset($options['tier_selection_policy']) && ! config('sms-exports.tier_selection_enabled', false)) {
             throw new HttpException(503, 'Source-tier selection requires its coordinated creation rollout.');
         }
-        if (($options['tier_selection_policy'] ?? null) === SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY) {
+        if (SmsRunOptions::isWindowedTierSelectionPolicy($options['tier_selection_policy'] ?? null)) {
             try { SmsTierWindowSchema::assertReady(DB::connection('sqlsrv')); }
             catch (Throwable $error) { throw new HttpException(503, 'Windowed source-tier selection requires its reviewed seek schema.', $error); }
+        }
+        if (SmsRunOptions::usesLeanDebtSources($options['tier_selection_policy'] ?? null)) {
+            try { SmsLeanHistorySchema::assertReady(DB::connection('sqlsrv')); }
+            catch (Throwable $error) { throw new HttpException(503, 'Lean SMS history requires unique TU and mailer source PK lookup identities.', $error); }
         }
         $capabilities = $this->fileCapabilities();
         if (isset($options['tier_selection_policy'])

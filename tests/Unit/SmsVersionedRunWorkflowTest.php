@@ -145,6 +145,7 @@ beforeEach(function (): void {
         $this->service->prepare($this->id);
     };
     $this->prepareApprovalVersion = function (): void {
+        config(['sms-exports.approval_only_creation_enabled' => true]);
         $this->options = SmsRunOptions::normalize(7, 3, null, null, SmsRunOptions::PLANNED_DATE_VERSION, '2026-10-26', SmsRunOptions::APPROVAL_FILENAME_VERSION);
         ($this->prepareVersioned)();
         $first = $this->db->table('TblProspectsExport')->where('Request_ID', $this->id)->orderBy('Prospect_PK')->limit(2)->pluck('Prospect_PK')->all();
@@ -652,6 +653,50 @@ test('malformed stored options never become legacy and migration rollback never 
     expect(fn () => $migration->up())->toThrow(RuntimeException::class);
     expect($this->db->getSchemaBuilder()->hasColumns('TblSMSRuns', ['Run_Options_JSON', 'Artifact_Manifest_JSON']))->toBeTrue();
 });
+
+test('approval-only creation rejects older new requests and preserves an existing frozen request', function (): void {
+    $old = $this->service->start($this->id, 7, 'editor@example.invalid', $this->options);
+    $stored = $this->db->table('TblSMSRuns')->where('Request_ID', $this->id)->first();
+    config(['sms-exports.approval_only_creation_enabled' => true]);
+    expect($this->service->start($this->id, 7, 'editor@example.invalid', $this->options)->options)->toBe($old->options);
+    expect($this->db->table('TblSMSRuns')->where('Request_ID', $this->id)->first())->toEqual($stored);
+    $this->db->table('TblSMSRuns')->where('Request_ID', $this->id)->update(['Status' => 'discarded']);
+
+    $earlyNames = SmsRunOptions::normalize(7, 3, null, null, SmsRunOptions::PLANNED_DATE_VERSION,
+        '2026-10-26', SmsRunOptions::DROP_RANGE_FILENAME_VERSION);
+    foreach ([null, $this->options, $earlyNames] as $options) {
+        expect(fn () => $this->service->start($this->otherId, 7, 'editor@example.invalid', $options))->toThrow(HttpException::class);
+        expect($this->db->table('TblSMSRuns')->where('Request_ID', $this->otherId)->exists())->toBeFalse();
+    }
+    expect($this->db->table('TblSMSDrops')->count())->toBe(0)
+        ->and($this->db->table('TblSMSHistory')->count())->toBe(0)->and($this->service->queued)->toHaveCount(1);
+});
+
+test('approval-only new batch previews without registration and approves once with creation disabled', function (): void {
+    config(['sms-exports.approval_only_creation_enabled' => true]);
+    ($this->prepareApprovalVersion)();
+    $this->service->filePath($this->id);
+    $parts = array_column(json_decode($this->db->table('TblSMSRuns')->value('Artifact_Manifest_JSON'), true)['parts'], 'sha256');
+    expect($this->db->table('TblSMSDrops')->count())->toBe(0)
+        ->and($this->db->table('TblSMSHistory')->count())->toBe(0)
+        ->and((int) $this->db->table('TblProspects')->sum('SMS_Attempts'))->toBe(0);
+    config(['sms-exports.run_file_options_enabled' => false]);
+    $this->service->requestApprove($this->id, 'approver@example.invalid');
+    $this->service->markApproved($this->id); $this->service->markApproved($this->id);
+    expect($this->db->table('TblSMSRuns')->value('Status'))->toBe('approved')
+        ->and($this->db->table('TblSMSHistory')->count())->toBe(5)
+        ->and((int) $this->db->table('TblProspects')->sum('SMS_Attempts'))->toBe(5);
+    expect(is_file($this->service->filePath($this->id)))->toBeTrue()
+        ->and(array_column(json_decode($this->db->table('TblSMSRuns')->value('Artifact_Manifest_JSON'), true)['parts'], 'sha256'))->toBe($parts);
+});
+
+test('approval-only creation fails closed when coordinated prerequisites are unavailable', function (string $missing): void {
+    config(['sms-exports.approval_only_creation_enabled' => true, 'sms-exports.'.$missing => false]);
+    $options = SmsRunOptions::normalize(7, 3, null, null, SmsRunOptions::PLANNED_DATE_VERSION,
+        '2026-10-26', SmsRunOptions::APPROVAL_FILENAME_VERSION);
+    expect(fn () => $this->service->start($this->id, 7, 'editor@example.invalid', $options))->toThrow(HttpException::class)
+        ->and($this->db->table('TblSMSRuns')->count())->toBe(0)->and($this->service->queued)->toBe([]);
+})->with(['record_workflow_enabled', 'durable_availability_enabled', 'run_file_options_enabled']);
 
 test('tier selector capability is opt-in and canonical choices replay with creation disabled', function (): void {
     $marked = SmsRunOptions::normalize(7, 3, ['T9','T2'], SmsRunOptions::TIER_SELECTION_POLICY);

@@ -38,6 +38,22 @@ test('windowed selection resolves only the connection-local ordered page without
         ->and(strpos($sql, 'SELECT TOP (?) ?'))->toBeLessThan(strpos($sql, 'r.Tier IN (?,?)'));
 });
 
+test('lean v3 writes no second source id for Tier while old selectors retain their frozen shape', function (): void {
+    $eligible = 'SELECT PK,Phone,Client,Address,City,State,Zip,Email,Creation_Date,Last_SMS_Date FROM TblProspects';
+    $old = SmsTierSelectionSql::select($eligible, ['T2']);
+    $lean = SmsTierSelectionSql::select($eligible, ['T2'], 'Send_Date', true);
+    $oldWindow = SmsTierWindowSelectionSql::insert(['T2']);
+    $leanWindow = SmsTierWindowSelectionSql::insert(['T2'], 'Send_Date', true);
+
+    foreach ([$lean, $leanWindow] as $sql) {
+        expect($sql)->toContain("r.Source, CASE WHEN r.Source='Tier' THEN NULL ELSE r.Source_PK END")
+            ->and(substr_count($sql, 'TOP (?)'))->toBe(1);
+    }
+    foreach ([$old, $oldWindow] as $sql) {
+        expect($sql)->toContain('r.Source, r.Source_PK')->not->toContain("CASE WHEN r.Source='Tier'");
+    }
+});
+
 test('invalid tier values lists and obsolete clocks fail before generating selection SQL', function (array $tiers): void {
     expect(fn () => SmsTierSelectionSql::select('SELECT * FROM TblProspects',$tiers))->toThrow(RuntimeException::class);
     expect(fn () => SmsTierWindowSelectionSql::insert($tiers))->toThrow(RuntimeException::class);

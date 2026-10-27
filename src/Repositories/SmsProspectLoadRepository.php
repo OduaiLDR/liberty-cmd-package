@@ -4,6 +4,7 @@ namespace Cmd\Reports\Repositories;
 
 use Cmd\Reports\Services\SmsWorkflowLock;
 use Cmd\Reports\Services\SmsAvailabilityRefresh;
+use Cmd\Reports\Services\SmsStatePolicy;
 use InvalidArgumentException;
 
 /**
@@ -41,14 +42,28 @@ WITH Source AS (
     CROSS APPLY (SELECT CASE WHEN LEN(d10.Digits) = 10 AND d10.Digits NOT LIKE '%[^0-9]%' THEN CAST(d10.Digits AS varchar(10)) END AS Phone) ph
     WHERE e.Drop_Name = ?
 ),
-People AS (
+RankedPeople AS (
     SELECT s.*, ROW_NUMBER() OVER (PARTITION BY s.Client, s.Address, s.Zip
-        ORDER BY CASE WHEN s.Phone IS NULL THEN 1 ELSE 0 END, s.PK DESC) AS Person_Rank
+        ORDER BY CASE WHEN s.Phone IS NULL THEN 1 ELSE 0 END, s.PK DESC) AS Person_Rank,
+        MIN(CASE WHEN /*STATE_POLICY*/ THEN 1 ELSE 0 END) OVER
+            (PARTITION BY s.Client, s.Address, s.Zip) AS All_States_Allowed,
+        MIN(s.State) OVER (PARTITION BY s.Client, s.Address, s.Zip) AS Min_State,
+        MAX(s.State) OVER (PARTITION BY s.Client, s.Address, s.Zip) AS Max_State
     FROM Source s
     WHERE s.Client <> '' AND s.Address <> '' AND s.Zip LIKE '[0-9][0-9][0-9][0-9][0-9]'
       AND (s.Phone IS NOT NULL OR s.Email IS NOT NULL)
+),
+People AS (
+    SELECT * FROM RankedPeople
+    WHERE Person_Rank = 1 AND All_States_Allowed = 1
+      AND Min_State = Max_State
 )
 SQL;
+
+    private function sourceSql(): string
+    {
+        return str_replace('/*STATE_POLICY*/', SmsStatePolicy::sqlPredicate('s.State', 'sqlsrv'), self::SOURCE_SQL);
+    }
 
     /**
      * Enriched drops, newest send date first (TblMarketing.Send_Date); drops without one come last.
@@ -85,19 +100,20 @@ SQL;
     private function loadDropNow(string $dropName, ?string $sendDate, bool $dryRun, bool $fill): array
     {
         $db = $this->connection();
+        $sourceSql = $this->sourceSql();
         if ($dryRun) {
-            $people = (int) $db->selectOne(self::SOURCE_SQL.' SELECT COUNT(*) AS n FROM People WHERE Person_Rank = 1', [$dropName])->n;
-            $added = (int) $db->selectOne(self::SOURCE_SQL.' SELECT COUNT(*) AS n FROM People p WHERE p.Person_Rank = 1
+            $people = (int) $db->selectOne($sourceSql.' SELECT COUNT(*) AS n FROM People WHERE Person_Rank = 1', [$dropName])->n;
+            $added = (int) $db->selectOne($sourceSql.' SELECT COUNT(*) AS n FROM People p WHERE p.Person_Rank = 1
                 AND NOT EXISTS (SELECT 1 FROM TblProspects q WHERE q.Client = p.Client AND q.Address = p.Address AND q.Zip = p.Zip)', [$dropName])->n;
 
             return ['people' => $people, 'added' => $added, 'filled' => 0];
         }
 
-        return $db->transaction(function () use ($db, $dropName, $sendDate, $fill): array {
+        return $db->transaction(function () use ($db, $dropName, $sendDate, $fill, $sourceSql): array {
             // Old deployments remain usable until the additive workflow migration is applied.
             $legacy = $db->getSchemaBuilder()->hasTable('TblSMSLegacySends')
                 ? "SELECT Send_Date AS Sent FROM TblSMSLegacySends WHERE Phone = p.Phone" : 'SELECT CAST(NULL AS date) AS Sent';
-            $added = $db->affectingStatement(self::SOURCE_SQL.<<<SQL
+            $added = $db->affectingStatement($sourceSql.<<<SQL
 
 INSERT INTO TblProspects (Creation_Date, Client, Address, City, State, Zip, Phone, Email, Latest_Export_Date, SMS_Attempts)
 SELECT ?, p.Client, p.Address, p.City, p.State, p.Zip, p.Phone, p.Email, x.Sent, CASE WHEN x.Sent IS NULL THEN 0 ELSE 1 END
@@ -109,12 +125,13 @@ WHERE p.Person_Rank = 1
   AND NOT EXISTS (SELECT 1 FROM TblProspects q WHERE q.Client = p.Client AND q.Address = p.Address AND q.Zip = p.Zip)
 SQL, [$dropName, $sendDate]);
             // The fill reads the drop a second time; --no-fill leaves it for a later run.
-            $filled = ! $fill ? 0 : $db->affectingStatement(self::SOURCE_SQL.<<<'SQL'
+            $currentState = SmsStatePolicy::sqlPredicate('q.State', 'sqlsrv');
+            $filled = ! $fill ? 0 : $db->affectingStatement($sourceSql.<<<SQL
 
 UPDATE q SET Phone = COALESCE(q.Phone, p.Phone), Email = COALESCE(q.Email, p.Email)
 FROM TblProspects q
 JOIN People p ON p.Person_Rank = 1 AND q.Client = p.Client AND q.Address = p.Address AND q.Zip = p.Zip
-WHERE (q.Phone IS NULL AND p.Phone IS NOT NULL) OR (q.Email IS NULL AND p.Email IS NOT NULL)
+WHERE ({$currentState}) AND ((q.Phone IS NULL AND p.Phone IS NOT NULL) OR (q.Email IS NULL AND p.Email IS NOT NULL))
 SQL, [$dropName]);
 
             if ($added + $filled > 0) SmsAvailabilityRefresh::afterCommit($db);
@@ -125,7 +142,8 @@ SQL, [$dropName]);
     /** Prospects an SMS run could text: a phone and not a contact (counted on the filtered Phone index). */
     public function prospectsWithPhone(): int
     {
-        return (int) $this->connection()->selectOne('SELECT COUNT(*) AS n FROM TblProspects WHERE Contacted = 0 AND Phone IS NOT NULL')->n;
+        $state = SmsStatePolicy::sqlPredicate('State', 'sqlsrv');
+        return (int) $this->connection()->selectOne("SELECT COUNT(*) AS n FROM TblProspects WHERE Contacted = 0 AND Phone IS NOT NULL AND {$state}")->n;
     }
 
     /**

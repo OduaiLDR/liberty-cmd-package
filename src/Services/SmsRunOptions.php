@@ -24,9 +24,13 @@ final class SmsRunOptions
     /** Exact-priority keyset windows; v1 remains readable/replayable for frozen runs. */
     public const WINDOWED_TIER_SELECTION_POLICY = 'current-source-tier-windowed-v2';
 
+    /** New lean provenance: TU/mailer keep their PK; Tier deliberately has no second source PK. */
+    public const LEAN_WINDOWED_TIER_SELECTION_POLICY = 'current-source-tier-windowed-lean-v3';
+
     public const TIER_SELECTION_POLICIES = [
         self::TIER_SELECTION_POLICY,
         self::WINDOWED_TIER_SELECTION_POLICY,
+        self::LEAN_WINDOWED_TIER_SELECTION_POLICY,
     ];
 
     public const PLANNED_DATE_VERSION = 'sms-planned-date-v1';
@@ -139,5 +143,15 @@ final class SmsRunOptions
     public static function isTierSelectionPolicy(mixed $policy): bool
     {
         return is_string($policy) && in_array($policy, self::TIER_SELECTION_POLICIES, true);
+    }
+
+    public static function isWindowedTierSelectionPolicy(mixed $policy): bool
+    {
+        return in_array($policy, [self::WINDOWED_TIER_SELECTION_POLICY, self::LEAN_WINDOWED_TIER_SELECTION_POLICY], true);
+    }
+
+    public static function usesLeanDebtSources(mixed $policy): bool
+    {
+        return $policy === self::LEAN_WINDOWED_TIER_SELECTION_POLICY;
     }
 }

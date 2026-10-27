@@ -30,6 +30,7 @@ class SmsRunPublicationWorkflow
         $pdo = $db->getPdo();
         $run = $this->run($id);
         $context = $this->context($run, false);
+        SmsFrozenEligibility::assertHandoff($id);
         SmsDeliveryPolicy::assertNotPast($context['options']['send_date']);
         $identity = $this->publisher->identity();
         $policy = $this->publisher->policy($context['options']['send_date']);
@@ -51,6 +52,7 @@ class SmsRunPublicationWorkflow
         return $this->operate($id, function ($db, PDO $pdo) use ($id, $actor): array {
             $run = $this->run($id);
             $context = $this->context($run, true);
+            SmsFrozenEligibility::assertHandoff($id);
             $identity = $this->publisher->identity();
             $policy = $this->publisher->policy($context['options']['send_date']);
             $this->outside($db, $pdo);
@@ -113,6 +115,7 @@ class SmsRunPublicationWorkflow
                         }
                         $this->transaction($db, $pdo, function () use ($db, $id, $row, $run, $part, $plan): void {
                             $this->unchanged($row, $run, true);
+                            SmsFrozenEligibility::assertHandoff($id);
                             SmsDeliveryPolicy::assertNotPast($plan['send_date']);
                             $before = $this->part($id, $part['part'], true);
                             $this->assertPart($before);
@@ -126,6 +129,7 @@ class SmsRunPublicationWorkflow
                         $this->outside($db, $pdo);
                         // Re-entering this provider operation reconciles the same deterministic
                         // create-only path/link. It does not blindly overwrite an uncertain upload.
+                        SmsFrozenEligibility::assertHandoff($id);
                         $receipt = $this->publisher->publish($id, $part, $stream, $plan['policy']);
                         $this->outside($db, $pdo);
                         $this->assertReceipt($receipt, $part, $id, $plan['policy']);
@@ -171,6 +175,7 @@ class SmsRunPublicationWorkflow
         if (! $this->schemaReady()) throw new HttpException(503, 'Apply the explicit SMS publication migration first.');
         $row = $this->publication($id);
         if ($row === null || $row->State !== 'published') throw new HttpException(409, 'Publish and verify every SMS file before preparing its email.');
+        SmsFrozenEligibility::assertHandoff($id);
         $run = $this->run($id);
         $plan = $this->plan($row, $run, $this->context($run, false));
         $parts = $this->parts($id, $plan);

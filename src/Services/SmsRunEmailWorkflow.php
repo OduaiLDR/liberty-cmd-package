@@ -30,6 +30,7 @@ class SmsRunEmailWorkflow
         return $this->operate($id, function ($db, PDO $pdo) use ($id, $links, $actor): array {
             $run = $this->run($id);
             $context = $this->context($run);
+            SmsFrozenEligibility::assertHandoff($id);
             $this->assertTrackedPublication($db, $id, $links);
             $existing = $this->outbox($id);
             if ($existing !== null) {
@@ -89,6 +90,7 @@ class SmsRunEmailWorkflow
             // All local prerequisites pass before the durable non-retryable boundary.
             $this->transaction($db, $pdo, function () use ($db, $id, $row, $run, $context, $payload): void {
                 if ($this->fingerprint($this->run($id, true)) !== $this->fingerprint($run)) throw new HttpException(409, 'The approved SMS receipt changed before the email attempt.');
+                SmsFrozenEligibility::assertHandoff($id);
                 $current = $this->outbox($id, true);
                 $this->sameRow($current, $row, 'ready');
                 $this->assertTrackedPublication($db, $id, $payload['links']);

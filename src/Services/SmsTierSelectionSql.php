@@ -18,7 +18,7 @@ final class SmsTierSelectionSql
      * in the supplied order. Values are never interpolated into the SQL text.
      * Caller owns snapshot isolation, run serialization, transaction/replay policy.
      */
-    public static function select(string $eligibleSql, array $tiers, string $mailerDate = 'Send_Date'): string
+    public static function select(string $eligibleSql, array $tiers, string $mailerDate = 'Send_Date', bool $leanDebtSources = false): string
     {
         if (trim($eligibleSql) === '') throw new RuntimeException('Tier selection requires a trusted unbounded eligibility SELECT.');
         if (! array_is_list($tiers) || $tiers === [] || count($tiers) > count(SmsRunOptions::TIERS)) {
@@ -39,6 +39,7 @@ SQL;
         $ctes = SmsCurrentDebtSql::withResolved($wanted, $mailerDate);
         $debt = SmsCurrentDebtSql::ROUNDED_DEBT_SQL;
         $valid = SmsCurrentDebtSql::VALID_PREDICATE;
+        $sourcePk = $leanDebtSources ? "CASE WHEN r.Source='Tier' THEN NULL ELSE r.Source_PK END" : 'r.Source_PK';
         $tierBindings = implode(',', array_fill(0, count($tiers), '?'));
         return $ctes.<<<SQL
 
@@ -46,7 +47,7 @@ INSERT INTO TblProspectsExport (Request_ID, Prospect_PK, Phone, Debt_Tier, Debt_
     Debt_Source, Debt_Source_PK, Client, Address, City, State, Zip, Email,
     Was_Previously_Texted, Last_SMS_Date_At_Selection)
 SELECT TOP (?) ?, w.Export_PK, w.Phone, r.Tier, {$debt},
-    r.Source, r.Source_PK, w.Client, w.Address, w.City, w.State, w.Snapshot_Zip, w.Email,
+    r.Source, {$sourcePk}, w.Client, w.Address, w.City, w.State, w.Snapshot_Zip, w.Email,
     CASE WHEN w.Last_SMS_Date IS NULL THEN 0 ELSE 1 END, w.Last_SMS_Date
 FROM Wanted w JOIN Resolved r ON r.Export_PK=w.Export_PK
 WHERE {$valid}

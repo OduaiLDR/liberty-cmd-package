@@ -52,6 +52,7 @@ beforeEach(function () {
         $table->string('Drop_Name');
         $table->string('External_ID');
         $table->string('Phone')->nullable();
+        $table->string('State', 2)->nullable()->default('CA');
         $table->string('Client')->default('Sample Person');
         $table->string('Address')->default('Sample address');
     });
@@ -103,6 +104,17 @@ function smsFixture($db, int $pk, string $tier, string $date, array $phones): vo
     }
 }
 
+test('approval-only rollout fences direct legacy exports without tracking or publication', function () {
+    smsFixture($this->db, 1, 'T1', '2026-10-05', ['2025550101']);
+    config(['sms-exports.approval_only_creation_enabled' => true]);
+    $published = false;
+    expect(fn () => $this->repo->prepareExport(1, '11111111-2222-4333-8444-555555555555', null,
+        function () use (&$published): void { $published = true; }))
+        ->toThrow(\Symfony\Component\HttpKernel\Exception\HttpException::class);
+    expect($published)->toBeFalse()->and($this->db->table('TblSmsExports')->count())->toBe(0)
+        ->and((int) $this->db->table('TblMarketing')->sum('SMS_Drops'))->toBe(0);
+});
+
 test('counts and CSV exclude synced phones including country-code and punctuation variants', function () {
     smsFixture($this->db, 1, 'T1', '2026-10-05', ['(202) 555-0101', '+1 202-555-0102', '2025550103', '', 'invalid']);
     $this->db->table('TblPhoneNumbers')->insert([['Phone' => '2025550101'], ['Phone' => '12025550102']]);
@@ -118,6 +130,29 @@ test('counts and CSV exclude synced phones including country-code and punctuatio
     } finally {
         unlink($export['path']);
     }
+});
+
+test('counts and CSV hold excluded unknown malformed and mixed-state leads', function () {
+    $states = ['CA','DC','CO','OR','RI','WI','WV',null,'ZZ','C1'];
+    $phones = [];
+    foreach ($states as $index => $state) $phones[] = '202555'.str_pad((string) (1000 + $index), 4, '0', STR_PAD_LEFT);
+    smsFixture($this->db, 1, 'T1', '2026-10-05', $phones);
+    foreach ($states as $index => $state) {
+        $this->db->table('TblMailersUniqueEnriched')->where('PK', 100 + $index)->update(['State' => $state]);
+    }
+    // A blocked sibling holds the complete External_ID even though its first row was allowed.
+    $this->db->table('TblMailersUniqueEnriched')->insert([
+        'PK' => 199, 'Drop_Name' => 'DROP1', 'External_ID' => 'EXT100', 'Phone' => '2025550199', 'State' => 'WV',
+    ]);
+
+    $selected = $this->repo->selectDrops(1);
+    expect((int) $selected->first()->Amount_Dropped)->toBe(1);
+    $export = $this->repo->prepareExport(1, '00000000-0000-4000-8000-000000000777');
+    try {
+        $csv = file_get_contents($export['path']);
+        expect($export['count'])->toBe(1)->and($csv)->toContain($phones[1])->not->toContain($phones[0]);
+        foreach (array_slice($phones, 2) as $held) expect($csv)->not->toContain($held);
+    } finally { unlink($export['path']); }
 });
 
 test('contacted phone lookups bind every number as text for SQL Server', function () {
@@ -488,7 +523,7 @@ test('allocates exact cents proportionally including small totals', function () 
     expect(fn () => $planner->allocate('1', [1 => 0]))->toThrow(ValidationException::class);
 });
 
-test('weekly SMS billing uses exported counts and does not affect another week', function () {
+test('legacy export generation retains evidence but cannot establish weekly billing', function () {
     smsFixture($this->db, 1, 'T1', '2026-10-05', ['2025550101']);
     smsFixture($this->db, 2, 'T2', '2026-10-05', ['2025550102', '2025550103']);
     $export = $this->repo->prepareExport(3, '00000000-0000-4000-8000-000000000008');
@@ -496,13 +531,15 @@ test('weekly SMS billing uses exported counts and does not affect another week',
     Carbon::setTestNow('2026-10-13 12:00:00');
     $next = $this->repo->prepareExport(1, '00000000-0000-4000-8000-000000000009');
     unlink($next['path']);
-    (new MarketingReportRepository)->allocateInvoice(['kind' => 'sms', 'invoice_number' => 'SMS-INV', 'cost' => '100.00', 'week' => '2026-10-07']);
-    expect((float) $this->db->table('TblSmsExports')->where('PK', 1)->value('SMS_Cost'))->toBe(33.33);
-    expect((float) $this->db->table('TblSmsExports')->where('PK', 2)->value('SMS_Cost'))->toBe(66.67);
+    expect(fn () => (new MarketingReportRepository)->allocateInvoice(['kind' => 'sms', 'invoice_number' => 'SMS-INV', 'cost' => '100.00', 'week' => '2026-10-07']))
+        ->toThrow(ValidationException::class);
+    expect((float) $this->db->table('TblSmsExports')->where('PK', 1)->value('SMS_Cost'))->toBe(0.0);
+    expect((float) $this->db->table('TblSmsExports')->where('PK', 2)->value('SMS_Cost'))->toBe(0.0);
     expect($this->db->table('TblSmsExports')->where('PK', 3)->value('SMS_Invoice_Number'))->toBeNull();
     expect(fn () => (new MarketingReportRepository)->allocateInvoice(['kind' => 'sms', 'invoice_number' => 'SECOND', 'cost' => '2.00', 'week' => '2026-10-07']))
         ->toThrow(ValidationException::class);
-    expect($this->db->table('TblSmsExports')->where('PK', 1)->value('SMS_Invoice_Number'))->toBe('SMS-INV');
+    expect($this->db->table('TblSmsExports')->where('PK', 1)->value('SMS_Invoice_Number'))->toBeNull();
+    expect((new MarketingReportRepository)->smsExports('2026-10-07')->sum('Confirmed_Count'))->toBe(0);
 });
 
 test('mail invoice distributes across all tiers of one drop and leaves other drops unchanged', function () {
@@ -597,6 +634,25 @@ test('marketing view renders SMS invoice fields and weekly totals', function () 
         ]]),
     ]);
     expect($html)->toContain('SMS0009')->toContain('INV-9')->toContain('$1.23')->not->toContain('Distribute SMS invoice');
+});
+
+test('marketing Blade separates retained export evidence from confirmed totals and invoice controls', function () {
+    $legacy = (object) ['SMS_Drop_Name' => 'OLD', 'Debt_Tier' => 'T1', 'Exported_At' => '2026-10-06 12:00:00',
+        'SMS_Count' => 99, 'Confirmed_Count' => 0, 'Billable' => false, 'Activity_Status' => 'exported_unconfirmed',
+        'SMS_Invoice_Number' => null, 'SMS_Cost' => '0.00', 'Invoice_Hold' => null];
+    $confirmed = (object) ['SMS_Drop_Name' => 'OFFICIAL', 'Debt_Tier' => 'T1', 'Exported_At' => '2026-10-06 12:00:00',
+        'SMS_Count' => 5, 'Confirmed_Count' => 5, 'Billable' => true, 'Activity_Status' => 'approved',
+        'SMS_Invoice_Number' => null, 'SMS_Cost' => '0.00', 'Invoice_Hold' => null];
+    $data = ['reports' => collect(), 'options' => [], 'smsWeek' => '2026-10-05', 'smsExports' => collect([$legacy])];
+    $html = smsRenderView('reports::reports.marketing', $data);
+    expect($html)->toContain('99 retained export records')->toContain('submission unconfirmed')->not->toContain('Distribute SMS invoice');
+    $data['smsExports']->push($confirmed);
+    $html = smsRenderView('reports::reports.marketing', $data);
+    expect($html)->toContain('Distribute SMS invoice')->toContain('Approved (not delivery)')->toContain('2026-10-06 05:00:00')
+        ->toContain('Confirmed week total / recorded costs (including historical allocations)</th><th>5</th>');
+    $confirmed->Invoice_Hold = 'Exact legacy invoice requires reconciliation';
+    $html = smsRenderView('reports::reports.marketing', $data);
+    expect($html)->toContain($confirmed->Invoice_Hold)->not->toContain('Distribute SMS invoice');
 });
 
 test('failed durable publishing rolls back SMS tracking and cleans the CSV', function () {

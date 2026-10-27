@@ -69,6 +69,7 @@ final class SmsEnrichmentWorkflowTest extends TestCase
         $prospects->up();
         $this->migration = require __DIR__.'/../../database/sms-migrations/2026_10_19_000002_create_sms_enrichment_tables.php';
         $this->migration->up();
+        (require __DIR__.'/../../database/sms-migrations/2026_10_27_000001_add_sms_state_holds.php')->up();
         $this->repository = new SmsEnrichmentRepository;
     }
 
@@ -99,6 +100,35 @@ final class SmsEnrichmentWorkflowTest extends TestCase
         self::assertSame(1, $this->db->table('TblProspects')->count());
     }
 
+    public function test_state_policy_holds_exact_exclusions_unknown_and_malformed_before_paid_export(): void
+    {
+        $records = [$this->record('Allowed', ['State' => ' ca ']), $this->record('District', ['State' => 'DC'])];
+        foreach (['CO','OR','RI','WI','WV',null,'','ZZ','C1','Colorado'] as $index => $state) {
+            $records[] = $this->record('Held '.$index, ['State' => $state]);
+        }
+        $summary = $this->repository->stage('states', $records, 'operator');
+
+        self::assertSame([12, 2, 10, 10], $this->counts($summary, ['records', 'submitted', 'rejected', 'state_held']));
+        self::assertSame(['CA','DC'], array_column($this->rows('states'), 'State'));
+        self::assertSame(2, $this->db->table('TblSMSEnrichmentPeople')->count());
+        self::assertSame(10, (int) $this->db->table('TblSMSEnrichmentChunks')->value('State_Held'));
+    }
+
+    public function test_return_refuses_state_drift_for_staged_or_existing_prospects(): void
+    {
+        $this->repository->stage('staged-drift', [$this->record('Staged Drift')], 'operator');
+        $stagedId = $this->rows('staged-drift')[0]['Record_ID'];
+        $this->db->table('TblSMSEnrichmentPeople')->where('Batch_ID', 'staged-drift')->update(['State' => 'WV']);
+        $this->http(409, fn () => $this->repository->returned('staged-drift', [['Record_ID' => $stagedId, 'Phone' => '2025550101']]));
+        self::assertSame(0, $this->db->table('TblProspects')->count());
+
+        $this->repository->stage('existing-drift', [$this->record('Existing Drift')], 'operator');
+        $existingId = $this->rows('existing-drift')[0]['Record_ID'];
+        $this->db->table('TblProspects')->insert(['Client' => 'Existing Drift', 'Address' => '10 Test Way', 'State' => 'OR', 'Zip' => '00123']);
+        $this->http(409, fn () => $this->repository->returned('existing-drift', [['Record_ID' => $existingId, 'Phone' => '2025550102']]));
+        self::assertNull($this->db->table('TblProspects')->value('Phone'));
+    }
+
     public function test_chunk_replay_is_immutable_but_associative_field_order_is_irrelevant(): void
     {
         $record = $this->record('New');
@@ -113,7 +143,7 @@ final class SmsEnrichmentWorkflowTest extends TestCase
     {
         $this->db->enableQueryLog();
         $first = $this->repository->stage('main', [$this->record('One'), $this->record('One'), $this->record('Bad', ['Zip' => 'bad'])], 'operator', 0, false);
-        self::assertSame(['batch_id' => 'main', 'chunk' => 0, 'records' => 3, 'rejected' => 1,
+        self::assertSame(['batch_id' => 'main', 'chunk' => 0, 'records' => 3, 'rejected' => 1, 'state_held' => 0,
             'existing' => 0, 'duplicate' => 1, 'submitted' => 1], $first);
         $second = $this->repository->stage('main', [$this->record('Two')], 'operator', 1, false);
         self::assertSame(1, $second['submitted']);
@@ -454,7 +484,7 @@ final class SmsEnrichmentWorkflowTest extends TestCase
         $this->repository->stage('main', [$this->record('One')], 'operator');
         $id = $this->rows('main')[0]['Record_ID'];
         $pk = $this->db->table('TblProspects')->insertGetId([
-            'Client' => 'ONE', 'Address' => '10 TEST WAY', 'Zip' => '00123',
+            'Client' => 'ONE', 'Address' => '10 TEST WAY', 'State' => 'CA', 'Zip' => '00123',
             'Phone' => '2025550199', 'Email' => null, 'Contacted' => 1, 'Invalid_Phone' => 1, 'Opt_Out' => 1,
             'Response_Date' => '2026-09-20', 'Latest_Export_Date' => '2026-10-01', 'SMS_Attempts' => 8,
         ]);

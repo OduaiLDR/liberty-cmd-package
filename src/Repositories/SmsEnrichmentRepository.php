@@ -8,6 +8,7 @@ use Carbon\CarbonImmutable;
 use Cmd\Reports\Services\SmsProspectValues;
 use Cmd\Reports\Services\SmsWorkflowLock;
 use Cmd\Reports\Services\SmsAvailabilityRefresh;
+use Cmd\Reports\Services\SmsStatePolicy;
 use Illuminate\Database\Query\Builder;
 use Symfony\Component\HttpKernel\Exception\HttpException;
 
@@ -65,12 +66,13 @@ final class SmsEnrichmentRepository extends SqlSrvRepository
                 $this->table(self::BATCHES)->insert(['Batch_ID' => $batchId, 'Created_By' => $actor,
                     'Status' => 'staging', 'Created_At' => $now, 'Updated_At' => $now]);
             }
-            $rejected = $duplicate = $existing = 0;
+            $rejected = $stateHeld = $duplicate = $existing = 0;
             $normalized = [];
             foreach ($records as $record) {
                 $person = $this->normalizeRecord($record);
                 if ($person === null) {
                     $rejected++;
+                    if (is_array($record) && SmsStatePolicy::holdReason($record['State'] ?? null) !== null) $stateHeld++;
                 } else {
                     $normalized[] = $person;
                 }
@@ -125,7 +127,7 @@ final class SmsEnrichmentRepository extends SqlSrvRepository
             }
             $staged = ['Batch_ID' => $batchId, 'Chunk' => $chunk, 'Payload_Hash' => $hash,
                 'Records' => count($records), 'Rejected' => $rejected, 'Existing' => $existing,
-                'Duplicate' => $duplicate, 'Created_By' => $actor, 'Created_At' => $now];
+                'Duplicate' => $duplicate, 'State_Held' => $stateHeld, 'Created_By' => $actor, 'Created_At' => $now];
             $this->table(self::CHUNKS)->insert($staged);
             $this->table(self::BATCHES)->where('Batch_ID', $batchId)->update(['Updated_At' => $now]);
 
@@ -139,6 +141,7 @@ final class SmsEnrichmentRepository extends SqlSrvRepository
         SmsWorkflowLock::run('prospect-admission', function () use ($batchId): void {
             $batch = $this->requireBatch($batchId);
             if ($batch->Status !== 'staging') return;
+            $this->assertSubmittedStates($batchId);
 
             $hasSubmittedPeople = $this->table(self::PEOPLE)->where('Batch_ID', $batchId)->where('Submitted', true)->exists();
             $now = $this->now();
@@ -148,6 +151,8 @@ final class SmsEnrichmentRepository extends SqlSrvRepository
             $this->table(self::BATCHES)->where('Batch_ID', $batchId)->where('Status', 'staging')
                 ->update($changes);
         });
+
+        $this->assertSubmittedStates($batchId);
 
         return $this->table(self::PEOPLE)->where('Batch_ID', $batchId)->where('Submitted', true)
             ->lazyById(500, 'PK')->map(static function (object $person): array {
@@ -196,6 +201,9 @@ final class SmsEnrichmentRepository extends SqlSrvRepository
             // Validate the entire request before any admission, including replay conflicts.
             foreach ($normalized as $id => $contact) {
                 $item = $items[$id];
+                if (SmsStatePolicy::holdReason($item->State ?? null) !== null) {
+                    throw new HttpException(409, 'A submitted enrichment item has an unsafe State and remains held.');
+                }
                 if ($item->Returned_At !== null) {
                     if (! hash_equals($item->Return_Hash, $contact['Return_Hash'])) {
                         throw new HttpException(409, 'A returned item is already bound to different contact results.');
@@ -235,6 +243,9 @@ final class SmsEnrichmentRepository extends SqlSrvRepository
                         ], 'PK');
                         $added = true;
                     } else {
+                        if (SmsStatePolicy::holdReason($existing->State ?? null) !== null) {
+                            throw new HttpException(409, 'An existing prospect has an unsafe current State and was not filled.');
+                        }
                         $pk = $existing->PK;
                         foreach (['Phone', 'Email'] as $field) {
                             if ($contact[$field] !== null) {
@@ -297,7 +308,7 @@ final class SmsEnrichmentRepository extends SqlSrvRepository
     private function summaryQuery(): Builder
     {
         $chunks = $this->table(self::CHUNKS)->groupBy('Batch_ID')->selectRaw('Batch_ID,
-            SUM(Records) AS records, SUM(Rejected) AS rejected, SUM(Existing) AS existing, SUM(Duplicate) AS duplicate');
+            SUM(Records) AS records, SUM(Rejected) AS rejected, SUM(State_Held) AS state_held, SUM(Existing) AS existing, SUM(Duplicate) AS duplicate');
         $people = $this->table(self::PEOPLE)->groupBy('Batch_ID')->selectRaw("Batch_ID,
             SUM(CASE WHEN Submitted = 1 THEN 1 ELSE 0 END) AS submitted,
             SUM(CASE WHEN Status = 'pending' THEN 1 ELSE 0 END) AS pending,
@@ -314,7 +325,7 @@ final class SmsEnrichmentRepository extends SqlSrvRepository
         return $this->table(self::BATCHES, 'b')->leftJoinSub($chunks, 'c', 'c.Batch_ID', '=', 'b.Batch_ID')
             ->leftJoinSub($people, 'p', 'p.Batch_ID', '=', 'b.Batch_ID')
             ->select('b.Batch_ID', 'b.Status', 'b.Created_At', 'b.Updated_At', 'b.Completed_At')
-            ->selectRaw('c.records, c.rejected, c.existing, c.duplicate,
+            ->selectRaw('c.records, c.rejected, c.state_held, c.existing, c.duplicate,
                 p.submitted, p.pending, p.closed_unreturned, p.returned, p.phone, p.email,
                 p.both, p.neither, p.added, p.filled, p.invalid_phone, p.invalid_email');
     }
@@ -323,7 +334,7 @@ final class SmsEnrichmentRepository extends SqlSrvRepository
     {
         $result = ['batch_id' => $row->Batch_ID, 'status' => $row->Status, 'created_at' => $row->Created_At,
             'updated_at' => $row->Updated_At, 'completed_at' => $row->Completed_At];
-        foreach (['records', 'rejected', 'existing', 'duplicate', 'submitted', 'pending', 'closed_unreturned',
+        foreach (['records', 'rejected', 'state_held', 'existing', 'duplicate', 'submitted', 'pending', 'closed_unreturned',
             'returned', 'phone', 'email', 'both', 'neither', 'added', 'filled', 'invalid_phone', 'invalid_email'] as $field) {
             $result[$field] = (int) ($row->{$field} ?? 0);
         }
@@ -338,7 +349,8 @@ final class SmsEnrichmentRepository extends SqlSrvRepository
     private function stagedChunkArray(string $batchId, object $chunk): array
     {
         return ['batch_id' => $batchId, 'chunk' => (int) $chunk->Chunk, 'records' => (int) $chunk->Records,
-            'rejected' => (int) $chunk->Rejected, 'existing' => (int) $chunk->Existing, 'duplicate' => (int) $chunk->Duplicate,
+            'rejected' => (int) $chunk->Rejected, 'state_held' => (int) ($chunk->State_Held ?? 0),
+            'existing' => (int) $chunk->Existing, 'duplicate' => (int) $chunk->Duplicate,
             'submitted' => (int) $chunk->Records - (int) $chunk->Rejected - (int) $chunk->Existing - (int) $chunk->Duplicate];
     }
 
@@ -357,8 +369,8 @@ final class SmsEnrichmentRepository extends SqlSrvRepository
         $zip = $record['Zip'] ?? '';
         if ((! is_string($zip) && ! is_int($zip)) || ! preg_match('/^[0-9]{5}(?:-?[0-9]{4})?$/D', trim((string) $zip))) return null;
         $values['Zip'] = substr(trim((string) $zip), 0, 5);
-        if ($values['State'] !== null && ! preg_match('/^[A-Za-z]{2}$/D', $values['State'])) return null;
-        $values['State'] = $values['State'] === null ? null : strtoupper($values['State']);
+        if (SmsStatePolicy::holdReason($values['State']) !== null) return null;
+        $values['State'] = SmsStatePolicy::normalize($values['State']);
         $tier = $record['Tier'] ?? null;
         if ($tier !== null && ! is_string($tier) && ! is_int($tier)) return null;
         $values['Tier'] = SmsProspectValues::tier($tier);
@@ -395,13 +407,22 @@ final class SmsEnrichmentRepository extends SqlSrvRepository
         foreach (array_chunk($people, 200, true) as $chunk) {
             [$source, $bindings] = $this->identitySource($chunk);
             $predicate = $this->identityPredicate();
-            foreach ($this->connection()->select("SELECT v.Person_Key, p.PK, p.Phone, p.Email FROM TblProspects p
+            foreach ($this->connection()->select("SELECT v.Person_Key, p.PK, p.Phone, p.Email, p.State FROM TblProspects p
                 INNER JOIN ({$source}) v ON {$predicate}
                 ORDER BY p.PK", $bindings) as $row) {
                 $matches[$row->Person_Key] ??= $row;
             }
         }
         return $matches;
+    }
+
+    private function assertSubmittedStates(string $batchId): void
+    {
+        $predicate = SmsStatePolicy::sqlPredicate('State', $this->connection()->getDriverName());
+        if ($this->table(self::PEOPLE)->where('Batch_ID', $batchId)->where('Submitted', true)
+            ->whereRaw("NOT ({$predicate})")->exists()) {
+            throw new HttpException(409, 'One or more enrichment records have a missing, invalid, unknown or excluded State and remain held.');
+        }
     }
 
     /** Logical matching follows database CI equality, including equivalents with different hashes. */

@@ -163,6 +163,24 @@ final class SmsProspectBackfillSqlServerTest extends TestCase
         self::assertSame(11, (int) $f->rows('SELECT revision FROM dbo.TblSMSAvailabilitySummary')[0]['revision']);
     }
 
+    public function test_blocked_state_is_deferred_with_bound_source_evidence(): void
+    {
+        $f = self::$fixture;
+        $f->db->exec('DISABLE TRIGGER dbo.TURepair20261014PostPublish ON dbo.TblMailersUniqueEnriched');
+        try { $f->db->exec("UPDATE dbo.TblMailersUniqueEnriched SET State=' wv ' WHERE PK=1"); }
+        finally { $f->db->exec('ENABLE TRIGGER dbo.TURepair20261014PostPublish ON dbo.TblMailersUniqueEnriched'); }
+        [, $candidates] = $this->begin([1]);
+
+        $result = SmsProspectBackfill::applyBatch($f->db, self::RUN, 0, $candidates);
+        self::assertSame([0, 0, 1], [$result['added'], $result['existing'], $result['deferred']]);
+        self::assertSame(1, $f->rows('SELECT COUNT(*) AS n FROM dbo.TblProspects')[0]['n']);
+        $receipt = $f->rows('SELECT Decision,Reason,Source_SHA256,Prospect_PK FROM dbo.TblSMSProspectBackfillRows')[0];
+        self::assertSame('deferred', $receipt['Decision']);
+        self::assertSame('blocked_state', $receipt['Reason']);
+        self::assertSame($candidates[0]['Observed_SHA256'], $receipt['Source_SHA256']);
+        self::assertNull($receipt['Prospect_PK']);
+    }
+
     public function test_existing_after_audit_watermark_matches_case_insensitively_and_stays_unchanged(): void
     {
         $f = self::$fixture;

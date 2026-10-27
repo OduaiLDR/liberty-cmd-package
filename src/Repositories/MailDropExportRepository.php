@@ -5,6 +5,7 @@ namespace Cmd\Reports\Repositories;
 use Carbon\Carbon;
 use Cmd\Reports\Services\SmsDropPlanner;
 use Cmd\Reports\Services\SmsPhoneCounter;
+use Cmd\Reports\Services\SmsStatePolicy;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Database\Query\JoinClause;
 use Illuminate\Support\Collection;
@@ -247,6 +248,7 @@ class MailDropExportRepository extends SqlSrvRepository
     /** @return array{path:string, count:int, names:array<string>, part_count:int, format:string} */
     public function prepareExport(int $target, string $requestId, ?array $dropPks = null, ?callable $publish = null): array
     {
+        \Cmd\Reports\Services\SmsApprovalCreationPolicy::assertLegacyRegistrationAllowed();
         $path = tempnam(sys_get_temp_dir(), 'sms-export-');
         if ($path === false) {
             throw new RuntimeException('Unable to create the SMS export file.');
@@ -481,7 +483,7 @@ class MailDropExportRepository extends SqlSrvRepository
             ->leftJoinSub($debt, 'source_debt', function (JoinClause $join): void {
                 $join->on('source_debt.External_ID', '=', 'e.External_ID')->where('source_debt.debt_rank', 1);
             })
-            ->selectRaw('e.PK, e.External_ID, e.Client, e.Address, e.Phone, source_debt.Debt_Amount');
+            ->selectRaw('e.PK, e.External_ID, e.Client, e.Address, e.State, e.Phone, source_debt.Debt_Amount');
         $identity = $this->connection()->getDriverName() === 'sqlsrv'
             ? SmsPhoneCounter::identitySql('External_ID')
             : 'LOWER(TRIM(External_ID, char(9) || char(10) || char(11) || char(13) || char(32) || char(0))) COLLATE BINARY';
@@ -526,7 +528,12 @@ class MailDropExportRepository extends SqlSrvRepository
         $debt = null;
         $phones = [];
         $latest = null;
+        $state = null;
         foreach ($sources as $source) {
+            if (SmsStatePolicy::holdReason($source->State ?? null) !== null) return null;
+            $sourceState = SmsStatePolicy::normalize($source->State);
+            if ($state !== null && $state !== $sourceState) return null;
+            $state = $sourceState;
             $sourceAddress = strtoupper(trim((string) ($source->Address ?? '')));
             if ($address !== null && $address !== $sourceAddress) {
                 throw ValidationException::withMessages(['target' => "{$dropName} has one External_ID with conflicting addresses. Reconcile the lead before exporting."]);

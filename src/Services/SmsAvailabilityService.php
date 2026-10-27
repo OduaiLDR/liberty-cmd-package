@@ -288,6 +288,7 @@ class SmsAvailabilityService
             config('app.env'), config('database.connections.sqlsrv.host'),
             config('database.connections.sqlsrv.port'), config('database.connections.sqlsrv.database'),
             (bool) config('sms-exports.demo', false),
+            SmsStatePolicy::VERSION,
         ], JSON_THROW_ON_ERROR));
     }
 }

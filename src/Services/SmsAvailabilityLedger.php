@@ -36,6 +36,7 @@ final class SmsAvailabilityLedger
             config('database.connections.sqlsrv.database'),
             (bool) config('sms-exports.demo', false),
             $policy,
+            SmsStatePolicy::VERSION,
         ], JSON_THROW_ON_ERROR));
     }
 

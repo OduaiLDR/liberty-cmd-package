@@ -90,6 +90,14 @@ afterEach(function () {
     Facade::setFacadeApplication($this->previousContainer);
 });
 
+test('approval-only rollout rejects legacy registration before artifacts queue or request writes', function () {
+    config(['sms-exports.approval_only_creation_enabled' => true]);
+    $request = Request::create('/', 'POST', ['request_id' => (string) Str::uuid(), 'target' => 5]);
+    expect(fn () => $this->controller->export($request))->toThrow(HttpException::class)
+        ->and($this->db->table('TblSmsExportRequests')->count())->toBe(0)
+        ->and($this->db->table('TblSmsExports')->count())->toBe(0);
+});
+
 test('API preview returns whole-drop counts and an actionable shortfall without exporting', function () {
     $this->drops->shouldReceive('selectDrops')->once()->with(10000)->andReturn(collect([
         (object) ['PK' => 1, 'Drop_Name' => 'DROP1', 'Debt_Tier' => 'T1', 'Amount_Dropped' => 6000, 'SMS_Drops' => 0],
@@ -233,6 +241,7 @@ test('download-only legacy status reads never recover or mutate incomplete track
 });
 
 test('explicit SMS manager retains owner-scoped legacy artifact recovery', function () {
+    config(['sms-exports.approval_only_creation_enabled' => true]);
     $id = 'd983d923-1d9d-4099-a80c-1d9d7e5fdb7d';
     $this->db->getSchemaBuilder()->table('TblSmsExports', function (Blueprint $table) {
         $table->string('Request_ID')->nullable(); $table->integer('SMS_Count')->nullable();
@@ -283,6 +292,7 @@ test('API routes are host gated and bind correct methods and CMD report permissi
         ['GET', "mail-drop-export-report/runs/{$run}", 'cmd.mail_drop_export.runs.show'],
         ['GET', "mail-drop-export-report/runs/{$run}/link", 'cmd.mail_drop_export.runs.link'],
         ['POST', "mail-drop-export-report/runs/{$run}/file", 'cmd.mail_drop_export.runs.file'],
+        ['POST', "mail-drop-export-report/runs/{$run}/cancel-selection", 'cmd.mail_drop_export.runs.cancel_selection'],
         ['POST', "mail-drop-export-report/runs/{$run}/sent", 'cmd.mail_drop_export.runs.sent'],
         ['POST', "mail-drop-export-report/runs/{$run}/approve", 'cmd.mail_drop_export.runs.approve'],
         ['GET', "mail-drop-export-report/runs/{$run}/details", 'cmd.mail_drop_export.runs.details'],

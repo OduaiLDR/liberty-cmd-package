@@ -14,7 +14,9 @@ use Cmd\Reports\Services\SmsRunArtifactFilename;
 use Cmd\Reports\Services\SmsTierSelectionSql;
 use Cmd\Reports\Services\SmsTierWindowSchema;
 use Cmd\Reports\Services\SmsTierWindowSelectionSql;
+use Cmd\Reports\Services\SmsLeanHistorySchema;
 use Cmd\Reports\Services\SmsSelectionCancellation;
+use Cmd\Reports\Services\SmsStatePolicy;
 use Illuminate\Database\Query\Builder;
 use RuntimeException;
 use Symfony\Component\HttpKernel\Exception\HttpException;
@@ -53,6 +55,7 @@ class SmsRecordExportRepository extends SqlSrvRepository
             $query->whereNotExists(fn (Builder $q) => $q->selectRaw('1')->from('TblPhoneNumbers as c')
                 ->whereNotNull('c.Phone')->whereRaw("{$contactPhone} = TblProspects.Phone"));
         }
+        SmsStatePolicy::applyEligible($query, 'TblProspects.State');
         if ($sqlServer) {
             return $query->whereRaw("DATALENGTH(Phone)=10 AND Phone NOT LIKE '%[^0-9]%'");
         }
@@ -130,12 +133,14 @@ class SmsRecordExportRepository extends SqlSrvRepository
             || $this->tierSelectionOptions($run, $target) !== $options) throw new HttpException(409, 'The frozen source-tier batch is not selecting.');
         if ($run->Selected !== null || $this->table('TblProspectsExport')->where('Request_ID', $requestId)->exists()
             || $this->table('TblSMSHistory')->where('Request_ID', $requestId)->exists()) throw new HttpException(409, 'This batch already has frozen membership.');
-        if ($options['tier_selection_policy'] === SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY) {
+        $leanDebtSources = SmsRunOptions::usesLeanDebtSources($options['tier_selection_policy']);
+        if ($leanDebtSources) SmsLeanHistorySchema::assertReady($this->connection());
+        if (SmsRunOptions::isWindowedTierSelectionPolicy($options['tier_selection_policy'])) {
             SmsTierWindowSchema::assertReady($this->connection());
             $this->selectTierWindows($requestId, $target, $options, $cancellation);
         } else {
             $eligible = $this->eligible()->select(['PK','Phone','Client','Address','City','State','Zip','Email','Creation_Date','Last_SMS_Date']);
-            $sql = SmsTierSelectionSql::select($eligible->toSql(), $options['tiers'], (string) config('sms-exports.mailer_recency_date', 'Send_Date'));
+            $sql = SmsTierSelectionSql::select($eligible->toSql(), $options['tiers'], (string) config('sms-exports.mailer_recency_date', 'Send_Date'), $leanDebtSources);
             $this->connection()->affectingStatement($sql, [...$eligible->getBindings(), $target, $requestId, ...$options['tiers']]);
         }
         $this->assertTierPrices($requestId, $options);
@@ -166,7 +171,8 @@ class SmsRecordExportRepository extends SqlSrvRepository
             PRIMARY KEY CLUSTERED (Window_Position), UNIQUE (Export_PK)
         )');
 
-        $sql = SmsTierWindowSelectionSql::insert($options['tiers'], (string) config('sms-exports.mailer_recency_date', 'Send_Date'));
+        $sql = SmsTierWindowSelectionSql::insert($options['tiers'], (string) config('sms-exports.mailer_recency_date', 'Send_Date'),
+            SmsRunOptions::usesLeanDebtSources($options['tier_selection_policy']));
         $selected = 0;
         $noCount = (int) $db->selectOne('SELECT CASE WHEN (@@OPTIONS & 512)=512 THEN 1 ELSE 0 END AS enabled')->enabled;
         $db->unprepared('SET NOCOUNT ON');
@@ -257,13 +263,31 @@ class SmsRecordExportRepository extends SqlSrvRepository
     public function assertTierPrices(string $requestId, array $options): void
     {
         if (! SmsRunOptions::isTierSelectionPolicy($options['tier_selection_policy'] ?? null)) throw new RuntimeException('An explicit source-tier selector is required.');
-        if ($this->table('TblProspectsExport')->where('Request_ID', $requestId)->where(function (Builder $q) use ($options): void {
+        $leanDebtSources = SmsRunOptions::usesLeanDebtSources($options['tier_selection_policy']);
+        if ($this->table('TblProspectsExport')->where('Request_ID', $requestId)->where(function (Builder $q) use ($options, $leanDebtSources): void {
             $q->whereNull('Debt_Tier')->orWhereNotIn('Debt_Tier', $options['tiers'])
                 ->orWhereNull('Debt_Amount')->orWhere('Debt_Amount', '<=', 0)
                 ->orWhereRaw('Debt_Amount <> CAST(Debt_Amount / 1000 AS bigint) * 1000')
-                ->orWhereNull('Debt_Source')->orWhereNotIn('Debt_Source', ['TblTUData','TblMailers','Tier'])
-                ->orWhereNull('Debt_Source_PK')->orWhere('Debt_Source_PK', '<=', 0);
+                ->orWhereNull('Debt_Source')->orWhereNotIn('Debt_Source', ['TblTUData','TblMailers','Tier']);
+            $q->orWhere(function (Builder $source) use ($leanDebtSources): void {
+                if ($leanDebtSources) {
+                    $source->whereIn('Debt_Source', ['TblTUData','TblMailers'])
+                        ->where(fn (Builder $pk) => $pk->whereNull('Debt_Source_PK')->orWhere('Debt_Source_PK', '<=', 0));
+                } else {
+                    $source->whereNull('Debt_Source_PK')->orWhere('Debt_Source_PK', '<=', 0);
+                }
+            });
+            if ($leanDebtSources) $q->orWhere(fn (Builder $source) => $source->where('Debt_Source', 'Tier')->whereNotNull('Debt_Source_PK'));
         })->exists()) throw new RuntimeException('Frozen source-tier membership or price provenance does not reconcile.');
+        if ($leanDebtSources && $this->connection()->getDriverName() === 'sqlsrv') {
+            SmsLeanHistorySchema::assertReady($this->connection());
+            foreach (['TblTUData','TblMailers'] as $source) {
+                if ($this->table('TblProspectsExport', 'x')->leftJoin($source.' as s', 's.PK', '=', 'x.Debt_Source_PK')
+                    ->where('x.Request_ID', $requestId)->where('x.Debt_Source', $source)->whereNull('s.PK')->exists()) {
+                    throw new RuntimeException('Frozen '.$source.' provenance no longer resolves to its exact source PK.');
+                }
+            }
+        }
     }
 
     public function composition(string $requestId): array
@@ -274,7 +298,7 @@ class SmsRecordExportRepository extends SqlSrvRepository
         return ['selected' => (int) $row->Selected, 'never_texted' => (int) $row->Never_Texted, 'previously_texted' => (int) $row->Previously_Texted];
     }
 
-    /** Validate frozen content, not current eligibility. Upturn owns live suppression after generation. */
+    /** Validate frozen content and current suppression without changing the saved selection. */
     public function assertFrozen(string $requestId, int $expected, bool $pendingIds = false): void
     {
         $run = $this->table('TblSMSRuns')->where('Request_ID', $requestId)->first();
@@ -297,6 +321,13 @@ class SmsRecordExportRepository extends SqlSrvRepository
                     ->orWhereRaw('Debt_Amount <> CAST(Debt_Amount / 1000 AS bigint) * 1000')
                     ->orWhereNull('Debt_Amount')->orWhere('Debt_Amount', '<=', 0)->orWhereNull('Was_Previously_Texted')->orWhereNotIn('Was_Previously_Texted', [0,1]);
             })->exists()) throw new RuntimeException('Frozen SMS membership, tier, debt or count does not reconcile.');
+        $this->assertCurrentStates($requestId);
+    }
+
+    /** Compatibility entry point: State, phone identity and authoritative suppressions. */
+    public function assertCurrentStates(string $requestId): void
+    {
+        \Cmd\Reports\Services\SmsFrozenEligibility::assertPending($this->connection(), $requestId);
     }
 
     /** Allocation is committed separately; every saved tier/member reference must reconcile on replay. */
@@ -351,6 +382,7 @@ class SmsRecordExportRepository extends SqlSrvRepository
             }
             if (! fflush($file)) throw new RuntimeException('Unable to finish the SMS record export.');
         } finally { fclose($file); }
+        $this->assertCurrentStates($requestId);
         return $count;
     }
 
@@ -378,7 +410,9 @@ class SmsRecordExportRepository extends SqlSrvRepository
                         $row->Debt_Amount, (string) $row->Phone, $pendingIds ? $options['send_date'] : Carbon::parse($row->Drop_Date)->toDateString());
                 }
             })();
-            return (new SmsRunArtifactBundle)->build($runDirectory, $stem, $cells, (int) $run->Selected, $options);
+            $bundle = (new SmsRunArtifactBundle)->build($runDirectory, $stem, $cells, (int) $run->Selected, $options);
+            $this->assertCurrentStates($requestId);
+            return $bundle;
         });
     }
 

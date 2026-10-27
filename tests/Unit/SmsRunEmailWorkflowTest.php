@@ -131,6 +131,24 @@ afterEach(function (): void {
     Facade::clearResolvedInstances(); Container::setInstance($this->emailPreviousContainer); Facade::setFacadeApplication($this->emailPreviousContainer);
 });
 
+test('late phone suppression blocks email before the attempt marker and leaves its reviewed payload intact', function (): void {
+    $ids = \Cmd\Reports\Tests\Support\SmsFrozenEligibilityFixture::seed($this->emailDb, $this->emailId);
+    config(['sms-exports.approved_handoff_suppression_enabled' => true]);
+    $prepared = ($this->emailPrepare)();
+    $stored = (array) $this->emailDb->table(SmsRunEmailWorkflow::TABLE)->first();
+    $this->emailGateway->onReady = function (): void {
+        $this->emailDb->table('TblPhoneNumbers')->insert(['Phone' => '12025550100']);
+    };
+    expect(fn () => $this->emailWorkflow->send($this->emailId, $prepared['payload_sha256']))
+        ->toThrow(RuntimeException::class, 'held without changing membership')
+        ->and($this->emailGateway->messages)->toBe([])
+        ->and((array) $this->emailDb->table(SmsRunEmailWorkflow::TABLE)->first())->toBe($stored)
+        ->and($this->emailWorkflow->status($this->emailId)['status'])->toBe('ready');
+    $this->emailGateway->onReady = null; $this->emailDb->table('TblPhoneNumbers')->delete();
+    expect($this->emailWorkflow->send($this->emailId, $prepared['payload_sha256'])['status'])->toBe('accepted')
+        ->and($this->emailGateway->messages)->toHaveCount(1);
+});
+
 test('SMS email preparation freezes dynamic configuration and exact approved file receipts without sending or business writes', function (): void {
     $run = (array) $this->emailDb->table('TblSMSRuns')->first();
     $pendingBytes = file_get_contents($this->emailPending['path']);

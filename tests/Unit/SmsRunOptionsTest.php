@@ -79,9 +79,16 @@ test('source-first selector is explicit and never inferred for old options or th
         ->and(SmsRunOptions::fromStored(null, 7))->toBeNull();
     expect(SmsRunOptions::normalize(7, 3, null, SmsRunOptions::TIER_SELECTION_POLICY)['tiers'])->toBe(SmsRunOptions::TIERS);
     $windowed = SmsRunOptions::normalize(7, 3, ['T2'], SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY);
+    $lean = SmsRunOptions::normalize(7, 3, ['T2'], SmsRunOptions::LEAN_WINDOWED_TIER_SELECTION_POLICY);
     expect(SmsRunOptions::fromStored(json_encode($windowed), 7))->toBe($windowed)
+        ->and(SmsRunOptions::fromStored(json_encode($lean), 7))->toBe($lean)
         ->and(SmsRunOptions::isTierSelectionPolicy(SmsRunOptions::TIER_SELECTION_POLICY))->toBeTrue()
-        ->and(SmsRunOptions::isTierSelectionPolicy(SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY))->toBeTrue();
+        ->and(SmsRunOptions::isTierSelectionPolicy(SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY))->toBeTrue()
+        ->and(SmsRunOptions::isTierSelectionPolicy(SmsRunOptions::LEAN_WINDOWED_TIER_SELECTION_POLICY))->toBeTrue()
+        ->and(SmsRunOptions::isWindowedTierSelectionPolicy(SmsRunOptions::TIER_SELECTION_POLICY))->toBeFalse()
+        ->and(SmsRunOptions::isWindowedTierSelectionPolicy(SmsRunOptions::LEAN_WINDOWED_TIER_SELECTION_POLICY))->toBeTrue()
+        ->and(SmsRunOptions::usesLeanDebtSources(SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY))->toBeFalse()
+        ->and(SmsRunOptions::usesLeanDebtSources(SmsRunOptions::LEAN_WINDOWED_TIER_SELECTION_POLICY))->toBeTrue();
     expect(fn () => SmsRunOptions::normalize(7, 3, ['T2'], 'unknown'))->toThrow(InvalidArgumentException::class);
 });
 

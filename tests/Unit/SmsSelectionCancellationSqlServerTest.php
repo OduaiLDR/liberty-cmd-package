@@ -81,7 +81,7 @@ final class SmsSelectionCancellationSqlServerTest extends SmsSelectionCancellati
     {
         $this->windowSchema();$this->makeRun('selecting');
         for($i=1;$i<=2;$i++) {
-            $this->source->table('TblProspects')->insert(['Client'=>'Synthetic Person','Address'=>'Window '.$i,'Zip'=>'90210',
+            $this->source->table('TblProspects')->insert(['Client'=>'Synthetic Person','Address'=>'Window '.$i,'State'=>'CA','Zip'=>'90210',
                 'Phone'=>'202555010'.$i,'Creation_Date'=>'2026-10-20','Contacted'=>0,'Opt_Out'=>0,'Invalid_Phone'=>0]);
             $this->source->table('TblTUData')->insert(['PK'=>$i,'Creation_Date'=>'2026-10-21','ncoaAddr_frstNme'=>'Synthetic','ncoaAddr_lastNme'=>'Person',
                 'ncoaAddr_addrLine1Txt'=>'Window '.$i,'ncoaAddr_zipCde'=>'90210','derivedFields1_unsecdebtbalance'=>13679,'Tier_Tag'=>'T1']);

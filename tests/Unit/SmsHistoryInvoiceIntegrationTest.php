@@ -47,7 +47,7 @@ final class SmsHistoryInvoiceIntegrationTest extends TestCase
             $t->string('Data_Invoice_Number')->nullable(); $t->decimal('Data_Drop_Cost', 12, 2)->default(0);
         });
         $schema->create('TblSmsExports', function (Blueprint $t): void {
-            $t->bigInteger('PK')->primary(); $t->string('SMS_Drop_Name'); $t->uuid('Request_ID');
+            $t->bigInteger('PK')->primary(); $t->string('SMS_Drop_Name'); $t->uuid('Request_ID')->collation('NOCASE');
             $t->string('Debt_Tier'); $t->date('Week_Start'); $t->dateTime('Exported_At');
             $t->bigInteger('SMS_Count'); $t->string('SMS_Invoice_Number')->nullable();
             $t->decimal('SMS_Cost', 12, 2)->default(0);
@@ -56,17 +56,17 @@ final class SmsHistoryInvoiceIntegrationTest extends TestCase
             $t->bigInteger('SMS_Export_PK'); $t->integer('Marketing_PK'); $t->bigInteger('SMS_Count');
         });
         $schema->create('TblSMSDrops', function (Blueprint $t): void {
-            $t->integer('PK')->primary(); $t->uuid('Request_ID')->nullable(); $t->string('Drop_Name');
+            $t->integer('PK')->primary(); $t->uuid('Request_ID')->nullable()->collation('NOCASE'); $t->string('Drop_Name');
             $t->string('Debt_Tier')->nullable(); $t->date('Drop_Date'); $t->integer('Amount_Dropped');
             $t->string('Invoice_Number')->nullable(); $t->decimal('Cost', 12, 2)->nullable();
             $t->dateTime('Created_At');
         });
         $schema->create('TblSMSRuns', function (Blueprint $t): void {
-            $t->uuid('Request_ID')->primary(); $t->string('Status'); $t->dateTime('Sent_At')->nullable();
+            $t->uuid('Request_ID')->primary()->collation('NOCASE'); $t->string('Status'); $t->dateTime('Sent_At')->nullable();
         });
         $schema->create('TblSMSHistory', function (Blueprint $t): void {
             $t->increments('PK'); $t->integer('SMS_Drop_PK')->nullable()->index();
-            $t->string('Drop_Name')->nullable(); $t->uuid('Request_ID');
+            $t->string('Drop_Name')->nullable(); $t->uuid('Request_ID')->collation('NOCASE');
         });
         $this->marketing = new MarketingReportRepository;
     }
@@ -133,6 +133,9 @@ final class SmsHistoryInvoiceIntegrationTest extends TestCase
         $rows = $this->marketing->smsExports('2026-10-25');
         self::assertSame(['TblSmsExports:1', 'TblSMSDrops:1', 'TblSMSDrops:2'], $rows->pluck('PK')->all());
         self::assertSame(15, $rows->sum('SMS_Count'));
+        self::assertSame(12, $rows->sum('Confirmed_Count'));
+        self::assertSame('exported_unconfirmed', $rows[0]->Activity_Status);
+        self::assertFalse($rows[0]->Billable);
         foreach ($rows as $row) {
             foreach (['PK', 'SMS_Drop_Name', 'Debt_Tier', 'SMS_Count', 'Week_Start', 'Exported_At', 'SMS_Invoice_Number', 'SMS_Cost', 'sources'] as $field) {
                 self::assertTrue(property_exists($row, $field), $field);
@@ -147,7 +150,7 @@ final class SmsHistoryInvoiceIntegrationTest extends TestCase
     public function test_only_sent_runs_are_billable_even_when_unsent_runs_retain_history(): void
     {
         $this->legacy(1);
-        foreach (['draft', 'queued', 'selecting', 'review', 'building_file', 'file_ready', 'sending', 'review_only', 'not_sent', 'reversing', 'discarded', 'failed'] as $index => $status) {
+        foreach (['draft', 'queued', 'selecting', 'review', 'building_file', 'file_ready', 'sending', 'review_only', 'not_sent', 'reversing', 'discarded', 'failed', 'approving', 'external_registering', 'external_sent'] as $index => $status) {
             $id = $index + 1;
             $this->seedRun($id, $status);
             $this->drop($id, $id);
@@ -157,7 +160,9 @@ final class SmsHistoryInvoiceIntegrationTest extends TestCase
         }
         $this->drop(999, 999); // An orphan Request_ID does not establish a send either.
         self::assertSame(['TblSmsExports:1'], $this->marketing->smsExports(self::WEEK)->pluck('PK')->all());
-        $this->invoice('1.00');
+        try { $this->invoice('1.00'); self::fail('Retained exports are not confirmed billing evidence.'); }
+        catch (ValidationException $error) { self::assertArrayHasKey('week', $error->errors()); }
+        self::assertNull($this->db->table('TblSmsExports')->value('SMS_Invoice_Number'));
         self::assertSame(0, $this->db->table('TblSMSDrops')->whereNotNull('Invoice_Number')->count());
         self::assertSame(0, $this->db->table('TblSMSDrops')->whereNotNull('Cost')->count());
     }
@@ -273,14 +278,15 @@ final class SmsHistoryInvoiceIntegrationTest extends TestCase
         foreach ($this->db->getQueryLog() as $query) self::assertStringNotContainsString('from "TblSmsExportSources"', $query['query']);
     }
 
-    public function test_one_invoice_total_is_allocated_once_across_both_tables_without_pk_collision(): void
+    public function test_one_invoice_total_is_allocated_only_across_confirmed_rows_without_pk_collision(): void
     {
         $this->legacy(1, 1); $this->seedRun(1); $this->drop(1, 1, 2); $this->drop(2, null, 3); $this->history(2);
         $this->invoice();
-        self::assertSame(1.67, (float) $this->db->table('TblSmsExports')->value('SMS_Cost'));
-        self::assertSame(3.34, (float) $this->db->table('TblSMSDrops')->where('PK', 1)->value('Cost'));
-        self::assertSame(5.00, (float) $this->db->table('TblSMSDrops')->where('PK', 2)->value('Cost'));
-        self::assertSame(['INV-SMS'], $this->marketing->smsExports(self::WEEK)->pluck('SMS_Invoice_Number')->unique()->values()->all());
+        self::assertSame(0.0, (float) $this->db->table('TblSmsExports')->value('SMS_Cost'));
+        self::assertNull($this->db->table('TblSmsExports')->value('SMS_Invoice_Number'));
+        self::assertSame(4.00, (float) $this->db->table('TblSMSDrops')->where('PK', 1)->value('Cost'));
+        self::assertSame(6.01, (float) $this->db->table('TblSMSDrops')->where('PK', 2)->value('Cost'));
+        self::assertSame(['INV-SMS'], $this->marketing->smsExports(self::WEEK)->where('Billable', true)->pluck('SMS_Invoice_Number')->unique()->values()->all());
         self::assertSame(10.01, round((float) $this->marketing->smsExports(self::WEEK)->sum('SMS_Cost'), 2));
     }
 
@@ -288,8 +294,8 @@ final class SmsHistoryInvoiceIntegrationTest extends TestCase
     {
         $this->seedRun(1); $this->drop(2); $this->drop(1); $this->legacy(1);
         $this->invoice('0.01');
-        self::assertSame(0.01, (float) $this->db->table('TblSmsExports')->value('SMS_Cost'));
-        self::assertSame([0, 0], $this->db->table('TblSMSDrops')->orderBy('PK')->pluck('Cost')->all());
+        self::assertSame(0.0, (float) $this->db->table('TblSmsExports')->value('SMS_Cost'));
+        self::assertSame([0.01, 0], $this->db->table('TblSMSDrops')->orderBy('PK')->pluck('Cost')->all());
     }
 
     public function test_any_existing_invoice_on_either_source_rejects_the_entire_week_without_changes(): void
@@ -314,7 +320,7 @@ final class SmsHistoryInvoiceIntegrationTest extends TestCase
     {
         $this->seedRun(1, 'review_only'); $this->drop(1);
         foreach ([false, true] as $zeroCount) {
-            if ($zeroCount) { $this->legacy(1, 0); }
+            if ($zeroCount) { $this->legacy(1, 0); $this->seedRun(2); $this->drop(2, 2, 0); }
             try {
                 $this->invoice(); self::fail('The empty or zero-count population must be rejected.');
             } catch (ValidationException $error) {
@@ -381,13 +387,92 @@ final class SmsHistoryInvoiceIntegrationTest extends TestCase
         }
     }
 
-    public function test_legacy_only_schema_still_supports_history_and_invoicing(): void
+    public function test_legacy_only_schema_retains_history_but_cannot_infer_billing_evidence(): void
     {
         foreach (['TblSMSHistory', 'TblSMSRuns', 'TblSMSDrops'] as $table) $this->db->getSchemaBuilder()->drop($table);
         $this->legacy(1);
         self::assertSame(['TblSmsExports:1'], $this->marketing->smsExports(self::WEEK)->pluck('PK')->all());
-        $this->invoice('1.23');
-        self::assertSame(1.23, (float) $this->db->table('TblSmsExports')->value('SMS_Cost'));
+        self::assertFalse($this->marketing->smsExports(self::WEEK)[0]->Billable);
+        try { $this->invoice('1.23'); self::fail('A legacy-only export cannot prove submission.'); }
+        catch (ValidationException $error) { self::assertArrayHasKey('week', $error->errors()); }
+        self::assertSame(0.0, (float) $this->db->table('TblSmsExports')->value('SMS_Cost'));
+    }
+
+    public function test_exact_run_states_classify_retained_exports_without_promoting_them_to_sends(): void
+    {
+        foreach (['queued', 'selecting', 'review', 'file_ready', 'approving', 'failed', 'discarded', 'not_sent', 'approved', 'sent', 'external_sent'] as $index => $status) {
+            $pk = $index + 1;
+            $this->legacy($pk);
+            $this->seedRun(9000 + $pk, $status);
+        }
+        $rows = $this->marketing->smsExports(self::WEEK);
+        self::assertSame(0, $rows->sum('Confirmed_Count'));
+        foreach ($rows as $row) {
+            self::assertFalse($row->Billable);
+            self::assertSame(in_array($row->Run_Status, ['approved', 'sent', 'external_sent'], true) ? 'exported_unconfirmed' : $row->Run_Status, $row->Activity_Status);
+        }
+    }
+
+    public function test_exact_request_duplicates_count_official_tiers_once_and_never_invoice_legacy_again(): void
+    {
+        $this->legacy(1, 2); $this->legacy(2, 3);
+        $this->db->table('TblSmsExports')->update(['Request_ID' => $this->requestId(1), 'Debt_Tier' => 'T2']);
+        $this->seedRun(1, 'approved'); $this->drop(1, 1, 2); $this->drop(2, 1, 3);
+        $rows = $this->marketing->smsExports(self::WEEK);
+        self::assertSame(5, $rows->sum('Confirmed_Count'));
+        self::assertSame(['reconciled_export', 'reconciled_export', 'approved', 'approved'], $rows->pluck('Activity_Status')->all());
+        self::assertSame([null], $rows->pluck('Invoice_Hold')->unique()->values()->all());
+        $this->invoice();
+        self::assertSame(0, $this->db->table('TblSmsExports')->whereNotNull('SMS_Invoice_Number')->count());
+        self::assertSame(10.01, round((float) $this->db->table('TblSMSDrops')->sum('Cost'), 2));
+        try { $this->invoice(); self::fail('Replay must not invoice again.'); }
+        catch (ValidationException $error) { self::assertArrayHasKey('week', $error->errors()); }
+    }
+
+    public function test_cross_week_exact_legacy_invoice_or_conflicting_counts_hold_official_allocation(): void
+    {
+        $this->legacy(1, 5, '2026-10-12');
+        $this->db->table('TblSmsExports')->update(['Request_ID' => $this->requestId(1), 'Debt_Tier' => 'T2', 'SMS_Invoice_Number' => 'OLD-INV', 'SMS_Cost' => '1.23']);
+        $this->seedRun(1); $this->drop(1, 1, 5);
+        foreach (['invoice', 'count', 'tier'] as $cause) {
+            if ($cause === 'count') $this->db->table('TblSmsExports')->update(['SMS_Invoice_Number' => null, 'SMS_Count' => 6]);
+            if ($cause === 'tier') $this->db->table('TblSmsExports')->update(['SMS_Count' => 5, 'Debt_Tier' => 'T1']);
+            $rows = $this->marketing->smsExports(self::WEEK);
+            self::assertSame(5, $rows->sum('Confirmed_Count'));
+            self::assertNotNull($rows[0]->Invoice_Hold);
+            try { $this->invoice(); self::fail('Conflicting or previously billed exact evidence must hold.'); }
+            catch (ValidationException $error) { self::assertArrayHasKey('week', $error->errors()); }
+            self::assertNull($this->db->table('TblSMSDrops')->value('Invoice_Number'));
+            self::assertSame(1.23, (float) $this->db->table('TblSmsExports')->value('SMS_Cost'));
+        }
+    }
+
+    public function test_uuid_case_does_not_hide_an_exact_duplicate_invoice(): void
+    {
+        // SQLite collation models SQL Server's native uniqueidentifier equality.
+        $id = 'abcdef01-1234-4123-8123-abcdef012345';
+        $this->legacy(1); $this->seedRun(1); $this->drop(1);
+        $this->db->table('TblSMSRuns')->update(['Request_ID' => $id]);
+        $this->db->table('TblSMSDrops')->update(['Request_ID' => strtoupper($id)]);
+        $this->db->table('TblSmsExports')->update(['Request_ID' => strtoupper($id), 'Debt_Tier' => 'T2', 'SMS_Invoice_Number' => 'OLD']);
+        $rows = $this->marketing->smsExports(self::WEEK);
+        self::assertSame(1, $rows->sum('Confirmed_Count'));
+        self::assertSame('reconciled_export', $rows[0]->Activity_Status);
+        self::assertNotNull($rows[1]->Invoice_Hold);
+        try { $this->invoice(); self::fail('UUID letter case is not a new billing identity.'); }
+        catch (ValidationException $error) { self::assertArrayHasKey('week', $error->errors()); }
+        self::assertNull($this->db->table('TblSMSDrops')->value('Invoice_Number'));
+    }
+
+    public function test_same_name_date_or_numeric_pk_never_establishes_a_duplicate_request(): void
+    {
+        $this->legacy(1, 99); $this->seedRun(1); $this->drop(1, 1, 5);
+        $this->db->table('TblSmsExports')->update(['SMS_Drop_Name' => 'SMS1']);
+        $rows = $this->marketing->smsExports(self::WEEK);
+        self::assertSame('exported_unconfirmed', $rows[0]->Activity_Status);
+        self::assertNull($rows[1]->Invoice_Hold);
+        $this->invoice();
+        self::assertNull($this->db->table('TblSmsExports')->value('SMS_Invoice_Number'));
     }
 
     public function test_mail_and_data_allocation_remain_scoped_to_the_named_marketing_drop(): void

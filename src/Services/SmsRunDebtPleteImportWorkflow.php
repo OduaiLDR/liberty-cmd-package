@@ -99,9 +99,13 @@ class SmsRunDebtPleteImportWorkflow
                 catch (RuntimeException $error) {
                     if ($error->getCode() !== 404) { throw $error; }
                     $this->assertCurrent($pin, $id, $plan, $identity, $lease, false);
+                    SmsFrozenEligibility::assertHandoff($id);
                     $remote = $this->gateway->register($plan->payload());
                 }
                 $this->assertCurrent($pin, $id, $plan, $identity, $lease, false);
+            } catch (SmsFrozenEligibilityHold) {
+                $this->hold($pin, $id, $plan, $identity, $lease, 'source_unconfirmed');
+                return $this->project($this->requiredRow($pin, $id));
             } catch (Throwable) { return $this->pendingResult($pin, $id, $plan, $identity, $lease); }
             $remote = $this->validatedRemote($pin, $id, $plan, $identity, $lease, $remote);
             if ($remote === null) { return $this->project($this->requiredRow($pin, $id)); }
@@ -125,6 +129,7 @@ class SmsRunDebtPleteImportWorkflow
             try {
                 $this->reader->oneVerified($this->directory($id), $plan->payload()['manifest'], $plan->options(), $plan->rows(), $number,
                     function (array $part, mixed $stream) use ($pin, $id, $plan, $identity, $lease, &$uploaded): void {
+                        SmsFrozenEligibility::assertHandoff($id);
                         try {
                             $this->assertCurrent($pin, $id, $plan, $identity, $lease, false);
                             $uploaded = $this->gateway->upload($id, $part['part'], $plan->sha256(), $stream);

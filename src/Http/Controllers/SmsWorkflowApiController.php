@@ -74,6 +74,7 @@ class SmsWorkflowApiController extends Controller
     {
         // Reuse validation rules, but do not invoke the Blade request's Laravel-user gate.
         $data = Validator::make($request->all(), (new MailDropExportRequest)->rules())->validate();
+        \Cmd\Reports\Services\SmsApprovalCreationPolicy::assertLegacyRegistrationAllowed();
         $this->ensureSchemaReady();
         $this->ensureRequestSchemaReady();
         $artifacts ??= app(SmsExportArtifacts::class);
@@ -328,7 +329,7 @@ class SmsWorkflowApiController extends Controller
 
         return new JsonResponse([
             'ok' => true,
-            'message' => 'Invoice saved. Mail and data costs are allocated across every tier in the selected drop; SMS costs are allocated across the export week.',
+            'message' => 'Invoice saved. Mail and data costs are allocated across every tier in the selected drop; SMS costs are allocated only across confirmed approved/submitted activity in the California week.',
         ]);
     }
 

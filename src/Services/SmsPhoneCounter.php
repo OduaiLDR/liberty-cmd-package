@@ -48,7 +48,7 @@ class SmsPhoneCounter
             $marks = implode(',', array_map(static fn (int $index): string =>
                 '('.$index.', CONVERT(nvarchar(4000), ?))', array_keys($names)));
             $filters = implode(',', array_fill(0, count($names), '?'));
-            $sources = 'SELECT d.Drop_Key AS Drop_Key, e.External_ID, e.Phone FROM TblMailersUniqueEnriched e WITH (FORCESEEK) '
+            $sources = 'SELECT d.Drop_Key AS Drop_Key, e.External_ID, e.Phone, e.State FROM TblMailersUniqueEnriched e WITH (FORCESEEK) '
                 .'JOIN RequestedDrops d ON e.Drop_Name = d.Drop_Name WHERE e.Drop_Name IN ('.$filters.')';
             $pdo = $connection->getPdo();
             $attribute = defined('PDO::SQLSRV_ATTR_QUERY_TIMEOUT') ? constant('PDO::SQLSRV_ATTR_QUERY_TIMEOUT') : null;
@@ -72,12 +72,12 @@ class SmsPhoneCounter
     }
 
     /** Trusted SQL fragments only; overrides allow SELECT-only SQL Server fixtures. */
-    public function sql(?string $sources = null, ?string $contacts = null): string
+    public function sql(?string $sources = null, ?string $contacts = null, bool $sourceHasState = false): string
     {
         if ($sources !== null) {
-            $sources = "SELECT N'fixture' AS Drop_Key, fixture.* FROM ({$sources}) fixture";
+            $sources = "SELECT N'fixture' AS Drop_Key, fixture.*".($sourceHasState ? '' : ", N'CA' AS State")." FROM ({$sources}) fixture";
         } else $sources = <<<'SQL'
-SELECT Drop_Name AS Drop_Key, External_ID, Phone FROM TblMailersUniqueEnriched WHERE Drop_Name = ?
+SELECT Drop_Name AS Drop_Key, External_ID, Phone, State FROM TblMailersUniqueEnriched WHERE Drop_Name = ?
 SQL;
 
         return $this->aggregateSql($sources, $contacts);
@@ -87,16 +87,22 @@ SQL;
     {
         $contacts ??= 'SELECT Phone FROM TblPhoneNumbers';
         $identity = self::identitySql('External_ID');
+        $stateAllowed = SmsStatePolicy::sqlPredicate('r.State', 'sqlsrv');
+        $normalizedState = SmsStatePolicy::normalizedSql('r.State', 'sqlsrv');
         // Verified source width: E phone is nvarchar(50).
         // Fixture SQL keeps arbitrary-length phone values for normalization tests.
 
         return <<<SQL
 WITH {$prefix} RawPhones AS ({$sources}),
+SourceRows AS (
+    SELECT r.Drop_Key, {$identity} AS Lead_ID, r.Phone, r.State
+    FROM RawPhones r
+),
 CleanPhones AS (
-    SELECT Drop_Key, {$identity} AS Lead_ID,
+    SELECT Drop_Key, Lead_ID,
         REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(CONVERT(nvarchar({$phoneWidth}), Phone),
         N' ', N''), N'-', N''), N'(', N''), N')', N''), N'+', N''), N'.', N'') AS Digits
-    FROM RawPhones
+    FROM SourceRows
 ),
 CountryPhones AS (
     SELECT Drop_Key, Lead_ID, CASE WHEN LEN(Digits) = 11 AND LEFT(Digits, 1) = N'1'
@@ -109,15 +115,23 @@ DistinctPhones AS (
     FROM CountryPhones
 ),
 ContactPhones AS ({$contacts}),
+LeadStates AS (
+    SELECT r.Drop_Key, r.Lead_ID,
+        MIN(CASE WHEN {$stateAllowed} THEN 1 ELSE 0 END) AS States_Allowed,
+        COUNT(DISTINCT CASE WHEN {$stateAllowed} THEN {$normalizedState} END) AS State_Count
+    FROM SourceRows r
+    GROUP BY r.Drop_Key, r.Lead_ID
+),
 LeadCounts AS (
     SELECT d.Drop_Key, d.Lead_ID, COUNT_BIG(d.Phone) AS Phone_Count,
-        MAX(COALESCE(c.Matched, 0)) AS Contacted
+        MAX(COALESCE(c.Matched, 0)) AS Contacted, s.States_Allowed, s.State_Count
     FROM DistinctPhones d
+    JOIN LeadStates s ON s.Drop_Key = d.Drop_Key AND (s.Lead_ID = d.Lead_ID OR (s.Lead_ID IS NULL AND d.Lead_ID IS NULL))
     OUTER APPLY (SELECT TOP (1) 1 AS Matched FROM ContactPhones c
         WHERE c.Phone = d.Phone OR c.Phone = N'1' + d.Phone) c
-    GROUP BY d.Drop_Key, d.Lead_ID
+    GROUP BY d.Drop_Key, d.Lead_ID, s.States_Allowed, s.State_Count
 )
-SELECT Drop_Key, COALESCE(SUM(CASE WHEN Contacted = 0 AND Phone_Count > 0 THEN 1 ELSE 0 END), 0) AS Eligible_Phones,
+SELECT Drop_Key, COALESCE(SUM(CASE WHEN Contacted = 0 AND Phone_Count > 0 AND States_Allowed = 1 AND State_Count = 1 THEN 1 ELSE 0 END), 0) AS Eligible_Phones,
     COALESCE(MAX(CASE WHEN Lead_ID IS NULL OR Lead_ID = N'' THEN 1 ELSE 0 END), 0) AS Missing_Identity
 FROM LeadCounts
 GROUP BY Drop_Key

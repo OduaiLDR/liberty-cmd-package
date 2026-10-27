@@ -165,6 +165,50 @@ afterEach(function (): void {
     rmdir($root); Carbon::setTestNow($this->previousClock); Facade::clearResolvedInstances(); Facade::setFacadeApplication($this->previousFacade); Container::setInstance($this->previousContainer);
 });
 
+it('holds a late suppressed approved handoff before new registration while allowing status reconciliation', function (): void {
+    $ids = \Cmd\Reports\Tests\Support\SmsFrozenEligibilityFixture::seed($this->db, $this->id);
+    $this->workflow->prepare($this->id, 'fixture@example.invalid');
+    config(['sms-exports.approved_handoff_suppression_enabled' => true]);
+    $this->db->table('TblProspects')->where('PK', $ids[0])->update(['Opt_Out' => 1]);
+    expect($this->workflow->step($this->id)['status'])->toBe('held')
+        ->and(array_column($this->gateway->calls, 0))->toBe(['status'])
+        ->and($this->db->table('TblSMSHistory')->count())->toBe(3)
+        ->and(hash_file('sha256', $this->bundle['path']))->toBe($this->bundle['sha256']);
+});
+
+it('reconciles accepted remote data but stops the next part when suppression changes', function (): void {
+    $ids = \Cmd\Reports\Tests\Support\SmsFrozenEligibilityFixture::seed($this->db, $this->id);
+    config(['sms-exports.approved_handoff_suppression_enabled' => true]);
+    $this->workflow->prepare($this->id, 'fixture@example.invalid');
+    expect($this->workflow->step($this->id)['files_accepted'])->toBe(1);
+    $calls = $this->gateway->calls;
+    $this->db->table('TblProspects')->where('PK', $ids[1])->update(['State' => 'CO']);
+    $result = $this->workflow->step($this->id);
+    expect($result['status'])->toBe('held')->and($result['files_accepted'])->toBe(1)
+        ->and(array_slice($this->gateway->calls, count($calls)))->toBe([['status', $this->id]])
+        ->and($this->db->table('TblSMSHistory')->count())->toBe(3)
+        ->and(hash_file('sha256', $this->bundle['path']))->toBe($this->bundle['sha256']);
+});
+
+it('adopts an already completed remote receipt after late suppression without registering or uploading again', function (): void {
+    $ids = \Cmd\Reports\Tests\Support\SmsFrozenEligibilityFixture::seed($this->db, $this->id);
+    config(['sms-exports.approved_handoff_suppression_enabled' => true]);
+    $this->workflow->prepare($this->id, 'fixture@example.invalid');
+    $this->workflow->step($this->id);
+    // Model a receiver completion whose last acknowledgement was lost locally.
+    $this->gateway->remote['state'] = $this->gateway->remote['status'] = 'completed';
+    $this->gateway->remote['processed'] = 3;
+    foreach ($this->gateway->remote['parts'] as &$part) {
+        $part['accepted'] = true; $part['state'] = 'completed'; $part['rows_committed'] = $part['rows_expected'];
+    }
+    unset($part);
+    $calls = $this->gateway->calls;
+    $this->db->table('TblProspects')->where('PK', $ids[0])->update(['Contacted' => 1]);
+    $result = $this->workflow->step($this->id);
+    expect($result['status'])->toBe('completed')->and($result['processed'])->toBe(3)
+        ->and(array_slice($this->gateway->calls, count($calls)))->toBe([['status', $this->id]]);
+});
+
 it('captures approval in its existing commit and rolls back the outbox without reading files or contacting the receiver', function (): void {
     config(['sms-exports.debtplete_import_automatic' => true]);
     rename($this->bundle['path'], $this->bundle['path'].'.retained');

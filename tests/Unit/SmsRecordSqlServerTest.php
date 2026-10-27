@@ -12,6 +12,7 @@ use Cmd\Reports\Services\SmsContactAttribution;
 use Cmd\Reports\Services\SmsContactEvent;
 use Cmd\Reports\Services\SmsRunService;
 use Cmd\Reports\Services\SmsRunOptions;
+use Cmd\Reports\Services\SmsLeanHistorySchema;
 use Cmd\Reports\Services\SmsTierWindowSchema;
 use Illuminate\Config\Repository;
 use Illuminate\Container\Container;
@@ -136,7 +137,7 @@ final class SmsRecordSqlServerTest extends TestCase
     private function person(array $values = []): int
     {
         return (int) $this->db->table('TblProspects')->insertGetId($values + ['Client' => 'Synthetic Person','Address' => 'Fixture St',
-            'Phone' => '0005550100','Zip' => '00123','Creation_Date' => '2026-10-01']);
+            'Phone' => '0005550100','State' => 'CA','Zip' => '00123','Creation_Date' => '2026-10-01']);
     }
 
     private function windowIndexes(): array
@@ -164,11 +165,12 @@ final class SmsRecordSqlServerTest extends TestCase
             'ncoaAddr_zipCde' => '00123-9999', 'derivedFields1_unsecdebtbalance' => $debt, 'Tier_Tag' => $tier]);
     }
 
-    private function tierRun(int $target, array $tiers): array
+    private function tierRun(int $target, array $tiers, string $policy = SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY): array
     {
         config(['sms-exports.run_file_options_enabled' => true, 'sms-exports.tier_selection_enabled' => true,
-            'sms-exports.tier_selection_windowed_enabled' => true, 'sms-exports.tier_selection_window_size' => 2]);
-        $options = SmsRunOptions::normalize($target, 1, $tiers, SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY);
+            'sms-exports.tier_selection_windowed_enabled' => true, 'sms-exports.tier_selection_window_size' => 2,
+            'sms-exports.lean_history_enabled' => SmsRunOptions::usesLeanDebtSources($policy)]);
+        $options = SmsRunOptions::normalize($target, 1, $tiers, $policy);
         $this->runs->start(self::ID, $target, 'synthetic@example.invalid', $options);
         return $options;
     }
@@ -195,6 +197,32 @@ final class SmsRecordSqlServerTest extends TestCase
     {
         return SmsContactEvent::fromCanonical($pk, '0005550100', '2026-10-22T06:59:59.999999999Z',
             'fixture.contacts', 'fixture-1', str_repeat('a', 64), 1, true);
+    }
+
+    public function test_final_state_guard_holds_current_prospect_row_against_a_second_session(): void
+    {
+        $pk = $this->person();
+        $repo = $this->readyApproval(1);
+        $other = new PDO('sqlsrv:Server=127.0.0.1,14330;Database='.self::$database.';Encrypt=no;TrustServerCertificate=yes',
+            'sa', 'LocalDev!2026Pass', [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        $other->exec('SET LOCK_TIMEOUT 250');
+        $this->db->beginTransaction();
+        try {
+            $repo->assertCurrentStates(self::ID);
+            $statement = $other->prepare("UPDATE dbo.TblProspects SET State='WV' WHERE PK=?");
+            try {
+                $statement->execute([$pk]);
+                self::fail('A concurrent State writer bypassed the frozen approval guard.');
+            } catch (\PDOException $error) {
+                self::assertTrue(($error->errorInfo[1] ?? null) === 1222 || str_contains(strtolower($error->getMessage()), 'lock request time out'));
+            }
+        } finally {
+            $this->db->rollBack();
+        }
+        $statement = $other->prepare("UPDATE dbo.TblProspects SET State='WV' WHERE PK=?");
+        $statement->execute([$pk]);
+        self::assertSame(1, $statement->rowCount());
+        $other->prepare("UPDATE dbo.TblProspects SET State='CA' WHERE PK=?")->execute([$pk]);
     }
 
     public function test_live_contacted_details_use_only_exact_frozen_pks_and_all_tiers_without_writes(): void
@@ -413,6 +441,47 @@ final class SmsRecordSqlServerTest extends TestCase
         self::assertSame(2, (int) $this->db->table('TblProspects')->sum('SMS_Attempts'));
     }
 
+    public function test_lean_v3_keeps_exact_tu_pk_and_gives_tier_fallback_no_second_source_id(): void
+    {
+        $tu = $this->person(['Address' => 'Lean TU']);
+        $tier = $this->person(['Address' => 'Lean Tier']);
+        $mailer = $this->person(['Address' => 'Lean Mailer']);
+        $this->source(41, 'Lean TU');
+        $this->db->table('TblMailers')->insert(['PK' => 51, 'Client' => 'Synthetic Person', 'Address' => 'Lean Tier',
+            'Zip' => '00123', 'Drop_Name' => 'LEAN-DROP', 'Debt_Amount' => null, 'Debt_Tier' => 'T2']);
+        $this->db->table('TblMailers')->insert(['PK' => 52, 'Client' => 'Synthetic Person', 'Address' => 'Lean Mailer',
+            'Zip' => '00123', 'Drop_Name' => 'LEAN-DROP', 'Debt_Amount' => 13500, 'Debt_Tier' => 'T2']);
+        $this->db->table('TblMarketing')->insert(['Drop_Name' => 'LEAN-DROP', 'Send_Date' => '2026-10-01']);
+        self::assertTrue(SmsLeanHistorySchema::ready($this->db));
+
+        $options = $this->tierRun(3, ['T2'], SmsRunOptions::LEAN_WINDOWED_TIER_SELECTION_POLICY);
+        $this->runs->prepare(self::ID);
+        $rows = $this->db->table('TblProspectsExport')->orderBy('Prospect_PK')->get(['Prospect_PK','Debt_Source','Debt_Source_PK']);
+        self::assertSame([$tu,$tier,$mailer], array_map('intval', $rows->pluck('Prospect_PK')->all()));
+        self::assertSame(['TblTUData','Tier','TblMailers'], $rows->pluck('Debt_Source')->all());
+        self::assertSame(41, (int) $rows[0]->Debt_Source_PK);
+        self::assertNull($rows[1]->Debt_Source_PK);
+        self::assertSame(52, (int) $rows[2]->Debt_Source_PK);
+        (new SmsRecordExportRepository)->assertTierPrices(self::ID, $options);
+
+        $this->db->table('TblProspectsExport')->where('Prospect_PK', $tier)->update(['Debt_Source_PK' => 51]);
+        try { (new SmsRecordExportRepository)->assertTierPrices(self::ID, $options); self::fail('Tier fallback retained a forbidden second source ID.'); }
+        catch (\RuntimeException $error) { self::assertStringContainsString('provenance', $error->getMessage()); }
+        $this->db->table('TblProspectsExport')->where('Prospect_PK', $tier)->update(['Debt_Source_PK' => null]);
+        $this->db->table('TblTUData')->where('PK', 41)->delete();
+        try { (new SmsRecordExportRepository)->assertTierPrices(self::ID, $options); self::fail('Missing exact TU source lookup was accepted.'); }
+        catch (\RuntimeException $error) { self::assertStringContainsString('exact source PK', $error->getMessage()); }
+
+        $this->source(41, 'Lean TU');
+        $this->runs->requestFile(self::ID); $this->runs->buildFile(self::ID);
+        $this->runs->requestApprove(self::ID, 'synthetic@example.invalid'); $this->runs->markApproved(self::ID);
+        $history = $this->db->table('TblSMSHistory')->orderBy('Prospect_PK')->get(['Debt_Source','Debt_Source_PK']);
+        self::assertSame(['TblTUData','Tier','TblMailers'], $history->pluck('Debt_Source')->all());
+        self::assertSame(41, (int) $history[0]->Debt_Source_PK);
+        self::assertNull($history[1]->Debt_Source_PK);
+        self::assertSame(52, (int) $history[2]->Debt_Source_PK);
+    }
+
     public function test_real_windowed_selector_matches_v1_exactly_across_rejected_pages_and_priority_phases(): void
     {
         $wrong = $this->person(['Address' => 'Diff wrong', 'Creation_Date' => '2026-10-22']);
@@ -547,7 +616,7 @@ final class SmsRecordSqlServerTest extends TestCase
             if ($injected || ! str_starts_with(ltrim($event->sql), 'WITH Wanted AS')) return;
             $injected = true;
             $writer->exec("UPDATE dbo.TblTUData SET Tier_Tag='T9',derivedFields1_unsecdebtbalance=85000 WHERE PK=2;
-                INSERT dbo.TblProspects (Client,Address,Phone,Zip,Creation_Date) VALUES ('Synthetic Person','Concurrent newcomer','0005550100','00123','2026-10-23');
+                INSERT dbo.TblProspects (Client,Address,Phone,State,Zip,Creation_Date) VALUES ('Synthetic Person','Concurrent newcomer','0005550100','CA','00123','2026-10-23');
                 INSERT dbo.TblTUData (PK,Creation_Date,ncoaAddr_frstNme,ncoaAddr_lastNme,ncoaAddr_addrLine1Txt,ncoaAddr_zipCde,derivedFields1_unsecdebtbalance,Tier_Tag)
                 VALUES (3,'2026-10-01','Synthetic','Person','Concurrent newcomer','00123',13500,'T2')");
         });
@@ -611,8 +680,8 @@ final class SmsRecordSqlServerTest extends TestCase
         if (! in_array($populationValue, ['100000','3000000'], true)) throw new \InvalidArgumentException('Scale population must be exactly 100000 or 3000000.');
         $population = (int) $populationValue;
         $this->db->statement("WITH n AS (SELECT TOP (?) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n FROM sys.all_objects a CROSS JOIN sys.all_objects b)
-            INSERT dbo.TblProspects (Client,Address,Phone,Zip,Creation_Date)
-            SELECT 'Synthetic Person',CONCAT('Scale ',n),'0005550100','00123',DATEADD(DAY,-CAST(n/1000 AS int),CAST('2026-10-22' AS date)) FROM n;
+            INSERT dbo.TblProspects (Client,Address,Phone,State,Zip,Creation_Date)
+            SELECT 'Synthetic Person',CONCAT('Scale ',n),'0005550100','CA','00123',DATEADD(DAY,-CAST(n/1000 AS int),CAST('2026-10-22' AS date)) FROM n;
             INSERT dbo.TblTUData (PK,Creation_Date,ncoaAddr_frstNme,ncoaAddr_lastNme,ncoaAddr_addrLine1Txt,ncoaAddr_zipCde,derivedFields1_unsecdebtbalance,Tier_Tag)
             SELECT PK,'2026-10-01','Synthetic','Person',Address,'00123',13500,'T2' FROM dbo.TblProspects", [$population]);
         self::assertSame($population, $this->db->table('TblProspects')->count());
@@ -1207,7 +1276,7 @@ final class SmsRecordSqlServerTest extends TestCase
                     $count = $this->connection()->table('TblProspects')->count();
                     if ($this->writer !== null) {
                         $this->writer->beginTransaction();
-                        $this->writer->exec("INSERT dbo.TblProspects (Client,Address,Phone,Zip,Creation_Date) VALUES ('Concurrent Fixture','Fixture St','0005550101','00123','2026-10-20')");
+                        $this->writer->exec("INSERT dbo.TblProspects (Client,Address,Phone,State,Zip,Creation_Date) VALUES ('Concurrent Fixture','Fixture St','0005550101','CA','00123','2026-10-20')");
                         $this->writer->exec("INSERT dbo.TblTUPipelinePhases (Batch_ID,Phase) VALUES ('new-processing','summary-refreshed')");
                         $this->writer->commit(); $this->writer = null;
                     }

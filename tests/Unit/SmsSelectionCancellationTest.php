@@ -133,9 +133,10 @@ class SmsSelectionCancellationTest extends TestCase
         }
     }
 
-    protected function makeRun(string $status='queued',array $extra=[],string $id=self::ID):object
+    protected function makeRun(string $status='queued',array $extra=[],string $id=self::ID,
+        string $policy=SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY):object
     {
-        $options=SmsRunOptions::normalize(2,2,['T1'],SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY,
+        $options=SmsRunOptions::normalize(2,2,['T1'],$policy,
             SmsRunOptions::PLANNED_DATE_VERSION,'2026-10-26',SmsRunOptions::APPROVAL_FILENAME_VERSION);
         $this->source->table('TblSMSRuns')->insert($extra+[
             'Request_ID'=>$id,'Status'=>$status,'Target'=>2,'Selected'=>null,'Selection_Policy'=>SmsRecordPolicy::RECORDS,
@@ -160,6 +161,16 @@ class SmsSelectionCancellationTest extends TestCase
         self::assertSame(1,$this->control->table('jobs')->count());
         self::assertSame('requested',$this->control->table(SmsSelectionCancellation::TABLE)->value('state'));
         self::assertSame('queued',$this->source->table('TblSMSRuns')->value('Status'));
+        $this->expectException(SmsSelectionCancelledException::class);$this->cancellation->checkpoint(self::ID);
+    }
+
+    public function testLeanV3UsesTheSameExplicitWindowedCancellationContract():void
+    {
+        $run=$this->makeRun('queued',[],self::ID,SmsRunOptions::LEAN_WINDOWED_TIER_SELECTION_POLICY);
+        self::assertTrue($this->cancellation->begin($run));
+        $view=$this->cancellation->requestCancel(self::ID,'owner@example.invalid');
+        self::assertSame('requested',$view->cancellation['state']);
+        self::assertSame(1,$this->control->table('jobs')->count());
         $this->expectException(SmsSelectionCancelledException::class);$this->cancellation->checkpoint(self::ID);
     }
 

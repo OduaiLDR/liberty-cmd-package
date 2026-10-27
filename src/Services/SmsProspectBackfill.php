@@ -143,12 +143,13 @@ SQL;
                         throw new RuntimeException('Candidate contact or identity proof failed.');
                     }
                     $city = trim((string) $row['City']);
-                    $state = strtoupper(trim((string) $row['State']));
+                    $state = SmsStatePolicy::normalize($row['State']);
+                    $stateReason = SmsStatePolicy::holdReason($row['State']);
                     $inputs[] = ['Source_PK' => $candidate['Source_PK'], 'Unique_Source_PK' => $row['Unique_Source_PK'],
                         'Source_SHA256' => $candidate['Observed_SHA256'],
-                        'Reason' => $row['Unique_Source_PK'] === null ? 'unresolved_source_owner' : (! (bool) $row['City_Valid'] ? 'invalid_city' : null),
+                        'Reason' => $stateReason ?? ($row['Unique_Source_PK'] === null ? 'unresolved_source_owner' : (! (bool) $row['City_Valid'] ? 'invalid_city' : null)),
                         'Creation_Date' => $row['Creation_Date'], 'Client' => $row['Client'], 'Address' => $row['Address'],
-                        'City' => $city === '' ? null : $city, 'State' => preg_match('/^[A-Z]{2}$/D', $state) ? $state : null,
+                        'City' => $city === '' ? null : $city, 'State' => $state,
                         'Zip' => $row['Zip'], 'Tier' => SmsProspectValues::tier($row['Source_Tier']), 'Phone' => $contact['Phone'], 'Email' => $contact['Email']];
                 }
                 // One set-based write round trip per chunk, not thousands of per-person

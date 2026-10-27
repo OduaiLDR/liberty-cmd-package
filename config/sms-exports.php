@@ -48,6 +48,11 @@ return [
     // New-format creation only, after the explicit file-options migration and coordinated release.
     // Existing versioned runs retain their stored format when this creation switch is off.
     'run_file_options_enabled' => env('CMD_SMS_RUN_FILE_OPTIONS_ENABLED', false),
+    // Creation rollout: reject new optionless/early-numbered and legacy direct exports.
+    // Existing TblSMSRuns retain their frozen workflow; legacy queued exports need review first.
+    'approval_only_creation_enabled' => env('CMD_SMS_APPROVAL_ONLY_CREATION_ENABLED', false),
+    // Outward publication/email/import rollout only; historical artifact reads stay available.
+    'approved_handoff_suppression_enabled' => env('CMD_SMS_APPROVED_HANDOFF_SUPPRESSION_ENABLED', false),
     // Creation gate only. Source-first tier selection needs production schema/plan/scale acceptance.
     // Existing marked runs keep their frozen selector even when this switch is off.
     'tier_selection_enabled' => env('CMD_SMS_TIER_SELECTION_ENABLED', false),
@@ -55,6 +60,9 @@ return [
     // performance acceptance are complete; frozen v1 runs remain on v1.
     'tier_selection_windowed_enabled' => env('CMD_SMS_TIER_SELECTION_WINDOWED_ENABLED', false),
     'tier_selection_window_size' => env('CMD_SMS_TIER_SELECTION_WINDOW_SIZE', 5000),
+    // New-run v3 only. Tier fallback intentionally stores no Debt_Source_PK;
+    // TU/mailer references require a unique non-null source PK. Old v1/v2 rows stay readable.
+    'lean_history_enabled' => env('CMD_SMS_LEAN_HISTORY_ENABLED', false),
     // Explicit operator archive/verify/restore only. No inherited legacy bucket,
     // chosen timing or deletion policy. Approve the complete contract before enabling.
     'run_archive_enabled' => env('CMD_SMS_RUN_ARCHIVE_ENABLED', false),

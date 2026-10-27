@@ -151,6 +151,23 @@ afterEach(function (): void {
     Facade::clearResolvedInstances(); Container::setInstance($this->publicationOldContainer); Facade::setFacadeApplication($this->publicationOldContainer);
 });
 
+test('final suppression gate holds approved publication and links while retaining original history and artifacts', function (): void {
+    $ids = \Cmd\Reports\Tests\Support\SmsFrozenEligibilityFixture::seed($this->publicationDb, $this->publicationId);
+    config(['sms-exports.approved_handoff_suppression_enabled' => true]);
+    $history = $this->publicationDb->table('TblSMSHistory')->get()->toJson();
+    $this->publicationDb->table('TblProspects')->where('PK', $ids[0])->update(['Contacted' => 1]);
+    expect(fn () => ($this->publicationPublish)())->toThrow(RuntimeException::class, 'held without changing membership')
+        ->and($this->publicationProvider->calls)->toBe(0)
+        ->and($this->publicationDb->table(SmsRunPublicationWorkflow::TABLE)->count())->toBe(0);
+    $this->publicationDb->table('TblProspects')->where('PK', $ids[0])->update(['Contacted' => 0]);
+    expect(($this->publicationPublish)()['status'])->toBe('published');
+    $this->publicationDb->table('TblProspects')->where('PK', $ids[0])->update(['State' => 'WV']);
+    expect(fn () => $this->publicationWorkflow->links($this->publicationId))->toThrow(RuntimeException::class, 'State')
+        ->and($this->publicationWorkflow->status($this->publicationId)['status'])->toBe('published')
+        ->and($this->publicationDb->table('TblSMSHistory')->get()->toJson())->toBe($history)
+        ->and(hash_file('sha256', $this->publicationBundle['path']))->toBe($this->publicationBundle['sha256']);
+});
+
 test('SMS publication stores exact ordered approved CSV parts and replay verifies without remote duplicates or business changes', function (): void {
     $run = (array) $this->publicationDb->table('TblSMSRuns')->first();
     $pendingBytes = file_get_contents($this->publicationPending['path']);

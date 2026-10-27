@@ -14,6 +14,8 @@
             $currentRange = request('from') || request('to') ? 'custom' : 'all';
         }
         $options = $options ?? [];
+        $confirmedSms = $smsExports->filter(fn ($row) => ($row->Billable ?? false) === true && in_array($row->Activity_Status ?? null, ['approved', 'sent'], true));
+        $unconfirmedSms = $smsExports->filter(fn ($row) => ($row->Billable ?? false) !== true && ($row->Activity_Status ?? null) !== 'reconciled_export');
     @endphp
 
     <div class="card">
@@ -30,8 +32,8 @@
             @endif
             <section class="border rounded p-3 mb-3" aria-labelledby="invoice-heading">
                 <h6 id="invoice-heading">SMS invoice allocation</h6>
-                <p class="small">Mail and data invoices are entered from the matching drop row below and allocated across all its tiers. An SMS invoice applies to every SMS export in the selected week, weighted by phone count.</p>
-                @if ($smsExports->isNotEmpty() && $smsExports->every(fn ($row) => trim((string) ($row->SMS_Invoice_Number ?? '')) === ''))
+                <p class="small">Mail and data invoices are entered from the matching drop row below and allocated across all its tiers. SMS invoices apply only to confirmed approved/submitted records in the selected California week, weighted by confirmed count. Retained exports are not billing evidence.</p>
+                @if ($confirmedSms->isNotEmpty() && $smsExports->every(fn ($row) => empty($row->Invoice_Hold) && trim((string) ($row->SMS_Invoice_Number ?? '')) === ''))
                 <form method="post" action="{{ route('cmd.reports.marketing_report.invoice') }}" class="row g-2 align-items-end">
                     @csrf
                     <input type="hidden" name="kind" value="sms">
@@ -50,6 +52,7 @@
                     <div class="col-md-2"><button class="btn btn-primary" type="submit">Distribute SMS invoice</button></div>
                 </form>
                 @endif
+                <p>{{ number_format((int) $unconfirmedSms->sum('SMS_Count')) }} retained export records without confirmed submission. Linked legacy export evidence is not counted again. Approval/submission is not delivery.</p>
             </section>
             <section class="border rounded p-3 mb-3" aria-labelledby="sms-history-heading">
                 <h6 id="sms-history-heading">SMS drops and invoices</h6>
@@ -62,15 +65,20 @@
                 </form>
                 <div class="table-responsive">
                     <table class="table table-striped table-bordered">
-                        <thead><tr><th>SMS drop</th><th>Tier</th><th>Exported</th><th>SMS count</th><th>SMS invoice</th><th>SMS cost</th></tr></thead>
+                        <thead><tr><th>SMS drop</th><th>Tier</th><th>Status / evidence</th><th>Approval/submission (CA) or legacy export (stored time)</th><th>Record count</th><th>SMS invoice</th><th>Recorded cost</th></tr></thead>
                         <tbody>
                         @forelse ($smsExports as $smsExport)
-                            <tr><td>{{ $smsExport->SMS_Drop_Name }}</td><td>{{ $smsExport->Debt_Tier }}</td><td>{{ $smsExport->Exported_At }}</td><td>{{ number_format((int) $smsExport->SMS_Count) }}</td><td>{{ $smsExport->SMS_Invoice_Number }}</td><td>{{ $formatCurrency($smsExport->SMS_Cost) }}</td></tr>
+                            <tr><td>{{ $smsExport->SMS_Drop_Name }}</td><td>{{ $smsExport->Debt_Tier }}</td><td>{{ match ($smsExport->Activity_Status ?? 'exported_unconfirmed') {
+                                'approved' => 'Approved (not delivery)', 'sent' => 'Submitted (not delivery)',
+                                'reconciled_export' => 'Linked legacy export (not counted again)',
+                                'exported_unconfirmed' => 'Export retained — submission unconfirmed',
+                                default => str_replace('_', ' ', $smsExport->Activity_Status).' — export only',
+                            } }} {{ $smsExport->Invoice_Hold ?? '' }}</td><td>{{ ($smsExport->Billable ?? false) === true ? \Carbon\Carbon::parse($smsExport->Exported_At, 'UTC')->setTimezone('America/Los_Angeles')->format('Y-m-d H:i:s') : $smsExport->Exported_At }}</td><td>{{ number_format((int) $smsExport->SMS_Count) }}</td><td>{{ $smsExport->SMS_Invoice_Number }}</td><td>{{ $formatCurrency($smsExport->SMS_Cost) }}</td></tr>
                         @empty
-                            <tr><td colspan="6">No SMS exports for this week.</td></tr>
+                            <tr><td colspan="7">No SMS exports for this week.</td></tr>
                         @endforelse
                         </tbody>
-                        <tfoot><tr><th colspan="3">Week total</th><th>{{ number_format((int) $smsExports->sum('SMS_Count')) }}</th><td></td><th>{{ $formatCurrency($smsExports->sum('SMS_Cost')) }}</th></tr></tfoot>
+                        <tfoot><tr><th colspan="4">Confirmed week total / recorded costs (including historical allocations)</th><th>{{ number_format((int) $confirmedSms->sum('Confirmed_Count')) }}</th><td></td><th>{{ $formatCurrency($smsExports->sum('SMS_Cost')) }}</th></tr></tfoot>
                     </table>
                 </div>
             </section>
