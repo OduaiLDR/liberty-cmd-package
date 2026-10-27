@@ -418,7 +418,7 @@ class SmsRecordExportRepository extends SqlSrvRepository
         return $updated;
     }
 
-    /** Frozen denominators and live suppressions. Response metrics await validated attribution. */
+    /** Frozen denominators and live prospect flags. Response metrics await validated attribution. */
     public function details(string $requestId): array
     {
         $run = $this->table('TblSMSRuns')->where('Request_ID', $requestId)->first();
@@ -426,20 +426,21 @@ class SmsRecordExportRepository extends SqlSrvRepository
         $rows = $this->table('TblSMSHistory', 'h')->leftJoin('TblProspects as p', 'p.PK', '=', 'h.Prospect_PK')
             ->where('h.Request_ID', $requestId)->groupBy('h.Debt_Tier')->selectRaw('h.Debt_Tier,COUNT(*) AS Records,
                 COALESCE(SUM(CASE WHEN p.Opt_Out=1 THEN 1 ELSE 0 END),0) AS Opt_Out,
-                COALESCE(SUM(CASE WHEN p.Invalid_Phone=1 THEN 1 ELSE 0 END),0) AS Invalid')->get()->keyBy('Debt_Tier');
-        $tiers = []; $total = ['records' => 0, 'opt_out' => 0, 'invalid' => 0];
+                COALESCE(SUM(CASE WHEN p.Invalid_Phone=1 THEN 1 ELSE 0 END),0) AS Invalid,
+                COALESCE(SUM(CASE WHEN p.Contacted=1 THEN 1 ELSE 0 END),0) AS Contacted')->get()->keyBy('Debt_Tier');
+        $tiers = []; $total = ['records' => 0, 'opt_out' => 0, 'invalid' => 0, 'contacted' => 0];
         for ($i = 1; $i <= 9; $i++) {
             $row = $rows->get('T'.$i);
             $tier = ['tier' => 'T'.$i, 'records' => (int) ($row->Records ?? 0), 'opt_out' => (int) ($row->Opt_Out ?? 0),
-                'invalid' => (int) ($row->Invalid ?? 0)];
+                'invalid' => (int) ($row->Invalid ?? 0), 'contacted' => (int) ($row->Contacted ?? 0)];
             foreach (array_keys($total) as $key) $total[$key] += $tier[$key];
-            $tier['contacted'] = null;
             $tier['response_rate'] = null;
             $tiers[] = $tier;
         }
-        $total['contacted'] = null;
         $total['response_rate'] = null;
         return ['request_id' => strtolower($requestId), 'reporting' => 'Live Status', 'tiers' => $tiers, 'total' => $total,
-            'response_metrics_available' => false, 'response_metrics_reason' => 'Contact response attribution is not implemented yet.'];
+            'contacted_metrics_available' => true, 'contacted_metrics_basis' => 'current_prospect_flag',
+            'response_metrics_available' => false,
+            'response_metrics_reason' => 'Current Contacted flags are live prospect status; contact response attribution to this drop is unavailable.'];
     }
 }

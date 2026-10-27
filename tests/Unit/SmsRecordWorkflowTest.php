@@ -435,13 +435,41 @@ final class SmsRecordWorkflowTest extends TestCase
             'Contact_At_UTC' => '2026-10-21 12:00:00', 'Contacted_Date' => '2026-10-21', 'Created_At' => '2026-10-21 13:00:00']);
         $report = $this->runs->details(self::ID);
         self::assertSame('Live Status', $report['reporting']); self::assertCount(9, $report['tiers']);
-        self::assertSame(['tier' => 'T2','records' => 2,'opt_out' => 2,'invalid' => 2,'contacted' => null,'response_rate' => null], $report['tiers'][1]);
+        self::assertSame(['tier' => 'T2','records' => 2,'opt_out' => 2,'invalid' => 2,'contacted' => 2,'response_rate' => null], $report['tiers'][1]);
         self::assertNull($report['tiers'][0]['response_rate']); self::assertSame(0, $report['tiers'][8]['records']);
-        self::assertSame(2, $report['total']['records']); self::assertNull($report['total']['response_rate']);
-        self::assertFalse($report['response_metrics_available']); self::assertStringContainsString('not implemented', $report['response_metrics_reason']);
+        self::assertSame(2, $report['total']['records']); self::assertSame(2, $report['total']['contacted']); self::assertNull($report['total']['response_rate']);
+        self::assertTrue($report['contacted_metrics_available']); self::assertSame('current_prospect_flag', $report['contacted_metrics_basis']);
+        self::assertFalse($report['response_metrics_available']); self::assertStringContainsString('attribution', $report['response_metrics_reason']);
+        self::assertStringContainsString('unavailable', $report['response_metrics_reason']);
         // A prospect disappearing must not change the original denominator.
         $this->db->table('TblProspects')->where('PK', $b)->delete();
-        self::assertSame(2, $this->runs->details(self::ID)['total']['records']);
+        $missing = $this->runs->details(self::ID);
+        self::assertSame(2, $missing['total']['records']); self::assertSame(1, $missing['total']['contacted']);
+    }
+
+    public function test_live_contacted_flags_are_exact_frozen_pks_read_only_and_not_phone_or_attribution_matches(): void
+    {
+        $a = $this->prospect(); $b = $this->prospect();
+        $this->fileReady(2); $this->runs->requestApprove(self::ID, 'actor'); $this->runs->markApproved(self::ID);
+        $this->prospect(['Contacted' => 1]); // Same phone, outside the approved membership.
+        $this->db->table('TblProspects')->where('PK', $a)->update(['Contacted' => 1, 'Opt_Out' => 1, 'Invalid_Phone' => 1]);
+        $this->db->table('TblSMSResponseAttribution')->insert(['Prospect_PK' => $b, 'Request_ID' => self::ID,
+            'Contact_At_UTC' => '2026-10-21 12:00:00', 'Contacted_Date' => '2026-10-21', 'Created_At' => '2026-10-21 13:00:00']);
+        $snapshot = fn (): array => array_map(fn ($table) => $this->db->table($table)->orderBy($table === 'TblSMSResponseAttribution' ? 'Prospect_PK' : 'PK')->get()->toJson(),
+            ['TblProspects','TblSMSHistory','TblSMSRuns','TblSMSDrops','TblProspectsExport','TblSMSResponseAttribution']);
+        $before = $snapshot(); $this->db->beginTransaction();
+        try {
+            $report = $this->runs->details(self::ID);
+            self::assertSame(['records' => 2, 'opt_out' => 1, 'invalid' => 1, 'contacted' => 1, 'response_rate' => null], $report['total']);
+            self::assertSame(['T1','T2','T3','T4','T5','T6','T7','T8','T9'], array_column($report['tiers'], 'tier'));
+            self::assertSame(array_fill(0, 8, 0), array_column(array_slice($report['tiers'], 1), 'contacted'));
+            self::assertFalse($report['response_metrics_available']); self::assertSame($before, $snapshot());
+        } finally { $this->db->rollBack(); }
+        self::assertSame($before, $snapshot()); self::assertSame(0, $this->db->transactionLevel());
+        $this->db->table('TblProspects')->where('PK', $a)->update(['Contacted' => 0]);
+        $changed = $snapshot();
+        self::assertSame(0, $this->runs->details(self::ID)['total']['contacted']);
+        self::assertSame($changed, $snapshot());
     }
 
     public function test_legacy_actions_stay_blocked_for_record_batches_when_feature_is_turned_off(): void
