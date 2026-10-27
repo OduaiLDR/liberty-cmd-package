@@ -11,6 +11,7 @@ use Illuminate\Container\Container;
 use Illuminate\Database\Capsule\Manager;
 use Illuminate\Support\Facades\Facade;
 use PDO;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 /** Explicitly owned, loopback-only fixture; never connects to the existing port 14330 instance. */
@@ -66,8 +67,8 @@ final class SmsFrozenEligibilitySqlServerTest extends TestCase
         self::assertSame(self::$database, $this->db->selectOne('SELECT DB_NAME() AS name')->name);
         $this->db->unprepared('DROP TABLE IF EXISTS TblProspectsExport,TblSMSHistory,TblProspects,TblPhoneNumbers,TblSMSSuppressions,TblSMSRuns;
 CREATE TABLE TblProspects(PK int NOT NULL PRIMARY KEY,State char(2),Phone varchar(20),Contacted bit NOT NULL,Opt_Out bit NOT NULL,Invalid_Phone bit NOT NULL);
-CREATE TABLE TblProspectsExport(Request_ID uniqueidentifier NOT NULL,Prospect_PK int NOT NULL,State char(2),Phone varchar(20),PRIMARY KEY(Request_ID,Prospect_PK));
-CREATE TABLE TblSMSHistory(Request_ID uniqueidentifier NOT NULL,Prospect_PK int NOT NULL,State char(2),Phone varchar(20),PRIMARY KEY(Request_ID,Prospect_PK));
+CREATE TABLE TblProspectsExport(Request_ID uniqueidentifier NOT NULL,Prospect_PK int NOT NULL,State char(2),Phone nvarchar(20),PRIMARY KEY(Request_ID,Prospect_PK));
+CREATE TABLE TblSMSHistory(Request_ID uniqueidentifier NOT NULL,Prospect_PK int NOT NULL,State char(2),Phone nvarchar(20),PRIMARY KEY(Request_ID,Prospect_PK));
 CREATE TABLE TblPhoneNumbers(Phone varchar(20) NOT NULL PRIMARY KEY);
 CREATE TABLE TblSMSSuppressions(Phone varchar(20) NOT NULL PRIMARY KEY,Opt_Out bit NOT NULL,Invalid_Phone bit NOT NULL);
 CREATE TABLE TblSMSRuns(Request_ID uniqueidentifier NOT NULL PRIMARY KEY,Selection_Policy varchar(40),Status varchar(20),Selected int,Approved_At datetime2,Approved_By varchar(100));
@@ -101,7 +102,7 @@ INSERT TblProspects VALUES(1,\'CA\',\'2025550100\',0,0,0);');
     public function test_native_guard_holds_blocked_state_phone_drift_and_flags_without_changing_membership(): void
     {
         $before = $this->db->table('TblProspectsExport')->first();
-        foreach ([['State' => 'WV'], ['Phone' => '2025550199'], ['Contacted' => 1], ['Opt_Out' => 1], ['Invalid_Phone' => 1]] as $change) {
+        foreach ([['State' => 'WV'], ['Phone' => '2025550199'], ['Phone' => '2025550100 '], ['Contacted' => 1], ['Opt_Out' => 1], ['Invalid_Phone' => 1]] as $change) {
             $this->db->beginTransaction();
             try {
                 $this->db->table('TblProspects')->where('PK', 1)->update($change);
@@ -122,5 +123,104 @@ INSERT TblProspects VALUES(1,\'CA\',\'2025550100\',0,0,0);');
         $this->db->table('TblSMSSuppressions')->insert(['Phone' => '2025550100', 'Opt_Out' => 0, 'Invalid_Phone' => 1]);
         try { SmsFrozenEligibility::assertApproved(self::ID); self::fail('Suppressed approved member was handed off.'); }
         catch (SmsFrozenEligibilityHold) { self::assertEquals($before, $this->db->table('TblSMSHistory')->first()); }
+    }
+
+    public static function phoneStorageCases(): array
+    {
+        return [
+            'legacy varchar' => ['varchar(20)', 'varchar(20)'],
+            'production mixed storage' => ['varchar(20)', 'nvarchar(20)'],
+            'inverse mixed storage' => ['nvarchar(20)', 'varchar(20)'],
+            'unicode storage' => ['nvarchar(20)', 'nvarchar(20)'],
+            'utf8 varchar storage' => ['varchar(20) COLLATE Latin1_General_100_BIN2_UTF8', 'varchar(20) COLLATE Latin1_General_100_BIN2_UTF8'],
+        ];
+    }
+
+    #[DataProvider('phoneStorageCases')]
+    public function test_same_ascii_phone_passes_pending_and_approved_checks_across_storage_types(string $currentType, string $frozenType): void
+    {
+        // Types are fixed fixture literals, never operator/customer input.
+        $this->db->unprepared("ALTER TABLE TblProspects ALTER COLUMN Phone {$currentType} NULL;
+ALTER TABLE TblProspectsExport ALTER COLUMN Phone {$frozenType} NULL;
+ALTER TABLE TblSMSHistory ALTER COLUMN Phone {$frozenType} NULL;");
+        if (str_contains($frozenType, 'UTF8')) $this->useUtf8ExclusionTables();
+        $bytes = $this->db->selectOne('SELECT DATALENGTH(p.Phone) AS current_bytes,DATALENGTH(x.Phone) AS frozen_bytes
+FROM TblProspectsExport x JOIN TblProspects p ON p.PK=x.Prospect_PK');
+        self::assertSame(str_starts_with($currentType, 'n') ? 20 : 10, (int) $bytes->current_bytes);
+        self::assertSame(str_starts_with($frozenType, 'n') ? 20 : 10, (int) $bytes->frozen_bytes);
+        $pendingBefore = $this->db->table('TblProspectsExport')->first();
+        SmsFrozenEligibility::assertPending($this->db, self::ID);
+        self::assertEquals($pendingBefore, $this->db->table('TblProspectsExport')->first());
+
+        $this->db->table('TblSMSRuns')->insert(['Request_ID' => self::ID, 'Status' => 'approved', 'Selected' => 1,
+            'Selection_Policy' => 'prospect-record-v1', 'Approved_At' => '2026-10-27 12:00:00', 'Approved_By' => 'fixture@example.invalid']);
+        $this->db->table('TblSMSHistory')->insert((array) $pendingBefore);
+        $approvedBefore = $this->db->table('TblSMSHistory')->first();
+        SmsFrozenEligibility::assertApproved(self::ID);
+        self::assertEquals($approvedBefore, $this->db->table('TblSMSHistory')->first());
+    }
+
+    public function test_unicode_storage_still_rejects_malformed_frozen_phones_without_mutation(): void
+    {
+        $this->db->unprepared('ALTER TABLE TblProspects ALTER COLUMN Phone nvarchar(20) NULL');
+        foreach (['202555010', '20255501000', '2025550100 ', ' 2025550100', '202555010 ',
+            '202555010x', '２０２５５５０１００', '٢٠٢٥٥٥٠١٠٠', "202555010\0", "202555010\t"] as $phone) {
+            $this->db->beginTransaction();
+            try {
+                $this->db->table('TblProspects')->where('PK', 1)->update(['Phone' => $phone]);
+                $this->db->table('TblProspectsExport')->update(['Phone' => $phone]);
+                $before = $this->db->table('TblProspectsExport')->first();
+                try { SmsFrozenEligibility::assertPending($this->db, self::ID); self::fail('Malformed frozen phone was released.'); }
+                catch (SmsFrozenEligibilityHold $error) { self::assertStringContainsString('held without changing membership', $error->getMessage()); }
+                self::assertEquals($before, $this->db->table('TblProspectsExport')->first());
+            } finally { $this->db->rollBack(); }
+        }
+    }
+
+    public function test_utf8_phones_are_not_folded_to_ascii_before_validation_or_identity_comparison(): void
+    {
+        $this->db->unprepared('ALTER TABLE TblProspects ALTER COLUMN Phone varchar(40) COLLATE Latin1_General_100_BIN2_UTF8 NULL;
+ALTER TABLE TblProspectsExport ALTER COLUMN Phone varchar(40) COLLATE Latin1_General_100_BIN2_UTF8 NULL;
+ALTER TABLE TblSMSHistory ALTER COLUMN Phone varchar(40) COLLATE Latin1_General_100_BIN2_UTF8 NULL;');
+        $this->useUtf8ExclusionTables();
+        $this->db->table('TblSMSRuns')->insert(['Request_ID' => self::ID, 'Status' => 'approved', 'Selected' => 1,
+            'Selection_Policy' => 'prospect-record-v1', 'Approved_At' => '2026-10-27 12:00:00', 'Approved_By' => 'fixture@example.invalid']);
+        $this->db->table('TblSMSHistory')->insert((array) $this->db->table('TblProspectsExport')->first());
+        SmsFrozenEligibility::assertPending($this->db, self::ID);
+        SmsFrozenEligibility::assertApproved(self::ID);
+
+        foreach (['202555010０' => 12, '２０２５５５０１００' => 30] as $phone => $utf8Bytes) {
+            $this->db->beginTransaction();
+            try {
+                foreach (['TblProspects', 'TblProspectsExport', 'TblSMSHistory'] as $table) $this->db->table($table)->update(['Phone' => $phone]);
+                self::assertSame($utf8Bytes, (int) $this->db->selectOne('SELECT DATALENGTH(Phone) AS bytes FROM TblProspectsExport')->bytes);
+                $before = $this->db->table('TblProspectsExport')->first();
+                foreach ([fn () => SmsFrozenEligibility::assertPending($this->db, self::ID), fn () => SmsFrozenEligibility::assertApproved(self::ID)] as $check) {
+                    try { $check(); self::fail('Non-ASCII UTF8 phone was released.'); }
+                    catch (SmsFrozenEligibilityHold) { self::assertEquals($before, $this->db->table('TblProspectsExport')->first()); }
+                }
+            } finally { $this->db->rollBack(); }
+        }
+
+        // A changed UTF8 current phone must not best-fit to the frozen ASCII phone.
+        $this->db->unprepared('ALTER TABLE TblProspectsExport ALTER COLUMN Phone nvarchar(40) COLLATE Latin1_General_100_BIN2_UTF8 NULL;
+ALTER TABLE TblSMSHistory ALTER COLUMN Phone nvarchar(40) COLLATE Latin1_General_100_BIN2_UTF8 NULL;');
+        $this->db->table('TblProspects')->update(['Phone' => '202555010０']);
+        self::assertSame(12, (int) $this->db->selectOne('SELECT DATALENGTH(Phone) AS bytes FROM TblProspects')->bytes);
+        $before = $this->db->table('TblSMSHistory')->first();
+        foreach ([fn () => SmsFrozenEligibility::assertPending($this->db, self::ID), fn () => SmsFrozenEligibility::assertApproved(self::ID)] as $check) {
+            try { $check(); self::fail('Changed UTF8 current phone was treated as unchanged.'); }
+            catch (SmsFrozenEligibilityHold) { self::assertEquals($before, $this->db->table('TblSMSHistory')->first()); }
+        }
+    }
+
+    private function useUtf8ExclusionTables(): void
+    {
+        // These owned tables are empty at this point. Keep indexed exclusion
+        // columns in the frozen phone collation so the fixture isolates phone
+        // validation, not an unrelated incompatible-collation schema error.
+        $this->db->unprepared('DROP TABLE TblPhoneNumbers,TblSMSSuppressions;
+CREATE TABLE TblPhoneNumbers(Phone varchar(40) COLLATE Latin1_General_100_BIN2_UTF8 NOT NULL PRIMARY KEY);
+CREATE TABLE TblSMSSuppressions(Phone varchar(40) COLLATE Latin1_General_100_BIN2_UTF8 NOT NULL PRIMARY KEY,Opt_Out bit NOT NULL,Invalid_Phone bit NOT NULL);');
     }
 }

@@ -58,9 +58,13 @@ WHERE x.Request_ID=? ORDER BY p.PK", [$requestId], false);
             throw new SmsFrozenEligibilityHold('A frozen SMS prospect State is missing, invalid, excluded or changed. The batch was held without changing membership.');
         }
 
-        $phoneValid = $native ? "DATALENGTH(x.Phone)=10 AND x.Phone NOT LIKE '%[^0-9]%'"
+        // Frozen/history phones are nvarchar in the published migrations while
+        // prospects may be varchar. Compare a common, lossless Unicode width,
+        // not native storage bytes. Keep exact ASCII digits and trailing-space
+        // rejection; SQL Server string equality alone pads trailing spaces.
+        $phoneValid = $native ? "DATALENGTH(CONVERT(nvarchar(max),x.Phone))=20 AND CONVERT(nvarchar(max),x.Phone) COLLATE Latin1_General_100_BIN2 LIKE '".str_repeat('[0-9]', 10)."'"
             : "length(x.Phone)=10 AND x.Phone NOT GLOB '*[^0-9]*'";
-        $samePhone = $native ? 'p.Phone COLLATE Latin1_General_100_BIN2 = x.Phone COLLATE Latin1_General_100_BIN2 AND DATALENGTH(p.Phone)=DATALENGTH(x.Phone)'
+        $samePhone = $native ? 'CONVERT(nvarchar(max),p.Phone) COLLATE Latin1_General_100_BIN2 = CONVERT(nvarchar(max),x.Phone) COLLATE Latin1_General_100_BIN2 AND DATALENGTH(CONVERT(nvarchar(max),p.Phone))=DATALENGTH(CONVERT(nvarchar(max),x.Phone))'
             : 'p.Phone COLLATE BINARY = x.Phone COLLATE BINARY';
         $contactPhone = $native ? "(c.Phone=x.Phone OR c.Phone='1'+x.Phone)"
             : "(c.Phone=x.Phone OR c.Phone='1'||x.Phone)";
