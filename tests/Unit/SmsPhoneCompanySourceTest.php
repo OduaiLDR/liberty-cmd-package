@@ -181,7 +181,7 @@ final class SmsPhoneCompanySourceTest extends TestCase
             public int $queries=0;
             public array $errors=[];
             public function __construct(private \PDO $pdo,public mixed $id,public mixed $date) {parent::__construct();}
-            public function option($key=null) {return ['source'=>'lt','dry-run'=>false,'batch-size'=>1000][$key]??null;}
+            public function option($key=null) {return ['source'=>'lt','dry-run'=>false,'batch-size'=>1000,'phones-only'=>true][$key]??null;}
             public function info($string,$verbosity=null) {}
             public function warn($string,$verbosity=null) {}
             public function error($string,$verbosity=null) {$this->errors[]=$string;}

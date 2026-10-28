@@ -114,16 +114,26 @@ final class SmsPhoneSnapshotDedupTest extends TestCase
         self::assertSame([],array_values(array_diff(glob(sys_get_temp_dir().'/sync-phone-*'),$files)));
     }
 
-    public function test_nullable_blank_unicode_and_text_external_ids_round_trip_and_default_flags_remain_enabled(): void
+    public function test_nullable_blank_unicode_and_text_external_ids_round_trip_without_prospect_changes(): void
     {
         $command=$this->command([[$this->row(['DATA_SOURCE'=>"源 O'Brien 😀",'EXTERNAL_ID'=>'000123-abc']),
             $this->row(['ID'=>'124','DATA_SOURCE'=>null,'EXTERNAL_ID'=>null]),
-            $this->row(['ID'=>'125','DATA_SOURCE'=>'','EXTERNAL_ID'=>''])]],false);
-        self::assertSame(0,$command->handle()); self::assertSame(1,$command->flags);
+            $this->row(['ID'=>'125','DATA_SOURCE'=>'','EXTERNAL_ID'=>''])]]);
+        self::assertSame(0,$command->handle()); self::assertSame(0,$command->flags);
         $rows=$this->db->table('TblPhoneNumbers')->where('Source','DP_LT')->orderBy('CID')->get();
         self::assertSame("源 O'Brien 😀",$rows[0]->Data_Source); self::assertSame('000123-abc',$rows[0]->External_ID);
         self::assertNull($rows[1]->Data_Source); self::assertNull($rows[1]->External_ID);
         self::assertSame('',$rows[2]->Data_Source); self::assertSame('',$rows[2]->External_ID);
+    }
+
+    public function test_default_schedule_cannot_run_the_superseded_prospect_date_writer(): void
+    {
+        $before=$this->db->table('TblPhoneNumbers')->get()->toJson();
+        $command=$this->command([[$this->row()]],false);
+        self::assertSame(1,$command->handle());
+        self::assertSame(0,$command->queries); self::assertSame(0,$command->flags);
+        self::assertSame($before,$this->db->table('TblPhoneNumbers')->get()->toJson());
+        self::assertSame(['Use --phones-only until the reviewed response and enrollment refresh is installed. No synchronization was started.'],$command->errors);
     }
 
     public static function invalidProvenance(): array

@@ -79,6 +79,10 @@ class SyncPhoneNumbers extends Command
             $this->error('Wide contact phone synchronization is not enabled. No source read or replacement was started.');
             return Command::FAILURE;
         }
+        if (! $this->option('dry-run') && ! $this->option('phones-only')) {
+            $this->error('Use --phones-only until the reviewed response and enrollment refresh is installed. No synchronization was started.');
+            return Command::FAILURE;
+        }
         $this->info('[INFO] SyncPhoneNumbers: starting.');
         Log::info('SyncPhoneNumbers command started.', ['source' => $this->sourceLabel()]);
 
