@@ -14,7 +14,7 @@ final class SmsTierWindowSelectionSql
      * the exact eligible keyset sequence. The caller owns SNAPSHOT/replay and
      * repeats this statement until target rows are frozen or candidates end.
      *
-     * Binding order: remaining quantity, request ID, then canonical tiers.
+     * Binding order: remaining quantity, request ID, canonical tiers, validated debt minimum.
      */
     public static function insert(array $tiers, string $mailerDate = 'Send_Date', bool $leanDebtSources = false): string
     {
@@ -50,6 +50,7 @@ SELECT TOP (?) ?, w.Export_PK, w.Phone, r.Tier, {$debt},
 FROM #SmsTierWanted w JOIN Resolved r ON r.Export_PK=w.Export_PK
 WHERE {$valid}
   AND r.Tier IN ({$tierBindings})
+  AND r.Debt>=?
 ORDER BY w.Window_Position ASC
 OPTION (RECOMPILE)
 SQL;

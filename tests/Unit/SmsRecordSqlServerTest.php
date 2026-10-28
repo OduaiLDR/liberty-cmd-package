@@ -24,11 +24,13 @@ use PDO;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\HttpKernel\Exception\HttpException;
 
-/** Hard-wired loopback only; creates/drops only its random sms_record_test_<hex> database. */
+/** Explicit owned loopback14337 only; creates/drops its random sms_record_test_<hex> database. */
 final class SmsRecordSqlServerTest extends TestCase
 {
     private static string $database;
     private static ?PDO $admin = null;
+    private static string $password;
+    private static bool $created = false;
     private Container $previous;
     private $db;
     private SmsRunService $runs;
@@ -37,20 +39,39 @@ final class SmsRecordSqlServerTest extends TestCase
 
     public static function setUpBeforeClass(): void
     {
-        if (! in_array('sqlsrv', PDO::getAvailableDrivers(), true)) self::markTestSkipped('Loopback SQL Server PDO is required.');
+        if (getenv('SMS_RECORD_NATIVE_ACCEPT_OWNED_FIXTURE') !== '1' || ! in_array('sqlsrv', PDO::getAvailableDrivers(), true)) {
+            self::markTestSkipped('Explicit owned SMS record native fixture is required.');
+        }
+        self::$password = (string) getenv('SMS_RECORD_NATIVE_OWNED_PASSWORD');
+        if (strlen(self::$password) < 16) throw new \RuntimeException('The owned native fixture password is absent.');
         self::$database = 'sms_record_test_'.bin2hex(random_bytes(8));
-        self::$admin = new PDO('sqlsrv:Server=127.0.0.1,14330;Database=master;Encrypt=no;TrustServerCertificate=yes',
-            'sa', 'LocalDev!2026Pass', [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        for ($attempt = 0; $attempt < 20; $attempt++) {
+            try { self::$admin = self::pdo('master'); break; }
+            catch (\PDOException) { usleep(250000); }
+        }
+        if (self::$admin === null) throw new \RuntimeException('Owned native SQL authentication did not become ready.');
         self::$admin->exec('CREATE DATABASE ['.self::$database.'] COLLATE SQL_Latin1_General_CP1_CI_AS');
+        self::$created = true;
         self::$admin->exec('ALTER DATABASE ['.self::$database.'] SET ALLOW_SNAPSHOT_ISOLATION ON');
     }
 
     public static function tearDownAfterClass(): void
     {
-        if (self::$admin !== null && preg_match('/^sms_record_test_[a-f0-9]{16}$/D', self::$database)) {
+        if (self::$created && self::$admin !== null && preg_match('/^sms_record_test_[a-f0-9]{16}$/D', self::$database)) {
             self::$admin->exec('ALTER DATABASE ['.self::$database.'] SET SINGLE_USER WITH ROLLBACK IMMEDIATE');
-            self::$admin->exec('DROP DATABASE ['.self::$database.']'); self::$admin = null;
+            self::$admin->exec('DROP DATABASE ['.self::$database.']'); self::$admin = null; self::$created = false;
         }
+    }
+
+    private static function pdo(string $database): PDO
+    {
+        if ($database !== 'master' && ($database !== self::$database || ! preg_match('/^sms_record_test_[a-f0-9]{16}$/D', $database))) {
+            throw new \RuntimeException('Unexpected owned native database.');
+        }
+        $pdo = new PDO('sqlsrv:Server=127.0.0.1,14337;Database='.$database.';Encrypt=no;TrustServerCertificate=yes',
+            'sa', self::$password, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        if ($pdo->query('SELECT DB_NAME()')->fetchColumn() !== $database) throw new \RuntimeException('Owned native database identity differs.');
+        return $pdo;
     }
 
     protected function setUp(): void
@@ -66,8 +87,8 @@ final class SmsRecordSqlServerTest extends TestCase
         $container->instance('config', new Repository(['app' => ['env' => 'testing'], 'sms-exports' => [
             'record_workflow_enabled' => true, 'durable_availability_enabled' => true, 'local_root' => $this->directory], 'database' => ['default' => 'sqlsrv']]));
         $capsule = new Manager($container);
-        $capsule->addConnection(['driver' => 'sqlsrv', 'host' => '127.0.0.1,14330', 'database' => self::$database,
-            'username' => 'sa', 'password' => 'LocalDev!2026Pass', 'encrypt' => 'no', 'trust_server_certificate' => 'yes'], 'sqlsrv');
+        $capsule->addConnection(['driver' => 'sqlsrv', 'host' => '127.0.0.1,14337', 'database' => self::$database,
+            'username' => 'sa', 'password' => self::$password, 'encrypt' => 'no', 'trust_server_certificate' => 'yes'], 'sqlsrv');
         $capsule->getDatabaseManager()->setDefaultConnection('sqlsrv');
         $container->instance('db', $capsule->getDatabaseManager());
         Facade::clearResolvedInstances(); Facade::setFacadeApplication($container);
@@ -158,7 +179,8 @@ final class SmsRecordSqlServerTest extends TestCase
         return new SmsRecordExportRepository;
     }
 
-    private function source(int $pk, string $address, string $tier = 'T2', string $debt = '13500'): void
+    /** Mechanics fixtures use a floor-qualified amount; deliberate low debts are explicit. */
+    private function source(int $pk, string $address, string $tier = 'T5', string $debt = '30500'): void
     {
         $this->db->table('TblTUData')->insert(['PK' => $pk, 'Creation_Date' => '2026-10-01',
             'ncoaAddr_frstNme' => 'Synthetic', 'ncoaAddr_lastNme' => 'Person', 'ncoaAddr_addrLine1Txt' => $address,
@@ -180,7 +202,7 @@ final class SmsRecordSqlServerTest extends TestCase
         $repo = $this->selecting($target); $selected = $repo->select(self::ID, $target)['selected'];
         $drop = $this->db->table('TblSMSDrops')->insertGetId(['Request_ID' => self::ID,'Drop_Name' => 'SMS0001',
             'Debt_Tier' => 'T1','Amount_Dropped' => $selected,'Drop_Date' => '2026-10-19','Created_At' => '2026-10-20 00:00:00']);
-        $this->db->table('TblProspectsExport')->update(['Debt_Amount' => 10000,'Debt_Tier' => 'T1','Debt_Source' => 'TblTUData','SMS_Drop_PK' => $drop,'Drop_Name' => 'SMS0001']);
+        $this->db->table('TblProspectsExport')->update(['Debt_Amount' => 30000,'Debt_Tier' => 'T1','Debt_Source' => 'TblTUData','SMS_Drop_PK' => $drop,'Drop_Name' => 'SMS0001']);
         $this->db->table('TblSMSRuns')->update(['Status' => 'approving','Selected' => $selected,
             'Approved_At' => '2026-10-20 00:30:00','Approved_By' => 'synthetic@example.invalid']);
         return $repo;
@@ -203,8 +225,7 @@ final class SmsRecordSqlServerTest extends TestCase
     {
         $pk = $this->person();
         $repo = $this->readyApproval(1);
-        $other = new PDO('sqlsrv:Server=127.0.0.1,14330;Database='.self::$database.';Encrypt=no;TrustServerCertificate=yes',
-            'sa', 'LocalDev!2026Pass', [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        $other = self::pdo(self::$database);
         $other->exec('SET LOCK_TIMEOUT 250');
         $this->db->beginTransaction();
         try {
@@ -296,9 +317,8 @@ final class SmsRecordSqlServerTest extends TestCase
     {
         $pk = $this->person(); $this->readyApproval(1); $this->enableContactAttribution();
         $settings = $this->db->getConfig();
-        self::assertSame('127.0.0.1,14330', $settings['host']); self::assertSame(self::$database, $settings['database']);
-        $other = new PDO('sqlsrv:Server='.$settings['host'].';Database='.$settings['database'].';Encrypt=no;TrustServerCertificate=yes',
-            $settings['username'], $settings['password'], [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        self::assertSame('127.0.0.1,14337', $settings['host']); self::assertSame(self::$database, $settings['database']);
+        $other = self::pdo(self::$database);
         $q = $other->prepare("DECLARE @r int; EXEC @r=sys.sp_getapplock @Resource=?,@LockMode='Exclusive',@LockOwner='Session',@LockTimeout=0; SELECT @r AS result");
         $q->execute(['sms:contact-attribution']); self::assertGreaterThanOrEqual(0, (int) $q->fetchColumn()); $q->closeCursor();
         try {
@@ -334,7 +354,7 @@ final class SmsRecordSqlServerTest extends TestCase
     public function test_real_new_approval_freezes_microsecond_acceptance_and_california_day_separate_from_monday(): void
     {
         $pk = $this->person(['Address' => 'J4 fixture']); $this->source(1, 'J4 fixture');
-        $this->tierRun(1, ['T2']); $this->runs->prepare(self::ID);
+        $this->tierRun(1, ['T5']); $this->runs->prepare(self::ID);
         $this->runs->requestFile(self::ID); $this->runs->buildFile(self::ID);
         $this->enableContactAttribution(); Carbon::setTestNow(Carbon::parse('2026-10-22T06:59:59.987654Z'));
         $this->runs->requestApprove(self::ID, 'first@example.invalid');
@@ -393,8 +413,7 @@ final class SmsRecordSqlServerTest extends TestCase
     public function test_real_session_lock_rejects_competing_approval_and_delete(): void
     {
         $this->person(); $this->readyApproval(1);
-        $other = new PDO('sqlsrv:Server=127.0.0.1,14330;Database='.self::$database.';Encrypt=no;TrustServerCertificate=yes',
-            'sa','LocalDev!2026Pass',[PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        $other = self::pdo(self::$database);
         $q = $other->prepare("DECLARE @r int; EXEC @r=sys.sp_getapplock @Resource=?,@LockMode='Exclusive',@LockOwner='Session',@LockTimeout=0; SELECT @r AS result");
         $q->execute(['sms:run:'.self::ID]); self::assertGreaterThanOrEqual(0, (int) $q->fetchColumn()); $q->closeCursor();
         try {
@@ -420,14 +439,14 @@ final class SmsRecordSqlServerTest extends TestCase
         $previous = $this->person(['Address' => 'Previously', 'Last_SMS_Date' => '2026-01-01']);
         $invalid = $this->person(['Address' => 'Invalid latest', 'Creation_Date' => '2026-10-21']);
         $this->source(1, 'Wrong tier', 'T9'); $this->source(2, 'Allowed A'); $this->source(3, 'Allowed B');
-        $this->source(4, 'Previously'); $this->source(5, 'Invalid latest', 'T2', '0');
-        $this->tierRun(2, ['T2']);
+        $this->source(4, 'Previously'); $this->source(5, 'Invalid latest', 'T5', '0');
+        $this->tierRun(2, ['T5']);
         $before = $this->db->selectOne('SELECT transaction_isolation_level AS isolation_level FROM sys.dm_exec_sessions WHERE session_id=@@SPID')->isolation_level;
         $this->runs->prepare(self::ID);
         self::assertSame([$a,$b], array_map('intval', $this->db->table('TblProspectsExport')->orderBy('PK')->pluck('Prospect_PK')->all()));
         $view = $this->runs->show(self::ID);
         self::assertSame(2, $view->selected); self::assertSame(0, $view->shortfall);
-        self::assertSame([14000,14000], array_map('intval', $this->db->table('TblProspectsExport')->orderBy('PK')->pluck('Debt_Amount')->all()));
+        self::assertSame([31000,31000], array_map('intval', $this->db->table('TblProspectsExport')->orderBy('PK')->pluck('Debt_Amount')->all()));
         self::assertSame([2,3], array_map('intval', $this->db->table('TblProspectsExport')->orderBy('PK')->pluck('Debt_Source_PK')->all()));
         self::assertSame((int) $before, (int) $this->db->selectOne('SELECT transaction_isolation_level AS isolation_level FROM sys.dm_exec_sessions WHERE session_id=@@SPID')->isolation_level);
         config(['sms-exports.tier_selection_enabled' => false]);
@@ -441,6 +460,21 @@ final class SmsRecordSqlServerTest extends TestCase
         self::assertSame(2, (int) $this->db->table('TblProspects')->sum('SMS_Attempts'));
     }
 
+    public function test_real_below_floor_source_is_separate_from_eligible_mechanics_and_does_not_consume_quantity(): void
+    {
+        $low = $this->person(['Address' => 'Explicit below floor', 'Creation_Date' => '2026-10-23']);
+        $allowed = $this->person(['Address' => 'Floor qualified', 'Creation_Date' => '2026-10-22']);
+        $this->source(1, 'Explicit below floor', 'T5', '24999.99');
+        $this->source(2, 'Floor qualified');
+        $this->tierRun(1, ['T5']);
+        $this->runs->prepare(self::ID);
+        self::assertSame([$allowed], array_map('intval', $this->db->table('TblProspectsExport')->pluck('Prospect_PK')->all()));
+        self::assertSame(31000, (int) $this->db->table('TblProspectsExport')->value('Debt_Amount'));
+        self::assertSame(0, $this->db->table('TblProspectsExport')->where('Prospect_PK', $low)->count());
+        self::assertSame([1,0], [$this->runs->show(self::ID)->selected,$this->runs->show(self::ID)->shortfall]);
+        self::assertSame(0, (int) $this->db->table('TblProspects')->sum('SMS_Attempts'));
+    }
+
     public function test_lean_v3_keeps_exact_tu_pk_and_gives_tier_fallback_no_second_source_id(): void
     {
         $tu = $this->person(['Address' => 'Lean TU']);
@@ -448,13 +482,13 @@ final class SmsRecordSqlServerTest extends TestCase
         $mailer = $this->person(['Address' => 'Lean Mailer']);
         $this->source(41, 'Lean TU');
         $this->db->table('TblMailers')->insert(['PK' => 51, 'Client' => 'Synthetic Person', 'Address' => 'Lean Tier',
-            'Zip' => '00123', 'Drop_Name' => 'LEAN-DROP', 'Debt_Amount' => null, 'Debt_Tier' => 'T2']);
+            'Zip' => '00123', 'Drop_Name' => 'LEAN-DROP', 'Debt_Amount' => null, 'Debt_Tier' => 'T5']);
         $this->db->table('TblMailers')->insert(['PK' => 52, 'Client' => 'Synthetic Person', 'Address' => 'Lean Mailer',
-            'Zip' => '00123', 'Drop_Name' => 'LEAN-DROP', 'Debt_Amount' => 13500, 'Debt_Tier' => 'T2']);
+            'Zip' => '00123', 'Drop_Name' => 'LEAN-DROP', 'Debt_Amount' => 30500, 'Debt_Tier' => 'T5']);
         $this->db->table('TblMarketing')->insert(['Drop_Name' => 'LEAN-DROP', 'Send_Date' => '2026-10-01']);
         self::assertTrue(SmsLeanHistorySchema::ready($this->db));
 
-        $options = $this->tierRun(3, ['T2'], SmsRunOptions::LEAN_WINDOWED_TIER_SELECTION_POLICY);
+        $options = $this->tierRun(3, ['T5'], SmsRunOptions::LEAN_WINDOWED_TIER_SELECTION_POLICY);
         $this->runs->prepare(self::ID);
         $rows = $this->db->table('TblProspectsExport')->orderBy('Prospect_PK')->get(['Prospect_PK','Debt_Source','Debt_Source_PK']);
         self::assertSame([$tu,$tier,$mailer], array_map('intval', $rows->pluck('Prospect_PK')->all()));
@@ -491,14 +525,14 @@ final class SmsRecordSqlServerTest extends TestCase
         $second = $this->person(['Address' => 'Diff second', 'Creation_Date' => null]);
         $previous = $this->person(['Address' => 'Diff previous', 'Creation_Date' => '2026-10-22', 'Last_SMS_Date' => '2026-01-01']);
         $this->source(1, 'Diff wrong', 'T9');
-        $this->source(2, 'Diff held', 'T2', '0');
+        $this->source(2, 'Diff held', 'T5', '0');
         $this->source(3, 'Diff first');
         $this->source(4, 'Diff second');
         $this->source(5, 'Diff previous');
         config(['sms-exports.run_file_options_enabled' => true, 'sms-exports.tier_selection_enabled' => true,
             'sms-exports.tier_selection_windowed_enabled' => false, 'sms-exports.tier_selection_window_size' => 2]);
 
-        $v1 = SmsRunOptions::normalize(3, 3, ['T2'], SmsRunOptions::TIER_SELECTION_POLICY);
+        $v1 = SmsRunOptions::normalize(3, 3, ['T5'], SmsRunOptions::TIER_SELECTION_POLICY);
         $this->runs->start(self::ID, 3, 'synthetic@example.invalid', $v1);
         $this->db->table('TblSMSRuns')->where('Request_ID', self::ID)->update(['Status' => 'selecting']);
         $repo = new SmsRecordExportRepository;
@@ -512,7 +546,7 @@ final class SmsRecordSqlServerTest extends TestCase
         $this->db->table('TblSMSRuns')->where('Request_ID', self::ID)->update(['Status' => 'discarded']);
         $this->db->table('TblProspectsExport')->where('Request_ID', self::ID)->delete();
         config(['sms-exports.tier_selection_windowed_enabled' => true]);
-        $v2 = SmsRunOptions::normalize(3, 3, ['T2'], SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY);
+        $v2 = SmsRunOptions::normalize(3, 3, ['T5'], SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY);
         $this->runs->start($v2id, 3, 'synthetic@example.invalid', $v2);
         $this->db->table('TblSMSRuns')->where('Request_ID', $v2id)->update(['Status' => 'selecting']);
         self::assertSame(3, $repo->select($v2id, 3)['selected']);
@@ -527,7 +561,7 @@ final class SmsRecordSqlServerTest extends TestCase
         $this->db->unprepared('DROP INDEX IX_TblMarketing_SMS_Drop_SendDate ON dbo.TblMarketing');
         try {
             self::assertFalse($this->runs->overview()['capabilities']['tier_subset']);
-            $options = SmsRunOptions::normalize(1, 1, ['T2'], SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY);
+            $options = SmsRunOptions::normalize(1, 1, ['T5'], SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY);
             try { $this->runs->start(self::ID, 1, 'synthetic@example.invalid', $options); self::fail('Expected missing seek schema refusal.'); }
             catch (HttpException $error) { self::assertSame(503, $error->getStatusCode()); }
             self::assertSame(0, $this->db->table('TblSMSRuns')->count());
@@ -577,7 +611,7 @@ final class SmsRecordSqlServerTest extends TestCase
         $first = $this->person(['Address' => 'First page', 'Creation_Date' => '2026-10-22']);
         $second = $this->person(['Address' => 'Failure page2', 'Creation_Date' => '2026-10-21']);
         $this->source(1, 'First page'); $this->source(2, 'Failure page2');
-        $this->tierRun(2, ['T2']); config(['sms-exports.tier_selection_window_size' => 1]);
+        $this->tierRun(2, ['T5']); config(['sms-exports.tier_selection_window_size' => 1]);
         $this->db->table('TblSMSRuns')->update(['Status' => 'selecting']);
         $this->db->unprepared("CREATE TRIGGER dbo.SmsRecordRejectSelection ON dbo.TblProspectsExport AFTER INSERT AS BEGIN
             IF EXISTS (SELECT 1 FROM inserted WHERE Address='Failure page2')
@@ -605,10 +639,9 @@ final class SmsRecordSqlServerTest extends TestCase
         $first = $this->person(['Address' => 'Snapshot first', 'Creation_Date' => '2026-10-22']);
         $second = $this->person(['Address' => 'Snapshot second', 'Creation_Date' => '2026-10-21']);
         $this->source(1, 'Snapshot first'); $this->source(2, 'Snapshot second');
-        $this->tierRun(3, ['T2']); config(['sms-exports.tier_selection_window_size' => 1]);
+        $this->tierRun(3, ['T5']); config(['sms-exports.tier_selection_window_size' => 1]);
         $this->db->table('TblSMSRuns')->update(['Status' => 'selecting']);
-        $writer = new PDO('sqlsrv:Server=127.0.0.1,14330;Database='.self::$database.';Encrypt=no;TrustServerCertificate=yes',
-            'sa', 'LocalDev!2026Pass', [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        $writer = self::pdo(self::$database);
         $writer->exec('SET LOCK_TIMEOUT 3000');
         $injected = false;
         $this->db->setEventDispatcher(new \Illuminate\Events\Dispatcher(Container::getInstance()));
@@ -618,13 +651,13 @@ final class SmsRecordSqlServerTest extends TestCase
             $writer->exec("UPDATE dbo.TblTUData SET Tier_Tag='T9',derivedFields1_unsecdebtbalance=85000 WHERE PK=2;
                 INSERT dbo.TblProspects (Client,Address,Phone,State,Zip,Creation_Date) VALUES ('Synthetic Person','Concurrent newcomer','0005550100','CA','00123','2026-10-23');
                 INSERT dbo.TblTUData (PK,Creation_Date,ncoaAddr_frstNme,ncoaAddr_lastNme,ncoaAddr_addrLine1Txt,ncoaAddr_zipCde,derivedFields1_unsecdebtbalance,Tier_Tag)
-                VALUES (3,'2026-10-01','Synthetic','Person','Concurrent newcomer','00123',13500,'T2')");
+                VALUES (3,'2026-10-01','Synthetic','Person','Concurrent newcomer','00123',30500,'T5')");
         });
         try { self::assertSame(2, (new SmsRecordExportRepository)->select(self::ID, 3)['selected']); }
         finally { $this->db->unsetEventDispatcher(); }
         self::assertTrue($injected);
         self::assertSame([$first,$second], array_map('intval', $this->db->table('TblProspectsExport')->orderBy('PK')->pluck('Prospect_PK')->all()));
-        self::assertSame(['T2','T2'], $this->db->table('TblProspectsExport')->orderBy('PK')->pluck('Debt_Tier')->all());
+        self::assertSame(['T5','T5'], $this->db->table('TblProspectsExport')->orderBy('PK')->pluck('Debt_Tier')->all());
         self::assertSame('T9', $this->db->table('TblTUData')->where('PK', 2)->value('Tier_Tag'));
         self::assertSame(3, $this->db->table('TblProspects')->count());
     }
@@ -639,7 +672,7 @@ final class SmsRecordSqlServerTest extends TestCase
             $expected[] = $this->person(['Address' => $address, 'Last_SMS_Date' => '2026-01-01']);
         }
         foreach (['TU blocks mailer','Unknown date','Conflicting date'] as $address) $this->person(['Address' => $address, 'Creation_Date' => '2026-10-23']);
-        $this->source(4, 'TU blocks mailer', 'T2', '0');
+        $this->source(4, 'TU blocks mailer', 'T5', '0');
         $this->db->table('TblMarketing')->insert([
             ['Drop_Name' => 'Known', 'Send_Date' => '2026-10-01'],
             ['Drop_Name' => 'Newer', 'Send_Date' => '2026-10-20'],
@@ -648,10 +681,10 @@ final class SmsRecordSqlServerTest extends TestCase
             ['Drop_Name' => 'Conflict', 'Send_Date' => '2026-10-02'],
         ]);
         foreach ([
-            ['Mailer positive','Known',13500,'T2'], ['Mailer positive','Newer',null,'T9'],
-            ['Mailer fallback','Known',null,'T2'], ['Mailer agreeing','Known',13500,'T2'],
-            ['Mailer agreeing','Known',13500,'T2'], ['TU blocks mailer','Known',13500,'T2'],
-            ['Unknown date','Unknown',13500,'T2'], ['Conflicting date','Conflict',13500,'T2'],
+            ['Mailer positive','Known',30500,'T5'], ['Mailer positive','Newer',null,'T9'],
+            ['Mailer fallback','Known',null,'T5'], ['Mailer agreeing','Known',30500,'T5'],
+            ['Mailer agreeing','Known',30500,'T5'], ['TU blocks mailer','Known',30500,'T5'],
+            ['Unknown date','Unknown',30500,'T5'], ['Conflicting date','Conflict',30500,'T5'],
         ] as $i => [$address,$drop,$debt,$tier]) {
             $this->db->table('TblMailers')->insert(['PK' => $i + 1, 'Client' => 'Synthetic Person', 'Address' => $address,
                 'Zip' => '00123-9999', 'Drop_Name' => $drop, 'Debt_Amount' => $debt, 'Debt_Tier' => $tier]);
@@ -659,14 +692,14 @@ final class SmsRecordSqlServerTest extends TestCase
         config(['sms-exports.run_file_options_enabled' => true,'sms-exports.tier_selection_enabled' => true]);
         $repo = new SmsRecordExportRepository;
         $columns = ['Prospect_PK','Debt_Tier','Debt_Amount','Debt_Source','Debt_Source_PK','Was_Previously_Texted','Last_SMS_Date_At_Selection'];
-        $v1 = SmsRunOptions::normalize(9, 9, ['T2'], SmsRunOptions::TIER_SELECTION_POLICY);
+        $v1 = SmsRunOptions::normalize(9, 9, ['T5'], SmsRunOptions::TIER_SELECTION_POLICY);
         $this->runs->start(self::ID, 9, 'synthetic@example.invalid', $v1);
         $this->db->table('TblSMSRuns')->update(['Status' => 'selecting']);
         self::assertSame(6, $repo->select(self::ID, 9)['selected']);
         $baseline = $this->db->table('TblProspectsExport')->orderBy('PK')->get($columns)->toJson();
         self::assertSame($expected, array_map('intval', $this->db->table('TblProspectsExport')->orderBy('PK')->pluck('Prospect_PK')->all()));
         $this->db->table('TblProspectsExport')->delete(); $this->db->table('TblSMSRuns')->delete();
-        $this->tierRun(9, ['T2']); config(['sms-exports.tier_selection_window_size' => 1]);
+        $this->tierRun(9, ['T5']); config(['sms-exports.tier_selection_window_size' => 1]);
         $this->db->table('TblSMSRuns')->update(['Status' => 'selecting']);
         self::assertSame(6, $repo->select(self::ID, 9)['selected']);
         self::assertSame($baseline, $this->db->table('TblProspectsExport')->orderBy('PK')->get($columns)->toJson());
@@ -683,14 +716,14 @@ final class SmsRecordSqlServerTest extends TestCase
             INSERT dbo.TblProspects (Client,Address,Phone,State,Zip,Creation_Date)
             SELECT 'Synthetic Person',CONCAT('Scale ',n),'0005550100','CA','00123',DATEADD(DAY,-CAST(n/1000 AS int),CAST('2026-10-22' AS date)) FROM n;
             INSERT dbo.TblTUData (PK,Creation_Date,ncoaAddr_frstNme,ncoaAddr_lastNme,ncoaAddr_addrLine1Txt,ncoaAddr_zipCde,derivedFields1_unsecdebtbalance,Tier_Tag)
-            SELECT PK,'2026-10-01','Synthetic','Person',Address,'00123',13500,'T2' FROM dbo.TblProspects", [$population]);
+            SELECT PK,'2026-10-01','Synthetic','Person',Address,'00123',30500,'T5' FROM dbo.TblProspects", [$population]);
         self::assertSame($population, $this->db->table('TblProspects')->count());
         self::assertSame($population, $this->db->table('TblTUData')->count());
         config(['sms-exports.run_file_options_enabled' => true,'sms-exports.tier_selection_enabled' => true,
             'sms-exports.tier_selection_windowed_enabled' => true,'sms-exports.tier_selection_window_size' => 5000]);
         foreach (array_values(array_unique([100,1000,100000,$population])) as $target) {
             $id = sprintf('%08d-bbbb-4ccc-8ddd-eeeeeeeeeeee', $target);
-            $options = SmsRunOptions::normalize($target, 100000, ['T2'], SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY);
+            $options = SmsRunOptions::normalize($target, 100000, ['T5'], SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY);
             $this->runs->start($id, $target, 'synthetic@example.invalid', $options);
             $this->db->table('TblSMSRuns')->where('Request_ID', $id)->update(['Status' => 'selecting']);
             $started = microtime(true); $result = (new SmsRecordExportRepository)->select($id, $target);
@@ -749,11 +782,11 @@ final class SmsRecordSqlServerTest extends TestCase
         foreach ($cases as $i => $values) {
             $address = 'Disjoint case '.$i;
             $pk = $this->person(['Address' => $address] + $values);
-            $this->source($i + 1, $address, $i === 4 ? 'T9' : 'T2', $i === 1 ? '0' : '13500');
+            $this->source($i + 1, $address, $i === 4 ? 'T9' : 'T5', $i === 1 ? '0' : '30500');
             if (! in_array($i, [1,4], true)) $expected[] = $pk;
         }
         config(['sms-exports.run_file_options_enabled' => true,'sms-exports.tier_selection_enabled' => true]);
-        $this->runs->start(self::ID, 18, 'synthetic@example.invalid', SmsRunOptions::normalize(18, 18, ['T2'], SmsRunOptions::TIER_SELECTION_POLICY));
+        $this->runs->start(self::ID, 18, 'synthetic@example.invalid', SmsRunOptions::normalize(18, 18, ['T5'], SmsRunOptions::TIER_SELECTION_POLICY));
         $this->db->table('TblSMSRuns')->update(['Status' => 'selecting']);
         $repo = new SmsRecordExportRepository;
         self::assertSame(16, $repo->select(self::ID, 18)['selected']);
@@ -761,7 +794,7 @@ final class SmsRecordSqlServerTest extends TestCase
         $baseline = $this->db->table('TblProspectsExport')->orderBy('PK')->get($columns)->toJson();
         self::assertSame($expected, array_map('intval', $this->db->table('TblProspectsExport')->orderBy('PK')->pluck('Prospect_PK')->all()));
         $this->db->table('TblProspectsExport')->delete(); $this->db->table('TblSMSRuns')->delete();
-        $this->tierRun(18, ['T2']);
+        $this->tierRun(18, ['T5']);
         $this->db->table('TblSMSRuns')->update(['Status' => 'selecting']);
         self::assertSame(16, $repo->select(self::ID, 18)['selected']);
         self::assertSame($baseline, $this->db->table('TblProspectsExport')->orderBy('PK')->get($columns)->toJson());
@@ -781,14 +814,14 @@ final class SmsRecordSqlServerTest extends TestCase
             ['Phone' => '110005550104'], ['Phone' => '00005550105'], ['Phone' => null],
         ]);
         config(['sms-exports.run_file_options_enabled' => true,'sms-exports.tier_selection_enabled' => true]);
-        $v1 = SmsRunOptions::normalize(7, 7, ['T2'], SmsRunOptions::TIER_SELECTION_POLICY);
+        $v1 = SmsRunOptions::normalize(7, 7, ['T5'], SmsRunOptions::TIER_SELECTION_POLICY);
         $this->runs->start(self::ID, 7, 'synthetic@example.invalid', $v1);
         $this->db->table('TblSMSRuns')->update(['Status' => 'selecting']);
         $repo = new SmsRecordExportRepository;
         self::assertSame(3, $repo->select(self::ID, 7)['selected']);
         self::assertSame($expected, array_map('intval', $this->db->table('TblProspectsExport')->orderBy('PK')->pluck('Prospect_PK')->all()));
         $this->db->table('TblProspectsExport')->delete(); $this->db->table('TblSMSRuns')->delete();
-        $this->tierRun(7, ['T2']); config(['sms-exports.tier_selection_window_size' => 1]);
+        $this->tierRun(7, ['T5']); config(['sms-exports.tier_selection_window_size' => 1]);
         $this->db->table('TblSMSRuns')->update(['Status' => 'selecting']);
         self::assertSame(3, $repo->select(self::ID, 7)['selected']);
         self::assertSame($expected, array_map('intval', $this->db->table('TblProspectsExport')->orderBy('PK')->pluck('Prospect_PK')->all()));
@@ -799,7 +832,7 @@ final class SmsRecordSqlServerTest extends TestCase
         foreach (['No count first','No count second','No count third'] as $i => $address) {
             $this->person(['Address' => $address]); $this->source($i + 1, $address);
         }
-        $this->tierRun(3, ['T2']); config(['sms-exports.tier_selection_window_size' => 1]);
+        $this->tierRun(3, ['T5']); config(['sms-exports.tier_selection_window_size' => 1]);
         $this->db->table('TblSMSRuns')->update(['Status' => 'selecting']);
         $this->db->unprepared('SET NOCOUNT ON');
         try {
@@ -814,7 +847,7 @@ final class SmsRecordSqlServerTest extends TestCase
     public function test_real_committed_selection_retry_keeps_source_prices_after_creation_flag_and_sources_change(): void
     {
         $this->person(['Address' => 'Frozen']); $this->source(1, 'Frozen');
-        $options = $this->tierRun(5, ['T2']);
+        $options = $this->tierRun(5, ['T5']);
         $this->db->table('TblSMSRuns')->update(['Status' => 'selecting']);
         $repo = new SmsRecordExportRepository;
         self::assertSame(1, $repo->select(self::ID, 5)['selected']);
@@ -826,14 +859,14 @@ final class SmsRecordSqlServerTest extends TestCase
         self::assertSame('review', $this->runs->show(self::ID)->status);
         self::assertSame(4, $this->runs->show(self::ID)->shortfall);
         self::assertSame($options, $this->runs->show(self::ID)->options);
-        self::assertSame('T2', $this->db->table('TblProspectsExport')->value('Debt_Tier'));
-        self::assertSame(14000, (int) $this->db->table('TblProspectsExport')->value('Debt_Amount'));
-        self::assertSame('T2', $this->db->table('TblSMSDrops')->value('Debt_Tier'));
+        self::assertSame('T5', $this->db->table('TblProspectsExport')->value('Debt_Tier'));
+        self::assertSame(31000, (int) $this->db->table('TblProspectsExport')->value('Debt_Amount'));
+        self::assertSame('T5', $this->db->table('TblSMSDrops')->value('Debt_Tier'));
     }
 
     public function test_real_source_selection_insert_failure_rolls_back_and_restores_snapshot_settings(): void
     {
-        $this->person(['Address' => 'Failure']); $this->source(1, 'Failure'); $this->tierRun(2, ['T2']);
+        $this->person(['Address' => 'Failure']); $this->source(1, 'Failure'); $this->tierRun(2, ['T5']);
         $this->db->table('TblSMSRuns')->update(['Status' => 'selecting']);
         $this->db->unprepared("CREATE TRIGGER dbo.SmsRecordRejectSelection ON dbo.TblProspectsExport AFTER INSERT AS BEGIN THROW 52902,'Synthetic selector failure.',1; END");
         $repo = new SmsRecordExportRepository;
@@ -849,7 +882,7 @@ final class SmsRecordSqlServerTest extends TestCase
     public function test_real_empty_committed_selection_remains_empty_when_retry_sources_change(): void
     {
         $this->person(['Address' => 'Initially unresolved']);
-        $this->tierRun(5, ['T2']);
+        $this->tierRun(5, ['T5']);
         $this->db->table('TblSMSRuns')->update(['Status' => 'selecting']);
         $repo = new SmsRecordExportRepository;
         self::assertSame(0, $repo->select(self::ID, 5)['selected']);
@@ -985,10 +1018,10 @@ final class SmsRecordSqlServerTest extends TestCase
             self::assertTrue($delivery->isDeleted());
         };
         foreach (['HTTP A', 'HTTP B', 'HTTP C', 'Wrong tier'] as $i => $address) {
-            $this->person(['Address' => $address]); $this->source($i + 1, $address, $i === 3 ? 'T9' : 'T2');
+            $this->person(['Address' => $address]); $this->source($i + 1, $address, $i === 3 ? 'T9' : 'T5');
         }
         $input = ['request_id' => self::ID, 'target' => 5, 'rows_per_file' => 2,
-            'csv_format' => SmsRunOptions::CSV_FORMAT, 'tiers' => ['T2'], 'tier_selection_policy' => SmsRunOptions::TIER_SELECTION_POLICY,
+            'csv_format' => SmsRunOptions::CSV_FORMAT, 'tiers' => ['T5'], 'tier_selection_policy' => SmsRunOptions::TIER_SELECTION_POLICY,
             'options_version' => SmsRunOptions::PLANNED_DATE_VERSION, 'send_date' => '2026-10-26',
             'filename_version' => SmsRunOptions::APPROVAL_FILENAME_VERSION];
         self::assertSame(403, $http('POST', 'runs', $input, 'agent')->getStatusCode());
@@ -1001,7 +1034,7 @@ final class SmsRecordSqlServerTest extends TestCase
         $deliver('prepare');
         $review = $http('GET', 'runs/'.self::ID, [], 'agent')->getData(true);
         self::assertSame(['review', 3, 2], [$review['status'], $review['selected'], $review['shortfall']]);
-        self::assertSame(['T2'], $review['options']['tiers']); self::assertSame(2, $review['options']['rows_per_file']);
+        self::assertSame(['T5'], $review['options']['tiers']); self::assertSame(2, $review['options']['rows_per_file']);
         self::assertSame('manager@example.invalid', $review['created_by']);
         self::assertSame('pending', $review['id_status']);
         self::assertSame(0, $this->db->table('TblSMSDrops')->count());
@@ -1053,7 +1086,7 @@ final class SmsRecordSqlServerTest extends TestCase
                     self::assertSame(['First name', 'debt load', 'phone1', 'send date'], fgetcsv($stream, null, ',', '"', ''));
                     $partRows = 0;
                     while (($row = fgetcsv($stream, null, ',', '"', '')) !== false) {
-                        self::assertCount(4, $row); self::assertSame(['14000', '0005550100', '2026-10-26'], array_slice($row, 1));
+                        self::assertCount(4, $row); self::assertSame(['31000', '0005550100', '2026-10-26'], array_slice($row, 1));
                         $partRows++; $rowsRead++;
                     }
                     self::assertSame($part['rows'], $partRows);
@@ -1206,7 +1239,7 @@ final class SmsRecordSqlServerTest extends TestCase
     {
         $this->person(['Address' => 'Archive A']); $this->person(['Address' => 'Archive B']);
         $this->source(1, 'Archive A'); $this->source(2, 'Archive B');
-        $this->tierRun(2, ['T2']); $this->runs->prepare(self::ID);
+        $this->tierRun(2, ['T5']); $this->runs->prepare(self::ID);
         $this->runs->requestFile(self::ID); $this->runs->buildFile(self::ID);
         $this->runs->requestApprove(self::ID, 'synthetic@example.invalid'); $this->runs->markApproved(self::ID);
         $history = $this->db->table('TblSMSHistory')->orderBy('PK')->get()->toJson();
@@ -1265,10 +1298,9 @@ final class SmsRecordSqlServerTest extends TestCase
             $this->person();
             config(['sms-exports.tu_completion_date_enabled' => true]);
             $settings = $this->db->getConfig();
-            self::assertSame('127.0.0.1,14330', $settings['host']);
+            self::assertSame('127.0.0.1,14337', $settings['host']);
             self::assertSame(self::$database, $settings['database']);
-            $writer = new PDO('sqlsrv:Server='.$settings['host'].';Database='.$settings['database'].';Encrypt=no;TrustServerCertificate=yes',
-                $settings['username'], $settings['password'], [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+            $writer = self::pdo(self::$database);
             $export = new class($writer) extends SmsProspectExportRepository {
                 public function __construct(private ?PDO $writer) {}
                 public function availabilityWithTimeout(): array

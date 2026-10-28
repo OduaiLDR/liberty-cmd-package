@@ -5,6 +5,7 @@ namespace Cmd\Reports\Http\Controllers;
 use Cmd\Reports\Services\SmsAvailabilityService;
 use Cmd\Reports\Services\SmsRunService;
 use Cmd\Reports\Services\SmsRunOptions;
+use Cmd\Reports\Services\SmsDebtPolicy;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Routing\Controller;
@@ -61,7 +62,8 @@ class SmsRunController extends Controller
         $data = Validator::make($request->all(), [
             'request_id' => ['required', 'uuid'],
             'target' => ['required', 'integer', 'min:1', 'max:'.SmsRunService::MAX_TARGET],
-            'csv_format' => ['required_with:rows_per_file,tiers,tier_selection_policy,options_version,send_date,filename_version', 'sometimes', 'string', 'in:'.SmsRunOptions::CSV_FORMAT],
+            'csv_format' => ['required_with:rows_per_file,tiers,tier_selection_policy,options_version,send_date,filename_version,minimum_debt_amount', 'sometimes', 'string', 'in:'.SmsRunOptions::CSV_FORMAT],
+            'minimum_debt_amount' => ['sometimes', 'integer', 'min:'.SmsDebtPolicy::FLOOR, 'max:'.SmsDebtPolicy::MAX],
             'options_version' => ['sometimes', 'string', 'in:'.SmsRunOptions::PLANNED_DATE_VERSION],
             'filename_version' => ['sometimes', 'string', 'in:'.SmsRunOptions::DROP_RANGE_FILENAME_VERSION.','.SmsRunOptions::APPROVAL_FILENAME_VERSION],
             'send_date' => ['sometimes', 'string', 'date_format:Y-m-d'],
@@ -78,7 +80,7 @@ class SmsRunController extends Controller
         $this->ensureSchemaReady();
 
         if (! isset($data['csv_format']) && (array_key_exists('rows_per_file', $data) || array_key_exists('tiers', $data) || array_key_exists('tier_selection_policy', $data)
-            || array_key_exists('options_version', $data) || array_key_exists('send_date', $data) || array_key_exists('filename_version', $data))) {
+            || array_key_exists('options_version', $data) || array_key_exists('send_date', $data) || array_key_exists('filename_version', $data) || array_key_exists('minimum_debt_amount', $data))) {
             throw \Illuminate\Validation\ValidationException::withMessages(['csv_format' => 'Choose the explicit SMS file format when supplying file options.']);
         }
         $options = isset($data['csv_format']) ? [
@@ -87,6 +89,7 @@ class SmsRunController extends Controller
             'tiers' => $data['tiers'] ?? null,
         ] : null;
         if ($options !== null && isset($data['tier_selection_policy'])) $options['tier_selection_policy'] = $data['tier_selection_policy'];
+        if ($options !== null && isset($data['minimum_debt_amount'])) $options['minimum_debt_amount'] = (int) $data['minimum_debt_amount'];
         foreach (['options_version', 'send_date', 'filename_version'] as $key) if ($options !== null && isset($data[$key])) $options[$key] = $data[$key];
         // Keep old callers' three-argument contract intact.
         $id = strtolower($data['request_id']);

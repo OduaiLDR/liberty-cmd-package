@@ -57,7 +57,7 @@ beforeEach(function (): void {
         public function lookupDebts(string $id, array $debts = [], ?callable $progress = null): array
         {
             $this->table('TblProspectsExport')->where('Request_ID', $id)->update([
-                'Debt_Amount' => 14000, 'Debt_Tier' => 'T2', 'Debt_Source' => 'TblMailers', 'Debt_Source_PK' => 123,
+                'Debt_Amount' => 30000, 'Debt_Tier' => 'T5', 'Debt_Source' => 'TblMailers', 'Debt_Source_PK' => 123,
             ]);
             return [];
         }
@@ -131,7 +131,7 @@ beforeEach(function (): void {
     $this->controller = new SmsRunController($this->service);
     $this->id = '11111111-2222-4333-8444-555555555555';
     $this->otherId = '22222222-3333-4444-8555-666666666666';
-    $this->options = SmsRunOptions::normalize(7, 3);
+    $this->fileOptions = SmsRunOptions::normalize(7, 3);
     $this->seedMembers = function (int $count = 5): void {
         for ($i = 0; $i < $count; $i++) {
             $this->db->table('TblProspects')->insert(['Client' => $i === 0 ? '=Synthetic Person' : 'Synthetic Person'.$i,
@@ -141,15 +141,15 @@ beforeEach(function (): void {
     };
     $this->prepareVersioned = function (): void {
         ($this->seedMembers)();
-        $this->service->start($this->id, 7, 'editor@example.invalid', $this->options);
+        $this->service->start($this->id, 7, 'editor@example.invalid', $this->fileOptions);
         $this->service->prepare($this->id);
     };
     $this->prepareApprovalVersion = function (): void {
         config(['sms-exports.approval_only_creation_enabled' => true]);
-        $this->options = SmsRunOptions::normalize(7, 3, null, null, SmsRunOptions::PLANNED_DATE_VERSION, '2026-10-26', SmsRunOptions::APPROVAL_FILENAME_VERSION);
+        $this->fileOptions = SmsRunOptions::normalize(7, 3, null, null, SmsRunOptions::PLANNED_DATE_VERSION, '2026-10-26', SmsRunOptions::APPROVAL_FILENAME_VERSION);
         ($this->prepareVersioned)();
         $first = $this->db->table('TblProspectsExport')->where('Request_ID', $this->id)->orderBy('Prospect_PK')->limit(2)->pluck('Prospect_PK')->all();
-        $this->db->table('TblProspectsExport')->where('Request_ID', $this->id)->whereIn('Prospect_PK', $first)->update(['Debt_Tier' => 'T1', 'Debt_Amount' => 10000]);
+        $this->db->table('TblProspectsExport')->where('Request_ID', $this->id)->whereIn('Prospect_PK', $first)->update(['Debt_Tier' => 'T6', 'Debt_Amount' => 42000]);
         $this->service->requestFile($this->id); $this->service->buildFile($this->id);
     };
     $this->makeFile = function (): string {
@@ -178,10 +178,10 @@ afterEach(function (): void {
 });
 
 test('versioned starts persist all options and compare the complete request on replay', function (): void {
-    $first = $this->service->start($this->id, 7, 'editor@example.invalid', $this->options);
-    expect($first->options)->toBe($this->options)->and($first->status)->toBe('queued');
-    expect(json_decode($this->db->table('TblSMSRuns')->value('Run_Options_JSON'), true))->toBe($this->options);
-    $this->service->start($this->id, 7, 'editor@example.invalid', $this->options);
+    $first = $this->service->start($this->id, 7, 'editor@example.invalid', $this->fileOptions);
+    expect($first->options)->toBe($this->fileOptions)->and($first->status)->toBe('queued');
+    expect(json_decode($this->db->table('TblSMSRuns')->value('Run_Options_JSON'), true))->toBe($this->fileOptions);
+    $this->service->start($this->id, 7, 'editor@example.invalid', $this->fileOptions);
     expect($this->service->queued)->toHaveCount(1);
     expect(fn () => $this->service->start($this->id, 7, 'editor@example.invalid', SmsRunOptions::normalize(7, 4)))->toThrow(HttpException::class);
     expect(fn () => $this->service->start($this->id, 7, 'editor@example.invalid', SmsRunOptions::normalize(7, 3, ['T2'])))->toThrow(HttpException::class);
@@ -190,15 +190,15 @@ test('versioned starts persist all options and compare the complete request on r
 });
 
 test('creation flag changes do not reinterpret a versioned retry or old optionless run', function (): void {
-    $this->service->start($this->id, 7, 'editor@example.invalid', $this->options);
+    $this->service->start($this->id, 7, 'editor@example.invalid', $this->fileOptions);
     config(['sms-exports.run_file_options_enabled' => false]);
-    expect($this->service->start($this->id, 7, 'editor@example.invalid', $this->options)->options)->toBe($this->options);
+    expect($this->service->start($this->id, 7, 'editor@example.invalid', $this->fileOptions)->options)->toBe($this->fileOptions);
     expect($this->service->overview()['capabilities'])->toBeNull();
-    expect(fn () => $this->service->start($this->otherId, 7, 'editor@example.invalid', $this->options))->toThrow(HttpException::class);
+    expect(fn () => $this->service->start($this->otherId, 7, 'editor@example.invalid', $this->fileOptions))->toThrow(HttpException::class);
     $this->db->table('TblSMSRuns')->where('Request_ID', $this->id)->update(['Status' => 'discarded']);
     config(['sms-exports.run_file_options_enabled' => true]);
     $legacy = $this->service->start($this->otherId, 7, 'editor@example.invalid');
-    expect($legacy->options)->toBeNull()->and($this->service->overview()['recent'][0]->options)->toBe($this->options);
+    expect($legacy->options)->toBeNull()->and($this->service->overview()['recent'][0]->options)->toBe($this->fileOptions);
 });
 
 test('capability requires the complete additive schema and explicit new requests fail before writes', function (): void {
@@ -210,7 +210,7 @@ test('capability requires the complete additive schema and explicit new requests
     ]);
     $this->db->getSchemaBuilder()->table('TblSMSRuns', fn (Blueprint $table) => $table->dropColumn('Artifact_Manifest_JSON'));
     expect($this->service->overview()['capabilities'])->toBeNull();
-    expect(fn () => $this->service->start($this->id, 7, 'editor@example.invalid', $this->options))->toThrow(HttpException::class);
+    expect(fn () => $this->service->start($this->id, 7, 'editor@example.invalid', $this->fileOptions))->toThrow(HttpException::class);
     expect($this->db->table('TblSMSRuns')->count())->toBe(0)->and($this->service->queued)->toBe([]);
     expect($this->service->start($this->id, 7, 'editor@example.invalid')->options)->toBeNull();
 });
@@ -247,9 +247,9 @@ test('explicit California today is accepted while new past malformed and unversi
 });
 
 test('future non-Monday date remains frozen through later-week selection generation and approval', function (): void {
-    $this->options = SmsRunOptions::normalize(7, 3, null, null, SmsRunOptions::PLANNED_DATE_VERSION, '2026-11-10');
+    $this->fileOptions = SmsRunOptions::normalize(7, 3, null, null, SmsRunOptions::PLANNED_DATE_VERSION, '2026-11-10');
     ($this->seedMembers)();
-    $this->service->start($this->id, 7, 'editor@example.invalid', $this->options);
+    $this->service->start($this->id, 7, 'editor@example.invalid', $this->fileOptions);
     Carbon::setTestNow(Carbon::parse('2026-11-03T18:00:00Z'));
     $this->service->prepare($this->id);
     expect($this->db->table('TblSMSDrops')->value('Drop_Date'))->toBe('2026-11-10');
@@ -275,9 +275,9 @@ test('future non-Monday date remains frozen through later-week selection generat
 });
 
 test('unpublished planned date expires safely without silently changing membership dates', function (string $stage): void {
-    $this->options = SmsRunOptions::normalize(7, 3, null, null, SmsRunOptions::PLANNED_DATE_VERSION, '2026-10-19');
+    $this->fileOptions = SmsRunOptions::normalize(7, 3, null, null, SmsRunOptions::PLANNED_DATE_VERSION, '2026-10-19');
     ($this->seedMembers)();
-    $this->service->start($this->id, 7, 'editor@example.invalid', $this->options);
+    $this->service->start($this->id, 7, 'editor@example.invalid', $this->fileOptions);
     if ($stage !== 'prepare') $this->service->prepare($this->id);
     if ($stage === 'build') $this->service->requestFile($this->id);
     Carbon::setTestNow(Carbon::parse('2026-10-20T18:00:00Z'));
@@ -290,7 +290,7 @@ test('unpublished planned date expires safely without silently changing membersh
 })->with(['prepare', 'request', 'build']);
 
 test('published planned-date recovery adopts its exact name and bytes even after planned date expires', function (): void {
-    $this->options = SmsRunOptions::normalize(7, 10, null, null, SmsRunOptions::PLANNED_DATE_VERSION, '2026-10-19');
+    $this->fileOptions = SmsRunOptions::normalize(7, 10, null, null, SmsRunOptions::PLANNED_DATE_VERSION, '2026-10-19');
     ($this->prepareVersioned)(); $this->service->requestFile($this->id); $this->service->interruptPublication = true;
     expect(fn () => $this->service->buildFile($this->id))->toThrow(RuntimeException::class, 'Synthetic interruption');
     $path = str_replace('\\', '/', $this->versionedDirectory).'/runs/'.$this->id.'/v1/published/SMS Export - 2026-10-19 - Part 1 of 1.csv';
@@ -305,7 +305,7 @@ test('published planned-date recovery adopts its exact name and bytes even after
 });
 
 test('planned-date status and history expose only pure reconciled file metadata and honest pending handoff', function (): void {
-    $this->options = SmsRunOptions::normalize(7, 3, null, null, SmsRunOptions::PLANNED_DATE_VERSION, '2026-11-10');
+    $this->fileOptions = SmsRunOptions::normalize(7, 3, null, null, SmsRunOptions::PLANNED_DATE_VERSION, '2026-11-10');
     $path = ($this->makeFile)();
     $view = $this->service->show($this->id);
     expect($view->handoff['email_preview']['available'])->toBeTrue()
@@ -321,7 +321,7 @@ test('planned-date status and history expose only pure reconciled file metadata 
 });
 
 test('opted-in drop range names use saved run drops not the next global counter and retain publication on recovery', function (): void {
-    $this->options = SmsRunOptions::normalize(7, 3, null, null, SmsRunOptions::PLANNED_DATE_VERSION, '2026-10-26', SmsRunOptions::DROP_RANGE_FILENAME_VERSION);
+    $this->fileOptions = SmsRunOptions::normalize(7, 3, null, null, SmsRunOptions::PLANNED_DATE_VERSION, '2026-10-26', SmsRunOptions::DROP_RANGE_FILENAME_VERSION);
     ($this->prepareVersioned)();
     $firstDrop = $this->db->table('TblSMSDrops')->where('Request_ID', $this->id)->value('PK');
     $this->db->table('TblSMSDrops')->where('PK', $firstDrop)->update(['Drop_Name' => 'SMS9999', 'Amount_Dropped' => 3]);
@@ -333,8 +333,8 @@ test('opted-in drop range names use saved run drops not the next global counter 
         ->update(['Drop_Name' => 'SMS10000', 'SMS_Drop_PK' => $secondDrop]);
     // Unrelated next counters must not contaminate this run's assigned range.
     $this->db->table('TblSMSDrops')->insert(['Drop_Name' => 'SMS99999', 'Debt_Tier' => 'T2', 'Amount_Dropped' => 1, 'Drop_Date' => '2026-10-26', 'Request_ID' => $this->otherId, 'Created_At' => '2026-10-20 00:30:00']);
-    expect($this->service->start($this->id, 7, 'editor@example.invalid', $this->options)->options)->toBe($this->options);
-    $withoutMarker = $this->options; unset($withoutMarker['filename_version']);
+    expect($this->service->start($this->id, 7, 'editor@example.invalid', $this->fileOptions)->options)->toBe($this->fileOptions);
+    $withoutMarker = $this->fileOptions; unset($withoutMarker['filename_version']);
     expect(fn () => $this->service->start($this->id, 7, 'editor@example.invalid', $withoutMarker))->toThrow(HttpException::class, 'different');
     $this->service->requestFile($this->id); $this->service->interruptPublication = true;
     expect(fn () => $this->service->buildFile($this->id))->toThrow(RuntimeException::class, 'Synthetic interruption');
@@ -517,7 +517,7 @@ test('controller validates explicit format cap and tiers instead of ignoring new
         'csv_format' => SmsRunOptions::CSV_FORMAT, 'rows_per_file' => 3]);
     $request->attributes->set('cmd_user', ['email' => 'editor@example.invalid']);
     $response = $this->controller->store($request);
-    expect($response->getStatusCode())->toBe(202)->and($response->getData(true)['options'])->toBe($this->options);
+    expect($response->getStatusCode())->toBe(202)->and($response->getData(true)['options'])->toBe($this->fileOptions);
 });
 
 test('selected count drives ZIP parts while generation preserves prospects and frozen four-column data', function (): void {
@@ -534,7 +534,7 @@ test('selected count drives ZIP parts while generation preserves prospects and f
             expect(fgetcsv($stream, escape: ''))->toBe(['First name', 'debt load', 'phone1', 'send date']);
             $count = 0;
             while (($row = fgetcsv($stream, escape: '')) !== false) {
-                expect($row)->toHaveCount(4)->and($row[1])->toBe('14000')->and($row[2])->toBe('0012345600')->and($row[3])->toBe('2026-10-26');
+                expect($row)->toHaveCount(4)->and($row[1])->toBe('30000')->and($row[2])->toBe('0012345600')->and($row[3])->toBe('2026-10-26');
                 if ($index === 0 && $count === 0) expect($row[0])->toBe("'=Synthetic");
                 $phones[] = $row[2]; $count++;
             }
@@ -549,7 +549,7 @@ test('selected count drives ZIP parts while generation preserves prospects and f
 });
 
 test('versioned single CSV ignores mutable legacy format settings and keeps original file bytes', function (): void {
-    $this->options = SmsRunOptions::normalize(7, 10);
+    $this->fileOptions = SmsRunOptions::normalize(7, 10);
     ($this->prepareVersioned)();
     config(['sms-exports.single_phone_csv' => true, 'sms-exports.run_file_options_enabled' => false]);
     $this->service->requestFile($this->id); $this->service->buildFile($this->id);
@@ -590,7 +590,7 @@ test('versioned approval keeps exact files and increments only frozen selected r
         ->and($this->db->table('TblProspects')->where('PK', $unselected)->value('Last_SMS_Date'))->toBeNull()
         ->and(hash_file('sha256', $this->service->filePath($this->id)))->toBe($hash)
         ->and($this->db->table('TblSMSDrops')->value('Drop_Date'))->toBe('2026-10-26');
-    expect($this->service->overview()['recent'][0]->options)->toBe($this->options);
+    expect($this->service->overview()['recent'][0]->options)->toBe($this->fileOptions);
 });
 
 test('a worker crash after publication adopts the exact bundle even after the week changes', function (): void {
@@ -639,8 +639,8 @@ test('database deletion failure restores the entire bundle and pending membershi
 
 test('malformed stored options never become legacy and migration rollback never drops receipts', function (): void {
     ($this->seedMembers)();
-    $this->service->start($this->id, 7, 'editor@example.invalid', $this->options);
-    foreach (['', '{', '{}', json_encode(array_replace($this->options, ['csv_format' => 'unknown']))] as $json) {
+    $this->service->start($this->id, 7, 'editor@example.invalid', $this->fileOptions);
+    foreach (['', '{', '{}', json_encode(array_replace($this->fileOptions, ['csv_format' => 'unknown']))] as $json) {
         $this->db->table('TblSMSRuns')->update(['Run_Options_JSON' => $json]);
         expect(fn () => $this->service->show($this->id))->toThrow(HttpException::class);
         expect(fn () => $this->service->prepare($this->id))->toThrow(HttpException::class);
@@ -655,16 +655,16 @@ test('malformed stored options never become legacy and migration rollback never 
 });
 
 test('approval-only creation rejects older new requests and preserves an existing frozen request', function (): void {
-    $old = $this->service->start($this->id, 7, 'editor@example.invalid', $this->options);
+    $old = $this->service->start($this->id, 7, 'editor@example.invalid', $this->fileOptions);
     $stored = $this->db->table('TblSMSRuns')->where('Request_ID', $this->id)->first();
     config(['sms-exports.approval_only_creation_enabled' => true]);
-    expect($this->service->start($this->id, 7, 'editor@example.invalid', $this->options)->options)->toBe($old->options);
+    expect($this->service->start($this->id, 7, 'editor@example.invalid', $this->fileOptions)->options)->toBe($old->options);
     expect($this->db->table('TblSMSRuns')->where('Request_ID', $this->id)->first())->toEqual($stored);
     $this->db->table('TblSMSRuns')->where('Request_ID', $this->id)->update(['Status' => 'discarded']);
 
     $earlyNames = SmsRunOptions::normalize(7, 3, null, null, SmsRunOptions::PLANNED_DATE_VERSION,
         '2026-10-26', SmsRunOptions::DROP_RANGE_FILENAME_VERSION);
-    foreach ([null, $this->options, $earlyNames] as $options) {
+    foreach ([null, $this->fileOptions, $earlyNames] as $options) {
         expect(fn () => $this->service->start($this->otherId, 7, 'editor@example.invalid', $options))->toThrow(HttpException::class);
         expect($this->db->table('TblSMSRuns')->where('Request_ID', $this->otherId)->exists())->toBeFalse();
     }
@@ -714,19 +714,52 @@ test('tier selector capability is opt-in and canonical choices replay with creat
     config(['sms-exports.tier_selection_enabled' => false, 'sms-exports.run_file_options_enabled' => false]);
     expect($this->service->start($this->id, 7, 'editor@example.invalid', $marked)->options)->toBe($marked)
         ->and($this->service->queued)->toHaveCount(1);
-    expect(fn () => $this->service->start($this->id, 7, 'editor@example.invalid', $this->options))->toThrow(HttpException::class);
+    expect(fn () => $this->service->start($this->id, 7, 'editor@example.invalid', $this->fileOptions))->toThrow(HttpException::class);
     expect(fn () => $this->service->start($this->id, 7, 'editor@example.invalid',
         SmsRunOptions::normalize(7, 3, ['T2'], SmsRunOptions::TIER_SELECTION_POLICY)))->toThrow(HttpException::class);
 });
 
 test('old all-tier options retain their selector while new all-tier options freeze the explicit version', function (): void {
     config(['sms-exports.tier_selection_enabled' => true]);
-    $old = $this->service->start($this->id, 7, 'editor@example.invalid', $this->options);
-    expect($old->options)->toBe($this->options)->and(array_keys($old->options))->toHaveCount(4);
+    $old = $this->service->start($this->id, 7, 'editor@example.invalid', $this->fileOptions);
+    expect($old->options)->toBe($this->fileOptions)->and(array_keys($old->options))->toHaveCount(4);
     $newAll = SmsRunOptions::normalize(7, 3, null, SmsRunOptions::TIER_SELECTION_POLICY);
     expect(fn () => $this->service->start($this->id, 7, 'editor@example.invalid', $newAll))->toThrow(HttpException::class);
     $this->db->table('TblSMSRuns')->where('Request_ID', $this->id)->update(['Status' => 'discarded']);
     expect($this->service->start($this->otherId, 7, 'editor@example.invalid', $newAll)->options)->toBe($newAll);
+});
+
+test('minimum debt capabilities and create response freeze exact integer options for idempotent retries', function (): void {
+    config(['sms-exports.tier_selection_enabled' => true]);
+    $caps = $this->service->overview()['capabilities'];
+    expect($caps['minimum_debt_amount'])->toBeTrue()->and($caps['minimum_debt_floor'])->toBe(25000)
+        ->and($caps['minimum_debt_default'])->toBe(25000)->and($caps['minimum_debt_max'])->toBe(9999999000);
+    $options = SmsRunOptions::normalize(7, 3, ['T5','T9'], SmsRunOptions::TIER_SELECTION_POLICY,
+        null, null, null, 31000);
+    $request = Request::create('/', 'POST', ['request_id' => $this->id, 'target' => 7,
+        'csv_format' => SmsRunOptions::CSV_FORMAT, 'rows_per_file' => 3, 'tiers' => ['T9','T5'],
+        'tier_selection_policy' => SmsRunOptions::TIER_SELECTION_POLICY, 'minimum_debt_amount' => '31000']);
+    $request->attributes->set('cmd_user', ['email' => 'editor@example.invalid']);
+    expect($this->controller->store($request)->getData(true)['options'])->toBe($options);
+    config(['sms-exports.tier_selection_enabled' => false, 'sms-exports.run_file_options_enabled' => false]);
+    expect($this->service->start($this->id, 7, 'editor@example.invalid', $options)->options)->toBe($options)
+        ->and($this->service->queued)->toHaveCount(1);
+    expect(fn () => $this->service->start($this->id, 7, 'editor@example.invalid',
+        array_replace($options, ['minimum_debt_amount' => 32000])))->toThrow(HttpException::class);
+    expect($this->db->table('TblSMSRuns')->count())->toBe(1)->and($this->db->table('TblProspectsExport')->count())->toBe(0);
+});
+
+test('invalid or formatless minimum debt input never creates a run', function (): void {
+    config(['sms-exports.tier_selection_enabled' => true]);
+    foreach ([24999, -1, 25000.5, null, '25000bad', 10000000000] as $minimum) {
+        $request = Request::create('/', 'POST', ['request_id' => $this->id, 'target' => 7,
+            'csv_format' => SmsRunOptions::CSV_FORMAT, 'tier_selection_policy' => SmsRunOptions::TIER_SELECTION_POLICY,
+            'minimum_debt_amount' => $minimum]);
+        expect(fn () => $this->controller->store($request))->toThrow(ValidationException::class);
+    }
+    $request = Request::create('/', 'POST', ['request_id' => $this->id, 'target' => 7, 'minimum_debt_amount' => 25000]);
+    expect(fn () => $this->controller->store($request))->toThrow(ValidationException::class);
+    expect($this->db->table('TblSMSRuns')->count())->toBe(0)->and($this->service->queued)->toBe([]);
 });
 
 test('malformed or formatless selector requests fail before run insertion', function (): void {
@@ -807,7 +840,7 @@ test('older historical runs retain frozen file metadata and download exact bytes
         'Status' => 'discarded', 'Created_By' => 'editor@example.invalid', 'Created_At' => '2026-10-21', 'Updated_At' => '2026-10-21']);
     $first = $this->service->history(); $older = $this->service->history($first['next_cursor']);
     $row = array_values(array_filter($older['items'], fn ($run) => $run->request_id === $this->id))[0];
-    expect($row->options)->toBe($this->options)->and($row->file['format'])->toBe('zip')->and($row->file['parts'])->toBe(2);
+    expect($row->options)->toBe($this->fileOptions)->and($row->file['format'])->toBe('zip')->and($row->file['parts'])->toBe(2);
     expect(hash_file('sha256', $this->service->filePath($row->request_id)))->toBe($hash);
     $attempts = (int) $this->db->table('TblProspects')->sum('SMS_Attempts');
     file_put_contents($path, str_repeat('x', filesize($path)));

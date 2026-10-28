@@ -19,6 +19,7 @@ final class SmsFrozenEligibility
     public static function assertPending(ConnectionInterface $db, string $requestId): void
     {
         self::assertMembers($db, $requestId, 'TblProspectsExport');
+        SmsDebtPolicy::assertPending($db, $requestId);
     }
 
     /** New outward handoffs must use complete approved membership; history reads stay independent. */

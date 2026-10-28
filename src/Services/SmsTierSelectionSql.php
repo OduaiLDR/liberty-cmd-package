@@ -15,7 +15,7 @@ final class SmsTierSelectionSql
      * Creation_Date and Last_SMS_Date. Do not put a quantity limit in that query.
      *
      * Binding order: eligible-query bindings first, target, request ID, then tiers
-     * in the supplied order. Values are never interpolated into the SQL text.
+     * in the supplied order, then the validated source-debt minimum.
      * Caller owns snapshot isolation, run serialization, transaction/replay policy.
      */
     public static function select(string $eligibleSql, array $tiers, string $mailerDate = 'Send_Date', bool $leanDebtSources = false): string
@@ -52,6 +52,7 @@ SELECT TOP (?) ?, w.Export_PK, w.Phone, r.Tier, {$debt},
 FROM Wanted w JOIN Resolved r ON r.Export_PK=w.Export_PK
 WHERE {$valid}
   AND r.Tier IN ({$tierBindings})
+  AND r.Debt>=?
 ORDER BY CASE WHEN w.Last_SMS_Date IS NULL THEN 0 ELSE 1 END ASC,
     CASE WHEN w.Last_SMS_Date IS NULL THEN w.Creation_Date END DESC,
     w.Last_SMS_Date ASC, w.Export_PK ASC

@@ -67,8 +67,8 @@ final class SmsFrozenEligibilitySqlServerTest extends TestCase
         self::assertSame(self::$database, $this->db->selectOne('SELECT DB_NAME() AS name')->name);
         $this->db->unprepared('DROP TABLE IF EXISTS TblProspectsExport,TblSMSHistory,TblProspects,TblPhoneNumbers,TblSMSSuppressions,TblSMSRuns;
 CREATE TABLE TblProspects(PK int NOT NULL PRIMARY KEY,State char(2),Phone varchar(20),Contacted bit NOT NULL,Opt_Out bit NOT NULL,Invalid_Phone bit NOT NULL);
-CREATE TABLE TblProspectsExport(Request_ID uniqueidentifier NOT NULL,Prospect_PK int NOT NULL,State char(2),Phone nvarchar(20),PRIMARY KEY(Request_ID,Prospect_PK));
-CREATE TABLE TblSMSHistory(Request_ID uniqueidentifier NOT NULL,Prospect_PK int NOT NULL,State char(2),Phone nvarchar(20),PRIMARY KEY(Request_ID,Prospect_PK));
+CREATE TABLE TblProspectsExport(Request_ID uniqueidentifier NOT NULL,Prospect_PK int NOT NULL,State char(2),Phone nvarchar(20),Debt_Amount decimal(12,2) DEFAULT 30000,Debt_Tier varchar(10) DEFAULT \'T5\',Debt_Source varchar(30) DEFAULT \'TblTUData\',Debt_Source_PK int DEFAULT 1,Client varchar(150),Address varchar(200),Zip varchar(10),PRIMARY KEY(Request_ID,Prospect_PK));
+CREATE TABLE TblSMSHistory(Request_ID uniqueidentifier NOT NULL,Prospect_PK int NOT NULL,State char(2),Phone nvarchar(20),Debt_Amount decimal(12,2) DEFAULT 30000,Debt_Tier varchar(10) DEFAULT \'T5\',Debt_Source varchar(30) DEFAULT \'TblTUData\',Debt_Source_PK int DEFAULT 1,Client varchar(150),Address varchar(200),Zip varchar(10),PRIMARY KEY(Request_ID,Prospect_PK));
 CREATE TABLE TblPhoneNumbers(Phone varchar(20) NOT NULL PRIMARY KEY);
 CREATE TABLE TblSMSSuppressions(Phone varchar(20) NOT NULL PRIMARY KEY,Opt_Out bit NOT NULL,Invalid_Phone bit NOT NULL);
 CREATE TABLE TblSMSRuns(Request_ID uniqueidentifier NOT NULL PRIMARY KEY,Selection_Policy varchar(40),Status varchar(20),Selected int,Approved_At datetime2,Approved_By varchar(100));

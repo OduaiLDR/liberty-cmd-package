@@ -43,6 +43,33 @@ final class SmsRunArtifactBundleTest extends TestCase
         for ($row = 1; $row <= $count; $row++) yield ['Name'.$row, '14000', '0202555'.sprintf('%03d', $row), '2026-10-26'];
     }
 
+    public function test_explicit_minimum_is_bound_to_artifacts_and_checked_before_publication(): void
+    {
+        $options = SmsRunOptions::normalize(2, 1, null, SmsRunOptions::TIER_SELECTION_POLICY, null, null, null, 25500);
+        $result = $this->bundles->build($this->runDir, 'sms-test', [
+            ['First', '26000', '2025550101', '2026-11-02'],
+            ['Second', '30000', '2025550102', '2026-11-02'],
+        ], 2, $options);
+        self::assertSame(2, $result['manifest']['rows']);
+        self::assertCount(2, $result['manifest']['parts']);
+        self::assertSame($result['path'], $this->bundles->verify($this->runDir, $result['manifest'], $options, 2));
+        $changed = array_replace($options, ['minimum_debt_amount' => 31000]);
+        $this->expectException(RuntimeException::class);
+        $this->bundles->build($this->runDir, 'sms-test', [], 2, $changed);
+    }
+
+    public function test_explicit_minimum_rejects_a_low_row_without_publishing_a_file(): void
+    {
+        $options = SmsRunOptions::normalize(1, 1, null, SmsRunOptions::TIER_SELECTION_POLICY, null, null, null, 25500);
+        try {
+            $this->bundles->build($this->runDir, 'sms-test', [['First', '25000', '2025550101', '2026-11-02']], 1, $options);
+            self::fail('Expected a frozen debt-minimum hold.');
+        } catch (RuntimeException $error) {
+            self::assertStringContainsString('below its frozen minimum', $error->getMessage());
+        }
+        self::assertDirectoryDoesNotExist($this->runDir.'/v1/published');
+    }
+
     private function build(int $count = 5, int $target = 7, int $cap = 3): array
     {
         return $this->bundles->build($this->runDir, 'sms-test', $this->rows($count), $count, SmsRunOptions::normalize($target, $cap));

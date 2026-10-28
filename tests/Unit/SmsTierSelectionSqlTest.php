@@ -13,7 +13,7 @@ test('tier selection reuses the exact source validity and monetary expressions b
     expect($sql)->toContain($eligible, SmsCurrentDebtSql::VALID_PREDICATE, SmsCurrentDebtSql::ROUNDED_DEBT_SQL,
         'r.Tier IN (?,?)', 'FROM Wanted w JOIN Resolved r', 'w.Snapshot_Zip', 'Was_Previously_Texted, Last_SMS_Date_At_Selection')
         ->not->toContain('p.Tier', 'p.Debt_Tier', 'NOLOCK', 'UPDATE TblProspects', "r.Tier IN ('T9','T2')");
-    expect(substr_count($sql, 'TOP (?)'))->toBe(1)->and(substr_count($sql,'?'))->toBe(5);
+    expect(substr_count($sql, 'TOP (?)'))->toBe(1)->and(substr_count($sql,'?'))->toBe(6);
     expect(strpos($sql, 'State=?'))->toBeLessThan(strpos($sql, 'SELECT TOP (?) ?'));
     expect(strpos($sql, 'SELECT TOP (?) ?'))->toBeLessThan(strpos($sql, 'r.Tier IN (?,?)'));
     expect($sql)->toContain('CASE WHEN w.Last_SMS_Date IS NULL THEN 0 ELSE 1 END ASC',
@@ -22,7 +22,7 @@ test('tier selection reuses the exact source validity and monetary expressions b
 
 test('all-tier selection still requires explicit requested tiers and binds every value', function (): void {
     $sql = SmsTierSelectionSql::select('SELECT * FROM TblProspects', SmsRunOptions::TIERS);
-    expect(substr_count($sql, '?'))->toBe(11)->and(substr_count($sql,'INSERT INTO TblProspectsExport'))->toBe(1);
+    expect(substr_count($sql, '?'))->toBe(12)->and(substr_count($sql,'INSERT INTO TblProspectsExport'))->toBe(1);
     // This is one logical SQL statement, not a claim about physical CTE evaluation
     // count, production indexes or execution-plan performance.
     expect($sql)->not->toContain('DELETE ', 'TRUNCATE ', 'BEGIN TRAN', 'sp_getapplock');
@@ -34,7 +34,7 @@ test('windowed selection resolves only the connection-local ordered page without
         SmsCurrentDebtSql::ROUNDED_DEBT_SQL, 't.SMS_Zip5=w.Zip', 'm.SMS_Zip5=w.Zip',
         'ORDER BY w.Window_Position ASC', 'OPTION (RECOMPILE)')
         ->not->toContain('OPTION (HASH JOIN)', 'LEFT(t.ncoaAddr_zipCde,5)', 'LEFT(m.Zip,5)', 'TblProspects p', 'UPDATE TblProspects');
-    expect(substr_count($sql, '?'))->toBe(4)
+    expect(substr_count($sql, '?'))->toBe(5)
         ->and(strpos($sql, 'SELECT TOP (?) ?'))->toBeLessThan(strpos($sql, 'r.Tier IN (?,?)'));
 });
 
@@ -52,6 +52,17 @@ test('lean v3 writes no second source id for Tier while old selectors retain the
     foreach ([$old, $oldWindow] as $sql) {
         expect($sql)->toContain('r.Source, r.Source_PK')->not->toContain("CASE WHEN r.Source='Tier'");
     }
+});
+
+test('debt minimum filters only the chosen unrounded winner and never changes source fallback validity', function (): void {
+    foreach([SmsTierSelectionSql::select('SELECT * FROM TblProspects',['T5']),SmsTierWindowSelectionSql::insert(['T5']),
+        SmsTierWindowSelectionSql::insert(['T5'],'Send_Date',true)] as $sql){
+        $ctes=substr($sql,0,strpos($sql,'INSERT INTO TblProspectsExport'));
+        expect($ctes)->toContain('FROM Mailers WHERE Debt>0','FROM Priorities WHERE Stage=Chosen_Stage',"('T4',CAST(22500 AS decimal(18,2)))")
+            ->not->toContain('Debt>=?');
+        expect($sql)->toContain('AND r.Debt>=?')->and(strpos($sql,'AND r.Debt>=?'))->toBeGreaterThan(strpos($sql,'JOIN Resolved r'));
+    }
+    expect(SmsCurrentDebtSql::VALID_PREDICATE)->not->toContain('25000','minimum');
 });
 
 test('invalid tier values lists and obsolete clocks fail before generating selection SQL', function (array $tiers): void {

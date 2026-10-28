@@ -321,6 +321,7 @@ SQL;
     private function writeCsvNow(string $requestId, string $path): int
     {
         $this->assertOpenRun($requestId);
+        \Cmd\Reports\Services\SmsDebtPolicy::assertPending($this->connection(), $requestId);
         if ($this->table('TblProspectsExport')->where('Request_ID', $requestId)->whereNull('SMS_Drop_PK')->exists()) {
             throw new RuntimeException('Assign the SMS drops before writing the file.');
         }

@@ -6,6 +6,7 @@ namespace Cmd\Reports\Repositories;
 
 use Carbon\Carbon;
 use Cmd\Reports\Services\SmsAvailabilityRefresh;
+use Cmd\Reports\Services\SmsDebtPolicy;
 use Cmd\Reports\Services\SmsRecordPolicy;
 use Cmd\Reports\Services\SmsDeliveryPolicy;
 use Cmd\Reports\Services\SmsRunArtifactBundle;
@@ -141,7 +142,7 @@ class SmsRecordExportRepository extends SqlSrvRepository
         } else {
             $eligible = $this->eligible()->select(['PK','Phone','Client','Address','City','State','Zip','Email','Creation_Date','Last_SMS_Date']);
             $sql = SmsTierSelectionSql::select($eligible->toSql(), $options['tiers'], (string) config('sms-exports.mailer_recency_date', 'Send_Date'), $leanDebtSources);
-            $this->connection()->affectingStatement($sql, [...$eligible->getBindings(), $target, $requestId, ...$options['tiers']]);
+            $this->connection()->affectingStatement($sql, [...$eligible->getBindings(), $target, $requestId, ...$options['tiers'], SmsDebtPolicy::minimum($options)]);
         }
         $this->assertTierPrices($requestId, $options);
         $cancellation?->checkpoint($requestId);
@@ -195,7 +196,7 @@ class SmsRecordExportRepository extends SqlSrvRepository
                     $remaining = $target - $selected;
                     // Read the statement's own count on the server: shared worker
                     // sessions/trigger NOCOUNT settings make PDO rowCount unreliable.
-                    $receipt = $db->selectOne($sql.'; SELECT CONVERT(int,@@ROWCOUNT) AS inserted_rows', [$remaining, $requestId, ...$options['tiers']]);
+                    $receipt = $db->selectOne($sql.'; SELECT CONVERT(int,@@ROWCOUNT) AS inserted_rows', [$remaining, $requestId, ...$options['tiers'], SmsDebtPolicy::minimum($options)]);
                     $inserted = (int) $receipt->inserted_rows;
                     if ($inserted < 0 || $inserted > $remaining) throw new RuntimeException('Invalid window selection count.');
                     $selected += $inserted;
@@ -266,7 +267,7 @@ class SmsRecordExportRepository extends SqlSrvRepository
         $leanDebtSources = SmsRunOptions::usesLeanDebtSources($options['tier_selection_policy']);
         if ($this->table('TblProspectsExport')->where('Request_ID', $requestId)->where(function (Builder $q) use ($options, $leanDebtSources): void {
             $q->whereNull('Debt_Tier')->orWhereNotIn('Debt_Tier', $options['tiers'])
-                ->orWhereNull('Debt_Amount')->orWhere('Debt_Amount', '<=', 0)
+                ->orWhereNull('Debt_Amount')->orWhere('Debt_Amount', '<', SmsDebtPolicy::minimum($options))
                 ->orWhereRaw('Debt_Amount <> CAST(Debt_Amount / 1000 AS bigint) * 1000')
                 ->orWhereNull('Debt_Source')->orWhereNotIn('Debt_Source', ['TblTUData','TblMailers','Tier']);
             $q->orWhere(function (Builder $source) use ($leanDebtSources): void {
