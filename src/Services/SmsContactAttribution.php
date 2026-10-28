@@ -56,6 +56,9 @@ final class SmsContactAttribution
         }
         $db = DB::connection('sqlsrv');
         $schema = $db->getSchemaBuilder();
+        if (! $schema->hasColumn('TblProspects', 'Contacted_Date')) {
+            throw new HttpException(503, 'Original-contact attribution requires its separate Contacted_Date evidence column.');
+        }
         if (! $schema->hasColumn('TblSMSRuns', 'Approved_At_Precision')
             || ! $schema->hasColumns('TblSMSResponseAttribution', self::EVIDENCE_COLUMNS)) {
             throw new HttpException(503, 'Apply the explicit contact-attribution evidence migration before activation.');
