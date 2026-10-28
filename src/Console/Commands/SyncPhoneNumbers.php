@@ -7,6 +7,7 @@ use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\SmsWorkflowLock;
 use Cmd\Reports\Services\SmsAvailabilityRefresh;
 use Cmd\Reports\Services\SmsDebtPleteImportPrivacy;
+use Cmd\Reports\Services\SmsPhoneSnapshotStage;
 use Illuminate\Console\Command;
 use Illuminate\Support\Env;
 use Illuminate\Support\Facades\DB;
@@ -18,6 +19,7 @@ class SyncPhoneNumbers extends Command
     protected $signature = 'Sync:phone-numbers
         {--source=lt : Company source: lt, ldr, or plaw (default keeps the existing LT schedule)}
         {--batch-size=1000 : Number of rows per INSERT (SQL Server maximum)}
+        {--phones-only : Replace phone rows without updating prospect contact flags}
         {--dry-run : Read and normalize the source data without changing SQL Server}';
 
     protected $description = 'Sync company phone numbers from Snowflake CONTACTS into SQL Server TblPhoneNumbers.';
@@ -81,6 +83,7 @@ class SyncPhoneNumbers extends Command
         $batchSize = min(max(1, $batchSize), 1000);
 
         $stagePath = null;
+        $stage = null;
         $phase = 'connectors';
 
         try {
@@ -111,7 +114,7 @@ class SyncPhoneNumbers extends Command
                 $contacts = (int) ($summary['CONTACTS'] ?? 0);
 
                 $this->info(sprintf(
-                    '[DRY RUN] Source rows: %d; contacts: %d; normalized rows to insert: %d; batches of %d.',
+                    '[DRY RUN] Source rows: %d; contacts: %d; non-empty rows before deduplication: %d; batches of %d.',
                     $sourceRows,
                     $contacts,
                     $normalizedRows,
@@ -132,10 +135,16 @@ class SyncPhoneNumbers extends Command
             if (! $this->withCreatedDate) {
                 throw new \RuntimeException('Phone synchronization requires the Created_Date target column.');
             }
+            foreach (['Data_Source', 'External_ID'] as $column) {
+                if (! DB::connection('sqlsrv')->getSchemaBuilder()->hasColumn('TblPhoneNumbers', $column)) {
+                    throw new \RuntimeException('Phone synchronization requires the provenance target columns.');
+                }
+            }
+            $this->assertProvenanceStorage();
             $phase = 'source_staging';
-            [$stagePath, $sourceCount, $normalizedCount] = $this->stagePhonesFromSnowflake($snowflake);
+            [$stage, $stagePath, $sourceCount, $normalizedCount] = $this->stagePhonesFromSnowflake($snowflake);
             $this->info("[INFO] Fetched {$sourceCount} phone rows from Snowflake.");
-            $this->info("[INFO] Normalized to {$normalizedCount} non-empty phones (matches VBA, duplicates preserved).");
+            $this->info("[INFO] Staged {$normalizedCount} distinct company/contact/phone rows; agreeing duplicates collapsed.");
 
             if ($normalizedCount === 0) {
                 $this->warn('[WARN] No phones to insert.');
@@ -147,7 +156,7 @@ class SyncPhoneNumbers extends Command
             [$deleted, $inserted, $cleaned] = $this->replacePhonesFromFile($sqlServer, $stagePath, $batchSize);
             $this->info("[INFO] Replaced {$deleted} existing phone rows with {$inserted} rows.");
             $phase = 'contact_flags';
-            $flagged = $this->flagContactedProspects();
+            $flagged = $this->option('phones-only') ? null : $this->flagContactedProspects();
             if ($flagged !== null) $this->info("[INFO] Marked {$flagged} SMS prospects as contacted.");
             Log::info('SyncPhoneNumbers command finished.', [
                 'source' => $this->sourceLabel(),
@@ -160,9 +169,7 @@ class SyncPhoneNumbers extends Command
             $this->reportFailure($e, $phase, $this->phoneSnapshotCommitted);
             return Command::FAILURE;
         } finally {
-            if ($stagePath !== null && is_file($stagePath)) {
-                @unlink($stagePath);
-            }
+            $stage?->close();
         }
 
         $this->info('[SUCCESS] SyncPhoneNumbers completed successfully!');
@@ -221,19 +228,7 @@ class SyncPhoneNumbers extends Command
         $pageSize = 5000;
         $offset = 0;
         $sourceCount = 0;
-        $normalizedCount = 0;
-        $stagePath = tempnam(sys_get_temp_dir(), 'sync-phone-');
-
-        if ($stagePath === false) {
-            throw new \RuntimeException('Unable to create temporary phone staging file.');
-        }
-
-        $handle = fopen($stagePath, 'wb');
-        if ($handle === false) {
-            @unlink($stagePath);
-            throw new \RuntimeException('Unable to open temporary phone staging file.');
-        }
-
+        $stage = new SmsPhoneSnapshotStage;
         $staged = false;
         try {
             do {
@@ -242,32 +237,32 @@ class SyncPhoneNumbers extends Command
                 $normalized = $this->normalizePhones($rows);
 
                 foreach ($normalized as $phone) {
-                    $line = json_encode($phone, JSON_THROW_ON_ERROR) . PHP_EOL;
-                    if (fwrite($handle, $line) !== strlen($line)) {
-                        throw new \RuntimeException('Unable to complete temporary phone staging.');
-                    }
+                    $stage->add($this->sourceLabel(), $phone);
                 }
-
-                $normalizedCount += count($normalized);
                 $offset += $pageSize;
             } while (count($rows) === $pageSize);
-            if (! fflush($handle)) throw new \RuntimeException('Unable to complete temporary phone staging.');
+            $stagePath = $stage->export();
             $staged = true;
         } finally {
-            fclose($handle);
-            if (! $staged) @unlink($stagePath);
+            if (! $staged) $stage->close();
         }
-
-        return [$stagePath, $sourceCount, $normalizedCount];
+        return [$stage, $stagePath, $sourceCount, $stage->count()];
     }
 
     private function fetchPhonePage(DBConnector $snowflake, int $limit, int $offset): array
     {
         // Query only one page so DBConnector never has to hold the full result set.
         $sql = "
-            SELECT c.ID::VARCHAR AS ID, phone_values.VALUE::STRING AS PHONE,
+            WITH source_names AS (
+                SELECT ID, MIN(NAME) AS NAME, COUNT(DISTINCT TO_BINARY(NAME, 'UTF-8')) AS NAME_VARIANTS
+                FROM DATA_SOURCES GROUP BY ID
+            )
+            SELECT c.ID::VARCHAR AS ID, c.TP_ID::VARCHAR AS EXTERNAL_ID,
+                ds.NAME AS DATA_SOURCE, COALESCE(ds.NAME_VARIANTS, 0) AS DATA_SOURCE_VARIANTS,
+                phone_values.VALUE::STRING AS PHONE,
                 TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', c.CREATED)::DATE, 'YYYY-MM-DD') AS CREATED_DATE
-            FROM CONTACTS AS c,
+            FROM CONTACTS AS c
+            LEFT JOIN source_names AS ds ON c.C_SOURCE = ds.ID,
                  LATERAL FLATTEN(
                      INPUT => ARRAY_CONSTRUCT_COMPACT(c.PHONE, c.PHONE2, c.PHONE3, c.PHONE4)
                  ) AS phone_values
@@ -314,13 +309,49 @@ class SyncPhoneNumbers extends Command
             if ($digits === '') {
                 continue;
             }
+            if ((int) ($row['DATA_SOURCE_VARIANTS'] ?? 0) > 1) {
+                throw new \RuntimeException('Conflicting data source names; the phone snapshot was not replaced.');
+            }
+            // Keep historic padding/other lengths; canonicalize the already-supported leading-1 form only.
+            $phone = str_pad($digits, 10, '0', STR_PAD_LEFT);
+            if (strlen($phone) === 11 && $phone[0] === '1') $phone = substr($phone, 1);
             $normalized[] = [
-                'phone' => str_pad($digits, 10, '0', STR_PAD_LEFT),
+                'phone' => $phone,
                 'cid'   => $this->contactId($row['ID'] ?? null),
                 'created' => $this->createdDate($row['CREATED_DATE'] ?? null),
+                'data_source' => $this->provenanceText($row['DATA_SOURCE'] ?? null, 50),
+                'external_id' => $this->provenanceText($row['EXTERNAL_ID'] ?? null, 256),
             ];
         }
         return $normalized;
+    }
+
+    private function provenanceText(mixed $value, int $limit): ?string
+    {
+        if ($value === null) return null;
+        if (! is_string($value) || preg_match('//u', $value) !== 1
+            || preg_match_all('/./us', $value) + preg_match_all('/[\x{10000}-\x{10FFFF}]/u', $value) > $limit) {
+            throw new \RuntimeException('Invalid phone provenance text; the phone snapshot was not replaced.');
+        }
+        return $value;
+    }
+
+    private function assertProvenanceStorage(): void
+    {
+        $db = DB::connection('sqlsrv');
+        if ($db->getDriverName() !== 'sqlsrv') return; // Synthetic local fixtures only.
+        $columns = $db->select("SELECT c.name AS column_name,t.name AS type_name,c.max_length,c.is_nullable
+            FROM sys.columns c JOIN sys.types t ON t.user_type_id=c.user_type_id
+            WHERE c.object_id=OBJECT_ID(N'TblPhoneNumbers') AND c.name IN (N'Data_Source',N'External_ID')");
+        $found = [];
+        foreach ($columns as $column) $found[$column->column_name] = $column;
+        foreach (['Data_Source'=>100,'External_ID'=>512] as $name=>$bytes) {
+            $column = $found[$name] ?? null;
+            if (! $column || strtolower($column->type_name) !== 'nvarchar' || ! (bool) $column->is_nullable
+                || ((int) $column->max_length !== -1 && (int) $column->max_length < $bytes)) {
+                throw new \RuntimeException('Phone synchronization requires nullable Unicode provenance storage of sufficient length.');
+            }
+        }
     }
 
     /** Snowflake NUMBER(38,0) does not fit a PHP integer; retain its original decimal text. */
@@ -395,10 +426,15 @@ class SyncPhoneNumbers extends Command
             $contactId = $this->contactId($item['cid'] ?? null);
             $cid = "'{$contactId}'";
             $created = "'".$this->createdDate($item['created'] ?? null)."'";
-            $values[] = "('{$phoneEsc}', '{$sourceEsc}', {$cid}, {$created})";
+            $dataSource = $this->provenanceText($item['data_source'] ?? null, 50);
+            $externalId = $this->provenanceText($item['external_id'] ?? null, 256);
+            $unicode = ($dataSource !== null || $externalId !== null) && DB::connection('sqlsrv')->getDriverName() === 'sqlsrv' ? 'N' : '';
+            $dataSource = $dataSource === null ? 'NULL' : $unicode."'".$this->esc($dataSource)."'";
+            $externalId = $externalId === null ? 'NULL' : $unicode."'".$this->esc($externalId)."'";
+            $values[] = "('{$phoneEsc}', '{$sourceEsc}', {$cid}, {$created}, {$dataSource}, {$externalId})";
         }
 
-        $columns = 'Phone, Source, CID, Created_Date';
+        $columns = 'Phone, Source, CID, Created_Date, Data_Source, External_ID';
         $sql = "INSERT INTO TblPhoneNumbers ({$columns}) VALUES " . implode(', ', $values);
         $affected = $this->executeSqlServerWrite($connection, $sql, 'insert phone batch ' . $batchNumber);
         $inserted = $affected > 0 ? $affected : count($chunk);

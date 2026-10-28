@@ -21,11 +21,12 @@ use PHPUnit\Framework\TestCase;
 use PHPUnit\Framework\Attributes\DataProvider;
 use RuntimeException;
 
-/** Real engine regression for the observed schema; hard-coded loopback, random owned DB only. */
+/** Real engine regression: explicitly acknowledged fresh fixture, fixed loopback 14337, random owned DB only. */
 final class SmsContactFlagSqlServerTest extends TestCase
 {
     private static string $database;
     private static ?PDO $admin = null;
+    private static string $password;
     private Container $previous;
     private Connection $db;
     private object $ledger;
@@ -33,10 +34,13 @@ final class SmsContactFlagSqlServerTest extends TestCase
 
     public static function setUpBeforeClass(): void
     {
+        if (getenv('SMS_PHONE_NATIVE_ACCEPT_OWNED_FIXTURE') !== '1') self::markTestSkipped('Explicit owned loopback fixture acknowledgement is required.');
         if (! in_array('sqlsrv', PDO::getAvailableDrivers(), true)) self::markTestSkipped('Loopback SQL Server PDO is required.');
+        self::$password = (string) getenv('SMS_PHONE_NATIVE_OWNED_PASSWORD');
+        if (strlen(self::$password) < 16) throw new RuntimeException('Owned native fixture password is absent.');
         self::$database = 'sms_contact_flag_test_'.bin2hex(random_bytes(8));
-        self::$admin = new PDO('sqlsrv:Server=127.0.0.1,14330;Database=master;Encrypt=no;TrustServerCertificate=yes',
-            'sa', 'LocalDev!2026Pass', [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        self::$admin = new PDO('sqlsrv:Server=127.0.0.1,14337;Database=master;Encrypt=no;TrustServerCertificate=yes',
+            'sa', self::$password, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
         self::$admin->exec('CREATE DATABASE ['.self::$database.']');
     }
 
@@ -54,8 +58,8 @@ final class SmsContactFlagSqlServerTest extends TestCase
         $app = new Container; Container::setInstance($app);
         $app->instance('config', new Repository(['database'=>['default'=>'sqlsrv'], 'sms-exports'=>['durable_availability_enabled'=>true]]));
         $capsule = new Manager($app);
-        $capsule->addConnection(['driver'=>'sqlsrv','host'=>'127.0.0.1,14330','database'=>self::$database,
-            'username'=>'sa','password'=>'LocalDev!2026Pass','encrypt'=>'no','trust_server_certificate'=>'yes'], 'sqlsrv');
+        $capsule->addConnection(['driver'=>'sqlsrv','host'=>'127.0.0.1,14337','database'=>self::$database,
+            'username'=>'sa','password'=>self::$password,'encrypt'=>'no','trust_server_certificate'=>'yes'], 'sqlsrv');
         $capsule->getDatabaseManager()->setDefaultConnection('sqlsrv');
         $app->instance('db', $capsule->getDatabaseManager());
         Facade::clearResolvedInstances(); Facade::setFacadeApplication($app);
@@ -66,14 +70,15 @@ final class SmsContactFlagSqlServerTest extends TestCase
             CREATE TABLE dbo.TblProspects(PK int PRIMARY KEY,Phone varchar(10) NULL,Contacted bit NOT NULL DEFAULT 0,
                 Contacted_Date date NULL,Creation_Date date NULL,Last_SMS_Date date NULL,Latest_Export_Date date NULL,
                 SMS_Attempts int NOT NULL DEFAULT 0,Opt_Out bit NOT NULL DEFAULT 0,Invalid_Phone bit NOT NULL DEFAULT 0);
-            CREATE TABLE dbo.TblPhoneNumbers(Phone nvarchar(50) NULL,Created_Date date NULL,Source nvarchar(50),CID nvarchar(50));
+            CREATE TABLE dbo.TblPhoneNumbers(Phone nvarchar(50) NULL,Created_Date date NULL,Source nvarchar(50),CID nvarchar(50),Data_Source nvarchar(50),External_ID nvarchar(256));
             CREATE TABLE dbo.test_revisions(id int IDENTITY PRIMARY KEY);');
         $this->ledger = new class {
             public bool $fail = false;
             public int $calls = 0;
+            public int $expectedLaravelLevel = 1;
             public function dirty(Connection $db): void {
                 ++$this->calls;
-                if ($db->transactionLevel() !== 1 || ! $db->getPdo()->inTransaction()) throw new RuntimeException('Missing transaction.');
+                if ($db->transactionLevel() !== $this->expectedLaravelLevel || ! $db->getPdo()->inTransaction()) throw new RuntimeException('Missing transaction.');
                 $db->statement('INSERT INTO test_revisions DEFAULT VALUES');
                 if ($this->fail) throw new RuntimeException('Synthetic revision failure.');
             }
@@ -449,5 +454,46 @@ SQL;
             self::assertSame('2025550191',$own[0]->Phone);self::assertSame($cid,$own[0]->CID);self::assertSame('2026-10-12',$own[0]->Created_Date);
             self::assertFalse($this->db->getPdo()->inTransaction());
         } finally {unlink($stage);}
+    }
+
+    public function test_phone_provenance_migration_and_unicode_round_trip_in_owned_native_fixture(): void
+    {
+        // Raw PDO commits deliberately keep Laravel's transaction counter at zero.
+        $this->ledger->expectedLaravelLevel = 0;
+        $this->db->statement('ALTER TABLE dbo.TblPhoneNumbers DROP COLUMN Data_Source,External_ID');
+        $migration=require __DIR__.'/../../database/sms-migrations/2026_10_28_000002_add_phone_source_provenance.php';
+        $migration->up(); $migration->up();
+        $columns=$this->db->select("SELECT c.name,t.name AS type,c.max_length,c.is_nullable FROM sys.columns c
+            JOIN sys.types t ON t.user_type_id=c.user_type_id WHERE c.object_id=OBJECT_ID(N'dbo.TblPhoneNumbers')
+            AND c.name IN (N'Data_Source',N'External_ID') ORDER BY c.name");
+        self::assertCount(2,$columns); self::assertSame('nvarchar',$columns[0]->type);
+        self::assertSame(100,(int)$columns[0]->max_length); self::assertSame(512,(int)$columns[1]->max_length);
+        self::assertTrue((bool)$columns[0]->is_nullable); self::assertTrue((bool)$columns[1]->is_nullable);
+        $command=new class extends SyncPhoneNumbers {
+            public function __construct() {parent::__construct();$this->withCreatedDate=true;}
+            public function info($string,$verbosity=null):void {}
+        };
+        (new \ReflectionMethod($command,'assertProvenanceStorage'))->invoke($command);
+        $stage=new \Cmd\Reports\Services\SmsPhoneSnapshotStage;
+        $row=['phone'=>'2025550199','cid'=>'00012345678901234567890123456789012345','created'=>'2026-10-12',
+            'data_source'=>"源 O'Brien 😀",'external_id'=>str_repeat('0',250).'-A😀'];
+        $this->db->table('TblPhoneNumbers')->insert(['Phone'=>'2025550100','Source'=>'DP_LDR','CID'=>'other']);
+        try {
+            $stage->add('DP_LT',$row); $stage->add('DP_LT',$row); $path=$stage->export();
+            self::assertSame([0,1,0],(new \ReflectionMethod($command,'replacePhonesFromFile'))->invoke($command,$this->db->getPdo(),$path,1000));
+            $actual=$this->db->table('TblPhoneNumbers')->where('Source','DP_LT')->sole();
+            self::assertSame($row['cid'],$actual->CID); self::assertSame($row['data_source'],$actual->Data_Source);
+            self::assertSame($row['external_id'],$actual->External_ID);
+            self::assertSame(1,$this->db->table('TblPhoneNumbers')->where('Source','DP_LDR')->count());
+            self::assertSame(1,$this->db->table('test_revisions')->count());
+            self::assertSame(1,$this->requests->calls);
+            self::assertSame(0,$this->db->transactionLevel());
+            self::assertFalse($this->db->getPdo()->inTransaction());
+        } finally { $stage->close(); }
+        $this->db->statement('ALTER TABLE dbo.TblPhoneNumbers ALTER COLUMN Data_Source varchar(50) NULL');
+        $before=$this->db->table('TblPhoneNumbers')->get()->toJson();
+        try { (new \ReflectionMethod($command,'assertProvenanceStorage'))->invoke($command); self::fail('Expected unsafe storage rejection.'); }
+        catch (RuntimeException $error) { self::assertStringContainsString('Unicode provenance storage',$error->getMessage()); }
+        self::assertSame($before,$this->db->table('TblPhoneNumbers')->get()->toJson());
     }
 }

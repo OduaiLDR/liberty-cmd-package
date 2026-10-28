@@ -50,9 +50,9 @@ final class SmsPhoneSourceValidityTest extends TestCase
             ['PHONE' => '', 'ID' => null, 'CREATED_DATE' => null],
         ]);
         self::assertSame([
-            ['phone' => '2025550199', 'cid' => '12345678901234567890123456789012345678', 'created' => '2024-02-29'],
-            ['phone' => '0000000001', 'cid' => '000123', 'created' => '0001-01-01'],
-            ['phone' => '12025550199', 'cid' => '123', 'created' => '9999-12-31'],
+            ['phone' => '2025550199', 'cid' => '12345678901234567890123456789012345678', 'created' => '2024-02-29', 'data_source' => null, 'external_id' => null],
+            ['phone' => '0000000001', 'cid' => '000123', 'created' => '0001-01-01', 'data_source' => null, 'external_id' => null],
+            ['phone' => '2025550199', 'cid' => '123', 'created' => '9999-12-31', 'data_source' => null, 'external_id' => null],
         ], $rows);
     }
 }

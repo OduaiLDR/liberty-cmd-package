@@ -865,6 +865,8 @@ test('failed phone sync preserves the previous suppression snapshot', function (
         $table->string('Source')->nullable();
         $table->integer('CID')->nullable();
         $table->date('Created_Date')->nullable();
+        $table->string('Data_Source', 50)->nullable();
+        $table->string('External_ID', 256)->nullable();
     });
     $this->db->table('TblPhoneNumbers')->insert(['Phone' => '2025550101', 'Source' => 'DP_LT']);
     $pdo = $this->db->getPdo();
@@ -889,6 +891,8 @@ test('successful phone sync atomically replaces only its own source', function (
         $table->string('Source')->nullable();
         $table->integer('CID')->nullable();
         $table->date('Created_Date')->nullable();
+        $table->string('Data_Source', 50)->nullable();
+        $table->string('External_ID', 256)->nullable();
     });
     $this->db->table('TblPhoneNumbers')->insert([
         ['Phone' => '2025550101', 'Source' => 'DP_LT'],
@@ -915,6 +919,8 @@ test('phone sync rejects invalid staged creation dates and rolls back the whole 
         $table->string('Source')->nullable();
         $table->integer('CID')->nullable();
         $table->date('Created_Date')->nullable();
+        $table->string('Data_Source', 50)->nullable();
+        $table->string('External_ID', 256)->nullable();
     });
     $pdo = $this->db->getPdo();
     $command = \Mockery::mock(\Cmd\Reports\Console\Commands\SyncPhoneNumbers::class)->makePartial();
