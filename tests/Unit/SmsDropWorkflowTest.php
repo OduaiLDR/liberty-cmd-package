@@ -861,10 +861,14 @@ test('marketing view offers only missing invoices for each source drop', functio
 
 
 test('failed phone sync preserves the previous suppression snapshot', function () {
+    config(['sms-exports.wide_phone_contacts_enabled'=>true]);
     $this->db->getSchemaBuilder()->table('TblPhoneNumbers', function (Blueprint $table) {
         $table->string('Source')->nullable();
         $table->integer('CID')->nullable();
         $table->date('Created_Date')->nullable();
+        $table->string('Data_Source', 50)->nullable();
+        $table->string('External_ID', 256)->nullable();
+        foreach(range(1,4) as $slot) $table->string('Phone'.$slot,50)->nullable();
     });
     $this->db->table('TblPhoneNumbers')->insert(['Phone' => '2025550101', 'Source' => 'DP_LT']);
     $pdo = $this->db->getPdo();
@@ -885,10 +889,14 @@ test('failed phone sync preserves the previous suppression snapshot', function (
 });
 
 test('successful phone sync atomically replaces only its own source', function () {
+    config(['sms-exports.wide_phone_contacts_enabled'=>true]);
     $this->db->getSchemaBuilder()->table('TblPhoneNumbers', function (Blueprint $table) {
         $table->string('Source')->nullable();
         $table->integer('CID')->nullable();
         $table->date('Created_Date')->nullable();
+        $table->string('Data_Source', 50)->nullable();
+        $table->string('External_ID', 256)->nullable();
+        foreach(range(1,4) as $slot) $table->string('Phone'.$slot,50)->nullable();
     });
     $this->db->table('TblPhoneNumbers')->insert([
         ['Phone' => '2025550101', 'Source' => 'DP_LT'],
@@ -911,10 +919,14 @@ test('successful phone sync atomically replaces only its own source', function (
 });
 
 test('phone sync rejects invalid staged creation dates and rolls back the whole replacement', function () {
+    config(['sms-exports.wide_phone_contacts_enabled'=>true]);
     $this->db->getSchemaBuilder()->table('TblPhoneNumbers', function (Blueprint $table) {
         $table->string('Source')->nullable();
         $table->integer('CID')->nullable();
         $table->date('Created_Date')->nullable();
+        $table->string('Data_Source', 50)->nullable();
+        $table->string('External_ID', 256)->nullable();
+        foreach(range(1,4) as $slot) $table->string('Phone'.$slot,50)->nullable();
     });
     $pdo = $this->db->getPdo();
     $command = \Mockery::mock(\Cmd\Reports\Console\Commands\SyncPhoneNumbers::class)->makePartial();

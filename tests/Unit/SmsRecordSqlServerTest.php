@@ -246,6 +246,52 @@ final class SmsRecordSqlServerTest extends TestCase
         $other->prepare("UPDATE dbo.TblProspects SET State='CA' WHERE PK=?")->execute([$pk]);
     }
 
+    public function test_wide_secondary_and_legacy_phones_suppress_counts_selection_and_frozen_export(): void
+    {
+        $added = [];
+        foreach (['PK' => 'int IDENTITY', 'Source' => 'nvarchar(50)', 'CID' => 'nvarchar(50)', 'Created_Date' => 'date',
+            'Data_Source' => 'nvarchar(50)', 'External_ID' => 'nvarchar(256)', 'Phone1' => 'nvarchar(50)',
+            'Phone2' => 'nvarchar(50)', 'Phone3' => 'nvarchar(50)', 'Phone4' => 'nvarchar(50)'] as $column => $type) {
+            if (! $this->db->getSchemaBuilder()->hasColumn('TblPhoneNumbers', $column)) {
+                $this->db->unprepared('ALTER TABLE TblPhoneNumbers ADD ['.$column.'] '.$type);
+                $added[] = '['.$column.']';
+            }
+        }
+        config(['sms-exports.wide_phone_contacts_enabled' => true]);
+        for ($n = 0; $n < 5; $n++) $this->person(['Phone' => '000555010'.$n]);
+        $this->db->table('TblPhoneNumbers')->insert(['Phone' => '2025550199', 'Phone1' => '2025550199',
+            'Phone2' => '10005550100', 'Phone3' => '0005550101', 'Phone4' => '0005550102', 'Source' => 'DP_LT', 'CID' => '00001']);
+        $this->db->table('TblPhoneNumbers')->insert(['Phone' => '0005550103', 'Source' => 'DP_LDR', 'CID' => '00002']);
+        $repo = new SmsRecordExportRepository;
+        self::assertSame(1, $repo->availability()['eligible']);
+        self::assertSame(1, (new \ReflectionMethod($repo, 'eligible'))->invoke($repo, true)->count());
+        config(['sms-exports.record_workflow_enabled' => false]);
+        self::assertSame(1, (new SmsProspectExportRepository)->availability()['eligible']);
+        config(['sms-exports.record_workflow_enabled' => true]);
+        $sql = (new \Cmd\Reports\Services\SmsPhoneCounter)->sql("SELECT 'synthetic' AS External_ID, '0005550102' AS Phone");
+        self::assertSame(0, (int) $this->db->selectOne($sql)->Eligible_Phones);
+        $mailer = new \Cmd\Reports\Repositories\MailDropExportRepository;
+        $leads = [(object) ['Phone' => '0005550104', 'Known_Phones' => ['0005550104', '0005550102'],
+            'First_Name' => 'Synthetic', 'Address' => 'Fixture St', 'Debt_Amount' => 30000]];
+        self::assertCount(0, iterator_to_array((new \ReflectionMethod($mailer, 'eligibleRowsForLeads'))->invoke($mailer, $leads)));
+        $repo = $this->selecting(5);
+        self::assertSame(1, $repo->select(self::ID, 5)['selected']);
+        self::assertSame('0005550104', $this->db->table('TblProspectsExport')->sole()->Phone);
+        $this->db->table('TblProspectsExport')->update(['Debt_Amount' => 30000, 'Debt_Tier' => 'T5', 'Debt_Source' => 'TblTUData', 'Debt_Source_PK' => 1]);
+        $this->db->table('TblPhoneNumbers')->where('CID', '00001')->update(['Phone4' => '0005550104']);
+        $before = $this->db->table('TblProspectsExport')->sole();
+        try {
+            \Cmd\Reports\Services\SmsFrozenEligibility::assertPending($this->db, self::ID);
+            self::fail('A new Phone4 contact must hold the already frozen export.');
+        } catch (\Cmd\Reports\Services\SmsFrozenEligibilityHold $error) {
+            self::assertStringContainsString('contacted', $error->getMessage());
+            self::assertEquals($before, $this->db->table('TblProspectsExport')->sole());
+        }
+        self::assertSame(4, (new SmsProspectExportRepository)->markContacted());
+        self::assertSame(0, $this->db->table('TblProspects')->whereNotNull('Contacted_Date')->count());
+        if ($added !== []) $this->db->unprepared('ALTER TABLE TblPhoneNumbers DROP COLUMN '.implode(',', $added));
+    }
+
     public function test_live_contacted_details_use_only_exact_frozen_pks_and_all_tiers_without_writes(): void
     {
         $members = [];

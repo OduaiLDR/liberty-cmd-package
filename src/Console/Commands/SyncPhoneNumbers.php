@@ -7,6 +7,7 @@ use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\SmsWorkflowLock;
 use Cmd\Reports\Services\SmsAvailabilityRefresh;
 use Cmd\Reports\Services\SmsDebtPleteImportPrivacy;
+use Cmd\Reports\Services\SmsPhoneSnapshotStage;
 use Illuminate\Console\Command;
 use Illuminate\Support\Env;
 use Illuminate\Support\Facades\DB;
@@ -18,6 +19,7 @@ class SyncPhoneNumbers extends Command
     protected $signature = 'Sync:phone-numbers
         {--source=lt : Company source: lt, ldr, or plaw (default keeps the existing LT schedule)}
         {--batch-size=1000 : Number of rows per INSERT (SQL Server maximum)}
+        {--phones-only : Replace phone rows without updating prospect contact flags}
         {--dry-run : Read and normalize the source data without changing SQL Server}';
 
     protected $description = 'Sync company phone numbers from Snowflake CONTACTS into SQL Server TblPhoneNumbers.';
@@ -73,6 +75,10 @@ class SyncPhoneNumbers extends Command
 
     protected function syncNow(): int
     {
+        if (! config('sms-exports.wide_phone_contacts_enabled', false)) {
+            $this->error('Wide contact phone synchronization is not enabled. No source read or replacement was started.');
+            return Command::FAILURE;
+        }
         $this->info('[INFO] SyncPhoneNumbers: starting.');
         Log::info('SyncPhoneNumbers command started.', ['source' => $this->sourceLabel()]);
 
@@ -81,6 +87,7 @@ class SyncPhoneNumbers extends Command
         $batchSize = min(max(1, $batchSize), 1000);
 
         $stagePath = null;
+        $stage = null;
         $phase = 'connectors';
 
         try {
@@ -111,7 +118,7 @@ class SyncPhoneNumbers extends Command
                 $contacts = (int) ($summary['CONTACTS'] ?? 0);
 
                 $this->info(sprintf(
-                    '[DRY RUN] Source rows: %d; contacts: %d; normalized rows to insert: %d; batches of %d.',
+                    '[DRY RUN] Source rows: %d; contacts: %d; non-empty rows before deduplication: %d; batches of %d.',
                     $sourceRows,
                     $contacts,
                     $normalizedRows,
@@ -132,10 +139,16 @@ class SyncPhoneNumbers extends Command
             if (! $this->withCreatedDate) {
                 throw new \RuntimeException('Phone synchronization requires the Created_Date target column.');
             }
+            foreach (['Data_Source', 'External_ID', 'Phone1', 'Phone2', 'Phone3', 'Phone4'] as $column) {
+                if (! DB::connection('sqlsrv')->getSchemaBuilder()->hasColumn('TblPhoneNumbers', $column)) {
+                    throw new \RuntimeException('Phone synchronization requires the provenance target columns.');
+                }
+            }
+            $this->assertProvenanceStorage();
             $phase = 'source_staging';
-            [$stagePath, $sourceCount, $normalizedCount] = $this->stagePhonesFromSnowflake($snowflake);
-            $this->info("[INFO] Fetched {$sourceCount} phone rows from Snowflake.");
-            $this->info("[INFO] Normalized to {$normalizedCount} non-empty phones (matches VBA, duplicates preserved).");
+            [$stage, $stagePath, $sourceCount, $normalizedCount] = $this->stagePhonesFromSnowflake($snowflake);
+            $this->info("[INFO] Fetched {$sourceCount} source phone slots from Snowflake.");
+            $this->info("[INFO] Staged {$normalizedCount} company/contact rows with up to four unique phones.");
 
             if ($normalizedCount === 0) {
                 $this->warn('[WARN] No phones to insert.');
@@ -147,7 +160,7 @@ class SyncPhoneNumbers extends Command
             [$deleted, $inserted, $cleaned] = $this->replacePhonesFromFile($sqlServer, $stagePath, $batchSize);
             $this->info("[INFO] Replaced {$deleted} existing phone rows with {$inserted} rows.");
             $phase = 'contact_flags';
-            $flagged = $this->flagContactedProspects();
+            $flagged = $this->option('phones-only') ? null : $this->flagContactedProspects();
             if ($flagged !== null) $this->info("[INFO] Marked {$flagged} SMS prospects as contacted.");
             Log::info('SyncPhoneNumbers command finished.', [
                 'source' => $this->sourceLabel(),
@@ -160,9 +173,7 @@ class SyncPhoneNumbers extends Command
             $this->reportFailure($e, $phase, $this->phoneSnapshotCommitted);
             return Command::FAILURE;
         } finally {
-            if ($stagePath !== null && is_file($stagePath)) {
-                @unlink($stagePath);
-            }
+            $stage?->close();
         }
 
         $this->info('[SUCCESS] SyncPhoneNumbers completed successfully!');
@@ -181,6 +192,7 @@ class SyncPhoneNumbers extends Command
     /** @return array{int, int, int} */
     protected function replacePhonesFromFile(PDO $connection, string $stagePath, int $batchSize): array
     {
+        if (! config('sms-exports.wide_phone_contacts_enabled', false)) throw new \RuntimeException('Wide contact phone synchronization is not enabled.');
         $this->phoneSnapshotCommitted = false;
         if (! $this->withCreatedDate) {
             throw new \RuntimeException('Phone synchronization requires the Created_Date target column.');
@@ -221,19 +233,7 @@ class SyncPhoneNumbers extends Command
         $pageSize = 5000;
         $offset = 0;
         $sourceCount = 0;
-        $normalizedCount = 0;
-        $stagePath = tempnam(sys_get_temp_dir(), 'sync-phone-');
-
-        if ($stagePath === false) {
-            throw new \RuntimeException('Unable to create temporary phone staging file.');
-        }
-
-        $handle = fopen($stagePath, 'wb');
-        if ($handle === false) {
-            @unlink($stagePath);
-            throw new \RuntimeException('Unable to open temporary phone staging file.');
-        }
-
+        $stage = new SmsPhoneSnapshotStage;
         $staged = false;
         try {
             do {
@@ -242,34 +242,34 @@ class SyncPhoneNumbers extends Command
                 $normalized = $this->normalizePhones($rows);
 
                 foreach ($normalized as $phone) {
-                    $line = json_encode($phone, JSON_THROW_ON_ERROR) . PHP_EOL;
-                    if (fwrite($handle, $line) !== strlen($line)) {
-                        throw new \RuntimeException('Unable to complete temporary phone staging.');
-                    }
+                    $stage->add($this->sourceLabel(), $phone);
                 }
-
-                $normalizedCount += count($normalized);
                 $offset += $pageSize;
             } while (count($rows) === $pageSize);
-            if (! fflush($handle)) throw new \RuntimeException('Unable to complete temporary phone staging.');
+            $stagePath = $stage->export();
             $staged = true;
         } finally {
-            fclose($handle);
-            if (! $staged) @unlink($stagePath);
+            if (! $staged) $stage->close();
         }
-
-        return [$stagePath, $sourceCount, $normalizedCount];
+        return [$stage, $stagePath, $sourceCount, $stage->count()];
     }
 
     private function fetchPhonePage(DBConnector $snowflake, int $limit, int $offset): array
     {
         // Query only one page so DBConnector never has to hold the full result set.
         $sql = "
-            SELECT c.ID::VARCHAR AS ID, phone_values.VALUE::STRING AS PHONE,
+            WITH source_names AS (
+                SELECT ID, MIN(NAME) AS NAME, COUNT(DISTINCT TO_BINARY(NAME, 'UTF-8')) AS NAME_VARIANTS
+                FROM DATA_SOURCES GROUP BY ID
+            )
+            SELECT c.ID::VARCHAR AS ID, c.TP_ID::VARCHAR AS EXTERNAL_ID,
+                ds.NAME AS DATA_SOURCE, COALESCE(ds.NAME_VARIANTS, 0) AS DATA_SOURCE_VARIANTS,
+                phone_values.VALUE::STRING AS PHONE, phone_values.INDEX AS PHONE_SLOT,
                 TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', c.CREATED)::DATE, 'YYYY-MM-DD') AS CREATED_DATE
-            FROM CONTACTS AS c,
+            FROM CONTACTS AS c
+            LEFT JOIN source_names AS ds ON c.C_SOURCE = ds.ID,
                  LATERAL FLATTEN(
-                     INPUT => ARRAY_CONSTRUCT_COMPACT(c.PHONE, c.PHONE2, c.PHONE3, c.PHONE4)
+                     INPUT => ARRAY_CONSTRUCT(c.PHONE, c.PHONE2, c.PHONE3, c.PHONE4)
                  ) AS phone_values
             ORDER BY c.ID, phone_values.INDEX
             LIMIT {$limit} OFFSET {$offset}
@@ -314,13 +314,77 @@ class SyncPhoneNumbers extends Command
             if ($digits === '') {
                 continue;
             }
+            if ((int) ($row['DATA_SOURCE_VARIANTS'] ?? 0) > 1) {
+                throw new \RuntimeException('Conflicting data source names; the phone snapshot was not replaced.');
+            }
+            // Keep historic padding/other lengths; canonicalize the already-supported leading-1 form only.
+            $phone = str_pad($digits, 10, '0', STR_PAD_LEFT);
+            if (strlen($phone) === 11 && $phone[0] === '1') $phone = substr($phone, 1);
             $normalized[] = [
-                'phone' => str_pad($digits, 10, '0', STR_PAD_LEFT),
+                'phone' => $phone,
                 'cid'   => $this->contactId($row['ID'] ?? null),
                 'created' => $this->createdDate($row['CREATED_DATE'] ?? null),
+                'data_source' => $this->provenanceText($row['DATA_SOURCE'] ?? null, 50),
+                'external_id' => $this->provenanceText($row['EXTERNAL_ID'] ?? null, 256),
+                'slot' => $this->phoneSlot($row['PHONE_SLOT'] ?? null),
             ];
         }
         return $normalized;
+    }
+
+    private function provenanceText(mixed $value, int $limit): ?string
+    {
+        if ($value === null) return null;
+        if (! is_string($value) || str_contains($value,"\0") || preg_match('//u', $value) !== 1
+            || preg_match_all('/./us', $value) + preg_match_all('/[\x{10000}-\x{10FFFF}]/u', $value) > $limit) {
+            throw new \RuntimeException('Invalid phone provenance text; the phone snapshot was not replaced.');
+        }
+        return $value;
+    }
+
+    private function phoneSlot(mixed $slot): int
+    {
+        if ((! is_int($slot) && ! is_string($slot)) || ! preg_match('/\A[0-3]\z/D',(string)$slot)) {
+            throw new \RuntimeException('Invalid phone slot; the phone snapshot was not replaced.');
+        }
+        return (int)$slot;
+    }
+
+    private function assertProvenanceStorage(): void
+    {
+        $db = DB::connection('sqlsrv');
+        if ($db->getDriverName() !== 'sqlsrv') return; // Synthetic local fixtures only.
+        $columns = $db->select("SELECT c.name AS column_name,t.name AS type_name,c.max_length,c.is_nullable,c.collation_name
+            FROM sys.columns c JOIN sys.types t ON t.user_type_id=c.user_type_id
+            WHERE c.object_id=OBJECT_ID(N'TblPhoneNumbers') AND c.name IN (N'Phone',N'Data_Source',N'External_ID',N'Phone1',N'Phone2',N'Phone3',N'Phone4')");
+        $found = [];
+        foreach ($columns as $column) $found[$column->column_name] = $column;
+        $phoneCollation=$found['Phone']->collation_name??null;
+        if(!is_string($phoneCollation)||$phoneCollation==='') throw new \RuntimeException('Wide phone synchronization requires the existing Phone collation.');
+        foreach(range(1,4) as $slot) {
+            if(($found['Phone'.$slot]->collation_name??null)!==$phoneCollation) throw new \RuntimeException('Wide phone synchronization requires matching phone collations.');
+        }
+        foreach (['Data_Source'=>100,'External_ID'=>512,'Phone1'=>100,'Phone2'=>100,'Phone3'=>100,'Phone4'=>100] as $name=>$bytes) {
+            $column = $found[$name] ?? null;
+            if (! $column || strtolower($column->type_name) !== 'nvarchar' || ! (bool) $column->is_nullable
+                || ((int) $column->max_length !== -1 && (int) $column->max_length < $bytes)) {
+                throw new \RuntimeException('Phone synchronization requires nullable Unicode provenance storage of sufficient length.');
+            }
+        }
+        $indexes=$db->select("SELECT i.name,i.is_unique,i.has_filter,i.filter_definition,c.name AS column_name,ic.key_ordinal
+            FROM sys.indexes i JOIN sys.index_columns ic ON i.object_id=ic.object_id AND i.index_id=ic.index_id
+            JOIN sys.columns c ON c.object_id=ic.object_id AND c.column_id=ic.column_id
+            WHERE i.object_id=OBJECT_ID(N'TblPhoneNumbers') AND i.is_disabled=0 AND i.is_hypothetical=0 AND ic.key_ordinal>0");
+        $grouped=[]; foreach($indexes as $index) $grouped[$index->name][]=$index;
+        foreach(['UX_TblPhoneNumbers_Wide_Source_CID'=>['Source','CID'],
+            'IX_TblPhoneNumbers_Phone1'=>['Phone1'],'IX_TblPhoneNumbers_Phone2'=>['Phone2'],
+            'IX_TblPhoneNumbers_Phone3'=>['Phone3'],'IX_TblPhoneNumbers_Phone4'=>['Phone4']] as $name=>$keys) {
+            $rows=$grouped[$name]??[]; usort($rows,fn($a,$b)=>(int)$a->key_ordinal<=>(int)$b->key_ordinal);
+            $first=$rows[0]??null; $filter=$first ? strtolower(preg_replace('/[\s\[\]()]/','',$first->filter_definition??'')) : '';
+            $expected=str_starts_with($name,'UX_')?'phone1isnotnull':strtolower($keys[0]).'isnotnull';
+            if(array_column($rows,'column_name')!==$keys || !$first->has_filter || $filter!==$expected
+                || (str_starts_with($name,'UX_') && !$first->is_unique)) throw new \RuntimeException('Wide phone synchronization requires the reviewed contact and phone indexes.');
+        }
     }
 
     /** Snowflake NUMBER(38,0) does not fit a PHP integer; retain its original decimal text. */
@@ -391,14 +455,26 @@ class SyncPhoneNumbers extends Command
         $values = [];
 
         foreach ($chunk as $item) {
-            $phoneEsc = $this->esc($item['phone']);
+            $phones = $item['phones'] ?? [$item['phone']??null,null,null,null];
+            if (! is_array($phones) || count($phones)!==4 || !is_string($phones[0]) || $phones[0]===''
+                || $phones[0]!==($item['phone']??null) || count(array_filter($phones,fn($p)=>$p!==null))!==count(array_unique(array_filter($phones,fn($p)=>$p!==null)))) {
+                throw new \RuntimeException('Invalid wide contact phone staging.');
+            }
+            foreach($phones as $phone) if($phone!==null && (!is_string($phone)||!preg_match('/\A[0-9]{1,50}\z/D',$phone))) throw new \RuntimeException('Invalid wide contact phone staging.');
+            $phoneEsc = $this->esc($phones[0]);
             $contactId = $this->contactId($item['cid'] ?? null);
             $cid = "'{$contactId}'";
             $created = "'".$this->createdDate($item['created'] ?? null)."'";
-            $values[] = "('{$phoneEsc}', '{$sourceEsc}', {$cid}, {$created})";
+            $dataSource = $this->provenanceText($item['data_source'] ?? null, 50);
+            $externalId = $this->provenanceText($item['external_id'] ?? null, 256);
+            $unicode = ($dataSource !== null || $externalId !== null) && DB::connection('sqlsrv')->getDriverName() === 'sqlsrv' ? 'N' : '';
+            $dataSource = $dataSource === null ? 'NULL' : $unicode."'".$this->esc($dataSource)."'";
+            $externalId = $externalId === null ? 'NULL' : $unicode."'".$this->esc($externalId)."'";
+            $wideValues=implode(', ',array_map(fn($phone)=>$phone===null?'NULL':"'".$this->esc($phone)."'",$phones));
+            $values[] = "('{$phoneEsc}', '{$sourceEsc}', {$cid}, {$created}, {$dataSource}, {$externalId}, {$wideValues})";
         }
 
-        $columns = 'Phone, Source, CID, Created_Date';
+        $columns = 'Phone, Source, CID, Created_Date, Data_Source, External_ID, Phone1, Phone2, Phone3, Phone4';
         $sql = "INSERT INTO TblPhoneNumbers ({$columns}) VALUES " . implode(', ', $values);
         $affected = $this->executeSqlServerWrite($connection, $sql, 'insert phone batch ' . $batchNumber);
         $inserted = $affected > 0 ? $affected : count($chunk);

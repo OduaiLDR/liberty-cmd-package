@@ -85,7 +85,9 @@ SQL;
 
     protected function aggregateSql(string $sources, ?string $contacts = null, string $prefix = '', string $phoneWidth = 'max'): string
     {
-        $contacts ??= 'SELECT Phone FROM TblPhoneNumbers';
+        $contacts ??= config('sms-exports.wide_phone_contacts_enabled', false)
+            ? 'SELECT c.Phone FROM '.SmsPhoneNumbersSql::from('c', '', true)
+            : 'SELECT Phone FROM TblPhoneNumbers';
         $identity = self::identitySql('External_ID');
         $stateAllowed = SmsStatePolicy::sqlPredicate('r.State', 'sqlsrv');
         $normalizedState = SmsStatePolicy::normalizedSql('r.State', 'sqlsrv');

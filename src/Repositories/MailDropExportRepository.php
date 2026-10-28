@@ -5,6 +5,7 @@ namespace Cmd\Reports\Repositories;
 use Carbon\Carbon;
 use Cmd\Reports\Services\SmsDropPlanner;
 use Cmd\Reports\Services\SmsPhoneCounter;
+use Cmd\Reports\Services\SmsPhoneNumbersSql;
 use Cmd\Reports\Services\SmsStatePolicy;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Database\Query\JoinClause;
@@ -581,7 +582,10 @@ class MailDropExportRepository extends SqlSrvRepository
             // PHP turns numeric string array keys into integers. SQL Server then
             // promotes this IN list to int and overflows on 11-digit phones.
             foreach ($chunk as $phone) { $lookups[] = (string) $phone; $lookups[] = '1'.(string) $phone; }
-            foreach ($this->table('TblPhoneNumbers')->whereIn('Phone', $lookups)->pluck('Phone') as $phone) {
+            $contactRows = config('sms-exports.wide_phone_contacts_enabled', false)
+                ? $this->connection()->query()->fromRaw(SmsPhoneNumbersSql::from('contact_numbers', '', true))
+                : $this->table('TblPhoneNumbers');
+            foreach ($contactRows->whereIn('Phone', $lookups)->pluck('Phone') as $phone) {
                 $contacted[strlen((string) $phone) === 11 ? substr((string) $phone, 1) : (string) $phone] = true;
             }
         }

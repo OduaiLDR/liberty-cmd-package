@@ -44,15 +44,15 @@ final class SmsPhoneSourceValidityTest extends TestCase
     public function test_exact_decimal_ids_calendar_boundaries_and_phone_behavior_are_preserved(): void
     {
         $rows = (new ReflectionMethod(SyncPhoneNumbers::class, 'normalizePhones'))->invoke(new SyncPhoneNumbers, [
-            ['PHONE' => '(202) 555-0199', 'ID' => '12345678901234567890123456789012345678', 'CREATED_DATE' => '2024-02-29'],
-            ['PHONE' => '1', 'ID' => '000123', 'CREATED_DATE' => '0001-01-01'],
-            ['PHONE' => '12025550199', 'ID' => 123, 'CREATED_DATE' => '9999-12-31'],
+            ['PHONE' => '(202) 555-0199', 'ID' => '12345678901234567890123456789012345678', 'CREATED_DATE' => '2024-02-29','PHONE_SLOT'=>0],
+            ['PHONE' => '1', 'ID' => '000123', 'CREATED_DATE' => '0001-01-01','PHONE_SLOT'=>0],
+            ['PHONE' => '12025550199', 'ID' => 123, 'CREATED_DATE' => '9999-12-31','PHONE_SLOT'=>0],
             ['PHONE' => '', 'ID' => null, 'CREATED_DATE' => null],
         ]);
         self::assertSame([
-            ['phone' => '2025550199', 'cid' => '12345678901234567890123456789012345678', 'created' => '2024-02-29'],
-            ['phone' => '0000000001', 'cid' => '000123', 'created' => '0001-01-01'],
-            ['phone' => '12025550199', 'cid' => '123', 'created' => '9999-12-31'],
+            ['phone' => '2025550199', 'cid' => '12345678901234567890123456789012345678', 'created' => '2024-02-29', 'data_source' => null, 'external_id' => null, 'slot'=>0],
+            ['phone' => '0000000001', 'cid' => '000123', 'created' => '0001-01-01', 'data_source' => null, 'external_id' => null, 'slot'=>0],
+            ['phone' => '2025550199', 'cid' => '123', 'created' => '9999-12-31', 'data_source' => null, 'external_id' => null, 'slot'=>0],
         ], $rows);
     }
 }

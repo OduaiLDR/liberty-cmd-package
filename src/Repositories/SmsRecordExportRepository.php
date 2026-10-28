@@ -18,6 +18,7 @@ use Cmd\Reports\Services\SmsTierWindowSelectionSql;
 use Cmd\Reports\Services\SmsLeanHistorySchema;
 use Cmd\Reports\Services\SmsSelectionCancellation;
 use Cmd\Reports\Services\SmsStatePolicy;
+use Cmd\Reports\Services\SmsPhoneNumbersSql;
 use Illuminate\Database\Query\Builder;
 use RuntimeException;
 use Symfony\Component\HttpKernel\Exception\HttpException;
@@ -32,6 +33,10 @@ class SmsRecordExportRepository extends SqlSrvRepository
             ? "CASE WHEN LEN(c.Phone) = 11 AND LEFT(c.Phone, 1) = '1' THEN SUBSTRING(c.Phone, 2, 10) ELSE c.Phone END"
             : "CASE WHEN length(c.Phone) = 11 AND substr(c.Phone, 1, 1) = '1' THEN substr(c.Phone, 2, 10) ELSE c.Phone END";
         $query = $this->table('TblProspects');
+        $wideContacts = (bool) config('sms-exports.wide_phone_contacts_enabled', false);
+        $contactRows = static fn (Builder $q): Builder => $wideContacts
+            ? $q->fromRaw(SmsPhoneNumbersSql::from('c', '', true))
+            : $q->from('TblPhoneNumbers as c');
         if ($seekContactPhones && $sqlServer) {
             // Fixed internal literals let cached plans prove the filtered-index
             // predicate; these flags are never supplied by the caller.
@@ -48,12 +53,12 @@ class SmsRecordExportRepository extends SqlSrvRepository
             // Eligible prospects contain exactly ten digits. The legacy CASE
             // therefore matches precisely the native ten-digit or 1+ten-digit
             // contact key (including SQL Server's existing trailing-space rule).
-            $query->whereNotExists(fn (Builder $q) => $q->selectRaw('1')->from('TblPhoneNumbers as c')
+            $query->whereNotExists(fn (Builder $q) => $contactRows($q->selectRaw('1'))
                 ->whereColumn('c.Phone', 'TblProspects.Phone'))
-                ->whereNotExists(fn (Builder $q) => $q->selectRaw('1')->from('TblPhoneNumbers as c')
+                ->whereNotExists(fn (Builder $q) => $contactRows($q->selectRaw('1'))
                     ->whereRaw("c.Phone = '1' + TblProspects.Phone"));
         } else {
-            $query->whereNotExists(fn (Builder $q) => $q->selectRaw('1')->from('TblPhoneNumbers as c')
+            $query->whereNotExists(fn (Builder $q) => $contactRows($q->selectRaw('1'))
                 ->whereNotNull('c.Phone')->whereRaw("{$contactPhone} = TblProspects.Phone"));
         }
         SmsStatePolicy::applyEligible($query, 'TblProspects.State');

@@ -24,7 +24,7 @@ final class SmsPhoneCompanySourceTest extends TestCase
     protected function setUp(): void
     {
         $this->previous=Container::getInstance();$app=new Container;Container::setInstance($app);
-        $app->instance('config',new Repository([]));
+        $app->instance('config',new Repository(['sms-exports'=>['wide_phone_contacts_enabled'=>true]]));
         $this->logger=new class {
             public array $contexts=[];public array $failures=[];
             public function info($message,array $context=[]):void {$this->contexts[]=$context;}
@@ -130,7 +130,7 @@ final class SmsPhoneCompanySourceTest extends TestCase
     public function test_postcommit_connection_failure_keeps_true_commit_receipt_and_next_failed_replacement_resets_it():void
     {
         $pdo=new \PDO('sqlite::memory:');
-        $pdo->exec('CREATE TABLE TblPhoneNumbers (Phone TEXT, Source TEXT, CID TEXT, Created_Date TEXT)');
+        $pdo->exec('CREATE TABLE TblPhoneNumbers (Phone TEXT, Source TEXT, CID TEXT, Created_Date TEXT, Data_Source TEXT, External_ID TEXT, Phone1 TEXT, Phone2 TEXT, Phone3 TEXT, Phone4 TEXT)');
         $path=tempnam(sys_get_temp_dir(),'sms-phone-commit-fixture-');
         self::assertNotFalse($path);
         $command=$this->command();
@@ -173,7 +173,7 @@ final class SmsPhoneCompanySourceTest extends TestCase
         $capsule->addConnection(['driver'=>'sqlite','database'=>':memory:'] ,'sqlsrv');
         $app->instance('db',$capsule->getDatabaseManager());
         $db=$capsule->getConnection('sqlsrv');
-        $db->statement('CREATE TABLE TblPhoneNumbers (Phone TEXT,Source TEXT,CID TEXT'.($schemaReady?',Created_Date TEXT':'').')');
+        $db->statement('CREATE TABLE TblPhoneNumbers (Phone TEXT,Source TEXT,CID TEXT,Data_Source TEXT,External_ID TEXT,Phone1 TEXT,Phone2 TEXT,Phone3 TEXT,Phone4 TEXT'.($schemaReady?',Created_Date TEXT':'').')');
         $db->table('TblPhoneNumbers')->insert(['Phone'=>'2025550101','Source'=>'DP_LT','CID'=>'old']);
         $before=$db->table('TblPhoneNumbers')->get()->toJson();
         $files=glob(sys_get_temp_dir().'/sync-phone-*');
@@ -193,8 +193,8 @@ final class SmsPhoneCompanySourceTest extends TestCase
                     public function query(string $sql,array $bindings=[],?int $timeoutSeconds=null):array {
                         ++$this->command->queries;
                         return ['data'=>$this->command->queries===1
-                            ? array_fill(0,5000,['PHONE'=>'2025550199','ID'=>'123','CREATED_DATE'=>'2026-10-12'])
-                            : [['PHONE'=>'2025550198','ID'=>$this->command->id,'CREATED_DATE'=>$this->command->date]]];
+                            ? array_fill(0,5000,['PHONE'=>'2025550199','ID'=>'123','CREATED_DATE'=>'2026-10-12','PHONE_SLOT'=>0])
+                            : [['PHONE'=>'2025550198','ID'=>$this->command->id,'CREATED_DATE'=>$this->command->date,'PHONE_SLOT'=>1]]];
                     }
                 };
             }

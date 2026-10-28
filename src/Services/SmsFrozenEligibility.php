@@ -70,12 +70,14 @@ WHERE x.Request_ID=? ORDER BY p.PK", [$requestId], false);
         $contactPhone = $native ? "(c.Phone=x.Phone OR c.Phone='1'+x.Phone)"
             : "(c.Phone=x.Phone OR c.Phone='1'||x.Phone)";
         $hint = $locking ? ' WITH (UPDLOCK,HOLDLOCK)' : '';
-        if ($members()->where(function (Builder $q) use ($phoneValid, $samePhone, $contactPhone, $hint): void {
+        $contactRows = config('sms-exports.wide_phone_contacts_enabled', false)
+            ? SmsPhoneNumbersSql::from('c', $hint, true) : 'TblPhoneNumbers as c'.$hint;
+        if ($members()->where(function (Builder $q) use ($phoneValid, $samePhone, $contactPhone, $hint, $contactRows): void {
             foreach (['Contacted','Opt_Out','Invalid_Phone'] as $flag) $q->orWhereNull('p.'.$flag)->orWhere('p.'.$flag, '<>', 0);
             $q->orWhereNull('p.Phone')->orWhereNull('x.Phone')->orWhereRaw("NOT ({$phoneValid})")->orWhereRaw("NOT ({$samePhone})")
                 ->orWhereExists(fn (Builder $s) => $s->selectRaw('1')->fromRaw('TblSMSSuppressions as s'.$hint)
                     ->whereColumn('s.Phone', 'x.Phone')->where(fn (Builder $flags) => $flags->where('s.Opt_Out', 1)->orWhere('s.Invalid_Phone', 1)))
-                ->orWhereExists(fn (Builder $c) => $c->selectRaw('1')->fromRaw('TblPhoneNumbers as c'.$hint)->whereRaw($contactPhone));
+                ->orWhereExists(fn (Builder $c) => $c->selectRaw('1')->fromRaw($contactRows)->whereRaw($contactPhone));
         })->exists()) {
             throw new SmsFrozenEligibilityHold('A frozen SMS member is contacted, suppressed, invalid or has a changed phone. The batch was held without changing membership.');
         }
