@@ -53,8 +53,14 @@ final class SmsRecordPolicy
         if (! self::enabled() || ! config('sms-exports.durable_availability_enabled', false)) {
             throw new HttpException(503, 'Record-based SMS approval requires the coordinated record-workflow and durable-summary rollout.');
         }
-        $schema = DB::connection('sqlsrv')->getSchemaBuilder();
-        foreach (['TblProspects' => ['Last_SMS_Date', 'Contacted_Date'],
+        $db = DB::connection('sqlsrv');
+        $schema = $db->getSchemaBuilder();
+        SmsProspectSchema::assertResponseReady($db);
+        if (SmsProspectSchema::responseEnabled() && config('sms-exports.contact_attribution_enabled', false)
+            && ! $schema->hasColumn('TblProspects', 'Contacted_Date')) {
+            throw new HttpException(503, 'Original-contact attribution requires its separate Contacted_Date evidence column.');
+        }
+        foreach (['TblProspects' => SmsProspectSchema::recordColumns(),
             'TblSMSRuns' => ['Selection_Policy', 'Never_Texted', 'Previously_Texted', 'Approved_At', 'Approved_By', 'File_Cleanup_Path'],
             'TblProspectsExport' => ['Was_Previously_Texted', 'Last_SMS_Date_At_Selection'],
             'TblSMSHistory' => ['Was_Previously_Texted', 'Last_SMS_Date_At_Selection']] as $table => $columns) {

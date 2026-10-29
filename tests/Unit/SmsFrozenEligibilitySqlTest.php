@@ -12,11 +12,26 @@ use PHPUnit\Framework\TestCase;
 /** SQL compilation only: an owned SQLite PDO is never queried with SQL Server SQL. */
 final class SmsFrozenEligibilitySqlTest extends TestCase
 {
+    private $previous;
+
+    protected function setUp(): void
+    {
+        $this->previous = \Illuminate\Container\Container::getInstance();
+        $container = new \Illuminate\Container\Container;
+        $container->instance('config', new \Illuminate\Config\Repository);
+        \Illuminate\Container\Container::setInstance($container);
+    }
+
+    protected function tearDown(): void
+    {
+        \Illuminate\Container\Container::setInstance($this->previous);
+    }
+
     public function test_native_guard_uses_common_unicode_width_without_weakening_safety_checks(): void
     {
         $db = new SqlServerConnection(new PDO('sqlite::memory:'), 'owned', '', ['driver' => 'sqlsrv']);
         $queries = $db->pretend(fn () => SmsFrozenEligibility::assertPending($db, 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'));
-        self::assertCount(2, $queries);
+        self::assertGreaterThanOrEqual(2, count($queries));
         $state = $queries[0]['query'];
         $phone = $queries[1]['query'];
         self::assertStringContainsString('p.State', $state);
@@ -30,8 +45,13 @@ final class SmsFrozenEligibilitySqlTest extends TestCase
         self::assertStringNotContainsString('x.Phone COLLATE Latin1_General_100_BIN2', $phone);
         self::assertStringNotContainsString('p.Phone COLLATE Latin1_General_100_BIN2', $phone);
         foreach (['Contacted', 'Opt_Out', 'Invalid_Phone'] as $flag) self::assertStringContainsString('[p].['.$flag.']', $phone);
-        self::assertStringContainsString('TblSMSSuppressions as s', $phone);
-        self::assertStringContainsString('TblPhoneNumbers as c', $phone);
-        self::assertStringContainsString("c.Phone=x.Phone OR c.Phone='1'+x.Phone", $phone);
+        $suppression = $queries[2]['query'];
+        self::assertStringNotContainsString('TblPhoneNumbers', $phone);
+        self::assertStringContainsString('JOIN TblSMSSuppressions AS s', $suppression);
+        self::assertStringContainsString('JOIN TblPhoneNumbers as c', $suppression);
+        self::assertStringContainsString('ON c.Phone=x.Phone', $suppression);
+        self::assertStringContainsString("ON c.Phone='1'+x.Phone", $suppression);
+        self::assertStringContainsString('OPTION (HASH JOIN)', $suppression);
+        self::assertSame(array_fill(0, 3, 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'), $queries[2]['bindings']);
     }
 }

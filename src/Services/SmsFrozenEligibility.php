@@ -19,6 +19,7 @@ final class SmsFrozenEligibility
     public static function assertPending(ConnectionInterface $db, string $requestId): void
     {
         self::assertMembers($db, $requestId, 'TblProspectsExport');
+        SmsDebtPolicy::assertPending($db, $requestId);
     }
 
     /** New outward handoffs must use complete approved membership; history reads stay independent. */
@@ -69,13 +70,32 @@ WHERE x.Request_ID=? ORDER BY p.PK", [$requestId], false);
         $contactPhone = $native ? "(c.Phone=x.Phone OR c.Phone='1'+x.Phone)"
             : "(c.Phone=x.Phone OR c.Phone='1'||x.Phone)";
         $hint = $locking ? ' WITH (UPDLOCK,HOLDLOCK)' : '';
-        if ($members()->where(function (Builder $q) use ($phoneValid, $samePhone, $contactPhone, $hint): void {
+        $contactRows = config('sms-exports.wide_phone_contacts_enabled', false)
+            ? SmsPhoneNumbersSql::from('c', $hint, true) : 'TblPhoneNumbers as c'.$hint;
+        $unsafeMember = $members()->where(function (Builder $q) use ($phoneValid, $samePhone, $contactPhone, $hint, $contactRows, $native): void {
             foreach (['Contacted','Opt_Out','Invalid_Phone'] as $flag) $q->orWhereNull('p.'.$flag)->orWhere('p.'.$flag, '<>', 0);
-            $q->orWhereNull('p.Phone')->orWhereNull('x.Phone')->orWhereRaw("NOT ({$phoneValid})")->orWhereRaw("NOT ({$samePhone})")
-                ->orWhereExists(fn (Builder $s) => $s->selectRaw('1')->fromRaw('TblSMSSuppressions as s'.$hint)
+            $q->orWhereNull('p.Phone')->orWhereNull('x.Phone')->orWhereRaw("NOT ({$phoneValid})")->orWhereRaw("NOT ({$samePhone})");
+            if (! $native) $q->orWhereExists(fn (Builder $s) => $s->selectRaw('1')->fromRaw('TblSMSSuppressions as s'.$hint)
                     ->whereColumn('s.Phone', 'x.Phone')->where(fn (Builder $flags) => $flags->where('s.Opt_Out', 1)->orWhere('s.Invalid_Phone', 1)))
-                ->orWhereExists(fn (Builder $c) => $c->selectRaw('1')->fromRaw('TblPhoneNumbers as c'.$hint)->whereRaw($contactPhone));
-        })->exists()) {
+                ->orWhereExists(fn (Builder $c) => $c->selectRaw('1')->fromRaw($contactRows)->whereRaw($contactPhone));
+        })->exists();
+        // Keep suppression probes separate from the per-member OR predicate.
+        // A row-goal nested-loop plan otherwise repeats every wide-phone branch
+        // millions of times. Equality hash joins retain the identical raw-phone
+        // semantics (including country prefix, source branches and lock hints).
+        $unsafeSuppression = ! $unsafeMember && $native && $db->selectOne("SELECT TOP(1) found
+FROM (
+ SELECT 1 AS found FROM {$table} AS x
+ JOIN TblSMSSuppressions AS s{$hint} ON s.Phone=x.Phone
+ WHERE x.Request_ID=? AND (s.Opt_Out=1 OR s.Invalid_Phone=1)
+ UNION ALL
+ SELECT 1 AS found FROM {$table} AS x
+ JOIN {$contactRows} ON c.Phone=x.Phone WHERE x.Request_ID=?
+ UNION ALL
+ SELECT 1 AS found FROM {$table} AS x
+ JOIN {$contactRows} ON c.Phone='1'+x.Phone WHERE x.Request_ID=?
+) AS unsafe_phone OPTION (HASH JOIN)", [$requestId, $requestId, $requestId], false) !== null;
+        if ($unsafeMember || $unsafeSuppression) {
             throw new SmsFrozenEligibilityHold('A frozen SMS member is contacted, suppressed, invalid or has a changed phone. The batch was held without changing membership.');
         }
     }

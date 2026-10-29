@@ -56,7 +56,7 @@ final class SmsContactFlagSqlServerTest extends TestCase
     {
         $this->previous = Container::getInstance();
         $app = new Container; Container::setInstance($app);
-        $app->instance('config', new Repository(['database'=>['default'=>'sqlsrv'], 'sms-exports'=>['durable_availability_enabled'=>true]]));
+        $app->instance('config', new Repository(['database'=>['default'=>'sqlsrv'], 'sms-exports'=>['durable_availability_enabled'=>true,'wide_phone_contacts_enabled'=>true]]));
         $capsule = new Manager($app);
         $capsule->addConnection(['driver'=>'sqlsrv','host'=>'127.0.0.1,14337','database'=>self::$database,
             'username'=>'sa','password'=>self::$password,'encrypt'=>'no','trust_server_certificate'=>'yes'], 'sqlsrv');
@@ -70,8 +70,10 @@ final class SmsContactFlagSqlServerTest extends TestCase
             CREATE TABLE dbo.TblProspects(PK int PRIMARY KEY,Phone varchar(10) NULL,Contacted bit NOT NULL DEFAULT 0,
                 Contacted_Date date NULL,Creation_Date date NULL,Last_SMS_Date date NULL,Latest_Export_Date date NULL,
                 SMS_Attempts int NOT NULL DEFAULT 0,Opt_Out bit NOT NULL DEFAULT 0,Invalid_Phone bit NOT NULL DEFAULT 0);
-            CREATE TABLE dbo.TblPhoneNumbers(Phone nvarchar(50) NULL,Created_Date date NULL,Source nvarchar(50),CID nvarchar(50),Data_Source nvarchar(50),External_ID nvarchar(256));
+            CREATE TABLE dbo.TblPhoneNumbers(PK int IDENTITY PRIMARY KEY,Phone nvarchar(50) NULL,Created_Date date NULL,Source nvarchar(50),CID nvarchar(50),Data_Source nvarchar(50),External_ID nvarchar(256));
             CREATE TABLE dbo.test_revisions(id int IDENTITY PRIMARY KEY);');
+        (require __DIR__.'/../../database/sms-migrations/2026_10_28_000002_add_phone_source_provenance.php')->up();
+        (require __DIR__.'/../../database/sms-migrations/2026_10_29_000001_add_phone_contact_metadata.php')->up();
         $this->ledger = new class {
             public bool $fail = false;
             public int $calls = 0;
@@ -145,7 +147,16 @@ final class SmsContactFlagSqlServerTest extends TestCase
     public function test_unicode_seek_matches_the_original_sql_for_edge_values(string $collation): void
     {
         $this->db->statement("ALTER TABLE dbo.TblProspects ALTER COLUMN Phone varchar(10) COLLATE {$collation} NULL");
+        foreach(['UX_TblPhoneNumbers_Wide_Source_CID','IX_TblPhoneNumbers_Phone1','IX_TblPhoneNumbers_Phone2','IX_TblPhoneNumbers_Phone3','IX_TblPhoneNumbers_Phone4'] as $index) {
+            $this->db->statement("DROP INDEX {$index} ON dbo.TblPhoneNumbers");
+        }
+        $this->db->statement('ALTER TABLE dbo.TblPhoneNumbers DROP COLUMN Phone1,Phone2,Phone3,Phone4');
         $this->db->statement("ALTER TABLE dbo.TblPhoneNumbers ALTER COLUMN Phone nvarchar(100) COLLATE {$collation} NULL");
+        // Exercise migration inheritance against each legacy collation before testing the unchanged edge semantics.
+        (require __DIR__.'/../../database/sms-migrations/2026_10_28_000002_add_phone_source_provenance.php')->up();
+        $phoneColumns=$this->db->select("SELECT collation_name FROM sys.columns WHERE object_id=OBJECT_ID(N'dbo.TblPhoneNumbers') AND name IN(N'Phone',N'Phone1',N'Phone2',N'Phone3',N'Phone4')");
+        self::assertCount(5,$phoneColumns);
+        self::assertSame([$collation],array_values(array_unique(array_column($phoneColumns,'collation_name'))));
         $prospects=['2025550101','2025550102','2025550103','2025550104','2025550105','2025550106',
             'abcdefghij','ABCDEFGHIJ','cafe','café','?', '', '123',null];
         foreach($prospects as $i=>$phone) $this->db->table('TblProspects')->insert(['PK'=>$i+1,'Phone'=>$phone]);
@@ -357,8 +368,8 @@ SQL;
         $id = '12345678901234567890123456789012345678';
         $normalize = new \ReflectionMethod($command,'normalizePhones');
         $rows = $normalize->invoke($command,[
-            ['ID'=>$id,'PHONE'=>'2025550101','CREATED_DATE'=>'2026-10-12'],
-            ['ID'=>'000123','PHONE'=>'2025550102','CREATED_DATE'=>'2024-02-29'],
+            ['ID'=>$id,'PHONE'=>'2025550101','CREATED_DATE'=>'2026-10-12','PHONE_SLOT'=>0],
+            ['ID'=>'000123','PHONE'=>'2025550102','CREATED_DATE'=>'2024-02-29','PHONE_SLOT'=>0],
         ]);
         self::assertSame($id,$rows[0]['cid']); self::assertSame('000123',$rows[1]['cid']);
         (new \ReflectionProperty($command,'withCreatedDate'))->setValue($command,true);
@@ -446,9 +457,9 @@ SQL;
         (new \ReflectionProperty($command,'withCreatedDate'))->setValue($command,true);
         $stage=tempnam(sys_get_temp_dir(),'sms-company-native-');self::assertNotFalse($stage);
         $cid='12345678901234567890123456789012345678';
-        file_put_contents($stage,json_encode(['phone'=>'2025550191','cid'=>$cid,'created'=>'2026-10-12'])."\n".json_encode(['phone'=>'','cid'=>'17','created'=>'2026-10-12'])."\n");
+        file_put_contents($stage,json_encode(['phone'=>'2025550191','cid'=>$cid,'created'=>'2026-10-12'])."\n");
         try {
-            self::assertSame([1,2,1],(new \ReflectionMethod($command,'replacePhonesFromFile'))->invoke($command,$this->db->getPdo(),$stage,1));
+            self::assertSame([1,1,0],(new \ReflectionMethod($command,'replacePhonesFromFile'))->invoke($command,$this->db->getPdo(),$stage,1));
             self::assertSame($others,$this->db->table('TblPhoneNumbers')->where('Source','<>',$label)->orderBy('Source')->get()->toJson());
             $own=$this->db->table('TblPhoneNumbers')->where('Source',$label)->get();self::assertCount(1,$own);
             self::assertSame('2025550191',$own[0]->Phone);self::assertSame($cid,$own[0]->CID);self::assertSame('2026-10-12',$own[0]->Created_Date);
@@ -476,7 +487,8 @@ SQL;
         (new \ReflectionMethod($command,'assertProvenanceStorage'))->invoke($command);
         $stage=new \Cmd\Reports\Services\SmsPhoneSnapshotStage;
         $row=['phone'=>'2025550199','cid'=>'00012345678901234567890123456789012345','created'=>'2026-10-12',
-            'data_source'=>"源 O'Brien 😀",'external_id'=>str_repeat('0',250).'-A😀'];
+            'data_source'=>"源 O'Brien 😀",'external_id'=>str_repeat('0',250).'-A😀',
+            'status'=>"Qualified O'Brien 😀"];
         $this->db->table('TblPhoneNumbers')->insert(['Phone'=>'2025550100','Source'=>'DP_LDR','CID'=>'other']);
         try {
             $stage->add('DP_LT',$row); $stage->add('DP_LT',$row); $path=$stage->export();
@@ -484,6 +496,7 @@ SQL;
             $actual=$this->db->table('TblPhoneNumbers')->where('Source','DP_LT')->sole();
             self::assertSame($row['cid'],$actual->CID); self::assertSame($row['data_source'],$actual->Data_Source);
             self::assertSame($row['external_id'],$actual->External_ID);
+            self::assertSame($row['status'],$actual->Status);
             self::assertSame(1,$this->db->table('TblPhoneNumbers')->where('Source','DP_LDR')->count());
             self::assertSame(1,$this->db->table('test_revisions')->count());
             self::assertSame(1,$this->requests->calls);
@@ -495,5 +508,37 @@ SQL;
         try { (new \ReflectionMethod($command,'assertProvenanceStorage'))->invoke($command); self::fail('Expected unsafe storage rejection.'); }
         catch (RuntimeException $error) { self::assertStringContainsString('Unicode provenance storage',$error->getMessage()); }
         self::assertSame($before,$this->db->table('TblPhoneNumbers')->get()->toJson());
+    }
+
+    public function test_wide_contact_unique_index_projection_and_slot_four_are_real_engine_safe(): void
+    {
+        $this->ledger->expectedLaravelLevel = 0;
+        $command=new class extends SyncPhoneNumbers {
+            public function __construct() {parent::__construct();$this->withCreatedDate=true;}
+            public function info($string,$verbosity=null):void {}
+        };
+        (new \ReflectionMethod($command,'assertProvenanceStorage'))->invoke($command);
+        $stage=new \Cmd\Reports\Services\SmsPhoneSnapshotStage;
+        $base=['cid'=>'000123','created'=>'2026-10-12','data_source'=>'Synthetic','external_id'=>'00009'];
+        try {
+            foreach([3,1,0,2] as $slot) $stage->add('DP_LT',[...$base,'phone'=>'202555019'.$slot,'slot'=>$slot]);
+            $path=$stage->export();
+            self::assertSame([0,1,0],(new \ReflectionMethod($command,'replacePhonesFromFile'))->invoke($command,$this->db->getPdo(),$path,1000));
+            $row=$this->db->table('TblPhoneNumbers')->sole();
+            self::assertSame(['2025550190','2025550191','2025550192','2025550193'],[$row->Phone1,$row->Phone2,$row->Phone3,$row->Phone4]);
+            self::assertSame($row->Phone1,$row->Phone);
+            $this->db->table('TblPhoneNumbers')->insert(['Phone'=>'2025550193','Source'=>'DP_LDR','CID'=>'000123']);
+            $rows=$this->db->select('SELECT p.* FROM '.\Cmd\Reports\Services\SmsPhoneNumbersSql::from('p',' WITH (HOLDLOCK)',true));
+            self::assertCount(5,$rows);
+            self::assertSame(4,count(array_filter($rows,fn($r)=>$r->Source==='DP_LT')));
+            self::assertSame(1,count(array_unique(array_map(fn($r)=>$r->PK,array_filter($rows,fn($r)=>$r->Source==='DP_LT')))));
+            $other=$this->db->getPdo();
+            try { $other->exec("INSERT TblPhoneNumbers(Source,CID,Phone1) VALUES('DP_LT','000123','2025550100')"); self::fail('Expected contact uniqueness rejection.'); }
+            catch(\PDOException $error) { self::assertContains((int)($error->errorInfo[1]??0),[2601,2627]); }
+            self::assertSame(2,$this->db->table('TblPhoneNumbers')->count());
+            $this->db->statement('DROP INDEX IX_TblPhoneNumbers_Phone4 ON dbo.TblPhoneNumbers');
+            try { (new \ReflectionMethod($command,'assertProvenanceStorage'))->invoke($command); self::fail('Expected missing seek index rejection.'); }
+            catch(RuntimeException $error) { self::assertStringContainsString('reviewed contact and phone indexes',$error->getMessage()); }
+        } finally { $stage->close(); }
     }
 }

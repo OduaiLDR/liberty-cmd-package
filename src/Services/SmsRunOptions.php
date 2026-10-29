@@ -48,8 +48,14 @@ final class SmsRunOptions
      * @param array<int, string>|null $tiers
      * @return array{target:int, rows_per_file:int, tiers:list<string>, csv_format:string}
      */
-    public static function normalize(int $target, ?int $rowsPerFile = null, ?array $tiers = null, ?string $tierSelectionPolicy = null, ?string $optionsVersion = null, ?string $sendDate = null, ?string $filenameVersion = null): array
+    public static function normalize(int $target, ?int $rowsPerFile = null, ?array $tiers = null, ?string $tierSelectionPolicy = null, ?string $optionsVersion = null, ?string $sendDate = null, ?string $filenameVersion = null, ?int $minimumDebtAmount = null): array
     {
+        if ($minimumDebtAmount !== null) {
+            SmsDebtPolicy::validate($minimumDebtAmount);
+            if (! self::isTierSelectionPolicy($tierSelectionPolicy)) {
+                throw new InvalidArgumentException('A debt minimum requires explicit current-source selection before quantity.');
+            }
+        }
         if ($filenameVersion !== null && (! in_array($filenameVersion, [self::DROP_RANGE_FILENAME_VERSION, self::APPROVAL_FILENAME_VERSION], true) || $optionsVersion !== self::PLANNED_DATE_VERSION)) {
             throw new InvalidArgumentException('SMS drop-range filenames require the explicit supported filename and planned-date versions.');
         }
@@ -98,6 +104,7 @@ final class SmsRunOptions
             $options['send_date'] = $sendDate;
         }
         if ($filenameVersion !== null) $options['filename_version'] = $filenameVersion;
+        if ($minimumDebtAmount !== null) $options['minimum_debt_amount'] = $minimumDebtAmount;
         return $options;
     }
 
@@ -128,6 +135,10 @@ final class SmsRunOptions
             $keys[] = 'filename_version';
             if (! in_array($stored['filename_version'], [self::DROP_RANGE_FILENAME_VERSION, self::APPROVAL_FILENAME_VERSION], true)) throw new InvalidArgumentException('Stored SMS filename version is invalid.');
         }
+        if (is_array($stored) && array_key_exists('minimum_debt_amount', $stored)) {
+            $keys[] = 'minimum_debt_amount';
+            if (! is_int($stored['minimum_debt_amount'])) throw new InvalidArgumentException('Stored SMS debt minimum is invalid.');
+        }
         if (! is_array($stored) || array_keys($stored) !== $keys
             || ! is_int($stored['target']) || $stored['target'] !== $target
             || ! is_int($stored['rows_per_file']) || ! is_array($stored['tiers'])
@@ -135,7 +146,7 @@ final class SmsRunOptions
             throw new InvalidArgumentException('Stored SMS run options are incomplete or inconsistent.');
         }
         $canonical = self::normalize($target, $stored['rows_per_file'], $stored['tiers'], $stored['tier_selection_policy'] ?? null,
-            $stored['options_version'] ?? null, $stored['send_date'] ?? null, $stored['filename_version'] ?? null);
+            $stored['options_version'] ?? null, $stored['send_date'] ?? null, $stored['filename_version'] ?? null, $stored['minimum_debt_amount'] ?? null);
         if ($stored !== $canonical) throw new InvalidArgumentException('Stored SMS run options are not canonical.');
         return $canonical;
     }

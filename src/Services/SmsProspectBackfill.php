@@ -306,7 +306,12 @@ SQL;
     {
         $json = \SmsProspectReconciliation::json($inputs);
         if (strlen($json) > 2 * 1024 * 1024) throw new RuntimeException('Backfill payload exceeded the chunk limit.');
-        return self::rows($db, <<<'SQL'
+        // Standalone recovery tools have no Laravel config container. Select the
+        // compatibility reader from actual additive schema, preserving old rows.
+        $wideColumns = self::rows($db, "SELECT c.name FROM sys.columns c WHERE c.object_id=OBJECT_ID('dbo.TblPhoneNumbers') AND c.name IN ('Phone1','Phone2','Phone3','Phone4')");
+        if (count($wideColumns) !== 0 && count($wideColumns) !== 4) throw new RuntimeException('Wide phone contact schema is incomplete; backfill remains held.');
+        $contacts = count($wideColumns) === 4 ? SmsPhoneNumbersSql::from('c', ' WITH (HOLDLOCK)', true) : 'dbo.TblPhoneNumbers c WITH(HOLDLOCK)';
+        return self::rows($db, <<<SQL
 SET NOCOUNT ON;
 DECLARE @run uniqueidentifier=?,@reviewed bit=?,@no_prior_sends bit=?;
 SELECT * INTO #BFInput FROM OPENJSON(CAST(? AS nvarchar(max))) WITH (
@@ -352,7 +357,7 @@ SELECT n.*,
  h.Latest_Export_Date,h.SMS_Attempts,
  CONVERT(char(64),HASHBYTES('SHA2_256',COALESCE((SELECT e.Event_ID,e.Send_Date FROM #BFEvents e WHERE e.Phone=n.Phone ORDER BY e.Send_Date,e.Event_ID FOR JSON PATH,INCLUDE_NULL_VALUES),N'[]')),2) AS History_SHA256
 INTO #BFReady FROM #BFNew n
-OUTER APPLY(SELECT TOP(1) 1 AS found FROM dbo.TblPhoneNumbers c WITH(HOLDLOCK) WHERE c.Phone IN(n.Phone,'1'+n.Phone)) c
+OUTER APPLY(SELECT TOP(1) 1 AS found FROM {$contacts} WHERE c.Phone IN(n.Phone,'1'+n.Phone)) c
 LEFT JOIN dbo.TblSMSSuppressions s WITH(UPDLOCK,HOLDLOCK) ON s.Phone=n.Phone
 -- Parallel workers can self-deadlock while taking RangeS-U locks on absent phone keys.
 -- Keep the suppression/identity locks; serialize these bounded locking lookups instead.

@@ -56,6 +56,10 @@ final class SmsRunArtifactBundle
                 if (isset($options['send_date']) && $row[3] !== $options['send_date']) {
                     throw new RuntimeException('The SMS row date differs from the frozen planned send date.');
                 }
+                if (isset($options['minimum_debt_amount']) && (! preg_match('/\A[0-9]+\z/D', $row[1])
+                    || (int) $row[1] < $options['minimum_debt_amount'] || (int) $row[1] > SmsDebtPolicy::MAX)) {
+                    throw new RuntimeException('The SMS row debt is below its frozen minimum or outside the supported debt range.');
+                }
                 if ($handle === null) {
                     $name = $this->partName($stem, ++$part, $parts);
                     $handle = fopen($stage.'/'.$name, 'xb');
@@ -304,7 +308,7 @@ final class SmsRunArtifactBundle
             || ! is_int($options['target']) || ! is_int($options['rows_per_file']) || ! is_array($options['tiers'])
             || (array_key_exists('tier_selection_policy', $options) && ! SmsRunOptions::isTierSelectionPolicy($options['tier_selection_policy']))
             || $options !== SmsRunOptions::normalize($options['target'], $options['rows_per_file'], $options['tiers'], $options['tier_selection_policy'] ?? null,
-                $options['options_version'] ?? null, $options['send_date'] ?? null, $options['filename_version'] ?? null)) {
+                $options['options_version'] ?? null, $options['send_date'] ?? null, $options['filename_version'] ?? null, $options['minimum_debt_amount'] ?? null)) {
             throw new RuntimeException('The SMS artifact requires complete canonical versioned run options.');
         }
         if ($expected < 1 || $expected > $options['target']) throw new RuntimeException('The SMS artifact requires a positive selected count no greater than its target.');

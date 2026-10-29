@@ -30,6 +30,12 @@ WHERE p.Phone IS NOT NULL
 OPTION (LOOP JOIN, FORCE ORDER)
 SQL;
 
+    public static function sql(bool $widePhones = false): string
+    {
+        return $widePhones ? str_replace('FROM dbo.TblPhoneNumbers',
+            'FROM '.SmsPhoneNumbersSql::from('contact_numbers', '', true), self::SQL) : self::SQL;
+    }
+
     public static function assertReady(ConnectionInterface $db): void
     {
         if ($db->getDriverName() !== 'sqlsrv' || $db->getTablePrefix() !== '') {

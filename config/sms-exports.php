@@ -30,6 +30,11 @@ return [
     // Flag-only path, opt in only after explicit Unicode index installation, all-writer
     // SET-option review and actual production scale/plan acceptance. Legacy Response_Date stays unchanged.
     'contact_flag_seek_enabled' => env('CMD_SMS_CONTACT_FLAG_SEEK_ENABLED', false),
+    // Coordinated contact-row rollout: all SMS readers must project every phone slot.
+    // Enable only after the additive Phone1-4 schema/indexes and fresh workers are verified.
+    'wide_phone_contacts_enabled' => env('CMD_SMS_WIDE_PHONE_CONTACTS_ENABLED', false),
+    // Explicit final-schema acceptance after prospect cleanup; no date aliases or backfill.
+    'response_schema_enabled' => env('CMD_SMS_RESPONSE_SCHEMA_ENABLED', false),
     // Coordinated package/runner rollout only, after TU data-date provenance and
     // completion contracts are approved. Never derive this date from upload/count time.
     'tu_completion_date_enabled' => env('CMD_SMS_TU_COMPLETION_DATE_ENABLED', false),

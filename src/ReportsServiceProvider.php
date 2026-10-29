@@ -139,6 +139,7 @@ class ReportsServiceProvider extends ServiceProvider
             __DIR__ . '/../database/sms-migrations/2026_10_24_000001_create_sms_external_events.php' => database_path('migrations/2026_10_24_000001_create_sms_external_events.php'),
             __DIR__ . '/../database/sms-migrations/2026_10_27_000001_add_sms_state_holds.php' => database_path('migrations/2026_10_27_000001_add_sms_state_holds.php'),
             __DIR__ . '/../database/sms-migrations/2026_10_28_000002_add_phone_source_provenance.php' => database_path('migrations/2026_10_28_000002_add_phone_source_provenance.php'),
+            __DIR__ . '/../database/sms-migrations/2026_10_29_000001_add_phone_contact_metadata.php' => database_path('migrations/2026_10_29_000001_add_phone_contact_metadata.php'),
         ], 'reports-sms-migrations');
         $this->publishes([
             __DIR__ . '/../database/sms-migrations/2026_10_25_000001_create_sms_debtplete_imports.php'

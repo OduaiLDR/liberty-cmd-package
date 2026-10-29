@@ -8,6 +8,7 @@ use Cmd\Reports\Console\Commands\SyncPhoneNumbers;
 use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\SmsAvailabilityService;
 use Cmd\Reports\Services\SmsPhoneSnapshotStage;
+use Cmd\Reports\Services\SmsPhoneNumbersSql;
 use Illuminate\Config\Repository;
 use Illuminate\Container\Container;
 use Illuminate\Database\Capsule\Manager;
@@ -27,7 +28,7 @@ final class SmsPhoneSnapshotDedupTest extends TestCase
     protected function setUp(): void
     {
         $this->previous = Container::getInstance(); $app = new Container; Container::setInstance($app);
-        $app->instance('config', new Repository([]));
+        $app->instance('config', new Repository(['sms-exports'=>['wide_phone_contacts_enabled'=>true]]));
         $manager = new Manager($app); $manager->addConnection(['driver'=>'sqlite','database'=>':memory:'], 'sqlsrv');
         $app->instance('db', $manager->getDatabaseManager());
         $app->instance(SmsAvailabilityService::class, new class { public function invalidate(): void {} });
@@ -38,7 +39,7 @@ final class SmsPhoneSnapshotDedupTest extends TestCase
         };
         $app->instance('log', $this->logger); Facade::clearResolvedInstances(); Facade::setFacadeApplication($app);
         $this->db = $manager->getConnection('sqlsrv');
-        $this->db->statement('CREATE TABLE TblPhoneNumbers(Phone TEXT,Source TEXT,CID TEXT,Created_Date TEXT,Data_Source TEXT,External_ID TEXT)');
+        $this->db->statement('CREATE TABLE TblPhoneNumbers(PK INTEGER PRIMARY KEY AUTOINCREMENT,Phone TEXT,Source TEXT,CID TEXT,Created_Date TEXT,Data_Source TEXT,External_ID TEXT,Status TEXT,Phone1 TEXT,Phone2 TEXT,Phone3 TEXT,Phone4 TEXT)');
         foreach (['DP_LT','DP_LDR','DP'] as $source) $this->db->table('TblPhoneNumbers')->insert(['Phone'=>'2025550100','Source'=>$source,'CID'=>'old']);
     }
 
@@ -50,7 +51,9 @@ final class SmsPhoneSnapshotDedupTest extends TestCase
     private function row(array $changes=[]): array
     {
         return array_replace(['PHONE'=>'(202) 555-0199','ID'=>'000123','CREATED_DATE'=>'2026-10-12',
-            'DATA_SOURCE'=>'Synthetic source','EXTERNAL_ID'=>'000987','DATA_SOURCE_VARIANTS'=>1], $changes);
+            'DATA_SOURCE'=>'Synthetic source','DATA_SOURCE_ID'=>'79071','EXTERNAL_ID'=>'000987','DATA_SOURCE_VARIANTS'=>1,
+            'STATUS'=>'Active','STATUS_ID'=>'1234','STATUS_VARIANTS'=>1,
+            'PHONE_SLOT'=>0], $changes);
     }
 
     private function command(array $pages, bool $phonesOnly=true): SyncPhoneNumbers
@@ -79,17 +82,22 @@ final class SmsPhoneSnapshotDedupTest extends TestCase
     {
         $command=$this->command([array_fill(0,5000,$this->row()),[
             $this->row(['PHONE'=>'12025550199']), $this->row(['PHONE'=>'202-555-0199']),
-            $this->row(['ID'=>'123']), $this->row(['PHONE'=>'2025550198']),
+            $this->row(['ID'=>'123']), $this->row(['PHONE'=>'2025550198','PHONE_SLOT'=>1]),
         ]]);
         $before=glob(sys_get_temp_dir().'/sync-phone-*');
         self::assertSame(0,$command->handle()); self::assertSame(2,$command->queries); self::assertSame(0,$command->flags);
-        $own=$this->db->table('TblPhoneNumbers')->where('Source','DP_LT')->get(); self::assertCount(3,$own);
-        self::assertSame(['000123','000123','123'],$own->pluck('CID')->sort()->values()->all());
+        $own=$this->db->table('TblPhoneNumbers')->where('Source','DP_LT')->orderBy('CID')->get(); self::assertCount(2,$own);
+        self::assertSame(['000123','123'],$own->pluck('CID')->all());
+        self::assertSame('2025550199',$own[0]->Phone1); self::assertSame('2025550198',$own[0]->Phone2);
+        self::assertSame($own[0]->Phone1,$own[0]->Phone); self::assertNull($own[0]->Phone3);
         self::assertSame(2,$this->db->table('TblPhoneNumbers')->whereIn('Source',['DP','DP_LDR'])->count());
         self::assertSame([],array_values(array_diff(glob(sys_get_temp_dir().'/sync-phone-*'),$before)));
         $sql=$command->sourceSql[0]; self::assertStringContainsString('c.TP_ID::VARCHAR AS EXTERNAL_ID',$sql);
         self::assertStringContainsString("COUNT(DISTINCT TO_BINARY(NAME, 'UTF-8'))",$sql);
         self::assertStringContainsString('LEFT JOIN source_names AS ds ON c.C_SOURCE = ds.ID',$sql);
+        self::assertStringContainsString('PARTITION BY CONTACT_ID ORDER BY STAMP DESC, ID DESC',$sql);
+        self::assertStringContainsString('COALESCE(_FIVETRAN_DELETED, FALSE) = FALSE',$sql);
+        self::assertStringContainsString('latest_status.STATUS_RANK = 1',$sql);
         self::assertStringContainsString("c.CREATED)::DATE",$sql); self::assertStringNotContainsString('CREATED_AT',$sql);
     }
 
@@ -111,22 +119,34 @@ final class SmsPhoneSnapshotDedupTest extends TestCase
         self::assertSame([],array_values(array_diff(glob(sys_get_temp_dir().'/sync-phone-*'),$files)));
     }
 
-    public function test_nullable_blank_unicode_and_text_external_ids_round_trip_and_default_flags_remain_enabled(): void
+    public function test_nullable_blank_unicode_and_text_external_ids_round_trip_without_prospect_changes(): void
     {
         $command=$this->command([[$this->row(['DATA_SOURCE'=>"源 O'Brien 😀",'EXTERNAL_ID'=>'000123-abc']),
-            $this->row(['ID'=>'124','DATA_SOURCE'=>null,'EXTERNAL_ID'=>null]),
-            $this->row(['ID'=>'125','DATA_SOURCE'=>'','EXTERNAL_ID'=>''])]],false);
-        self::assertSame(0,$command->handle()); self::assertSame(1,$command->flags);
+            $this->row(['ID'=>'124','DATA_SOURCE'=>null,'DATA_SOURCE_ID'=>null,'DATA_SOURCE_VARIANTS'=>0,'EXTERNAL_ID'=>null,
+                'STATUS'=>null,'STATUS_ID'=>null,'STATUS_VARIANTS'=>0]),
+            $this->row(['ID'=>'125','DATA_SOURCE'=>'','EXTERNAL_ID'=>''])]]);
+        self::assertSame(0,$command->handle()); self::assertSame(0,$command->flags);
         $rows=$this->db->table('TblPhoneNumbers')->where('Source','DP_LT')->orderBy('CID')->get();
         self::assertSame("源 O'Brien 😀",$rows[0]->Data_Source); self::assertSame('000123-abc',$rows[0]->External_ID);
         self::assertNull($rows[1]->Data_Source); self::assertNull($rows[1]->External_ID);
         self::assertSame('',$rows[2]->Data_Source); self::assertSame('',$rows[2]->External_ID);
+        self::assertSame('Active',$rows[0]->Status);
+    }
+
+    public function test_default_schedule_cannot_run_the_superseded_prospect_date_writer(): void
+    {
+        $before=$this->db->table('TblPhoneNumbers')->get()->toJson();
+        $command=$this->command([[$this->row()]],false);
+        self::assertSame(1,$command->handle());
+        self::assertSame(0,$command->queries); self::assertSame(0,$command->flags);
+        self::assertSame($before,$this->db->table('TblPhoneNumbers')->get()->toJson());
+        self::assertSame(['Use --phones-only until the reviewed response and enrollment refresh is installed. No synchronization was started.'],$command->errors);
     }
 
     public static function invalidProvenance(): array
     {
         return [['DATA_SOURCE',str_repeat('x',51)],['DATA_SOURCE',str_repeat('😀',26)],
-            ['EXTERNAL_ID',str_repeat('x',257)],['EXTERNAL_ID',123],['DATA_SOURCE',"\xFF"]];
+            ['EXTERNAL_ID',str_repeat('x',257)],['EXTERNAL_ID',123],['DATA_SOURCE',"\xFF"],['EXTERNAL_ID',"bad\0id"]];
     }
 
     #[DataProvider('invalidProvenance')]
@@ -155,11 +175,77 @@ final class SmsPhoneSnapshotDedupTest extends TestCase
     {
         $this->db->statement('ALTER TABLE TblPhoneNumbers DROP COLUMN Data_Source');
         $this->db->statement('ALTER TABLE TblPhoneNumbers DROP COLUMN External_ID');
+        $this->db->statement('ALTER TABLE TblPhoneNumbers DROP COLUMN Status');
         $command=$this->command([[$this->row()]]); self::assertSame(1,$command->handle()); self::assertSame(0,$command->queries);
         $migration=require __DIR__.'/../../database/sms-migrations/2026_10_28_000002_add_phone_source_provenance.php';
         $migration->up(); $migration->up(); $migration->down();
+        $metadataMigration=require __DIR__.'/../../database/sms-migrations/2026_10_29_000001_add_phone_contact_metadata.php';
+        $metadataMigration->up(); $metadataMigration->up(); $metadataMigration->down();
         self::assertSame(3,$this->db->table('TblPhoneNumbers')->count());
         self::assertTrue($this->db->getSchemaBuilder()->hasColumn('TblPhoneNumbers','Data_Source'));
         self::assertTrue($this->db->getSchemaBuilder()->hasColumn('TblPhoneNumbers','External_ID'));
+        self::assertTrue($this->db->getSchemaBuilder()->hasColumn('TblPhoneNumbers','Status'));
+        // Jacob keeps the values only; IDs, stamps and which lookup filled Data_Source are not stored.
+        foreach (['Data_Source_ID','Data_Source_Origin','Data_Source_Map_SHA256','Status_ID','Status_Stamp'] as $column) {
+            self::assertFalse($this->db->getSchemaBuilder()->hasColumn('TblPhoneNumbers',$column));
+        }
+    }
+
+    public function test_lt_legacy_source_fallback_fills_data_source_and_status_title_can_be_unknown(): void
+    {
+        $command=$this->command([[$this->row(['DATA_SOURCE'=>null,'DATA_SOURCE_ID'=>'79071','DATA_SOURCE_VARIANTS'=>0,
+            'STATUS'=>null,'STATUS_ID'=>'999999','STATUS_VARIANTS'=>0])]]);
+        self::assertSame(0,$command->handle());
+        $row=$this->db->table('TblPhoneNumbers')->where('Source','DP_LT')->sole();
+        self::assertSame('DPP - Mass Post Source',$row->Data_Source);
+        self::assertNull($row->Status);
+    }
+
+    public function test_four_unique_phones_keep_source_slot_order_and_fifth_aborts_without_target_changes(): void
+    {
+        $phones=[]; foreach([3,1,2,0] as $slot) $phones[]=$this->row(['PHONE'=>'202555010'.$slot,'PHONE_SLOT'=>$slot]);
+        $command=$this->command([$phones]); self::assertSame(0,$command->handle());
+        $row=$this->db->table('TblPhoneNumbers')->where('Source','DP_LT')->sole();
+        self::assertSame(['2025550100','2025550101','2025550102','2025550103'],[$row->Phone1,$row->Phone2,$row->Phone3,$row->Phone4]);
+        self::assertSame($row->Phone1,$row->Phone);
+        $before=$this->db->table('TblPhoneNumbers')->get()->toJson();
+        $phones[]=$this->row(['PHONE'=>'2025550104','PHONE_SLOT'=>3]);
+        $command=$this->command([$phones]); self::assertSame(1,$command->handle());
+        self::assertSame($before,$this->db->table('TblPhoneNumbers')->get()->toJson());
+        self::assertSame(0,$command->flags);
+    }
+
+    public function test_conflicting_metadata_across_different_phones_on_same_contact_is_not_a_second_row(): void
+    {
+        $before=$this->db->table('TblPhoneNumbers')->get()->toJson();
+        $command=$this->command([[$this->row(),$this->row(['PHONE'=>'2025550198','PHONE_SLOT'=>1,'EXTERNAL_ID'=>'different'])]]);
+        self::assertSame(1,$command->handle()); self::assertSame($before,$this->db->table('TblPhoneNumbers')->get()->toJson());
+    }
+
+    public function test_gate_off_refuses_source_read_and_publication_and_missing_slot_is_not_invented(): void
+    {
+        config(['sms-exports.wide_phone_contacts_enabled'=>false]); $command=$this->command([[$this->row()]]);
+        self::assertSame(1,$command->handle()); self::assertSame(0,$command->queries); self::assertSame(0,$command->flags);
+        config(['sms-exports.wide_phone_contacts_enabled'=>true]);
+        foreach([null,-1,4,'1.0'] as $slot) { $command=$this->command([[$this->row(['PHONE_SLOT'=>$slot])]]); self::assertSame(1,$command->handle()); }
+    }
+
+    public function test_wide_projection_keeps_all_phones_and_metadata_without_repeating_compatibility_phone(): void
+    {
+        self::assertSame('TblPhoneNumbers AS c',SmsPhoneNumbersSql::from('c'));
+        $this->db->table('TblPhoneNumbers')->delete();
+        $this->db->table('TblPhoneNumbers')->insert(['Phone'=>'2025550101','Phone1'=>'2025550101','Phone2'=>'2025550102',
+            'Phone3'=>'2025550103','Phone4'=>'2025550104','Source'=>'DP_LT','CID'=>'000123','Data_Source'=>'Synthetic','External_ID'=>'0009']);
+        $this->db->table('TblPhoneNumbers')->insert(['Phone'=>'2025550101','Source'=>'DP_LDR','CID'=>'000123']);
+        $rows=$this->db->select('SELECT * FROM '.SmsPhoneNumbersSql::from('p','',true));
+        self::assertCount(5,$rows); self::assertSame(4,count(array_filter($rows,fn($r)=>$r->Source==='DP_LT')));
+        self::assertSame(1,count(array_unique(array_map(fn($r)=>$r->PK,array_filter($rows,fn($r)=>$r->Source==='DP_LT')))));
+        $hinted=SmsPhoneNumbersSql::from('p',' WITH(UPDLOCK,HOLDLOCK)',true);
+        self::assertSame(5,substr_count($hinted,'TblPhoneNumbers WITH (UPDLOCK, HOLDLOCK)'));
+        self::assertStringEndsWith(') AS p',$hinted);
+        foreach([['p;DROP',''],['p',' WITH(NOLOCK)']] as [$alias,$hint]) {
+            try { SmsPhoneNumbersSql::from($alias,$hint,true); self::fail('Expected unsafe SQL rejection.'); }
+            catch(\InvalidArgumentException) {}
+        }
     }
 }

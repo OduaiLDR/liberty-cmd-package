@@ -5,13 +5,14 @@ namespace Cmd\Reports\Services;
 use PDO;
 use RuntimeException;
 
-/** Private, bounded-memory deduplication across every source page, before target deletion. */
+/** Private, bounded-memory contact aggregation across every source page, before target deletion. */
 final class SmsPhoneSnapshotStage
 {
     private ?PDO $db = null;
     private string $directory;
     private ?\PDOStatement $find = null;
     private ?\PDOStatement $insert = null;
+    private ?\PDOStatement $update = null;
     private int $count = 0;
 
     public function __construct()
@@ -23,25 +24,36 @@ final class SmsPhoneSnapshotStage
             $this->db = new PDO('sqlite:'.$this->directory.DIRECTORY_SEPARATOR.'snapshot.sqlite', null, null,
                 [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
             $this->db->exec('PRAGMA cache_size=-2048; CREATE TABLE phones(source TEXT COLLATE BINARY NOT NULL,
-                cid TEXT COLLATE BINARY NOT NULL,phone TEXT COLLATE BINARY NOT NULL,payload TEXT NOT NULL,
-                PRIMARY KEY(source,cid,phone)) WITHOUT ROWID');
+                cid TEXT COLLATE BINARY NOT NULL,payload TEXT NOT NULL,
+                PRIMARY KEY(source,cid)) WITHOUT ROWID');
             $this->db->beginTransaction();
-            $this->find = $this->db->prepare('SELECT payload FROM phones WHERE source=? AND cid=? AND phone=?');
-            $this->insert = $this->db->prepare('INSERT INTO phones(source,cid,phone,payload) VALUES(?,?,?,?)');
+            $this->find = $this->db->prepare('SELECT payload FROM phones WHERE source=? AND cid=?');
+            $this->insert = $this->db->prepare('INSERT INTO phones(source,cid,payload) VALUES(?,?,?)');
+            $this->update = $this->db->prepare('UPDATE phones SET payload=? WHERE source=? AND cid=?');
         } catch (\Throwable $error) { $this->close(); throw $error; }
     }
 
     public function add(string $source, array $row): void
     {
-        $payload = json_encode($row, JSON_THROW_ON_ERROR);
-        $key = [$source, $row['cid'], $row['phone']];
+        $metadata = ['cid'=>$row['cid'],'created'=>$row['created'],
+            'data_source'=>$row['data_source']??null,'external_id'=>$row['external_id']??null,
+            'status'=>$row['status']??null];
+        $slot = $row['slot'] ?? 0;
+        if (! is_int($slot) || $slot < 0 || $slot > 3) throw new RuntimeException('Invalid phone slot; the phone snapshot was not replaced.');
+        $key = [$source, $row['cid']];
         $this->find->execute($key);
         $previous = $this->find->fetchColumn();
         $this->find->closeCursor();
         if ($previous !== false) {
-            if ($previous !== $payload) throw new RuntimeException('Conflicting phone provenance; the phone snapshot was not replaced.');
+            $saved = json_decode($previous, true, 512, JSON_THROW_ON_ERROR);
+            if ($saved['metadata'] !== $metadata) throw new RuntimeException('Conflicting phone provenance; the phone snapshot was not replaced.');
+            $phones = $saved['phones'];
+            $phones[$row['phone']] = min($phones[$row['phone']] ?? 4, $slot);
+            if (count($phones) > 4) throw new RuntimeException('More than four unique contact phones; the phone snapshot was not replaced.');
+            $this->update->execute([json_encode(['metadata'=>$metadata,'phones'=>$phones], JSON_THROW_ON_ERROR), ...$key]);
             return;
         }
+        $payload = json_encode(['metadata'=>$metadata,'phones'=>[$row['phone']=>$slot]], JSON_THROW_ON_ERROR);
         $this->insert->execute([...$key, $payload]);
         ++$this->count;
     }
@@ -57,7 +69,13 @@ final class SmsPhoneSnapshotStage
         try {
             $rows = $this->db->query('SELECT payload FROM phones');
             while (($payload = $rows->fetchColumn()) !== false) {
-                $line = $payload.PHP_EOL;
+                $saved = json_decode($payload, true, 512, JSON_THROW_ON_ERROR);
+                $phones = $saved['phones'];
+                // Source slot is authoritative; lexical order only resolves impossible equal-slot source ties deterministically.
+                uksort($phones, fn ($left,$right) => $phones[$left] <=> $phones[$right] ?: strcmp((string)$left,(string)$right));
+                $numbers = array_map('strval', array_keys($phones));
+                $row = [...$saved['metadata'], 'phone'=>$numbers[0], 'phones'=>array_pad($numbers,4,null)];
+                $line = json_encode($row, JSON_THROW_ON_ERROR).PHP_EOL;
                 if (fwrite($handle, $line) !== strlen($line)) throw new RuntimeException('Unable to complete private phone staging.');
             }
             if (! fflush($handle)) throw new RuntimeException('Unable to complete private phone staging.');
@@ -77,7 +95,7 @@ final class SmsPhoneSnapshotStage
 
     public function close(): void
     {
-        $this->find = null; $this->insert = null;
+        $this->find = null; $this->insert = null; $this->update = null;
         if ($this->db?->inTransaction()) $this->db->rollBack();
         $this->db = null;
         foreach (['phones.jsonl', 'snapshot.sqlite-journal', 'snapshot.sqlite-wal', 'snapshot.sqlite-shm', 'snapshot.sqlite'] as $name) {

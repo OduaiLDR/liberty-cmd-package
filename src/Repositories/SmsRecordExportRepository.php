@@ -6,6 +6,7 @@ namespace Cmd\Reports\Repositories;
 
 use Carbon\Carbon;
 use Cmd\Reports\Services\SmsAvailabilityRefresh;
+use Cmd\Reports\Services\SmsDebtPolicy;
 use Cmd\Reports\Services\SmsRecordPolicy;
 use Cmd\Reports\Services\SmsDeliveryPolicy;
 use Cmd\Reports\Services\SmsRunArtifactBundle;
@@ -17,6 +18,7 @@ use Cmd\Reports\Services\SmsTierWindowSelectionSql;
 use Cmd\Reports\Services\SmsLeanHistorySchema;
 use Cmd\Reports\Services\SmsSelectionCancellation;
 use Cmd\Reports\Services\SmsStatePolicy;
+use Cmd\Reports\Services\SmsPhoneNumbersSql;
 use Illuminate\Database\Query\Builder;
 use RuntimeException;
 use Symfony\Component\HttpKernel\Exception\HttpException;
@@ -24,6 +26,10 @@ use Symfony\Component\HttpKernel\Exception\HttpException;
 /** PRD record membership. No phone deduplication, household expansion or inferred send date. */
 class SmsRecordExportRepository extends SqlSrvRepository
 {
+    // Stay below SQL Server's 2,100 parameter limit and keep log-throttled
+    // approval writes bounded without committing partial campaign history.
+    public const APPROVAL_WRITE_PAGE = 1000;
+
     private function eligible(bool $seekContactPhones = false): Builder
     {
         $sqlServer = $this->connection()->getDriverName() === 'sqlsrv';
@@ -31,6 +37,10 @@ class SmsRecordExportRepository extends SqlSrvRepository
             ? "CASE WHEN LEN(c.Phone) = 11 AND LEFT(c.Phone, 1) = '1' THEN SUBSTRING(c.Phone, 2, 10) ELSE c.Phone END"
             : "CASE WHEN length(c.Phone) = 11 AND substr(c.Phone, 1, 1) = '1' THEN substr(c.Phone, 2, 10) ELSE c.Phone END";
         $query = $this->table('TblProspects');
+        $wideContacts = (bool) config('sms-exports.wide_phone_contacts_enabled', false);
+        $contactRows = static fn (Builder $q): Builder => $wideContacts
+            ? $q->fromRaw(SmsPhoneNumbersSql::from('c', '', true))
+            : $q->from('TblPhoneNumbers as c');
         if ($seekContactPhones && $sqlServer) {
             // Fixed internal literals let cached plans prove the filtered-index
             // predicate; these flags are never supplied by the caller.
@@ -47,12 +57,12 @@ class SmsRecordExportRepository extends SqlSrvRepository
             // Eligible prospects contain exactly ten digits. The legacy CASE
             // therefore matches precisely the native ten-digit or 1+ten-digit
             // contact key (including SQL Server's existing trailing-space rule).
-            $query->whereNotExists(fn (Builder $q) => $q->selectRaw('1')->from('TblPhoneNumbers as c')
+            $query->whereNotExists(fn (Builder $q) => $contactRows($q->selectRaw('1'))
                 ->whereColumn('c.Phone', 'TblProspects.Phone'))
-                ->whereNotExists(fn (Builder $q) => $q->selectRaw('1')->from('TblPhoneNumbers as c')
+                ->whereNotExists(fn (Builder $q) => $contactRows($q->selectRaw('1'))
                     ->whereRaw("c.Phone = '1' + TblProspects.Phone"));
         } else {
-            $query->whereNotExists(fn (Builder $q) => $q->selectRaw('1')->from('TblPhoneNumbers as c')
+            $query->whereNotExists(fn (Builder $q) => $contactRows($q->selectRaw('1'))
                 ->whereNotNull('c.Phone')->whereRaw("{$contactPhone} = TblProspects.Phone"));
         }
         SmsStatePolicy::applyEligible($query, 'TblProspects.State');
@@ -141,7 +151,7 @@ class SmsRecordExportRepository extends SqlSrvRepository
         } else {
             $eligible = $this->eligible()->select(['PK','Phone','Client','Address','City','State','Zip','Email','Creation_Date','Last_SMS_Date']);
             $sql = SmsTierSelectionSql::select($eligible->toSql(), $options['tiers'], (string) config('sms-exports.mailer_recency_date', 'Send_Date'), $leanDebtSources);
-            $this->connection()->affectingStatement($sql, [...$eligible->getBindings(), $target, $requestId, ...$options['tiers']]);
+            $this->connection()->affectingStatement($sql, [...$eligible->getBindings(), $target, $requestId, ...$options['tiers'], SmsDebtPolicy::minimum($options)]);
         }
         $this->assertTierPrices($requestId, $options);
         $cancellation?->checkpoint($requestId);
@@ -195,7 +205,7 @@ class SmsRecordExportRepository extends SqlSrvRepository
                     $remaining = $target - $selected;
                     // Read the statement's own count on the server: shared worker
                     // sessions/trigger NOCOUNT settings make PDO rowCount unreliable.
-                    $receipt = $db->selectOne($sql.'; SELECT CONVERT(int,@@ROWCOUNT) AS inserted_rows', [$remaining, $requestId, ...$options['tiers']]);
+                    $receipt = $db->selectOne($sql.'; SELECT CONVERT(int,@@ROWCOUNT) AS inserted_rows', [$remaining, $requestId, ...$options['tiers'], SmsDebtPolicy::minimum($options)]);
                     $inserted = (int) $receipt->inserted_rows;
                     if ($inserted < 0 || $inserted > $remaining) throw new RuntimeException('Invalid window selection count.');
                     $selected += $inserted;
@@ -266,7 +276,7 @@ class SmsRecordExportRepository extends SqlSrvRepository
         $leanDebtSources = SmsRunOptions::usesLeanDebtSources($options['tier_selection_policy']);
         if ($this->table('TblProspectsExport')->where('Request_ID', $requestId)->where(function (Builder $q) use ($options, $leanDebtSources): void {
             $q->whereNull('Debt_Tier')->orWhereNotIn('Debt_Tier', $options['tiers'])
-                ->orWhereNull('Debt_Amount')->orWhere('Debt_Amount', '<=', 0)
+                ->orWhereNull('Debt_Amount')->orWhere('Debt_Amount', '<', SmsDebtPolicy::minimum($options))
                 ->orWhereRaw('Debt_Amount <> CAST(Debt_Amount / 1000 AS bigint) * 1000')
                 ->orWhereNull('Debt_Source')->orWhereNotIn('Debt_Source', ['TblTUData','TblMailers','Tier']);
             $q->orWhere(function (Builder $source) use ($leanDebtSources): void {
@@ -430,15 +440,34 @@ class SmsRecordExportRepository extends SqlSrvRepository
             || $counts['never_texted'] + $counts['previously_texted'] !== $expected) throw new RuntimeException('The approved composition differs from the frozen batch.');
         if ($this->table('TblSMSHistory')->where('Request_ID', $requestId)->exists()) throw new RuntimeException('This pending batch already has history; reconcile before retrying.');
         $date = $approvedAt->copy()->setTimezone(SmsProspectExportRepository::TIMEZONE)->toDateString();
-        $members = $this->table('TblProspectsExport')->where('Request_ID', $requestId)->select('Prospect_PK');
-        $updated = $this->table('TblProspects')->whereIn('PK', $members)->update([
-            'Last_SMS_Date' => $date, 'Latest_Export_Date' => $date, 'SMS_Attempts' => $db->raw('SMS_Attempts + 1'),
-        ]);
-        if ($updated !== $expected) throw new RuntimeException('Not all frozen prospect IDs could be updated; approval was rolled back.');
         $columns = ['Request_ID','SMS_Drop_PK','Drop_Name','Prospect_PK','Phone','Debt_Amount','Debt_Tier','Debt_Source','Debt_Source_PK',
             'Client','Address','City','State','Zip','Email','Was_Previously_Texted','Last_SMS_Date_At_Selection'];
-        $this->table('TblSMSHistory')->insertUsing([...$columns,'Export_Date'], $this->table('TblProspectsExport')->where('Request_ID', $requestId)
-            ->select($columns)->selectRaw('? AS Export_Date', [$approvedAt->copy()->utc()->format('Y-m-d H:i:s')]));
+        $updated = 0;
+        $last = null;
+        do {
+            // Request+prospect is an existing unique key. Never use OFFSET or
+            // phone matching, and never create another transaction per page.
+            $page = $this->table('TblProspectsExport')->useWritePdo()->where('Request_ID', $requestId);
+            if ($last !== null) $page->where('Prospect_PK', '>', $last);
+            $ids = $page->orderBy('Prospect_PK')->limit(self::APPROVAL_WRITE_PAGE)->pluck('Prospect_PK')->all();
+            if ($ids === []) break;
+            $count = count($ids);
+            $changed = $this->table('TblProspects')->whereIn('PK', $ids)->update([
+                'Last_SMS_Date' => $date, 'Latest_Export_Date' => $date, 'SMS_Attempts' => $db->raw('SMS_Attempts + 1'),
+            ]);
+            if ($changed !== $count) throw new RuntimeException('Not all frozen prospect IDs could be updated; approval was rolled back.');
+            $members = fn (): Builder => $this->table('TblProspectsExport')->where('Request_ID', $requestId)->whereIn('Prospect_PK', $ids);
+            $inserted = $this->table('TblSMSHistory')->insertUsing([...$columns,'Export_Date'], $members()
+                ->select($columns)->selectRaw('? AS Export_Date', [$approvedAt->copy()->utc()->format('Y-m-d H:i:s')]));
+            if ($inserted !== $count || $members()->delete() !== $count) {
+                throw new RuntimeException('Frozen SMS approval page counts do not reconcile; approval was rolled back.');
+            }
+            $updated += $changed;
+            $last = $ids[array_key_last($ids)];
+        } while ($count === self::APPROVAL_WRITE_PAGE);
+        if ($updated !== $expected || $this->table('TblProspectsExport')->where('Request_ID', $requestId)->exists()) {
+            throw new RuntimeException('Not all frozen prospect IDs could be moved; approval was rolled back.');
+        }
         $tierCounts = $this->table('TblSMSHistory')->where('Request_ID', $requestId)->groupBy('Debt_Tier')->selectRaw('Debt_Tier,COUNT(*) AS Records')->get();
         foreach ($tierCounts as $tier) {
             $drop = $this->table('TblSMSDrops')->where('Request_ID', $requestId)->where('Debt_Tier', $tier->Debt_Tier);
@@ -447,7 +476,6 @@ class SmsRecordExportRepository extends SqlSrvRepository
             $drop->update(['Amount_Dropped' => (int) $tier->Records]);
         }
         if ($this->table('TblSMSHistory')->where('Request_ID', $requestId)->count() !== $expected) throw new RuntimeException('Approved history count does not reconcile.');
-        $this->table('TblProspectsExport')->where('Request_ID', $requestId)->delete();
         SmsAvailabilityRefresh::afterCommit($db);
         return $updated;
     }

@@ -29,17 +29,21 @@ class SmsReadinessCommand extends Command
             $this->line($name.': '.($schema->hasTable($name) ? number_format((int) ($count->Rows ?? 0)).' rows (metadata)' : 'not installed'));
         }
         $has = static fn (string $table, array $columns): bool => $schema->hasTable($table) && $schema->hasColumns($table, $columns);
-        $recordSchema = $has('TblProspects', ['Last_SMS_Date', 'Contacted_Date'])
+        $recordSchema = $has('TblProspects', \Cmd\Reports\Services\SmsProspectSchema::recordColumns())
             && $has('TblSMSRuns', ['Selection_Policy', 'Never_Texted', 'Previously_Texted', 'Approved_At', 'Approved_By', 'File_Cleanup_Path'])
             && $has('TblProspectsExport', ['Was_Previously_Texted', 'Last_SMS_Date_At_Selection'])
             && $has('TblSMSHistory', ['Was_Previously_Texted', 'Last_SMS_Date_At_Selection'])
             && $has('TblSMSResponseAttribution', ['Prospect_PK', 'Request_ID', 'Contact_At_UTC', 'Contacted_Date', 'Created_At']);
+        if (\Cmd\Reports\Services\SmsProspectSchema::responseEnabled()) {
+            try { \Cmd\Reports\Services\SmsProspectSchema::assertResponseReady($db); }
+            catch (\Symfony\Component\HttpKernel\Exception\HttpException) { $recordSchema=false; }
+        }
         $fileSchema = $has('TblSMSRuns', ['Run_Options_JSON', 'Artifact_Manifest_JSON']);
         $durableSummarySchema = $has('TblSMSAvailabilitySummary', [
             'scope', 'revision', 'published_revision', 'eligible', 'never_texted', 'texted_before', 'counted_at', 'latest_data_date',
         ]);
         $tuDateSchema = $durableSummarySchema && $has('TblSMSAvailabilitySummary', ['tu_date_verified']);
-        $contactSchema = $recordSchema
+        $contactSchema = $recordSchema && $has('TblProspects', ['Contacted_Date'])
             && $has('TblSMSRuns', ['Approved_At_Precision'])
             && $has('TblSMSResponseAttribution', ['Contact_At_UTC_Exact', 'Source_System', 'Source_Contact_ID', 'Source_Contract_SHA256', 'Source_Candidate_Count']);
         foreach (['TblSMSHistory', 'TblProspectsExport'] as $table) {

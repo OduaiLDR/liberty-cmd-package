@@ -7,6 +7,7 @@ use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\SmsWorkflowLock;
 use Cmd\Reports\Services\SmsAvailabilityRefresh;
 use Cmd\Reports\Services\SmsDebtPleteImportPrivacy;
+use Cmd\Reports\Services\SmsLegacyDataSourceMap;
 use Cmd\Reports\Services\SmsPhoneSnapshotStage;
 use Illuminate\Console\Command;
 use Illuminate\Support\Env;
@@ -75,6 +76,14 @@ class SyncPhoneNumbers extends Command
 
     protected function syncNow(): int
     {
+        if (! config('sms-exports.wide_phone_contacts_enabled', false)) {
+            $this->error('Wide contact phone synchronization is not enabled. No source read or replacement was started.');
+            return Command::FAILURE;
+        }
+        if (! $this->option('dry-run') && ! $this->option('phones-only')) {
+            $this->error('Use --phones-only until the reviewed response and enrollment refresh is installed. No synchronization was started.');
+            return Command::FAILURE;
+        }
         $this->info('[INFO] SyncPhoneNumbers: starting.');
         Log::info('SyncPhoneNumbers command started.', ['source' => $this->sourceLabel()]);
 
@@ -135,7 +144,7 @@ class SyncPhoneNumbers extends Command
             if (! $this->withCreatedDate) {
                 throw new \RuntimeException('Phone synchronization requires the Created_Date target column.');
             }
-            foreach (['Data_Source', 'External_ID'] as $column) {
+            foreach (['Data_Source', 'External_ID', 'Status', 'Phone1', 'Phone2', 'Phone3', 'Phone4'] as $column) {
                 if (! DB::connection('sqlsrv')->getSchemaBuilder()->hasColumn('TblPhoneNumbers', $column)) {
                     throw new \RuntimeException('Phone synchronization requires the provenance target columns.');
                 }
@@ -143,8 +152,8 @@ class SyncPhoneNumbers extends Command
             $this->assertProvenanceStorage();
             $phase = 'source_staging';
             [$stage, $stagePath, $sourceCount, $normalizedCount] = $this->stagePhonesFromSnowflake($snowflake);
-            $this->info("[INFO] Fetched {$sourceCount} phone rows from Snowflake.");
-            $this->info("[INFO] Staged {$normalizedCount} distinct company/contact/phone rows; agreeing duplicates collapsed.");
+            $this->info("[INFO] Fetched {$sourceCount} source phone slots from Snowflake.");
+            $this->info("[INFO] Staged {$normalizedCount} company/contact rows with up to four unique phones.");
 
             if ($normalizedCount === 0) {
                 $this->warn('[WARN] No phones to insert.');
@@ -188,6 +197,7 @@ class SyncPhoneNumbers extends Command
     /** @return array{int, int, int} */
     protected function replacePhonesFromFile(PDO $connection, string $stagePath, int $batchSize): array
     {
+        if (! config('sms-exports.wide_phone_contacts_enabled', false)) throw new \RuntimeException('Wide contact phone synchronization is not enabled.');
         $this->phoneSnapshotCommitted = false;
         if (! $this->withCreatedDate) {
             throw new \RuntimeException('Phone synchronization requires the Created_Date target column.');
@@ -256,15 +266,31 @@ class SyncPhoneNumbers extends Command
             WITH source_names AS (
                 SELECT ID, MIN(NAME) AS NAME, COUNT(DISTINCT TO_BINARY(NAME, 'UTF-8')) AS NAME_VARIANTS
                 FROM DATA_SOURCES GROUP BY ID
+            ), latest_status AS (
+                SELECT CONTACT_ID, STATUS_ID, STAMP,
+                    ROW_NUMBER() OVER (PARTITION BY CONTACT_ID ORDER BY STAMP DESC, ID DESC) AS STATUS_RANK
+                FROM CONTACTS_STATUS
+                WHERE COALESCE(_FIVETRAN_DELETED, FALSE) = FALSE
+            ), status_names AS (
+                SELECT ID, MIN(TITLE) AS TITLE,
+                    COUNT(DISTINCT TO_BINARY(TITLE, 'UTF-8')) AS TITLE_VARIANTS
+                FROM CONTACTS_LEAD_STATUS
+                WHERE COALESCE(_FIVETRAN_DELETED, FALSE) = FALSE
+                GROUP BY ID
             )
             SELECT c.ID::VARCHAR AS ID, c.TP_ID::VARCHAR AS EXTERNAL_ID,
+                c.C_SOURCE::VARCHAR AS DATA_SOURCE_ID,
                 ds.NAME AS DATA_SOURCE, COALESCE(ds.NAME_VARIANTS, 0) AS DATA_SOURCE_VARIANTS,
-                phone_values.VALUE::STRING AS PHONE,
+                status_names.TITLE AS STATUS, COALESCE(status_names.TITLE_VARIANTS, 0) AS STATUS_VARIANTS,
+                latest_status.STATUS_ID::VARCHAR AS STATUS_ID,
+                phone_values.VALUE::STRING AS PHONE, phone_values.INDEX AS PHONE_SLOT,
                 TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', c.CREATED)::DATE, 'YYYY-MM-DD') AS CREATED_DATE
             FROM CONTACTS AS c
-            LEFT JOIN source_names AS ds ON c.C_SOURCE = ds.ID,
+            LEFT JOIN source_names AS ds ON c.C_SOURCE = ds.ID
+            LEFT JOIN latest_status ON latest_status.CONTACT_ID = c.ID AND latest_status.STATUS_RANK = 1
+            LEFT JOIN status_names ON status_names.ID = latest_status.STATUS_ID,
                  LATERAL FLATTEN(
-                     INPUT => ARRAY_CONSTRUCT_COMPACT(c.PHONE, c.PHONE2, c.PHONE3, c.PHONE4)
+                     INPUT => ARRAY_CONSTRUCT(c.PHONE, c.PHONE2, c.PHONE3, c.PHONE4)
                  ) AS phone_values
             ORDER BY c.ID, phone_values.INDEX
             LIMIT {$limit} OFFSET {$offset}
@@ -309,9 +335,19 @@ class SyncPhoneNumbers extends Command
             if ($digits === '') {
                 continue;
             }
-            if ((int) ($row['DATA_SOURCE_VARIANTS'] ?? 0) > 1) {
-                throw new \RuntimeException('Conflicting data source names; the phone snapshot was not replaced.');
+            $dataSourceVariants = $this->variantCount($row['DATA_SOURCE_VARIANTS'] ?? 0, 'Data Source');
+            $statusVariants = $this->variantCount($row['STATUS_VARIANTS'] ?? 0, 'status');
+            $status = $this->provenanceText($row['STATUS'] ?? null, 256);
+            $statusId = $this->decimalIdentifier($row['STATUS_ID'] ?? null, 'status');
+            if (($status === null) !== ($statusVariants === 0) || ($status !== null && $statusId === null)) {
+                throw new \RuntimeException('Incomplete current status evidence; the phone snapshot was not replaced.');
             }
+            $dataSource = SmsLegacyDataSourceMap::resolve(
+                $this->sourceEnvironment,
+                $this->decimalIdentifier($row['DATA_SOURCE_ID'] ?? null, 'Data Source'),
+                $this->provenanceText($row['DATA_SOURCE'] ?? null, 50),
+                $dataSourceVariants
+            );
             // Keep historic padding/other lengths; canonicalize the already-supported leading-1 form only.
             $phone = str_pad($digits, 10, '0', STR_PAD_LEFT);
             if (strlen($phone) === 11 && $phone[0] === '1') $phone = substr($phone, 1);
@@ -319,8 +355,10 @@ class SyncPhoneNumbers extends Command
                 'phone' => $phone,
                 'cid'   => $this->contactId($row['ID'] ?? null),
                 'created' => $this->createdDate($row['CREATED_DATE'] ?? null),
-                'data_source' => $this->provenanceText($row['DATA_SOURCE'] ?? null, 50),
+                'data_source' => $dataSource,
                 'external_id' => $this->provenanceText($row['EXTERNAL_ID'] ?? null, 256),
+                'status' => $status,
+                'slot' => $this->phoneSlot($row['PHONE_SLOT'] ?? null),
             ];
         }
         return $normalized;
@@ -329,28 +367,77 @@ class SyncPhoneNumbers extends Command
     private function provenanceText(mixed $value, int $limit): ?string
     {
         if ($value === null) return null;
-        if (! is_string($value) || preg_match('//u', $value) !== 1
+        if (! is_string($value) || str_contains($value,"\0") || preg_match('//u', $value) !== 1
             || preg_match_all('/./us', $value) + preg_match_all('/[\x{10000}-\x{10FFFF}]/u', $value) > $limit) {
             throw new \RuntimeException('Invalid phone provenance text; the phone snapshot was not replaced.');
         }
         return $value;
     }
 
+    private function variantCount(mixed $value, string $field): int
+    {
+        if ((! is_int($value) && ! is_string($value)) || preg_match('/\A[0-9]+\z/D', (string) $value) !== 1) {
+            throw new \RuntimeException("Invalid {$field} variants; the phone snapshot was not replaced.");
+        }
+        $count = (int) $value;
+        if ($count > 1) throw new \RuntimeException("Conflicting {$field} names; the phone snapshot was not replaced.");
+        return $count;
+    }
+
+    private function decimalIdentifier(mixed $value, string $field): ?string
+    {
+        if ($value === null) return null;
+        if ((! is_int($value) && ! is_string($value)) || preg_match('/\A[0-9]{1,38}\z/D', (string) $value) !== 1) {
+            throw new \RuntimeException("Invalid {$field} ID; the phone snapshot was not replaced.");
+        }
+        return (string) $value;
+    }
+
+    private function phoneSlot(mixed $slot): int
+    {
+        if ((! is_int($slot) && ! is_string($slot)) || ! preg_match('/\A[0-3]\z/D',(string)$slot)) {
+            throw new \RuntimeException('Invalid phone slot; the phone snapshot was not replaced.');
+        }
+        return (int)$slot;
+    }
+
     private function assertProvenanceStorage(): void
     {
         $db = DB::connection('sqlsrv');
         if ($db->getDriverName() !== 'sqlsrv') return; // Synthetic local fixtures only.
-        $columns = $db->select("SELECT c.name AS column_name,t.name AS type_name,c.max_length,c.is_nullable
+        $columns = $db->select("SELECT c.name AS column_name,t.name AS type_name,c.max_length,c.is_nullable,c.collation_name
             FROM sys.columns c JOIN sys.types t ON t.user_type_id=c.user_type_id
-            WHERE c.object_id=OBJECT_ID(N'TblPhoneNumbers') AND c.name IN (N'Data_Source',N'External_ID')");
+            WHERE c.object_id=OBJECT_ID(N'TblPhoneNumbers') AND c.name IN (N'Phone',N'Data_Source',N'External_ID',
+                N'Status',
+                N'Phone1',N'Phone2',N'Phone3',N'Phone4')");
         $found = [];
         foreach ($columns as $column) $found[$column->column_name] = $column;
-        foreach (['Data_Source'=>100,'External_ID'=>512] as $name=>$bytes) {
+        $phoneCollation=$found['Phone']->collation_name??null;
+        if(!is_string($phoneCollation)||$phoneCollation==='') throw new \RuntimeException('Wide phone synchronization requires the existing Phone collation.');
+        foreach(range(1,4) as $slot) {
+            if(($found['Phone'.$slot]->collation_name??null)!==$phoneCollation) throw new \RuntimeException('Wide phone synchronization requires matching phone collations.');
+        }
+        foreach (['Data_Source'=>100,'External_ID'=>512,'Status'=>512,
+            'Phone1'=>100,'Phone2'=>100,'Phone3'=>100,'Phone4'=>100] as $name=>$bytes) {
             $column = $found[$name] ?? null;
             if (! $column || strtolower($column->type_name) !== 'nvarchar' || ! (bool) $column->is_nullable
                 || ((int) $column->max_length !== -1 && (int) $column->max_length < $bytes)) {
                 throw new \RuntimeException('Phone synchronization requires nullable Unicode provenance storage of sufficient length.');
             }
+        }
+        $indexes=$db->select("SELECT i.name,i.is_unique,i.has_filter,i.filter_definition,c.name AS column_name,ic.key_ordinal
+            FROM sys.indexes i JOIN sys.index_columns ic ON i.object_id=ic.object_id AND i.index_id=ic.index_id
+            JOIN sys.columns c ON c.object_id=ic.object_id AND c.column_id=ic.column_id
+            WHERE i.object_id=OBJECT_ID(N'TblPhoneNumbers') AND i.is_disabled=0 AND i.is_hypothetical=0 AND ic.key_ordinal>0");
+        $grouped=[]; foreach($indexes as $index) $grouped[$index->name][]=$index;
+        foreach(['UX_TblPhoneNumbers_Wide_Source_CID'=>['Source','CID'],
+            'IX_TblPhoneNumbers_Phone1'=>['Phone1'],'IX_TblPhoneNumbers_Phone2'=>['Phone2'],
+            'IX_TblPhoneNumbers_Phone3'=>['Phone3'],'IX_TblPhoneNumbers_Phone4'=>['Phone4']] as $name=>$keys) {
+            $rows=$grouped[$name]??[]; usort($rows,fn($a,$b)=>(int)$a->key_ordinal<=>(int)$b->key_ordinal);
+            $first=$rows[0]??null; $filter=$first ? strtolower(preg_replace('/[\s\[\]()]/','',$first->filter_definition??'')) : '';
+            $expected=str_starts_with($name,'UX_')?'phone1isnotnull':strtolower($keys[0]).'isnotnull';
+            if(array_column($rows,'column_name')!==$keys || !$first->has_filter || $filter!==$expected
+                || (str_starts_with($name,'UX_') && !$first->is_unique)) throw new \RuntimeException('Wide phone synchronization requires the reviewed contact and phone indexes.');
         }
     }
 
@@ -422,19 +509,31 @@ class SyncPhoneNumbers extends Command
         $values = [];
 
         foreach ($chunk as $item) {
-            $phoneEsc = $this->esc($item['phone']);
+            $phones = $item['phones'] ?? [$item['phone']??null,null,null,null];
+            if (! is_array($phones) || count($phones)!==4 || !is_string($phones[0]) || $phones[0]===''
+                || $phones[0]!==($item['phone']??null) || count(array_filter($phones,fn($p)=>$p!==null))!==count(array_unique(array_filter($phones,fn($p)=>$p!==null)))) {
+                throw new \RuntimeException('Invalid wide contact phone staging.');
+            }
+            foreach($phones as $phone) if($phone!==null && (!is_string($phone)||!preg_match('/\A[0-9]{1,50}\z/D',$phone))) throw new \RuntimeException('Invalid wide contact phone staging.');
+            $phoneEsc = $this->esc($phones[0]);
             $contactId = $this->contactId($item['cid'] ?? null);
             $cid = "'{$contactId}'";
             $created = "'".$this->createdDate($item['created'] ?? null)."'";
             $dataSource = $this->provenanceText($item['data_source'] ?? null, 50);
             $externalId = $this->provenanceText($item['external_id'] ?? null, 256);
-            $unicode = ($dataSource !== null || $externalId !== null) && DB::connection('sqlsrv')->getDriverName() === 'sqlsrv' ? 'N' : '';
-            $dataSource = $dataSource === null ? 'NULL' : $unicode."'".$this->esc($dataSource)."'";
-            $externalId = $externalId === null ? 'NULL' : $unicode."'".$this->esc($externalId)."'";
-            $values[] = "('{$phoneEsc}', '{$sourceEsc}', {$cid}, {$created}, {$dataSource}, {$externalId})";
+            $metadata = [
+                $dataSource,
+                $externalId,
+                $this->provenanceText($item['status'] ?? null, 256),
+            ];
+            $hasMetadata = array_filter($metadata, static fn (?string $value): bool => $value !== null) !== [];
+            $unicode = $hasMetadata && DB::connection('sqlsrv')->getDriverName() === 'sqlsrv' ? 'N' : '';
+            $metadataValues = array_map(fn (?string $value): string => $value === null ? 'NULL' : $unicode."'".$this->esc($value)."'", $metadata);
+            $wideValues=implode(', ',array_map(fn($phone)=>$phone===null?'NULL':"'".$this->esc($phone)."'",$phones));
+            $values[] = "('{$phoneEsc}', '{$sourceEsc}', {$cid}, {$created}, ".implode(', ', $metadataValues).", {$wideValues})";
         }
 
-        $columns = 'Phone, Source, CID, Created_Date, Data_Source, External_ID';
+        $columns = 'Phone, Source, CID, Created_Date, Data_Source, External_ID, Status, Phone1, Phone2, Phone3, Phone4';
         $sql = "INSERT INTO TblPhoneNumbers ({$columns}) VALUES " . implode(', ', $values);
         $affected = $this->executeSqlServerWrite($connection, $sql, 'insert phone batch ' . $batchNumber);
         $inserted = $affected > 0 ? $affected : count($chunk);

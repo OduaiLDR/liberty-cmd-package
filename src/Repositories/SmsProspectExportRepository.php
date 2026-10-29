@@ -12,6 +12,7 @@ use Cmd\Reports\Services\SmsTuCompletionDate;
 use Cmd\Reports\Services\SmsWorkflowLock;
 use Cmd\Reports\Services\SmsRunOptions;
 use Cmd\Reports\Services\SmsStatePolicy;
+use Cmd\Reports\Services\SmsPhoneNumbersSql;
 use Illuminate\Validation\ValidationException;
 use RuntimeException;
 
@@ -55,6 +56,12 @@ class SmsProspectExportRepository extends SqlSrvRepository
     /** A contact phone as 10 digits: '12025551234' and '2025551234' are the same number. */
     private const CONTACT_PHONE = "CASE WHEN LEN(Phone) = 11 AND LEFT(Phone, 1) = '1' THEN SUBSTRING(Phone, 2, 10) ELSE Phone END";
 
+    private function contactRowsSql(): string
+    {
+        return config('sms-exports.wide_phone_contacts_enabled', false)
+            ? SmsPhoneNumbersSql::from('sms_contact_numbers', '', true) : 'TblPhoneNumbers';
+    }
+
     /**
      * Prospects whose phone is now a synced contact (TblPhoneNumbers) get Contacted = 1 and the
      * contact's creation date as Response_Date when that legacy column exists. Contacted_Date is
@@ -66,22 +73,23 @@ class SmsProspectExportRepository extends SqlSrvRepository
         $db = $this->connection();
         $phone = self::CONTACT_PHONE;
         $hashJoins = self::HASH_JOINS;
+        $contacts = $this->contactRowsSql();
         $withResponseDate = $db->getSchemaBuilder()->hasColumn('TblProspects', 'Response_Date');
 
         if (! $withResponseDate && config('sms-exports.contact_flag_seek_enabled', false)) {
             return SmsAvailabilityRefresh::transaction($db, function () use ($db): int {
                 SmsContactFlagSeek::assertReady($db);
-                $changed=$db->update(SmsContactFlagSeek::SQL);
+                $changed=$db->update(SmsContactFlagSeek::sql((bool) config('sms-exports.wide_phone_contacts_enabled', false)));
                 if ($changed>0) SmsAvailabilityRefresh::afterCommit($db);
                 return $changed;
             });
         }
 
-        return SmsAvailabilityRefresh::transaction($db, function () use ($db, $phone, $hashJoins, $withResponseDate): int {
+        return SmsAvailabilityRefresh::transaction($db, function () use ($db, $phone, $hashJoins, $withResponseDate, $contacts): int {
             $sql = $withResponseDate ? <<<SQL
 WITH Contacts AS (
     SELECT {$phone} AS Phone, MIN(Created_Date) AS Created_Date
-    FROM TblPhoneNumbers
+    FROM {$contacts}
     WHERE Phone IS NOT NULL
     GROUP BY {$phone}
 )
@@ -93,7 +101,7 @@ WHERE (p.Contacted = 0 OR p.Response_Date IS NULL OR c.Created_Date < p.Response
 SQL : <<<SQL
 WITH Contacts AS (
     SELECT DISTINCT {$phone} AS Phone
-    FROM TblPhoneNumbers
+    FROM {$contacts}
     WHERE Phone IS NOT NULL
 )
 UPDATE p SET Contacted = 1
@@ -190,11 +198,12 @@ FROM Eligible WHERE Phone_Rank = 1
     {
         $priority = self::PRIORITY;
         $phone = self::CONTACT_PHONE;
+        $contacts = $this->contactRowsSql();
         $state = SmsStatePolicy::sqlPredicate('p.State', 'sqlsrv');
 
         return <<<SQL
 WITH Contacts AS (
-    SELECT {$phone} AS Phone FROM TblPhoneNumbers WHERE Phone IS NOT NULL
+    SELECT {$phone} AS Phone FROM {$contacts} WHERE Phone IS NOT NULL
 ),
 SharedPhones AS (
     SELECT Phone FROM TblProspects
@@ -321,6 +330,8 @@ SQL;
     private function writeCsvNow(string $requestId, string $path): int
     {
         $this->assertOpenRun($requestId);
+        $contacts = $this->contactRowsSql();
+        \Cmd\Reports\Services\SmsDebtPolicy::assertPending($this->connection(), $requestId);
         if ($this->table('TblProspectsExport')->where('Request_ID', $requestId)->whereNull('SMS_Drop_PK')->exists()) {
             throw new RuntimeException('Assign the SMS drops before writing the file.');
         }
@@ -332,7 +343,7 @@ SQL;
         $blocked = $this->connection()->selectOne(<<<SQL
 WITH Contacts AS (
     SELECT CASE WHEN LEN(Phone) = 11 AND LEFT(Phone, 1) = '1' THEN SUBSTRING(Phone, 2, 10) ELSE Phone END AS Phone
-    FROM TblPhoneNumbers GROUP BY CASE WHEN LEN(Phone) = 11 AND LEFT(Phone, 1) = '1' THEN SUBSTRING(Phone, 2, 10) ELSE Phone END
+    FROM {$contacts} GROUP BY CASE WHEN LEN(Phone) = 11 AND LEFT(Phone, 1) = '1' THEN SUBSTRING(Phone, 2, 10) ELSE Phone END
 )
 SELECT COUNT(*) AS n FROM TblProspectsExport x
 JOIN TblProspects p ON p.PK = x.Prospect_PK
@@ -496,13 +507,18 @@ SQL, [$requestId]);
     /** @return array<int, array{PK:int, Drop_Name:string, Debt_Tier:?string, Amount_Dropped:int}> */
     public function drops(string $requestId): array
     {
-        $table = $this->hasRows('TblProspectsExport', $requestId) ? 'TblProspectsExport' : 'TblSMSHistory';
-
-        return $this->table('TblSMSDrops', 'd')
-            ->where(function ($q) use ($table, $requestId): void {
+        // assignDrops saves Request_ID on all of a run's drops in one transaction, so an indexed seek finds
+        // them. Only legacy runs numbered before that column need their membership (possibly millions of
+        // rows); record runs never do, since they have no drops until approval assigns them.
+        $drops = $this->table('TblSMSDrops', 'd')->where('d.Request_ID', $requestId);
+        if (! $this->isRecordRun($requestId) && ! (clone $drops)->exists()) {
+            $table = $this->hasRows('TblProspectsExport', $requestId) ? 'TblProspectsExport' : 'TblSMSHistory';
+            $drops = $this->table('TblSMSDrops', 'd')->where(function ($q) use ($table, $requestId): void {
                 $q->where('d.Request_ID', $requestId)->orWhereIn('d.PK', $this->table($table)->where('Request_ID', $requestId)->whereNotNull('SMS_Drop_PK')->select('SMS_Drop_PK'));
-            })
-            ->orderBy('d.Drop_Name')->get(['d.PK', 'd.Drop_Name', 'd.Debt_Tier', 'd.Amount_Dropped'])
+            });
+        }
+
+        return $drops->orderBy('d.Drop_Name')->get(['d.PK', 'd.Drop_Name', 'd.Debt_Tier', 'd.Amount_Dropped'])
             ->map(fn ($d) => ['PK' => (int) $d->PK, 'Drop_Name' => (string) $d->Drop_Name, 'Debt_Tier' => $d->Debt_Tier, 'Amount_Dropped' => (int) $d->Amount_Dropped])
             ->all();
     }

@@ -64,7 +64,7 @@ final class SmsRecordWorkflowTest extends TestCase
         $export = new class extends SmsProspectExportRepository {
             public function lookupDebts(string $id, array $debts = [], ?callable $progress = null): array
             {
-                $this->table('TblProspectsExport')->where('Request_ID', $id)->update(['Debt_Amount' => 10000, 'Debt_Tier' => 'T1', 'Debt_Source' => 'TblTUData']);
+                $this->table('TblProspectsExport')->where('Request_ID', $id)->update(['Debt_Amount' => 30000, 'Debt_Tier' => 'T1', 'Debt_Source' => 'TblTUData']);
                 return [];
             }
         };
@@ -286,7 +286,7 @@ final class SmsRecordWorkflowTest extends TestCase
     {
         config(['sms-exports.single_phone_csv' => true]);
         $this->prospect(); $this->prepare(1);
-        $this->db->table('TblProspectsExport')->update(['Debt_Amount' => 14000]);
+        $this->db->table('TblProspectsExport')->update(['Debt_Amount' => 30000]);
         $this->runs->requestFile(self::ID); $this->runs->buildFile(self::ID);
         $path = $this->runs->filePath(self::ID);
         $before = hash_file('sha256', $path);
@@ -294,13 +294,28 @@ final class SmsRecordWorkflowTest extends TestCase
         try {
             self::assertSame(['First name','address','debt load','phone1','send date'], fgetcsv($stream, escape: ''));
             $row = fgetcsv($stream, escape: '');
-            self::assertCount(5, $row); self::assertSame('14000', $row[2]);
+            self::assertCount(5, $row); self::assertSame('30000', $row[2]);
             self::assertSame('2026-10-26', $row[4]);
         } finally { fclose($stream); }
         config(['sms-exports.single_phone_csv' => false]);
         Carbon::setTestNow(Carbon::parse('2026-11-04T12:00:00Z'));
         $this->runs->buildFile(self::ID);
         self::assertSame($before, hash_file('sha256', $this->runs->filePath(self::ID)));
+    }
+
+    public function test_old_pending_low_debt_is_held_without_trimming_repeated_phone_members_or_rewriting_options(): void
+    {
+        $this->prospect();$this->prospect(['Client'=>'Another Person']);$this->prepare(2);
+        $pk=$this->db->table('TblProspectsExport')->orderBy('PK')->value('PK');
+        $this->db->table('TblProspectsExport')->where('PK',$pk)->update(['Debt_Amount'=>23000]);
+        $before=$this->db->table('TblProspectsExport')->orderBy('PK')->get()->toJson();
+        $options=$this->db->table('TblSMSRuns')->value('Run_Options_JSON');
+        try{$this->records->assertFrozen(self::ID,2);self::fail('Old low frozen price was released');}
+        catch(\Cmd\Reports\Services\SmsFrozenEligibilityHold){}
+        self::assertSame($before,$this->db->table('TblProspectsExport')->orderBy('PK')->get()->toJson());
+        self::assertSame($options,$this->db->table('TblSMSRuns')->value('Run_Options_JSON'));
+        self::assertSame(2,$this->db->table('TblProspectsExport')->count());self::assertSame(0,$this->db->table('TblSMSHistory')->count());
+        self::assertSame(0,(int)$this->db->table('TblProspects')->sum('SMS_Attempts'));
     }
 
     public function test_generation_in_a_later_week_requires_new_batch_instead_of_rewriting_review(): void
