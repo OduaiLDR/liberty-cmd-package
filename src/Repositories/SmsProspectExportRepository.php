@@ -507,13 +507,18 @@ SQL, [$requestId]);
     /** @return array<int, array{PK:int, Drop_Name:string, Debt_Tier:?string, Amount_Dropped:int}> */
     public function drops(string $requestId): array
     {
-        $table = $this->hasRows('TblProspectsExport', $requestId) ? 'TblProspectsExport' : 'TblSMSHistory';
-
-        return $this->table('TblSMSDrops', 'd')
-            ->where(function ($q) use ($table, $requestId): void {
+        // assignDrops saves Request_ID on all of a run's drops in one transaction, so an indexed seek finds
+        // them. Only legacy runs numbered before that column need their membership (possibly millions of
+        // rows); record runs never do, since they have no drops until approval assigns them.
+        $drops = $this->table('TblSMSDrops', 'd')->where('d.Request_ID', $requestId);
+        if (! $this->isRecordRun($requestId) && ! (clone $drops)->exists()) {
+            $table = $this->hasRows('TblProspectsExport', $requestId) ? 'TblProspectsExport' : 'TblSMSHistory';
+            $drops = $this->table('TblSMSDrops', 'd')->where(function ($q) use ($table, $requestId): void {
                 $q->where('d.Request_ID', $requestId)->orWhereIn('d.PK', $this->table($table)->where('Request_ID', $requestId)->whereNotNull('SMS_Drop_PK')->select('SMS_Drop_PK'));
-            })
-            ->orderBy('d.Drop_Name')->get(['d.PK', 'd.Drop_Name', 'd.Debt_Tier', 'd.Amount_Dropped'])
+            });
+        }
+
+        return $drops->orderBy('d.Drop_Name')->get(['d.PK', 'd.Drop_Name', 'd.Debt_Tier', 'd.Amount_Dropped'])
             ->map(fn ($d) => ['PK' => (int) $d->PK, 'Drop_Name' => (string) $d->Drop_Name, 'Debt_Tier' => $d->Debt_Tier, 'Amount_Dropped' => (int) $d->Amount_Dropped])
             ->all();
     }

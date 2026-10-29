@@ -394,6 +394,44 @@ test('approval-time files remain ID Pending until approval and preserve every CS
     expect((int) $this->db->table('TblProspects')->sum('SMS_Attempts'))->toBe(5)->and($this->db->table('TblSMSDrops')->count())->toBe(2);
 });
 
+test('record runs find their drops by Request_ID without reading their membership, pending or approved', function (): void {
+    ($this->prepareApprovalVersion)();
+    $membershipReads = function (): array {
+        $reads = array_filter(array_column($this->db->getQueryLog(), 'query'), fn ($sql) => str_contains($sql, 'SMS_Drop_PK'));
+        $this->db->flushQueryLog();
+        return array_values($reads);
+    };
+    $this->db->enableQueryLog();
+    // A pending batch has no SMS IDs yet; its membership is not read to find none.
+    expect($this->service->show($this->id)->drops)->toBe([])->and($membershipReads())->toBe([]);
+    $this->service->requestApprove($this->id, 'editor@example.invalid'); $this->service->markApproved($this->id);
+    $this->db->flushQueryLog();
+    // A 3M-row approved run made the old membership lookup time out on every page load.
+    expect(array_column($this->service->history()['items'][0]->drops, 'Drop_Name'))->toBe(['SMS0001', 'SMS0002'])
+        ->and(array_column($this->service->show($this->id)->drops, 'Drop_Name'))->toBe(['SMS0001', 'SMS0002'])
+        ->and($membershipReads())->toBe([]);
+});
+
+test('legacy runs use saved Request_ID drops when present and membership only for drops numbered before it', function (): void {
+    $legacyRun = fn (string $id) => $this->db->table('TblSMSRuns')->insert(['Request_ID' => $id, 'Target' => 1, 'Status' => 'sent',
+        'Created_By' => 'editor@example.invalid', 'Created_At' => '2026-10-14 00:00:00', 'Updated_At' => '2026-10-14 00:00:00']);
+    $sent = fn (string $id, int $drop, string $name) => $this->db->table('TblSMSHistory')->insert(['Request_ID' => $id,
+        'SMS_Drop_PK' => $drop, 'Drop_Name' => $name, 'Prospect_PK' => 1, 'Phone' => '0012345600', 'Export_Date' => '2026-10-14 00:00:00']);
+    $old = $this->db->table('TblSMSDrops')->insertGetId(['Drop_Name' => 'SMS0003', 'Debt_Tier' => 'T5', 'Amount_Dropped' => 1,
+        'Drop_Date' => '2026-10-14', 'Created_At' => '2026-10-14 00:00:00']);
+    $legacyRun($this->otherId); $sent($this->otherId, $old, 'SMS0003');
+    $newerId = '33333333-4444-4555-8666-777777777777';
+    $newer = $this->db->table('TblSMSDrops')->insertGetId(['Drop_Name' => 'SMS0004', 'Debt_Tier' => 'T6', 'Amount_Dropped' => 1,
+        'Drop_Date' => '2026-10-20', 'Request_ID' => $newerId, 'Created_At' => '2026-10-20 00:00:00']);
+    $legacyRun($newerId); $sent($newerId, $newer, 'SMS0004');
+    $this->db->enableQueryLog();
+    expect((new SmsProspectExportRepository)->drops($newerId))
+        ->toBe([['PK' => $newer, 'Drop_Name' => 'SMS0004', 'Debt_Tier' => 'T6', 'Amount_Dropped' => 1]])
+        ->and(array_filter(array_column($this->db->getQueryLog(), 'query'), fn ($sql) => str_contains($sql, 'SMS_Drop_PK')))->toBe([])
+        ->and((new SmsProspectExportRepository)->drops($this->otherId))
+        ->toBe([['PK' => $old, 'Drop_Name' => 'SMS0003', 'Debt_Tier' => 'T5', 'Amount_Dropped' => 1]]);
+});
+
 test('deleting a pending approval-time export consumes no SMS IDs and no attempts', function (): void {
     ($this->prepareApprovalVersion)();
     $this->service->discard($this->id);
