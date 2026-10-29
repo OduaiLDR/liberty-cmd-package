@@ -481,6 +481,42 @@ test('partial saved allocation is rejected without issuing more IDs or business 
         ->and((int) $this->db->table('TblProspects')->sum('SMS_Attempts'))->toBe(0);
 });
 
+test('multi-page approval retry retains allocated IDs and exact published ZIP after a late write failure', function (): void {
+    config(['sms-exports.approval_only_creation_enabled' => true]);
+    $count = SmsRecordExportRepository::APPROVAL_WRITE_PAGE + 1;
+    ($this->seedMembers)($count);
+    $options = SmsRunOptions::normalize($count, 500, null, null, SmsRunOptions::PLANNED_DATE_VERSION,
+        '2026-10-26', SmsRunOptions::APPROVAL_FILENAME_VERSION);
+    $this->service->start($this->id, $count, 'editor@example.invalid', $options);
+    $this->service->prepare($this->id);
+    $this->service->requestFile($this->id); $this->service->buildFile($this->id);
+    $this->service->requestApprove($this->id, 'editor@example.invalid');
+    $last = (int) $this->db->table('TblProspectsExport')->max('Prospect_PK');
+    $this->db->statement("CREATE TRIGGER fail_late_approval BEFORE UPDATE ON TblProspects WHEN NEW.PK={$last}
+        BEGIN SELECT RAISE(ABORT, 'Synthetic late approval page failure'); END");
+    expect(fn () => $this->service->markApproved($this->id))->toThrow(\Illuminate\Database\QueryException::class);
+    $ids = $this->db->table('TblSMSDrops')->orderBy('PK')->pluck('Drop_Name','PK')->all();
+    $accepted = $this->db->table('TblSMSRuns')->value('Approved_At');
+    $root = str_replace('\\', '/', $this->versionedDirectory).'/runs/'.$this->id.'/v2/published/';
+    $manifest = json_decode(file_get_contents($root.'manifest.json'), true, flags: JSON_THROW_ON_ERROR);
+    $zip = $root.$manifest['download']['name']; $sha = hash_file('sha256', $zip);
+    expect($this->db->table('TblSMSHistory')->count())->toBe(0)
+        ->and($this->db->table('TblProspectsExport')->count())->toBe($count)
+        ->and((int) $this->db->table('TblProspects')->sum('SMS_Attempts'))->toBe(0);
+    $this->service->fail($this->id, 'approve', 'Synthetic late approval page failure');
+    $this->db->statement('DROP TRIGGER fail_late_approval');
+    Carbon::setTestNow(Carbon::parse('2026-10-30T12:00:00Z'));
+    $this->service->retry($this->id); $this->service->markApproved($this->id); $this->service->markApproved($this->id);
+    expect($this->db->table('TblSMSRuns')->value('Status'))->toBe('approved')
+        ->and($this->db->table('TblSMSRuns')->value('Approved_At'))->toBe($accepted)
+        ->and($this->db->table('TblSMSDrops')->orderBy('PK')->pluck('Drop_Name','PK')->all())->toBe($ids)
+        ->and(hash_file('sha256', $zip))->toBe($sha)
+        ->and($this->service->filePath($this->id))->toBe($zip)
+        ->and($this->db->table('TblSMSHistory')->count())->toBe($count)
+        ->and($this->db->table('TblProspectsExport')->count())->toBe(0)
+        ->and($this->db->table('TblProspects')->where('SMS_Attempts',1)->where('Last_SMS_Date','2026-10-19')->count())->toBe($count);
+});
+
 test('post-commit callback failure cannot duplicate final approval business updates', function (): void {
     ($this->prepareApprovalVersion)(); $this->service->requestApprove($this->id, 'editor@example.invalid');
     $interrupt = true;

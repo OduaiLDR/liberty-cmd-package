@@ -26,6 +26,10 @@ use Symfony\Component\HttpKernel\Exception\HttpException;
 /** PRD record membership. No phone deduplication, household expansion or inferred send date. */
 class SmsRecordExportRepository extends SqlSrvRepository
 {
+    // Stay below SQL Server's 2,100 parameter limit and keep log-throttled
+    // approval writes bounded without committing partial campaign history.
+    public const APPROVAL_WRITE_PAGE = 1000;
+
     private function eligible(bool $seekContactPhones = false): Builder
     {
         $sqlServer = $this->connection()->getDriverName() === 'sqlsrv';
@@ -436,15 +440,34 @@ class SmsRecordExportRepository extends SqlSrvRepository
             || $counts['never_texted'] + $counts['previously_texted'] !== $expected) throw new RuntimeException('The approved composition differs from the frozen batch.');
         if ($this->table('TblSMSHistory')->where('Request_ID', $requestId)->exists()) throw new RuntimeException('This pending batch already has history; reconcile before retrying.');
         $date = $approvedAt->copy()->setTimezone(SmsProspectExportRepository::TIMEZONE)->toDateString();
-        $members = $this->table('TblProspectsExport')->where('Request_ID', $requestId)->select('Prospect_PK');
-        $updated = $this->table('TblProspects')->whereIn('PK', $members)->update([
-            'Last_SMS_Date' => $date, 'Latest_Export_Date' => $date, 'SMS_Attempts' => $db->raw('SMS_Attempts + 1'),
-        ]);
-        if ($updated !== $expected) throw new RuntimeException('Not all frozen prospect IDs could be updated; approval was rolled back.');
         $columns = ['Request_ID','SMS_Drop_PK','Drop_Name','Prospect_PK','Phone','Debt_Amount','Debt_Tier','Debt_Source','Debt_Source_PK',
             'Client','Address','City','State','Zip','Email','Was_Previously_Texted','Last_SMS_Date_At_Selection'];
-        $this->table('TblSMSHistory')->insertUsing([...$columns,'Export_Date'], $this->table('TblProspectsExport')->where('Request_ID', $requestId)
-            ->select($columns)->selectRaw('? AS Export_Date', [$approvedAt->copy()->utc()->format('Y-m-d H:i:s')]));
+        $updated = 0;
+        $last = null;
+        do {
+            // Request+prospect is an existing unique key. Never use OFFSET or
+            // phone matching, and never create another transaction per page.
+            $page = $this->table('TblProspectsExport')->useWritePdo()->where('Request_ID', $requestId);
+            if ($last !== null) $page->where('Prospect_PK', '>', $last);
+            $ids = $page->orderBy('Prospect_PK')->limit(self::APPROVAL_WRITE_PAGE)->pluck('Prospect_PK')->all();
+            if ($ids === []) break;
+            $count = count($ids);
+            $changed = $this->table('TblProspects')->whereIn('PK', $ids)->update([
+                'Last_SMS_Date' => $date, 'Latest_Export_Date' => $date, 'SMS_Attempts' => $db->raw('SMS_Attempts + 1'),
+            ]);
+            if ($changed !== $count) throw new RuntimeException('Not all frozen prospect IDs could be updated; approval was rolled back.');
+            $members = fn (): Builder => $this->table('TblProspectsExport')->where('Request_ID', $requestId)->whereIn('Prospect_PK', $ids);
+            $inserted = $this->table('TblSMSHistory')->insertUsing([...$columns,'Export_Date'], $members()
+                ->select($columns)->selectRaw('? AS Export_Date', [$approvedAt->copy()->utc()->format('Y-m-d H:i:s')]));
+            if ($inserted !== $count || $members()->delete() !== $count) {
+                throw new RuntimeException('Frozen SMS approval page counts do not reconcile; approval was rolled back.');
+            }
+            $updated += $changed;
+            $last = $ids[array_key_last($ids)];
+        } while ($count === self::APPROVAL_WRITE_PAGE);
+        if ($updated !== $expected || $this->table('TblProspectsExport')->where('Request_ID', $requestId)->exists()) {
+            throw new RuntimeException('Not all frozen prospect IDs could be moved; approval was rolled back.');
+        }
         $tierCounts = $this->table('TblSMSHistory')->where('Request_ID', $requestId)->groupBy('Debt_Tier')->selectRaw('Debt_Tier,COUNT(*) AS Records')->get();
         foreach ($tierCounts as $tier) {
             $drop = $this->table('TblSMSDrops')->where('Request_ID', $requestId)->where('Debt_Tier', $tier->Debt_Tier);
@@ -453,7 +476,6 @@ class SmsRecordExportRepository extends SqlSrvRepository
             $drop->update(['Amount_Dropped' => (int) $tier->Records]);
         }
         if ($this->table('TblSMSHistory')->where('Request_ID', $requestId)->count() !== $expected) throw new RuntimeException('Approved history count does not reconcile.');
-        $this->table('TblProspectsExport')->where('Request_ID', $requestId)->delete();
         SmsAvailabilityRefresh::afterCommit($db);
         return $updated;
     }

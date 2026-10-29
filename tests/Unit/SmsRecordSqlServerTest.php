@@ -128,6 +128,9 @@ final class SmsRecordSqlServerTest extends TestCase
         $this->db->unprepared('DROP TRIGGER IF EXISTS dbo.SmsRecordRejectHistory');
         $this->db->unprepared('DROP TRIGGER IF EXISTS dbo.SmsRecordRejectSelection');
         $this->db->unprepared('DROP TRIGGER IF EXISTS dbo.SmsRecordRejectContact');
+        foreach (['SmsApprovalBoundedProspects','SmsApprovalBoundedHistory','SmsApprovalBoundedExports','SmsApprovalRejectPage'] as $trigger) {
+            $this->db->unprepared('DROP TRIGGER IF EXISTS dbo.'.$trigger);
+        }
         foreach (['TblSMSFilePublicationParts','TblSMSFilePublications','TblSMSEmailOutbox','TblSMSResponseAttribution','TblSMSHistory','TblProspectsExport','TblSMSDrops','TblSMSRuns','TblProspects',
             'TblSMSAvailabilitySummary','TblSMSLegacySends','TblSMSSuppressions','TblPhoneNumbers','TblTUData','TblMailers','TblMarketing'] as $table) $this->db->table($table)->delete();
         $summary = \Mockery::mock(SmsDurableAvailabilityService::class);
@@ -468,6 +471,75 @@ final class SmsRecordSqlServerTest extends TestCase
         self::assertSame(1, (int) $this->db->table('TblSMSAvailabilitySummary')->value('revision'));
         self::assertSame('approved', $this->db->table('TblSMSRuns')->value('Status'));
         self::assertSame(0, $this->db->table('TblSMSLegacySends')->count());
+    }
+
+    private function pagedApproval(): int
+    {
+        $rows = array_fill(0, SmsRecordExportRepository::APPROVAL_WRITE_PAGE + 1, [
+            'Client' => 'Synthetic Person', 'Address' => 'Fixture St', 'Phone' => '0005550100',
+            'State' => 'CA', 'Zip' => '00123', 'Creation_Date' => '2026-10-10', 'SMS_Attempts' => 4,
+        ]);
+        foreach (array_chunk($rows, 100) as $page) $this->db->table('TblProspects')->insert($page);
+        $outside = $this->person(['Creation_Date' => '2025-01-01', 'SMS_Attempts' => 7]);
+        $this->readyApproval(count($rows));
+        $other = (array) $this->db->table('TblProspectsExport')->first();
+        unset($other['PK']);
+        $other['Request_ID'] = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff';
+        $other['Prospect_PK'] = $outside;
+        $this->db->table('TblProspectsExport')->insert($other);
+        return $outside;
+    }
+
+    public function test_real_approval_bounds_every_write_and_keeps_one_atomic_commit(): void
+    {
+        $outside = $this->pagedApproval();
+        foreach ([['SmsApprovalBoundedProspects','TblProspects','UPDATE','inserted'],
+            ['SmsApprovalBoundedHistory','TblSMSHistory','INSERT','inserted'],
+            ['SmsApprovalBoundedExports','TblProspectsExport','DELETE','deleted']] as [$name,$table,$event,$rows]) {
+            $this->db->unprepared("CREATE TRIGGER dbo.{$name} ON dbo.{$table} AFTER {$event} AS BEGIN
+                SET NOCOUNT ON; IF (SELECT COUNT(*) FROM {$rows})>1000 THROW 52904,'Unbounded approval write.',1; END");
+        }
+        $this->runs->markApproved(self::ID);
+        $this->runs->markApproved(self::ID);
+        $expected = SmsRecordExportRepository::APPROVAL_WRITE_PAGE + 1;
+        self::assertSame($expected, $this->db->table('TblSMSHistory')->where('Request_ID', self::ID)->count());
+        self::assertSame(0, $this->db->table('TblProspectsExport')->where('Request_ID', self::ID)->count());
+        self::assertSame(1, $this->db->table('TblProspectsExport')->count());
+        self::assertSame($expected, $this->db->table('TblProspects')->where('SMS_Attempts', 5)->where('Last_SMS_Date', '2026-10-19')->where('Latest_Export_Date', '2026-10-19')->count());
+        self::assertSame(7, (int) $this->db->table('TblProspects')->where('PK', $outside)->value('SMS_Attempts'));
+        self::assertNull($this->db->table('TblProspects')->where('PK', $outside)->value('Last_SMS_Date'));
+        self::assertSame(1, (int) $this->db->table('TblSMSAvailabilitySummary')->value('revision'));
+        self::assertSame('approved', $this->db->table('TblSMSRuns')->value('Status'));
+    }
+
+    public static function approvalPageFailures(): array
+    {
+        return [['TblProspects','UPDATE','inserted'], ['TblSMSHistory','INSERT','inserted'], ['TblProspectsExport','DELETE','deleted']];
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('approvalPageFailures')]
+    public function test_real_second_approval_page_failure_rolls_back_all_prior_pages(string $table, string $event, string $rows): void
+    {
+        $outside = $this->pagedApproval();
+        $last = (int) $this->db->table('TblProspectsExport')->where('Request_ID', self::ID)->max('Prospect_PK');
+        $this->db->unprepared("CREATE TRIGGER dbo.SmsApprovalRejectPage ON dbo.{$table} AFTER {$event} AS BEGIN
+            SET NOCOUNT ON; IF EXISTS(SELECT 1 FROM {$rows} WHERE ".($table === 'TblProspects' ? 'PK' : 'Prospect_PK')."={$last})
+            THROW 52905,'Synthetic second approval page failure.',1; END");
+        try { $this->runs->markApproved(self::ID); self::fail('Expected second-page rollback.'); }
+        catch (\Illuminate\Database\QueryException $error) { self::assertStringContainsString('Synthetic second approval page failure', $error->getMessage()); }
+        $expected = SmsRecordExportRepository::APPROVAL_WRITE_PAGE + 1;
+        self::assertSame(0, $this->db->table('TblSMSHistory')->count());
+        self::assertSame($expected, $this->db->table('TblProspectsExport')->where('Request_ID', self::ID)->count());
+        self::assertSame($expected, $this->db->table('TblProspects')->where('SMS_Attempts', 4)->whereNull('Last_SMS_Date')->whereNull('Latest_Export_Date')->count());
+        self::assertSame(7, (int) $this->db->table('TblProspects')->where('PK', $outside)->value('SMS_Attempts'));
+        self::assertSame('approving', $this->db->table('TblSMSRuns')->value('Status'));
+        self::assertSame(0, $this->db->table('TblSMSAvailabilitySummary')->count());
+        $this->db->unprepared('DROP TRIGGER dbo.SmsApprovalRejectPage');
+        $this->runs->markApproved(self::ID);
+        self::assertSame('approved', $this->db->table('TblSMSRuns')->value('Status'));
+        self::assertSame($expected, $this->db->table('TblSMSHistory')->count());
+        self::assertSame($expected, $this->db->table('TblProspects')->where('SMS_Attempts', 5)->count());
+        self::assertSame(1, $this->db->table('TblProspectsExport')->count());
     }
 
     public function test_real_history_failure_rolls_back_approval_and_is_manually_retryable(): void
