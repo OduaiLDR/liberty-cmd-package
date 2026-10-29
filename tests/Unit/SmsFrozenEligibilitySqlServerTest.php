@@ -214,6 +214,59 @@ ALTER TABLE TblSMSHistory ALTER COLUMN Phone nvarchar(40) COLLATE Latin1_General
         }
     }
 
+    public function test_wide_set_probe_covers_every_slot_legacy_and_country_prefix_without_changing_membership(): void
+    {
+        config(['sms-exports.wide_phone_contacts_enabled' => true]);
+        $this->db->unprepared('DROP TABLE TblPhoneNumbers;
+CREATE TABLE TblPhoneNumbers(PK int IDENTITY PRIMARY KEY,Source varchar(20),CID varchar(50),Created_Date datetime2,
+Data_Source nvarchar(150),External_ID nvarchar(50),Phone varchar(20),Phone1 varchar(20),Phone2 varchar(20),Phone3 varchar(20),Phone4 varchar(20));');
+        $before = $this->db->table('TblProspectsExport')->first();
+        foreach (['Phone','Phone1','Phone2','Phone3','Phone4'] as $slot) {
+            foreach (['2025550100', '12025550100'] as $number) {
+                $this->db->table('TblPhoneNumbers')->delete();
+                $row = [$slot => $number];
+                if (in_array($slot, ['Phone2','Phone3','Phone4'], true)) $row['Phone1'] = '9995550100';
+                $this->db->table('TblPhoneNumbers')->insert($row);
+                try { SmsFrozenEligibility::assertPending($this->db, self::ID); self::fail('A wide/legacy/prefixed phone escaped suppression.'); }
+                catch (SmsFrozenEligibilityHold) { self::assertEquals($before, $this->db->table('TblProspectsExport')->first()); }
+            }
+        }
+        $this->db->table('TblPhoneNumbers')->delete();
+        // Legacy Phone is deliberately ignored when Phone1 is populated.
+        $this->db->table('TblPhoneNumbers')->insert(['Phone' => '2025550100', 'Phone1' => '9995550100']);
+        SmsFrozenEligibility::assertPending($this->db, self::ID);
+        self::assertEquals($before, $this->db->table('TblProspectsExport')->first());
+    }
+
+    public function test_native_suppression_uses_hash_joins_and_checks_a_late_member_without_mutation(): void
+    {
+        $this->db->unprepared(";WITH n AS (SELECT TOP(6000) ROW_NUMBER() OVER(ORDER BY (SELECT NULL))+1 AS n FROM sys.all_objects a CROSS JOIN sys.all_objects b)
+INSERT TblProspects SELECT n,'CA',CONVERT(varchar(20),2025550000+n),0,0,0 FROM n;");
+        $this->db->insert('INSERT TblProspectsExport(Request_ID,Prospect_PK,State,Phone) SELECT ?,PK,State,Phone FROM TblProspects WHERE PK>1', [self::ID]);
+        $queries = $this->db->pretend(fn () => SmsFrozenEligibility::assertPending($this->db, self::ID));
+        $query = array_values(array_filter($queries, fn ($q) => str_contains($q['query'], 'OPTION (HASH JOIN)')))[0];
+        $pdo = $this->db->getPdo();
+        $pdo->exec('SET STATISTICS XML ON');
+        $xml = '';
+        try {
+            $statement = $pdo->prepare($query['query']);
+            $statement->execute($query['bindings']);
+            do {
+                if ($statement->columnCount() === 0) continue;
+                foreach ($statement->fetchAll(PDO::FETCH_NUM) as $row) {
+                    if (is_string($row[0] ?? null) && str_contains($row[0], 'ShowPlanXML')) $xml = $row[0];
+                }
+            } while ($statement->nextRowset());
+            $statement->closeCursor();
+        } finally { $pdo->exec('SET STATISTICS XML OFF'); }
+        self::assertStringContainsString('PhysicalOp="Hash Match"', $xml);
+        self::assertStringNotContainsString('PhysicalOp="Nested Loops"', $xml);
+        $before = $this->db->selectOne('SELECT COUNT(*) AS n,CHECKSUM_AGG(BINARY_CHECKSUM(*)) AS digest FROM TblProspectsExport');
+        $this->db->table('TblPhoneNumbers')->insert(['Phone' => '12025556001']);
+        try { SmsFrozenEligibility::assertPending($this->db, self::ID); self::fail('Late member was skipped.'); }
+        catch (SmsFrozenEligibilityHold) { self::assertEquals($before, $this->db->selectOne('SELECT COUNT(*) AS n,CHECKSUM_AGG(BINARY_CHECKSUM(*)) AS digest FROM TblProspectsExport')); }
+    }
+
     private function useUtf8ExclusionTables(): void
     {
         // These owned tables are empty at this point. Keep indexed exclusion
