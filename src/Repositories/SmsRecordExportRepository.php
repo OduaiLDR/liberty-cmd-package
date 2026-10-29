@@ -12,6 +12,7 @@ use Cmd\Reports\Services\SmsDeliveryPolicy;
 use Cmd\Reports\Services\SmsRunArtifactBundle;
 use Cmd\Reports\Services\SmsRunOptions;
 use Cmd\Reports\Services\SmsRunArtifactFilename;
+use Cmd\Reports\Services\SmsTierSelectionMetrics;
 use Cmd\Reports\Services\SmsTierSelectionSql;
 use Cmd\Reports\Services\SmsTierWindowSchema;
 use Cmd\Reports\Services\SmsTierWindowSelectionSql;
@@ -184,6 +185,7 @@ class SmsRecordExportRepository extends SqlSrvRepository
         $sql = SmsTierWindowSelectionSql::insert($options['tiers'], (string) config('sms-exports.mailer_recency_date', 'Send_Date'),
             SmsRunOptions::usesLeanDebtSources($options['tier_selection_policy']));
         $selected = 0;
+        $metrics = new SmsTierSelectionMetrics($requestId, $target, $windowSize);
         $noCount = (int) $db->selectOne('SELECT CASE WHEN (@@OPTIONS & 512)=512 THEN 1 ELSE 0 END AS enabled')->enabled;
         $db->unprepared('SET NOCOUNT ON');
         try {
@@ -191,29 +193,35 @@ class SmsRecordExportRepository extends SqlSrvRepository
                 $cursor = null;
                 while ($selected < $target) {
                     $cancellation?->checkpoint($requestId);
+                    $loadStarted = hrtime(true);
                     $db->unprepared('TRUNCATE TABLE #SmsTierWanted');
                     $window = $this->tierWindow($phase, $cursor, $windowSize);
                     $db->table('#SmsTierWanted')->insertUsing([
                         'Window_Position','Export_PK','Phone','Client','Address','City','State',
                         'Snapshot_Zip','Zip','Email','Creation_Date','Last_SMS_Date',
                     ], $window);
+                    // Window_Position is ROW_NUMBER(), so the last position is this window's candidate count.
                     $last = $db->table('#SmsTierWanted')->orderByDesc('Window_Position')->first([
-                        'Export_PK','Creation_Date','Last_SMS_Date',
+                        'Window_Position','Export_PK','Creation_Date','Last_SMS_Date',
                     ]);
+                    $loaded = hrtime(true) - $loadStarted;
                     if ($last === null) break;
 
                     $remaining = $target - $selected;
                     // Read the statement's own count on the server: shared worker
                     // sessions/trigger NOCOUNT settings make PDO rowCount unreliable.
+                    $resolveStarted = hrtime(true);
                     $receipt = $db->selectOne($sql.'; SELECT CONVERT(int,@@ROWCOUNT) AS inserted_rows', [$remaining, $requestId, ...$options['tiers'], SmsDebtPolicy::minimum($options)]);
                     $inserted = (int) $receipt->inserted_rows;
                     if ($inserted < 0 || $inserted > $remaining) throw new RuntimeException('Invalid window selection count.');
                     $selected += $inserted;
+                    $metrics->window($phase, (int) $last->Window_Position, $inserted, $loaded, hrtime(true) - $resolveStarted);
                     $cursor = $last;
                     $cancellation?->checkpoint($requestId);
                 }
                 if ($selected >= $target) break;
             }
+            $metrics->finish($selected);
             $db->unprepared('DROP TABLE #SmsTierWanted');
         } catch (\Throwable $error) {
             // A failed SNAPSHOT transaction rolls its temp DDL back. If it is
