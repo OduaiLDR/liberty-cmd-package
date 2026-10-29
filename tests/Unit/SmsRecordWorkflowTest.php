@@ -501,6 +501,21 @@ final class SmsRecordWorkflowTest extends TestCase
         self::assertSame('approved', $this->runs->show(self::ID)->status);
     }
 
+    public function test_download_grant_pins_a_pending_file_without_eligibility_while_release_still_holds(): void
+    {
+        $pk = $this->prospect(); $this->fileReady(1);
+        $path = $this->runs->filePath(self::ID);
+        $this->db->table('TblProspects')->where('PK', $pk)->update(['Contacted' => 1]);
+        // Issuing a grant only pins the exact verified bytes; streaming them still refuses the held member.
+        self::assertSame($path, $this->runs->grantArtifactPath(self::ID));
+        try { $this->runs->filePath(self::ID); self::fail('A late suppressed frozen member was released.'); }
+        catch (\RuntimeException $error) { self::assertStringContainsString('held without changing membership', $error->getMessage()); }
+        file_put_contents($path, 'tampered', FILE_APPEND);
+        $this->refuses(fn () => $this->runs->grantArtifactPath(self::ID));
+        $this->runs->discard(self::ID);
+        $this->refuses(fn () => $this->runs->grantArtifactPath(self::ID), 404);
+    }
+
     public function test_delete_removes_pending_file_and_membership_without_a_send_or_history(): void
     {
         $this->prospect(); $this->fileReady(1);

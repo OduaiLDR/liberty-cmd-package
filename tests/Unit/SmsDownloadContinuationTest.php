@@ -137,7 +137,7 @@ final class SmsDownloadContinuationTest extends TestCase
         $payload = json_decode($this->container->make('encrypter')->decrypt($encrypted,false),true,24,JSON_THROW_ON_ERROR);
         self::assertSame(self::COOKIE,$payload['cookie']);self::assertSame(hash('sha256',self::COOKIE),$payload['session_sha256']);
         self::assertArrayNotHasKey('permissionIds',$payload);self::assertSame(60,$payload['expires_at']-$payload['issued_at']);
-        self::assertSame(1,$this->runs->fileCalls);self::assertSame(1,$this->runs->urlCalls);Http::assertNothingSent();
+        self::assertSame(0,$this->runs->fileCalls);self::assertSame(1,$this->runs->grantCalls);self::assertSame(1,$this->runs->urlCalls);Http::assertNothingSent();
     }
 
     public function test_issuance_gate_keeps_legacy_link_and_allows_an_existing_grant_to_finish(): void
@@ -163,7 +163,7 @@ final class SmsDownloadContinuationTest extends TestCase
         foreach (['',str_repeat('x',16385),"fixture=bad\r\nvalue"] as $cookie) {
             $request = $this->issuer();$request->headers->set('Cookie',$cookie);$this->refuses(fn () => $this->downloads->issue($request,self::ID),401);
         }
-        self::assertSame(0,$this->runs->fileCalls);self::assertSame(0,$this->runs->urlCalls);Http::assertNothingSent();
+        self::assertSame(0,$this->runs->fileCalls);self::assertSame(0,$this->runs->grantCalls);self::assertSame(0,$this->runs->urlCalls);Http::assertNothingSent();
     }
 
     public function test_fresh_redemption_streams_existing_csv_and_restores_unrelated_browser_cookie(): void
@@ -192,10 +192,23 @@ final class SmsDownloadContinuationTest extends TestCase
         }
     }
 
+    public function test_issuance_pins_the_file_without_the_release_check_that_redemption_still_runs(): void
+    {
+        // A 3M pending batch made the full eligibility check outlast the page proxy at issuance.
+        $descriptor = $this->downloads->issue($this->issuer(),self::ID);
+        self::assertSame(0,$this->runs->fileCalls);self::assertSame(1,$this->runs->grantCalls);
+        $this->runs->releaseHold = 409;$this->identity();
+        $this->refuses(fn () => $this->pipeline($this->post($descriptor)),409);
+        self::assertSame(1,$this->runs->fileCalls);
+        $this->runs->releaseHold = null;$descriptor = $this->downloads->issue($this->issuer(),self::ID);
+        self::assertInstanceOf(BinaryFileResponse::class,$this->pipeline($this->post($descriptor)));
+        self::assertSame(2,$this->runs->fileCalls);self::assertSame(2,$this->runs->grantCalls);
+    }
+
     public function test_expired_identity_signature_and_wrong_method_or_missing_body_never_stream(): void
     {
         $descriptor = $this->downloads->issue($this->issuer(),self::ID);$this->identity([],401);
-        $this->refuses(fn () => $this->pipeline($this->post($descriptor)),401);self::assertSame(1,$this->runs->fileCalls);
+        $this->refuses(fn () => $this->pipeline($this->post($descriptor)),401);self::assertSame(0,$this->runs->fileCalls);self::assertSame(1,$this->runs->grantCalls);
         $descriptor = $this->downloads->issue($this->issuer(),self::ID);Carbon::setTestNow(now()->addSeconds(61));
         $this->refuses(fn () => $this->pipeline($this->post($descriptor)),403);
         Carbon::setTestNow('2026-10-25T18:00:00Z');$descriptor = $this->downloads->issue($this->issuer(),self::ID);
@@ -210,7 +223,7 @@ final class SmsDownloadContinuationTest extends TestCase
         $descriptor = $this->downloads->issue($this->issuer(),self::ID);
         $descriptor['url'] = 'https://runner.fixture.invalid'.URL::temporarySignedRoute('cmd.sms_run.download_continue',now()->addSeconds(60),['requestId'=>self::OTHER],false);
         $this->refuses(fn () => $this->downloads->consume($this->post($descriptor),self::OTHER),410);Http::assertNothingSent();
-        self::assertSame(1,$this->runs->fileCalls);
+        self::assertSame(0,$this->runs->fileCalls);self::assertSame(1,$this->runs->grantCalls);
     }
 
     public function test_artifact_replacement_is_denied_after_fresh_authorization(): void
@@ -234,7 +247,7 @@ final class SmsDownloadContinuationTest extends TestCase
             $response = $this->pipeline($this->post($descriptor));self::assertSame('application/zip',$response->headers->get('Content-Type'));
             self::assertSame($path,$response->getFile()->getPathname());self::assertSame($sha,hash_file('sha256',$path));self::assertSame($policy,$this->runs->policy);
         }
-        self::assertSame(4,$this->runs->fileCalls);self::assertSame(2,$this->runs->urlCalls);
+        self::assertSame(2,$this->runs->fileCalls);self::assertSame(2,$this->runs->grantCalls);self::assertSame(2,$this->runs->urlCalls);
     }
 
     public function test_cache_lock_contention_and_atomic_used_fence_prevent_duplicate_redemption(): void
@@ -352,7 +365,7 @@ PHP;
         $this->refuses(fn()=>$this->downloads->consume($this->post($descriptor),self::ID),503);
         self::assertIsString(Cache::get($this->key($descriptor)));self::assertTrue(Cache::get($this->key($descriptor).':used'));
         $this->refuses(fn()=>$this->downloads->consume($this->post($descriptor),self::ID),410);
-        self::assertSame(1,$this->runs->fileCalls);Http::assertNothingSent();
+        self::assertSame(0,$this->runs->fileCalls);self::assertSame(1,$this->runs->grantCalls);Http::assertNothingSent();
     }
 
     public function test_unavailable_real_cache_lock_refuses_issuance_without_a_delegation(): void
@@ -384,6 +397,8 @@ final class DownloadContinuationRuns extends SmsRunService
 {
     public int $urlCalls = 0;
     public int $fileCalls = 0;
+    public int $grantCalls = 0;
+    public ?int $releaseHold = null;
     public string $policy = 'prospect-record-v1';
     public function __construct(public string $path) {}
     public function downloadUrl(string $requestId): string
@@ -391,5 +406,11 @@ final class DownloadContinuationRuns extends SmsRunService
         $this->urlCalls++;
         return 'https://runner.fixture.invalid'.URL::temporarySignedRoute('cmd.sms_run.download',now()->addMinutes(15),['requestId'=>$requestId],false);
     }
-    public function filePath(string $requestId): string { $this->fileCalls++;return $this->path; }
+    public function filePath(string $requestId): string
+    {
+        $this->fileCalls++;
+        if ($this->releaseHold !== null) throw new HttpException($this->releaseHold, 'A frozen member is now held without changing membership.');
+        return $this->path;
+    }
+    public function grantArtifactPath(string $requestId): string { $this->grantCalls++;return $this->path; }
 }

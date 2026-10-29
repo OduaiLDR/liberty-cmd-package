@@ -857,6 +857,21 @@ class SmsRunService
 
     public function filePath(string $requestId): string
     {
+        return $this->releasableArtifact($requestId, true);
+    }
+
+    /**
+     * Pins the exact file for a one-use download grant without the pending eligibility queries,
+     * which can outlast the page proxy on a large batch. Redeeming the grant streams through
+     * filePath(), which runs every check again before any byte leaves the server.
+     */
+    public function grantArtifactPath(string $requestId): string
+    {
+        return $this->releasableArtifact($requestId, false);
+    }
+
+    private function releasableArtifact(string $requestId, bool $checkPendingEligibility): string
+    {
         $run = $this->mustRun($requestId);
         if (SmsRecordPolicy::isExternal($run)) {
             $header = SmsExternalEventProjection::assertComplete($run);
@@ -864,23 +879,23 @@ class SmsRunService
             catch (\Throwable $error) { throw new HttpException(409, 'Original external files are unavailable or do not match their receipt.', $error); }
         }
         if (SmsRecordPolicy::isRecord($run) && ! in_array($run->Status, ['file_ready','approving','approved'], true)) throw new HttpException(404, 'This batch has no downloadable file.');
-        if (SmsRecordPolicy::isRecord($run) && in_array($run->Status, ['file_ready','approving'], true)) {
-            app(SmsRecordExportRepository::class)->assertCurrentStates($requestId);
-        }
-        if (! SmsRecordPolicy::isRecord($run) && in_array($run->Status, ['file_ready','sending'], true)) {
-            $this->export->assertCurrentStates($requestId);
-        }
+        if ($checkPendingEligibility) $this->assertPendingDownloadStates($run, $requestId);
         if ($this->approvalFilenames($this->fileOptions($run)) && $run->Status === 'approving') throw new HttpException(409, 'SMS files are being finalized after approval.');
         $path = $this->verifiedRunArtifact($run, $this->artifactGeneration($run));
         // Hashing can take time for a large bundle. Check again immediately before
         // releasing a pending download, using the same frozen membership.
+        if ($checkPendingEligibility) $this->assertPendingDownloadStates($run, $requestId);
+        return $path;
+    }
+
+    private function assertPendingDownloadStates(object $run, string $requestId): void
+    {
         if (SmsRecordPolicy::isRecord($run) && in_array($run->Status, ['file_ready','approving'], true)) {
             app(SmsRecordExportRepository::class)->assertCurrentStates($requestId);
         }
         if (! SmsRecordPolicy::isRecord($run) && in_array($run->Status, ['file_ready','sending'], true)) {
             $this->export->assertCurrentStates($requestId);
         }
-        return $path;
     }
 
     private function verifiedRunArtifact(object $run, string $generation): string

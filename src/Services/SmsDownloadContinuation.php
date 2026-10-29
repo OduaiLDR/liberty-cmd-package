@@ -45,7 +45,8 @@ final class SmsDownloadContinuation
         // Preserve the existing status and artifact gates; no alternate file lookup or generation.
         $existing = $this->runs->downloadUrl($id);
         $origin = $this->origin($existing);
-        $artifact = $this->artifact($this->runs->filePath($id));
+        // Pin the file only; the redeeming download reruns filePath() with pending eligibility.
+        $artifact = $this->artifact($this->runs->grantArtifactPath($id));
         $issuedAt = now()->timestamp;
         $expires = now()->setTimestamp($issuedAt + self::TTL);
         $relative = URL::temporarySignedRoute('cmd.sms_run.download_continue', $expires, ['requestId' => $id], false);
