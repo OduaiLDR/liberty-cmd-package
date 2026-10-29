@@ -39,7 +39,7 @@ final class SmsPhoneSnapshotDedupTest extends TestCase
         };
         $app->instance('log', $this->logger); Facade::clearResolvedInstances(); Facade::setFacadeApplication($app);
         $this->db = $manager->getConnection('sqlsrv');
-        $this->db->statement('CREATE TABLE TblPhoneNumbers(PK INTEGER PRIMARY KEY AUTOINCREMENT,Phone TEXT,Source TEXT,CID TEXT,Created_Date TEXT,Data_Source TEXT,External_ID TEXT,Data_Source_ID TEXT,Data_Source_Origin TEXT,Data_Source_Map_SHA256 TEXT,Status TEXT,Status_ID TEXT,Status_Stamp TEXT,Phone1 TEXT,Phone2 TEXT,Phone3 TEXT,Phone4 TEXT)');
+        $this->db->statement('CREATE TABLE TblPhoneNumbers(PK INTEGER PRIMARY KEY AUTOINCREMENT,Phone TEXT,Source TEXT,CID TEXT,Created_Date TEXT,Data_Source TEXT,External_ID TEXT,Status TEXT,Phone1 TEXT,Phone2 TEXT,Phone3 TEXT,Phone4 TEXT)');
         foreach (['DP_LT','DP_LDR','DP'] as $source) $this->db->table('TblPhoneNumbers')->insert(['Phone'=>'2025550100','Source'=>$source,'CID'=>'old']);
     }
 
@@ -52,7 +52,7 @@ final class SmsPhoneSnapshotDedupTest extends TestCase
     {
         return array_replace(['PHONE'=>'(202) 555-0199','ID'=>'000123','CREATED_DATE'=>'2026-10-12',
             'DATA_SOURCE'=>'Synthetic source','DATA_SOURCE_ID'=>'79071','EXTERNAL_ID'=>'000987','DATA_SOURCE_VARIANTS'=>1,
-            'STATUS'=>'Active','STATUS_ID'=>'1234','STATUS_STAMP'=>'2026-10-28 12:34:56.000 -0700','STATUS_VARIANTS'=>1,
+            'STATUS'=>'Active','STATUS_ID'=>'1234','STATUS_VARIANTS'=>1,
             'PHONE_SLOT'=>0], $changes);
     }
 
@@ -123,16 +123,14 @@ final class SmsPhoneSnapshotDedupTest extends TestCase
     {
         $command=$this->command([[$this->row(['DATA_SOURCE'=>"源 O'Brien 😀",'EXTERNAL_ID'=>'000123-abc']),
             $this->row(['ID'=>'124','DATA_SOURCE'=>null,'DATA_SOURCE_ID'=>null,'DATA_SOURCE_VARIANTS'=>0,'EXTERNAL_ID'=>null,
-                'STATUS'=>null,'STATUS_ID'=>null,'STATUS_STAMP'=>null,'STATUS_VARIANTS'=>0]),
+                'STATUS'=>null,'STATUS_ID'=>null,'STATUS_VARIANTS'=>0]),
             $this->row(['ID'=>'125','DATA_SOURCE'=>'','EXTERNAL_ID'=>''])]]);
         self::assertSame(0,$command->handle()); self::assertSame(0,$command->flags);
         $rows=$this->db->table('TblPhoneNumbers')->where('Source','DP_LT')->orderBy('CID')->get();
         self::assertSame("源 O'Brien 😀",$rows[0]->Data_Source); self::assertSame('000123-abc',$rows[0]->External_ID);
         self::assertNull($rows[1]->Data_Source); self::assertNull($rows[1]->External_ID);
         self::assertSame('',$rows[2]->Data_Source); self::assertSame('',$rows[2]->External_ID);
-        self::assertSame('79071',$rows[0]->Data_Source_ID); self::assertSame('current',$rows[0]->Data_Source_Origin);
-        self::assertSame('Active',$rows[0]->Status); self::assertSame('1234',$rows[0]->Status_ID);
-        self::assertSame('2026-10-28 12:34:56.000 -0700',$rows[0]->Status_Stamp);
+        self::assertSame('Active',$rows[0]->Status);
     }
 
     public function test_default_schedule_cannot_run_the_superseded_prospect_date_writer(): void
@@ -177,9 +175,7 @@ final class SmsPhoneSnapshotDedupTest extends TestCase
     {
         $this->db->statement('ALTER TABLE TblPhoneNumbers DROP COLUMN Data_Source');
         $this->db->statement('ALTER TABLE TblPhoneNumbers DROP COLUMN External_ID');
-        foreach (['Data_Source_ID','Data_Source_Origin','Data_Source_Map_SHA256','Status','Status_ID','Status_Stamp'] as $column) {
-            $this->db->statement("ALTER TABLE TblPhoneNumbers DROP COLUMN {$column}");
-        }
+        $this->db->statement('ALTER TABLE TblPhoneNumbers DROP COLUMN Status');
         $command=$this->command([[$this->row()]]); self::assertSame(1,$command->handle()); self::assertSame(0,$command->queries);
         $migration=require __DIR__.'/../../database/sms-migrations/2026_10_28_000002_add_phone_source_provenance.php';
         $migration->up(); $migration->up(); $migration->down();
@@ -188,23 +184,21 @@ final class SmsPhoneSnapshotDedupTest extends TestCase
         self::assertSame(3,$this->db->table('TblPhoneNumbers')->count());
         self::assertTrue($this->db->getSchemaBuilder()->hasColumn('TblPhoneNumbers','Data_Source'));
         self::assertTrue($this->db->getSchemaBuilder()->hasColumn('TblPhoneNumbers','External_ID'));
-        foreach (['Data_Source_ID','Data_Source_Origin','Data_Source_Map_SHA256','Status','Status_ID','Status_Stamp'] as $column) {
-            self::assertTrue($this->db->getSchemaBuilder()->hasColumn('TblPhoneNumbers',$column));
+        self::assertTrue($this->db->getSchemaBuilder()->hasColumn('TblPhoneNumbers','Status'));
+        // Jacob keeps the values only; IDs, stamps and which lookup filled Data_Source are not stored.
+        foreach (['Data_Source_ID','Data_Source_Origin','Data_Source_Map_SHA256','Status_ID','Status_Stamp'] as $column) {
+            self::assertFalse($this->db->getSchemaBuilder()->hasColumn('TblPhoneNumbers',$column));
         }
     }
 
-    public function test_lt_legacy_source_fallback_is_auditable_and_status_title_can_be_unknown(): void
+    public function test_lt_legacy_source_fallback_fills_data_source_and_status_title_can_be_unknown(): void
     {
         $command=$this->command([[$this->row(['DATA_SOURCE'=>null,'DATA_SOURCE_ID'=>'79071','DATA_SOURCE_VARIANTS'=>0,
-            'STATUS'=>null,'STATUS_ID'=>'999999','STATUS_STAMP'=>'2026-10-28 09:00:00.000 -0700','STATUS_VARIANTS'=>0])]]);
+            'STATUS'=>null,'STATUS_ID'=>'999999','STATUS_VARIANTS'=>0])]]);
         self::assertSame(0,$command->handle());
         $row=$this->db->table('TblPhoneNumbers')->where('Source','DP_LT')->sole();
         self::assertSame('DPP - Mass Post Source',$row->Data_Source);
-        self::assertSame('79071',$row->Data_Source_ID);
-        self::assertSame('legacy',$row->Data_Source_Origin);
-        self::assertSame(\Cmd\Reports\Services\SmsLegacyDataSourceMap::SOURCE_SHA256,$row->Data_Source_Map_SHA256);
-        self::assertNull($row->Status); self::assertSame('999999',$row->Status_ID);
-        self::assertSame('2026-10-28 09:00:00.000 -0700',$row->Status_Stamp);
+        self::assertNull($row->Status);
     }
 
     public function test_four_unique_phones_keep_source_slot_order_and_fifth_aborts_without_target_changes(): void

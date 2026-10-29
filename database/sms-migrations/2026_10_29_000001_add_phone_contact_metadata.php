@@ -13,13 +13,9 @@ return new class extends Migration
     {
         $schema = Schema::connection($this->getConnection());
         if (! $schema->hasTable('TblPhoneNumbers')) throw new RuntimeException('Phone metadata requires the existing phone table.');
+        // Jacob keeps values only; the source and status IDs are used for lookup during sync, not stored.
         foreach ([
-            'Data_Source_ID' => ['string', 50],
-            'Data_Source_Origin' => ['string', 20],
-            'Data_Source_Map_SHA256' => ['char', 64],
             'Status' => ['string', 256],
-            'Status_ID' => ['string', 50],
-            'Status_Stamp' => ['string', 64],
         ] as $column => [$type, $length]) {
             if ($schema->hasColumn('TblPhoneNumbers', $column)) continue;
             $schema->table('TblPhoneNumbers', function (Blueprint $table) use ($column, $type, $length): void {

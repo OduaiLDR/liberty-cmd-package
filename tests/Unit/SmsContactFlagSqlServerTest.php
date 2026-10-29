@@ -488,9 +488,7 @@ SQL;
         $stage=new \Cmd\Reports\Services\SmsPhoneSnapshotStage;
         $row=['phone'=>'2025550199','cid'=>'00012345678901234567890123456789012345','created'=>'2026-10-12',
             'data_source'=>"源 O'Brien 😀",'external_id'=>str_repeat('0',250).'-A😀',
-            'data_source_id'=>'79071','data_source_origin'=>'legacy',
-            'data_source_map_sha256'=>\Cmd\Reports\Services\SmsLegacyDataSourceMap::SOURCE_SHA256,
-            'status'=>"Qualified O'Brien 😀",'status_id'=>'987654','status_stamp'=>'2026-10-28 12:34:56.123 -0700'];
+            'status'=>"Qualified O'Brien 😀"];
         $this->db->table('TblPhoneNumbers')->insert(['Phone'=>'2025550100','Source'=>'DP_LDR','CID'=>'other']);
         try {
             $stage->add('DP_LT',$row); $stage->add('DP_LT',$row); $path=$stage->export();
@@ -498,11 +496,7 @@ SQL;
             $actual=$this->db->table('TblPhoneNumbers')->where('Source','DP_LT')->sole();
             self::assertSame($row['cid'],$actual->CID); self::assertSame($row['data_source'],$actual->Data_Source);
             self::assertSame($row['external_id'],$actual->External_ID);
-            self::assertSame($row['data_source_id'],$actual->Data_Source_ID);
-            self::assertSame($row['data_source_origin'],$actual->Data_Source_Origin);
-            self::assertSame($row['data_source_map_sha256'],$actual->Data_Source_Map_SHA256);
-            self::assertSame($row['status'],$actual->Status); self::assertSame($row['status_id'],$actual->Status_ID);
-            self::assertSame($row['status_stamp'],$actual->Status_Stamp);
+            self::assertSame($row['status'],$actual->Status);
             self::assertSame(1,$this->db->table('TblPhoneNumbers')->where('Source','DP_LDR')->count());
             self::assertSame(1,$this->db->table('test_revisions')->count());
             self::assertSame(1,$this->requests->calls);

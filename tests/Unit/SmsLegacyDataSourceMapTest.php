@@ -22,14 +22,10 @@ final class SmsLegacyDataSourceMapTest extends TestCase
 
     public function test_current_name_wins_and_legacy_is_lt_only(): void
     {
-        self::assertSame(['name'=>'Current Name','id'=>'79071','origin'=>'current','mapping_sha256'=>null],
-            SmsLegacyDataSourceMap::resolve('lt','79071','Current Name',1));
-        self::assertSame(['name'=>'DPP - Mass Post Source','id'=>'79071','origin'=>'legacy','mapping_sha256'=>SmsLegacyDataSourceMap::SOURCE_SHA256],
-            SmsLegacyDataSourceMap::resolve('lt','79071',null,0));
-        self::assertSame(['name'=>null,'id'=>'79071','origin'=>null,'mapping_sha256'=>null],
-            SmsLegacyDataSourceMap::resolve('ldr','79071',null,0));
-        self::assertSame(['name'=>null,'id'=>'999999','origin'=>null,'mapping_sha256'=>null],
-            SmsLegacyDataSourceMap::resolve('lt','999999',null,0));
+        self::assertSame('Current Name', SmsLegacyDataSourceMap::resolve('lt','79071','Current Name',1));
+        self::assertSame('DPP - Mass Post Source', SmsLegacyDataSourceMap::resolve('lt','79071',null,0));
+        self::assertNull(SmsLegacyDataSourceMap::resolve('ldr','79071',null,0));
+        self::assertNull(SmsLegacyDataSourceMap::resolve('lt','999999',null,0));
     }
 
     public function test_conflicting_current_names_and_invalid_ids_hold(): void

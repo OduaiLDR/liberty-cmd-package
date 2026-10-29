@@ -53,7 +53,7 @@ final class SmsLegacyDataSourceMap
     }
 
     /** Current official names always win; only unresolved LT IDs use the immutable fallback. */
-    public static function resolve(string $company, ?string $sourceId, ?string $currentName, int $currentVariants = 0): array
+    public static function resolve(string $company, ?string $sourceId, ?string $currentName, int $currentVariants = 0): ?string
     {
         if ($currentVariants < 0 || $currentVariants > 1) {
             throw new RuntimeException('Conflicting current Data Source names.');
@@ -62,16 +62,12 @@ final class SmsLegacyDataSourceMap
             self::text($currentName);
             $sourceId = self::id($sourceId);
             if ($currentVariants !== 1 || $sourceId === null) throw new RuntimeException('Incomplete current Data Source evidence.');
-            return ['name' => $currentName, 'id' => $sourceId, 'origin' => 'current', 'mapping_sha256' => null];
+            return $currentName;
         }
         $sourceId = self::id($sourceId);
         if ($currentVariants !== 0) throw new RuntimeException('Incomplete current Data Source evidence.');
-        if ($company !== 'lt' || $sourceId === null) {
-            return ['name' => null, 'id' => $sourceId, 'origin' => null, 'mapping_sha256' => null];
-        }
-        $name = self::all()[$sourceId] ?? null;
-        return ['name' => $name, 'id' => $sourceId, 'origin' => $name === null ? null : 'legacy',
-            'mapping_sha256' => $name === null ? null : self::SOURCE_SHA256];
+        if ($company !== 'lt' || $sourceId === null) return null;
+        return self::all()[$sourceId] ?? null;
     }
 
     private static function id(?string $value): ?string

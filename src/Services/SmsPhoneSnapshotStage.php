@@ -37,11 +37,7 @@ final class SmsPhoneSnapshotStage
     {
         $metadata = ['cid'=>$row['cid'],'created'=>$row['created'],
             'data_source'=>$row['data_source']??null,'external_id'=>$row['external_id']??null,
-            'data_source_id'=>$row['data_source_id']??null,
-            'data_source_origin'=>$row['data_source_origin']??null,
-            'data_source_map_sha256'=>$row['data_source_map_sha256']??null,
-            'status'=>$row['status']??null,'status_id'=>$row['status_id']??null,
-            'status_stamp'=>$row['status_stamp']??null];
+            'status'=>$row['status']??null];
         $slot = $row['slot'] ?? 0;
         if (! is_int($slot) || $slot < 0 || $slot > 3) throw new RuntimeException('Invalid phone slot; the phone snapshot was not replaced.');
         $key = [$source, $row['cid']];

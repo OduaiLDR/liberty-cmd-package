@@ -130,7 +130,7 @@ final class SmsPhoneCompanySourceTest extends TestCase
     public function test_postcommit_connection_failure_keeps_true_commit_receipt_and_next_failed_replacement_resets_it():void
     {
         $pdo=new \PDO('sqlite::memory:');
-        $pdo->exec('CREATE TABLE TblPhoneNumbers (Phone TEXT, Source TEXT, CID TEXT, Created_Date TEXT, Data_Source TEXT, External_ID TEXT, Data_Source_ID TEXT, Data_Source_Origin TEXT, Data_Source_Map_SHA256 TEXT, Status TEXT, Status_ID TEXT, Status_Stamp TEXT, Phone1 TEXT, Phone2 TEXT, Phone3 TEXT, Phone4 TEXT)');
+        $pdo->exec('CREATE TABLE TblPhoneNumbers (Phone TEXT, Source TEXT, CID TEXT, Created_Date TEXT, Data_Source TEXT, External_ID TEXT, Status TEXT, Phone1 TEXT, Phone2 TEXT, Phone3 TEXT, Phone4 TEXT)');
         $path=tempnam(sys_get_temp_dir(),'sms-phone-commit-fixture-');
         self::assertNotFalse($path);
         $command=$this->command();
@@ -173,7 +173,7 @@ final class SmsPhoneCompanySourceTest extends TestCase
         $capsule->addConnection(['driver'=>'sqlite','database'=>':memory:'] ,'sqlsrv');
         $app->instance('db',$capsule->getDatabaseManager());
         $db=$capsule->getConnection('sqlsrv');
-        $db->statement('CREATE TABLE TblPhoneNumbers (Phone TEXT,Source TEXT,CID TEXT,Data_Source TEXT,External_ID TEXT,Data_Source_ID TEXT,Data_Source_Origin TEXT,Data_Source_Map_SHA256 TEXT,Status TEXT,Status_ID TEXT,Status_Stamp TEXT,Phone1 TEXT,Phone2 TEXT,Phone3 TEXT,Phone4 TEXT'.($schemaReady?',Created_Date TEXT':'').')');
+        $db->statement('CREATE TABLE TblPhoneNumbers (Phone TEXT,Source TEXT,CID TEXT,Data_Source TEXT,External_ID TEXT,Status TEXT,Phone1 TEXT,Phone2 TEXT,Phone3 TEXT,Phone4 TEXT'.($schemaReady?',Created_Date TEXT':'').')');
         $db->table('TblPhoneNumbers')->insert(['Phone'=>'2025550101','Source'=>'DP_LT','CID'=>'old']);
         $before=$db->table('TblPhoneNumbers')->get()->toJson();
         $files=glob(sys_get_temp_dir().'/sync-phone-*');

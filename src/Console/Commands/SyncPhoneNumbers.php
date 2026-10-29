@@ -144,9 +144,7 @@ class SyncPhoneNumbers extends Command
             if (! $this->withCreatedDate) {
                 throw new \RuntimeException('Phone synchronization requires the Created_Date target column.');
             }
-            foreach (['Data_Source', 'External_ID', 'Data_Source_ID', 'Data_Source_Origin',
-                'Data_Source_Map_SHA256', 'Status', 'Status_ID', 'Status_Stamp',
-                'Phone1', 'Phone2', 'Phone3', 'Phone4'] as $column) {
+            foreach (['Data_Source', 'External_ID', 'Status', 'Phone1', 'Phone2', 'Phone3', 'Phone4'] as $column) {
                 if (! DB::connection('sqlsrv')->getSchemaBuilder()->hasColumn('TblPhoneNumbers', $column)) {
                     throw new \RuntimeException('Phone synchronization requires the provenance target columns.');
                 }
@@ -284,7 +282,7 @@ class SyncPhoneNumbers extends Command
                 c.C_SOURCE::VARCHAR AS DATA_SOURCE_ID,
                 ds.NAME AS DATA_SOURCE, COALESCE(ds.NAME_VARIANTS, 0) AS DATA_SOURCE_VARIANTS,
                 status_names.TITLE AS STATUS, COALESCE(status_names.TITLE_VARIANTS, 0) AS STATUS_VARIANTS,
-                latest_status.STATUS_ID::VARCHAR AS STATUS_ID, latest_status.STAMP::VARCHAR AS STATUS_STAMP,
+                latest_status.STATUS_ID::VARCHAR AS STATUS_ID,
                 phone_values.VALUE::STRING AS PHONE, phone_values.INDEX AS PHONE_SLOT,
                 TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', c.CREATED)::DATE, 'YYYY-MM-DD') AS CREATED_DATE
             FROM CONTACTS AS c
@@ -344,7 +342,7 @@ class SyncPhoneNumbers extends Command
             if (($status === null) !== ($statusVariants === 0) || ($status !== null && $statusId === null)) {
                 throw new \RuntimeException('Incomplete current status evidence; the phone snapshot was not replaced.');
             }
-            $resolvedSource = SmsLegacyDataSourceMap::resolve(
+            $dataSource = SmsLegacyDataSourceMap::resolve(
                 $this->sourceEnvironment,
                 $this->decimalIdentifier($row['DATA_SOURCE_ID'] ?? null, 'Data Source'),
                 $this->provenanceText($row['DATA_SOURCE'] ?? null, 50),
@@ -357,14 +355,9 @@ class SyncPhoneNumbers extends Command
                 'phone' => $phone,
                 'cid'   => $this->contactId($row['ID'] ?? null),
                 'created' => $this->createdDate($row['CREATED_DATE'] ?? null),
-                'data_source' => $resolvedSource['name'],
+                'data_source' => $dataSource,
                 'external_id' => $this->provenanceText($row['EXTERNAL_ID'] ?? null, 256),
-                'data_source_id' => $resolvedSource['id'],
-                'data_source_origin' => $resolvedSource['origin'],
-                'data_source_map_sha256' => $resolvedSource['mapping_sha256'],
                 'status' => $status,
-                'status_id' => $statusId,
-                'status_stamp' => $this->provenanceText($row['STATUS_STAMP'] ?? null, 64),
                 'slot' => $this->phoneSlot($row['PHONE_SLOT'] ?? null),
             ];
         }
@@ -415,7 +408,7 @@ class SyncPhoneNumbers extends Command
         $columns = $db->select("SELECT c.name AS column_name,t.name AS type_name,c.max_length,c.is_nullable,c.collation_name
             FROM sys.columns c JOIN sys.types t ON t.user_type_id=c.user_type_id
             WHERE c.object_id=OBJECT_ID(N'TblPhoneNumbers') AND c.name IN (N'Phone',N'Data_Source',N'External_ID',
-                N'Data_Source_ID',N'Data_Source_Origin',N'Data_Source_Map_SHA256',N'Status',N'Status_ID',N'Status_Stamp',
+                N'Status',
                 N'Phone1',N'Phone2',N'Phone3',N'Phone4')");
         $found = [];
         foreach ($columns as $column) $found[$column->column_name] = $column;
@@ -424,12 +417,10 @@ class SyncPhoneNumbers extends Command
         foreach(range(1,4) as $slot) {
             if(($found['Phone'.$slot]->collation_name??null)!==$phoneCollation) throw new \RuntimeException('Wide phone synchronization requires matching phone collations.');
         }
-        foreach (['Data_Source'=>100,'External_ID'=>512,'Data_Source_ID'=>100,'Data_Source_Origin'=>40,
-            'Data_Source_Map_SHA256'=>64,'Status'=>512,'Status_ID'=>100,'Status_Stamp'=>128,
+        foreach (['Data_Source'=>100,'External_ID'=>512,'Status'=>512,
             'Phone1'=>100,'Phone2'=>100,'Phone3'=>100,'Phone4'=>100] as $name=>$bytes) {
             $column = $found[$name] ?? null;
-            $allowedTypes = $name === 'Data_Source_Map_SHA256' ? ['char','nchar'] : ['nvarchar'];
-            if (! $column || ! in_array(strtolower($column->type_name), $allowedTypes, true) || ! (bool) $column->is_nullable
+            if (! $column || strtolower($column->type_name) !== 'nvarchar' || ! (bool) $column->is_nullable
                 || ((int) $column->max_length !== -1 && (int) $column->max_length < $bytes)) {
                 throw new \RuntimeException('Phone synchronization requires nullable Unicode provenance storage of sufficient length.');
             }
@@ -533,19 +524,8 @@ class SyncPhoneNumbers extends Command
             $metadata = [
                 $dataSource,
                 $externalId,
-                $this->decimalIdentifier($item['data_source_id'] ?? null, 'Data Source'),
-                $this->provenanceText($item['data_source_origin'] ?? null, 20),
-                $this->provenanceText($item['data_source_map_sha256'] ?? null, 64),
                 $this->provenanceText($item['status'] ?? null, 256),
-                $this->decimalIdentifier($item['status_id'] ?? null, 'status'),
-                $this->provenanceText($item['status_stamp'] ?? null, 64),
             ];
-            if ($metadata[3] !== null && ! in_array($metadata[3], ['current','legacy'], true)) {
-                throw new \RuntimeException('Invalid Data Source origin; the phone snapshot was not replaced.');
-            }
-            if ($metadata[4] !== null && preg_match('/\A[a-f0-9]{64}\z/D', $metadata[4]) !== 1) {
-                throw new \RuntimeException('Invalid Data Source map hash; the phone snapshot was not replaced.');
-            }
             $hasMetadata = array_filter($metadata, static fn (?string $value): bool => $value !== null) !== [];
             $unicode = $hasMetadata && DB::connection('sqlsrv')->getDriverName() === 'sqlsrv' ? 'N' : '';
             $metadataValues = array_map(fn (?string $value): string => $value === null ? 'NULL' : $unicode."'".$this->esc($value)."'", $metadata);
@@ -553,8 +533,7 @@ class SyncPhoneNumbers extends Command
             $values[] = "('{$phoneEsc}', '{$sourceEsc}', {$cid}, {$created}, ".implode(', ', $metadataValues).", {$wideValues})";
         }
 
-        $columns = 'Phone, Source, CID, Created_Date, Data_Source, External_ID, Data_Source_ID, '
-            .'Data_Source_Origin, Data_Source_Map_SHA256, Status, Status_ID, Status_Stamp, Phone1, Phone2, Phone3, Phone4';
+        $columns = 'Phone, Source, CID, Created_Date, Data_Source, External_ID, Status, Phone1, Phone2, Phone3, Phone4';
         $sql = "INSERT INTO TblPhoneNumbers ({$columns}) VALUES " . implode(', ', $values);
         $affected = $this->executeSqlServerWrite($connection, $sql, 'insert phone batch ' . $batchNumber);
         $inserted = $affected > 0 ? $affected : count($chunk);
