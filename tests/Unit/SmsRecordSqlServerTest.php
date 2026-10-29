@@ -299,28 +299,35 @@ final class SmsRecordSqlServerTest extends TestCase
     {
         \Cmd\Reports\Services\SmsRecordPolicy::assertReady();
         $this->db->statement('ALTER TABLE dbo.TblProspects DROP COLUMN Contacted_Date');
-        foreach(['Response_Date'=>'date NULL','Response_CID'=>'nvarchar(50) NULL',
-            'Enrollment_Date'=>'date NULL','Enrollment_CID'=>'nvarchar(50) NULL'] as $column=>$type) {
-            if(!$this->db->getSchemaBuilder()->hasColumn('TblProspects',$column)) {
-                $this->db->statement("ALTER TABLE dbo.TblProspects ADD {$column} {$type}");
+        try {
+            foreach(['Response_Date'=>'date NULL','Response_CID'=>'nvarchar(50) NULL',
+                'Enrollment_Date'=>'date NULL','Enrollment_CID'=>'nvarchar(50) NULL'] as $column=>$type) {
+                if(!$this->db->getSchemaBuilder()->hasColumn('TblProspects',$column)) {
+                    $this->db->statement("ALTER TABLE dbo.TblProspects ADD {$column} {$type}");
+                }
+            }
+            $held=static function(callable $work,string $fragment):void {
+                try{$work();self::fail('Expected schema hold.');}
+                catch(HttpException $error){self::assertSame(503,$error->getStatusCode());self::assertStringContainsString($fragment,$error->getMessage());}
+            };
+            $held(static fn()=>\Cmd\Reports\Services\SmsRecordPolicy::assertReady(),'migration');
+            config(['sms-exports.response_schema_enabled'=>true]);
+            \Cmd\Reports\Services\SmsRecordPolicy::assertReady();
+            self::assertSame(['Last_SMS_Date','Contacted','Response_Date','Response_CID','Enrollment_Date','Enrollment_CID'],
+                \Cmd\Reports\Services\SmsProspectSchema::recordColumns());
+            $this->db->statement('ALTER TABLE dbo.TblProspects ALTER COLUMN Response_CID varchar(50) NULL');
+            $held(static fn()=>\Cmd\Reports\Services\SmsRecordPolicy::assertReady(),'response and enrollment schema');
+            $this->db->statement('ALTER TABLE dbo.TblProspects ALTER COLUMN Response_CID nvarchar(50) NULL');
+            config(['sms-exports.contact_attribution_enabled'=>true,'sms-exports.contact_source_system'=>'fixture.contacts',
+                'sms-exports.contact_source_contract_sha256'=>str_repeat('a',64)]);
+            $held(static fn()=>SmsContactAttribution::assertReady(),'separate Contacted_Date');
+            self::assertFalse($this->db->getSchemaBuilder()->hasColumn('TblProspects','Contacted_Date'));
+        } finally {
+            // Later tests share this fixture and expect the record-approval schema back.
+            if (! $this->db->getSchemaBuilder()->hasColumn('TblProspects', 'Contacted_Date')) {
+                $this->db->statement('ALTER TABLE dbo.TblProspects ADD Contacted_Date date NULL');
             }
         }
-        $held=static function(callable $work,string $fragment):void {
-            try{$work();self::fail('Expected schema hold.');}
-            catch(HttpException $error){self::assertSame(503,$error->getStatusCode());self::assertStringContainsString($fragment,$error->getMessage());}
-        };
-        $held(static fn()=>\Cmd\Reports\Services\SmsRecordPolicy::assertReady(),'migration');
-        config(['sms-exports.response_schema_enabled'=>true]);
-        \Cmd\Reports\Services\SmsRecordPolicy::assertReady();
-        self::assertSame(['Last_SMS_Date','Contacted','Response_Date','Response_CID','Enrollment_Date','Enrollment_CID'],
-            \Cmd\Reports\Services\SmsProspectSchema::recordColumns());
-        $this->db->statement('ALTER TABLE dbo.TblProspects ALTER COLUMN Response_CID varchar(50) NULL');
-        $held(static fn()=>\Cmd\Reports\Services\SmsRecordPolicy::assertReady(),'response and enrollment schema');
-        $this->db->statement('ALTER TABLE dbo.TblProspects ALTER COLUMN Response_CID nvarchar(50) NULL');
-        config(['sms-exports.contact_attribution_enabled'=>true,'sms-exports.contact_source_system'=>'fixture.contacts',
-            'sms-exports.contact_source_contract_sha256'=>str_repeat('a',64)]);
-        $held(static fn()=>SmsContactAttribution::assertReady(),'separate Contacted_Date');
-        self::assertFalse($this->db->getSchemaBuilder()->hasColumn('TblProspects','Contacted_Date'));
     }
 
     public function test_live_contacted_details_use_only_exact_frozen_pks_and_all_tiers_without_writes(): void
