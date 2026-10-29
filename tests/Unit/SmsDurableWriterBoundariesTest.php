@@ -58,7 +58,7 @@ final class SmsDurableWriterBoundariesTest extends TestCase
         $this->db->setTransactionManager(new DatabaseTransactionsManager);
         Facade::clearResolvedInstances();
         Facade::setFacadeApplication($app);
-        $this->db->statement('CREATE TABLE TblPhoneNumbers (Phone TEXT, Source TEXT, CID INTEGER, Data_Source TEXT, External_ID TEXT, Phone1 TEXT, Phone2 TEXT, Phone3 TEXT, Phone4 TEXT)');
+        $this->db->statement('CREATE TABLE TblPhoneNumbers (Phone TEXT, Source TEXT, CID INTEGER, Data_Source TEXT, External_ID TEXT, Data_Source_ID TEXT, Data_Source_Origin TEXT, Data_Source_Map_SHA256 TEXT, Status TEXT, Status_ID TEXT, Status_Stamp TEXT, Phone1 TEXT, Phone2 TEXT, Phone3 TEXT, Phone4 TEXT)');
         foreach (['2026_10_12_000001_create_sms_prospects_tables.php', '2026_10_19_000001_complete_sms_workflow.php',
             '2026_10_19_000002_create_sms_enrichment_tables.php',
             '2026_10_27_000001_add_sms_state_holds.php'] as $file) {

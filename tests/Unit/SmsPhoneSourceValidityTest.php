@@ -50,9 +50,12 @@ final class SmsPhoneSourceValidityTest extends TestCase
             ['PHONE' => '', 'ID' => null, 'CREATED_DATE' => null],
         ]);
         self::assertSame([
-            ['phone' => '2025550199', 'cid' => '12345678901234567890123456789012345678', 'created' => '2024-02-29', 'data_source' => null, 'external_id' => null, 'slot'=>0],
-            ['phone' => '0000000001', 'cid' => '000123', 'created' => '0001-01-01', 'data_source' => null, 'external_id' => null, 'slot'=>0],
-            ['phone' => '2025550199', 'cid' => '123', 'created' => '9999-12-31', 'data_source' => null, 'external_id' => null, 'slot'=>0],
+            ['phone' => '2025550199', 'cid' => '12345678901234567890123456789012345678', 'created' => '2024-02-29', 'data_source' => null, 'external_id' => null,
+                'data_source_id'=>null,'data_source_origin'=>null,'data_source_map_sha256'=>null,'status'=>null,'status_id'=>null,'status_stamp'=>null,'slot'=>0],
+            ['phone' => '0000000001', 'cid' => '000123', 'created' => '0001-01-01', 'data_source' => null, 'external_id' => null,
+                'data_source_id'=>null,'data_source_origin'=>null,'data_source_map_sha256'=>null,'status'=>null,'status_id'=>null,'status_stamp'=>null,'slot'=>0],
+            ['phone' => '2025550199', 'cid' => '123', 'created' => '9999-12-31', 'data_source' => null, 'external_id' => null,
+                'data_source_id'=>null,'data_source_origin'=>null,'data_source_map_sha256'=>null,'status'=>null,'status_id'=>null,'status_stamp'=>null,'slot'=>0],
         ], $rows);
     }
 }

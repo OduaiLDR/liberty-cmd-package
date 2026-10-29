@@ -868,6 +868,12 @@ test('failed phone sync preserves the previous suppression snapshot', function (
         $table->date('Created_Date')->nullable();
         $table->string('Data_Source', 50)->nullable();
         $table->string('External_ID', 256)->nullable();
+        $table->string('Data_Source_ID', 50)->nullable();
+        $table->string('Data_Source_Origin', 20)->nullable();
+        $table->char('Data_Source_Map_SHA256', 64)->nullable();
+        $table->string('Status', 256)->nullable();
+        $table->string('Status_ID', 50)->nullable();
+        $table->string('Status_Stamp', 64)->nullable();
         foreach(range(1,4) as $slot) $table->string('Phone'.$slot,50)->nullable();
     });
     $this->db->table('TblPhoneNumbers')->insert(['Phone' => '2025550101', 'Source' => 'DP_LT']);
@@ -896,6 +902,12 @@ test('successful phone sync atomically replaces only its own source', function (
         $table->date('Created_Date')->nullable();
         $table->string('Data_Source', 50)->nullable();
         $table->string('External_ID', 256)->nullable();
+        $table->string('Data_Source_ID', 50)->nullable();
+        $table->string('Data_Source_Origin', 20)->nullable();
+        $table->char('Data_Source_Map_SHA256', 64)->nullable();
+        $table->string('Status', 256)->nullable();
+        $table->string('Status_ID', 50)->nullable();
+        $table->string('Status_Stamp', 64)->nullable();
         foreach(range(1,4) as $slot) $table->string('Phone'.$slot,50)->nullable();
     });
     $this->db->table('TblPhoneNumbers')->insert([
@@ -926,6 +938,12 @@ test('phone sync rejects invalid staged creation dates and rolls back the whole 
         $table->date('Created_Date')->nullable();
         $table->string('Data_Source', 50)->nullable();
         $table->string('External_ID', 256)->nullable();
+        $table->string('Data_Source_ID', 50)->nullable();
+        $table->string('Data_Source_Origin', 20)->nullable();
+        $table->char('Data_Source_Map_SHA256', 64)->nullable();
+        $table->string('Status', 256)->nullable();
+        $table->string('Status_ID', 50)->nullable();
+        $table->string('Status_Stamp', 64)->nullable();
         foreach(range(1,4) as $slot) $table->string('Phone'.$slot,50)->nullable();
     });
     $pdo = $this->db->getPdo();
