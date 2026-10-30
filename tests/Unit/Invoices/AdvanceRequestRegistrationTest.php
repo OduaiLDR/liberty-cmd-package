@@ -82,7 +82,10 @@ final class AdvanceRequestRegistrationTest extends TestCase
         $source = file_get_contents(dirname(__DIR__, 3) . '/src/Console/Commands/GenerateAdvanceRequest.php');
         self::assertStringContainsString('if (! $isDryRun && ! $sendToMe) {', $source);
         self::assertSame(1, preg_match_all("/\\\$invoice\\['invoice_number'\\] = \\\$registeredNumber;/", $source), 'the only invoice field the registry sets');
-        self::assertStringContainsString("'issue_date' => now()->format('F j, Y')", $source, 'printed issue date is unchanged');
+        $defaultInvoice = (new ReflectionMethod(GenerateAdvanceRequest::class, 'buildInvoiceData'))->invoke(
+            new GenerateAdvanceRequest(), 'LDR', 656000.0, '53', ['label' => 'September 2026', 'start' => '2026-09-01']
+        );
+        self::assertSame(now()->format('F j, Y'), $defaultInvoice['issue_date'], 'the default issue date remains today');
         self::assertSame(2, substr_count($source, "(string) \$invoice['issue_date']"), 'reserve and record both use the printed date, never run time');
         // The PDF builder output only depends on the invoice array: same data in, same bytes out.
         $builder = new AdvanceRequestInvoiceBuilder();
