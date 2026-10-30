@@ -13,6 +13,7 @@ use Illuminate\Console\OutputStyle;
 use Illuminate\Container\Container;
 use Illuminate\Support\Facades\Facade;
 use PhpOffice\PhpSpreadsheet\IOFactory;
+use PhpOffice\PhpSpreadsheet\Shared\Date as ExcelDate;
 use PhpOffice\PhpSpreadsheet\Worksheet\Worksheet;
 use PHPUnit\Framework\TestCase;
 use ReflectionProperty;
@@ -93,8 +94,8 @@ final class ReportPrivateDeliveryTest extends TestCase
         );
         self::assertSame('000123', $detail->getCell('A4')->getValue());
         self::assertSame('Fixture Client', $detail->getCell('B4')->getValue());
-        self::assertSame('2026-09-07', $detail->getCell('D4')->getValue());
-        self::assertSame('2026-09-09', $detail->getCell('E4')->getValue());
+        self::assertEquals(ExcelDate::PHPToExcel(new \DateTimeImmutable('2026-09-07')), $detail->getCell('D4')->getValue());
+        self::assertEquals(ExcelDate::PHPToExcel(new \DateTimeImmutable('2026-09-09')), $detail->getCell('E4')->getValue());
         $detailTotal = $detail->getCell('C4')->getValue() + $detail->getCell('C5')->getValue();
         $summaryRows = (new ReflectionProperty(GenerateEnrollmentSummaryReport::class, 'rows'))->getValue($command);
         $summaryRow = array_values(array_filter($summaryRows, fn ($row) => $row['label'] === 'Sellable Debt Paying in September'))[0];

@@ -127,7 +127,7 @@ class Formatter
     private const PEEL_OFF_COMPANIES = [PeelOffsBuilder::COMPANY_PROGRESS_LAW, PeelOffsBuilder::COMPANY_LDR];
 
     /**
-     * Builds the combined workbook: Enrollment Summary, Peel Offs, Tranche Summary, Capital Report.
+     * Builds Enrollment Summary, hidden Sellable Debt detail, Peel Offs, Tranche Summary, Capital Report.
      *
      * @param array<int, array<string, mixed>> $enrollmentRows Ordered row definitions from the command.
      * @param string[] $columnKeys e.g. ['Total', 'LDR', 'Legal']
@@ -160,6 +160,10 @@ class Formatter
 
         $this->buildEnrollmentSummarySheet($spreadsheet, $enrollmentRows, $columnKeys, $reportDate);
 
+        if ($sellableDebtPayingRows !== null) {
+            $this->buildSellableDebtPayingSheet($spreadsheet, $sellableDebtPayingRows, $sellableDebtPayingMonth);
+        }
+
         if ($peelOffs !== null) {
             $this->buildPeelOffsSheet($spreadsheet, $peelOffs, $reportDate);
         }
@@ -170,10 +174,6 @@ class Formatter
 
         if ($capitalReport !== null) {
             $this->buildCapitalReportSheet($spreadsheet, $capitalReport['rows'], $capitalReport['totals'], $monthlyResiduals);
-        }
-
-        if ($sellableDebtPayingRows !== null) {
-            $this->buildSellableDebtPayingSheet($spreadsheet, $sellableDebtPayingRows, $sellableDebtPayingMonth);
         }
 
         $spreadsheet->setActiveSheetIndex(0);
@@ -268,6 +268,7 @@ class Formatter
         $sheet->getStyle("A3:{$lastColLetter}3")->applyFromArray([
             'font' => ['bold' => true],
             'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER],
+            'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['argb' => 'FF8EA9DB']],
         ]);
 
         $rowIndex = 4;
@@ -351,24 +352,37 @@ class Formatter
         $sheet->getStyle('A3:E3')->applyFromArray([
             'font' => ['bold' => true],
             'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER],
+            'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['argb' => 'FF8EA9DB']],
         ]);
+
+        usort($rows, static fn (array $left, array $right): int =>
+            strcasecmp((string) ($left['Name'] ?? ''), (string) ($right['Name'] ?? ''))
+            ?: strcmp((string) ($left['LLG_ID'] ?? ''), (string) ($right['LLG_ID'] ?? ''))
+        );
 
         $rowIndex = 4;
         foreach ($rows as $row) {
             $sheet->setCellValueExplicit("A{$rowIndex}", (string) ($row['LLG_ID'] ?? ''), DataType::TYPE_STRING);
             $sheet->setCellValue("B{$rowIndex}", (string) ($row['Name'] ?? ''));
             $sheet->setCellValue("C{$rowIndex}", (float) ($row['Debt_Amount'] ?? 0));
-            $sheet->setCellValue("D{$rowIndex}", (string) ($row['First_Payment_Date'] ?? ''));
-            $sheet->setCellValue("E{$rowIndex}", (string) ($row['First_Payment_Cleared_Date'] ?? ''));
+            foreach (['D' => 'First_Payment_Date', 'E' => 'First_Payment_Cleared_Date'] as $column => $key) {
+                $value = $row[$key] ?? null;
+                if ($value !== null && $value !== '') {
+                    $sheet->setCellValue("{$column}{$rowIndex}", ExcelDate::PHPToExcel(new \DateTimeImmutable((string) $value)));
+                }
+            }
             $rowIndex++;
         }
         if ($rowIndex > 4) {
             $sheet->getStyle('C4:C' . ($rowIndex - 1))->getNumberFormat()->setFormatCode('$#,##0.00');
+            $sheet->getStyle('D4:E' . ($rowIndex - 1))->getNumberFormat()->setFormatCode('m/d/yyyy');
             $sheet->getStyle('A3:E' . ($rowIndex - 1))->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
         }
 
         $sheet->getStyle('A1:E' . max(3, $rowIndex - 1))->getFont()->setName('Calibri')->setSize(9);
         $sheet->setSheetState(Worksheet::SHEETSTATE_HIDDEN);
+        $sheet->freezePane('A4');
+        $sheet->setSelectedCells('A4');
     }
 
     /**
