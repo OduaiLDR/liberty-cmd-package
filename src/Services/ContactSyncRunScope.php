@@ -47,7 +47,8 @@ final class ContactSyncRunScope
         if (!is_array($result) || !in_array($source, ['LT', 'LDR', 'PLAW'], true)
             || ($result['source'] ?? null) !== $source || ($result['complete'] ?? null) !== true
             || !is_array($result['excluded_ids'] ?? null) || !is_array($result['campaigns'] ?? null)
-            || !is_array($result['campaign_hold_ids'] ?? null)
+            || !is_array($result['campaign_hold_ids'] ?? null) || !is_array($result['retry_ids'] ?? null)
+            || !is_bool($result['retry_complete'] ?? null)
             || !is_array($result['enrollment_changes']['categories'] ?? null)
             || !is_array($result['enrollment_changes']['affiliates'] ?? null)
             || !is_string($result['started_at'] ?? null)
@@ -56,6 +57,7 @@ final class ContactSyncRunScope
         }
         foreach ($result['excluded_ids'] as $id) self::validateId($id);
         foreach ($result['campaign_hold_ids'] as $id) self::validateId($id);
+        foreach ($result['retry_ids'] as $id) self::validateId($id);
         foreach (['categories' => 'category', 'affiliates' => 'agent'] as $kind => $field) {
             foreach ($result['enrollment_changes'][$kind] as $change) {
                 self::validateId($change['llg_id'] ?? null);

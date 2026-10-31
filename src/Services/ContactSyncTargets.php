@@ -12,6 +12,9 @@ final class ContactSyncTargets
         'created_by', 'agent', 'client', 'phone', 'email', 'address_1', 'address_2', 'city', 'state', 'zip',
         'stage', 'status', 'debt_amount', 'debt_enrolled', 'credit_score', 'credit_utilization', 'category', 'affiliate_agent'];
 
+    /** Accepted rows whose campaign attribution stays held for review. */
+    public const ATTRIBUTION_HOLD_CODES = ['campaign_attribution_preserved', 'campaign_attribution_withheld'];
+
     public static function table(string $source): string
     {
         return match ($source) {
@@ -127,7 +130,7 @@ final class ContactSyncTargets
             $held = [];
             foreach ($plan as $change) {
                 foreach ($change['warnings'] ?? [] as $warning) {
-                    if ($warning['code'] === 'campaign_attribution_preserved') {
+                    if (in_array($warning['code'], self::ATTRIBUTION_HOLD_CODES, true)) {
                         array_push($held, ...($warning['related_ids'] ?? [$change['incoming_id']]));
                     }
                 }
@@ -311,6 +314,7 @@ final class ContactSyncTargets
                         && (string) $campaignLinks[0]['campaign'] === (string) $before['campaign']));
                 $campaign = ContactSyncCampaign::plan($row, $before, $proof, $campaignLinks, $preserveUnverified);
                 $preserveAttribution = $campaign['preserve_attribution'] ?? false;
+                $withholdAttribution = $campaign['withhold_attribution'] ?? false;
                 $attributionReview = $campaign['review_reason'] ?? null;
                 $attributionIds = array_merge([$id, $target], array_column($campaignLinks, 'llg_id'));
                 if ($source !== 'LT' && ContactSyncIdentity::validNativeId((string) $row['external_id'])) {
@@ -353,7 +357,9 @@ final class ContactSyncTargets
                 }
                 if ($attributionReview !== null && $campaign['reason'] === null) {
                     if ($before === null) {
-                        $campaign['reason'] = $attributionReview;
+                        // Attribution doubt never keeps a new person out of the contact tables.
+                        $withholdAttribution = true;
+                        $campaign['value'] = '';
                     } else {
                         $preserveAttribution = true;
                         $campaign['value'] = $before['campaign'];
@@ -414,6 +420,11 @@ final class ContactSyncTargets
                         'message' => 'Existing campaign and external ID preserved; ordinary updates allowed. ' . $attributionReview,
                         'related_ids' => array_values(array_unique($attributionIds))];
                 }
+                if ($withholdAttribution) {
+                    $warnings[] = ['code' => 'campaign_attribution_withheld', 'source' => $source, 'id' => $id,
+                        'message' => 'New contact accepted with a blank campaign; attribution needs review. ' . $attributionReview,
+                        'related_ids' => array_values(array_unique($attributionIds))];
+                }
                 $changes = [];
                 foreach ($after as $field => $value) {
                     $old = $before[$field] ?? null;
@@ -422,7 +433,7 @@ final class ContactSyncTargets
                     }
                 }
                 $plan[] = ['incoming_id' => $id, 'target_id' => $target, 'before' => $before, 'after' => $after, 'changes' => $changes];
-                if (($proof['status'] ?? '') === 'verified' && !$preserveAttribution) {
+                if (($proof['status'] ?? '') === 'verified' && !$preserveAttribution && !$withholdAttribution) {
                     $plan[array_key_last($plan)]['campaign_proof'] = $proof;
                     // The LT main row can still use its native ID until final matching remaps it.
                     $plan[array_key_last($plan)]['campaign_proof_ids'] = array_values(array_unique(array_merge(
