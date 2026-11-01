@@ -24,6 +24,21 @@ final class ApprovalProcessorTest extends TestCase
         return [new ApprovalProcessor($crm, $ledger, $mail), $crm, $ledger, $mail];
     }
 
+    public function test_lease_cleanup_failure_never_hides_the_original_processing_failure(): void
+    {
+        [$flow, $crm, $ledger] = $this->setupFlow();
+        $crm->fail = 'before_status';
+        $ledger->releaseError = new RuntimeException('cleanup failed');
+        try {
+            $flow->process($this->email(), 'body');
+            self::fail('Expected original processing failure.');
+        } catch (RuntimeException $e) {
+            self::assertSame('timeout', $e->getMessage());
+        }
+        self::assertSame(1, $ledger->releases);
+        self::assertSame('status_attempting', $ledger->rows[$this->email()->key()]['stage']);
+    }
+
     public function test_vba_payment_type_rules_for_both_companies_and_exact_note(): void
     {
         foreach (['LDR', 'PLAW'] as $company) {
@@ -249,13 +264,18 @@ final class FakeApprovalLedger implements ApprovalLedger
     public array $rows = [];
     public int $releases = 0;
     public bool $busy = false;
+    public ?\Throwable $releaseError = null;
     public function claim(ApprovalEmail $email): ?array
     {
         if ($this->busy) return null;
         return $this->rows[$email->key()] ??= ['stage' => 'ready'];
     }
     public function save(ApprovalEmail $email, array $changes): void { $this->rows[$email->key()] = array_replace($this->rows[$email->key()], $changes); }
-    public function release(ApprovalEmail $email): void { $this->releases++; }
+    public function release(ApprovalEmail $email): void
+    {
+        $this->releases++;
+        if ($this->releaseError !== null) throw $this->releaseError;
+    }
 }
 
 final class FakeApprovalMail implements ApprovalNotifier

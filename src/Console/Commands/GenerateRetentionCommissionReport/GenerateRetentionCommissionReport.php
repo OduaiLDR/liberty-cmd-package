@@ -360,16 +360,18 @@ class GenerateRetentionCommissionReport extends Command
             $archiveContext = PayrollReportArtifactArchive::captureRequested()
                 ? (new GenerateRetentionManagerCommission)->buildPayrollRetentionContext($rows) : [];
             if (PayrollReportArtifactArchive::captureRequested()) $archiveContext['commissionResults'] = PayrollCommissionResultSnapshot::component('retention', $source, $startDate, 'commission', $retResults);
-            $persisted = CommissionResultsWriter::replaceComponent($sql, 'retention', $source, $startDate, 'Commission', $retResults);
-            if ($notice = CommissionResultsWriter::failureNotice($persisted, $display)) {
-                $this->warn($notice);
-            }
-            RetentionCommissionTierStore::persist(
-                $sql,
-                $source,
-                $startDate,
-                RetentionCommissionTierStore::rowsFromSummary($this->lastSummaryRows)
-            );
+            $snapshotPath = $this->persistWithSnapshot($file, $display, $startDate, function () use ($sql, $source, $startDate, $retResults, $display): void {
+                $persisted = CommissionResultsWriter::replaceComponent($sql, 'retention', $source, $startDate, 'Commission', $retResults);
+                if ($notice = CommissionResultsWriter::failureNotice($persisted, $display)) {
+                    $this->warn($notice);
+                }
+                RetentionCommissionTierStore::persist(
+                    $sql,
+                    $source,
+                    $startDate,
+                    RetentionCommissionTierStore::rowsFromSummary($this->lastSummaryRows)
+                );
+            });
 
             if ($file) {
                 $this->info("[INFO] [$display] Workbook built: {$file['filename']}");
@@ -390,7 +392,6 @@ class GenerateRetentionCommissionReport extends Command
                 // statement, so this was a second, competing delivery path.
                 $files = [$file];
 
-                $snapshotPath = $this->saveSnapshotCopy($file, $display, $startDate);
                 $this->info("[INFO] [$display] Snapshot saved: {$snapshotPath}");
                 PayrollReportArtifactArchive::captureFromEnvironment('retention', $source, $startDate, $file, $archiveContext);
                 $this->cleanupOldSnapshots($startDate);
@@ -1254,6 +1255,27 @@ class GenerateRetentionCommissionReport extends Command
 
     private function saveSnapshotCopy(array $file, string $display, string $startDate): string
     {
+        return $this->persistWithSnapshot($file, $display, $startDate, static function (): void {});
+    }
+
+    /** Stage and verify before persistence; publish atomically before any delivery. */
+    private function persistWithSnapshot(array $file, string $display, string $startDate, callable $persist): string
+    {
+        [$staged, $dest] = $this->stageSnapshotCopy($file, $display, $startDate);
+        try {
+            $persist();
+            if (!@rename($staged, $dest)) {
+                throw new \RuntimeException('Retention commission results were saved, but the manager snapshot could not be published. No email was sent. Reconcile and rerun this source/period: ' . $dest);
+            }
+            return $dest;
+        } finally {
+            if (is_file($staged)) @unlink($staged);
+        }
+    }
+
+    /** @return array{0:string,1:string} */
+    private function stageSnapshotCopy(array $file, string $display, string $startDate): array
+    {
         if (!isset($file['path'], $file['filename']) || !is_file((string) $file['path'])) {
             throw new \RuntimeException('Cannot save retention commission snapshot because workbook file is missing.');
         }
@@ -1262,8 +1284,8 @@ class GenerateRetentionCommissionReport extends Command
         $period = date('m-Y', strtotime($startDate));
         $source = strtoupper($display) === 'PROGRESS LAW' ? 'Progress Law' : 'LDR';
         $dir = storage_path("app/commission-snapshots/{$month}/retention");
-        if (!is_dir($dir)) {
-            mkdir($dir, 0775, true);
+        if (!is_dir($dir) && !@mkdir($dir, 0775, true) && !is_dir($dir)) {
+            throw new \RuntimeException('Cannot create retention commission snapshot directory: ' . $dir);
         }
 
         // Stable name so retention-manager-commission can find the All workbook.
@@ -1274,9 +1296,26 @@ class GenerateRetentionCommissionReport extends Command
             ? "Retention Commission Report - {$source} - {$period}.xlsx"
             : $filename;
         $dest = $dir . DIRECTORY_SEPARATOR . $destName;
-        copy((string) $file['path'], $dest); // overwrite same month/source if rerun
+        $staged = $dir . DIRECTORY_SEPARATOR . '.retention-' . bin2hex(random_bytes(12)) . '.tmp';
+        try {
+            if (!$this->copySnapshotFile((string) $file['path'], $staged)) {
+                throw new \RuntimeException('Cannot copy retention commission workbook to its staged snapshot: ' . $dest);
+            }
+            $sourceHash = @hash_file('sha256', (string) $file['path']);
+            $snapshotHash = @hash_file('sha256', $staged);
+            if ($sourceHash === false || $snapshotHash === false || !hash_equals($sourceHash, $snapshotHash)) {
+                throw new \RuntimeException('Retention commission snapshot verification failed; prior snapshot was preserved.');
+            }
+            return [$staged, $dest];
+        } catch (\Throwable $error) {
+            if (is_file($staged)) @unlink($staged);
+            throw $error;
+        }
+    }
 
-        return $dest;
+    protected function copySnapshotFile(string $source, string $destination): bool
+    {
+        return @copy($source, $destination);
     }
 
     private function cleanupOldSnapshots(string $currentStartDate): void

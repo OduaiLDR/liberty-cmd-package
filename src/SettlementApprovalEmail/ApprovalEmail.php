@@ -4,8 +4,6 @@ declare(strict_types=1);
 
 namespace Cmd\Reports\SettlementApprovalEmail;
 
-use InvalidArgumentException;
-
 /** The legacy email contract; intentionally independent of the portal's date-based API. */
 final readonly class ApprovalEmail
 {
@@ -33,16 +31,17 @@ final readonly class ApprovalEmail
     public static function parse(string $body, string $sender, string $subject, string $messageId = ''): self
     {
         $company = self::company($sender, $subject);
-        if ($company === null) throw new InvalidArgumentException('Not a recognized settlement approval email.');
+        if ($company === null) throw new ApprovalEmailRejected('unrecognized_email');
         $fields = [];
         $labels = ['Settlement Approval For Customer Id', 'Creditor Name', 'Settlement ID', 'Last 4 Account Number'];
+        $names = array_combine($labels, ['customer_id', 'creditor', 'settlement_id', 'last_four']);
         foreach (preg_split('/\r\n|\r|\n/', $body) as $line) {
             $parts = explode(':', $line, 2);
             $label = trim($parts[0]);
             if (!in_array($label, $labels, true)) continue;
             $value = trim($parts[1] ?? '');
             if (isset($fields[$label]) && $fields[$label] !== $value) {
-                throw new InvalidArgumentException('Conflicting settlement approval fields.');
+                throw new ApprovalEmailRejected('conflicting_fields', [$names[$label] => 'conflicting']);
             }
             $fields[$label] = $value;
         }
@@ -50,10 +49,13 @@ final readonly class ApprovalEmail
         $settlement = $fields[$labels[2]] ?? '';
         $creditor = $fields[$labels[1]] ?? '';
         $lastFour = $fields[$labels[3]] ?? '';
-        if (!preg_match('/^[1-9][0-9]*$/D', $contact) || !preg_match('/^[1-9][0-9]*$/D', $settlement)
-            || $creditor === '' || !preg_match('/^[0-9]{4}$/D', $lastFour)) {
-            throw new InvalidArgumentException('Approval email requires numeric customer/settlement IDs, creditor and four account digits.');
+        $issues = [];
+        foreach (['customer_id' => [$contact, '/^[1-9][0-9]*$/D'], 'settlement_id' => [$settlement, '/^[1-9][0-9]*$/D'],
+            'creditor' => [$creditor, null], 'last_four' => [$lastFour, '/^[0-9]{4}$/D']] as $name => [$value, $pattern]) {
+            if ($value === '') $issues[$name] = 'missing';
+            elseif ($pattern !== null && !preg_match($pattern, $value)) $issues[$name] = 'invalid';
         }
+        if ($issues !== []) throw new ApprovalEmailRejected('invalid_fields', $issues);
         return new self($company, $contact, $settlement, $creditor, $lastFour, $messageId);
     }
 

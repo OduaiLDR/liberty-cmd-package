@@ -23,7 +23,12 @@ rules, or the separate outbound `ProcessSettlementAuthorization` routine.
 
 The replacement reads the current offer from Forth instead of waiting for its Snowflake mirror.
 It additionally validates the offer ID and customer association. Missing offers remain retryable.
-Malformed emails and conflicting approval identities are left in Inbox and fail the run visibly.
+Malformed emails (including conflicting fields within an email) are counted as `rejected`, logged
+as warnings and left in Inbox without failing the run. Missing offers and messages leased by
+another worker are deferred without failing the run. These outcomes do not approve the settlement.
+Execution errors (including timeouts, API/database failures and processing configuration problems)
+and uncertain processing outcomes requiring manual review still fail the run. Conflicting approval
+identities discovered during processing remain errors.
 Unrelated messages are untouched; the broader VBA reader's cleanup of unrelated mail is not migrated.
 No date-based acceptance rule is introduced. The VBA's unreachable Offer Expired notification is not reproduced.
 
