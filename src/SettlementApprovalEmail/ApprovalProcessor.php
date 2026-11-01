@@ -45,6 +45,7 @@ final class ApprovalProcessor
             $log?->event('ledger_busy', ['reason' => 'another_worker_holds_lease'], 'warning');
             return 'busy';
         }
+        $processingError = null;
         try {
             $stage = $state['stage'];
             $knownStages = ['ready', 'status_attempting', 'status_updated', 'note_attempting', 'notification_ready', 'mail_attempting', 'completed', 'skipped', 'needs_review'];
@@ -139,8 +140,17 @@ final class ApprovalProcessor
                 return $result;
             }
             throw new RuntimeException('Unrecognized settlement approval processing stage.');
+        } catch (\Throwable $e) {
+            $processingError = $e;
+            throw $e;
         } finally {
-            $this->ledger->release($email);
+            try {
+                $this->ledger->release($email);
+            } catch (\Throwable $cleanupError) {
+                $log?->failure($cleanupError, 'ledger_release_failed', 'ledger_release_started');
+                // A cleanup failure is still fatal, but must never mask an earlier processing error.
+                if ($processingError === null) throw $cleanupError;
+            }
         }
     }
 

@@ -93,8 +93,9 @@ final class ForthApprovalGateway implements ApprovalGateway
         if ($payload !== null) $options['json'] = $payload;
         try {
             $response = $this->http->request($method, 'https://api.forthcrm.com/v1' . $path, $options);
-        } catch (\Throwable) {
-            throw new RuntimeException('Forth request failed; mutation outcomes require reconciliation before retry.');
+        } catch (\Throwable $e) {
+            // Preserve typed transport diagnostics without copying raw provider details to run logs.
+            throw new RuntimeException('Forth request failed; mutation outcomes require reconciliation before retry.', 0, $e);
         }
         $httpStatus = $response->getStatusCode();
         if ($allowMissing && $httpStatus === 404) return null;

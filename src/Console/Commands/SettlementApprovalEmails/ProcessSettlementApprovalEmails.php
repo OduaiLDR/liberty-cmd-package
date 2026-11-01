@@ -8,6 +8,7 @@ use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\EmailSenderService;
 use Cmd\Reports\Services\GraphMailboxClient;
 use Cmd\Reports\SettlementApprovalEmail\ApprovalEmail;
+use Cmd\Reports\SettlementApprovalEmail\ApprovalEmailRejected;
 use Cmd\Reports\SettlementApprovalEmail\ApprovalProcessor;
 use Cmd\Reports\SettlementApprovalEmail\ApprovalRunLog;
 use Cmd\Reports\SettlementApprovalEmail\DatabaseApprovalLedger;
@@ -51,7 +52,7 @@ class ProcessSettlementApprovalEmails extends Command
         $counts = array_fill_keys([
             'pages', 'scanned', 'selected', 'filtered', 'would_approve', 'would_skip',
             'completed', 'skipped', 'retry_offer_missing', 'busy', 'needs_review',
-            'errors', 'archived', 'kept_in_inbox',
+            'rejected', 'errors', 'archived', 'kept_in_inbox',
         ], 0);
         $exitCode = Command::FAILURE;
         $stopReason = 'exhausted';
@@ -79,14 +80,21 @@ class ProcessSettlementApprovalEmails extends Command
             if ($file !== '') {
                 $stopReason = 'file_preview';
                 $log->event('file_read_started');
-                $email = ApprovalEmail::parse($this->readFile($file), (string) $this->option('sender'), ApprovalEmail::SUBJECT_PREFIX);
+                $body = $this->readFile($file);
+                $counts['selected']++;
+                $log->event('message_parse_started');
+                try {
+                    $email = ApprovalEmail::parse($body, (string) $this->option('sender'), ApprovalEmail::SUBJECT_PREFIX);
+                } catch (ApprovalEmailRejected $e) {
+                    $this->reject($e, $log, $counts, false);
+                    return $exitCode = Command::SUCCESS;
+                }
                 if ($company !== 'all' && strtolower($email->company) !== $company) throw new RuntimeException('File sender does not match --company.');
                 $log->message(company: $email->company, settlementId: $email->settlementId);
-                $counts['selected']++;
                 $log->event('processor_initializing');
                 $processor = $this->processor(false);
                 $result = $processor->preview($email, $log);
-                $counts[$result['outcome']]++;
+                $this->countOutcome($counts, $result['outcome'] ?? null, false);
                 $this->report($email, $result);
                 $log->event('message_result', $result);
                 return $exitCode = Command::SUCCESS;
@@ -99,6 +107,7 @@ class ProcessSettlementApprovalEmails extends Command
             $processor = null;
             $next = null;
             $seen = [];
+            $seenMessages = [];
             $count = 0;
             $scanned = 0;
             $failed = false;
@@ -106,12 +115,18 @@ class ProcessSettlementApprovalEmails extends Command
                 $log->message();
                 $log->event('inbox_page_requested', ['page' => $counts['pages'] + 1]);
                 $page = $mail->approvalInboxPage(self::MAILBOX, ApprovalEmail::SUBJECT_PREFIX, $next);
+                if (!isset($page['messages']) || !is_array($page['messages']) || !array_is_list($page['messages'])
+                    || !array_key_exists('next', $page)
+                    || ($page['next'] !== null && (!is_string($page['next']) || $page['next'] === ''))) {
+                    throw new RuntimeException('Invalid approval Inbox page response.');
+                }
                 $counts['pages']++;
                 $log->event('inbox_page_received', [
                     'page' => $counts['pages'], 'message_count' => count($page['messages']),
                     'has_next_page' => $page['next'] !== null,
                 ]);
                 foreach ($page['messages'] as $message) {
+                    if (!is_array($message)) throw new RuntimeException('Invalid approval Inbox message response.');
                     $counts['scanned']++;
                     if (++$scanned > 10000) throw new RuntimeException('Inbox scan bound reached; narrow the company/message selection.');
                     $id = (string) ($message['id'] ?? '');
@@ -126,6 +141,11 @@ class ProcessSettlementApprovalEmails extends Command
                         continue;
                     }
                     if ($id === '') throw new RuntimeException('Graph returned an empty approval message ID.');
+                    if (isset($seenMessages[$id])) {
+                        $counts['filtered']++;
+                        $log->event('message_filtered', ['reason' => 'duplicate_message']);
+                        continue;
+                    }
                     if (++$count > $limit) {
                         $stopReason = 'limit';
                         $log->event('run_limit_reached', ['limit' => $limit]);
@@ -133,12 +153,18 @@ class ProcessSettlementApprovalEmails extends Command
                         break 2;
                     }
                     $counts['selected']++;
+                    $seenMessages[$id] = true;
                     try {
                         $log->event('message_fetch_started');
                         $full = $mail->approvalMessage(self::MAILBOX, $id);
                         $log->event('message_parse_started');
                         $body = $this->body($full);
-                        $email = ApprovalEmail::parse($body, $this->sender($full), (string) ($full['subject'] ?? ''), (string) ($full['internetMessageId'] ?? $id));
+                        try {
+                            $email = ApprovalEmail::parse($body, $this->sender($full), (string) ($full['subject'] ?? ''), (string) ($full['internetMessageId'] ?? $id));
+                        } catch (ApprovalEmailRejected $e) {
+                            $this->reject($e, $log, $counts, true);
+                            continue;
+                        }
                         if ($email->company !== $route) throw new RuntimeException('Message routing changed during processing.');
                         $log->message($id, $email->company, $email->settlementId);
                         $log->event('message_validated');
@@ -148,7 +174,7 @@ class ProcessSettlementApprovalEmails extends Command
                         }
                         if (!$live) {
                             $result = $processor->preview($email, $log);
-                            $counts[$result['outcome']]++;
+                            $this->countOutcome($counts, $result['outcome'] ?? null, false);
                             $counts['kept_in_inbox']++;
                             $this->report($email, $result);
                             $log->event('message_result', $result);
@@ -156,11 +182,11 @@ class ProcessSettlementApprovalEmails extends Command
                             continue;
                         }
                         $outcome = $processor->process($email, $body, $log);
-                        $counts[$outcome]++;
+                        $this->countOutcome($counts, $outcome, true);
                         $this->report($email, ['outcome' => $outcome]);
                         $log->event('message_result', ['outcome' => $outcome]);
                         if (!in_array($outcome, ['completed', 'skipped'], true)) {
-                            $failed = true;
+                            if (!in_array($outcome, ['retry_offer_missing', 'busy'], true)) $failed = true;
                             $counts['kept_in_inbox']++;
                             $log->event('message_kept_in_inbox', ['reason' => $outcome], 'warning');
                             continue;
@@ -200,14 +226,16 @@ class ProcessSettlementApprovalEmails extends Command
             $this->error($log->failure($e, 'run_failed'));
             return $exitCode;
         } finally {
+            $result = $exitCode !== Command::SUCCESS ? 'failed'
+                : (($counts['rejected'] + $counts['retry_offer_missing'] + $counts['busy']) > 0 ? 'completed_with_warnings' : 'completed');
             $log->message();
             $log->event('run_finished', [
-                'exit_code' => $exitCode, 'stop_reason' => $stopReason, 'counts' => $counts,
-            ], $exitCode === Command::SUCCESS ? 'info' : 'warning');
+                'exit_code' => $exitCode, 'stop_reason' => $stopReason, 'result' => $result, 'counts' => $counts,
+            ], $result === 'completed' ? 'info' : 'warning');
             $summary = [];
             foreach ($counts as $name => $value) $summary[] = $name . '=' . $value;
             $this->line('Summary: ' . implode(' ', $summary) . ' stop=' . $stopReason
-                . ' exit_code=' . $exitCode . ' elapsed_ms=' . $log->elapsedMs());
+                . ' exit_code=' . $exitCode . ' elapsed_ms=' . $log->elapsedMs() . ' result=' . $result);
         }
     }
 
@@ -254,12 +282,30 @@ class ProcessSettlementApprovalEmails extends Command
 
     private function body(array $message): string
     {
-        $body = (string) ($message['body']['content'] ?? '');
+        if (!isset($message['body']['content']) || !is_string($message['body']['content'])) {
+            throw new RuntimeException('Approval email body is missing.');
+        }
+        $body = $message['body']['content'];
         if (strtolower((string) ($message['body']['contentType'] ?? '')) === 'html') {
             $body = preg_replace('/<\s*(?:br\b[^>]*|\/p\s*|\/div\s*)>/i', "\n", $body);
             $body = html_entity_decode(strip_tags($body), ENT_QUOTES | ENT_HTML5, 'UTF-8');
         }
         return $body;
+    }
+
+    private function reject(ApprovalEmailRejected $error, ApprovalRunLog $log, array &$counts, bool $inInbox): void
+    {
+        $counts['rejected']++;
+        if ($inInbox) $counts['kept_in_inbox']++;
+        $this->warn('Approval email rejected' . ($inInbox ? '; left in Inbox: ' : ': ') . $log->rejection($error));
+    }
+
+    private function countOutcome(array &$counts, mixed $outcome, bool $live): void
+    {
+        $allowed = $live ? ['completed', 'skipped', 'retry_offer_missing', 'busy', 'needs_review']
+            : ['would_approve', 'would_skip', 'retry_offer_missing'];
+        if (!in_array($outcome, $allowed, true)) throw new RuntimeException('Unrecognized settlement approval processing outcome.');
+        $counts[$outcome]++;
     }
 
     private function readFile(string $path): string
@@ -277,6 +323,10 @@ class ProcessSettlementApprovalEmails extends Command
             $details .= ' (current_status=' . $result['current_status'] . ' required_status=1194 reason=status_not_1194)';
         } elseif ($result['outcome'] === 'retry_offer_missing') {
             $details .= ' (offer not found; left for a later run)';
+        } elseif ($result['outcome'] === 'busy') {
+            $details .= ' (another worker holds the lease; left for a later run)';
+        } elseif ($result['outcome'] === 'needs_review') {
+            $details .= ' (manual review required before retrying uncertain operations)';
         }
         $this->line($email->company . ' settlement ' . $email->settlementId . ': ' . $result['outcome'] . $details);
     }

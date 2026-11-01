@@ -45,4 +45,17 @@ final class ApprovalEmailTest extends TestCase
             catch (InvalidArgumentException) { self::assertTrue(true); }
         }
     }
+
+    public function test_rejection_identifies_missing_and_invalid_fields_without_their_values(): void
+    {
+        try {
+            ApprovalEmail::parse("Settlement Approval For Customer Id: private-contact\nCreditor Name: Bank\nSettlement ID: private-offer",
+                'no-reply@progresslaw.com', 'Settlement Approval Data:');
+            self::fail('Expected rejection.');
+        } catch (InvalidArgumentException $e) {
+            self::assertSame('invalid_fields', $e->reason);
+            self::assertSame(['customer_id' => 'invalid', 'settlement_id' => 'invalid', 'last_four' => 'missing'], $e->fields);
+            self::assertStringNotContainsString('private-', $e->getMessage() . json_encode($e->fields));
+        }
+    }
 }

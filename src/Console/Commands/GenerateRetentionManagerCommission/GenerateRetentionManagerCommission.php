@@ -584,6 +584,21 @@ class GenerateRetentionManagerCommission extends Command
             return $this->runReconcile($startDate, $endDate);
         }
 
+        // Check every requested source before generating/emailing any report. In
+        // particular, an absent NSF input must not cause a retry to resend Rama/Nick.
+        if ($this->option('require-snapshots')) {
+            try {
+                $missing = $this->missingSnapshotPaths($this->requiredSnapshotPaths($report, $startDate, $this->options()));
+                if ($missing !== []) {
+                    $this->error('Required commission snapshot files are not ready: ' . implode(' | ', $missing));
+                    return Command::FAILURE;
+                }
+            } catch (\InvalidArgumentException $error) {
+                $this->error($error->getMessage());
+                return Command::FAILURE;
+            }
+        }
+
         $needRetention = in_array($report, ['rama', 'nick', 'both', 'all'], true);
         $rows = [];
         if ($needRetention) {
@@ -673,6 +688,41 @@ class GenerateRetentionManagerCommission extends Command
         $this->applyTrancheAssignments($all);
 
         return $all;
+    }
+
+    /** Inputs shared with CMD Runner's non-blocking dependency retry. No source runs or writes. */
+    public function requiredSnapshotPaths(string $report, string $startDate, array $options = []): array
+    {
+        $paths = [];
+        if (in_array($report, ['rama', 'nick', 'both', 'all'], true)) {
+            if (($options['all-data-xlsx'] ?? '') !== '') {
+                $paths[] = $options['all-data-xlsx'];
+            } else {
+                $paths = $this->snapshotPair($options, 'retention', $this->defaultRetentionSnapshotPaths($startDate));
+            }
+        }
+        if (in_array($report, ['anthony', 'all'], true)) {
+            $paths = array_merge($paths, $this->snapshotPair($options, 'nsf', $this->defaultNsfSnapshotPaths($startDate)));
+        }
+        return $paths;
+    }
+
+    public function missingSnapshotPaths(array $paths): array
+    {
+        return array_values(array_filter($paths, static function (string $path): bool {
+            clearstatcache(true, $path);
+            return !is_file($path) || !is_readable($path) || filesize($path) === 0;
+        }));
+    }
+
+    private function snapshotPair(array $options, string $kind, array $defaults): array
+    {
+        $ldr = (string) ($options[$kind . '-ldr'] ?? '');
+        $plaw = (string) ($options[$kind . '-plaw'] ?? '');
+        if (($ldr === '') !== ($plaw === '')) {
+            throw new \InvalidArgumentException("Use both --{$kind}-ldr=path and --{$kind}-plaw=path.");
+        }
+        return $ldr === '' ? $defaults : [$ldr, $plaw];
     }
 
     /** @return array{0:string,1:string} */

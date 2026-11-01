@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Cmd\Reports\SettlementApprovalEmail;
 
 use Closure;
+use GuzzleHttp\Exception\ConnectException;
 use GuzzleHttp\Exception\RequestException;
 use JsonException;
 use Throwable;
@@ -46,6 +47,9 @@ final class ApprovalRunLog
         'Live processing dependencies are missing.',
         'Settlement status could not be verified; reconcile before repeating.',
         'Unrecognized settlement approval processing stage.',
+        'Unrecognized settlement approval processing outcome.',
+        'Invalid approval Inbox page response.',
+        'Invalid approval Inbox message response.',
         'Settlement/customer mismatch; no approval will be applied.',
         'Offer status is missing or invalid.',
         'Offer payment type is missing or invalid.',
@@ -109,24 +113,86 @@ final class ApprovalRunLog
         }
     }
 
-    public function failure(Throwable $error, string $event): string
+    public function rejection(ApprovalEmailRejected $error): string
     {
+        $stage = $this->stage;
+        $this->event('message_rejected', [
+            'stage' => $stage, 'outcome' => 'rejected', 'reason' => $error->reason,
+            'fields' => $error->fields, 'recovery' => 'correct_email_data',
+        ], 'warning');
+        $fields = [];
+        foreach ($error->fields as $field => $issue) $fields[] = $field . ':' . $issue;
+        return $error->getMessage() . ' [reason=' . $error->reason
+            . ($fields === [] ? '' : ' fields=' . implode(',', $fields)) . ' run_id=' . $this->id . ']';
+    }
+
+    public function failure(Throwable $error, string $event, ?string $stage = null): string
+    {
+        $operationStage = $this->stage;
         $message = $error->getMessage();
         $safe = in_array($message, self::SAFE_ERRORS, true)
             || preg_match('/\AForth request rejected \(HTTP [1-5][0-9]{2}\)\.\z/', $message);
         $diagnostic = $safe ? $message : 'Operation failed; raw provider/database details omitted.';
         if ($error instanceof JsonException) $diagnostic = 'Invalid JSON in the provider response or preview fixture.';
-        $context = ['stage' => $this->stage, 'error_type' => get_class($error)];
+        $context = ['stage' => $stage ?? $operationStage, 'error_type' => get_class($error)];
+        $httpStatus = null;
+        $timeout = $connection = $database = $programming = $json = false;
+        if (preg_match('/\AForth request rejected \(HTTP ([1-5][0-9]{2})\)\.\z/', $message, $matches)) {
+            $httpStatus = (int) $matches[1];
+        }
         for ($cause = $error, $depth = 0; $cause !== null && $depth < 8; $cause = $cause->getPrevious(), $depth++) {
+            $database = $database || $cause instanceof \PDOException;
+            $programming = $programming || $cause instanceof \Error;
+            $json = $json || $cause instanceof JsonException;
+            if ($cause instanceof ConnectException || $cause instanceof RequestException) {
+                $timeout = $timeout || ($cause->getHandlerContext()['errno'] ?? null) === 28;
+                $connection = $connection || $cause instanceof ConnectException;
+            }
             if ($cause instanceof RequestException && $cause->hasResponse()) {
-                $context['http_status'] = $cause->getResponse()->getStatusCode();
-                if (!$safe) $diagnostic = 'Provider request failed (HTTP ' . $context['http_status'] . '); response details omitted.';
-                break;
+                $httpStatus ??= $cause->getResponse()->getStatusCode();
+                $retryAfter = $cause->getResponse()->getHeaderLine('Retry-After');
+                if (ctype_digit($retryAfter) && strlen($retryAfter) <= 5 && (int) $retryAfter <= 86400) {
+                    $context['retry_after_seconds'] = (int) $retryAfter;
+                }
             }
         }
+        if ($httpStatus !== null) {
+            $context['http_status'] = $httpStatus;
+            if (!$safe) $diagnostic = 'Provider request failed (HTTP ' . $httpStatus . '); response details omitted.';
+        }
+        $configuration = $safe && (str_starts_with($message, 'Configure ') || str_starts_with($message, 'Microsoft Graph is not configured:')
+            || str_starts_with($message, 'A unique Forth API key is required') || $message === 'Forth API key is not configured.'
+            || str_starts_with($message, 'Settlement Approval recipients') || str_starts_with($message, 'Live mode requires')
+            || str_starts_with($message, 'Publish and apply') || in_array($context['stage'], ['processor_initializing', 'live_configuration_check_started', 'notification_configuration_check_started'], true));
+        $context['error_code'] = match (true) {
+            $programming => 'programming_error',
+            $database => 'database_error',
+            $timeout => 'timeout',
+            $connection => 'connection_failed',
+            $httpStatus === 401 => 'authentication_failed',
+            $httpStatus === 403 => 'access_denied',
+            $httpStatus === 429 => 'rate_limited',
+            $httpStatus !== null && $httpStatus >= 500 => 'provider_unavailable',
+            $httpStatus !== null => 'provider_rejected',
+            $json => 'invalid_json',
+            $configuration => 'configuration_error',
+            default => 'operation_failed',
+        };
+        $context['recovery'] = match (true) {
+            in_array($context['stage'], ['note_create_started', 'notification_send_started'], true) => 'manual_review_before_retry',
+            in_array($context['stage'], ['status_update_started', 'status_verification_started'], true) => 'reconcile_status_before_retry',
+            in_array($context['stage'], ['message_mark_read_started', 'message_archive_started'], true) => 'retry_mailbox_only',
+            in_array($context['error_code'], ['configuration_error', 'authentication_failed', 'access_denied'], true) => 'check_configuration',
+            in_array($context['error_code'], ['timeout', 'connection_failed', 'rate_limited', 'provider_unavailable', 'database_error'], true) => 'retry_next_run',
+            default => 'investigate',
+        };
         $context['error'] = $diagnostic;
         $this->event($event, $context, 'error');
-        return $diagnostic . ' [stage=' . $context['stage'] . ' run_id=' . $this->id . ']';
+        // Error reporting must not replace the operation that actually failed (including cleanup errors).
+        $this->stage = $operationStage;
+        return $diagnostic . ' [stage=' . $context['stage'] . ' error_code=' . $context['error_code']
+            . ' recovery=' . $context['recovery'] . (isset($context['http_status']) ? ' http_status=' . $context['http_status'] : '')
+            . ' run_id=' . $this->id . ']';
     }
 
     public function elapsedMs(): int
