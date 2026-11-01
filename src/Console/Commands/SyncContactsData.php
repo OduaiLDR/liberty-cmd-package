@@ -58,6 +58,9 @@ class SyncContactsData extends Command
     private array $matchingExclusions = [];
     private array $sourceLinks = [];
     private array $deferredEnrollmentChanges = [];
+
+    /** Native IDs a previous run skipped; fetched again by ID alongside the incremental window. */
+    private array $retryIds = [];
     private bool $matchingScopePrepared = false;
 
     /** Per-command source instances keep verified metadata scoped to their immutable credentials. */
@@ -247,11 +250,20 @@ class SyncContactsData extends Command
 
         $this->logStep('Step 3/3: matching done', $matchStarted);
         $hasReviewFlags = $hasReviewFlags || $this->contactFlags !== [];
-        if ($this->exclusionSeeds !== [] || $hasSkippedRecords) {
+        $skipped = $this->exclusionSeeds !== [] || $hasSkippedRecords;
+        $retry = $this->option('owners-refresh') ? null : $this->checkpointRetries(
+            array_map(fn (array $scope) => $scope['retry_complete'] ? $scope['retry_ids'] : null, $scopes),
+            $this->deferredEnrollmentChanges);
+        if ($retry !== null) {
+            $this->saveCheckpoints($retry, array_map(fn (array $scope) => $scope['started_at'], $scopes));
+            if ($skipped) {
+                $this->warn('[SYNC FLAGS] Eligible files reconciled; excluded file groups require review. '
+                    . array_sum(array_map('count', $retry)) . ' skipped file(s) will be fetched again by ID; checkpoints advanced.');
+                $hasReviewFlags = true;
+            }
+        } elseif ($skipped) {
             $this->warn('[SYNC FLAGS] Eligible files reconciled; excluded file groups require review. All source checkpoints retained for retry.');
             $hasReviewFlags = true;
-        } elseif (!$this->option('owners-refresh')) {
-            foreach ($scopes as $src => $scope) $this->writeLastSyncTime($src, $scope['started_at']);
         }
         $this->info("\n" . str_repeat('=', 80));
         $this->logStep($hasReviewFlags ? 'All source runs and matching completed with review flags; see source summaries'
@@ -358,7 +370,7 @@ class SyncContactsData extends Command
         $this->contactFlags = [];
         $this->skippedContactIds = [];
         $this->exclusionSeeds = $this->matchingExclusions = $this->verifiedCampaigns = $this->sourceLinks = [];
-        $this->campaignHolds = [];
+        $this->campaignHolds = $this->retryIds = [];
         $this->matchingScopePrepared = false;
         $dryRun = (bool) $this->option('dry-run');
         if ($dryRun) {
@@ -417,6 +429,10 @@ class SyncContactsData extends Command
             // Guarded upserts are idempotent; repeated overlap does not merge native source IDs.
             $startDate = date('Y-m-d H:i:s', strtotime($lastSyncAt) - 86400);
             $this->info("[INFO] Incremental mode: fetching contacts modified since {$startDate}.");
+            $this->retryIds = ContactSyncWatermark::readRetryIds($this->retryFilePath(), $this->source);
+            if ($this->retryIds !== []) {
+                $this->info('[INFO] Fetching ' . count($this->retryIds) . ' previously skipped record(s) again by ID.');
+            }
         } elseif ($ownersRefresh) {
             // Explicit wide fetch uses the same verified target selection and field updates.
             $startDate     = '2021-07-01';
@@ -611,11 +627,20 @@ class SyncContactsData extends Command
         // is a wide corrective sweep, not a chronological checkpoint — leave the
         // incremental watermark untouched so the next scheduled incremental run
         // still picks up everything modified since the last real incremental.
-        if (!$dryRun && $this->exclusionSeeds !== []) {
-            $this->warn('[WARN] Sync checkpoint retained so skipped records are retried on the next run.');
-        } elseif (!$dryRun && !$ownersRefresh && !$this->option('no-match')) {
-            $this->writeLastSyncTime($this->source, $syncStartedAt);
+        // Skipped records are fetched again by ID, so they no longer hold the window open.
+        $sourceRetries = $this->sourceRetryIds();
+        $checkpointAdvanced = false;
+        if ($this->option('no-match')) {
+            if (!$dryRun && $this->skippedContactIds !== []) {
+                $this->info('[INFO] Skipped records are reported to the orchestrator for retry by ID.');
+            }
+        } elseif (!$dryRun && !$ownersRefresh && ($retry = $this->checkpointRetries([$this->source => $sourceRetries],
+            [$this->source => ['categories' => $categoryChanges, 'affiliates' => $affiliateChanges]])) !== null) {
+            $this->saveCheckpoints($retry, [$this->source => $syncStartedAt]);
+            $checkpointAdvanced = true;
             $this->info("[INFO] Sync watermark saved: {$syncStartedAt}");
+        } elseif (!$dryRun && $this->exclusionSeeds !== []) {
+            $this->warn('[WARN] Sync checkpoint retained so skipped records are retried on the next run.');
         } elseif ($ownersRefresh) {
             $this->info('[INFO] Owners-refresh: incremental watermark left unchanged.');
         }
@@ -623,7 +648,7 @@ class SyncContactsData extends Command
         if ($this->skippedContactIds !== []) {
             $this->warn('[SYNC FLAGS] ' . json_encode(['source' => $this->source, 'accepted' => $totalInserted,
                 'skipped_ids' => count($this->skippedContactIds), 'flags' => count($this->contactFlags),
-                'dry_run' => $dryRun, 'checkpoint_advanced' => false], JSON_THROW_ON_ERROR));
+                'dry_run' => $dryRun, 'checkpoint_advanced' => $checkpointAdvanced], JSON_THROW_ON_ERROR));
             $this->warn($dryRun ? '[DRY RUN] Preview completed with flagged records; no changes applied.'
                 : '[WARN] Accepted records were processed; skipped records still require review.');
         } elseif ($this->contactFlags !== []) {
@@ -638,6 +663,7 @@ class SyncContactsData extends Command
                 'source' => $this->source, 'complete' => true, 'started_at' => $syncStartedAt,
                 'excluded_ids' => array_keys($this->exclusionSeeds), 'campaigns' => $this->verifiedCampaigns,
                 'campaign_hold_ids' => array_keys($this->campaignHolds),
+                'retry_ids' => $sourceRetries ?? [], 'retry_complete' => $sourceRetries !== null,
                 'enrollment_changes' => ['categories' => $categoryChanges, 'affiliates' => $affiliateChanges],
             ]);
         }
@@ -696,6 +722,10 @@ class SyncContactsData extends Command
         $cutoff = "'{$this->esc($startDate)}'::TIMESTAMP_NTZ";
         $contact = "CONVERT_TIMEZONE('America/Los_Angeles', COALESCE(c.MODIFIED, c.CREATED))::TIMESTAMP_NTZ >= {$cutoff}
             OR CONVERT_TIMEZONE('America/Los_Angeles', c._FIVETRAN_SYNCED)::TIMESTAMP_NTZ >= {$cutoff}";
+        if ($this->retryIds !== []) {
+            // Validated native IDs: skipped records are retried without holding the whole window open.
+            $contact .= "\n            OR c.ID IN (" . implode(', ', $this->retryIds) . ')';
+        }
         if ($this->source !== 'LT') {
             return "({$contact})";
         }
@@ -1381,7 +1411,7 @@ class SyncContactsData extends Command
             foreach (array_merge($this->sourceLinks[$flag['id']] ?? [$flag['id']], $warning['related_ids'] ?? []) as $id) {
                 $this->exclusionSeeds[(string) $id] = true;
             }
-        } elseif ($flag['code'] === 'campaign_attribution_preserved') {
+        } elseif (in_array($flag['code'], ContactSyncTargets::ATTRIBUTION_HOLD_CODES, true)) {
             foreach (array_merge($this->sourceLinks[$flag['id']] ?? [$flag['id']], $warning['related_ids'] ?? []) as $id) {
                 $this->campaignHolds[(string) $id] = true;
                 unset($this->verifiedCampaigns[(string) $id]);
@@ -2120,6 +2150,83 @@ class SyncContactsData extends Command
     private function writeLastSyncTime(string $source, string $datetime): void
     {
         ContactSyncWatermark::write($this->timestampFilePath(), $source, $datetime);
+    }
+
+    private function retryFilePath(): string
+    {
+        return storage_path('app/sync_retry_ids.json');
+    }
+
+    /** This run's skipped records, or null when one of them has no ID it could be fetched by. */
+    private function sourceRetryIds(): ?array
+    {
+        $ids = [];
+        foreach (array_keys($this->skippedContactIds) as $id) {
+            $id = (string) $id;
+            if (!str_starts_with($id, 'LLG-') || !ContactSyncIdentity::validNativeId(substr($id, 4))) {
+                return null;
+            }
+            $ids[] = $id;
+        }
+        return $ids;
+    }
+
+    /**
+     * Native IDs to fetch again per source, or null to keep every checkpoint where it is.
+     * A final-matching skip or an enrollment change blocked by an exclusion is retried
+     * through the source file that proposed it.
+     */
+    private function checkpointRetries(array $sourceRetries, array $bySourceChanges): ?array
+    {
+        $retry = [];
+        foreach ($sourceRetries as $source => $ids) {
+            if ($ids === null) {
+                return null;
+            }
+            $retry[$source] = $ids;
+        }
+        $blocked = array_fill_keys($this->matchingExclusions, true) + $this->skippedContactIds;
+        foreach ($bySourceChanges as $source => $changes) {
+            foreach (['categories', 'affiliates'] as $kind) {
+                foreach ($changes[$kind] ?? [] as $change) {
+                    if (isset($blocked[$change['llg_id']])) {
+                        $retry[$source][] = $change['llg_id'];
+                    }
+                }
+            }
+        }
+        $listed = [];
+        foreach ($retry as $ids) {
+            $listed += array_fill_keys($ids, true);
+        }
+        if (array_diff_key($this->skippedContactIds, $listed) !== []) {
+            return null;
+        }
+        foreach ($retry as $source => $ids) {
+            $native = [];
+            foreach (array_unique($ids) as $id) {
+                if (!str_starts_with((string) $id, 'LLG-') || !ContactSyncIdentity::validNativeId(substr((string) $id, 4))) {
+                    return null;
+                }
+                $native[] = substr((string) $id, 4);
+            }
+            if (count($native) > ContactSyncWatermark::MAX_RETRY_IDS) {
+                return null;
+            }
+            $retry[$source] = $native;
+        }
+        return $retry;
+    }
+
+    /** Retry lists are saved first, so a failure in between only widens the next fetch. */
+    private function saveCheckpoints(array $retry, array $startedAt): void
+    {
+        foreach ($retry as $source => $ids) {
+            ContactSyncWatermark::writeRetryIds($this->retryFilePath(), $source, $ids);
+        }
+        foreach ($startedAt as $source => $datetime) {
+            $this->writeLastSyncTime($source, $datetime);
+        }
     }
 
     // -------------------------------------------------------------------------

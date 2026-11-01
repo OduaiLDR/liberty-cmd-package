@@ -164,11 +164,25 @@ class MarketingReportRepository extends SqlSrvRepository
         return $this->smsRowsForWeek($week);
     }
 
-    /** One billing population for history and invoicing; IDs are stable across both tables. */
+    /** Retained export evidence and official activity are distinct; only the latter is billable. */
     protected function smsRowsForWeek(string $week, bool $lock = false): Collection
     {
         $start = \Carbon\Carbon::parse($week, 'America/Los_Angeles')->startOfWeek(\Carbon\Carbon::MONDAY);
         $legacy = $this->table('TblSmsExports')->where('Week_Start', $start->toDateString())->orderBy('PK');
+        // Read/lock official runs before either representation of their drops.
+        $schema = $this->connection()->getSchemaBuilder();
+        $sentRuns = collect();
+        $modern = $schema->hasTable('TblSMSDrops') && $schema->hasTable('TblSMSRuns');
+        if ($modern) {
+            // Convert both CA boundaries separately (including a DST transition).
+            $runs = $this->table('TblSMSRuns')->whereIn('Status', ['sent', 'approved'])
+                ->where('Sent_At', '>=', $start->copy()->utc()->toDateTimeString())
+                ->where('Sent_At', '<', $start->copy()->addWeek()->utc()->toDateTimeString())
+                ->orderBy('Request_ID');
+            if ($lock) $runs->lockForUpdate();
+            $sentRuns = $runs->get(['Request_ID', 'Status', 'Sent_At'])
+                ->keyBy(fn (object $run): string => strtolower((string) $run->Request_ID));
+        }
         if ($lock) $legacy->lockForUpdate();
         $rows = $legacy->get(['PK', 'SMS_Drop_Name', 'Request_ID', 'Debt_Tier', 'Week_Start',
             'Exported_At', 'SMS_Count', 'SMS_Invoice_Number', 'SMS_Cost'])->map(function (object $row): object {
@@ -176,24 +190,43 @@ class MarketingReportRepository extends SqlSrvRepository
             $row->Source_PK = $row->PK;
             $row->PK = 'TblSmsExports:'.$row->PK;
             $row->sources = [];
+            // prepareExport writes these rows while building a file. Neither this
+            // registration nor Exported_At proves approval, submission or delivery.
+            $row->Activity_Status = 'exported_unconfirmed';
+            $row->Run_Status = null;
+            $row->Billable = false;
+            $row->Confirmed_Count = 0;
+            $row->Invoice_Hold = null;
             return $row;
         });
 
-        // Keep legacy history available on hosts which have not enabled person-level SMS yet.
-        $schema = $this->connection()->getSchemaBuilder();
-        if (! $schema->hasTable('TblSMSDrops') || ! $schema->hasTable('TblSMSRuns')) return $rows;
-
-        // Sent_At is stored in UTC. Convert both CA midnights separately so DST weeks
-        // are correct, and leave the column bare for an indexed range lookup.
-        $runs = $this->table('TblSMSRuns')->whereIn('Status', ['sent', 'approved'])
-            ->where('Sent_At', '>=', $start->copy()->utc()->toDateTimeString())
-            ->where('Sent_At', '<', $start->copy()->addWeek()->utc()->toDateTimeString())
-            ->orderBy('Request_ID');
-        // Invoice writers lock run state before drops. Send corrections must acquire
-        // that same run lock before checking invoices and changing status.
-        if ($lock) $runs->lockForUpdate();
-        $sentRuns = $runs->get(['Request_ID', 'Sent_At'])->keyBy(fn (object $run): string => strtolower((string) $run->Request_ID));
+        // Do not relabel every old export as unsent. Retain unknown provenance and
+        // expose an exact linked run's state without making its export billable.
+        if ($schema->hasTable('TblSMSRuns')) {
+            $states = collect();
+            foreach ($rows->pluck('Request_ID')->unique()->chunk(1000) as $ids) {
+                $states = $states->concat($this->table('TblSMSRuns')->whereIn('Request_ID', $ids->all())
+                    ->get(['Request_ID', 'Status']));
+            }
+            $states = $states->keyBy(fn (object $run): string => strtolower((string) $run->Request_ID));
+            foreach ($rows as $row) {
+                $row->Run_Status = $states->get(strtolower((string) $row->Request_ID))->Status ?? null;
+                if ($row->Run_Status !== null && ! in_array($row->Run_Status, ['approved', 'sent', 'external_sent'], true)) {
+                    $row->Activity_Status = $row->Run_Status;
+                }
+            }
+        }
         if ($sentRuns->isEmpty()) return $rows;
+
+        // Look across export weeks: an invoice on an older representation must not
+        // disappear just because the official approval belongs to a later week.
+        $relatedLegacy = collect();
+        foreach ($sentRuns->pluck('Request_ID')->chunk(1000) as $ids) {
+            $query = $this->table('TblSmsExports')->whereIn('Request_ID', $ids->all())->orderBy('PK');
+            if ($lock) $query->lockForUpdate();
+            $relatedLegacy = $relatedLegacy->concat($query->get(['PK', 'Request_ID', 'Debt_Tier', 'SMS_Count', 'SMS_Invoice_Number']));
+        }
+        $relatedLegacy = $relatedLegacy->groupBy(fn (object $row): string => strtolower((string) $row->Request_ID));
 
         $columns = ['PK', 'Request_ID', 'Drop_Name', 'Debt_Tier', 'Amount_Dropped', 'Invoice_Number', 'Cost'];
         $drops = collect();
@@ -244,18 +277,39 @@ class MarketingReportRepository extends SqlSrvRepository
             return true;
         });
 
+        $byRequest = $drops->groupBy(fn (object $drop): string => strtolower((string) $drop->Request_ID));
         foreach ($drops as $drop) {
             $run = $sentRuns->get(strtolower((string) $drop->Request_ID));
             if ($run === null) continue;
+            $legacyRows = $relatedLegacy->get(strtolower((string) $run->Request_ID), collect());
+            $hold = null;
+            if ($legacyRows->contains(fn (object $row): bool => trim((string) ($row->SMS_Invoice_Number ?? '')) !== '')) {
+                $hold = 'An exact linked legacy export already has an invoice; reconcile it before allocating again.';
+            } elseif ($legacyRows->isNotEmpty()) {
+                $totals = static fn (Collection $entries, string $column): array => $entries->groupBy('Debt_Tier')
+                    ->map(fn (Collection $tier): int => (int) $tier->sum($column))->sortKeys()->all();
+                if ($totals($legacyRows, 'SMS_Count') !== $totals($byRequest->get(strtolower((string) $run->Request_ID)), 'Amount_Dropped')) {
+                    $hold = 'Exact linked legacy and official tier counts disagree; evidence reconciliation is required.';
+                }
+            }
             $rows->push((object) [
                 'PK' => 'TblSMSDrops:'.$drop->PK, 'Source_Table' => 'TblSMSDrops', 'Source_PK' => $drop->PK,
                 'Request_ID' => $run->Request_ID, 'SMS_Drop_Name' => $drop->Drop_Name,
                 'Debt_Tier' => $drop->Debt_Tier, 'SMS_Count' => (int) $drop->Amount_Dropped,
                 'Week_Start' => $start->toDateString(), 'Exported_At' => $run->Sent_At,
                 'SMS_Invoice_Number' => $drop->Invoice_Number, 'SMS_Cost' => $drop->Cost ?? 0,
+                'Activity_Status' => $run->Status, 'Run_Status' => $run->Status,
+                'Billable' => true, 'Confirmed_Count' => (int) $drop->Amount_Dropped,
+                'Invoice_Hold' => $hold,
                 // Person-level sends have no legacy TblMarketing source rows.
                 'sources' => [],
             ]);
+        }
+
+        foreach ($rows as $row) {
+            if ($row->Source_Table === 'TblSmsExports' && $byRequest->has(strtolower((string) $row->Request_ID))) {
+                $row->Activity_Status = 'reconciled_export';
+            }
         }
 
         return $rows->values();
@@ -268,6 +322,9 @@ class MarketingReportRepository extends SqlSrvRepository
             $sms = $data['kind'] === 'sms';
             if ($sms) {
                 $rows = $this->smsRowsForWeek($data['week'], true);
+                if ($rows->contains(fn (object $row): bool => ($row->Invoice_Hold ?? null) !== null)) {
+                    throw \Illuminate\Validation\ValidationException::withMessages(['week' => 'This SMS week has linked legacy evidence requiring invoice reconciliation.']);
+                }
                 $countColumn = 'SMS_Count';
                 $costColumn = 'SMS_Cost';
                 $invoiceColumn = 'SMS_Invoice_Number';
@@ -287,6 +344,12 @@ class MarketingReportRepository extends SqlSrvRepository
                 throw \Illuminate\Validation\ValidationException::withMessages([$sms ? 'week' : 'drop_name' => $sms
                     ? 'This SMS export week already has an invoice.'
                     : 'This drop already has an invoice for this cost type.']);
+            }
+            if ($sms) {
+                $rows = $rows->filter(fn (object $row): bool => $row->Billable === true)->values();
+                if ($rows->isEmpty()) {
+                    throw \Illuminate\Validation\ValidationException::withMessages(['week' => 'No confirmed approved/submitted SMS activity matches this week. Retained exports alone are not billing evidence.']);
+                }
             }
             $counts = $rows->mapWithKeys(fn (object $row): array => [$row->PK => (int) $row->{$countColumn}])->all();
             $costs = (new \Cmd\Reports\Services\SmsDropPlanner)->allocate((string) $data['cost'], $counts);

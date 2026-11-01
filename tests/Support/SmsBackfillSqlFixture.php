@@ -40,7 +40,7 @@ final class SmsBackfillSqlFixture
 CREATE TABLE dbo.TblProspects (
  PK int IDENTITY(1,1) NOT NULL CONSTRAINT PK_TblProspects PRIMARY KEY,
  Creation_Date date,Client varchar(150),Address varchar(200),City varchar(100),State char(2),Zip varchar(10),
- Tier varchar(2),Phone varchar(10),Email varchar(254),Contacted bit NOT NULL DEFAULT 0,Response_Date date,
+ Phone varchar(10),Email varchar(254),Contacted bit NOT NULL DEFAULT 0,Response_Date date,
  Invalid_Phone bit NOT NULL DEFAULT 0,Opt_Out bit NOT NULL DEFAULT 0,Latest_Export_Date date,SMS_Attempts int NOT NULL DEFAULT 0);
 CREATE INDEX IX_TblProspects_Match ON dbo.TblProspects(Client,Address,Zip);
 CREATE TABLE dbo.TblMailersUniqueEnriched (
@@ -103,8 +103,8 @@ DELETE dbo.TblMarketing; DELETE dbo.TblSMSHistory; DELETE dbo.TblSMSLegacySends;
 DELETE dbo.TblPhoneNumbers; DELETE dbo.TblSMSSuppressions; DELETE dbo.TblSMSAvailabilitySummary;
 DELETE tu_repair_20261014.Control; DELETE dbo.TblProspects;
 SET IDENTITY_INSERT dbo.TblProspects ON;
-INSERT dbo.TblProspects(PK,Client,Address,Zip,Phone,Tier,Contacted,Opt_Out,Invalid_Phone,SMS_Attempts,Latest_Export_Date,Response_Date)
- VALUES(100,'Existing sentinel','100 Unchanged St','00123','2025550199','T9',1,1,1,9,'2026-09-30','2026-10-01');
+INSERT dbo.TblProspects(PK,Client,Address,Zip,Phone,Contacted,Opt_Out,Invalid_Phone,SMS_Attempts,Latest_Export_Date,Response_Date)
+ VALUES(100,'Existing sentinel','100 Unchanged St','00123','2025550199',1,1,1,9,'2026-09-30','2026-10-01');
 SET IDENTITY_INSERT dbo.TblProspects OFF;
 DBCC CHECKIDENT ('dbo.TblProspects',RESEED,100) WITH NO_INFOMSGS;
 INSERT tu_repair_20261014.Control VALUES(1,'PUBLISHED',OBJECT_ID('dbo.TblMailersUniqueEnriched'),123,0);

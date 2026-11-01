@@ -49,7 +49,7 @@ class GenerateLendingTowerInvoices extends Command
                             {--company=all : PLAW, LDR or all}
                             {--dry-run : Calculate and print the figures without creating or sending anything}
                             {--save= : Write the invoice PDFs and backup workbooks to this folder instead of emailing}
-                            {--send-to-me : Send test copies only to oduai@libertydebtrelief.com, with no CC or BCC}
+                            {--send-to-me : Send only to oduai@libertydebtrelief.com with normal invoice wording and no CC or BCC}
                             {--test-to= : Email the invoices only to this address, from the normal report sender, marked TEST}
                             {--force : Send even if this invoice number was already sent}';
 
@@ -754,14 +754,15 @@ class GenerateLendingTowerInvoices extends Command
     /** @param array<string, string> $files */
     private function sendTest(string $company, array $document, array $files, array $period, string $to): bool
     {
-        $notice = sprintf(
+        $unmarked = (bool) $this->option('send-to-me');
+        $notice = $unmarked ? null : sprintf(
             'Review copy sent only to %s, from the same mailbox as the real invoice. The real one goes to the recipients in TblReports under "%s".',
             $to,
             self::REPORT_NAMES[$company]
         );
 
         $sent = $this->mailer()->sendMailHtml(
-            '[TEST] ' . $this->subject($company, $document, $period),
+            ($unmarked ? '' : '[TEST] ') . $this->subject($company, $document, $period),
             $this->emailBody($company, $document, $period, $notice),
             [$to],
             [],
@@ -771,8 +772,8 @@ class GenerateLendingTowerInvoices extends Command
         );
 
         $sent
-            ? $this->info("[TEST] {$document['number']} ({$document['total_due']}) sent to {$to}")
-            : $this->error("[ERROR] Test email for {$document['number']} was not sent; see laravel.log for the Graph error.");
+            ? $this->info(($unmarked ? '[INFO] ' : '[TEST] ') . "{$document['number']} ({$document['total_due']}) sent only to {$to}")
+            : $this->error("[ERROR] Invoice email for {$document['number']} was not sent; see laravel.log for the Graph error.");
 
         return $sent;
     }

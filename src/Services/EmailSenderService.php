@@ -149,9 +149,9 @@ class EmailSenderService
     }
 
     /** Read the configured shared recipient groups without sending or adding environment extras. */
-    public function recipientGroupsForReports(DBConnector $connector, array $reportNames): array
+    public function recipientGroupsForReports(DBConnector $connector, array $reportNames, array $companies = [], bool $strictCompany = false): array
     {
-        return $this->normalizeRecipientGroups($this->fetchRecipientGroupsFromTblReports($connector, $reportNames, [], false));
+        return $this->normalizeRecipientGroups($this->fetchRecipientGroupsFromTblReports($connector, $reportNames, $companies, $strictCompany));
     }
 
     /**

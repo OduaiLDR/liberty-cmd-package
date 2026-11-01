@@ -125,7 +125,28 @@ final class GenerateLendingTowerInvoicesRegistryTest extends TestCase
         $this->deliverLive($cmd, ['PLAW'], false, 'review@example.com');
         self::assertSame(0, $this->store->puts);
         self::assertTrue($cmd->mail->sent[0]['test'] ?? false, 'went out as a TEST email');
+        self::assertStringStartsWith('[TEST] ', $cmd->mail->sent[0][0]);
         self::assertStringContainsString('LT-PL-2026-09', $cmd->mail->sent[0][0]);
+    }
+
+    public function test_send_to_me_has_normal_wording_and_never_records_live_delivery(): void
+    {
+        $cmd = $this->command(['--send-to-me' => true]);
+        $cmd->useInvoiceGate('PLAW', $this->gate());
+        $cmd->useInvoiceGate('LDR', $this->gate());
+        self::assertTrue($this->deliverLive($cmd, ['PLAW', 'LDR'], false, 'oduai@libertydebtrelief.com'));
+        self::assertCount(2, $cmd->mail->sent);
+        self::assertSame(0, $this->store->puts);
+        self::assertSame([], $this->disk()->allFiles());
+        foreach ($cmd->mail->sent as $message) {
+            self::assertStringNotContainsString('[TEST]', $message[0]);
+            self::assertStringNotContainsString('<strong>TEST</strong>', $message[1]);
+            self::assertStringNotContainsString('Review copy', $message[1]);
+            self::assertSame(['oduai@libertydebtrelief.com'], $message[2]);
+            self::assertSame([], $message[3]);
+            self::assertSame([], $message[4]);
+            self::assertCount(2, $message[5]);
+        }
     }
 
     public function test_the_real_switch_defaults_to_off(): void

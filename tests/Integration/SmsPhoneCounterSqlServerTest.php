@@ -36,4 +36,15 @@ class SmsPhoneCounterSqlServerTest extends TestCase
         ['php-unicode-identity', "SELECT * FROM (VALUES (N'Á',N'2025550101'),(N'á',N'2025550101')) v(External_ID,Phone)", 'SELECT CAST(NULL AS nvarchar(50)) Phone WHERE 1=0', 2, 0],
     ];
     }
+
+    public function test_mixed_allowed_and_blocked_rows_hold_the_complete_identity(): void
+    {
+        if (getenv('CMD_SMS_SQLSERVER_READ_ONLY_TESTS') !== '1') {
+            self::markTestSkipped('Requires a bootstrapped SQL Server host and explicit read-only fixture opt-in.');
+        }
+        $source = "SELECT * FROM (VALUES (N'a',N'2025550101',N'CA'),(N'a',N'2025550102',N'WV'),(N'b',N'2025550103',N'DC')) v(External_ID,Phone,State)";
+        $contacts = 'SELECT CAST(NULL AS nvarchar(50)) Phone WHERE 1=0';
+        $row = DB::connection('sqlsrv')->selectOne((new SmsPhoneCounter)->sql($source, $contacts, true));
+        self::assertSame(1, (int) $row->Eligible_Phones);
+    }
 }

@@ -10,6 +10,7 @@ use Cmd\Reports\Repositories\SmsRecordExportRepository;
 use Cmd\Reports\Services\SmsAvailabilityLedger;
 use Cmd\Reports\Services\SmsDurableAvailabilityService;
 use Cmd\Reports\Services\SmsRecordPolicy;
+use Cmd\Reports\Services\SmsRunOptions;
 use Cmd\Reports\Services\SmsRunService;
 use Illuminate\Config\Repository;
 use Illuminate\Container\Container;
@@ -18,6 +19,7 @@ use Illuminate\Database\DatabaseTransactionsManager;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Facade;
 use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
 use Symfony\Component\HttpKernel\Exception\HttpException;
 use Throwable;
 
@@ -62,7 +64,7 @@ final class SmsRecordWorkflowTest extends TestCase
         $export = new class extends SmsProspectExportRepository {
             public function lookupDebts(string $id, array $debts = [], ?callable $progress = null): array
             {
-                $this->table('TblProspectsExport')->where('Request_ID', $id)->update(['Debt_Amount' => 10000, 'Debt_Source' => 'Tier']);
+                $this->table('TblProspectsExport')->where('Request_ID', $id)->update(['Debt_Amount' => 30000, 'Debt_Tier' => 'T1', 'Debt_Source' => 'TblTUData']);
                 return [];
             }
         };
@@ -94,7 +96,7 @@ final class SmsRecordWorkflowTest extends TestCase
     private function prospect(array $values = []): int
     {
         return (int) $this->db->table('TblProspects')->insertGetId($values + ['Client' => 'Synthetic Person', 'Address' => '1 Fixture St',
-            'City' => 'Test', 'State' => 'CA', 'Zip' => '00123', 'Phone' => '2025550100', 'Tier' => 'T1', 'Creation_Date' => '2026-10-01']);
+            'City' => 'Test', 'State' => 'CA', 'Zip' => '00123', 'Phone' => '2025550100', 'Creation_Date' => '2026-10-01']);
     }
 
     private function prepare(int $target = 10): object
@@ -132,17 +134,87 @@ final class SmsRecordWorkflowTest extends TestCase
         self::assertSame(0, (int) $this->db->table('TblProspects')->sum('SMS_Attempts'));
     }
 
-    public function test_order_uses_creation_only_for_never_texted_then_date_and_pk_for_previous(): void
+    public function test_state_policy_excludes_exact_business_states_and_holds_unknown_or_malformed_values(): void
+    {
+        $allowed = [];
+        foreach (['CA','DC','CO','OR','RI','WI','WV',null,'','ZZ','C1','Colorado'] as $index => $state) {
+            $pk = $this->prospect(['State' => $state, 'Phone' => '202555'.str_pad((string) (1000 + $index), 4, '0', STR_PAD_LEFT)]);
+            if (in_array($state, ['CA','DC'], true)) $allowed[] = $pk;
+        }
+
+        self::assertSame(['eligible' => 2, 'never_texted' => 2, 'texted_before' => 0], $this->records->availability());
+        $run = $this->prepare(20);
+        self::assertSame([2, 18], [$run->selected, $run->shortfall]);
+        self::assertSame($allowed, array_map('intval', $this->db->table('TblProspectsExport')->orderBy('PK')->pluck('Prospect_PK')->all()));
+        self::assertSame(12, $this->db->table('TblProspects')->count(), 'Existing prospects are preserved; unsafe States are filtered, not deleted.');
+    }
+
+    public function test_selection_uses_source_debt_tier_without_a_live_tier_column(): void
+    {
+        $this->prospect();
+        $this->prepare(1);
+        self::assertSame('T1', $this->db->table('TblProspectsExport')->value('Debt_Tier'));
+        self::assertFalse($this->db->getSchemaBuilder()->hasColumn('TblProspects', 'Debt_Tier'));
+        self::assertFalse($this->db->getSchemaBuilder()->hasColumn('TblProspects', 'Tier'));
+    }
+
+    public function test_lean_source_validator_versions_tier_null_pk_without_reinterpreting_old_rows(): void
+    {
+        $this->prospect();
+        $this->prepare(1);
+        $lean = SmsRunOptions::normalize(1, 1, ['T1'], SmsRunOptions::LEAN_WINDOWED_TIER_SELECTION_POLICY);
+        $old = SmsRunOptions::normalize(1, 1, ['T1'], SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY);
+        $row = $this->db->table('TblProspectsExport')->where('Request_ID', self::ID);
+
+        $row->update(['Debt_Source' => 'Tier', 'Debt_Source_PK' => null]);
+        $this->records->assertTierPrices(self::ID, $lean);
+        foreach ([
+            ['Debt_Source' => 'Tier', 'Debt_Source_PK' => 77],
+            ['Debt_Source' => 'TblTUData', 'Debt_Source_PK' => null],
+            ['Debt_Source' => 'TblMailers', 'Debt_Source_PK' => 0],
+        ] as $invalid) {
+            $row->update($invalid);
+            try { $this->records->assertTierPrices(self::ID, $lean); self::fail('Expected lean source-specific provenance refusal.'); }
+            catch (\RuntimeException $error) { self::assertStringContainsString('provenance', $error->getMessage()); }
+        }
+
+        foreach (['TblTUData','TblMailers'] as $source) {
+            $row->update(['Debt_Source' => $source, 'Debt_Source_PK' => 77]);
+            $this->records->assertTierPrices(self::ID, $lean);
+        }
+        $row->update(['Debt_Source' => 'Tier', 'Debt_Source_PK' => 77]);
+        $this->records->assertTierPrices(self::ID, $old);
+        $row->update(['Debt_Source_PK' => null]);
+        try { $this->records->assertTierPrices(self::ID, $old); self::fail('Expected old frozen selector shape to retain its positive source-PK contract.'); }
+        catch (\RuntimeException $error) { self::assertStringContainsString('provenance', $error->getMessage()); }
+    }
+
+    public function test_order_is_newest_never_then_oldest_previous_with_nulls_ties_and_no_cooldown(): void
     {
         $old = $this->prospect(['Creation_Date' => '2025-01-01']);
-        $new = $this->prospect(['Creation_Date' => '2026-10-10']);
+        $newA = $this->prospect(['Creation_Date' => '2026-10-10']);
+        $newB = $this->prospect(['Creation_Date' => '2026-10-10']);
+        $unknownA = $this->prospect(['Creation_Date' => null]);
+        $unknownB = $this->prospect(['Creation_Date' => null]);
         $previousA = $this->prospect(['Last_SMS_Date' => '2026-09-01', 'Creation_Date' => '2020-01-01']);
         $previousB = $this->prospect(['Last_SMS_Date' => '2026-09-01', 'Creation_Date' => '2026-10-10']);
-        $later = $this->prospect(['Last_SMS_Date' => '2026-10-01']);
-        $this->prepare(4);
-        self::assertSame([$new,$old,$previousA,$previousB], array_map('intval', $this->db->table('TblProspectsExport')->orderBy('PK')->pluck('Prospect_PK')->all()));
-        self::assertFalse($this->db->table('TblProspectsExport')->where('Prospect_PK', $later)->exists());
-        self::assertSame([2,2], [$this->runs->show(self::ID)->never_texted, $this->runs->show(self::ID)->previously_texted]);
+        $recent = $this->prospect(['Last_SMS_Date' => '2026-10-19']);
+
+        $run = $this->prepare(20);
+
+        self::assertSame(
+            [$newA,$newB,$old,$unknownA,$unknownB,$previousA,$previousB,$recent],
+            array_map('intval', $this->db->table('TblProspectsExport')->orderBy('PK')->pluck('Prospect_PK')->all())
+        );
+        self::assertSame([8,5,3,12], [$run->selected,$run->never_texted,$run->previously_texted,$run->shortfall]);
+        self::assertSame(
+            [0,0,0,0,0,1,1,1],
+            array_map('intval', $this->db->table('TblProspectsExport')->orderBy('PK')->pluck('Was_Previously_Texted')->all())
+        );
+        self::assertTrue(
+            $this->db->table('TblProspectsExport')->where('Prospect_PK', $recent)->exists(),
+            'A record texted yesterday remains eligible: the selector has no invented 60-day cooldown.'
+        );
     }
 
     public function test_authoritative_suppressions_exclude_zero_flag_records_before_admission(): void
@@ -210,6 +282,64 @@ final class SmsRecordWorkflowTest extends TestCase
         $this->refuses(fn () => $this->runs->start(self::ID, 2, 'editor@example.invalid'));
     }
 
+    public function test_five_column_file_keeps_rounded_snapshot_and_ready_file_is_not_rebuilt(): void
+    {
+        config(['sms-exports.single_phone_csv' => true]);
+        $this->prospect(); $this->prepare(1);
+        $this->db->table('TblProspectsExport')->update(['Debt_Amount' => 30000]);
+        $this->runs->requestFile(self::ID); $this->runs->buildFile(self::ID);
+        $path = $this->runs->filePath(self::ID);
+        $before = hash_file('sha256', $path);
+        $stream = fopen($path, 'rb');
+        try {
+            self::assertSame(['First name','address','debt load','phone1','send date'], fgetcsv($stream, escape: ''));
+            $row = fgetcsv($stream, escape: '');
+            self::assertCount(5, $row); self::assertSame('30000', $row[2]);
+            self::assertSame('2026-10-26', $row[4]);
+        } finally { fclose($stream); }
+        config(['sms-exports.single_phone_csv' => false]);
+        Carbon::setTestNow(Carbon::parse('2026-11-04T12:00:00Z'));
+        $this->runs->buildFile(self::ID);
+        self::assertSame($before, hash_file('sha256', $this->runs->filePath(self::ID)));
+    }
+
+    public function test_old_pending_low_debt_is_held_without_trimming_repeated_phone_members_or_rewriting_options(): void
+    {
+        $this->prospect();$this->prospect(['Client'=>'Another Person']);$this->prepare(2);
+        $pk=$this->db->table('TblProspectsExport')->orderBy('PK')->value('PK');
+        $this->db->table('TblProspectsExport')->where('PK',$pk)->update(['Debt_Amount'=>23000]);
+        $before=$this->db->table('TblProspectsExport')->orderBy('PK')->get()->toJson();
+        $options=$this->db->table('TblSMSRuns')->value('Run_Options_JSON');
+        try{$this->records->assertFrozen(self::ID,2);self::fail('Old low frozen price was released');}
+        catch(\Cmd\Reports\Services\SmsFrozenEligibilityHold){}
+        self::assertSame($before,$this->db->table('TblProspectsExport')->orderBy('PK')->get()->toJson());
+        self::assertSame($options,$this->db->table('TblSMSRuns')->value('Run_Options_JSON'));
+        self::assertSame(2,$this->db->table('TblProspectsExport')->count());self::assertSame(0,$this->db->table('TblSMSHistory')->count());
+        self::assertSame(0,(int)$this->db->table('TblProspects')->sum('SMS_Attempts'));
+    }
+
+    public function test_generation_in_a_later_week_requires_new_batch_instead_of_rewriting_review(): void
+    {
+        $this->prospect(); $this->prepare(1);
+        $this->runs->requestFile(self::ID);
+        Carbon::setTestNow(Carbon::parse('2026-11-04T12:00:00Z'));
+        try { $this->runs->buildFile(self::ID); self::fail('Stale planned Monday was exported.'); }
+        catch (\RuntimeException $e) { self::assertStringContainsString('Start a fresh batch', $e->getMessage()); }
+        self::assertSame('2026-10-26', $this->db->table('TblSMSDrops')->value('Drop_Date'));
+        self::assertNull($this->db->table('TblSMSRuns')->value('File_Path'));
+    }
+
+    public function test_old_exact_debt_snapshot_cannot_silently_diverge_from_the_generated_file(): void
+    {
+        $this->prospect(); $this->prepare(1);
+        $this->db->table('TblProspectsExport')->update(['Debt_Amount' => '13500.01']);
+        $this->runs->requestFile(self::ID);
+        try { $this->runs->buildFile(self::ID); self::fail('Old exact debt was exported.'); }
+        catch (\RuntimeException $e) { self::assertStringContainsString('does not reconcile', $e->getMessage()); }
+        self::assertNull($this->db->table('TblSMSRuns')->value('File_Path'));
+        self::assertSame('13500.01', (string) $this->db->table('TblProspectsExport')->value('Debt_Amount'));
+    }
+
     public function test_approval_updates_only_selected_ids_uses_acceptance_date_and_is_immutable(): void
     {
         $selected = $this->prospect(['Creation_Date' => '2026-10-10']);
@@ -229,6 +359,7 @@ final class SmsRecordWorkflowTest extends TestCase
         self::assertSame(0, $this->db->table('TblSMSLegacySends')->count(), 'Record approval must not invent phone-level sends.');
         self::assertSame('approved', $this->runs->show(self::ID)->status);
         self::assertSame($at, $this->db->table('TblSMSRuns')->value('Approved_At'));
+        self::assertSame('2026-10-26', $this->db->table('TblSMSDrops')->value('Drop_Date'), 'Approval must not replace the CSV planned Monday with its acceptance date.');
         self::assertSame('approver@example.invalid', $this->db->table('TblSMSRuns')->value('Approved_By'));
         foreach ([fn () => $this->runs->discard(self::ID), fn () => $this->runs->requestSent(self::ID, 'actor'),
             fn () => $this->runs->reviewOnly(self::ID, 'actor'), fn () => $this->runs->requestNotSent(self::ID, 'actor', 'A sufficiently long correction reason')] as $action) $this->refuses($action);
@@ -236,15 +367,34 @@ final class SmsRecordWorkflowTest extends TestCase
         self::assertNull($this->runs->overview()['open']); self::assertSame('approved', $this->runs->overview()['recent'][0]->status);
     }
 
-    public function test_frozen_file_and_approval_do_not_recheck_live_eligibility(): void
+    public function test_confirmed_j4_uses_california_acceptance_day_not_monday_and_freezes_microseconds(): void
+    {
+        (require dirname(__DIR__, 2).'/database/sms-migrations/2026_10_23_000001_add_sms_contact_attribution_evidence.php')->up();
+        config(['sms-exports.contact_attribution_enabled' => true, 'sms-exports.contact_source_system' => 'fixture.contacts',
+            'sms-exports.contact_source_contract_sha256' => str_repeat('a', 64)]);
+        $pk = $this->prospect(); $this->fileReady(1);
+        $bytes = file_get_contents($this->runs->filePath(self::ID));
+        Carbon::setTestNow(Carbon::parse('2026-10-22T06:59:59.987654Z'));
+        $this->runs->requestApprove(self::ID, 'first@example.invalid');
+        self::assertSame('2026-10-22 06:59:59.987654', $this->db->table('TblSMSRuns')->value('Approved_At'));
+        self::assertSame(6, (int) $this->db->table('TblSMSRuns')->value('Approved_At_Precision'));
+        Carbon::setTestNow(Carbon::parse('2026-10-24T12:00:00Z'));
+        $this->runs->requestApprove(self::ID, 'later@example.invalid');
+        $this->runs->markApproved(self::ID); $this->runs->markApproved(self::ID);
+        self::assertSame('2026-10-21', $this->db->table('TblProspects')->where('PK', $pk)->value('Last_SMS_Date'));
+        self::assertSame('2026-10-26', $this->db->table('TblSMSDrops')->value('Drop_Date'));
+        self::assertSame('2026-10-22 06:59:59.987654', $this->db->table('TblSMSRuns')->value('Approved_At'));
+        self::assertSame('first@example.invalid', $this->db->table('TblSMSRuns')->value('Approved_By'));
+        self::assertSame($bytes, file_get_contents($this->runs->filePath(self::ID)));
+        self::assertSame(1, (int) $this->db->table('TblProspects')->value('SMS_Attempts'));
+        self::assertNull($this->db->table('TblProspects')->value('Contacted_Date'));
+    }
+
+    public function test_current_name_and_address_changes_do_not_reprice_or_rewrite_frozen_content(): void
     {
         $pk = $this->prospect(['Client' => 'Original Name', 'Address' => 'Original Address']);
         $this->prepare(1);
-        $this->db->table('TblSMSSuppressions')->insert(['Phone' => '2025550100', 'Opt_Out' => 1,
-            'Invalid_Phone' => 1, 'Updated_At' => '2026-10-20']);
-        $this->db->table('TblPhoneNumbers')->insert(['Phone' => '12025550100']);
-        $this->db->table('TblProspects')->where('PK', $pk)->update(['Client' => 'Changed Name', 'Address' => 'Changed Address',
-            'Contacted' => 1, 'Opt_Out' => 1, 'Invalid_Phone' => 1, 'Tier' => 'T9', 'Phone' => '2025550199']);
+        $this->db->table('TblProspects')->where('PK', $pk)->update(['Client' => 'Changed Name', 'Address' => 'Changed Address']);
         $this->runs->requestFile(self::ID); $this->runs->buildFile(self::ID);
         $text = file_get_contents($this->runs->filePath(self::ID));
         self::assertStringContainsString('Original', $text); self::assertStringContainsString('Original Address', $text);
@@ -252,7 +402,87 @@ final class SmsRecordWorkflowTest extends TestCase
         $this->runs->requestApprove(self::ID, 'actor'); $this->runs->markApproved(self::ID);
         $history = $this->db->table('TblSMSHistory')->first();
         self::assertSame('Original Name', $history->Client); self::assertSame('T1', $history->Debt_Tier); self::assertSame('2025550100', $history->Phone);
-        self::assertSame(1, (int) $this->db->table('TblProspects')->value('Opt_Out'));
+        self::assertSame(0, (int) $this->db->table('TblProspects')->value('Opt_Out'));
+    }
+
+    public static function lateSuppressions(): array
+    {
+        $cases = [];
+        foreach (['building','ready','accepted'] as $phase) {
+            foreach (['Contacted','Opt_Out','Invalid_Phone','phone_changed','contact_ten','contact_eleven','opt_out_phone','invalid_phone'] as $reason) {
+                $cases[$phase.'_'.$reason] = [$phase, $reason];
+            }
+        }
+        return $cases;
+    }
+
+    #[DataProvider('lateSuppressions')]
+    public function test_late_suppression_holds_frozen_build_download_and_approval(string $phase, string $reason): void
+    {
+        $pk = $this->prospect(); $this->prepare(1);
+        $snapshot = $this->db->table('TblProspectsExport')->first();
+        $this->runs->requestFile(self::ID);
+        $path = $hash = null;
+        if ($phase !== 'building') {
+            $this->runs->buildFile(self::ID);
+            $path = $this->runs->filePath(self::ID); $hash = hash_file('sha256', $path);
+        }
+        if ($phase === 'accepted') $this->runs->requestApprove(self::ID, 'actor@example.invalid');
+        if (in_array($reason, ['Contacted','Opt_Out','Invalid_Phone'], true)) {
+            $this->db->table('TblProspects')->where('PK', $pk)->update([$reason => 1]);
+        } elseif ($reason === 'phone_changed') {
+            $this->db->table('TblProspects')->where('PK', $pk)->update(['Phone' => '2025550199']);
+        } elseif (str_starts_with($reason, 'contact_')) {
+            $this->db->table('TblPhoneNumbers')->insert(['Phone' => $reason === 'contact_ten' ? '2025550100' : '12025550100']);
+        } else {
+            $this->db->table('TblSMSSuppressions')->insert(['Phone' => '2025550100',
+                'Opt_Out' => $reason === 'opt_out_phone' ? 1 : 0, 'Invalid_Phone' => $reason === 'invalid_phone' ? 1 : 0,
+                'Updated_At' => '2026-10-20']);
+        }
+        $actions = $phase === 'building' ? [fn () => $this->runs->buildFile(self::ID)]
+            : ($phase === 'accepted' ? [fn () => $this->runs->markApproved(self::ID)]
+                : [fn () => $this->runs->filePath(self::ID), fn () => $this->runs->requestApprove(self::ID, 'actor@example.invalid')]);
+        foreach ($actions as $action) {
+            try { $action(); self::fail('A late suppressed frozen member was released.'); }
+            catch (\RuntimeException $error) { self::assertStringContainsString('held without changing membership', $error->getMessage()); }
+        }
+        self::assertEquals($snapshot, $this->db->table('TblProspectsExport')->first());
+        self::assertSame(0, $this->db->table('TblSMSHistory')->count());
+        self::assertSame(0, (int) $this->db->table('TblProspects')->sum('SMS_Attempts'));
+        if ($path !== null) self::assertSame($hash, hash_file('sha256', $path));
+    }
+
+    public function test_state_drift_holds_file_and_approval_without_replacing_frozen_members(): void
+    {
+        $pk = $this->prospect(['State' => 'CA']);
+        $this->prepare(1);
+        $snapshot = $this->db->table('TblProspectsExport')->where('Request_ID', self::ID)->first();
+        $this->runs->requestFile(self::ID);
+
+        $this->db->table('TblProspects')->where('PK', $pk)->update(['State' => 'WV']);
+        try { $this->runs->buildFile(self::ID); self::fail('Excluded State was exported.'); }
+        catch (\RuntimeException $error) { self::assertStringContainsString('State', $error->getMessage()); }
+        self::assertNull($this->db->table('TblSMSRuns')->value('File_Path'));
+        self::assertEquals($snapshot, $this->db->table('TblProspectsExport')->where('Request_ID', self::ID)->first());
+        self::assertSame(0, $this->db->table('TblSMSHistory')->count());
+
+        $this->db->table('TblProspects')->where('PK', $pk)->update(['State' => 'CA']);
+        $this->runs->buildFile(self::ID);
+        $path = $this->runs->filePath(self::ID);
+        $hash = hash_file('sha256', $path);
+        $this->db->table('TblProspects')->where('PK', $pk)->update(['State' => 'NY']);
+        try { $this->runs->requestApprove(self::ID, 'actor@example.invalid'); self::fail('Changed State was approved.'); }
+        catch (\RuntimeException $error) { self::assertStringContainsString('State', $error->getMessage()); }
+        self::assertSame('file_ready', $this->runs->show(self::ID)->status);
+        self::assertSame($hash, hash_file('sha256', $path));
+        self::assertEquals($snapshot, $this->db->table('TblProspectsExport')->where('Request_ID', self::ID)->first());
+        self::assertSame(0, (int) $this->db->table('TblProspects')->value('SMS_Attempts'));
+        self::assertSame(0, $this->db->table('TblSMSHistory')->count());
+
+        $this->db->table('TblProspects')->where('PK', $pk)->update(['State' => 'CA']);
+        $this->runs->requestApprove(self::ID, 'actor@example.invalid');
+        $this->runs->markApproved(self::ID);
+        self::assertSame('approved', $this->runs->show(self::ID)->status);
     }
 
     public function test_history_failure_rolls_back_prospect_history_summary_and_status_together(): void
@@ -269,6 +499,21 @@ final class SmsRecordWorkflowTest extends TestCase
         $this->runs->fail(self::ID, 'approve', 'synthetic failure');
         $this->runs->retry(self::ID); $this->runs->markApproved(self::ID);
         self::assertSame('approved', $this->runs->show(self::ID)->status);
+    }
+
+    public function test_download_grant_pins_a_pending_file_without_eligibility_while_release_still_holds(): void
+    {
+        $pk = $this->prospect(); $this->fileReady(1);
+        $path = $this->runs->filePath(self::ID);
+        $this->db->table('TblProspects')->where('PK', $pk)->update(['Contacted' => 1]);
+        // Issuing a grant only pins the exact verified bytes; streaming them still refuses the held member.
+        self::assertSame($path, $this->runs->grantArtifactPath(self::ID));
+        try { $this->runs->filePath(self::ID); self::fail('A late suppressed frozen member was released.'); }
+        catch (\RuntimeException $error) { self::assertStringContainsString('held without changing membership', $error->getMessage()); }
+        file_put_contents($path, 'tampered', FILE_APPEND);
+        $this->refuses(fn () => $this->runs->grantArtifactPath(self::ID));
+        $this->runs->discard(self::ID);
+        $this->refuses(fn () => $this->runs->grantArtifactPath(self::ID), 404);
     }
 
     public function test_delete_removes_pending_file_and_membership_without_a_send_or_history(): void
@@ -348,20 +593,52 @@ final class SmsRecordWorkflowTest extends TestCase
 
     public function test_report_uses_frozen_tiers_and_does_not_invent_unimplemented_response_metrics(): void
     {
-        $a = $this->prospect(['Tier' => 'T2']); $b = $this->prospect(['Tier' => 'T2']);
-        $this->fileReady(2); $this->runs->requestApprove(self::ID, 'actor'); $this->runs->markApproved(self::ID);
-        $this->db->table('TblProspects')->update(['Tier' => 'T9','Contacted' => 1,'Opt_Out' => 1,'Invalid_Phone' => 1]);
+        $a = $this->prospect(); $b = $this->prospect();
+        $this->prepare(2);
+        $this->db->table('TblProspectsExport')->update(['Debt_Tier' => 'T2']);
+        $this->db->table('TblSMSDrops')->update(['Debt_Tier' => 'T2']);
+        $this->runs->requestFile(self::ID); $this->runs->buildFile(self::ID);
+        $this->runs->requestApprove(self::ID, 'actor'); $this->runs->markApproved(self::ID);
+        $this->db->table('TblProspects')->update(['Contacted' => 1,'Opt_Out' => 1,'Invalid_Phone' => 1]);
         $this->db->table('TblSMSResponseAttribution')->insert(['Prospect_PK' => $a, 'Request_ID' => self::ID,
             'Contact_At_UTC' => '2026-10-21 12:00:00', 'Contacted_Date' => '2026-10-21', 'Created_At' => '2026-10-21 13:00:00']);
         $report = $this->runs->details(self::ID);
         self::assertSame('Live Status', $report['reporting']); self::assertCount(9, $report['tiers']);
-        self::assertSame(['tier' => 'T2','records' => 2,'opt_out' => 2,'invalid' => 2,'contacted' => null,'response_rate' => null], $report['tiers'][1]);
+        self::assertSame(['tier' => 'T2','records' => 2,'opt_out' => 2,'invalid' => 2,'contacted' => 2,'response_rate' => null], $report['tiers'][1]);
         self::assertNull($report['tiers'][0]['response_rate']); self::assertSame(0, $report['tiers'][8]['records']);
-        self::assertSame(2, $report['total']['records']); self::assertNull($report['total']['response_rate']);
-        self::assertFalse($report['response_metrics_available']); self::assertStringContainsString('not implemented', $report['response_metrics_reason']);
+        self::assertSame(2, $report['total']['records']); self::assertSame(2, $report['total']['contacted']); self::assertNull($report['total']['response_rate']);
+        self::assertTrue($report['contacted_metrics_available']); self::assertSame('current_prospect_flag', $report['contacted_metrics_basis']);
+        self::assertFalse($report['response_metrics_available']); self::assertStringContainsString('attribution', $report['response_metrics_reason']);
+        self::assertStringContainsString('unavailable', $report['response_metrics_reason']);
         // A prospect disappearing must not change the original denominator.
         $this->db->table('TblProspects')->where('PK', $b)->delete();
-        self::assertSame(2, $this->runs->details(self::ID)['total']['records']);
+        $missing = $this->runs->details(self::ID);
+        self::assertSame(2, $missing['total']['records']); self::assertSame(1, $missing['total']['contacted']);
+    }
+
+    public function test_live_contacted_flags_are_exact_frozen_pks_read_only_and_not_phone_or_attribution_matches(): void
+    {
+        $a = $this->prospect(); $b = $this->prospect();
+        $this->fileReady(2); $this->runs->requestApprove(self::ID, 'actor'); $this->runs->markApproved(self::ID);
+        $this->prospect(['Contacted' => 1]); // Same phone, outside the approved membership.
+        $this->db->table('TblProspects')->where('PK', $a)->update(['Contacted' => 1, 'Opt_Out' => 1, 'Invalid_Phone' => 1]);
+        $this->db->table('TblSMSResponseAttribution')->insert(['Prospect_PK' => $b, 'Request_ID' => self::ID,
+            'Contact_At_UTC' => '2026-10-21 12:00:00', 'Contacted_Date' => '2026-10-21', 'Created_At' => '2026-10-21 13:00:00']);
+        $snapshot = fn (): array => array_map(fn ($table) => $this->db->table($table)->orderBy($table === 'TblSMSResponseAttribution' ? 'Prospect_PK' : 'PK')->get()->toJson(),
+            ['TblProspects','TblSMSHistory','TblSMSRuns','TblSMSDrops','TblProspectsExport','TblSMSResponseAttribution']);
+        $before = $snapshot(); $this->db->beginTransaction();
+        try {
+            $report = $this->runs->details(self::ID);
+            self::assertSame(['records' => 2, 'opt_out' => 1, 'invalid' => 1, 'contacted' => 1, 'response_rate' => null], $report['total']);
+            self::assertSame(['T1','T2','T3','T4','T5','T6','T7','T8','T9'], array_column($report['tiers'], 'tier'));
+            self::assertSame(array_fill(0, 8, 0), array_column(array_slice($report['tiers'], 1), 'contacted'));
+            self::assertFalse($report['response_metrics_available']); self::assertSame($before, $snapshot());
+        } finally { $this->db->rollBack(); }
+        self::assertSame($before, $snapshot()); self::assertSame(0, $this->db->transactionLevel());
+        $this->db->table('TblProspects')->where('PK', $a)->update(['Contacted' => 0]);
+        $changed = $snapshot();
+        self::assertSame(0, $this->runs->details(self::ID)['total']['contacted']);
+        self::assertSame($changed, $snapshot());
     }
 
     public function test_legacy_actions_stay_blocked_for_record_batches_when_feature_is_turned_off(): void

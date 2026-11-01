@@ -44,6 +44,7 @@ SQL;
     public static function install(PDO $db): void
     {
         self::dedicated($db);
+        self::assertNoExternalEvents($db);
         self::transaction($db, function () use ($db): void {
             foreach (['Runs', 'Chunks', 'Rows'] as $suffix) {
                 if (self::rows($db, 'SELECT OBJECT_ID(?) AS id', ['dbo.TblSMSLegacyImport'.$suffix])[0]['id'] !== null) {
@@ -344,11 +345,20 @@ SQL, [$runId, self::json($events)])[0];
                 $held[] = $name;
             }
 
+            self::assertNoExternalEvents($db);
             return $work();
         } finally {
             foreach (array_reverse($held) as $name) {
                 self::execute($db, "EXEC sys.sp_releaseapplock @Resource=?,@LockOwner='Session'", [$name]);
             }
+        }
+    }
+
+    private static function assertNoExternalEvents(PDO $db): void
+    {
+        $object = self::rows($db, "SELECT OBJECT_ID(N'dbo.TblSMSExternalEvents',N'U') AS id")[0]['id'] ?? null;
+        if ($object !== null && self::rows($db, 'SELECT TOP(1) Request_ID FROM dbo.TblSMSExternalEvents WITH(HOLDLOCK)') !== []) {
+            throw new RuntimeException('This legacy phone/day writer does not support exact-PK external SMS events. Keep historical evidence unchanged and use the dedicated external-event workflow.');
         }
     }
 

@@ -13,6 +13,8 @@ class GenerateAdvanceRequest extends Command
 {
     protected $signature = 'Generate:advance-request
                             {--month= : Reporting month as YYYY-MM (defaults to previous calendar month)}
+                            {--advance-month= : Advance month displayed on the email and invoice, as YYYY-MM (defaults to the reporting month)}
+                            {--invoice-date= : Invoice issue date as YYYY-MM-DD (defaults to today)}
                             {--company=all : Send LDR, PLAW, or all; allocation always includes both companies}
                             {--dry-run : Calculate and display results without sending email}
                             {--send-to-me : Send only to oduai@libertydebtrelief.com instead of TblReports recipients}';
@@ -40,7 +42,10 @@ class GenerateAdvanceRequest extends Command
             return Command::FAILURE;
         }
         $window = $this->resolveMonthWindow();
+        $advanceWindow = $this->resolveMonthWindow('advance-month', $window);
+        $invoiceDate = $this->resolveInvoiceDate();
         $this->info("[INFO] Advance request period: {$window['label']} ({$window['start']} through {$window['end_exclusive']})");
+        $this->info('[INFO] Advance month: ' . $advanceWindow['label'] . '; invoice date: ' . $invoiceDate->format('Y-m-d'));
 
         $sendToMe = (bool) $this->option('send-to-me');
         $isDryRun = (bool) $this->option('dry-run');
@@ -110,7 +115,7 @@ class GenerateAdvanceRequest extends Command
             $allocation['ldr'], $allocation['progress_law'], $tranche));
 
         $invoiceBuilder = new AdvanceRequestInvoiceBuilder();
-        $monthLabel = $window['label'];
+        $monthLabel = $advanceWindow['label'];
         $sent = true;
 
         foreach ([
@@ -136,7 +141,7 @@ class GenerateAdvanceRequest extends Command
             }
             $subject = $request['subject'];
             $body = $this->buildEmailBody($request['name'], $request['amount'], $tranche, $monthLabel);
-            $invoice = $this->buildInvoiceData($request['name'], $request['amount'], $tranche, $window);
+            $invoice = $this->buildInvoiceData($request['name'], $request['amount'], $tranche, $advanceWindow, $invoiceDate);
             // Invoice registry (own switch, default off): live sends only; replaces just the printed invoice number.
             $registeredNumber = null;
             if (! $isDryRun && ! $sendToMe) {
@@ -222,11 +227,14 @@ class GenerateAdvanceRequest extends Command
         return $company === 'PLAW' ? 'PLAW_MS' : 'MS';
     }
 
-    private function resolveMonthWindow(): array
+    private function resolveMonthWindow(string $option = 'month', ?array $fallback = null): array
     {
-        $month = $this->option('month');
-        if ($month !== null && !preg_match('/^\d{4}-\d{2}$/', (string) $month)) {
-            throw new \InvalidArgumentException("Invalid --month value '{$month}', expected YYYY-MM.");
+        $month = $this->option($option);
+        if ($month === null && $fallback !== null) {
+            return $fallback;
+        }
+        if ($month !== null && !preg_match('/^\d{4}-(0[1-9]|1[0-2])$/', (string) $month)) {
+            throw new \InvalidArgumentException("Invalid --{$option} value '{$month}', expected YYYY-MM.");
         }
 
         $start = $month !== null
@@ -238,6 +246,19 @@ class GenerateAdvanceRequest extends Command
             'start' => $start->format('Y-m-d'),
             'end_exclusive' => $start->copy()->addMonthNoOverflow()->format('Y-m-d'),
         ];
+    }
+
+    private function resolveInvoiceDate(): \DateTimeInterface
+    {
+        $value = $this->option('invoice-date');
+        if ($value === null) {
+            return now();
+        }
+        $date = \DateTimeImmutable::createFromFormat('!Y-m-d', (string) $value);
+        if ($date === false || $date->format('Y-m-d') !== $value) {
+            throw new \InvalidArgumentException('Invalid --invoice-date; expected a valid YYYY-MM-DD date.');
+        }
+        return $date;
     }
 
     private function fetchAzureEnrollments(DBConnector $connector, array $window): array
@@ -346,7 +367,7 @@ class GenerateAdvanceRequest extends Command
             . '</div>';
     }
 
-    private function buildInvoiceData(string $program, float $amount, string $tranche, array $window): array
+    private function buildInvoiceData(string $program, float $amount, string $tranche, array $window, ?\DateTimeInterface $invoiceDate = null): array
     {
         $prefix = $program === 'Progress Law' ? 'PLAW' : 'LDR';
         $trancheToken = preg_replace('/[^A-Za-z0-9]+/', '-', strtoupper($tranche)) ?: 'UNKNOWN';
@@ -357,7 +378,7 @@ class GenerateAdvanceRequest extends Command
             'tranche' => $tranche,
             'month' => $window['label'],
             'invoice_number' => sprintf('%s-ADV-%s-%s', $prefix, str_replace('-', '', $window['start']), $trancheToken),
-            'issue_date' => now()->format('F j, Y'),
+            'issue_date' => ($invoiceDate ?? now())->format('F j, Y'),
             'sample' => false,
         ];
     }

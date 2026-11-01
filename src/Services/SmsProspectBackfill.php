@@ -55,6 +55,7 @@ SQL;
     public static function install(PDO $db): void
     {
         self::dedicated($db);
+        self::assertNoExternalEvents($db);
         $db->beginTransaction();
         try {
             foreach (['Runs', 'Batches', 'Rows'] as $suffix) {
@@ -142,12 +143,13 @@ SQL;
                         throw new RuntimeException('Candidate contact or identity proof failed.');
                     }
                     $city = trim((string) $row['City']);
-                    $state = strtoupper(trim((string) $row['State']));
+                    $state = SmsStatePolicy::normalize($row['State']);
+                    $stateReason = SmsStatePolicy::holdReason($row['State']);
                     $inputs[] = ['Source_PK' => $candidate['Source_PK'], 'Unique_Source_PK' => $row['Unique_Source_PK'],
                         'Source_SHA256' => $candidate['Observed_SHA256'],
-                        'Reason' => $row['Unique_Source_PK'] === null ? 'unresolved_source_owner' : (! (bool) $row['City_Valid'] ? 'invalid_city' : null),
+                        'Reason' => $stateReason ?? ($row['Unique_Source_PK'] === null ? 'unresolved_source_owner' : (! (bool) $row['City_Valid'] ? 'invalid_city' : null)),
                         'Creation_Date' => $row['Creation_Date'], 'Client' => $row['Client'], 'Address' => $row['Address'],
-                        'City' => $city === '' ? null : $city, 'State' => preg_match('/^[A-Z]{2}$/D', $state) ? $state : null,
+                        'City' => $city === '' ? null : $city, 'State' => $state,
                         'Zip' => $row['Zip'], 'Tier' => SmsProspectValues::tier($row['Source_Tier']), 'Phone' => $contact['Phone'], 'Email' => $contact['Email']];
                 }
                 // One set-based write round trip per chunk, not thousands of per-person
@@ -304,7 +306,12 @@ SQL;
     {
         $json = \SmsProspectReconciliation::json($inputs);
         if (strlen($json) > 2 * 1024 * 1024) throw new RuntimeException('Backfill payload exceeded the chunk limit.');
-        return self::rows($db, <<<'SQL'
+        // Standalone recovery tools have no Laravel config container. Select the
+        // compatibility reader from actual additive schema, preserving old rows.
+        $wideColumns = self::rows($db, "SELECT c.name FROM sys.columns c WHERE c.object_id=OBJECT_ID('dbo.TblPhoneNumbers') AND c.name IN ('Phone1','Phone2','Phone3','Phone4')");
+        if (count($wideColumns) !== 0 && count($wideColumns) !== 4) throw new RuntimeException('Wide phone contact schema is incomplete; backfill remains held.');
+        $contacts = count($wideColumns) === 4 ? SmsPhoneNumbersSql::from('c', ' WITH (HOLDLOCK)', true) : 'dbo.TblPhoneNumbers c WITH(HOLDLOCK)';
+        return self::rows($db, <<<SQL
 SET NOCOUNT ON;
 DECLARE @run uniqueidentifier=?,@reviewed bit=?,@no_prior_sends bit=?;
 SELECT * INTO #BFInput FROM OPENJSON(CAST(? AS nvarchar(max))) WITH (
@@ -350,15 +357,15 @@ SELECT n.*,
  h.Latest_Export_Date,h.SMS_Attempts,
  CONVERT(char(64),HASHBYTES('SHA2_256',COALESCE((SELECT e.Event_ID,e.Send_Date FROM #BFEvents e WHERE e.Phone=n.Phone ORDER BY e.Send_Date,e.Event_ID FOR JSON PATH,INCLUDE_NULL_VALUES),N'[]')),2) AS History_SHA256
 INTO #BFReady FROM #BFNew n
-OUTER APPLY(SELECT TOP(1) 1 AS found FROM dbo.TblPhoneNumbers c WITH(HOLDLOCK) WHERE c.Phone IN(n.Phone,'1'+n.Phone)) c
+OUTER APPLY(SELECT TOP(1) 1 AS found FROM {$contacts} WHERE c.Phone IN(n.Phone,'1'+n.Phone)) c
 LEFT JOIN dbo.TblSMSSuppressions s WITH(UPDLOCK,HOLDLOCK) ON s.Phone=n.Phone
 -- Parallel workers can self-deadlock while taking RangeS-U locks on absent phone keys.
 -- Keep the suppression/identity locks; serialize these bounded locking lookups instead.
 OUTER APPLY(SELECT MAX(Send_Date) AS Latest_Export_Date,COUNT(*) AS SMS_Attempts FROM #BFEvents e WHERE e.Phone=n.Phone) h OPTION(MAXDOP 1);
 CREATE TABLE #BFAdded(Source_PK int PRIMARY KEY,Prospect_PK int NOT NULL);
 MERGE dbo.TblProspects AS target USING #BFReady AS source ON 1=0
-WHEN NOT MATCHED THEN INSERT(Creation_Date,Client,Address,City,State,Zip,Tier,Phone,Email,Contacted,Response_Date,Invalid_Phone,Opt_Out,Latest_Export_Date,SMS_Attempts)
- VALUES(source.Creation_Date,source.Client,source.Address,source.City,source.State,source.Zip,source.Tier,source.Phone,source.Email,source.Contacted,NULL,source.Invalid_Phone,source.Opt_Out,source.Latest_Export_Date,source.SMS_Attempts)
+WHEN NOT MATCHED THEN INSERT(Creation_Date,Client,Address,City,State,Zip,Phone,Email,Contacted,Response_Date,Invalid_Phone,Opt_Out,Latest_Export_Date,SMS_Attempts)
+ VALUES(source.Creation_Date,source.Client,source.Address,source.City,source.State,source.Zip,source.Phone,source.Email,source.Contacted,NULL,source.Invalid_Phone,source.Opt_Out,source.Latest_Export_Date,source.SMS_Attempts)
 OUTPUT source.Source_PK,inserted.PK INTO #BFAdded;
 INSERT dbo.TblSMSProspectBackfillRows(Run_ID,Source_PK,Unique_Source_PK,Prospect_PK,Decision,Reason,Source_SHA256,After_SHA256,History_SHA256)
 SELECT @run,i.Source_PK,i.Unique_Source_PK,COALESCE(a.Prospect_PK,x.PK),
@@ -436,9 +443,18 @@ SQL, [$runId, (int) $historyReviewed, (int) $noPriorSends, $json])[0];
                 if ((int) $lock['result'] < 0) throw new RuntimeException('Another SMS workflow is active; no backfill chunk was started.');
                 $held[] = $name;
             }
+            self::assertNoExternalEvents($db);
             return $work();
         } finally {
             foreach (array_reverse($held) as $name) self::execute($db, "EXEC sys.sp_releaseapplock @Resource=?,@LockOwner='Session'", [$name]);
+        }
+    }
+
+    private static function assertNoExternalEvents(PDO $db): void
+    {
+        $object = self::rows($db, "SELECT OBJECT_ID(N'dbo.TblSMSExternalEvents',N'U') AS id")[0]['id'] ?? null;
+        if ($object !== null && self::rows($db, 'SELECT TOP(1) Request_ID FROM dbo.TblSMSExternalEvents WITH(HOLDLOCK)') !== []) {
+            throw new RuntimeException('This legacy phone/day writer does not support exact-PK external SMS events. Keep historical evidence unchanged and use the dedicated external-event workflow.');
         }
     }
 

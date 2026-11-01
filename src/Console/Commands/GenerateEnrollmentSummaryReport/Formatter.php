@@ -2,11 +2,13 @@
 
 namespace Cmd\Reports\Console\Commands\GenerateEnrollmentSummaryReport;
 
+use PhpOffice\PhpSpreadsheet\Cell\DataType;
 use PhpOffice\PhpSpreadsheet\Shared\Date as ExcelDate;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Style\Alignment;
 use PhpOffice\PhpSpreadsheet\Style\Border;
 use PhpOffice\PhpSpreadsheet\Style\Fill;
+use PhpOffice\PhpSpreadsheet\Worksheet\Worksheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 
 class Formatter
@@ -125,7 +127,7 @@ class Formatter
     private const PEEL_OFF_COMPANIES = [PeelOffsBuilder::COMPANY_PROGRESS_LAW, PeelOffsBuilder::COMPANY_LDR];
 
     /**
-     * Builds the combined workbook: Enrollment Summary, Peel Offs, Tranche Summary, Capital Report.
+     * Builds Enrollment Summary, hidden Sellable Debt detail, Peel Offs, Tranche Summary, Capital Report.
      *
      * @param array<int, array<string, mixed>> $enrollmentRows Ordered row definitions from the command.
      * @param string[] $columnKeys e.g. ['Total', 'LDR', 'Legal']
@@ -133,6 +135,7 @@ class Formatter
      * @param array{rows: array<int, array<string, mixed>>, totals: array<string, mixed>}|null $capitalReport
      * @param array<int, array{label: string, contacts: int, fee: ?float, residual: float, projection: float, bold: bool}>|null $monthlyResiduals
      * @param array{nsf: array<int, array<string, mixed>>, cancel: array<int, array<string, mixed>>, unprocessed: array<int, array<string, mixed>>}|null $peelOffs
+     * @param array<int, array<string, mixed>>|null $sellableDebtPayingRows
      */
     public function buildWorkbook(
         array $enrollmentRows,
@@ -141,7 +144,9 @@ class Formatter
         ?array $trancheRows = null,
         ?array $capitalReport = null,
         ?array $monthlyResiduals = null,
-        ?array $peelOffs = null
+        ?array $peelOffs = null,
+        ?array $sellableDebtPayingRows = null,
+        string $sellableDebtPayingMonth = 'First Month'
     ): ?array {
         if (empty($enrollmentRows)) {
             return null;
@@ -154,6 +159,10 @@ class Formatter
         $spreadsheet->removeSheetByIndex(0);
 
         $this->buildEnrollmentSummarySheet($spreadsheet, $enrollmentRows, $columnKeys, $reportDate);
+
+        if ($sellableDebtPayingRows !== null) {
+            $this->buildSellableDebtPayingSheet($spreadsheet, $sellableDebtPayingRows, $sellableDebtPayingMonth);
+        }
 
         if ($peelOffs !== null) {
             $this->buildPeelOffsSheet($spreadsheet, $peelOffs, $reportDate);
@@ -259,6 +268,7 @@ class Formatter
         $sheet->getStyle("A3:{$lastColLetter}3")->applyFromArray([
             'font' => ['bold' => true],
             'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER],
+            'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['argb' => 'FF8EA9DB']],
         ]);
 
         $rowIndex = 4;
@@ -317,6 +327,62 @@ class Formatter
         $sheet->getStyle("A3:{$lastColLetter}{$lastRow}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
         $sheet->getStyle("A1:{$lastColLetter}{$lastRow}")->getFont()->setName('Calibri')->setSize(9);
         $sheet->setSelectedCells('B1');
+    }
+
+    /** Hidden audit detail for the first month's Total Sellable Debt Paying summary amount. */
+    private function buildSellableDebtPayingSheet(Spreadsheet $spreadsheet, array $rows, string $monthLabel): void
+    {
+        $sheet = $spreadsheet->createSheet();
+        $sheet->setTitle('Sellable Debt Paying Detail');
+        $sheet->setShowGridlines(false);
+
+        $headers = ['LLG_ID', 'Name', 'Debt_Amount', 'First_Payment_Date', 'First_Payment_Cleared_Date'];
+        $sheet->setCellValue('A1', "Sellable Debt Paying in {$monthLabel} (First Month)");
+        $sheet->getStyle('A1')->getFont()->setBold(true);
+        $sheet->getColumnDimension('A')->setWidth(18);
+        $sheet->getColumnDimension('B')->setWidth(32);
+        $sheet->getColumnDimension('C')->setWidth(18);
+        $sheet->getColumnDimension('D')->setWidth(22);
+        $sheet->getColumnDimension('E')->setWidth(30);
+
+        foreach ($headers as $index => $header) {
+            $column = chr(ord('A') + $index);
+            $sheet->setCellValue("{$column}3", $header);
+        }
+        $sheet->getStyle('A3:E3')->applyFromArray([
+            'font' => ['bold' => true],
+            'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER],
+            'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['argb' => 'FF8EA9DB']],
+        ]);
+
+        usort($rows, static fn (array $left, array $right): int =>
+            strcasecmp((string) ($left['Name'] ?? ''), (string) ($right['Name'] ?? ''))
+            ?: strcmp((string) ($left['LLG_ID'] ?? ''), (string) ($right['LLG_ID'] ?? ''))
+        );
+
+        $rowIndex = 4;
+        foreach ($rows as $row) {
+            $sheet->setCellValueExplicit("A{$rowIndex}", (string) ($row['LLG_ID'] ?? ''), DataType::TYPE_STRING);
+            $sheet->setCellValue("B{$rowIndex}", (string) ($row['Name'] ?? ''));
+            $sheet->setCellValue("C{$rowIndex}", (float) ($row['Debt_Amount'] ?? 0));
+            foreach (['D' => 'First_Payment_Date', 'E' => 'First_Payment_Cleared_Date'] as $column => $key) {
+                $value = $row[$key] ?? null;
+                if ($value !== null && $value !== '') {
+                    $sheet->setCellValue("{$column}{$rowIndex}", ExcelDate::PHPToExcel(new \DateTimeImmutable((string) $value)));
+                }
+            }
+            $rowIndex++;
+        }
+        if ($rowIndex > 4) {
+            $sheet->getStyle('C4:C' . ($rowIndex - 1))->getNumberFormat()->setFormatCode('$#,##0.00');
+            $sheet->getStyle('D4:E' . ($rowIndex - 1))->getNumberFormat()->setFormatCode('m/d/yyyy');
+            $sheet->getStyle('A3:E' . ($rowIndex - 1))->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN);
+        }
+
+        $sheet->getStyle('A1:E' . max(3, $rowIndex - 1))->getFont()->setName('Calibri')->setSize(9);
+        $sheet->setSheetState(Worksheet::SHEETSTATE_HIDDEN);
+        $sheet->freezePane('A4');
+        $sheet->setSelectedCells('A4');
     }
 
     /**

@@ -134,7 +134,6 @@ return new class extends Migration
                 $table->string('City', 100)->nullable();
                 $table->char('State', 2)->nullable();
                 $table->string('Zip', 10)->nullable();
-                $table->string('Tier', 2)->nullable();
                 $table->string('Phone', 10)->nullable()->index('IX_TblProspects_Phone');
                 $table->string('Email', 254)->nullable();
                 $table->boolean('Contacted')->default(false);
@@ -159,7 +158,6 @@ CREATE TABLE dbo.TblProspects (
     City VARCHAR(100) NULL,
     State CHAR(2) NULL,
     Zip VARCHAR(10) NULL,
-    Tier VARCHAR(2) NULL,
     Phone VARCHAR(10) NULL,
     Email VARCHAR(254) NULL,
     Contacted BIT NOT NULL CONSTRAINT DF_TblProspects_Contacted DEFAULT 0,

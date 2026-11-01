@@ -10,6 +10,9 @@ use RuntimeException;
 /** A shared checkpoint file: readers see complete JSON and parallel sources cannot lose keys. */
 final class ContactSyncWatermark
 {
+    /** Above this many skipped records a source keeps its checkpoint instead of retrying by ID. */
+    public const MAX_RETRY_IDS = 5000;
+
     public static function read(string $path, string $source): ?string
     {
         self::validateSource($source);
@@ -21,6 +24,36 @@ final class ContactSyncWatermark
     {
         self::validateSource($source);
         self::validateDate($datetime);
+        self::replace($path, fn (): array => self::readAll($path), function (array $data) use ($source, $datetime): array {
+            // A delayed completion must never move a successfully recorded source backwards.
+            $data[$source] = max($data[$source] ?? $datetime, $datetime);
+            return $data;
+        });
+    }
+
+    /** Native source IDs the last completed run skipped; the next incremental run fetches them by ID. */
+    public static function readRetryIds(string $path, string $source): array
+    {
+        self::validateSource($source);
+        return self::readRetryAll($path)[$source] ?? [];
+    }
+
+    public static function writeRetryIds(string $path, string $source, array $ids): void
+    {
+        self::validateSource($source);
+        $ids = self::validateRetryIds($ids);
+        self::replace($path, fn (): array => self::readRetryAll($path), function (array $data) use ($source, $ids): array {
+            if ($ids === []) {
+                unset($data[$source]);
+            } else {
+                $data[$source] = $ids;
+            }
+            return $data;
+        });
+    }
+
+    private static function replace(string $path, callable $read, callable $change): void
+    {
         $lock = fopen($path . '.lock', 'c');
         if ($lock === false) {
             throw new RuntimeException('Cannot open the contact-sync checkpoint lock.');
@@ -30,9 +63,7 @@ final class ContactSyncWatermark
             if (!flock($lock, LOCK_EX)) {
                 throw new RuntimeException('Cannot lock the contact-sync checkpoint.');
             }
-            $data = self::readAll($path);
-            // A delayed completion must never move a successfully recorded source backwards.
-            $data[$source] = max($data[$source] ?? $datetime, $datetime);
+            $data = $change($read());
             $json = json_encode((object) $data, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR) . "\n";
             $temporary = tempnam(dirname($path), '.contact-sync-');
             if ($temporary === false || dirname($temporary) !== realpath(dirname($path))) {
@@ -56,6 +87,32 @@ final class ContactSyncWatermark
 
     private static function readAll(string $path): array
     {
+        $data = self::decode($path);
+        foreach ($data as $source => $date) {
+            self::validateSource((string) $source);
+            if (!is_string($date)) {
+                throw new RuntimeException('Invalid contact-sync checkpoint timestamp.');
+            }
+            self::validateDate($date);
+        }
+        return $data;
+    }
+
+    private static function readRetryAll(string $path): array
+    {
+        $data = self::decode($path);
+        foreach ($data as $source => $ids) {
+            self::validateSource((string) $source);
+            if (!is_array($ids)) {
+                throw new RuntimeException('Invalid contact-sync retry list.');
+            }
+            $data[$source] = self::validateRetryIds($ids);
+        }
+        return $data;
+    }
+
+    private static function decode(string $path): array
+    {
         if (!is_file($path)) {
             return [];
         }
@@ -71,15 +128,22 @@ final class ContactSyncWatermark
         if (!$object instanceof \stdClass) {
             throw new RuntimeException('Contact-sync checkpoint must be a JSON object.');
         }
-        $data = (array) $object;
-        foreach ($data as $source => $date) {
-            self::validateSource((string) $source);
-            if (!is_string($date)) {
-                throw new RuntimeException('Invalid contact-sync checkpoint timestamp.');
+        return (array) $object;
+    }
+
+    private static function validateRetryIds(array $ids): array
+    {
+        foreach ($ids as $id) {
+            if (!is_string($id) || !ContactSyncIdentity::validNativeId($id)) {
+                throw new RuntimeException('Invalid contact-sync retry ID.');
             }
-            self::validateDate($date);
         }
-        return $data;
+        $ids = array_values(array_unique($ids));
+        if (count($ids) > self::MAX_RETRY_IDS) {
+            throw new RuntimeException('Contact-sync retry list exceeds ' . self::MAX_RETRY_IDS . ' IDs.');
+        }
+        sort($ids, SORT_STRING);
+        return $ids;
     }
 
     private static function validateSource(string $source): void

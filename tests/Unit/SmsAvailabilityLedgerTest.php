@@ -6,6 +6,7 @@ namespace Cmd\Reports\Tests\Unit;
 
 use Cmd\Reports\Services\SmsAvailabilityLedger;
 use Cmd\Reports\Services\SmsExportQueue;
+use Cmd\Reports\Services\SmsStatePolicy;
 use Illuminate\Cache\ArrayStore;
 use Illuminate\Cache\CacheManager;
 use Illuminate\Config\Repository;
@@ -110,10 +111,10 @@ final class SmsAvailabilityLedgerTest extends TestCase
         ]));
     }
 
-    public function test_scope_is_the_fixed_order_six_input_digest(): void
+    public function test_scope_is_the_fixed_order_policy_versioned_digest(): void
     {
         self::assertSame(hash('sha256', json_encode([
-            'testing', 'synthetic.invalid', '1433', 'sms_ledger_test', false, 'legacy-phone-v1',
+            'testing', 'synthetic.invalid', '1433', 'sms_ledger_test', false, 'legacy-phone-v1', SmsStatePolicy::VERSION,
         ], JSON_THROW_ON_ERROR)), $this->ledger->scope());
         self::assertMatchesRegularExpression('/^[a-f0-9]{64}$/', $this->ledger->scope());
     }

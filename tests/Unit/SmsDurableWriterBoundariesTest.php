@@ -58,9 +58,10 @@ final class SmsDurableWriterBoundariesTest extends TestCase
         $this->db->setTransactionManager(new DatabaseTransactionsManager);
         Facade::clearResolvedInstances();
         Facade::setFacadeApplication($app);
-        $this->db->statement('CREATE TABLE TblPhoneNumbers (Phone TEXT, Source TEXT, CID INTEGER)');
+        $this->db->statement('CREATE TABLE TblPhoneNumbers (Phone TEXT, Source TEXT, CID INTEGER, Data_Source TEXT, External_ID TEXT, Status TEXT, Phone1 TEXT, Phone2 TEXT, Phone3 TEXT, Phone4 TEXT)');
         foreach (['2026_10_12_000001_create_sms_prospects_tables.php', '2026_10_19_000001_complete_sms_workflow.php',
-            '2026_10_19_000002_create_sms_enrichment_tables.php'] as $file) {
+            '2026_10_19_000002_create_sms_enrichment_tables.php',
+            '2026_10_27_000001_add_sms_state_holds.php'] as $file) {
             (require __DIR__.'/../../database/sms-migrations/'.$file)->up();
         }
         $this->db->statement('CREATE TABLE committed_changes (value INTEGER)');
@@ -336,7 +337,7 @@ final class SmsDurableWriterBoundariesTest extends TestCase
     public function test_enrichment_admission_dirties_inside_its_transaction_and_replay_does_not(): void
     {
         $repo = new SmsEnrichmentRepository;
-        $repo->stage('enrich', [['Client' => 'Test Person', 'Address' => '1 Test Way', 'Zip' => '90210']], 'test', 0, false);
+        $repo->stage('enrich', [['Client' => 'Test Person', 'Address' => '1 Test Way', 'State' => 'CA', 'Zip' => '90210']], 'test', 0, false);
         self::assertSame(0, $this->revisions());
         $id = $this->db->table('TblSMSEnrichmentPeople')->value('PK');
         $result = [['Record_ID' => 'SMSP-'.$id, 'Phone' => '3035550001']];
@@ -483,7 +484,9 @@ final class SmsDurableWriterBoundariesTest extends TestCase
 
     private function phoneCommand(): SyncPhoneNumbers
     {
+        config(['sms-exports.wide_phone_contacts_enabled'=>true]);
         return new class extends SyncPhoneNumbers {
+            public function __construct() { parent::__construct(); $this->withCreatedDate = true; }
             public function info($string, $verbosity = null): void {}
             public function replace(PDO $pdo, string $path): array { return $this->replacePhonesFromFile($pdo, $path, 1); }
         };
@@ -494,7 +497,7 @@ final class SmsDurableWriterBoundariesTest extends TestCase
         $path = tempnam(sys_get_temp_dir(), 'sms-durable-boundary-');
         if ($path === false) throw new RuntimeException('Unable to create fixture.');
         $this->files[] = $path;
-        file_put_contents($path, $empty ? '' : json_encode(['phone' => '3035550001', 'cid' => 1], JSON_THROW_ON_ERROR)."\n");
+        file_put_contents($path, $empty ? '' : json_encode(['phone' => '3035550001', 'cid' => 1, 'created' => '2026-10-12'], JSON_THROW_ON_ERROR)."\n");
         return $path;
     }
 

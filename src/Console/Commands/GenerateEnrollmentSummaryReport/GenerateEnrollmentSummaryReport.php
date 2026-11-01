@@ -13,6 +13,7 @@ class GenerateEnrollmentSummaryReport extends Command
     protected $signature = 'Generate:enrollment-summary-report
         {--date= : Window date (Y-m-d), drives which month the "Paying in X" projection window starts from. If omitted, resolved automatically via SoldTranche() (see resolveDefaultWindowDate).}
         {--snapshot-date= : TESTING ONLY. Overrides today\'s date for snapshot metrics (Gross Enrollments, Cancels, NSFs, etc). The VBA always uses today for these regardless of --date.}
+        {--test : Send only to oduai@libertydebtrelief.com instead of TblReports recipients}
         {--no-email : Skip sending the email, just build the file}
         {--output= : Save the workbook to this path instead of the temp storage path (implies --no-email unless combined with normal flow)}
         {--ledger-write=auto : Record today\'s Unprocessed Peel Offs in TblEnrollmentPeelOffs so later runs exclude them from NSF/Cancel. auto = only on a real run (no --snapshot-date, no --output); on / off force it.}';
@@ -26,6 +27,8 @@ class GenerateEnrollmentSummaryReport extends Command
         'Legal' => "AND Enrollment_Plan LIKE '%Progress%' AND State NOT IN ('WI') ",
     ];
 
+    private const TEST_RECIPIENT = 'oduai@libertydebtrelief.com';
+
     /** @var array<int, array<string, mixed>> Ordered row definitions: label, values per column, format, bold, blank */
     private array $rows = [];
 
@@ -37,6 +40,11 @@ class GenerateEnrollmentSummaryReport extends Command
 
     /** Peel-off detail for the window's first month; built once per run, read by every column pass. */
     private ?PeelOffsBuilder $peelOffs = null;
+
+    /** Rows included in the Total-column Sellable Debt Paying figure for the window's first month. */
+    private array $sellableDebtPayingRows = [];
+
+    private string $sellableDebtPayingMonthLabel = 'First Month';
 
     public function handle(): int
     {
@@ -148,7 +156,17 @@ class GenerateEnrollmentSummaryReport extends Command
         }
 
         $formatter = new Formatter();
-        $workbook = $formatter->buildWorkbook($this->rows, array_keys(self::COLUMNS), $snapshotDate, $trancheRows, $capitalReport, $monthlyResiduals, $peelOffRows);
+        $workbook = $formatter->buildWorkbook(
+            $this->rows,
+            array_keys(self::COLUMNS),
+            $snapshotDate,
+            $trancheRows,
+            $capitalReport,
+            $monthlyResiduals,
+            $peelOffRows,
+            $this->sellableDebtPayingRows,
+            $this->sellableDebtPayingMonthLabel
+        );
         $emailHtml = $formatter->buildEnrollmentSummaryEmailHtml($this->rows, array_keys(self::COLUMNS), $snapshotDate);
 
         $outputPath = $this->option('output');
@@ -181,7 +199,7 @@ class GenerateEnrollmentSummaryReport extends Command
         }
 
         // Same schedule: send Gross/Net as a separate email right after Enrollment Summary.
-        if (!$skipEmail) {
+        if (!$skipEmail && !$this->option('test')) {
             $this->info('[INFO] Triggering Enrollment Gross/Net report (separate email)...');
             $grossNetExit = Artisan::call('Generate:enrollment-gross-net-report');
             $this->output->write(Artisan::output());
@@ -444,6 +462,24 @@ class GenerateEnrollmentSummaryReport extends Command
             ", [$monthStart, $monthEnd]);
             $this->setRow("Sellable Debt Paying in {$monthLabel}", $columnKey, $sellableDebt, 'currency', bold: true);
 
+            // Keep a row-level audit of the exact first-month Total population used above.
+            // It deliberately mirrors the aggregate predicates and the same payment grace cutoff.
+            if ($columnKey === 'Total' && $monthIndex === 1) {
+                $this->sellableDebtPayingMonthLabel = $monthLabel;
+                $detailResult = $connector->querySqlServer("
+                    SELECT LLG_ID, Client AS Name, Debt_Amount,
+                           CONVERT(varchar(10), First_Payment_Date, 23) AS First_Payment_Date,
+                           CONVERT(varchar(10), First_Payment_Cleared_Date, 23) AS First_Payment_Cleared_Date
+                    FROM TblEnrollment
+                    WHERE Cancel_Date IS NULL AND NSF_Date IS NULL
+                      AND {$paidCoalesce} >= ? AND {$paidCoalesce} <= ?
+                      AND Debt_Sold_To IS NULL
+                      AND Enrollment_Status IN('LDR Enrolled', 'ProLaw Enrolled', 'Approved') {$criteria} {$payingClause}
+                    ORDER BY LLG_ID
+                ", [$monthStart, $monthEnd]);
+                $this->sellableDebtPayingRows = $detailResult['data'] ?? [];
+            }
+
             // Gross Debt Paying in X: all scheduled debt for the month regardless of cancel, NSF, status, or 3-day rule.
             $grossDebtScheduled = (float) $this->scalar($connector, "
                 SELECT SUM(Debt_Amount) FROM TblEnrollment
@@ -629,7 +665,8 @@ class GenerateEnrollmentSummaryReport extends Command
 
     private function sendReport(DBConnector $connector, ?array $workbook, string $reportDate): bool
     {
-        $subject = 'Enrollment Summary Report - ' . date('m/d/Y', strtotime($reportDate));
+        $isTest = (bool) $this->option('test');
+        $subject = ($isTest ? '[TEST] ' : '') . 'Enrollment Summary Report - ' . date('m/d/Y', strtotime($reportDate));
         $body = 'Attached is the Enrollment Summary Report for ' . date('m/d/Y', strtotime($reportDate)) . '.';
 
         $attachments = [];
@@ -641,25 +678,36 @@ class GenerateEnrollmentSummaryReport extends Command
             ];
         }
 
-        $email = new EmailSenderService();
-        $sent = $email->sendMailUsingTblReports(
-            $connector,
-            ['EnrollmentSummary'],
-            ['LDR', 'PLAW'],
-            $subject,
-            $body,
-            $attachments,
-            true
-        );
+        $email = $this->emailSender();
+        if ($isTest) {
+            $sent = $email->sendMailHtml($subject, $body, [self::TEST_RECIPIENT], [], [], $attachments);
+        } else {
+            $sent = $email->sendMailUsingTblReports(
+                $connector,
+                ['EnrollmentSummary'],
+                ['LDR', 'PLAW'],
+                $subject,
+                $body,
+                $attachments,
+                true
+            );
+        }
 
         if ($sent) {
-            $this->info('[INFO] Enrollment Summary Report emailed (TblReports recipients).');
+            $this->info($isTest
+                ? '[INFO] Enrollment Summary Report test email sent only to ' . self::TEST_RECIPIENT . '.'
+                : '[INFO] Enrollment Summary Report emailed (TblReports recipients).');
         } else {
             $this->warn('[WARN] Enrollment Summary Report not sent (no TblReports recipients found or send failed).');
             Log::warning('GenerateEnrollmentSummaryReport: notification email failed.');
         }
 
         return $sent;
+    }
+
+    protected function emailSender(): EmailSenderService
+    {
+        return new EmailSenderService();
     }
 
     private function scalar(DBConnector $connector, string $sql, array $params = []): mixed
@@ -730,7 +778,7 @@ class GenerateEnrollmentSummaryReport extends Command
             $mode = 'off';
         }
 
-        $isReviewRun = $this->option('snapshot-date') !== null || $this->option('output') !== null;
+        $isReviewRun = $this->option('test') || $this->option('snapshot-date') !== null || $this->option('output') !== null;
         $shouldWrite = $mode === 'on' || ($mode === 'auto' && !$isReviewRun);
 
         if (!$shouldWrite) {
@@ -766,7 +814,7 @@ class GenerateEnrollmentSummaryReport extends Command
         return $count > 0;
     }
 
-    private function initializeSqlServerConnector(): DBConnector
+    protected function initializeSqlServerConnector(): DBConnector
     {
         $candidates = ['ldr', 'plaw', 'production', 'sandbox'];
         $errors = [];

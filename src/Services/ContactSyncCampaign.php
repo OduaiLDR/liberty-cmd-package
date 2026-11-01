@@ -80,7 +80,9 @@ final class ContactSyncCampaign
         $existing = trim((string) ($before['campaign'] ?? ''));
         $value = $before === null ? '' : $before['campaign'];
         $reject = static fn (string $reason) => ['value' => $value, 'reason' => $reason];
-        $preserve = static fn (string $reason) => $before === null ? $reject($reason)
+        // A new contact is accepted with a blank campaign; only its attribution waits for review.
+        $preserve = static fn (string $reason) => $before === null
+            ? ['value' => '', 'reason' => null, 'withhold_attribution' => true, 'review_reason' => $reason]
             : ['value' => $value, 'reason' => null, 'preserve_attribution' => true, 'review_reason' => $reason];
         // Target identity/ownership is checked by the caller. Retaining attribution
         // does not require proving the historical recipient again or create new proof.

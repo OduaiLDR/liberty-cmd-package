@@ -93,6 +93,31 @@ final class SmsProspectBackfillSqlServerTest extends TestCase
         }
     }
 
+    public function test_external_headers_hold_phone_wide_backfill_even_completed_but_empty_schema_remains_usable(): void
+    {
+        $f = self::$fixture; $f->assertOwnedDatabase();
+        $f->db->exec('CREATE TABLE dbo.TblSMSExternalEvents(Request_ID uniqueidentifier PRIMARY KEY,State varchar(16) NOT NULL)');
+        try {
+            [$proof, $candidates] = $this->begin([1]);
+            SmsProspectBackfill::applyBatch($f->db, self::RUN, 0, $candidates);
+            self::assertSame('completed', SmsProspectBackfill::finish($f->db, self::RUN)['status']);
+            $business = $f->snapshot(); $ledger = $f->ledger();
+            foreach (['registering','completed'] as $state) {
+                $query = $f->db->prepare('INSERT dbo.TblSMSExternalEvents VALUES(?,?)');
+                $query->execute(['99999999-8888-4777-8666-555555555555', $state]); $query->closeCursor();
+                foreach ([fn () => SmsProspectBackfill::begin($f->db, self::RUN, $proof, 'local-fixture@example.invalid', true),
+                    fn () => SmsProspectBackfill::applyBatch($f->db, self::RUN, 0, $candidates),
+                    fn () => SmsProspectBackfill::finish($f->db, self::RUN), fn () => SmsProspectBackfill::install($f->db)] as $work) {
+                    $this->refuses($work, 'does not support exact-PK external SMS events');
+                    $this->assertUnchanged($business, $ledger);
+                }
+                self::assertSame('completed', SmsProspectBackfill::status($f->db, self::RUN)['status']);
+                $f->db->exec('DELETE dbo.TblSMSExternalEvents');
+            }
+            self::assertSame('completed', SmsProspectBackfill::begin($f->db, self::RUN, $proof, 'local-fixture@example.invalid', true)['status']);
+        } finally { $f->db->exec('DROP TABLE dbo.TblSMSExternalEvents'); }
+    }
+
     public function test_phone_and_email_only_inserts_use_verified_history_mailer_date_and_lineage(): void
     {
         $f = self::$fixture;
@@ -117,7 +142,7 @@ final class SmsProspectBackfillSqlServerTest extends TestCase
         self::assertSame([0, 0, 0], array_map('intval', [$email['Contacted'], $email['Opt_Out'], $email['Invalid_Phone']]));
         foreach ($rows as $row) {
             self::assertSame('2026-09-12', $row['Creation_Date'], 'MAX mailer Send_Date, never the SMS marketing/export date.');
-            self::assertSame('T2', $row['Tier']);
+            self::assertArrayNotHasKey('Debt_Tier', $row);
             self::assertSame('00123', $row['Zip']);
             self::assertSame('Test City', $row['City']);
             self::assertSame('CA', $row['State']);
@@ -138,13 +163,31 @@ final class SmsProspectBackfillSqlServerTest extends TestCase
         self::assertSame(11, (int) $f->rows('SELECT revision FROM dbo.TblSMSAvailabilitySummary')[0]['revision']);
     }
 
+    public function test_blocked_state_is_deferred_with_bound_source_evidence(): void
+    {
+        $f = self::$fixture;
+        $f->db->exec('DISABLE TRIGGER dbo.TURepair20261014PostPublish ON dbo.TblMailersUniqueEnriched');
+        try { $f->db->exec("UPDATE dbo.TblMailersUniqueEnriched SET State=' wv ' WHERE PK=1"); }
+        finally { $f->db->exec('ENABLE TRIGGER dbo.TURepair20261014PostPublish ON dbo.TblMailersUniqueEnriched'); }
+        [, $candidates] = $this->begin([1]);
+
+        $result = SmsProspectBackfill::applyBatch($f->db, self::RUN, 0, $candidates);
+        self::assertSame([0, 0, 1], [$result['added'], $result['existing'], $result['deferred']]);
+        self::assertSame(1, $f->rows('SELECT COUNT(*) AS n FROM dbo.TblProspects')[0]['n']);
+        $receipt = $f->rows('SELECT Decision,Reason,Source_SHA256,Prospect_PK FROM dbo.TblSMSProspectBackfillRows')[0];
+        self::assertSame('deferred', $receipt['Decision']);
+        self::assertSame('blocked_state', $receipt['Reason']);
+        self::assertSame($candidates[0]['Observed_SHA256'], $receipt['Source_SHA256']);
+        self::assertNull($receipt['Prospect_PK']);
+    }
+
     public function test_existing_after_audit_watermark_matches_case_insensitively_and_stays_unchanged(): void
     {
         $f = self::$fixture;
         [$proof, $candidates] = $this->begin([3]);
         self::assertSame(100, $proof['prospect_watermark_pk']);
-        $pk = $f->rows("INSERT dbo.TblProspects(Client,Address,Zip,Phone,Email,Tier,Creation_Date,Contacted,Opt_Out,Invalid_Phone,Response_Date,Latest_Export_Date,SMS_Attempts)
-            OUTPUT INSERTED.PK VALUES('CASE PERSON','3 TEST ST','00123','2025550198','keep@example.test','T8','2020-01-01',1,1,1,'2026-01-01','2026-01-02',23)")[0]['PK'];
+        $pk = $f->rows("INSERT dbo.TblProspects(Client,Address,Zip,Phone,Email,Creation_Date,Contacted,Opt_Out,Invalid_Phone,Response_Date,Latest_Export_Date,SMS_Attempts)
+            OUTPUT INSERTED.PK VALUES('CASE PERSON','3 TEST ST','00123','2025550198','keep@example.test','2020-01-01',1,1,1,'2026-01-01','2026-01-02',23)")[0]['PK'];
         self::assertGreaterThan(100, (int) $pk);
         self::assertSame($proof['source_guard'], SmsProspectCoverage::sourceGuard(SmsProspectCoverage::metadata($f->db)));
         $business = $f->snapshot();
@@ -446,7 +489,7 @@ SQL);
             self::assertSame(1, (int) $f->rows("SELECT COUNT(*) AS n FROM sys.indexes WHERE object_id=OBJECT_ID('dbo.TblMailersUnique') AND index_id=0")[0]['n']);
             $f->db->exec("INSERT dbo.TblMailersUnique VALUES(9001,'another-drop','external-1','T8'),(9002,'fixture-drop','external-1','T9')");
             self::assertSame(1, SmsProspectBackfill::applyBatch($f->db, self::RUN, 0, [$candidates[0]])['added']);
-            self::assertSame('T2', $f->rows('SELECT Tier FROM dbo.TblProspects WHERE PK>100')[0]['Tier']);
+            self::assertSame(1, (int) $f->rows('SELECT COUNT(*) AS n FROM dbo.TblProspects WHERE PK>100')[0]['n']);
             $f->db->exec("INSERT dbo.TblMailersUnique VALUES(1002,'fixture-drop','external-2','T9')");
             self::assertSame(1, SmsProspectBackfill::applyBatch($f->db, self::RUN, 1, [$candidates[1]])['deferred']);
             self::assertSame([['Prospect_PK' => null, 'Reason' => 'unresolved_source_owner']],

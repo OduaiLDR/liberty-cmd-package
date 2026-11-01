@@ -74,6 +74,7 @@ class SmsWorkflowApiController extends Controller
     {
         // Reuse validation rules, but do not invoke the Blade request's Laravel-user gate.
         $data = Validator::make($request->all(), (new MailDropExportRequest)->rules())->validate();
+        \Cmd\Reports\Services\SmsApprovalCreationPolicy::assertLegacyRegistrationAllowed();
         $this->ensureSchemaReady();
         $this->ensureRequestSchemaReady();
         $artifacts ??= app(SmsExportArtifacts::class);
@@ -136,7 +137,9 @@ class SmsWorkflowApiController extends Controller
             throw new HttpException(404, 'SMS export request not found.');
         }
 
-        if ($row->Status !== 'ready') {
+        // Download-only actors may inspect completed files, never perform legacy
+        // artifact recovery or its tracking/status updates through a GET.
+        if ($row->Status !== 'ready' && \Cmd\Reports\Services\SmsAccess::canManage($request->attributes->get('cmd_user'))) {
             $tracked = DB::connection('sqlsrv')->table('TblSmsExports')->where('Request_ID', $id);
             if ($tracked->exists()) {
                 try {
@@ -326,7 +329,7 @@ class SmsWorkflowApiController extends Controller
 
         return new JsonResponse([
             'ok' => true,
-            'message' => 'Invoice saved. Mail and data costs are allocated across every tier in the selected drop; SMS costs are allocated across the export week.',
+            'message' => 'Invoice saved. Mail and data costs are allocated across every tier in the selected drop; SMS costs are allocated only across confirmed approved/submitted activity in the California week.',
         ]);
     }
 
