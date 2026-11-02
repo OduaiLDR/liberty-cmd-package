@@ -24,7 +24,7 @@ use RuntimeException;
  * its first qualifying status (Pacific Time). Current status is shown separately in the backup.
  * Deleted contacts and co-applicants are excluded.
  *
- * LDR is billed on enrollments: 7% of the debt basis (Sold_Debt, else Debt_Amount) of LDR clients
+ * LDR is billed on enrollments: 5% of the debt basis (Sold_Debt, else Debt_Amount) of LDR clients
  * whose first payment cleared in the month. TblEnrollment holds both firms' enrollments, so LDR is
  * scoped by TblContactsLDR; Progress Law's clients are billed per lead on their own invoice. A
  * Lookback Deduction then comes off for clients Lending Tower actually billed (from its first invoice
@@ -51,7 +51,7 @@ class GenerateLendingTowerInvoices extends Command
                             {--dry-run : Calculate and print the figures without creating or sending anything}
                             {--save= : Write the invoice PDFs and backup workbooks to this folder instead of emailing}
                             {--send-to-me : Send only to oduai@libertydebtrelief.com with normal invoice wording and no CC or BCC}
-                            {--review-terms : Use 5% LDR, $300 PLAW and company-to-company review numbers; only for private or saved previews}
+                            {--review-terms : Use separate company-to-company review numbers; only for private or saved previews}
                             {--test-to= : Email the invoices only to this address, from the normal report sender, marked TEST}
                             {--force : Send even if this invoice number was already sent}';
 
@@ -59,10 +59,10 @@ class GenerateLendingTowerInvoices extends Command
 
     private const TIMEZONE = 'America/Los_Angeles';
 
-    private const PLAW_RATE_PER_LEAD_CENTS = 27500;
+    private const PLAW_RATE_PER_LEAD_CENTS = 30000;
 
-    /** 7%, in basis points so the fee stays in integer arithmetic. */
-    private const LDR_FEE_BASIS_POINTS = 700;
+    /** 5%, in basis points so the fee stays in integer arithmetic. */
+    private const LDR_FEE_BASIS_POINTS = 500;
     private ?ReviewInvoiceNumbers $reviewNumbers = null;
 
     public function useReviewInvoiceNumbers(ReviewInvoiceNumbers $numbers): void
@@ -707,12 +707,12 @@ class GenerateLendingTowerInvoices extends Command
 
     private function ldrBasisPoints(): int
     {
-        return $this->usingReviewTerms() ? 500 : self::LDR_FEE_BASIS_POINTS;
+        return self::LDR_FEE_BASIS_POINTS;
     }
 
     private function progressLawRateCents(): int
     {
-        return $this->usingReviewTerms() ? 30000 : self::PLAW_RATE_PER_LEAD_CENTS;
+        return self::PLAW_RATE_PER_LEAD_CENTS;
     }
 
     // -------------------------------------------------------------------------
