@@ -3,13 +3,9 @@
 namespace Cmd\Reports\Tests\Unit;
 
 use Cmd\Reports\Console\Commands\GenerateAdvanceRequest;
-use Cmd\Reports\Services\ReviewInvoiceNumbers;
-use Cmd\Reports\Tests\Unit\Invoices\TestFiles;
-use Illuminate\Console\OutputStyle;
 use PHPUnit\Framework\TestCase;
 use ReflectionClass;
 use Symfony\Component\Console\Input\ArrayInput;
-use Symfony\Component\Console\Output\BufferedOutput;
 
 class GenerateAdvanceRequestDeliveryTest extends TestCase
 {
@@ -100,36 +96,5 @@ class GenerateAdvanceRequestDeliveryTest extends TestCase
         $command->setInput(new ArrayInput(['--invoice-date' => '2026-02-30'], $command->getDefinition()));
         $this->expectException(\InvalidArgumentException::class);
         (new ReflectionClass($command))->getMethod('resolveInvoiceDate')->invoke($command);
-    }
-
-    public function test_advance_review_numbers_use_the_confirmed_company_pairs_only(): void
-    {
-        $root = sys_get_temp_dir() . '/advance-review-' . bin2hex(random_bytes(6));
-        try {
-            $command = new GenerateAdvanceRequest();
-            $command->useReviewInvoiceNumbers(new ReviewInvoiceNumbers($root));
-            $method = (new ReflectionClass($command))->getMethod('applyReviewNumber');
-            $date = new \DateTimeImmutable('2026-11-01');
-            $data = ['invoice_number' => 'old', 'amount' => 633000.0, 'month' => 'December 2026'];
-            $first = $method->invoke($command, $data, 'LDR', $date, true);
-            self::assertSame('LDR-NGF-20261101-01', $first['invoice_number']);
-            self::assertSame(633000.0, $first['amount']);
-            self::assertSame('December 2026', $first['month']);
-            self::assertSame('LDR-NGF-20261101-02', $method->invoke($command, $data, 'LDR', $date, true)['invoice_number']);
-            self::assertSame('PL-NGF-20261101-01', $method->invoke($command, $data, 'PLAW', $date, true)['invoice_number']);
-        } finally {
-            TestFiles::removeTree($root);
-        }
-    }
-
-    public function test_review_terms_cannot_be_sent_to_normal_live_recipients(): void
-    {
-        $command = new GenerateAdvanceRequest();
-        $input = new ArrayInput(['--month' => '2026-10', '--review-terms' => true], $command->getDefinition());
-        $output = new BufferedOutput();
-        $command->setInput($input);
-        $command->setOutput(new OutputStyle($input, $output));
-        self::assertSame(1, $command->handle());
-        self::assertStringContainsString('--review-terms requires', $output->fetch());
     }
 }

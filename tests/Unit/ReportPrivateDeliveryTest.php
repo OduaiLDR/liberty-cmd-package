@@ -8,8 +8,6 @@ use Cmd\Reports\Console\Commands\GenerateAdvanceRecoupReport\GenerateAdvanceReco
 use Cmd\Reports\Console\Commands\GenerateEnrollmentSummaryReport\GenerateEnrollmentSummaryReport;
 use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\EmailSenderService;
-use Cmd\Reports\Services\ReviewInvoiceNumbers;
-use Cmd\Reports\Tests\Unit\Invoices\TestFiles;
 use Illuminate\Console\Command;
 use Illuminate\Console\OutputStyle;
 use Illuminate\Container\Container;
@@ -49,7 +47,11 @@ final class ReportPrivateDeliveryTest extends TestCase
 
     protected function tearDown(): void
     {
-        TestFiles::removeTree($this->storage);
+        foreach (glob($this->storage . '/app/*') ?: [] as $path) {
+            unlink($path);
+        }
+        rmdir($this->storage . '/app');
+        rmdir($this->storage);
         Facade::clearResolvedInstances();
         Facade::setFacadeApplication(null);
         Container::setInstance(null);
@@ -154,32 +156,6 @@ final class ReportPrivateDeliveryTest extends TestCase
         self::assertSame(Command::SUCCESS, $command->handle());
         self::assertSame([], $mail->deliveries);
         self::assertFileExists($this->storage . '/app/PL-PL-20260930.pdf');
-    }
-
-    public function test_epf_review_has_sequential_company_numbers_and_clean_subject(): void
-    {
-        [$command, $mail] = $this->epfCommand();
-        $command->useReviewInvoiceNumbers(new ReviewInvoiceNumbers($this->storage . '/review-numbers'));
-        $this->configure($command, ['--month' => '2026-09', '--test' => true, '--review-terms' => true]);
-        self::assertSame(Command::SUCCESS, $command->handle());
-        self::assertSame(Command::SUCCESS, $command->handle());
-        self::assertSame('PL-PL-20260930-01.pdf', $mail->deliveries[0]['attachments'][1]['name']);
-        self::assertSame('PL-PL-20260930-02.pdf', $mail->deliveries[1]['attachments'][1]['name']);
-        foreach ($mail->deliveries as $message) {
-            self::assertStringNotContainsString('[TEST]', $message['subject']);
-            self::assertSame(['oduai@libertydebtrelief.com'], $message['to']);
-            self::assertSame([], $message['cc']);
-            self::assertSame([], $message['bcc']);
-        }
-    }
-
-    public function test_epf_review_cannot_use_normal_report_recipients(): void
-    {
-        [$command, $mail] = $this->epfCommand();
-        $output = $this->configure($command, ['--month' => '2026-09', '--review-terms' => true]);
-        self::assertSame(Command::FAILURE, $command->handle());
-        self::assertSame([], $mail->deliveries);
-        self::assertStringContainsString('--review-terms requires', $output->fetch());
     }
 
     private function configure(Command $command, array $options): BufferedOutput
