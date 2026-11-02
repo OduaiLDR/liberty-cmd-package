@@ -4,6 +4,7 @@ namespace Cmd\Reports\Console\Commands\GenerateAdvanceRecoupReport;
 
 use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\EmailSenderService;
+use Cmd\Reports\Services\ReviewInvoiceNumbers;
 use Cmd\Reports\Console\Commands\GenerateLendingTowerInvoices\InvoicePdf;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
@@ -36,6 +37,7 @@ class GenerateAdvanceRecoupReport extends Command
     protected $signature = 'Generate:advance-recoup-report
                             {--test : Send only to oduai@libertydebtrelief.com instead of TblReports recipients}
                             {--local-only : Generate the workbook and invoice locally without sending email}
+                            {--review-terms : Use company-to-company review numbering; requires --test or --local-only}
                             {--month= : Month to report on as YYYY-MM (defaults to last full calendar month)}';
 
     protected $description = 'Email the monthly Advances/Refunds/Recoups EPF adjustments workbook.';
@@ -45,6 +47,12 @@ class GenerateAdvanceRecoupReport extends Command
     private const RENT_AMOUNT = -400.0;
     private const PRIMARY_ACCOUNT_RATE = 0.03;
     private const TEST_RECIPIENT = 'oduai@libertydebtrelief.com';
+    private ?ReviewInvoiceNumbers $reviewNumbers = null;
+
+    public function useReviewInvoiceNumbers(ReviewInvoiceNumbers $numbers): void
+    {
+        $this->reviewNumbers = $numbers;
+    }
 
     public function handle(): int
     {
@@ -52,6 +60,11 @@ class GenerateAdvanceRecoupReport extends Command
 
         $isTest = (bool) $this->option('test');
         $isLocalOnly = (bool) $this->option('local-only');
+        $reviewTerms = (bool) $this->option('review-terms');
+        if ($reviewTerms && !$isTest && !$isLocalOnly) {
+            $this->error('--review-terms requires --test or --local-only; scheduled live delivery is unchanged.');
+            return Command::FAILURE;
+        }
         if ($isTest && $isLocalOnly) {
             $this->error('Choose either --test (email to yourself) or --local-only (no email).');
             return Command::FAILURE;
@@ -146,6 +159,10 @@ class GenerateAdvanceRecoupReport extends Command
         }
         $invoiceDate = \Carbon\Carbon::parse($window['endExclusive'])->subDay()->format('Y-m-d');
         $invoice = AdvanceRecoupInvoice::document($window, (float) ($totalRow['amount'] ?? 0), $invoiceDate);
+        if ($reviewTerms) {
+            $this->reviewNumbers ??= ReviewInvoiceNumbers::fromLocalStorage();
+            $invoice['number'] = $this->reviewNumbers->next('PL', 'PL', $invoiceDate, !$isLocalOnly);
+        }
         $invoicePath = storage_path('app/' . $invoice['number'] . '.pdf');
         $invoiceBytes = (new InvoicePdf(sys_get_temp_dir() . '/progress-law-epf-invoice-pdf'))->render($invoice);
         if (file_put_contents($invoicePath, $invoiceBytes) === false) {
@@ -153,7 +170,7 @@ class GenerateAdvanceRecoupReport extends Command
         }
         $this->info('[INFO] Invoice written to: ' . $invoicePath);
 
-        $subject = ($isTest ? '[TEST] ' : '') . 'EPF Adjustments - ' . $window['label'];
+        $subject = ($isTest && !$reviewTerms ? '[TEST] ' : '') . 'EPF Adjustments - ' . $window['label'];
         $body = $this->buildSummaryEmailBody($summaryRows, $window['label']);
 
         $attachments = [[
@@ -172,9 +189,10 @@ class GenerateAdvanceRecoupReport extends Command
         }
 
         $email = $this->emailSender();
+        $sender = $reviewTerms ? (string) env('INVOICE_REVIEW_FROM_ADDRESS', AdvanceRecoupInvoice::SENDER) : AdvanceRecoupInvoice::SENDER;
         if ($isTest) {
             $recipients = [self::TEST_RECIPIENT];
-            $sent = $email->sendMailHtml($subject, $body, $recipients, [], [], $attachments, AdvanceRecoupInvoice::SENDER);
+            $sent = $email->sendMailHtml($subject, $body, $recipients, [], [], $attachments, $sender);
         } else {
             $sent = $email->sendMailUsingTblReportsHtml(
                 $sqlServer,

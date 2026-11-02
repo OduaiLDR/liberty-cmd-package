@@ -6,6 +6,7 @@ use Cmd\Reports\Invoices\InvoiceRegistryGate;
 use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\EmailSenderService;
 use Cmd\Reports\Services\GraphMailboxClient;
+use Cmd\Reports\Services\ReviewInvoiceNumbers;
 use DateTimeImmutable;
 use DateTimeZone;
 use Illuminate\Console\Command;
@@ -50,6 +51,7 @@ class GenerateLendingTowerInvoices extends Command
                             {--dry-run : Calculate and print the figures without creating or sending anything}
                             {--save= : Write the invoice PDFs and backup workbooks to this folder instead of emailing}
                             {--send-to-me : Send only to oduai@libertydebtrelief.com with normal invoice wording and no CC or BCC}
+                            {--review-terms : Use 5% LDR, $300 PLAW and company-to-company review numbers; only for private or saved previews}
                             {--test-to= : Email the invoices only to this address, from the normal report sender, marked TEST}
                             {--force : Send even if this invoice number was already sent}';
 
@@ -61,6 +63,12 @@ class GenerateLendingTowerInvoices extends Command
 
     /** 7%, in basis points so the fee stays in integer arithmetic. */
     private const LDR_FEE_BASIS_POINTS = 700;
+    private ?ReviewInvoiceNumbers $reviewNumbers = null;
+
+    public function useReviewInvoiceNumbers(ReviewInvoiceNumbers $numbers): void
+    {
+        $this->reviewNumbers = $numbers;
+    }
 
 
     /**
@@ -227,6 +235,10 @@ class GenerateLendingTowerInvoices extends Command
             $testTo = 'oduai@libertydebtrelief.com';
         }
         $live = ! $dryRun && $saveDir === '' && $testTo === '';
+        if ($this->usingReviewTerms() && ($live || ($testTo !== '' && strcasecmp($testTo, 'oduai@libertydebtrelief.com') !== 0))) {
+            $this->error('--review-terms is restricted to --send-to-me, --save or --dry-run; scheduled live delivery is unchanged.');
+            return self::FAILURE;
+        }
 
         if ($testTo !== '' && filter_var($testTo, FILTER_VALIDATE_EMAIL) === false) {
             $this->error("--test-to must be an email address, got '{$testTo}'.");
@@ -241,7 +253,7 @@ class GenerateLendingTowerInvoices extends Command
             return self::FAILURE;
         }
 
-        $lock = $dryRun ? null : Cache::lock('lending-tower-invoices', 1800);
+        $lock = $dryRun ? null : Cache::lock($live ? 'lending-tower-invoices' : 'lending-tower-invoices-review', 1800);
         if ($lock !== null && ! $lock->get()) {
             $this->error('Another Lending Tower invoice run is in progress.');
 
@@ -335,7 +347,7 @@ class GenerateLendingTowerInvoices extends Command
 
         return [
             'month' => $first->format('F Y'),
-            'range' => $first->format('F j') . 'â€“' . $last->format('j, Y'),
+            'range' => $first->format('F j') . ' - ' . $last->format('j, Y'),
             'last_day' => $last->format('Y-m-d'),
             'suffix' => $first->format('Y-m'),
             'issue_date' => $issue->format('F j, Y'),
@@ -382,7 +394,7 @@ class GenerateLendingTowerInvoices extends Command
         return [
             'leads' => $leads,
             'lead_count' => count($leads),
-            'total_cents' => count($leads) * self::PLAW_RATE_PER_LEAD_CENTS,
+            'total_cents' => count($leads) * $this->progressLawRateCents(),
         ];
     }
 
@@ -391,7 +403,7 @@ class GenerateLendingTowerInvoices extends Command
         $this->newLine();
         $this->line('<options=bold>Progress Law</>');
         $this->row('Leads (first qualifying status)', number_format($invoice['lead_count']));
-        $this->row('Rate per lead', $this->money(self::PLAW_RATE_PER_LEAD_CENTS));
+        $this->row('Rate per lead', $this->money($this->progressLawRateCents()));
         $this->row('Total due', $this->money($invoice['total_cents']));
     }
 
@@ -406,7 +418,7 @@ class GenerateLendingTowerInvoices extends Command
                 'description' => 'Lead generation',
                 'detail' => "First qualifying status in {$period['range']} (Pacific Time)",
                 'quantity' => number_format($invoice['lead_count']),
-                'rate' => $this->money(self::PLAW_RATE_PER_LEAD_CENTS),
+                'rate' => $this->money($this->progressLawRateCents()),
                 'amount' => $this->money($invoice['total_cents']),
             ]],
             'totals' => [],
@@ -427,7 +439,7 @@ class GenerateLendingTowerInvoices extends Command
             sprintf(
                 '%s leads x %s = %s',
                 number_format($invoice['lead_count']),
-                $this->money(self::PLAW_RATE_PER_LEAD_CENTS),
+                $this->money($this->progressLawRateCents()),
                 $this->money($invoice['total_cents'])
             ),
             ['Contact ID', 'Client', 'State', 'Qualifying Status Date', 'Billable Status', 'Current Status'],
@@ -685,7 +697,22 @@ class GenerateLendingTowerInvoices extends Command
 
     private function ldrRateLabel(): string
     {
-        return rtrim(rtrim(number_format(self::LDR_FEE_BASIS_POINTS / 100, 2), '0'), '.') . '%';
+        return rtrim(rtrim(number_format($this->ldrBasisPoints() / 100, 2), '0'), '.') . '%';
+    }
+
+    private function usingReviewTerms(): bool
+    {
+        return $this->input !== null && (bool) $this->option('review-terms');
+    }
+
+    private function ldrBasisPoints(): int
+    {
+        return $this->usingReviewTerms() ? 500 : self::LDR_FEE_BASIS_POINTS;
+    }
+
+    private function progressLawRateCents(): int
+    {
+        return $this->usingReviewTerms() ? 30000 : self::PLAW_RATE_PER_LEAD_CENTS;
     }
 
     // -------------------------------------------------------------------------
@@ -721,10 +748,19 @@ class GenerateLendingTowerInvoices extends Command
         $this->newLine();
 
         foreach ($invoices as $company => $invoice) {
+            if ($this->usingReviewTerms() && ($live || ($testTo !== '' && strcasecmp($testTo, 'oduai@libertydebtrelief.com') !== 0))) {
+                throw new RuntimeException('Review terms cannot be used for live or third-party delivery.');
+            }
             $registered = $live ? $this->registerNumber($company, $period) : null;
+            $reviewNumber = null;
+            if ($this->usingReviewTerms()) {
+                $this->reviewNumbers ??= ReviewInvoiceNumbers::fromLocalStorage();
+                $reviewNumber = $this->reviewNumbers->next('LT', $company === 'PLAW' ? 'PL' : 'LDR',
+                    (new DateTimeImmutable($period['last_day']))->modify('+1 day')->format('Y-m-d'), $testTo !== '');
+            }
             $document = $company === 'PLAW'
-                ? $this->progressLawDocument($invoice, $period, $registered['number'] ?? null)
-                : $this->ldrDocument($invoice, $period, $registered['number'] ?? null);
+                ? $this->progressLawDocument($invoice, $period, $reviewNumber ?? $registered['number'] ?? null)
+                : $this->ldrDocument($invoice, $period, $reviewNumber ?? $registered['number'] ?? null);
             $document['logo_data_uri'] = $logo;
             $number = $document['number'];
 
@@ -988,7 +1024,7 @@ class GenerateLendingTowerInvoices extends Command
             throw new RuntimeException('LDR debt basis is negative (' . $this->money($basisCents) . ').');
         }
 
-        return intdiv($basisCents * self::LDR_FEE_BASIS_POINTS + 5000, 10000);
+        return intdiv($basisCents * $this->ldrBasisPoints() + 5000, 10000);
     }
 
     /**
