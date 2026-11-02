@@ -6,6 +6,7 @@ use Cmd\Reports\Services\AdvanceRequestInvoiceBuilder;
 use Cmd\Reports\Services\AdvanceRequestRegistration;
 use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\EmailSenderService;
+use Cmd\Reports\Services\ReviewInvoiceNumbers;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
 
@@ -15,6 +16,7 @@ class GenerateAdvanceRequest extends Command
                             {--month= : Reporting month as YYYY-MM (defaults to previous calendar month)}
                             {--advance-month= : Advance month displayed on the email and invoice, as YYYY-MM (defaults to the reporting month)}
                             {--invoice-date= : Invoice issue date as YYYY-MM-DD (defaults to today)}
+                            {--review-terms : Use company-to-company review numbering; requires --send-to-me or --dry-run}
                             {--company=all : Send LDR, PLAW, or all; allocation always includes both companies}
                             {--dry-run : Calculate and display results without sending email}
                             {--send-to-me : Send only to oduai@libertydebtrelief.com instead of TblReports recipients}';
@@ -27,6 +29,12 @@ class GenerateAdvanceRequest extends Command
     private const ADVANCE_TOTAL = 1000000.0;
 
     private ?AdvanceRequestRegistration $registration = null;
+    private ?ReviewInvoiceNumbers $reviewNumbers = null;
+
+    public function useReviewInvoiceNumbers(ReviewInvoiceNumbers $numbers): void
+    {
+        $this->reviewNumbers = $numbers;
+    }
 
     /** Inject a registration (tests). */
     public function useRegistration(?AdvanceRequestRegistration $registration): void
@@ -49,6 +57,11 @@ class GenerateAdvanceRequest extends Command
 
         $sendToMe = (bool) $this->option('send-to-me');
         $isDryRun = (bool) $this->option('dry-run');
+        $reviewTerms = (bool) $this->option('review-terms');
+        if ($reviewTerms && !$sendToMe && !$isDryRun) {
+            $this->error('--review-terms requires --send-to-me or --dry-run; scheduled live delivery is unchanged.');
+            return Command::FAILURE;
+        }
 
         try {
             $azure = DBConnector::fromEnvironment('ldr');
@@ -142,6 +155,9 @@ class GenerateAdvanceRequest extends Command
             $subject = $request['subject'];
             $body = $this->buildEmailBody($request['name'], $request['amount'], $tranche, $monthLabel);
             $invoice = $this->buildInvoiceData($request['name'], $request['amount'], $tranche, $advanceWindow, $invoiceDate);
+            if ($reviewTerms) {
+                $invoice = $this->applyReviewNumber($invoice, $request['company'], $invoiceDate, !$isDryRun);
+            }
             // Invoice registry (own switch, default off): live sends only; replaces just the printed invoice number.
             $registeredNumber = null;
             if (! $isDryRun && ! $sendToMe) {
@@ -381,6 +397,13 @@ class GenerateAdvanceRequest extends Command
             'issue_date' => ($invoiceDate ?? now())->format('F j, Y'),
             'sample' => false,
         ];
+    }
+
+    private function applyReviewNumber(array $invoice, string $company, \DateTimeInterface $date, bool $reserve): array
+    {
+        $this->reviewNumbers ??= ReviewInvoiceNumbers::fromLocalStorage();
+        $invoice['invoice_number'] = $this->reviewNumbers->next($company === 'PLAW' ? 'PL' : 'LDR', 'NGF', $date->format('Y-m-d'), $reserve);
+        return $invoice;
     }
 
     private function writeInvoicePreview(string $filename, string $pdfBytes): string

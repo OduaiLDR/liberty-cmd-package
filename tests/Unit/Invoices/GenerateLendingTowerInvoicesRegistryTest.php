@@ -154,6 +154,48 @@ final class GenerateLendingTowerInvoicesRegistryTest extends TestCase
         self::assertNull(InvoiceRegistryGate::forGenerator('INVOICE_LT_PL_ENABLED'));
     }
 
+    public function test_review_terms_are_five_percent_and_three_hundred_dollars_without_changing_live_defaults(): void
+    {
+        $review = $this->command(['--send-to-me' => true, '--review-terms' => true]);
+        $normal = $this->command();
+        self::assertSame(5000, $this->call($review, 'ldrFee', [100000]));
+        self::assertSame(7000, $this->call($normal, 'ldrFee', [100000]));
+        self::assertSame('5%', $this->call($review, 'ldrRateLabel', []));
+        self::assertSame('7%', $this->call($normal, 'ldrRateLabel', []));
+        self::assertSame(30000, $this->call($review, 'progressLawRateCents', []));
+        self::assertSame(27500, $this->call($normal, 'progressLawRateCents', []));
+        $period = $this->call($review, 'periodDetails', ['2026-10-01', '2026-11-01']);
+        self::assertSame('October 1 - 31, 2026', $period['range']);
+    }
+
+    public function test_review_numbers_increment_only_in_the_private_namespace_and_reach_both_attachments(): void
+    {
+        $cmd = $this->command(['--send-to-me' => true, '--review-terms' => true]);
+        $cmd->useInvoiceGate('PLAW', $this->gate());
+        $cmd->useInvoiceGate('LDR', $this->gate());
+        self::assertTrue($this->deliverLive($cmd, ['PLAW', 'LDR'], false, 'oduai@libertydebtrelief.com'));
+        self::assertTrue($this->deliverLive($cmd, ['PLAW', 'LDR'], false, 'oduai@libertydebtrelief.com'));
+        self::assertSame(0, $this->store->puts);
+        self::assertSame([], $this->disk()->allFiles('cmd/lending-tower-invoices'));
+        self::assertCount(4, $this->disk()->allFiles('cmd/review-invoice-numbers'));
+        foreach (['LT-PL-20261001-01', 'LT-LDR-20261001-01', 'LT-PL-20261001-02', 'LT-LDR-20261001-02'] as $index => $number) {
+            $message = $cmd->mail->sent[$index];
+            self::assertStringContainsString($number, $message[0]);
+            self::assertSame($number . '.pdf', $message[5][0]['name']);
+            self::assertSame($number . ' backup.xlsx', $message[5][1]['name']);
+            self::assertSame(['oduai@libertydebtrelief.com'], $message[2]);
+            self::assertSame([], $message[3]);
+            self::assertSame([], $message[4]);
+        }
+    }
+
+    public function test_review_terms_without_a_private_or_local_mode_are_rejected_before_queries(): void
+    {
+        $cmd = $this->command(['--review-terms' => true]);
+        self::assertSame(1, $cmd->handle());
+        self::assertStringContainsString('--review-terms is restricted', $this->out->fetch());
+    }
+
     public function test_ldr_has_its_own_switch_independent_of_progress_law(): void
     {
         $cmd = $this->command();
