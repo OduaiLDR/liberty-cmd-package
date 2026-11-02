@@ -27,6 +27,9 @@ return [
     // Opt in only after the additive summary migration, all eligibility writers and
     // the refresh scheduler have been deployed together. No live rollout is implicit.
     'durable_availability_enabled' => env('CMD_SMS_DURABLE_AVAILABILITY_ENABLED', false),
+    // Unset: recount only after a write marks the summary dirty or a person presses Refresh.
+    // A positive number of seconds restores a time-based recount on top of that.
+    'availability_fresh_seconds' => env('CMD_SMS_AVAILABILITY_FRESH_SECONDS'),
     // Flag-only path, opt in only after explicit Unicode index installation, all-writer
     // SET-option review and actual production scale/plan acceptance. Legacy Response_Date stays unchanged.
     'contact_flag_seek_enabled' => env('CMD_SMS_CONTACT_FLAG_SEEK_ENABLED', false),

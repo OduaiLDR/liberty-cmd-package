@@ -105,6 +105,16 @@ final class SmsDurableAvailabilityTest extends TestCase
         self::assertCount(1, $this->jobs);
     }
 
+    public function test_without_a_time_window_a_published_count_stays_ready_and_queues_nothing(): void
+    {
+        $this->app['config']->set('sms-exports.availability_fresh_seconds', null);
+        self::assertSame('ready', $this->good()['state']);
+        $queued = count($this->jobs);
+        Carbon::setTestNow(now()->addDays(30));
+        self::assertSame('ready', $this->service->request()['state']);
+        self::assertCount($queued, $this->jobs);
+    }
+
     public function test_worker_publishes_atomic_counts_but_never_advances_the_tu_data_date(): void
     {
         $result = $this->good();

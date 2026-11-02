@@ -63,10 +63,11 @@ class SmsDurableAvailabilityService
     private function response(?array $row, bool $unavailable = false): array
     {
         $status = $row['status'] ?? 'idle';
+        $seconds = SmsAvailabilityLedger::freshSeconds();
         $fresh = $row !== null && $status === 'ready'
             && (int) $row['revision'] === (int) $row['published_revision']
             && $row['counted_at'] !== null
-            && Carbon::parse($row['counted_at'], 'UTC')->addSeconds(SmsAvailabilityLedger::FRESH_SECONDS)->isFuture();
+            && ($seconds === null || Carbon::parse($row['counted_at'], 'UTC')->addSeconds($seconds)->isFuture());
         $state = $unavailable || $status === 'failed' ? 'failed' : ($fresh ? 'ready' : 'pending');
         $response = ['state' => $state, 'summary_storage' => 'database',
             'selection_policy' => SmsRecordPolicy::current(),

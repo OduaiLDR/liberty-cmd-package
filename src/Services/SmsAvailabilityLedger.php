@@ -21,6 +21,14 @@ final class SmsAvailabilityLedger
     public const LEASE_SECONDS = SmsExportQueue::JOB_TIMEOUT + 300;
     public const RETRY_SECONDS = 60;
 
+    /** Seconds an unchanged count stays fresh; null keeps it until a data change marks it dirty. */
+    public static function freshSeconds(): ?int
+    {
+        $seconds = config('sms-exports.availability_fresh_seconds', self::FRESH_SECONDS);
+
+        return $seconds === null || $seconds === '' || (int) $seconds <= 0 ? null : (int) $seconds;
+    }
+
     public function scope(): string
     {
         return $this->scopeForPolicy(SmsRecordPolicy::current());
@@ -80,9 +88,11 @@ final class SmsAvailabilityLedger
             if ($this->future($row['retry_at'], $now)) {
                 return null;
             }
+            $fresh = self::freshSeconds();
             if (! $force && $row['status'] === 'ready'
                 && (string) $row['revision'] === (string) $row['published_revision']
-                && $this->future($row['counted_at'], $now->copy()->subSeconds(self::FRESH_SECONDS))) {
+                && ($fresh === null ? $row['counted_at'] !== null
+                    : $this->future($row['counted_at'], $now->copy()->subSeconds($fresh)))) {
                 return null;
             }
 

@@ -350,6 +350,34 @@ final class SmsAvailabilityLedgerTest extends TestCase
         self::assertNotNull($this->ledger->claim());
     }
 
+    public function test_without_a_time_window_an_unchanged_count_stays_fresh_until_data_changes(): void
+    {
+        $this->app['config']->set('sms-exports.availability_fresh_seconds', null);
+        $this->ready();
+        $this->advance(30 * 86400);
+        self::assertNull($this->ledger->claim());
+        $this->dirty();
+        self::assertNotNull($this->ledger->claim());
+    }
+
+    public function test_without_a_time_window_force_still_recounts(): void
+    {
+        $this->app['config']->set('sms-exports.availability_fresh_seconds', '');
+        $this->ready();
+        self::assertNull($this->ledger->claim());
+        self::assertNotNull($this->ledger->claim(true));
+    }
+
+    public function test_a_configured_window_replaces_the_default(): void
+    {
+        $this->app['config']->set('sms-exports.availability_fresh_seconds', '3600');
+        $this->ready();
+        $this->advance(3599);
+        self::assertNull($this->ledger->claim());
+        $this->advance(1);
+        self::assertNotNull($this->ledger->claim());
+    }
+
     public function test_force_refresh_preserves_last_good_even_while_fresh(): void
     {
         $ready = $this->ready();
