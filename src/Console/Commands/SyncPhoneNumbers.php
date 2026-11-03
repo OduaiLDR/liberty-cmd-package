@@ -271,6 +271,8 @@ class SyncPhoneNumbers extends Command
                     ROW_NUMBER() OVER (PARTITION BY CONTACT_ID ORDER BY STAMP DESC, ID DESC) AS STATUS_RANK
                 FROM CONTACTS_STATUS
                 WHERE COALESCE(_FIVETRAN_DELETED, FALSE) = FALSE
+                    -- Forth's CRM migration left STATUS_ID 0 rows with no status; the latest real one wins.
+                    AND STATUS_ID IS NOT NULL AND STATUS_ID <> 0
             ), status_names AS (
                 SELECT ID, MIN(TITLE) AS TITLE,
                     COUNT(DISTINCT TO_BINARY(TITLE, 'UTF-8')) AS TITLE_VARIANTS

@@ -52,7 +52,7 @@ final class SmsLegacyDataSourceMap
         }
     }
 
-    /** Current official names always win; only unresolved LT IDs use the immutable fallback. */
+    /** Current official names always win; any unresolved LT, LDR or PLAW ID uses the immutable fallback. */
     public static function resolve(string $company, ?string $sourceId, ?string $currentName, int $currentVariants = 0): ?string
     {
         if ($currentVariants < 0 || $currentVariants > 1) {
@@ -66,7 +66,8 @@ final class SmsLegacyDataSourceMap
         }
         $sourceId = self::id($sourceId);
         if ($currentVariants !== 0) throw new RuntimeException('Incomplete current Data Source evidence.');
-        if ($company !== 'lt' || $sourceId === null) return null;
+        // The three companies share one data-source ID space (Jacob, Nov 3); LDR/PLAW names were missing too.
+        if (! in_array($company, ['lt', 'ldr', 'plaw'], true) || $sourceId === null) return null;
         return self::all()[$sourceId] ?? null;
     }
 
