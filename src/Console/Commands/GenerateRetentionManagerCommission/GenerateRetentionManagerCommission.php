@@ -54,6 +54,7 @@ class GenerateRetentionManagerCommission extends Command
     private ?string $payrollOutputDirectory = null;
     private bool $payrollFrozenNsfValidity = false;
     private ?array $payrollCalculationContext = null;
+    private bool $payrollReadOnlyComponent = false;
 
     public static function currentPayrollCalculationContext(): array
     {
@@ -93,6 +94,152 @@ class GenerateRetentionManagerCommission extends Command
             foreach ($row as $rate) if ((!is_int($rate) && !is_float($rate)) || !is_finite((float) $rate) || $rate < 0) throw new \InvalidArgumentException('Frozen NSF leadership rates are invalid.');
         }
         return $context;
+    }
+
+    /**
+     * Calculate independently available leadership components from immutable files.
+     * This reader never queries source databases, generates files, or sends email.
+     * Missing legacy tranche evidence leaves Rama's bonus and full pay unknown.
+     */
+    public function buildPayrollReviewLeadershipComponents(string $period, array $retentionArtifacts, array $nsfArtifacts = [], ?array $calculationContext = null): array
+    {
+        $date = \DateTimeImmutable::createFromFormat('!Y-m-d', $period);
+        if (!$date || $date->format('Y-m-d') !== $period || $date->format('d') !== '01') throw new \InvalidArgumentException('Leadership components require an exact reporting month.');
+        $end = $date->format('Y-m-t');
+        $rules = self::validatePayrollCalculationContext($calculationContext ?? self::currentPayrollCalculationContext());
+        $retentionProof = $this->verifyLeadershipArtifacts($retentionArtifacts, 'retention', $period);
+        $nsfProof = $nsfArtifacts === [] ? [] : $this->verifyLeadershipArtifacts($nsfArtifacts, 'nsf', $period);
+        $priorReadOnly = $this->payrollReadOnlyComponent;
+        $priorRoster = $this->anthonyRosterCache;
+        $priorValidity = $this->payrollFrozenNsfValidity;
+        $priorCalculation = $this->payrollCalculationContext;
+        $this->payrollReadOnlyComponent = true;
+        $this->payrollCalculationContext = $rules;
+        try {
+            $retentionRows = [];
+            foreach (['ldr' => 'LDR', 'plaw' => 'Progress Law'] as $source => $display) {
+                $this->verifyLeadershipHeaders($retentionArtifacts['retention_' . $source]['path'], 'retention');
+                $rows = $this->loadRetentionReportRowsFromXlsx($retentionArtifacts['retention_' . $source]['path'], $display);
+                array_push($retentionRows, ...$rows);
+            }
+            $retentionRows = $this->filterRetentionRowsForPeriod($retentionRows, $period, $end);
+            $seen = [];
+            foreach ($retentionRows as $row) {
+                if (strtoupper((string) $this->col($row, 'IMMEDIATE_RESULTS', '')) === 'RETAINED') {
+                    $debt = $this->col($row, 'ENROLLED_DEBT');
+                    if (!is_numeric($debt) || !is_finite((float) $debt) || (float) $debt < 0) throw new \RuntimeException('A retained leadership row has no verified enrolled debt.');
+                }
+                $id = (string) $this->col($row, 'ID', '');
+                if ($id === '') throw new \RuntimeException('Retention leadership requires a client identity.');
+                if (isset($seen[$id]) && $seen[$id] !== $row) throw new \RuntimeException('Retention leadership has conflicting duplicate client rows.');
+                $seen[$id] = $row;
+            }
+            $retentionRows = $this->dedupeRetentionRowsByContactId($retentionRows);
+            $this->sortRetentionRows($retentionRows);
+            $bucket = $this->ramaBucket($retentionRows, false);
+            $base = (float) $this->ramaCommission($bucket['pct'], false);
+            $lines = $this->retentionTeamLines($retentionRows);
+            foreach ($lines as &$line) unset($line['commissionTotal']);
+            unset($line);
+            $rama = ['reportKind' => 'retention_manager', 'managerName' => 'Rama Davis',
+                'commissionType' => $this->managerSheetTitle('rama'), 'company' => 'LDR / Progress Law',
+                'team' => $this->retentionTeamNames($retentionRows), 'summary' => [
+                    'assignedCount' => $bucket['assigned'], 'retainedCount' => $bucket['retained'], 'retentionRate' => $bucket['pct'],
+                    'bonusAssignedCount' => null, 'bonusRetainedCount' => null, 'bonusRate' => null,
+                    'commissionRateDisplay' => 'Tiered manager rate', 'commission' => $base,
+                    'bonusCommission' => null, 'totalCommission' => null, 'totalPay' => null,
+                ], 'lines' => $lines];
+            $reports = [
+                'retention_manager' => $this->leadershipComponent($rama['reportKind'], $rama['managerName'], 'partial', $base,
+                    [['code' => 'rama_bonus', 'reason' => 'Original tranche and cutoff evidence is required to determine the Customer Support Manager bonus.']], $rama, $retentionProof),
+                'retention_team_leader' => $this->leadershipComponent('retention_team_leader', 'Nick Jones', 'ready',
+                    ($nick = $this->buildNickPayrollSnapshot($retentionRows, $period, $end))['summary']['totalPay'], [], $nick, $retentionProof),
+                'nsf_team_leader' => $this->leadershipComponent('nsf_team_leader', 'Anthony Clark', 'pending', null,
+                    [['code' => 'nsf_capture', 'reason' => 'An exact frozen NSF capture for both companies is required.']], null, [], $rules),
+            ];
+            if ($nsfArtifacts !== []) {
+                $nsfRows = $roster = $readinessIds = [];
+                foreach (['ldr' => 'LDR', 'plaw' => 'Progress Law'] as $source => $display) {
+                    $path = $nsfArtifacts['nsf_' . $source]['path'];
+                    $this->verifyLeadershipHeaders($path, 'nsf');
+                    $rows = $this->loadNsfCommissionRowsFromXlsx($path, $display, $readinessIds, $source);
+                    $seen = [];
+                    foreach ($rows as $row) {
+                        $id = trim((string) ($row['ID'] ?? ''));
+                        if ($id === '' || isset($seen[$id])) throw new \RuntimeException('NSF leadership requires unique source client rows.');
+                        $seen[$id] = true;
+                        \Cmd\Reports\Services\CustomerServiceRosterAmendment::frozenValidity($row['VALID_COMMISSION'] ?? null);
+                    }
+                    array_push($nsfRows, ...$rows);
+                    foreach ($this->archivedNsfRoster($path) as $name) $roster[$this->anthonyAgentKey($name)] = $name;
+                }
+                if (count($readinessIds) !== 2) throw new \RuntimeException('Frozen NSF workbooks lack their original readiness identities.');
+                $this->anthonyRosterCache = array_values($roster);
+                $this->payrollFrozenNsfValidity = true;
+                $anthony = $this->buildAnthonyPayrollSnapshot($nsfRows);
+                $anthony['nsfReadinessRunIds'] = $readinessIds;
+                $reports['nsf_team_leader'] = $this->leadershipComponent('nsf_team_leader', 'Anthony Clark', 'ready',
+                    $anthony['summary']['totalPay'], [], $anthony, $nsfProof, $rules);
+            }
+            // Detect a changed input even if it changed after the first verified read.
+            if ($retentionProof !== $this->verifyLeadershipArtifacts($retentionArtifacts, 'retention', $period)
+                || ($nsfArtifacts !== [] && $nsfProof !== $this->verifyLeadershipArtifacts($nsfArtifacts, 'nsf', $period))) {
+                throw new \RuntimeException('A leadership source changed during inspection.');
+            }
+            return ['reports' => $reports, 'calculationContext' => $rules];
+        } finally {
+            $this->payrollReadOnlyComponent = $priorReadOnly;
+            $this->anthonyRosterCache = $priorRoster;
+            $this->payrollFrozenNsfValidity = $priorValidity;
+            $this->payrollCalculationContext = $priorCalculation;
+        }
+    }
+
+    private function verifyLeadershipArtifacts(array $artifacts, string $family, string $period): array
+    {
+        $expected = [$family . '_ldr', $family . '_plaw'];
+        if (count($artifacts) !== 2 || array_diff($expected, array_keys($artifacts))) throw new \InvalidArgumentException('Both exact leadership source artifacts are required.');
+        $proof = [];
+        foreach ($expected as $key) {
+            $artifact = $artifacts[$key];
+            $path = $artifact['path'] ?? null;
+            $context = $artifact['context'] ?? null;
+            if (!is_array($artifact) || ($artifact['key'] ?? null) !== $key || ($artifact['period'] ?? null) !== $period
+                || !is_string($path) || is_link($path) || !is_file($path) || !is_array($context)
+                || !is_string($artifact['sha256'] ?? null) || !preg_match('/^[a-f0-9]{64}$/D', $artifact['sha256'])
+                || hash_file('sha256', $path) !== $artifact['sha256']
+                || hash('sha256', json_encode($context, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)) !== ($artifact['contextSha256'] ?? null)) {
+                throw new \RuntimeException('Leadership source does not match its immutable artifact evidence.');
+            }
+            $proof[] = ['key' => $key, 'period' => $period, 'sha256' => $artifact['sha256'], 'contextSha256' => $artifact['contextSha256']];
+        }
+        return $proof;
+    }
+
+    private function verifyLeadershipHeaders(string $path, string $family): void
+    {
+        $title = $family === 'nsf' ? 'NSF Data' : 'Retention Data';
+        $reader = IOFactory::createReader('Xlsx');
+        $reader->setReadDataOnly(true); $reader->setLoadSheetsOnly([$title]);
+        $book = $reader->load($path);
+        try {
+            $sheet = $book->getSheetByName($title);
+            if (!$sheet || $sheet->getHighestDataRow() > 100000) throw new \RuntimeException('Leadership detail sheet is missing or exceeds its size limit.');
+            $headers = [];
+            foreach ($sheet->rangeToArray('A1:' . $sheet->getHighestDataColumn() . '1', null, false, false)[0] as $header) $headers[] = trim((string) $header);
+            $required = $family === 'nsf' ? ['ID', 'Agent', 'NSF Action', 'Valid Commission']
+                : ['ID', 'Retention Agent', 'Immediate Results', 'Enrolled Debt', 'Cancel Request Date'];
+            if (array_diff($required, $headers)) throw new \RuntimeException('Leadership detail headers do not supply all required inputs.');
+        } finally { $book->disconnectWorksheets(); }
+    }
+
+    private function leadershipComponent(string $kind, string $name, string $state, ?float $knownSubtotal, array $pending, ?array $snapshot, array $inputs, ?array $rules = null): array
+    {
+        $version = hash_file('sha256', __FILE__);
+        if (!is_string($version)) throw new \RuntimeException('Leadership calculation version is unavailable.');
+        $digest = hash('sha256', json_encode(['cs-component-leadership-v1', $kind, $inputs, $version, $rules, $snapshot, $pending], JSON_THROW_ON_ERROR));
+        return ['reportKind' => $kind, 'managerName' => $name, 'state' => $state, 'sourceDigest' => $digest,
+            'knownSubtotal' => $knownSubtotal, 'pendingInputs' => $pending, 'snapshot' => $snapshot];
     }
 
     /** Freeze the existing Rama tranche/cutoff inputs when the source report completes. */
@@ -183,6 +330,7 @@ class GenerateRetentionManagerCommission extends Command
 
     private function reportInfo(string $message): void
     {
+        if ($this->payrollReadOnlyComponent) return;
         try {
             $this->info($message);
         } catch (\Throwable) {
@@ -193,6 +341,7 @@ class GenerateRetentionManagerCommission extends Command
     /** Same guard as reportInfo — buildPayrollReviewSnapshots() runs outside a console context. */
     private function reportWarn(string $message): void
     {
+        if ($this->payrollReadOnlyComponent) return;
         try {
             $this->warn($message);
         } catch (\Throwable) {
