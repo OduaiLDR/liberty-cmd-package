@@ -181,15 +181,38 @@ class SmsExternalEventServiceTest extends TestCase
     {
         $this->staged(); $this->writer->applyNext(self::ID,$this->plan['plan_sha256'],null); $this->writer->finish(self::ID,$this->plan['plan_sha256']);
         self::assertTrue($this->writer->verify(self::ID,$this->plan['plan_sha256'])['verified']);
-        foreach (['fixture 1','Fixture 1 '] as $bad) {
-            $this->db->table('TblSMSHistory')->where('Prospect_PK',1)->update(['Address'=>$bad]); $caught=false;
+        // History keeps no address copy (Jacob, Nov 3); the sealed member row still holds the exact original.
+        self::assertNull($this->db->table('TblSMSHistory')->where('Prospect_PK',1)->value('Address'));
+        $original=$this->db->table('TblSMSExternalMembers')->where('Prospect_PK',1)->value('Original_Address');
+        foreach ([strtolower($original),$original.' '] as $bad) {
+            $this->db->table('TblSMSExternalMembers')->where('Prospect_PK',1)->update(['Original_Address'=>$bad]); $caught=false;
             try { $this->writer->verify(self::ID,$this->plan['plan_sha256']); } catch (\Throwable) { $caught=true; }
             self::assertTrue($caught,'Immutable original address bytes must match even under a CI collation.');
         }
-        $this->db->table('TblSMSHistory')->where('Prospect_PK',1)->update(['Address'=>'Fixture 1']);
+        $this->db->table('TblSMSExternalMembers')->where('Prospect_PK',1)->update(['Original_Address'=>$original]);
+        self::assertTrue($this->writer->verify(self::ID,$this->plan['plan_sha256'])['verified']);
         $this->db->table('TblSMSExternalMembers')->where('Prospect_PK',1)->update(['Original_Debt_Text'=>'different']); $caught=false;
         try { $this->writer->verify(self::ID,$this->plan['plan_sha256']); } catch (\Throwable) { $caught=true; }
         self::assertTrue($caught);
+    }
+
+    public function test_a_later_tier_assignment_verifies_only_through_this_runs_own_matching_drop(): void
+    {
+        $this->staged(); $this->writer->applyNext(self::ID,$this->plan['plan_sha256'],null); $this->writer->finish(self::ID,$this->plan['plan_sha256']);
+        $drop=fn (string $request, string $name, string $tier): int => (int)$this->db->table('TblSMSDrops')->insertGetId(['Drop_Name'=>$name,
+            'Debt_Tier'=>$tier,'Drop_Date'=>'2026-10-26','Amount_Dropped'=>1,'Request_ID'=>$request,'Created_At'=>'2026-11-03 12:00:00']);
+        $own=$drop(self::ID,'SMS0001','T1'); $foreign=$drop('99999999-8888-4777-8666-555555555555','SMS0002','T1');
+        $assigned=['SMS_Drop_PK'=>$own,'Drop_Name'=>'SMS0001','Debt_Tier'=>'T1','Debt_Source'=>'TblTUData','Debt_Source_PK'=>7,'Was_Previously_Texted'=>null];
+        $this->db->table('TblSMSHistory')->where('Prospect_PK',1)->update($assigned);
+        self::assertTrue($this->writer->verify(self::ID,$this->plan['plan_sha256'])['verified'], 'The 10/26 send may carry its own drop and tier.');
+        foreach ([['SMS_Drop_PK'=>$foreign,'Drop_Name'=>'SMS0002'],['Debt_Tier'=>'T2'],['Drop_Name'=>'SMS0003'],
+            ['SMS_Drop_PK'=>null],['Debt_Tier'=>null],['Was_Previously_Texted'=>1]] as $bad) {
+            $this->db->table('TblSMSHistory')->where('Prospect_PK',1)->update(array_replace($assigned,$bad)); $caught=false;
+            try { $this->writer->verify(self::ID,$this->plan['plan_sha256']); } catch (\Throwable) { $caught=true; }
+            self::assertTrue($caught,'Rejected: '.json_encode($bad));
+        }
+        $this->db->table('TblSMSHistory')->where('Prospect_PK',1)->update($assigned);
+        self::assertTrue($this->writer->verify(self::ID,$this->plan['plan_sha256'])['verified']);
     }
 
     public function test_committed_chunk_survives_process_recovery_and_explicit_hold_resume(): void

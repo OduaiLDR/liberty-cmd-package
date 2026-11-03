@@ -281,14 +281,15 @@ class SyncPhoneNumbers extends Command
                 GROUP BY ID
             )
             SELECT c.ID::VARCHAR AS ID, c.TP_ID::VARCHAR AS EXTERNAL_ID,
-                c.C_SOURCE::VARCHAR AS DATA_SOURCE_ID,
+                -- Data source 0 is not a source (Jacob, Nov 3): it reads as no source, never a name.
+                NULLIF(c.C_SOURCE, 0)::VARCHAR AS DATA_SOURCE_ID,
                 ds.NAME AS DATA_SOURCE, COALESCE(ds.NAME_VARIANTS, 0) AS DATA_SOURCE_VARIANTS,
                 status_names.TITLE AS STATUS, COALESCE(status_names.TITLE_VARIANTS, 0) AS STATUS_VARIANTS,
                 latest_status.STATUS_ID::VARCHAR AS STATUS_ID,
                 phone_values.VALUE::STRING AS PHONE, phone_values.INDEX AS PHONE_SLOT,
                 TO_CHAR(CONVERT_TIMEZONE('America/Los_Angeles', c.CREATED)::DATE, 'YYYY-MM-DD') AS CREATED_DATE
             FROM CONTACTS AS c
-            LEFT JOIN source_names AS ds ON c.C_SOURCE = ds.ID
+            LEFT JOIN source_names AS ds ON ds.ID = NULLIF(c.C_SOURCE, 0)
             LEFT JOIN latest_status ON latest_status.CONTACT_ID = c.ID AND latest_status.STATUS_RANK = 1
             LEFT JOIN status_names ON status_names.ID = latest_status.STATUS_ID,
                  LATERAL FLATTEN(

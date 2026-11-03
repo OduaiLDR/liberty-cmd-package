@@ -37,6 +37,14 @@ class SmsProspectExportRepository extends SqlSrvRepository
     /** Business dates (send date, Latest_Export_Date) are California dates. */
     public const TIMEZONE = 'America/Los_Angeles';
 
+    /**
+     * Columns copied from TblProspectsExport into TblSMSHistory (plus Export_Date). Jacob, Nov 3: history
+     * keeps the prospect PK and its drop, not a copy of the address; the PK finds the person's record.
+     * State stays: the final handoff compares the frozen State with the prospect's current one.
+     */
+    public const HISTORY_COLUMNS = ['Request_ID', 'SMS_Drop_PK', 'Drop_Name', 'Prospect_PK', 'Phone', 'Debt_Amount', 'Debt_Tier',
+        'Debt_Source', 'Debt_Source_PK', 'State', 'Was_Previously_Texted'];
+
     // ASC puts the never-exported (NULL) first.
     private const PRIORITY = 'Latest_Export_Date ASC, CASE WHEN Latest_Export_Date IS NULL THEN Creation_Date END DESC, Creation_Date DESC, PK ASC';
 
@@ -427,8 +435,8 @@ SQL, [$sentAt->copy()->setTimezone(self::TIMEZONE)->toDateString(), $requestId, 
 
             $moved = $db->affectingStatement(<<<'SQL'
 INSERT INTO TblSMSHistory (Request_ID, SMS_Drop_PK, Drop_Name, Prospect_PK, Phone, Export_Date,
-    Debt_Amount, Debt_Tier, Debt_Source, Debt_Source_PK, Client, Address, City, State, Zip, Email)
-SELECT Request_ID, SMS_Drop_PK, Drop_Name, Prospect_PK, Phone, ?, Debt_Amount, Debt_Tier, Debt_Source, Debt_Source_PK, Client, Address, City, State, Zip, Email
+    Debt_Amount, Debt_Tier, Debt_Source, Debt_Source_PK, State)
+SELECT Request_ID, SMS_Drop_PK, Drop_Name, Prospect_PK, Phone, ?, Debt_Amount, Debt_Tier, Debt_Source, Debt_Source_PK, State
 FROM TblProspectsExport
 WHERE Request_ID = ?
 SQL, [$sentAt->toDateTimeString(), $requestId]);

@@ -63,7 +63,7 @@ final class SmsRecordPolicy
         foreach (['TblProspects' => SmsProspectSchema::recordColumns(),
             'TblSMSRuns' => ['Selection_Policy', 'Never_Texted', 'Previously_Texted', 'Approved_At', 'Approved_By', 'File_Cleanup_Path'],
             'TblProspectsExport' => ['Was_Previously_Texted', 'Last_SMS_Date_At_Selection'],
-            'TblSMSHistory' => ['Was_Previously_Texted', 'Last_SMS_Date_At_Selection']] as $table => $columns) {
+            'TblSMSHistory' => ['Was_Previously_Texted']] as $table => $columns) {
             if (! $schema->hasTable($table) || ! $schema->hasColumns($table, $columns)) {
                 throw new HttpException(503, 'Apply the explicit SMS record-approval migration before enabling this workflow.');
             }
