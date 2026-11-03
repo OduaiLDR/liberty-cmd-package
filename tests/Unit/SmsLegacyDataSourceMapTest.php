@@ -20,12 +20,17 @@ final class SmsLegacyDataSourceMapTest extends TestCase
         self::assertNotSame('79071', '79086');
     }
 
-    public function test_current_name_wins_and_legacy_is_lt_only(): void
+    public function test_current_name_wins_and_legacy_covers_all_three_companies(): void
     {
         self::assertSame('Current Name', SmsLegacyDataSourceMap::resolve('lt','79071','Current Name',1));
+        self::assertSame('Current Name', SmsLegacyDataSourceMap::resolve('ldr','57786','Current Name',1));
         self::assertSame('DPP - Mass Post Source', SmsLegacyDataSourceMap::resolve('lt','79071',null,0));
-        self::assertNull(SmsLegacyDataSourceMap::resolve('ldr','79071',null,0));
+        // Unnamed LDR/PLAW IDs seen in production on Nov 3 resolve through the same shared table.
+        self::assertSame('LLG-call-center', SmsLegacyDataSourceMap::resolve('ldr','57786',null,0));
+        self::assertSame('CrediCare Submission', SmsLegacyDataSourceMap::resolve('plaw','130578',null,0));
         self::assertNull(SmsLegacyDataSourceMap::resolve('lt','999999',null,0));
+        self::assertNull(SmsLegacyDataSourceMap::resolve('plaw','0',null,0));
+        self::assertNull(SmsLegacyDataSourceMap::resolve('other','57786',null,0));
     }
 
     public function test_conflicting_current_names_and_invalid_ids_hold(): void

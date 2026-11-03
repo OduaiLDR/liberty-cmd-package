@@ -98,6 +98,8 @@ final class SmsPhoneSnapshotDedupTest extends TestCase
         self::assertStringContainsString('PARTITION BY CONTACT_ID ORDER BY STAMP DESC, ID DESC',$sql);
         self::assertStringContainsString('COALESCE(_FIVETRAN_DELETED, FALSE) = FALSE',$sql);
         self::assertStringContainsString('latest_status.STATUS_RANK = 1',$sql);
+        // Status 0 rows from the Forth CRM migration never become the latest status.
+        self::assertStringContainsString('AND STATUS_ID IS NOT NULL AND STATUS_ID <> 0',$sql);
         self::assertStringContainsString("c.CREATED)::DATE",$sql); self::assertStringNotContainsString('CREATED_AT',$sql);
     }
 
