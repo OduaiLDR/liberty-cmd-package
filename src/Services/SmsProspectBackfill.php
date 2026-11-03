@@ -217,7 +217,9 @@ SQL;
                 if ($table === 'dbo.TblMailersUnique' && $index['name'] !== 'IndexExternalID') continue;
                 $groups[$index['name']][] = $index['Column_Name'];
             }
-            $found = array_filter($groups, static fn (array $columns): bool => array_slice($columns, 0, count($keys)) === $keys);
+            $found = array_filter($groups, static fn (array $columns): bool => array_slice($columns, 0, count($keys)) === $keys
+                // Wide contacts are read through Phone1-4 (Jacob, Nov 3); the old Phone column and its index can be gone.
+                || ($table === 'dbo.TblPhoneNumbers' && array_slice($columns, 0, 1) === ['Phone1']));
             if ($found === []) throw new RuntimeException('A required bounded backfill lookup index is unavailable.');
         }
         $external = self::rows($db, "SELECT TYPE_NAME(user_type_id) AS Type_Name,max_length FROM sys.columns WHERE object_id=OBJECT_ID('dbo.TblMailersUnique') AND name='External_ID'")[0] ?? null;

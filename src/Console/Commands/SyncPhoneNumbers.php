@@ -30,6 +30,8 @@ class SyncPhoneNumbers extends Command
 
     /** Set once TblPhoneNumbers has the contact's creation date (the SMS prospects migration adds it). */
     protected bool $withCreatedDate = false;
+    /** The old one-phone column. Jacob, Nov 3: only Phone1-4 are used; it is filled only until it is dropped. */
+    protected bool $withLegacyPhone = true;
     /** Set at the native commit boundary, before any postcommit refresh can fail. */
     protected bool $phoneSnapshotCommitted = false;
 
@@ -149,6 +151,7 @@ class SyncPhoneNumbers extends Command
                     throw new \RuntimeException('Phone synchronization requires the provenance target columns.');
                 }
             }
+            $this->withLegacyPhone = DB::connection('sqlsrv')->getSchemaBuilder()->hasColumn('TblPhoneNumbers', 'Phone');
             $this->assertProvenanceStorage();
             $phase = 'source_staging';
             [$stage, $stagePath, $sourceCount, $normalizedCount] = $this->stagePhonesFromSnowflake($snowflake);
@@ -415,9 +418,11 @@ class SyncPhoneNumbers extends Command
                 N'Phone1',N'Phone2',N'Phone3',N'Phone4')");
         $found = [];
         foreach ($columns as $column) $found[$column->column_name] = $column;
-        $phoneCollation=$found['Phone']->collation_name??null;
-        if(!is_string($phoneCollation)||$phoneCollation==='') throw new \RuntimeException('Wide phone synchronization requires the existing Phone collation.');
-        foreach(range(1,4) as $slot) {
+        // Phone1 is the reference: the old Phone column may already be gone, and must match while it exists.
+        $phoneCollation=$found['Phone1']->collation_name??null;
+        if(!is_string($phoneCollation)||$phoneCollation==='') throw new \RuntimeException('Wide phone synchronization requires the existing Phone1 collation.');
+        if(isset($found['Phone']) && $found['Phone']->collation_name!==$phoneCollation) throw new \RuntimeException('Wide phone synchronization requires matching phone collations.');
+        foreach(range(2,4) as $slot) {
             if(($found['Phone'.$slot]->collation_name??null)!==$phoneCollation) throw new \RuntimeException('Wide phone synchronization requires matching phone collations.');
         }
         foreach (['Data_Source'=>100,'External_ID'=>512,'Status'=>512,
@@ -533,10 +538,10 @@ class SyncPhoneNumbers extends Command
             $unicode = $hasMetadata && DB::connection('sqlsrv')->getDriverName() === 'sqlsrv' ? 'N' : '';
             $metadataValues = array_map(fn (?string $value): string => $value === null ? 'NULL' : $unicode."'".$this->esc($value)."'", $metadata);
             $wideValues=implode(', ',array_map(fn($phone)=>$phone===null?'NULL':"'".$this->esc($phone)."'",$phones));
-            $values[] = "('{$phoneEsc}', '{$sourceEsc}', {$cid}, {$created}, ".implode(', ', $metadataValues).", {$wideValues})";
+            $values[] = '('.($this->withLegacyPhone ? "'{$phoneEsc}', " : '')."'{$sourceEsc}', {$cid}, {$created}, ".implode(', ', $metadataValues).", {$wideValues})";
         }
 
-        $columns = 'Phone, Source, CID, Created_Date, Data_Source, External_ID, Status, Phone1, Phone2, Phone3, Phone4';
+        $columns = ($this->withLegacyPhone ? 'Phone, ' : '').'Source, CID, Created_Date, Data_Source, External_ID, Status, Phone1, Phone2, Phone3, Phone4';
         $sql = "INSERT INTO TblPhoneNumbers ({$columns}) VALUES " . implode(', ', $values);
         $affected = $this->executeSqlServerWrite($connection, $sql, 'insert phone batch ' . $batchNumber);
         $inserted = $affected > 0 ? $affected : count($chunk);
@@ -559,7 +564,7 @@ class SyncPhoneNumbers extends Command
     private function cleanupEmptyPhones(PDO $connection): int
     {
         $source = $this->esc($this->sourceLabel());
-        $sql = "DELETE FROM TblPhoneNumbers WHERE Source = '{$source}' AND Phone = ''";
+        $sql = "DELETE FROM TblPhoneNumbers WHERE Source = '{$source}' AND Phone1 = ''";
         return $this->executeSqlServerWrite($connection, $sql, 'cleanup empty phones');
     }
 

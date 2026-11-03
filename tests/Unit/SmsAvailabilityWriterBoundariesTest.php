@@ -264,7 +264,7 @@ final class SmsAvailabilityWriterBoundariesTest extends TestCase
                     if ($this->failInsert) throw new RuntimeException('synthetic phone insert failure');
                     return 1;
                 }
-                if (str_contains($statement, "AND Phone = ''")) {
+                if (str_contains($statement, "AND Phone1 = ''")) {
                     $this->trace->events[] = 'cleanup';
                     return 0;
                 }
