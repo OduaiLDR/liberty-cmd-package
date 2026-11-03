@@ -165,11 +165,10 @@ class GenerateNSFCommissionReport extends Command
                 true
             );
 
-            // The report itself only ever shows roster members.
-            $commissionRows = array_values(array_filter(
-                $pricedRows,
-                fn (array $r): bool => $isOnRoster((string) $r['agent'])
-            ));
+            // Workbook/payable rows retain the roster scope. Payroll capture
+            // keeps every priced identity so missing roster earners are auditable.
+            $payloads = $this->commissionPayloads($pricedRows, $isOnRoster);
+            $commissionRows = $payloads['rosterRows'];
 
             $unassigned = UnassignedCommissionAgents::fromTotals(
                 array_column(
@@ -211,7 +210,8 @@ class GenerateNSFCommissionReport extends Command
                 );
             });
             $context = PayrollReportArtifactArchive::captureRequested()
-                ? ['commissionResults' => PayrollCommissionResultSnapshot::component('nsf', $source, $startDate, 'commission', $nsfResults)] : [];
+                ? ['commissionResults' => PayrollCommissionResultSnapshot::component('nsf', $source, $startDate, 'commission', $payloads['sourceResults'],
+                    PayrollCommissionResultSnapshot::NSF_ALL_PRICED_AGENTS)] : [];
             PayrollReportArtifactArchive::captureFromEnvironment('nsf', $source, $startDate, $allFile, $context);
             NsfReportReadiness::complete($sql, $readiness);
             $this->info("[INFO] [$display] Snapshot saved: {$snapshotPath}");
@@ -250,6 +250,15 @@ class GenerateNSFCommissionReport extends Command
     private function fetchNSFRows(DBConnector $sf, array $cfg, string $startDate, string $endDate): array
     {
         return NsfCommissionSource::fetch($sf, $cfg, $startDate, $endDate);
+    }
+
+    /** Preserve computed source amounts independently from the payable roster filter. */
+    private function commissionPayloads(array $pricedRows, callable $isOnRoster): array
+    {
+        return [
+            'rosterRows' => array_values(array_filter($pricedRows, fn (array $row): bool => $isOnRoster((string) $row['agent']))),
+            'sourceResults' => array_map(fn (array $row): array => ['agent' => $row['agent'], 'amount' => $row['commission']], $pricedRows),
+        ];
     }
 
     /**
