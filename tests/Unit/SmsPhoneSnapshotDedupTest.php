@@ -104,6 +104,24 @@ final class SmsPhoneSnapshotDedupTest extends TestCase
         self::assertStringContainsString("c.CREATED)::DATE",$sql); self::assertStringNotContainsString('CREATED_AT',$sql);
     }
 
+    public function test_sync_writes_only_phone1_to_4_once_the_old_phone_column_is_dropped(): void
+    {
+        // Jacob, Nov 3: the duplicate Phone column goes; the sync must keep working without it.
+        $this->db->statement('DROP TABLE TblPhoneNumbers');
+        $this->db->statement('CREATE TABLE TblPhoneNumbers(PK INTEGER PRIMARY KEY AUTOINCREMENT,Source TEXT,CID TEXT,Created_Date TEXT,Data_Source TEXT,External_ID TEXT,Status TEXT,Phone1 TEXT,Phone2 TEXT,Phone3 TEXT,Phone4 TEXT)');
+        $this->db->table('TblPhoneNumbers')->insert(['Phone1'=>'2025550100','Source'=>'DP_LDR','CID'=>'old']);
+        $command=$this->command([[$this->row(), $this->row(['PHONE'=>'2025550198','PHONE_SLOT'=>1])]]);
+        self::assertSame(0,$command->handle(), implode(' ', $command->errors));
+        $own=$this->db->table('TblPhoneNumbers')->where('Source','DP_LT')->get();
+        self::assertCount(1,$own); self::assertSame(['2025550199','2025550198'],[$own[0]->Phone1,$own[0]->Phone2]);
+        self::assertObjectNotHasProperty('Phone',$own[0]);
+        self::assertSame(1,$this->db->table('TblPhoneNumbers')->where('Source','DP_LDR')->count());
+        // With the column gone, the contact projection reads Phone1-4 only and never names Phone.
+        $projection=SmsPhoneNumbersSql::from('p','',true);
+        self::assertSame(4,substr_count($projection,'FROM TblPhoneNumbers')); self::assertStringNotContainsString('SELECT Phone,',$projection);
+        self::assertSame(['2025550100','2025550198','2025550199'],collect($this->db->select('SELECT Phone FROM '.$projection))->pluck('Phone')->sort()->values()->all());
+    }
+
     public static function conflicts(): array
     {
         return [['CREATED_DATE','2026-10-13'],['DATA_SOURCE','Different source'],['DATA_SOURCE',null],
