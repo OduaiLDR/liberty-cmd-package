@@ -35,7 +35,16 @@ final class PayrollReportArtifactArchive
 
     public function capture(string $key, string $period, string $identity, array $file, array $context = []): array
     {
-        $directory = $this->directory($key, $period, $identity);
+        return $this->captureAt($key, $period, $identity, $file, $context, $this->directory($key, $period, $identity));
+    }
+
+    public function captureAmendment(string $key, string $period, string $bundleId, array $file, array $context = []): array
+    {
+        return $this->captureAt($key, $period, $bundleId, $file, $context, $this->amendmentDirectory($key, $period, $bundleId));
+    }
+
+    private function captureAt(string $key, string $period, string $identity, array $file, array $context, string $directory): array
+    {
         $fileName = (string) ($file['filename'] ?? '');
         if ($fileName === '' || basename(str_replace('\\', '/', $fileName)) !== $fileName || !str_ends_with(strtolower($fileName), '.xlsx')) {
             throw new \InvalidArgumentException('The payroll archive requires a safe XLSX attachment name.');
@@ -52,7 +61,7 @@ final class PayrollReportArtifactArchive
         if (!$lock || !flock($lock, LOCK_EX)) throw new \RuntimeException('Payroll workbook archive lock is unavailable.');
         try {
             if (is_file($directory . '/artifact.json')) {
-                $stored = $this->read($key, $period, $identity);
+                $stored = $this->readAt($key, $period, $identity, $directory);
                 if (array_diff_key($stored, ['path' => true]) !== $metadata) throw new \RuntimeException('An immutable payroll workbook identity already has different content.');
                 return $stored;
             }
@@ -78,7 +87,16 @@ final class PayrollReportArtifactArchive
 
     public function read(string $key, string $period, string $identity): array
     {
-        $directory = $this->directory($key, $period, $identity);
+        return $this->readAt($key, $period, $identity, $this->directory($key, $period, $identity));
+    }
+
+    public function readAmendment(string $key, string $period, string $bundleId): array
+    {
+        return $this->readAt($key, $period, $bundleId, $this->amendmentDirectory($key, $period, $bundleId));
+    }
+
+    private function readAt(string $key, string $period, string $identity, string $directory): array
+    {
         $path = $directory . '/report.xlsx';
         if (is_link($directory) || is_link($path) || !is_file($directory . '/artifact.json')) throw new \RuntimeException('The correlated payroll workbook archive is missing.');
         $metadata = json_decode((string) file_get_contents($directory . '/artifact.json'), true, flags: JSON_THROW_ON_ERROR);
@@ -100,6 +118,17 @@ final class PayrollReportArtifactArchive
             throw new \InvalidArgumentException('Payroll artifact scope requires an approved report, exact reporting month and correlated identity.');
         }
         return rtrim($this->root, '/\\') . '/' . $period . '/' . $identity . '/' . $key;
+    }
+
+    private function amendmentDirectory(string $key, string $period, string $bundleId): string
+    {
+        $date = \DateTimeImmutable::createFromFormat('!Y-m-d', $period);
+        if (!in_array($key, [...self::SOURCE_KEYS, ...self::LEADERSHIP_KEYS], true)
+            || !$date || $date->format('Y-m-d') !== $period || $date->format('d') !== '01'
+            || !preg_match('/^[a-f0-9]{64}$/D', $bundleId)) {
+            throw new \InvalidArgumentException('Payroll amendment requires an approved report, reporting month and immutable bundle id.');
+        }
+        return rtrim($this->root, '/\\') . '/amendments/' . $period . '/' . $bundleId . '/' . $key;
     }
 
     private function verifyWorkbook(string $path): array

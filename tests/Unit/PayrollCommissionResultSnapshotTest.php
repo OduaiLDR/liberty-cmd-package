@@ -45,6 +45,31 @@ class PayrollCommissionResultSnapshotTest extends TestCase
         $this->assertSame([], $snapshot['agentResults']);
         $this->assertCount(4, $snapshot['agentResultsCoverage']);
     }
+    public function test_only_explicit_all_priced_nsf_capture_preserves_the_new_coverage_basis(): void
+    {
+        $sources = $this->sources();
+        $legacy = PayrollCommissionResultSnapshot::merge($sources, '2098-09-01');
+        foreach ($legacy['agentResultsCoverage'] as $scope) $this->assertArrayNotHasKey('coverageBasis', $scope);
+        foreach (['ldr', 'plaw'] as $source) {
+            $component = $sources['nsf_' . $source]['context']['commissionResults'];
+            $sources['nsf_' . $source]['context']['commissionResults'] = PayrollCommissionResultSnapshot::component('nsf', $source,
+                '2098-09-01', 'commission', $component['rows'], PayrollCommissionResultSnapshot::NSF_ALL_PRICED_AGENTS);
+        }
+        $current = PayrollCommissionResultSnapshot::merge($sources, '2098-09-01');
+        $this->assertSame($legacy['agentResults'], $current['agentResults']);
+        foreach ($current['agentResultsCoverage'] as $scope) {
+            if ($scope['reportKind'] === 'nsf') $this->assertSame('all_priced_agents_v1', $scope['coverageBasis']);
+            else $this->assertArrayNotHasKey('coverageBasis', $scope);
+        }
+    }
+
+    public function test_an_unknown_coverage_claim_cannot_be_published(): void
+    {
+        $sources = $this->sources();
+        $sources['nsf_ldr']['context']['commissionResults']['coverageBasis'] = 'roster_only';
+        $this->expectException(\RuntimeException::class);
+        PayrollCommissionResultSnapshot::merge($sources, '2098-09-01');
+    }
     public function test_component_source_or_period_substitution_cannot_publish(): void
     {
         foreach (['source' => 'ldr', 'period' => '2098-08-01', 'complete' => false] as $field => $value) {

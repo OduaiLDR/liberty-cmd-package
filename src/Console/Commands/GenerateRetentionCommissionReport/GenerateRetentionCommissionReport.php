@@ -15,6 +15,7 @@ use Cmd\Reports\Services\CommissionRosterProvider;
 use Cmd\Reports\Services\EmailSenderService;
 use Cmd\Reports\Services\RetentionCommissionTierStore;
 use Cmd\Reports\Services\RetentionAgentIdentity;
+use Cmd\Reports\Services\RetentionPricingSnapshot;
 use Cmd\Reports\Services\RetentionCommissionReportBuilder;
 use Cmd\Reports\Services\UnassignedCommissionAgents;
 use Illuminate\Console\Command;
@@ -29,13 +30,9 @@ use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 /**
  * Retention Commission Report (not the bonus/percentage report).
  *
- * Produces two sheets per source:
- *   1. "Retention Commission Report" – one row per retained contact with T1/T2/T3 flat-dollar commissions
- *   2. "Commission Summary"          – one row per retention agent with tier and total commission
- *
- * Emails one workbook per source (LDR, PLAW) containing the full dataset
- * (" - All"), plus one workbook per configured agent filtered to their data
- * (" - <Agent Name>"), all attached in the same email.
+ * Produces Retention Data and Commission Summary sheets per source. Data keeps
+ * the candidate rates and the actual selected tier/amount for each paid line.
+ * One full workbook per source is saved; payroll controls review distribution.
  *
  * LDR:  custom_agent=742096, custom_date=742101, custom_results=742105,
  *        recon_status_id=377650, cancel_request_custom=742098
@@ -120,12 +117,15 @@ class GenerateRetentionCommissionReport extends Command
 
     /** Per-agent commission summary from the most recent buildWorkbook(), for the Azure results write. */
     private array $lastSummaryRows = [];
+    /** Actual choices made by the same pricing pass, keyed by raw worksheet row. */
+    private array $lastPricingRows = [];
 
     protected function runForSource(string $source): bool
     {
         // Reset per source: handle() runs LDR then PLAW on the SAME instance, so a stale value
         // here would persist one source's commission under the other source's key.
         $this->lastSummaryRows = [];
+        $this->lastPricingRows = [];
 
         $cfg     = self::SOURCE_CONFIG[$source];
         $display = $cfg['display'];
@@ -359,7 +359,11 @@ class GenerateRetentionCommissionReport extends Command
             }
             $archiveContext = PayrollReportArtifactArchive::captureRequested()
                 ? (new GenerateRetentionManagerCommission)->buildPayrollRetentionContext($rows) : [];
-            if (PayrollReportArtifactArchive::captureRequested()) $archiveContext['commissionResults'] = PayrollCommissionResultSnapshot::component('retention', $source, $startDate, 'commission', $retResults);
+            if (PayrollReportArtifactArchive::captureRequested()) {
+                $archiveContext['commissionResults'] = PayrollCommissionResultSnapshot::component('retention', $source, $startDate, 'commission', $retResults);
+                $archiveContext['regularPricing'] = RetentionPricingSnapshot::capture($source, $startDate, $useRetainedMonthTier,
+                    array_values($this->lastPricingRows), $archiveContext['commissionResults']);
+            }
             $snapshotPath = $this->persistWithSnapshot($file, $display, $startDate, function () use ($sql, $source, $startDate, $retResults, $display): void {
                 $persisted = CommissionResultsWriter::replaceComponent($sql, 'retention', $source, $startDate, 'Commission', $retResults);
                 if ($notice = CommissionResultsWriter::failureNotice($persisted, $display)) {
@@ -633,6 +637,8 @@ class GenerateRetentionCommissionReport extends Command
     ): ?array
     {
         try {
+            $rows = array_values($rows);
+            $this->lastPricingRows = [];
             $sp = new Spreadsheet();
 
             // ── Sheet 1: Retention Commission Report
@@ -653,8 +659,15 @@ class GenerateRetentionCommissionReport extends Command
                 $headers1[] = 'T4 Rate';
             }
             $headers1[] = 'Cancel Request Date';
-            $lastDataCol = $hasT4 ? 'O' : 'N';
             $cancelCol   = $hasT4 ? 'O' : 'N';
+            // Append after the established source columns so existing header-
+            // driven consumers retain the same dates, candidate rates and IDs.
+            array_push($headers1, 'Applied Tier Month', 'Applied Tier', 'Payable Commission', 'Paid This Period');
+            $pricingColumn = $hasT4 ? 'P' : 'O';
+            $appliedTierColumn = $hasT4 ? 'Q' : 'P';
+            $amountColumn = $hasT4 ? 'R' : 'Q';
+            $paidColumn = $hasT4 ? 'S' : 'R';
+            $lastDataCol = $paidColumn;
 
             foreach ($headers1 as $i => $h) {
                 $sheet1->setCellValue(chr(65 + $i) . '1', $h);
@@ -728,9 +741,38 @@ class GenerateRetentionCommissionReport extends Command
                 $hasT4,
                 $tierSnapshotMap,
                 $useRetainedMonthTier,
-                $logShadowCompare
+                $logShadowCompare,
+                function (int $index, array $row, string $agent, int $currentTier, int $appliedTier, float $amount): void {
+                    $detailRow = $index + 2;
+                    $retentionDate = $this->toDate($this->col($row, 'RETENTION_DATE'));
+                    $this->lastPricingRows[$detailRow] = [
+                        'detailRow' => $detailRow, 'clientId' => trim((string) $this->col($row, 'ID', '')),
+                        'agent' => RetentionAgentIdentity::canonicalName($agent),
+                        'agentKey' => mb_strtolower(RetentionAgentIdentity::canonicalName($agent), 'UTF-8'),
+                        'retentionDate' => $retentionDate,
+                        'paymentDate' => $this->toDate($this->col($row, 'RETENTION_PAYMENT_DATE')),
+                        'retainedMonth' => substr($retentionDate, 0, 7) . '-01',
+                        'currentTier' => $currentTier, 'appliedTier' => $appliedTier,
+                        'rates' => array_map(fn (int $tier): float => (float) $this->col($row, 'T' . $tier, 0), [1, 2, 3, 4]),
+                        // Preserve the existing summation policy: no per-line
+                        // rounding is introduced by this evidence capture.
+                        'amount' => $amount,
+                    ];
+                }
             );
             $this->lastSummaryRows = $summaryRows;
+            ksort($this->lastPricingRows, SORT_NUMERIC);
+            foreach ($rows as $index => $row) {
+                $detailRow = $index + 2;
+                $priced = $this->lastPricingRows[$detailRow] ?? null;
+                if ($priced !== null) {
+                    $sheet1->setCellValue($pricingColumn . $detailRow, $useRetainedMonthTier ? $priced['retainedMonth'] : $startDate);
+                    $sheet1->setCellValue($appliedTierColumn . $detailRow, $priced['appliedTier']);
+                }
+                $sheet1->setCellValue($amountColumn . $detailRow, $priced['amount'] ?? 0);
+                $sheet1->setCellValue($paidColumn . $detailRow, $priced !== null ? 'Yes' : 'No');
+            }
+            $sheet1->getStyle("{$amountColumn}2:{$amountColumn}{$last1}")->getNumberFormat()->setFormatCode('$#,##0.00');
 
             // The roster decides who is on the paid list; everyone else with commission this period
             // is listed separately below it (Jacob, 2026-09-03). With no roster we keep the previous
@@ -901,7 +943,8 @@ class GenerateRetentionCommissionReport extends Command
         bool $hasT4 = false,
         array $tierSnapshotMap = [],
         bool $useRetainedMonthTier = false,
-        bool $logShadowCompare = false
+        bool $logShadowCompare = false,
+        ?callable $captureLine = null
     ): array
     {
         $summary = [];
@@ -911,9 +954,9 @@ class GenerateRetentionCommissionReport extends Command
         // Preserve input order within each agent, including the order of floating
         // point additions, while avoiding two complete report scans per agent.
         $rowsByAgent = [];
-        foreach ($rows as $row) {
+        foreach ($rows as $index => $row) {
             $key = RetentionCommissionTierStore::agentKey((string) $this->col($row, 'RETENTION_AGENT', ''));
-            $rowsByAgent[$key][] = $row;
+            $rowsByAgent[$key][$index] = $row;
         }
 
         foreach ($agents as $agentName) {
@@ -940,7 +983,7 @@ class GenerateRetentionCommissionReport extends Command
             $pct  = ($assigned > 0) ? ($retained / $assigned) : 0.0;
             $tier = $this->resolveTier($pct, $retained, $hasT4);
 
-            foreach ($agentRows as $row) {
+            foreach ($agentRows as $index => $row) {
                 // Old snapshots must not award commission when column D is blank.
                 if ($this->toDate($this->col($row, 'RETENTION_DATE')) === null) {
                     continue;
@@ -977,6 +1020,10 @@ class GenerateRetentionCommissionReport extends Command
                         (string) ($this->col($row, 'RETENTION_DATE') ?? ''), $startDate)
                     : RetentionCommissionTierStore::resolveTierForPayment($tier, $snapshotTier);
                 $commissionNew += $this->amountForTier($row, $payTier);
+                if ($captureLine !== null) {
+                    $selectedTier = $useRetainedMonthTier ? $payTier : $tier;
+                    $captureLine($index, $row, $agentName, $tier, $selectedTier, $this->amountForTier($row, $selectedTier));
+                }
             }
 
             $commission = $useRetainedMonthTier ? $commissionNew : $commissionOld;

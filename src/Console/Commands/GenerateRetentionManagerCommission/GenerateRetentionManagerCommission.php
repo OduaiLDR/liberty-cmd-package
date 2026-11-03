@@ -52,6 +52,48 @@ class GenerateRetentionManagerCommission extends Command
 
     private bool $hadFailures = false;
     private ?string $payrollOutputDirectory = null;
+    private bool $payrollFrozenNsfValidity = false;
+    private ?array $payrollCalculationContext = null;
+
+    public static function currentPayrollCalculationContext(): array
+    {
+        return ['version' => 'cs_leadership_rules_v1', 'nsfTeamLeader' => [
+            'version' => 'nsf_team_leader_v1', 'actionRatioThresholds' => [0.40, 0.55],
+            'clearThresholds' => [200, 300, 500],
+            'rates' => [[0.0, 0.07, 0.40], [0.0, 0.10, 0.50], [0.0, 0.30, 0.70]],
+        ]];
+    }
+
+    public static function validatePayrollCalculationContext(array $context): array
+    {
+        $expected = ['version', 'nsfTeamLeader'];
+        if (array_diff(array_keys($context), $expected) || array_diff($expected, array_keys($context))
+            || $context['version'] !== 'cs_leadership_rules_v1' || !is_array($context['nsfTeamLeader'])) {
+            throw new \InvalidArgumentException('Frozen leadership calculation context is invalid.');
+        }
+        $rules = $context['nsfTeamLeader'];
+        $keys = ['version', 'actionRatioThresholds', 'clearThresholds', 'rates'];
+        if (array_diff(array_keys($rules), $keys) || array_diff($keys, array_keys($rules)) || $rules['version'] !== 'nsf_team_leader_v1') {
+            throw new \InvalidArgumentException('Frozen NSF leadership rules are invalid.');
+        }
+        foreach (['actionRatioThresholds' => 2, 'clearThresholds' => 3] as $key => $count) {
+            if (!is_array($rules[$key]) || !array_is_list($rules[$key]) || count($rules[$key]) !== $count) throw new \InvalidArgumentException('Frozen NSF leadership thresholds are invalid.');
+            $previous = -1;
+            foreach ($rules[$key] as $value) {
+                if ((!is_int($value) && !is_float($value)) || !is_finite((float) $value) || $value <= $previous || $value < 0
+                    || ($key === 'actionRatioThresholds' && $value > 1) || ($key === 'clearThresholds' && (!is_int($value) || $value < 1))) {
+                    throw new \InvalidArgumentException('Frozen NSF leadership thresholds are invalid.');
+                }
+                $previous = $value;
+            }
+        }
+        if (!is_array($rules['rates']) || !array_is_list($rules['rates']) || count($rules['rates']) !== 3) throw new \InvalidArgumentException('Frozen NSF leadership rates are invalid.');
+        foreach ($rules['rates'] as $row) {
+            if (!is_array($row) || !array_is_list($row) || count($row) !== 3) throw new \InvalidArgumentException('Frozen NSF leadership rates are invalid.');
+            foreach ($row as $rate) if ((!is_int($rate) && !is_float($rate)) || !is_finite((float) $rate) || $rate < 0) throw new \InvalidArgumentException('Frozen NSF leadership rates are invalid.');
+        }
+        return $context;
+    }
 
     /** Freeze the existing Rama tranche/cutoff inputs when the source report completes. */
     public function buildPayrollRetentionContext(array $rows): array
@@ -67,8 +109,9 @@ class GenerateRetentionManagerCommission extends Command
     }
 
     /** Actual leadership workbooks and matching JSON from archived source bytes only. No email or database lookup. */
-    public function buildPayrollReviewWorkbookBundle(string $startDate, string $endDate, array $artifacts, string $outputDirectory): array
+    public function buildPayrollReviewWorkbookBundle(string $startDate, string $endDate, array $artifacts, string $outputDirectory, ?array $calculationContext = null): array
     {
+        $calculationContext = self::validatePayrollCalculationContext($calculationContext ?? self::currentPayrollCalculationContext());
         $retentionRows = [];
         foreach (['ldr' => 'LDR', 'plaw' => 'Progress Law'] as $source => $display) {
             $artifact = $artifacts['retention_' . $source] ?? [];
@@ -96,14 +139,18 @@ class GenerateRetentionManagerCommission extends Command
         }
         $priorOutput = $this->payrollOutputDirectory;
         $priorRoster = $this->anthonyRosterCache;
+        $priorValidity = $this->payrollFrozenNsfValidity;
+        $priorCalculation = $this->payrollCalculationContext;
         $this->payrollOutputDirectory = $outputDirectory;
         $this->anthonyRosterCache = array_values($roster);
+        $this->payrollFrozenNsfValidity = true;
+        $this->payrollCalculationContext = $calculationContext;
         try {
             $reports = ['retention_manager' => $this->buildRamaPayrollSnapshot($retentionRows),
                 'retention_team_leader' => $this->buildNickPayrollSnapshot($retentionRows, $startDate, $endDate),
                 'nsf_team_leader' => $this->buildAnthonyPayrollSnapshot($nsfRows)];
             $reports['nsf_team_leader']['nsfReadinessRunIds'] = $readinessIds;
-            return ['reports' => $reports, 'files' => [
+            return ['reports' => $reports, 'calculationContext' => $calculationContext, 'files' => [
                 'customer_support_manager' => $this->buildWorkbook('rama', 'Customer Support Manager', $retentionRows, $startDate, $endDate),
                 'retention_team_leader' => $this->buildWorkbook('nick', 'Retention Team Leader', $retentionRows, $startDate, $endDate),
                 'nsf_team_leader' => $this->buildAnthonyWorkbook('NSF Team Leader', $nsfRows),
@@ -111,6 +158,8 @@ class GenerateRetentionManagerCommission extends Command
         } finally {
             $this->payrollOutputDirectory = $priorOutput;
             $this->anthonyRosterCache = $priorRoster;
+            $this->payrollFrozenNsfValidity = $priorValidity;
+            $this->payrollCalculationContext = $priorCalculation;
         }
     }
 
@@ -392,11 +441,7 @@ class GenerateRetentionManagerCommission extends Command
             if (trim((string) ($row['NSF_ACTION'] ?? $row['nsf_action'] ?? '')) !== '') {
                 $byAgent[$key]['actions']++;
             }
-            if ($this->isValidCommission(
-                $row['NSF_RETURNED_DATE'] ?? $row['nsf_returned_date'] ?? null,
-                $row['NSF_RECOUP_DATE'] ?? $row['nsf_recoup_date'] ?? null,
-                $row['CLEARED_DATE'] ?? $row['cleared_date'] ?? null,
-            )) {
+            if ($this->validNsfRow($row)) {
                 $byAgent[$key]['clears']++;
             }
         }
@@ -1316,11 +1361,7 @@ class GenerateRetentionManagerCommission extends Command
                 $byAgent[$key]['actions']++;
             }
 
-            $valid = $this->isValidCommission(
-                $row['NSF_RETURNED_DATE'] ?? $row['nsf_returned_date'] ?? null,
-                $row['NSF_RECOUP_DATE'] ?? $row['nsf_recoup_date'] ?? null,
-                $row['CLEARED_DATE'] ?? $row['cleared_date'] ?? null,
-            );
+            $valid = $this->validNsfRow($row);
             if ($valid) {
                 $byAgent[$key]['clears']++;
             }
@@ -1448,10 +1489,10 @@ class GenerateRetentionManagerCommission extends Command
         // Tier table to the right of the commission block.
         $comm->setCellValue('D1', 'Commission Tiers');
         $comm->getStyle('D1')->getFont()->setBold(true);
-        $comm->fromArray([['Clears', 0.40, 0.55, 0.65]], null, 'D2', true);
-        $comm->fromArray([[200, 0.0, 0.07, 0.40]], null, 'D3', true);
-        $comm->fromArray([[300, 0.0, 0.10, 0.50]], null, 'D4', true);
-        $comm->fromArray([[500, 0.0, 0.30, 0.70]], null, 'D5', true);
+        $rules = ($this->payrollCalculationContext ?? self::currentPayrollCalculationContext())['nsfTeamLeader'];
+        $ratioHeadings = $this->payrollCalculationContext === null ? [0.40, 0.55, 0.65] : [0.0, ...$rules['actionRatioThresholds']];
+        $comm->fromArray([['Clears', ...$ratioHeadings]], null, 'D2', true);
+        foreach ($rules['clearThresholds'] as $index => $threshold) $comm->fromArray([[$threshold, ...$rules['rates'][$index]]], null, 'D' . ($index + 3), true);
         $this->headerStyle($comm, 'D2:G2');
         // Column headings are the action-ratio thresholds, so those stay percentages...
         $comm->getStyle('E2:G2')->getNumberFormat()->setFormatCode('0%');
@@ -1493,31 +1534,36 @@ class GenerateRetentionManagerCommission extends Command
 
     private function anthonyRate(float $ratio, float $clears): float
     {
-        if ($ratio >= 0.55) {
+        $rules = ($this->payrollCalculationContext ?? self::currentPayrollCalculationContext())['nsfTeamLeader'];
+        if ($ratio >= $rules['actionRatioThresholds'][1]) {
             $col = 2;
-        } elseif ($ratio >= 0.40) {
+        } elseif ($ratio >= $rules['actionRatioThresholds'][0]) {
             $col = 1;
         } else {
             $col = 0;
         }
 
-        if ($clears >= 500) {
+        if ($clears >= $rules['clearThresholds'][2]) {
             $row = 2;
-        } elseif ($clears >= 300) {
+        } elseif ($clears >= $rules['clearThresholds'][1]) {
             $row = 1;
-        } elseif ($clears >= 200) {
+        } elseif ($clears >= $rules['clearThresholds'][0]) {
             $row = 0;
         } else {
             return 0.0;
         }
 
-        $grid = [
-            [0.0,  0.07, 0.40], // 200+ clears
-            [0.0,  0.10, 0.50], // 300+ clears
-            [0.0,  0.30, 0.70], // 500+ clears
-        ];
+        return $rules['rates'][$row][$col];
+    }
 
-        return $grid[$row][$col];
+    private function validNsfRow(array $row): bool
+    {
+        if (!$this->payrollFrozenNsfValidity) return $this->isValidCommission(
+            $row['NSF_RETURNED_DATE'] ?? $row['nsf_returned_date'] ?? null,
+            $row['NSF_RECOUP_DATE'] ?? $row['nsf_recoup_date'] ?? null,
+            $row['CLEARED_DATE'] ?? $row['cleared_date'] ?? null,
+        );
+        return \Cmd\Reports\Services\CustomerServiceRosterAmendment::frozenValidity($row['VALID_COMMISSION'] ?? null);
     }
 
     /**
