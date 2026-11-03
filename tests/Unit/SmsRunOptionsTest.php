@@ -145,3 +145,28 @@ test('approval-time filename version is explicit and preserves every older canon
         ->and(SmsRunOptions::fromStored(json_encode($old), 7))->toBe($old)
         ->and(SmsRunOptions::fromStored(json_encode($base), 7))->toBe($base);
 });
+
+test('debt range appends the maximum last and every older stored shape round-trips byte for byte', function (): void {
+    $planned = [SmsRunOptions::PLANNED_DATE_VERSION, '2026-11-02', SmsRunOptions::APPROVAL_FILENAME_VERSION];
+    $older = [
+        SmsRunOptions::normalize(7, 3),
+        SmsRunOptions::normalize(7, 3, ['T9', 'T2'], SmsRunOptions::TIER_SELECTION_POLICY),
+        SmsRunOptions::normalize(7, 3, ['T2'], SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY, ...$planned),
+        SmsRunOptions::normalize(7, 3, null, SmsRunOptions::LEAN_WINDOWED_TIER_SELECTION_POLICY, ...$planned),
+        SmsRunOptions::normalize(7, 3, null, SmsRunOptions::LEAN_WINDOWED_TIER_SELECTION_POLICY, ...[...$planned, 31000]),
+    ];
+    foreach ($older as $options) {
+        $json = json_encode($options, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
+        expect($options)->not->toHaveKey('maximum_debt_amount')
+            ->and(json_encode(SmsRunOptions::fromStored($json, 7), JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES))->toBe($json);
+    }
+    $range = SmsRunOptions::normalize(7, 3, null, SmsRunOptions::LEAN_WINDOWED_TIER_SELECTION_POLICY, ...[...$planned, 31000, 85000]);
+    expect(array_keys($range))->toBe(['target', 'rows_per_file', 'tiers', 'csv_format', 'tier_selection_policy',
+        'options_version', 'send_date', 'filename_version', 'minimum_debt_amount', 'maximum_debt_amount'])
+        ->and($range)->toBe($older[4] + ['maximum_debt_amount' => 85000])
+        ->and(SmsRunOptions::fromStored(json_encode($range), 7))->toBe($range);
+    // By-tier mode: a subset with no debt keys stays a valid canonical shape.
+    $byTier = SmsRunOptions::normalize(7, 3, ['T5', 'T3'], SmsRunOptions::LEAN_WINDOWED_TIER_SELECTION_POLICY, ...$planned);
+    expect($byTier['tiers'])->toBe(['T3', 'T5'])->and($byTier)->not->toHaveKeys(['minimum_debt_amount', 'maximum_debt_amount'])
+        ->and(SmsRunOptions::fromStored(json_encode($byTier), 7))->toBe($byTier);
+});

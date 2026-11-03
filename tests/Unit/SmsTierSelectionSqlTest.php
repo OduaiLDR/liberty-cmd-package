@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use Cmd\Reports\Services\SmsCurrentDebtSql;
+use Cmd\Reports\Services\SmsDebtPolicy;
 use Cmd\Reports\Services\SmsRunOptions;
 use Cmd\Reports\Services\SmsTierSelectionSql;
 use Cmd\Reports\Services\SmsTierWindowSelectionSql;
@@ -79,4 +80,46 @@ test('the shared resolver keeps the original update wrapper and rejects unapprov
     expect(fn () => SmsCurrentDebtSql::withResolved(''))->toThrow(RuntimeException::class);
     expect(fn () => SmsTierSelectionSql::select('', ['T2']))->toThrow(RuntimeException::class);
     expect(fn () => SmsTierSelectionSql::select('SELECT * FROM TblProspects',['T2'],'Update_Date'))->toThrow(RuntimeException::class);
+});
+
+test('a frozen maximum adds one bound ceiling after the minimum and runs without it keep their exact SQL', function (): void {
+    $eligible = 'SELECT * FROM TblProspects WHERE State=?';
+    $builders = [
+        'v1' => [fn (bool $maximum) => SmsTierSelectionSql::select($eligible, ['T9','T2'], 'Send_Date', false, $maximum), 6],
+        'windowed' => [fn (bool $maximum) => SmsTierWindowSelectionSql::insert(['T9','T2'], 'Send_Date', false, $maximum), 5],
+        'lean' => [fn (bool $maximum) => SmsTierWindowSelectionSql::insert(['T9','T2'], 'Send_Date', true, $maximum), 5],
+    ];
+    foreach ($builders as [$build, $bindings]) {
+        $without = $build(false);
+        $with = $build(true);
+        expect(substr_count($without, '?'))->toBe($bindings)->and(substr_count($with, '?'))->toBe($bindings + 1)
+            ->and($without)->not->toContain('r.Debt<=?')
+            ->and(str_replace("\n  AND r.Debt<=?", '', $with))->toBe($without)
+            ->and(strpos($with, 'AND r.Debt<=?'))->toBeGreaterThan(strpos($with, 'AND r.Debt>=?'))
+            ->and(strpos($with, 'AND r.Debt<=?'))->toBeLessThan(strrpos($with, 'ORDER BY'));
+        $ctes = substr($with, 0, strpos($with, 'INSERT INTO TblProspectsExport'));
+        expect($ctes)->not->toContain('Debt<=?');
+    }
+    expect(SmsTierSelectionSql::select($eligible, ['T2']))->toBe(SmsTierSelectionSql::select($eligible, ['T2'], 'Send_Date', false, false))
+        ->and(SmsTierWindowSelectionSql::insert(['T2']))->toBe(SmsTierWindowSelectionSql::insert(['T2'], 'Send_Date', false, false));
+    // Bindings follow the SQL: lower bound, then the maximum only when one was frozen.
+    $byTier = SmsRunOptions::normalize(7, 7, ['T2'], SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY);
+    $minimum = SmsRunOptions::normalize(7, 7, null, SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY, null, null, null, 31000);
+    $range = SmsRunOptions::normalize(7, 7, null, SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY, null, null, null, 31000, 35000);
+    expect(SmsDebtPolicy::bindings($byTier))->toBe([0])->and(SmsDebtPolicy::bindings($minimum))->toBe([31000])
+        ->and(SmsDebtPolicy::bindings($range))->toBe([31000, 35000]);
+});
+
+test('by-tier runs keep the same selector text and bind a zero lower bound that adds nothing to the validity rule', function (): void {
+    $eligible = 'SELECT * FROM TblProspects';
+    $byTier = SmsRunOptions::normalize(7, 7, ['T1', 'T2'], SmsRunOptions::LEAN_WINDOWED_TIER_SELECTION_POLICY);
+    $minimum = SmsRunOptions::normalize(7, 7, ['T1', 'T2'], SmsRunOptions::LEAN_WINDOWED_TIER_SELECTION_POLICY, null, null, null, 25000);
+    foreach ([fn (array $o) => SmsTierSelectionSql::select($eligible, $o['tiers'], 'Send_Date', true, SmsDebtPolicy::maximum($o) !== null),
+        fn (array $o) => SmsTierWindowSelectionSql::insert($o['tiers'], 'Send_Date', true, SmsDebtPolicy::maximum($o) !== null)] as $build) {
+        $sql = $build($byTier);
+        expect($sql)->toBe($build($minimum))->and(substr_count($sql, '?'))->toBe(2 + count($byTier['tiers']) + count(SmsDebtPolicy::bindings($byTier)));
+    }
+    // VALID_PREDICATE already requires positive debt, so r.Debt>=0 filters nothing.
+    expect(SmsCurrentDebtSql::VALID_PREDICATE)->toContain('r.Debt>0')
+        ->and(SmsDebtPolicy::bindings($byTier))->toBe([0])->and(SmsDebtPolicy::bindings($minimum))->toBe([25000]);
 });

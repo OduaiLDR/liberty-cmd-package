@@ -99,6 +99,7 @@ class SmsRunService
         } catch (SmsSelectionCancelledException) {
             // The repository's source snapshot has unwound before this terminal cleanup.
             $cancellation->complete($requestId);
+            app(SmsRunProgress::class)->forget($requestId);
         }
     }
 
@@ -156,6 +157,7 @@ class SmsRunService
         } else {
             $this->move($requestId, ['selecting'], 'review', $counts + ['Progress_Step' => 'review']);
         }
+        app(SmsRunProgress::class)->forget($requestId);
     }
 
     /** The recovery command shares the same per-run lock as the selection worker. */
@@ -285,6 +287,7 @@ class SmsRunService
             // must never cause a second file with different reviewed content to replace it.
             throw new RuntimeException('The SMS file was published but its run changed before the receipt was saved.');
         }
+        app(SmsRunProgress::class)->forget((string) $run->Request_ID);
     }
 
     public function requestSent(string $requestId, string $actor): object
@@ -749,6 +752,7 @@ class SmsRunService
         $step = ['prepare' => 'select', 'file' => 'file', 'send' => 'send', 'reverse' => 'reverse', 'approve' => 'approve'][$job] ?? $job;
         $from = ['prepare' => ['queued', 'selecting'], 'file' => ['building_file'], 'send' => ['sending'], 'reverse' => ['reversing'], 'approve' => ['approving']][$job] ?? [];
         $this->move($requestId, $from, 'failed', ['Failed_Step' => $step, 'Error' => mb_substr($message, 0, 500)]);
+        app(SmsRunProgress::class)->forget($requestId);
     }
 
     public function show(string $requestId): object
@@ -778,6 +782,8 @@ class SmsRunService
             'drops' => in_array($run->Status, ['queued', 'selecting', 'discarded'], true) ? [] : $this->export->drops($requestId),
         ];
 
+        // Worker cache snapshot, never SQL; Updated_At stays the stall/elapsed clock.
+        if (in_array($run->Status, ['queued', 'selecting', 'building_file'], true)) $view['progress'] = app(SmsRunProgress::class)->forRun($run);
         $view += $this->approvalFileView($run, $view['options']);
         if (($run->Progress_Step ?? null) === SmsSelectionCancellation::CANCELLED_STEP) $view['selection_cancelled'] = true;
         $cancellation = app(SmsSelectionCancellation::class)->projection($run);
@@ -1004,7 +1010,7 @@ class SmsRunService
         if ($input === null) return null;
         try {
             if (($input['csv_format'] ?? null) !== SmsRunOptions::CSV_FORMAT
-                || array_diff(array_keys($input), ['target', 'csv_format', 'rows_per_file', 'tiers', 'tier_selection_policy', 'options_version', 'send_date', 'filename_version', 'minimum_debt_amount']) !== []
+                || array_diff(array_keys($input), ['target', 'csv_format', 'rows_per_file', 'tiers', 'tier_selection_policy', 'options_version', 'send_date', 'filename_version', 'minimum_debt_amount', 'maximum_debt_amount']) !== []
                 || (isset($input['target']) && $input['target'] !== $target)
                 || (isset($input['rows_per_file']) && ! is_int($input['rows_per_file']))
                 || (isset($input['tiers']) && ! is_array($input['tiers']))
@@ -1012,7 +1018,8 @@ class SmsRunService
                 || (array_key_exists('options_version', $input) && $input['options_version'] !== SmsRunOptions::PLANNED_DATE_VERSION)
                 || (array_key_exists('filename_version', $input) && ! in_array($input['filename_version'], [SmsRunOptions::DROP_RANGE_FILENAME_VERSION, SmsRunOptions::APPROVAL_FILENAME_VERSION], true))
                 || (array_key_exists('send_date', $input) && ! is_string($input['send_date']))
-                || (array_key_exists('minimum_debt_amount', $input) && ! is_int($input['minimum_debt_amount']))) {
+                || (array_key_exists('minimum_debt_amount', $input) && ! is_int($input['minimum_debt_amount']))
+                || (array_key_exists('maximum_debt_amount', $input) && ! is_int($input['maximum_debt_amount']))) {
                 throw new \InvalidArgumentException('Use the explicit supported SMS format and valid file options.');
             }
             $planned = isset($input['options_version']) || array_key_exists('send_date', $input);
@@ -1020,7 +1027,8 @@ class SmsRunService
             $stored = $planned && $existing !== null ? $this->fileOptions($existing) : null;
             $date = $planned ? ($input['send_date'] ?? $stored['send_date'] ?? SmsDeliveryPolicy::followingMonday()->toDateString()) : null;
             return SmsRunOptions::normalize($target, $input['rows_per_file'] ?? null, $input['tiers'] ?? null, $input['tier_selection_policy'] ?? null,
-                $planned ? SmsRunOptions::PLANNED_DATE_VERSION : null, $date, $input['filename_version'] ?? null, $input['minimum_debt_amount'] ?? null);
+                $planned ? SmsRunOptions::PLANNED_DATE_VERSION : null, $date, $input['filename_version'] ?? null, $input['minimum_debt_amount'] ?? null,
+                $input['maximum_debt_amount'] ?? null);
         } catch (\InvalidArgumentException $error) {
             throw ValidationException::withMessages(['file_options' => $error->getMessage()]);
         }
@@ -1043,7 +1051,7 @@ class SmsRunService
     private function assertSameStart(object $run, int $target, ?array $options): void
     {
         if ((int) $run->Target !== $target || $this->fileOptions($run) !== $options) {
-            throw new HttpException(409, 'This run ID belongs to different quantity, tier, debt minimum or file options. Retry the original request unchanged.');
+            throw new HttpException(409, 'This run ID belongs to different quantity, tier, debt range or file options. Retry the original request unchanged.');
         }
     }
 
@@ -1066,7 +1074,9 @@ class SmsRunService
                 ? ($leanHistory ? SmsRunOptions::LEAN_WINDOWED_TIER_SELECTION_POLICY : SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY)
                 : SmsRunOptions::TIER_SELECTION_POLICY;
             $capabilities += ['minimum_debt_amount' => true, 'minimum_debt_floor' => SmsDebtPolicy::FLOOR,
-                'minimum_debt_default' => SmsDebtPolicy::FLOOR, 'minimum_debt_max' => SmsDebtPolicy::MAX];
+                'minimum_debt_default' => SmsDebtPolicy::FLOOR, 'minimum_debt_max' => SmsDebtPolicy::MAX,
+                'maximum_debt_amount' => true, 'maximum_debt_step' => SmsDebtPolicy::MAXIMUM_STEP,
+                'maximum_debt_floor' => SmsDebtPolicy::FLOOR, 'maximum_debt_max' => SmsDebtPolicy::MAX];
         }
         $capabilities += ['options_version' => SmsRunOptions::PLANNED_DATE_VERSION, 'send_date' => true,
             'default_send_date' => SmsDeliveryPolicy::followingMonday()->toDateString(),
@@ -1082,6 +1092,7 @@ class SmsRunService
     private function assertNewFileOptionsReady(array $options): void
     {
         if (array_key_exists('minimum_debt_amount', $options)) SmsDebtPolicy::minimum($options);
+        if (array_key_exists('maximum_debt_amount', $options)) SmsDebtPolicy::maximum($options);
         if (! isset($options['tier_selection_policy']) && $options['tiers'] !== SmsRunOptions::TIERS) {
             throw ValidationException::withMessages(['tiers' => 'Tier subsets require the explicit current-source-tier selection policy.']);
         }

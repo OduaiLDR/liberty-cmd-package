@@ -12,6 +12,7 @@ use ZipArchive;
 final class SmsRunArtifactBundle
 {
     public const MAX_PARTS = 1000;
+    public const PROGRESS_ROWS = 50000;
     private const ZIP_TIME = 315532800; // Fixed 1980-01-01, representable by ZIP on every host.
 
     public function __construct(private readonly string $generation = 'v1')
@@ -19,8 +20,13 @@ final class SmsRunArtifactBundle
         if (! in_array($generation, ['v1', 'v2'], true)) throw new RuntimeException('Use an explicit supported SMS artifact generation.');
     }
 
-    /** @return array{path:string,bytes:int,sha256:string,manifest:array} */
-    public function build(string $runDir, string $stem, iterable $cells, int $expected, array $options): array
+    /**
+     * $progress(phase, rows written, parts closed, parts total) is advisory and never
+     * interrupts the build; phases are writing, packaging and verifying.
+     *
+     * @return array{path:string,bytes:int,sha256:string,manifest:array}
+     */
+    public function build(string $runDir, string $stem, iterable $cells, int $expected, array $options, ?callable $progress = null): array
     {
         if ($this->generation !== 'v1') throw new RuntimeException('Approved SMS artifacts must copy their verified pending publication.');
         [$root, $id] = $this->context($runDir);
@@ -34,6 +40,7 @@ final class SmsRunArtifactBundle
         $this->ownedTree($root, $id);
         if (is_dir($root.'/published')) {
             $manifest = $this->json($root.'/published/manifest.json');
+            $this->report($progress, 'verifying', $expected, $parts, $parts);
             $path = $this->verify($runDir, $manifest, $options, $expected);
             if ($manifest['download']['name'] !== $this->downloadName($stem, $parts)) {
                 throw new RuntimeException('The published SMS artifact belongs to a different filename; it was not overwritten.');
@@ -47,6 +54,7 @@ final class SmsRunArtifactBundle
         try {
             $this->writeJson($stage.'/.build.json', ['version' => 1, 'request_id' => $id, 'stem' => $stem, 'parts' => $parts]);
             $manifestParts = []; $total = 0; $partRows = 0; $part = 0; $name = '';
+            $this->report($progress, 'writing', 0, 0, $parts);
             foreach ($cells as $row) {
                 if (++$total > $expected) throw new RuntimeException('SMS artifact row count exceeds the frozen selection.');
                 if (! is_array($row) || ! array_is_list($row) || count($row) !== 4
@@ -57,8 +65,8 @@ final class SmsRunArtifactBundle
                     throw new RuntimeException('The SMS row date differs from the frozen planned send date.');
                 }
                 if (isset($options['minimum_debt_amount']) && (! preg_match('/\A[0-9]+\z/D', $row[1])
-                    || (int) $row[1] < $options['minimum_debt_amount'] || (int) $row[1] > SmsDebtPolicy::MAX)) {
-                    throw new RuntimeException('The SMS row debt is below its frozen minimum or outside the supported debt range.');
+                    || (int) $row[1] < $options['minimum_debt_amount'] || (int) $row[1] > ($options['maximum_debt_amount'] ?? SmsDebtPolicy::MAX))) {
+                    throw new RuntimeException('The SMS row debt is below its frozen minimum, above its frozen maximum or outside the supported debt range.');
                 }
                 if ($handle === null) {
                     $name = $this->partName($stem, ++$part, $parts);
@@ -72,16 +80,21 @@ final class SmsRunArtifactBundle
                 if (++$partRows === $options['rows_per_file']) {
                     $this->finish($handle); $handle = null;
                     $manifestParts[] = ['part' => $part, 'name' => $name, 'rows' => $partRows] + $this->fileInfo($stage.'/'.$name);
+                    $this->report($progress, 'writing', $total, count($manifestParts), $parts);
+                } elseif ($total % self::PROGRESS_ROWS === 0) {
+                    $this->report($progress, 'writing', $total, count($manifestParts), $parts);
                 }
             }
             if ($handle !== null) {
                 $this->finish($handle); $handle = null;
                 $manifestParts[] = ['part' => $part, 'name' => $name, 'rows' => $partRows] + $this->fileInfo($stage.'/'.$name);
+                $this->report($progress, 'writing', $total, count($manifestParts), $parts);
             }
             if ($total !== $expected || count($manifestParts) !== $parts) throw new RuntimeException('SMS artifact row count differs from the frozen selection.');
             $format = $parts === 1 ? 'csv' : 'zip';
             $download = $this->downloadName($stem, $parts);
             if ($parts > 1) {
+                $this->report($progress, 'packaging', $total, $parts, $parts);
                 $this->archive($stage, $download, $manifestParts);
                 foreach ($manifestParts as $entry) {
                     if (! unlink($stage.'/'.$entry['name'])) throw new RuntimeException('Unable to remove private SMS packaging scratch.');
@@ -94,6 +107,7 @@ final class SmsRunArtifactBundle
             if (! unlink($stage.'/.build.json')) throw new RuntimeException('Unable to finish the private SMS packaging receipt.');
             // A directory rename publishes the primary artifact and its receipt together.
             if (file_exists($root.'/published') || ! rename($stage, $root.'/published')) throw new RuntimeException('Unable to atomically publish the SMS artifact bundle.');
+            $this->report($progress, 'verifying', $total, $parts, $parts);
             $path = $this->verify($runDir, $manifest, $options, $expected);
             return ['path' => $path, 'bytes' => $manifest['download']['bytes'], 'sha256' => $manifest['download']['sha256'], 'manifest' => $manifest];
         } catch (Throwable $error) {
@@ -308,7 +322,8 @@ final class SmsRunArtifactBundle
             || ! is_int($options['target']) || ! is_int($options['rows_per_file']) || ! is_array($options['tiers'])
             || (array_key_exists('tier_selection_policy', $options) && ! SmsRunOptions::isTierSelectionPolicy($options['tier_selection_policy']))
             || $options !== SmsRunOptions::normalize($options['target'], $options['rows_per_file'], $options['tiers'], $options['tier_selection_policy'] ?? null,
-                $options['options_version'] ?? null, $options['send_date'] ?? null, $options['filename_version'] ?? null, $options['minimum_debt_amount'] ?? null)) {
+                $options['options_version'] ?? null, $options['send_date'] ?? null, $options['filename_version'] ?? null, $options['minimum_debt_amount'] ?? null,
+                $options['maximum_debt_amount'] ?? null)) {
             throw new RuntimeException('The SMS artifact requires complete canonical versioned run options.');
         }
         if ($expected < 1 || $expected > $options['target']) throw new RuntimeException('The SMS artifact requires a positive selected count no greater than its target.');
@@ -554,6 +569,13 @@ final class SmsRunArtifactBundle
         clearstatcache(true, $path); $size = filesize($path); $hash = hash_file('sha256', $path);
         if ($size === false || $size < 1 || $hash === false) throw new RuntimeException('Unable to verify the SMS artifact file.');
         return ['bytes' => $size, 'sha256' => $hash];
+    }
+
+    /** Advisory progress only: a failing callback never interrupts the build. */
+    private function report(?callable $progress, string $phase, int $rows, int $partsDone, int $partsTotal): void
+    {
+        if ($progress === null) return;
+        try { $progress($phase, $rows, $partsDone, $partsTotal); } catch (Throwable) {}
     }
 
     private function csv($handle, array $row): void

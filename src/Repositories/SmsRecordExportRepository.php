@@ -12,6 +12,7 @@ use Cmd\Reports\Services\SmsDeliveryPolicy;
 use Cmd\Reports\Services\SmsRunArtifactBundle;
 use Cmd\Reports\Services\SmsRunOptions;
 use Cmd\Reports\Services\SmsRunArtifactFilename;
+use Cmd\Reports\Services\SmsRunProgress;
 use Cmd\Reports\Services\SmsTierSelectionMetrics;
 use Cmd\Reports\Services\SmsTierSelectionSql;
 use Cmd\Reports\Services\SmsTierWindowSchema;
@@ -151,8 +152,9 @@ class SmsRecordExportRepository extends SqlSrvRepository
             $this->selectTierWindows($requestId, $target, $options, $cancellation);
         } else {
             $eligible = $this->eligible()->select(['PK','Phone','Client','Address','City','State','Zip','Email','Creation_Date','Last_SMS_Date']);
-            $sql = SmsTierSelectionSql::select($eligible->toSql(), $options['tiers'], (string) config('sms-exports.mailer_recency_date', 'Send_Date'), $leanDebtSources);
-            $this->connection()->affectingStatement($sql, [...$eligible->getBindings(), $target, $requestId, ...$options['tiers'], SmsDebtPolicy::minimum($options)]);
+            $sql = SmsTierSelectionSql::select($eligible->toSql(), $options['tiers'], (string) config('sms-exports.mailer_recency_date', 'Send_Date'),
+                $leanDebtSources, SmsDebtPolicy::maximum($options) !== null);
+            $this->connection()->affectingStatement($sql, [...$eligible->getBindings(), $target, $requestId, ...$options['tiers'], ...SmsDebtPolicy::bindings($options)]);
         }
         $this->assertTierPrices($requestId, $options);
         $cancellation?->checkpoint($requestId);
@@ -182,10 +184,15 @@ class SmsRecordExportRepository extends SqlSrvRepository
             PRIMARY KEY CLUSTERED (Window_Position), UNIQUE (Export_PK)
         )');
 
+        $debt = SmsDebtPolicy::bindings($options);
         $sql = SmsTierWindowSelectionSql::insert($options['tiers'], (string) config('sms-exports.mailer_recency_date', 'Send_Date'),
-            SmsRunOptions::usesLeanDebtSources($options['tier_selection_policy']));
+            SmsRunOptions::usesLeanDebtSources($options['tier_selection_policy']), SmsDebtPolicy::maximum($options) !== null);
         $selected = 0;
+        $scanned = 0;
         $metrics = new SmsTierSelectionMetrics($requestId, $target, $windowSize);
+        // Cache only: TblSMSRuns must not change inside this snapshot transaction.
+        $progress = app(SmsRunProgress::class);
+        $progress->write($requestId, ['phase' => 'selecting', 'done' => 0, 'total' => $target, 'scanned' => 0]);
         $noCount = (int) $db->selectOne('SELECT CASE WHEN (@@OPTIONS & 512)=512 THEN 1 ELSE 0 END AS enabled')->enabled;
         $db->unprepared('SET NOCOUNT ON');
         try {
@@ -211,17 +218,20 @@ class SmsRecordExportRepository extends SqlSrvRepository
                     // Read the statement's own count on the server: shared worker
                     // sessions/trigger NOCOUNT settings make PDO rowCount unreliable.
                     $resolveStarted = hrtime(true);
-                    $receipt = $db->selectOne($sql.'; SELECT CONVERT(int,@@ROWCOUNT) AS inserted_rows', [$remaining, $requestId, ...$options['tiers'], SmsDebtPolicy::minimum($options)]);
+                    $receipt = $db->selectOne($sql.'; SELECT CONVERT(int,@@ROWCOUNT) AS inserted_rows', [$remaining, $requestId, ...$options['tiers'], ...$debt]);
                     $inserted = (int) $receipt->inserted_rows;
                     if ($inserted < 0 || $inserted > $remaining) throw new RuntimeException('Invalid window selection count.');
                     $selected += $inserted;
+                    $scanned += (int) $last->Window_Position;
                     $metrics->window($phase, (int) $last->Window_Position, $inserted, $loaded, hrtime(true) - $resolveStarted);
+                    $progress->write($requestId, ['phase' => 'selecting', 'done' => $selected, 'total' => $target, 'scanned' => $scanned]);
                     $cursor = $last;
                     $cancellation?->checkpoint($requestId);
                 }
                 if ($selected >= $target) break;
             }
             $metrics->finish($selected);
+            $progress->write($requestId, ['phase' => 'finalizing_selection', 'done' => $selected, 'total' => $target, 'scanned' => $scanned]);
             $db->unprepared('DROP TABLE #SmsTierWanted');
         } catch (\Throwable $error) {
             // A failed SNAPSHOT transaction rolls its temp DDL back. If it is
@@ -282,11 +292,15 @@ class SmsRecordExportRepository extends SqlSrvRepository
     {
         if (! SmsRunOptions::isTierSelectionPolicy($options['tier_selection_policy'] ?? null)) throw new RuntimeException('An explicit source-tier selector is required.');
         $leanDebtSources = SmsRunOptions::usesLeanDebtSources($options['tier_selection_policy']);
-        if ($this->table('TblProspectsExport')->where('Request_ID', $requestId)->where(function (Builder $q) use ($options, $leanDebtSources): void {
+        $maximum = SmsDebtPolicy::maximum($options);
+        // Rounded amounts are whole thousands: a bound of 1 rejects only non-positive debt for by-tier runs.
+        $floor = max(1, SmsDebtPolicy::lowerBound($options));
+        if ($this->table('TblProspectsExport')->where('Request_ID', $requestId)->where(function (Builder $q) use ($options, $leanDebtSources, $maximum, $floor): void {
             $q->whereNull('Debt_Tier')->orWhereNotIn('Debt_Tier', $options['tiers'])
-                ->orWhereNull('Debt_Amount')->orWhere('Debt_Amount', '<', SmsDebtPolicy::minimum($options))
+                ->orWhereNull('Debt_Amount')->orWhere('Debt_Amount', '<', $floor)
                 ->orWhereRaw('Debt_Amount <> CAST(Debt_Amount / 1000 AS bigint) * 1000')
                 ->orWhereNull('Debt_Source')->orWhereNotIn('Debt_Source', ['TblTUData','TblMailers','Tier']);
+            if ($maximum !== null) $q->orWhere('Debt_Amount', '>', $maximum);
             $q->orWhere(function (Builder $source) use ($leanDebtSources): void {
                 if ($leanDebtSources) {
                     $source->whereIn('Debt_Source', ['TblTUData','TblMailers'])
@@ -415,7 +429,12 @@ class SmsRecordExportRepository extends SqlSrvRepository
                 throw new HttpException(409, 'This batch has no matching frozen file options.');
             }
             $pendingIds = ($options['filename_version'] ?? null) === SmsRunOptions::APPROVAL_FILENAME_VERSION;
-            $this->assertFrozen($requestId, (int) $run->Selected, $pendingIds);
+            $expected = (int) $run->Selected;
+            $progress = app(SmsRunProgress::class);
+            $report = static fn (string $phase, int $done, ?int $partsDone = null, ?int $partsTotal = null) => $progress->write($requestId,
+                ['phase' => $phase, 'done' => $done, 'total' => $expected, 'parts_done' => $partsDone, 'parts_total' => $partsTotal]);
+            $report('checking', 0);
+            $this->assertFrozen($requestId, $expected, $pendingIds);
             $cells = (function () use ($requestId, $options): \Generator {
                 $pendingIds = ($options['filename_version'] ?? null) === SmsRunOptions::APPROVAL_FILENAME_VERSION;
                 $query = $this->table('TblProspectsExport', 'x')->where('x.Request_ID', $requestId);
@@ -428,7 +447,9 @@ class SmsRecordExportRepository extends SqlSrvRepository
                         $row->Debt_Amount, (string) $row->Phone, $pendingIds ? $options['send_date'] : Carbon::parse($row->Drop_Date)->toDateString());
                 }
             })();
-            $bundle = (new SmsRunArtifactBundle)->build($runDirectory, $stem, $cells, (int) $run->Selected, $options);
+            $bundle = (new SmsRunArtifactBundle)->build($runDirectory, $stem, $cells, $expected, $options, $report);
+            $parts = count($bundle['manifest']['parts']);
+            $report('final_check', $expected, $parts, $parts);
             $this->assertCurrentStates($requestId);
             return $bundle;
         });

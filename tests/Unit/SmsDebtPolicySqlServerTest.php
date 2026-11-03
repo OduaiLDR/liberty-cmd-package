@@ -78,7 +78,9 @@ CREATE TABLE TblSMSRuns(Request_ID uniqueidentifier,Target int,Run_Options_JSON 
 CREATE TABLE TblProspectsExport(PK int IDENTITY NOT NULL PRIMARY KEY,Request_ID uniqueidentifier,Prospect_PK int,Phone nvarchar(20),Debt_Tier varchar(10),Debt_Amount decimal(12,2),Debt_Source varchar(30),Debt_Source_PK int,Client varchar(150),Address varchar(200),City varchar(100),State char(2),Zip varchar(10),Email varchar(254),Was_Previously_Texted bit,Last_SMS_Date_At_Selection date);
 CREATE INDEX IX_TU_Identity ON TblTUData(ncoaAddr_addrLine1Txt,SMS_Zip5);
 CREATE INDEX IX_Mailer_Identity ON TblMailers(Client,Address,SMS_Zip5);');
-        $this->db->table('TblSMSRuns')->insert(['Request_ID' => self::ID, 'Target' => 9]);
+        // These boundary receipts exercise range mode's frozen 25,000 minimum.
+        $this->db->table('TblSMSRuns')->insert(['Request_ID' => self::ID, 'Target' => 9, 'Run_Options_JSON' => json_encode(
+            SmsRunOptions::normalize(9, 9, SmsRunOptions::TIERS, SmsRunOptions::TIER_SELECTION_POLICY, null, null, null, 25000), JSON_THROW_ON_ERROR)]);
         $this->db->table('TblMarketing')->insert(['Drop_Name' => 'SYNTHETIC', 'Send_Date' => '2026-10-01']);
         foreach (range(1, 9) as $pk) {
             $this->db->table('TblProspects')->insert(['PK' => $pk, 'Phone' => in_array($pk, [2, 6], true) ? '2025550100' : '20255501'.str_pad((string) $pk, 2, '0', STR_PAD_LEFT),
@@ -108,20 +110,86 @@ CREATE INDEX IX_Mailer_Identity ON TblMailers(Client,Address,SMS_Zip5);');
         return [['v1', false], ['windowed', false], ['windowed', true]];
     }
 
-    private function select(string $selector, bool $lean, int $minimum, int $target): array
+    /** A null minimum is by-tier mode: no frozen debt floor. */
+    private function select(string $selector, bool $lean, ?int $minimum, int $target, ?int $maximum = null): array
     {
         $this->db->table('TblProspectsExport')->delete();
         if ($selector === 'v1') {
-            $sql = SmsTierSelectionSql::select('SELECT * FROM TblProspects', SmsRunOptions::TIERS, 'Send_Date', $lean);
+            $sql = SmsTierSelectionSql::select('SELECT * FROM TblProspects', SmsRunOptions::TIERS, 'Send_Date', $lean, $maximum !== null);
         } else {
             $this->db->unprepared('DROP TABLE IF EXISTS #SmsTierWanted;
 SELECT ROW_NUMBER() OVER(ORDER BY CASE WHEN Last_SMS_Date IS NULL THEN 0 ELSE 1 END,CASE WHEN Last_SMS_Date IS NULL THEN Creation_Date END DESC,Last_SMS_Date,PK) AS Window_Position,
 PK AS Export_PK,Phone,Client,Address,City,State,Zip AS Snapshot_Zip,LEFT(Zip,5) AS Zip,Email,Creation_Date,Last_SMS_Date INTO #SmsTierWanted FROM TblProspects;');
-            $sql = SmsTierWindowSelectionSql::insert(SmsRunOptions::TIERS, 'Send_Date', $lean);
+            $sql = SmsTierWindowSelectionSql::insert(SmsRunOptions::TIERS, 'Send_Date', $lean, $maximum !== null);
         }
-        $this->db->statement($sql, [$target, self::ID, ...SmsRunOptions::TIERS, SmsDebtPolicy::validate($minimum)]);
+        $range = ['tier_selection_policy' => SmsRunOptions::TIER_SELECTION_POLICY] + ($minimum === null ? []
+            : ['minimum_debt_amount' => $minimum] + ($maximum === null ? [] : ['maximum_debt_amount' => $maximum]));
+        $this->db->statement($sql, [$target, self::ID, ...SmsRunOptions::TIERS, ...SmsDebtPolicy::bindings($range)]);
 
         return $this->db->table('TblProspectsExport')->orderBy('PK')->get()->all();
+    }
+
+    #[DataProvider('selectors')]
+    public function test_by_tier_run_without_a_minimum_keeps_low_source_debt_and_low_tier_fallbacks_in_priority(string $selector, bool $lean): void
+    {
+        $pks = fn (array $rows): array => array_map(fn ($r) => (int) $r->Prospect_PK, $rows);
+        $rows = $this->select($selector, $lean, null, 9);
+        // PK1 and PK4 are 24,999.99 source debt; PK9 is the 22,500 T4 fallback. PK5 has an unknown source date.
+        self::assertSame([1, 2, 3, 4, 6, 8, 9, 7], $pks($rows));
+        self::assertSame([25000, 25000, 26000, 25000, 35000, 31000, 23000, 40000], array_map(fn ($r) => (int) $r->Debt_Amount, $rows));
+        self::assertSame(['TblTUData', 'TblMailers', 'Tier'], [$rows[0]->Debt_Source, $rows[3]->Debt_Source, $rows[6]->Debt_Source]);
+        $this->db->table('TblSMSRuns')->update(['Run_Options_JSON' => json_encode(
+            SmsRunOptions::normalize(9, 9, ['T4', 'T5', 'T9'], SmsRunOptions::TIER_SELECTION_POLICY), JSON_THROW_ON_ERROR)]);
+        SmsDebtPolicy::assertPending($this->db, self::ID);
+        // The same frozen members are held once a range-mode 25,000 minimum applies.
+        $this->db->table('TblSMSRuns')->update(['Run_Options_JSON' => json_encode(
+            SmsRunOptions::normalize(9, 9, SmsRunOptions::TIERS, SmsRunOptions::TIER_SELECTION_POLICY, null, null, null, 25000), JSON_THROW_ON_ERROR)]);
+        try {
+            SmsDebtPolicy::assertPending($this->db, self::ID);
+            self::fail('Range mode released a member below its frozen minimum');
+        } catch (SmsFrozenEligibilityHold) {
+        }
+        self::assertSame([2, 3, 6, 8, 7], $pks($this->select($selector, $lean, 25000, 9)));
+    }
+
+    #[DataProvider('selectors')]
+    public function test_whole_thousand_maximum_excludes_higher_unrounded_debt_and_keeps_exact_ceilings(string $selector, bool $lean): void
+    {
+        $pks = fn (array $rows): array => array_map(fn ($r) => (int) $r->Prospect_PK, $rows);
+        // PK6 is exactly 35,000; PK7 is 40,000 and is excluded before quantity.
+        $rows = $this->select($selector, $lean, 25000, 9, 35000);
+        self::assertSame([2, 3, 6, 8], $pks($rows));
+        self::assertSame([25000, 26000, 35000, 31000], array_map(fn ($r) => (int) $r->Debt_Amount, $rows));
+        self::assertSame([2, 3, 6], $pks($this->select($selector, $lean, 25000, 3, 35000)));
+        // 25,000.01 rounds to 26,000: above a 25,000 ceiling, equal to a 26,000 ceiling.
+        self::assertSame([2], $pks($this->select($selector, $lean, 25000, 9, 25000)));
+        self::assertSame([2, 3], $pks($this->select($selector, $lean, 25000, 9, 26000)));
+        // The 30,500 T5 fallback rounds to 31,000 and is excluded by 30,000, included at 31,000.
+        self::assertSame([2, 3], $pks($this->select($selector, $lean, 25000, 9, 30000)));
+        self::assertSame([2, 3, 8], $pks($this->select($selector, $lean, 25000, 9, 31000)));
+        self::assertSame([6, 7], $pks($this->select($selector, $lean, 31000, 9, SmsDebtPolicy::MAX)));
+        self::assertSame($pks($this->select($selector, $lean, 25000, 9)), $pks($this->select($selector, $lean, 25000, 9, SmsDebtPolicy::MAX)));
+    }
+
+    public function test_pending_frozen_maximum_holds_raised_members_and_its_tier_ceiling(): void
+    {
+        $options = SmsRunOptions::normalize(9, 9, SmsRunOptions::TIERS, SmsRunOptions::TIER_SELECTION_POLICY, null, null, null, 25000, 35000);
+        $this->db->table('TblSMSRuns')->update(['Run_Options_JSON' => json_encode($options, JSON_THROW_ON_ERROR)]);
+        $this->select('v1', false, 25000, 9, 35000);
+        SmsDebtPolicy::assertPending($this->db, self::ID);
+        $before = $this->db->table('TblProspectsExport')->get()->toJson();
+        $this->db->table('TblProspectsExport')->where('Prospect_PK', 6)->update(['Debt_Amount' => 36000]);
+        try {
+            SmsDebtPolicy::assertPending($this->db, self::ID);
+            self::fail('Frozen member above the maximum was released');
+        } catch (SmsFrozenEligibilityHold $error) {
+            self::assertStringContainsString('above the chosen debt maximum', $error->getMessage());
+        }
+        $this->db->table('TblProspectsExport')->where('Prospect_PK', 6)->update(['Debt_Amount' => 35000]);
+        self::assertSame($before, $this->db->table('TblProspectsExport')->get()->toJson());
+        $this->db->table('TblProspectsExport')->where('Prospect_PK', 8)->update(['Debt_Tier' => 'T6']);
+        $this->expectException(SmsFrozenEligibilityHold::class);
+        SmsDebtPolicy::assertPending($this->db, self::ID);
     }
 
     #[DataProvider('selectors')]

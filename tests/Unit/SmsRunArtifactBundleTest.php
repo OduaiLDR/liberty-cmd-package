@@ -70,6 +70,55 @@ final class SmsRunArtifactBundleTest extends TestCase
         self::assertDirectoryDoesNotExist($this->runDir.'/v1/published');
     }
 
+    public function test_explicit_maximum_rejects_a_high_row_and_binds_the_exact_ceiling(): void
+    {
+        $options = SmsRunOptions::normalize(2, 2, null, SmsRunOptions::TIER_SELECTION_POLICY, null, null, null, 25000, 35000);
+        try {
+            $this->bundles->build($this->runDir, 'sms-test', [['First', '35000', '2025550101', '2026-11-02'], ['Second', '36000', '2025550102', '2026-11-02']], 2, $options);
+            self::fail('Expected a frozen debt-maximum hold.');
+        } catch (RuntimeException $error) {
+            self::assertStringContainsString('above its frozen maximum', $error->getMessage());
+        }
+        self::assertDirectoryDoesNotExist($this->runDir.'/v1/published');
+        $result = $this->bundles->build($this->runDir, 'sms-test', [['First', '35000', '2025550101', '2026-11-02'], ['Second', '25000', '2025550102', '2026-11-02']], 2, $options);
+        self::assertSame(2, $result['manifest']['rows']);
+        self::assertSame($result['path'], $this->bundles->verify($this->runDir, $result['manifest'], $options, 2));
+        // The maximum is part of the frozen intent bound to the receipt.
+        $this->expectException(RuntimeException::class);
+        $this->bundles->verify($this->runDir, $result['manifest'], array_replace($options, ['maximum_debt_amount' => 36000]), 2);
+    }
+
+    public function test_progress_reports_rows_parts_packaging_and_verification_without_changing_bytes(): void
+    {
+        $calls = [];
+        $progress = function (string $phase, int $rows, int $partsDone, int $partsTotal) use (&$calls): void {
+            $calls[] = [$phase, $rows, $partsDone, $partsTotal];
+        };
+        $result = $this->bundles->build($this->runDir, 'sms-test', $this->rows(5), 5, SmsRunOptions::normalize(7, 3), $progress);
+        self::assertSame([['writing', 0, 0, 2], ['writing', 3, 1, 2], ['writing', 5, 2, 2], ['packaging', 5, 2, 2], ['verifying', 5, 2, 2]], $calls);
+        // A retry adopts the publication and only reports its verification.
+        $calls = [];
+        $adopted = $this->bundles->build($this->runDir, 'sms-test', [], 5, SmsRunOptions::normalize(7, 3), $progress);
+        self::assertSame([['verifying', 5, 2, 2]], $calls);
+        self::assertSame($result['sha256'], $adopted['sha256']);
+        $plain = new SmsRunArtifactBundle;
+        $other = $this->base.'/runs/22345678-1234-4234-8234-123456789abc';
+        self::assertSame($result['sha256'], $plain->build($other, 'sms-test', $this->rows(5), 5, SmsRunOptions::normalize(7, 3))['sha256']);
+    }
+
+    public function test_progress_reports_every_fifty_thousand_rows_once_and_a_failing_callback_never_breaks_the_build(): void
+    {
+        $calls = [];
+        $rows = SmsRunArtifactBundle::PROGRESS_ROWS * 2;
+        $result = $this->bundles->build($this->runDir, 'sms-test', $this->rows($rows), $rows, SmsRunOptions::normalize($rows, $rows),
+            function (string $phase, int $done, int $partsDone, int $partsTotal) use (&$calls): void {
+                $calls[] = [$phase, $done, $partsDone, $partsTotal];
+                throw new RuntimeException('Synthetic progress store failure.');
+            });
+        self::assertSame([['writing', 0, 0, 1], ['writing', 50000, 0, 1], ['writing', 100000, 1, 1], ['verifying', 100000, 1, 1]], $calls);
+        self::assertSame($rows, $result['manifest']['rows']);
+    }
+
     private function build(int $count = 5, int $target = 7, int $cap = 3): array
     {
         return $this->bundles->build($this->runDir, 'sms-test', $this->rows($count), $count, SmsRunOptions::normalize($target, $cap));
