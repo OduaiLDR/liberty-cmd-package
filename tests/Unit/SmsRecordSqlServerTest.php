@@ -12,8 +12,10 @@ use Cmd\Reports\Services\SmsContactAttribution;
 use Cmd\Reports\Services\SmsContactEvent;
 use Cmd\Reports\Services\SmsRunService;
 use Cmd\Reports\Services\SmsRunOptions;
+use Cmd\Reports\Services\SmsRunProgress;
 use Cmd\Reports\Services\SmsLeanHistorySchema;
 use Cmd\Reports\Services\SmsTierWindowSchema;
+use Illuminate\Cache\CacheManager;
 use Illuminate\Config\Repository;
 use Illuminate\Container\Container;
 use Illuminate\Database\Capsule\Manager;
@@ -190,12 +192,13 @@ final class SmsRecordSqlServerTest extends TestCase
             'ncoaAddr_zipCde' => '00123-9999', 'derivedFields1_unsecdebtbalance' => $debt, 'Tier_Tag' => $tier]);
     }
 
-    private function tierRun(int $target, array $tiers, string $policy = SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY): array
+    /** No minimum is by-tier mode (no debt floor); a minimum is range mode. */
+    private function tierRun(int $target, array $tiers, string $policy = SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY, ?int $minimum = null): array
     {
         config(['sms-exports.run_file_options_enabled' => true, 'sms-exports.tier_selection_enabled' => true,
             'sms-exports.tier_selection_windowed_enabled' => true, 'sms-exports.tier_selection_window_size' => 2,
             'sms-exports.lean_history_enabled' => SmsRunOptions::usesLeanDebtSources($policy)]);
-        $options = SmsRunOptions::normalize($target, 1, $tiers, $policy);
+        $options = SmsRunOptions::normalize($target, 1, $tiers, $policy, null, null, null, $minimum);
         $this->runs->start(self::ID, $target, 'synthetic@example.invalid', $options);
         return $options;
     }
@@ -619,13 +622,36 @@ final class SmsRecordSqlServerTest extends TestCase
         $allowed = $this->person(['Address' => 'Floor qualified', 'Creation_Date' => '2026-10-22']);
         $this->source(1, 'Explicit below floor', 'T5', '24999.99');
         $this->source(2, 'Floor qualified');
-        $this->tierRun(1, ['T5']);
+        $this->tierRun(1, ['T5'], SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY, 25000);
         $this->runs->prepare(self::ID);
         self::assertSame([$allowed], array_map('intval', $this->db->table('TblProspectsExport')->pluck('Prospect_PK')->all()));
         self::assertSame(31000, (int) $this->db->table('TblProspectsExport')->value('Debt_Amount'));
         self::assertSame(0, $this->db->table('TblProspectsExport')->where('Prospect_PK', $low)->count());
         self::assertSame([1,0], [$this->runs->show(self::ID)->selected,$this->runs->show(self::ID)->shortfall]);
         self::assertSame(0, (int) $this->db->table('TblProspects')->sum('SMS_Attempts'));
+    }
+
+    public function test_real_by_tier_run_selects_and_builds_debt_below_25000_that_range_mode_excludes(): void
+    {
+        $low = $this->person(['Address' => 'Low debt', 'Creation_Date' => '2026-10-23']);
+        $high = $this->person(['Address' => 'High debt', 'Creation_Date' => '2026-10-22']);
+        $this->source(1, 'Low debt', 'T2', '12000');
+        $this->source(2, 'High debt');
+        $this->tierRun(2, ['T2', 'T5'], SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY, 25000);
+        $this->runs->prepare(self::ID);
+        self::assertSame([$high], array_map('intval', $this->db->table('TblProspectsExport')->pluck('Prospect_PK')->all()));
+        foreach (['TblProspectsExport', 'TblSMSDrops', 'TblSMSRuns'] as $table) $this->db->table($table)->delete();
+
+        $options = $this->tierRun(2, ['T2', 'T5']);
+        self::assertArrayNotHasKey('minimum_debt_amount', $options);
+        $this->runs->prepare(self::ID);
+        self::assertSame([$low, $high], array_map('intval', $this->db->table('TblProspectsExport')->orderBy('PK')->pluck('Prospect_PK')->all()));
+        self::assertSame([12000, 31000], array_map('intval', $this->db->table('TblProspectsExport')->orderBy('PK')->pluck('Debt_Amount')->all()));
+        // Frozen prices, the pending guard and the bundle all accept the low member without a floor.
+        $this->runs->requestFile(self::ID); $this->runs->buildFile(self::ID);
+        $ready = $this->runs->show(self::ID);
+        self::assertSame(['file_ready', 2, 2], [$ready->status, $ready->selected, $ready->file['parts']]);
+        (new SmsRecordExportRepository)->assertCurrentStates(self::ID);
     }
 
     public function test_lean_v3_keeps_exact_tu_pk_and_gives_tier_fallback_no_second_source_id(): void
@@ -995,6 +1021,69 @@ final class SmsRecordSqlServerTest extends TestCase
         } finally {
             $this->db->unprepared('SET NOCOUNT OFF');
         }
+    }
+
+    public function test_real_windowed_progress_is_cache_only_and_reaches_the_committed_selection_count(): void
+    {
+        foreach (['Progress first','Progress second','Progress third'] as $i => $address) {
+            $this->person(['Address' => $address]); $this->source($i + 1, $address);
+        }
+        $this->person(['Address' => 'Progress wrong tier']); $this->source(4, 'Progress wrong tier', 'T9');
+        $this->tierRun(5, ['T5']); config(['sms-exports.tier_selection_window_size' => 1]);
+        $this->db->table('TblSMSRuns')->update(['Status' => 'selecting']);
+        $container = Container::getInstance();
+        config(['cache' => ['default' => 'file', 'stores' => ['file' => ['driver' => 'array']], 'prefix' => 'sms-test']]);
+        $container->instance('cache', new CacheManager($container));
+        Facade::clearResolvedInstances();
+        $recorded = new class extends SmsRunProgress {
+            public array $calls = [];
+            public function write(string $id, array $snapshot): void { $this->calls[] = $snapshot; parent::write($id, $snapshot); }
+        };
+        $container->instance(SmsRunProgress::class, $recorded);
+        $updated = $this->db->table('TblSMSRuns')->value('Updated_At');
+
+        self::assertSame(3, (new SmsRecordExportRepository)->select(self::ID, 5)['selected']);
+        self::assertSame($updated, $this->db->table('TblSMSRuns')->value('Updated_At'));
+        self::assertSame(['phase' => 'selecting', 'done' => 0, 'total' => 5, 'scanned' => 0], $recorded->calls[0]);
+        $windows = array_slice($recorded->calls, 1, -1);
+        self::assertSame([1, 2, 3, 4], array_column($windows, 'scanned'));
+        self::assertSame([1, 2, 3, 3], array_column($windows, 'done'));
+        self::assertSame(['phase' => 'finalizing_selection', 'done' => 3, 'total' => 5, 'scanned' => 4], end($recorded->calls));
+        $snapshot = (new SmsRunProgress)->read(self::ID);
+        self::assertSame('finalizing_selection', $snapshot['phase']);
+        self::assertSame((int) $this->db->table('TblSMSRuns')->value('Selected'), $snapshot['done']);
+        self::assertSame($snapshot, $this->runs->show(self::ID)->progress);
+    }
+
+    public function test_real_debt_range_run_selects_through_the_whole_thousand_ceiling_and_builds_its_file(): void
+    {
+        $over = $this->person(['Address' => 'Range over', 'Creation_Date' => '2026-10-23']);
+        $exact = $this->person(['Address' => 'Range exact', 'Creation_Date' => '2026-10-22']);
+        $rounded = $this->person(['Address' => 'Range rounded', 'Creation_Date' => '2026-10-21']);
+        $tier = $this->person(['Address' => 'Range high tier', 'Creation_Date' => '2026-10-20']);
+        $this->source(1, 'Range over', 'T6', '35000.01');
+        $this->source(2, 'Range exact', 'T6', '35000');
+        $this->source(3, 'Range rounded', 'T6', '34000.01');
+        $this->db->table('TblMailers')->insert(['PK' => 4, 'Client' => 'Synthetic Person', 'Address' => 'Range high tier',
+            'Zip' => '00123', 'Drop_Name' => 'RANGE-DROP', 'Debt_Amount' => null, 'Debt_Tier' => 'T6']);
+        $this->db->table('TblMarketing')->insert(['Drop_Name' => 'RANGE-DROP', 'Send_Date' => '2026-10-01']);
+        config(['sms-exports.run_file_options_enabled' => true, 'sms-exports.tier_selection_enabled' => true,
+            'sms-exports.tier_selection_windowed_enabled' => true, 'sms-exports.tier_selection_window_size' => 1]);
+        $options = SmsRunOptions::normalize(4, 1, null, SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY, null, null, null, 25000, 35000);
+        $this->runs->start(self::ID, 4, 'synthetic@example.invalid', $options);
+        $this->runs->prepare(self::ID);
+        self::assertSame([$exact, $rounded], array_map('intval', $this->db->table('TblProspectsExport')->orderBy('PK')->pluck('Prospect_PK')->all()));
+        self::assertSame([35000, 35000], array_map('intval', $this->db->table('TblProspectsExport')->orderBy('PK')->pluck('Debt_Amount')->all()));
+        foreach ([$over, $tier] as $pk) self::assertSame(0, $this->db->table('TblProspectsExport')->where('Prospect_PK', $pk)->count());
+        $view = $this->runs->show(self::ID);
+        self::assertSame([2, 2, $options], [$view->selected, $view->shortfall, $view->options]);
+        $this->runs->requestFile(self::ID); $this->runs->buildFile(self::ID);
+        $ready = $this->runs->show(self::ID);
+        self::assertSame(['file_ready', 2], [$ready->status, $ready->file['parts']]);
+        // A frozen member raised above the ceiling is held by the pending guard.
+        $this->db->table('TblProspectsExport')->where('Prospect_PK', $exact)->update(['Debt_Amount' => 36000]);
+        $this->expectException(\Cmd\Reports\Services\SmsFrozenEligibilityHold::class);
+        (new SmsRecordExportRepository)->assertCurrentStates(self::ID);
     }
 
     public function test_real_committed_selection_retry_keeps_source_prices_after_creation_flag_and_sources_change(): void

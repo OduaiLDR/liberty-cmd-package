@@ -18,15 +18,54 @@ final class SmsDebtPolicyTest extends TestCase
 {
     private const ID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
 
-    public function test_legacy_options_keep_their_shape_but_the_effective_floor_is_mandatory(): void
+    public function test_legacy_options_keep_their_shape_and_floor_while_only_by_tier_runs_drop_it(): void
     {
         $old = ['target' => 3, 'rows_per_file' => 3, 'tiers' => SmsRunOptions::TIERS, 'csv_format' => SmsRunOptions::CSV_FORMAT];
         $before = json_encode($old);
         self::assertSame(25000, SmsDebtPolicy::minimum(null));
         self::assertSame(25000, SmsDebtPolicy::minimum($old));
+        self::assertSame([25000, 25000], [SmsDebtPolicy::lowerBound(null), SmsDebtPolicy::lowerBound($old)]);
+        self::assertFalse(SmsDebtPolicy::floorless(null) || SmsDebtPolicy::floorless($old));
         self::assertSame($before, json_encode($old));
+        $byTier = SmsRunOptions::normalize(3, null, ['T1'], SmsRunOptions::LEAN_WINDOWED_TIER_SELECTION_POLICY);
+        self::assertTrue(SmsDebtPolicy::floorless($byTier));
+        self::assertSame([0, [0]], [SmsDebtPolicy::lowerBound($byTier), SmsDebtPolicy::bindings($byTier)]);
+        $range = SmsRunOptions::normalize(3, null, null, SmsRunOptions::LEAN_WINDOWED_TIER_SELECTION_POLICY, null, null, null, 35000);
+        self::assertFalse(SmsDebtPolicy::floorless($range));
         self::assertSame(35000, SmsDebtPolicy::minimum(['minimum_debt_amount' => 35000]));
+        self::assertSame(35000, SmsDebtPolicy::lowerBound($range));
         self::assertSame(SmsDebtPolicy::MAX, SmsDebtPolicy::validate(SmsDebtPolicy::MAX));
+    }
+
+    public function test_by_tier_runs_without_a_minimum_release_low_debt_and_low_tier_fallbacks_but_hold_invalid_debt(): void
+    {
+        $db = $this->db();
+        $db->table('TblSMSRuns')->update(['Run_Options_JSON' => json_encode(SmsRunOptions::normalize(3, null, ['T1', 'T5'],
+            SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY), JSON_THROW_ON_ERROR)]);
+        $this->frozen($db, '9999.99', '10000');
+        $db->table('TblProspectsExport')->insert(['PK' => 2, 'Request_ID' => self::ID, 'Debt_Amount' => 10000, 'Debt_Tier' => 'T1', 'Debt_Source' => 'Tier']);
+        // No boundary source proof either: the frozen TU row is not re-read.
+        $db->unprepared('DROP TABLE TblTUData; DROP TABLE TblMailers;');
+        SmsDebtPolicy::assertPending($db, self::ID);
+        $byTier = $db->table('TblSMSRuns')->value('Run_Options_JSON');
+        // Legacy runs without a selector keep the original 25,000 pending guard.
+        $db->table('TblSMSRuns')->update(['Run_Options_JSON' => null]);
+        try {
+            SmsDebtPolicy::assertPending($db, self::ID);
+            self::fail('Legacy low debt was released');
+        } catch (SmsFrozenEligibilityHold $error) {
+            self::assertStringContainsString('below the required debt minimum', $error->getMessage());
+        }
+        $db->table('TblSMSRuns')->update(['Run_Options_JSON' => $byTier]);
+        foreach ([null, 0, -1000, SmsDebtPolicy::MAX + 1000] as $invalid) {
+            $db->table('TblProspectsExport')->where('PK', 1)->update(['Debt_Amount' => $invalid]);
+            try {
+                SmsDebtPolicy::assertPending($db, self::ID);
+                self::fail('Invalid frozen debt was released without a minimum');
+            } catch (SmsFrozenEligibilityHold $error) {
+                self::assertStringContainsString('unknown, non-positive or unsupported debt', $error->getMessage());
+            }
+        }
     }
 
     #[DataProvider('invalidMinimums')]
@@ -49,7 +88,9 @@ CREATE TABLE TblProspectsExport(PK INTEGER PRIMARY KEY,Request_ID TEXT,Debt_Amou
 CREATE TABLE TblTUData(PK INTEGER,derivedFields1_unsecdebtbalance DECIMAL(18,2),ncoaAddr_frstNme TEXT,ncoaAddr_lastNme TEXT,ncoaAddr_addrLine1Txt TEXT,ncoaAddr_zipCde TEXT);
 CREATE TABLE TblMailers(PK INTEGER,Debt_Amount DECIMAL(18,2),Client TEXT,Address TEXT,Zip TEXT);
 CREATE TABLE TblSMSHistory(PK INTEGER,Request_ID TEXT,Debt_Amount DECIMAL(12,2));');
-        $db->table('TblSMSRuns')->insert(['Request_ID' => self::ID, 'Target' => 3]);
+        // Boundary receipts below exercise range mode's frozen 25,000 minimum.
+        $options = SmsRunOptions::normalize(3, null, SmsRunOptions::TIERS, SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY, null, null, null, 25000);
+        $db->table('TblSMSRuns')->insert(['Request_ID' => self::ID, 'Target' => 3, 'Run_Options_JSON' => json_encode($options, JSON_THROW_ON_ERROR)]);
 
         return $db;
     }
@@ -204,5 +245,98 @@ CREATE TABLE TblSMSHistory(PK INTEGER,Request_ID TEXT,Debt_Amount DECIMAL(12,2))
         $db->table('TblTUData')->update(['derivedFields1_unsecdebtbalance' => '25500.00']);
         SmsDebtPolicy::assertPending($db, self::ID);
         self::assertSame('26000', (string) $db->table('TblProspectsExport')->value('Debt_Amount'));
+    }
+
+    public function test_maximum_is_optional_whole_thousands_in_range_and_not_below_the_minimum(): void
+    {
+        self::assertNull(SmsDebtPolicy::maximum(null));
+        self::assertNull(SmsDebtPolicy::maximum(['minimum_debt_amount' => 31000]));
+        self::assertSame(31000, SmsDebtPolicy::maximum(['minimum_debt_amount' => 31000, 'maximum_debt_amount' => 31000]));
+        self::assertSame(SmsDebtPolicy::MAX, SmsDebtPolicy::validateMaximum(SmsDebtPolicy::MAX, SmsDebtPolicy::FLOOR));
+        self::assertSame(SmsDebtPolicy::FLOOR, SmsDebtPolicy::validateMaximum(SmsDebtPolicy::FLOOR, SmsDebtPolicy::FLOOR));
+        self::assertSame([31000, 35000], SmsDebtPolicy::bindings(['minimum_debt_amount' => 31000, 'maximum_debt_amount' => 35000]));
+    }
+
+    #[DataProvider('invalidMaximums')]
+    public function test_invalid_or_orphan_maximum_is_rejected(array $options): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage(SmsDebtPolicy::MAXIMUM_MESSAGE);
+        SmsDebtPolicy::maximum($options);
+    }
+
+    public static function invalidMaximums(): array
+    {
+        $range = static fn (mixed $maximum, int $minimum = 25000): array => [['minimum_debt_amount' => $minimum, 'maximum_debt_amount' => $maximum]];
+        return [
+            'not whole thousands' => $range(35500), 'one dollar' => $range(35001), 'below floor' => $range(24000),
+            'zero' => $range(0), 'above max' => $range(SmsDebtPolicy::MAX + 1000), 'below minimum' => $range(30000, 31000),
+            'string' => $range('35000'), 'float' => $range(35000.0), 'null' => $range(null),
+            'without minimum' => [['maximum_debt_amount' => 35000]],
+        ];
+    }
+
+    private function range(SQLiteConnection $db, int $minimum, int $maximum): void
+    {
+        $options = SmsRunOptions::normalize(3, null, SmsRunOptions::TIERS, SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY, null, null, null, $minimum, $maximum);
+        $db->table('TblSMSRuns')->update(['Run_Options_JSON' => json_encode($options, JSON_THROW_ON_ERROR)]);
+    }
+
+    public function test_frozen_member_above_the_chosen_maximum_is_held_and_the_exact_ceiling_passes(): void
+    {
+        $db = $this->db();
+        $this->frozen($db, '35000.00', '35000');
+        $this->range($db, 25000, 35000);
+        SmsDebtPolicy::assertPending($db, self::ID);
+        $db->table('TblProspectsExport')->update(['Debt_Amount' => 36000]);
+        $before = $db->table('TblProspectsExport')->get()->toJson();
+        try {
+            SmsDebtPolicy::assertPending($db, self::ID);
+            self::fail('Frozen debt above the chosen maximum was released');
+        } catch (SmsFrozenEligibilityHold $error) {
+            self::assertStringContainsString('above the chosen debt maximum', $error->getMessage());
+        }
+        self::assertSame($before, $db->table('TblProspectsExport')->get()->toJson());
+        // Minimum-only and legacy runs have no ceiling below the supported range.
+        $db->table('TblSMSRuns')->update(['Run_Options_JSON' => null]);
+        SmsDebtPolicy::assertPending($db, self::ID);
+    }
+
+    public function test_tier_fallback_above_the_maximum_is_held_even_when_its_frozen_amount_fits(): void
+    {
+        $db = $this->db();
+        $db->table('TblProspectsExport')->insert(['PK' => 1, 'Request_ID' => self::ID, 'Debt_Amount' => 31000, 'Debt_Tier' => 'T5', 'Debt_Source' => 'Tier']);
+        $this->range($db, 25000, 31000);
+        SmsDebtPolicy::assertPending($db, self::ID);
+        // T6 is a fixed 42,500 fallback: a fitting rounded amount cannot release it.
+        $db->table('TblProspectsExport')->update(['Debt_Tier' => 'T6']);
+        try {
+            SmsDebtPolicy::assertPending($db, self::ID);
+            self::fail('Tier fallback above the maximum was released');
+        } catch (SmsFrozenEligibilityHold $error) {
+            self::assertStringContainsString('above the chosen maximum', $error->getMessage());
+        }
+        $db->table('TblProspectsExport')->update(['Debt_Tier' => 'T5']);
+        $this->range($db, 25000, 30000);
+        $this->expectException(SmsFrozenEligibilityHold::class);
+        SmsDebtPolicy::assertPending($db, self::ID);
+    }
+
+    public function test_boundary_reproof_uses_the_frozen_maximum_as_its_upper_bound(): void
+    {
+        $db = $this->db();
+        $this->frozen($db, '25000.00', '25000');
+        $this->range($db, 25000, 25000);
+        SmsDebtPolicy::assertPending($db, self::ID);
+        $db->table('TblTUData')->update(['derivedFields1_unsecdebtbalance' => '25000.50']);
+        try {
+            SmsDebtPolicy::assertPending($db, self::ID);
+            self::fail('Source above the frozen maximum proved the boundary');
+        } catch (SmsFrozenEligibilityHold) {
+        }
+        // Without a maximum the same boundary only proves the floor.
+        $db->table('TblSMSRuns')->update(['Run_Options_JSON' => null]);
+        SmsDebtPolicy::assertPending($db, self::ID);
+        self::assertSame(1, $db->table('TblProspectsExport')->count());
     }
 }

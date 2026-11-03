@@ -6,9 +6,12 @@ use Carbon\Carbon;
 use Cmd\Reports\Http\Controllers\SmsRunController;
 use Cmd\Reports\Repositories\SmsProspectExportRepository;
 use Cmd\Reports\Repositories\SmsRecordExportRepository;
+use Cmd\Reports\Services\SmsDebtPolicy;
 use Cmd\Reports\Services\SmsDurableAvailabilityService;
 use Cmd\Reports\Services\SmsRunOptions;
+use Cmd\Reports\Services\SmsRunProgress;
 use Cmd\Reports\Services\SmsRunService;
+use Illuminate\Cache\CacheManager;
 use Illuminate\Config\Repository;
 use Illuminate\Container\Container;
 use Illuminate\Database\Capsule\Manager;
@@ -1101,4 +1104,146 @@ test('automatic queue and logging failures preserve committed approval and its r
     expect($this->db->table('TblSMSAutomaticHandoffs')->first())->toEqual($before)
         ->and($this->db->table('TblSMSRuns')->value('Status'))->toBe('approved')
         ->and($this->db->table('TblSMSHistory')->count())->toBe(5);
+});
+
+test('debt range capabilities sit inside the tier-subset block in exact order', function (): void {
+    config(['sms-exports.tier_selection_enabled' => true]);
+    expect($this->service->overview()['capabilities'])->toBe([
+        'csv_format' => SmsRunOptions::CSV_FORMAT, 'rows_per_file' => true, 'tier_subset' => true, 'max_parts' => 1000,
+        'tier_selection_policy' => SmsRunOptions::TIER_SELECTION_POLICY,
+        'minimum_debt_amount' => true, 'minimum_debt_floor' => 25000, 'minimum_debt_default' => 25000, 'minimum_debt_max' => 9999999000,
+        'maximum_debt_amount' => true, 'maximum_debt_step' => 1000, 'maximum_debt_floor' => 25000, 'maximum_debt_max' => 9999999000,
+        'options_version' => SmsRunOptions::PLANNED_DATE_VERSION, 'send_date' => true, 'default_send_date' => '2026-10-26',
+        'min_send_date' => '2026-10-19', 'send_date_timezone' => 'America/Los_Angeles',
+        'filename_version' => SmsRunOptions::APPROVAL_FILENAME_VERSION,
+    ]);
+    config(['sms-exports.tier_selection_enabled' => false]);
+    expect($this->service->overview()['capabilities'])->not->toHaveKey('minimum_debt_amount')->not->toHaveKey('maximum_debt_amount');
+});
+
+test('debt range create freezes the maximum after the minimum and replays only the identical range', function (): void {
+    config(['sms-exports.tier_selection_enabled' => true]);
+    $range = SmsRunOptions::normalize(7, 3, null, SmsRunOptions::TIER_SELECTION_POLICY, null, null, null, 31000, 85000);
+    $request = Request::create('/', 'POST', ['request_id' => $this->id, 'target' => 7, 'csv_format' => SmsRunOptions::CSV_FORMAT,
+        'rows_per_file' => 3, 'tiers' => SmsRunOptions::TIERS, 'tier_selection_policy' => SmsRunOptions::TIER_SELECTION_POLICY,
+        'minimum_debt_amount' => '31000', 'maximum_debt_amount' => '85000']);
+    $request->attributes->set('cmd_user', ['email' => 'editor@example.invalid']);
+    $created = $this->controller->store($request)->getData(true)['options'];
+    expect($created)->toBe($range)->and(array_slice(array_keys($created), -2))->toBe(['minimum_debt_amount', 'maximum_debt_amount'])
+        ->and($this->db->table('TblSMSRuns')->value('Run_Options_JSON'))->toBe(json_encode($range, JSON_THROW_ON_ERROR));
+    config(['sms-exports.tier_selection_enabled' => false, 'sms-exports.run_file_options_enabled' => false]);
+    expect($this->service->start($this->id, 7, 'editor@example.invalid', $range)->options)->toBe($range)
+        ->and($this->service->queued)->toHaveCount(1);
+    foreach ([array_replace($range, ['maximum_debt_amount' => 86000]), array_diff_key($range, ['maximum_debt_amount' => true])] as $changed) {
+        expect(fn () => $this->service->start($this->id, 7, 'editor@example.invalid', $changed))->toThrow(HttpException::class);
+    }
+    expect($this->db->table('TblSMSRuns')->count())->toBe(1)->and($this->db->table('TblProspectsExport')->count())->toBe(0);
+});
+
+test('controller rejects a maximum without a minimum or outside whole thousands from the minimum to the supported max', function (array $debt, array $errors): void {
+    config(['sms-exports.tier_selection_enabled' => true]);
+    $request = Request::create('/', 'POST', $debt + ['request_id' => $this->id, 'target' => 7,
+        'csv_format' => SmsRunOptions::CSV_FORMAT, 'tier_selection_policy' => SmsRunOptions::TIER_SELECTION_POLICY]);
+    try {
+        $this->controller->store($request);
+        $this->fail('An invalid maximum debt was accepted.');
+    } catch (ValidationException $error) {
+        expect($error->errors())->toBe($errors);
+    }
+    expect($this->db->table('TblSMSRuns')->count())->toBe(0)->and($this->service->queued)->toBe([]);
+})->with([
+    'without minimum' => [['maximum_debt_amount' => 35000],
+        ['minimum_debt_amount' => ['Choose a minimum debt with the maximum debt.'], 'maximum_debt_amount' => [SmsDebtPolicy::MAXIMUM_MESSAGE]]],
+    'not whole thousands' => [['minimum_debt_amount' => 25000, 'maximum_debt_amount' => 35500], ['maximum_debt_amount' => [SmsDebtPolicy::MAXIMUM_MESSAGE]]],
+    'below minimum' => [['minimum_debt_amount' => 31000, 'maximum_debt_amount' => 30000], ['maximum_debt_amount' => [SmsDebtPolicy::MAXIMUM_MESSAGE]]],
+    'above supported max' => [['minimum_debt_amount' => 25000, 'maximum_debt_amount' => 10000000000], ['maximum_debt_amount' => [SmsDebtPolicy::MAXIMUM_MESSAGE]]],
+    'below floor' => [['minimum_debt_amount' => 25000, 'maximum_debt_amount' => 24000], ['maximum_debt_amount' => [SmsDebtPolicy::MAXIMUM_MESSAGE]]],
+    'null' => [['minimum_debt_amount' => 25000, 'maximum_debt_amount' => null], ['maximum_debt_amount' => [SmsDebtPolicy::MAXIMUM_MESSAGE]]],
+    'text' => [['minimum_debt_amount' => 25000, 'maximum_debt_amount' => '35000bad'], ['maximum_debt_amount' => [SmsDebtPolicy::MAXIMUM_MESSAGE]]],
+]);
+
+test('formatless maximum and service-level maximum shapes never create a run', function (): void {
+    config(['sms-exports.tier_selection_enabled' => true]);
+    $request = Request::create('/', 'POST', ['request_id' => $this->id, 'target' => 7, 'minimum_debt_amount' => 25000, 'maximum_debt_amount' => 35000]);
+    expect(fn () => $this->controller->store($request))->toThrow(ValidationException::class);
+    $base = ['csv_format' => SmsRunOptions::CSV_FORMAT, 'tier_selection_policy' => SmsRunOptions::TIER_SELECTION_POLICY];
+    foreach ([
+        [$base + ['maximum_debt_amount' => 35000], 'A maximum debt requires a chosen minimum debt.'],
+        [$base + ['minimum_debt_amount' => 25000, 'maximum_debt_amount' => 35500], SmsDebtPolicy::MAXIMUM_MESSAGE],
+        [$base + ['minimum_debt_amount' => 31000, 'maximum_debt_amount' => 30000], SmsDebtPolicy::MAXIMUM_MESSAGE],
+        [$base + ['minimum_debt_amount' => 25000, 'maximum_debt_amount' => '35000'], 'Use the explicit supported SMS format and valid file options.'],
+        [['csv_format' => SmsRunOptions::CSV_FORMAT, 'minimum_debt_amount' => 25000, 'maximum_debt_amount' => 35000],
+            'A debt minimum requires explicit current-source selection before quantity.'],
+    ] as [$options, $message]) {
+        try {
+            $this->service->start($this->id, 7, 'editor@example.invalid', $options);
+            $this->fail('An invalid maximum debt was accepted.');
+        } catch (ValidationException $error) {
+            expect($error->errors()['file_options'])->toBe([$message]);
+        }
+    }
+    expect($this->db->table('TblSMSRuns')->count())->toBe(0)->and($this->service->queued)->toBe([]);
+});
+
+test('by-tier mode freezes a subset without debt keys and binds no debt floor', function (): void {
+    config(['sms-exports.tier_selection_enabled' => true]);
+    $request = Request::create('/', 'POST', ['request_id' => $this->id, 'target' => 7, 'csv_format' => SmsRunOptions::CSV_FORMAT,
+        'rows_per_file' => 3, 'tiers' => ['T7', 'T3'], 'tier_selection_policy' => SmsRunOptions::TIER_SELECTION_POLICY]);
+    $request->attributes->set('cmd_user', ['email' => 'editor@example.invalid']);
+    $options = $this->controller->store($request)->getData(true)['options'];
+    expect($options)->toBe(SmsRunOptions::normalize(7, 3, ['T3', 'T7'], SmsRunOptions::TIER_SELECTION_POLICY))
+        ->not->toHaveKey('minimum_debt_amount')->not->toHaveKey('maximum_debt_amount')
+        ->and(SmsDebtPolicy::bindings($options))->toBe([0]);
+});
+
+test('busy run status carries only its matching cached progress phase without SQL and clears it after each step', function (): void {
+    $container = Container::getInstance();
+    config(['cache' => ['default' => 'file', 'stores' => ['file' => ['driver' => 'array']], 'prefix' => 'sms-test']]);
+    $container->instance('cache', new CacheManager($container));
+    Facade::clearResolvedInstances();
+    $progress = new class extends SmsRunProgress {
+        public array $calls = [];
+        public function write(string $id, array $snapshot): void { $this->calls[] = $snapshot; parent::write($id, $snapshot); }
+    };
+    $container->instance(SmsRunProgress::class, $progress);
+    ($this->seedMembers)();
+    $queued = $this->service->start($this->id, 7, 'editor@example.invalid', $this->fileOptions);
+    expect($queued)->toHaveProperty('progress')->and($queued->progress)->toBeNull();
+
+    $progress->write($this->id, ['phase' => 'selecting', 'done' => 2, 'total' => 7, 'scanned' => 4]);
+    $this->db->enableQueryLog(); $this->db->flushQueryLog();
+    $view = $this->service->show($this->id);
+    $queries = count($this->db->getQueryLog());
+    expect($view->progress)->toBe(['phase' => 'selecting', 'done' => 2, 'total' => 7, 'scanned' => 4,
+        'parts_done' => null, 'parts_total' => null, 'updated_at' => '2026-10-20T00:30:00+00:00']);
+    $progress->forget($this->id); $this->db->flushQueryLog();
+    expect($this->service->show($this->id)->progress)->toBeNull()->and(count($this->db->getQueryLog()))->toBe($queries);
+    $this->db->disableQueryLog();
+
+    // A build phase never decorates a selection status; a later status change hides older snapshots.
+    $progress->write($this->id, ['phase' => 'writing', 'done' => 1, 'total' => 7]);
+    expect($this->service->show($this->id)->progress)->toBeNull();
+    $this->db->table('TblSMSRuns')->update(['Status' => 'selecting']);
+    $progress->write($this->id, ['phase' => 'finalizing_selection', 'done' => 5, 'total' => 7, 'scanned' => 9]);
+    expect($this->service->show($this->id)->progress['phase'])->toBe('finalizing_selection');
+    $this->db->table('TblSMSRuns')->update(['Updated_At' => '2026-10-20 00:30:01']);
+    expect($this->service->show($this->id)->progress)->toBeNull();
+    $this->db->table('TblSMSRuns')->update(['Status' => 'queued', 'Updated_At' => '2026-10-20 00:30:00']);
+
+    $this->service->prepare($this->id);
+    $review = $this->service->show($this->id);
+    expect($review->status)->toBe('review')->and((array) $review)->not->toHaveKey('progress')->and($progress->read($this->id))->toBeNull();
+
+    $this->service->requestFile($this->id);
+    $progress->write($this->id, ['phase' => 'selecting', 'done' => 5, 'total' => 5]);
+    $building = $this->service->show($this->id);
+    expect($building->status)->toBe('building_file')->and($building->progress)->toBeNull();
+    $progress->calls = [];
+    $this->service->buildFile($this->id);
+    expect(array_column($progress->calls, 'phase'))->toBe(['checking', 'writing', 'writing', 'writing', 'packaging', 'verifying', 'final_check'])
+        ->and($progress->calls[0])->toBe(['phase' => 'checking', 'done' => 0, 'total' => 5, 'parts_done' => null, 'parts_total' => null])
+        ->and($progress->calls[2])->toBe(['phase' => 'writing', 'done' => 3, 'total' => 5, 'parts_done' => 1, 'parts_total' => 2])
+        ->and($progress->calls[6])->toBe(['phase' => 'final_check', 'done' => 5, 'total' => 5, 'parts_done' => 2, 'parts_total' => 2]);
+    $ready = $this->service->show($this->id);
+    expect($ready->status)->toBe('file_ready')->and((array) $ready)->not->toHaveKey('progress')->and($progress->read($this->id))->toBeNull();
 });

@@ -15,10 +15,11 @@ final class SmsTierSelectionSql
      * Creation_Date and Last_SMS_Date. Do not put a quantity limit in that query.
      *
      * Binding order: eligible-query bindings first, target, request ID, then tiers
-     * in the supplied order, then the validated source-debt minimum.
+     * in the supplied order, then the validated source-debt minimum, then the
+     * frozen maximum only when $maximumDebt (SmsDebtPolicy::bindings()).
      * Caller owns snapshot isolation, run serialization, transaction/replay policy.
      */
-    public static function select(string $eligibleSql, array $tiers, string $mailerDate = 'Send_Date', bool $leanDebtSources = false): string
+    public static function select(string $eligibleSql, array $tiers, string $mailerDate = 'Send_Date', bool $leanDebtSources = false, bool $maximumDebt = false): string
     {
         if (trim($eligibleSql) === '') throw new RuntimeException('Tier selection requires a trusted unbounded eligibility SELECT.');
         if (! array_is_list($tiers) || $tiers === [] || count($tiers) > count(SmsRunOptions::TIERS)) {
@@ -41,6 +42,8 @@ SQL;
         $valid = SmsCurrentDebtSql::VALID_PREDICATE;
         $sourcePk = $leanDebtSources ? "CASE WHEN r.Source='Tier' THEN NULL ELSE r.Source_PK END" : 'r.Source_PK';
         $tierBindings = implode(',', array_fill(0, count($tiers), '?'));
+        // Runs without a frozen maximum keep their exact SQL text and binding count.
+        $maximum = $maximumDebt ? "\n  AND r.Debt<=?" : '';
         return $ctes.<<<SQL
 
 INSERT INTO TblProspectsExport (Request_ID, Prospect_PK, Phone, Debt_Tier, Debt_Amount,
@@ -52,7 +55,7 @@ SELECT TOP (?) ?, w.Export_PK, w.Phone, r.Tier, {$debt},
 FROM Wanted w JOIN Resolved r ON r.Export_PK=w.Export_PK
 WHERE {$valid}
   AND r.Tier IN ({$tierBindings})
-  AND r.Debt>=?
+  AND r.Debt>=?{$maximum}
 ORDER BY CASE WHEN w.Last_SMS_Date IS NULL THEN 0 ELSE 1 END ASC,
     CASE WHEN w.Last_SMS_Date IS NULL THEN w.Creation_Date END DESC,
     w.Last_SMS_Date ASC, w.Export_PK ASC

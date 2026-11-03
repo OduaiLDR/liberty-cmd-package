@@ -17,6 +17,11 @@ final class SmsDebtPolicy
 
     public const VERSION = 'source-debt-minimum-v1';
 
+    public const MAXIMUM_STEP = 1000;
+
+    public const MAXIMUM_MESSAGE = 'The SMS maximum debt must be whole thousands from $25,000 to $9,999,999,000 and not below the minimum.';
+
+    /** A frozen minimum (never below FLOOR), else FLOOR. By-tier runs use lowerBound(). */
     public static function minimum(?array $options): int
     {
         if (! array_key_exists('minimum_debt_amount', $options ?? [])) {
@@ -38,26 +43,92 @@ final class SmsDebtPolicy
         return $minimum;
     }
 
+    /** Null means no chosen ceiling. A maximum is only valid beside a frozen minimum. */
+    public static function maximum(?array $options): ?int
+    {
+        if (! array_key_exists('maximum_debt_amount', $options ?? [])) {
+            return null;
+        }
+        if (! is_int($options['maximum_debt_amount']) || ! array_key_exists('minimum_debt_amount', $options)) {
+            throw new InvalidArgumentException(self::MAXIMUM_MESSAGE);
+        }
+
+        return self::validateMaximum($options['maximum_debt_amount'], self::minimum($options));
+    }
+
+    /** Whole thousands keep the frozen CEILING-to-thousand amount exact: raw <= M iff rounded <= M. */
+    public static function validateMaximum(int $maximum, int $minimum): int
+    {
+        if ($maximum % self::MAXIMUM_STEP !== 0 || $maximum < self::FLOOR || $maximum > self::MAX || $maximum < $minimum) {
+            throw new InvalidArgumentException(self::MAXIMUM_MESSAGE);
+        }
+
+        return $maximum;
+    }
+
+    /**
+     * By-tier runs: an explicit source-tier selector with no frozen minimum.
+     * Legacy runs without a selector keep the FLOOR pending guard unchanged.
+     */
+    public static function floorless(?array $options): bool
+    {
+        return ! array_key_exists('minimum_debt_amount', $options ?? [])
+            && SmsRunOptions::isTierSelectionPolicy($options['tier_selection_policy'] ?? null);
+    }
+
+    /**
+     * Zero for by-tier runs keeps the selector's r.Debt>=? text and binding
+     * count: VALID_PREDICATE already requires r.Debt>0, so it adds no filter.
+     */
+    public static function lowerBound(?array $options): int
+    {
+        return self::floorless($options) ? 0 : self::minimum($options);
+    }
+
+    /** Selection bindings: the lower bound, then the maximum only for runs that froze one. */
+    public static function bindings(?array $options): array
+    {
+        $maximum = self::maximum($options);
+
+        return $maximum === null ? [self::lowerBound($options)] : [self::lowerBound($options), $maximum];
+    }
+
     /** Pending snapshots only: approved historical evidence remains readable unchanged. */
     public static function assertPending(ConnectionInterface $db, string $requestId): void
     {
         $run = $db->table('TblSMSRuns')->useWritePdo()->where('Request_ID', $requestId)->first();
         $options = isset($run->Run_Options_JSON) ? SmsRunOptions::fromStored($run->Run_Options_JSON, (int) $run->Target) : null;
-        $minimum = self::minimum($options);
         $rows = fn (): Builder => $db->table('TblProspectsExport as x')->useWritePdo()->where('x.Request_ID', $requestId);
+        if (self::floorless($options)) {
+            // By-tier: no floor (and so no maximum), no tier-floor or boundary proof.
+            if ($rows()->where(fn (Builder $q) => $q->whereNull('x.Debt_Amount')->orWhere('x.Debt_Amount', '<=', 0)
+                ->orWhere('x.Debt_Amount', '>', self::MAX))->exists()) {
+                throw new SmsFrozenEligibilityHold('A frozen SMS member has unknown, non-positive or unsupported debt. The batch was held without changing membership.');
+            }
+
+            return;
+        }
+        $minimum = self::minimum($options);
+        $maximum = self::maximum($options);
         if ($rows()->where(fn (Builder $q) => $q->whereNull('x.Debt_Amount')->orWhere('x.Debt_Amount', '<', $minimum))->exists()) {
             throw new SmsFrozenEligibilityHold('A frozen SMS member is below the required debt minimum or has unknown debt. The batch was held without changing membership.');
         }
+        if ($maximum !== null && $rows()->where('x.Debt_Amount', '>', $maximum)->exists()) {
+            throw new SmsFrozenEligibilityHold('A frozen SMS member is above the chosen debt maximum. The batch was held without changing membership.');
+        }
         // Tier debt is an approved fixed amount. A frozen rounded amount cannot
         // turn a low tier fallback into source debt meeting a higher minimum.
-        $allowed = array_keys(array_filter(SmsCurrentDebtSql::TIER_AMOUNTS, fn (int $amount) => $amount >= $minimum));
+        $allowed = array_keys(array_filter(SmsCurrentDebtSql::TIER_AMOUNTS,
+            fn (int $amount) => $amount >= $minimum && $amount <= ($maximum ?? self::MAX)));
         $tiers = $rows()->where('x.Debt_Source', 'Tier');
         if (($allowed === [] ? $tiers : $tiers->where(fn (Builder $q) => $q->whereNull('x.Debt_Tier')->orWhereNotIn('x.Debt_Tier', $allowed)))->exists()) {
-            throw new SmsFrozenEligibilityHold('A frozen SMS tier fallback is below the required source-debt minimum. The batch was held without changing membership.');
+            throw new SmsFrozenEligibilityHold('A frozen SMS tier fallback is below the required source-debt minimum or above the chosen maximum. The batch was held without changing membership.');
         }
         // CEILING to a thousand can hide a shortfall only in this one boundary
         // bucket. Larger rounded snapshots prove the floor mathematically. Do
         // not run the global resolver or reprice/fallback any frozen member.
+        // A whole-thousand maximum needs no bucket; it only bounds the re-proof.
+        $upper = $maximum ?? self::MAX;
         $border = fn (): Builder => $rows()->whereRaw('x.Debt_Amount - 1000 < ?', [$minimum])->where(fn (Builder $q) => $q->whereNull('x.Debt_Source')->orWhere('x.Debt_Source', '<>', 'Tier'));
         if (! $border()->exists()) {
             return;
@@ -72,7 +143,7 @@ final class SmsDebtPolicy
                 continue;
             }
             if ($native) {
-                self::assertNativeSource($db, $requestId, $table, $debt, $minimum);
+                self::assertNativeSource($db, $requestId, $table, $debt, $minimum, $upper);
 
                 continue;
             }
@@ -81,12 +152,12 @@ final class SmsDebtPolicy
                 : "s.ncoaAddr_addrLine1Txt=x.Address AND substr(s.ncoaAddr_zipCde,1,5)=substr(x.Zip,1,5)
  AND s.ncoaAddr_frstNme<>'' AND s.ncoaAddr_lastNme<>'' AND substr(x.Client,1,length(s.ncoaAddr_frstNme)+1)=s.ncoaAddr_frstNme||' '
  AND substr(x.Client,-(length(s.ncoaAddr_lastNme)+1))=' '||s.ncoaAddr_lastNme";
-            $safe = $border()->where('x.Debt_Source', $table)->where(function (Builder $q) use ($table, $debt, $minimum, $identity): void {
+            $safe = $border()->where('x.Debt_Source', $table)->where(function (Builder $q) use ($table, $debt, $minimum, $upper, $identity): void {
                 $q->whereExists(fn (Builder $duplicate) => $duplicate->selectRaw('1')->fromRaw($table.' s')
                     ->whereColumn('s.PK', 'x.Debt_Source_PK')->whereRaw($identity)->orderBy('s.PK')->offset(1)->limit(1))
-                    ->orWhereNotExists(function (Builder $s) use ($table, $debt, $minimum, $identity): void {
+                    ->orWhereNotExists(function (Builder $s) use ($table, $debt, $minimum, $upper, $identity): void {
                         $s->selectRaw('1')->fromRaw($table.' s')->whereColumn('s.PK', 'x.Debt_Source_PK')
-                            ->where('s.'.$debt, '>=', $minimum)->where('s.'.$debt, '<=', self::MAX)->whereRaw($identity);
+                            ->where('s.'.$debt, '>=', $minimum)->where('s.'.$debt, '<=', $upper)->whereRaw($identity);
                     });
             });
             if ($safe->exists()) {
@@ -101,7 +172,7 @@ final class SmsDebtPolicy
     }
 
     /** Only the frozen boundary subset is visited, using a catalog-proven forced seek. */
-    private static function assertNativeSource(ConnectionInterface $db, string $requestId, string $table, string $debt, int $minimum): void
+    private static function assertNativeSource(ConnectionInterface $db, string $requestId, string $table, string $debt, int $minimum, int $upper): void
     {
         [$columns, $index, $identitySeek] = self::sourceAccess($db, $table, $debt);
         $casts = [];
@@ -134,7 +205,7 @@ final class SmsDebtPolicy
             : ['PK'];
         $hint = ' WITH (FORCESEEK(['.str_replace(']', ']]', $index).'] (['.implode('],[', $seekKeys).']))'.($db->transactionLevel() > 0 ? ',HOLDLOCK' : '').')';
         $pk = $columns['PK']->type_name;
-        $max = self::MAX;
+        $max = $upper;
         // TOP(2) is inside the aggregate, BEFORE debt validity/minimum filters.
         // Same-PK evidence for unrelated identities is deliberately irrelevant to
         // the v1/v2 frozen composite identity; the lean global PK gate is separate.

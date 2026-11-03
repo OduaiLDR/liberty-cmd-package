@@ -14,9 +14,10 @@ final class SmsTierWindowSelectionSql
      * the exact eligible keyset sequence. The caller owns SNAPSHOT/replay and
      * repeats this statement until target rows are frozen or candidates end.
      *
-     * Binding order: remaining quantity, request ID, canonical tiers, validated debt minimum.
+     * Binding order: remaining quantity, request ID, canonical tiers, validated debt minimum,
+     * then the frozen maximum only when $maximumDebt (SmsDebtPolicy::bindings()).
      */
-    public static function insert(array $tiers, string $mailerDate = 'Send_Date', bool $leanDebtSources = false): string
+    public static function insert(array $tiers, string $mailerDate = 'Send_Date', bool $leanDebtSources = false, bool $maximumDebt = false): string
     {
         if (! array_is_list($tiers) || $tiers === [] || count($tiers) > count(SmsRunOptions::TIERS)) {
             throw new RuntimeException('Choose a nonempty unique list of tiers from T1 to T9.');
@@ -38,6 +39,8 @@ SQL;
         $valid = SmsCurrentDebtSql::VALID_PREDICATE;
         $sourcePk = $leanDebtSources ? "CASE WHEN r.Source='Tier' THEN NULL ELSE r.Source_PK END" : 'r.Source_PK';
         $tierBindings = implode(',', array_fill(0, count($tiers), '?'));
+        // Runs without a frozen maximum keep their exact SQL text and binding count.
+        $maximum = $maximumDebt ? "\n  AND r.Debt<=?" : '';
 
         return $ctes.<<<SQL
 
@@ -50,7 +53,7 @@ SELECT TOP (?) ?, w.Export_PK, w.Phone, r.Tier, {$debt},
 FROM #SmsTierWanted w JOIN Resolved r ON r.Export_PK=w.Export_PK
 WHERE {$valid}
   AND r.Tier IN ({$tierBindings})
-  AND r.Debt>=?
+  AND r.Debt>=?{$maximum}
 ORDER BY w.Window_Position ASC
 OPTION (RECOMPILE)
 SQL;
