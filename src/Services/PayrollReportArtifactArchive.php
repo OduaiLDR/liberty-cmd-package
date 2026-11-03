@@ -51,6 +51,23 @@ final class PayrollReportArtifactArchive
         }
         $input = (string) ($file['path'] ?? '');
         $evidence = $this->verifyWorkbook($input);
+        // Legacy evidence must describe these exact bytes before an immutable
+        // identity is reserved. Otherwise a replaced input could poison it.
+        if (array_key_exists('legacyEvidence', $context)) {
+            $legacy = $context['legacyEvidence'];
+            if (!is_array($legacy) || !in_array($key, ['retention_ldr', 'retention_plaw'], true)
+                || ($legacy['source'] ?? null) !== substr($key, strlen('retention_'))
+                || ($legacy['period'] ?? null) !== $period
+                || !is_string($legacy['workbookSha256'] ?? null)
+                || !hash_equals($evidence['sha256'], $legacy['workbookSha256'])
+                || ($legacy['coverage'] ?? null) !== 'unverified'
+                || ($legacy['historicalLinePricing'] ?? null) !== 'unverified'
+                || ($legacy['executionReceipt'] ?? null) !== 'unverified'
+                || ($legacy['eligibleForPayment'] ?? null) !== false
+                || array_key_exists('commissionResults', $context)) {
+                throw new \RuntimeException('Legacy evidence does not match the original workbook and unverified scope.');
+            }
+        }
         $contextJson = json_encode($context, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         $context = json_decode($contextJson, true, flags: JSON_THROW_ON_ERROR);
         $metadata = ['key' => $key, 'period' => $period, 'identity' => $identity, 'fileName' => $fileName,
