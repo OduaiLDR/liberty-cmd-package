@@ -401,7 +401,9 @@ final class SmsRecordWorkflowTest extends TestCase
         self::assertStringNotContainsString('Changed', $text); self::assertStringContainsString('2025550100', $text);
         $this->runs->requestApprove(self::ID, 'actor'); $this->runs->markApproved(self::ID);
         $history = $this->db->table('TblSMSHistory')->first();
-        self::assertSame('Original Name', $history->Client); self::assertSame('T1', $history->Debt_Tier); self::assertSame('2025550100', $history->Phone);
+        // History finds the person by PK; it keeps no copy of the name or address (Jacob, Nov 3).
+        self::assertSame($pk, (int) $history->Prospect_PK); self::assertNull($history->Client); self::assertNull($history->Address);
+        self::assertSame('T1', $history->Debt_Tier); self::assertSame('2025550100', $history->Phone);
         self::assertSame(0, (int) $this->db->table('TblProspects')->value('Opt_Out'));
     }
 

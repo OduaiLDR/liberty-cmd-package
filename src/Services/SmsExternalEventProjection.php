@@ -57,7 +57,7 @@ final class SmsExternalEventProjection
             'selection_policy' => SmsRecordPolicy::EXTERNAL, 'target' => (int) $header->Expected_Rows,
             'selected' => $header->State === 'completed' ? (int) $header->Applied_Rows : null, 'options' => null, 'debt' => null,
             'never_texted' => null, 'previously_texted' => null, 'shortfall' => null,
-            'approved_at' => null, 'approved_by' => null, 'can_correct_send' => false, 'drops' => [], 'handoff' => null,
+            'approved_at' => null, 'approved_by' => null, 'can_correct_send' => false, 'drops' => self::drops($run), 'handoff' => null,
             'created_at' => self::utc($header->Started_At_UTC), 'created_by' => $header->Registered_By,
             'updated_at' => self::utc($header->Updated_At_UTC), 'sent_at' => $header->State === 'completed' ? self::utc($header->Occurred_At_UTC) : null,
             'sent_by' => null, 'file' => $file, 'file_cleanup_pending' => false, 'failed_step' => null, 'error' => null,
@@ -78,16 +78,32 @@ final class SmsExternalEventProjection
                 COALESCE(SUM(CASE WHEN p.Opt_Out=1 THEN 1 ELSE 0 END),0) AS Opt_Out,
                 COALESCE(SUM(CASE WHEN p.Invalid_Phone=1 THEN 1 ELSE 0 END),0) AS Invalid')->get();
         $empty = ['records' => 0, 'opt_out' => 0, 'invalid' => 0, 'contacted' => null, 'response_rate' => null];
+        // Jude's file had no tier column; tiers assigned later to this run's own drops are reported per tier.
+        $tiers = array_fill_keys(array_map(static fn (int $i): string => 'T'.$i, range(1, 9)), $empty);
         $unknown = $empty;
+        $total = $empty;
         foreach ($rows as $row) {
-            if ($row->Debt_Tier !== null) throw new HttpException(409, 'Original unknown tier history was changed.');
-            $unknown['records'] += (int) $row->Records; $unknown['opt_out'] += (int) $row->Opt_Out; $unknown['invalid'] += (int) $row->Invalid;
+            $tier = $row->Debt_Tier === null ? null : (string) $row->Debt_Tier;
+            if ($tier !== null && ! isset($tiers[$tier])) throw new HttpException(409, 'External history has an unknown tier.');
+            foreach (['records' => 'Records', 'opt_out' => 'Opt_Out', 'invalid' => 'Invalid'] as $key => $column) {
+                if ($tier === null) $unknown[$key] += (int) $row->{$column}; else $tiers[$tier][$key] += (int) $row->{$column};
+                $total[$key] += (int) $row->{$column};
+            }
         }
-        if ($unknown['records'] !== (int) $header->Expected_Rows) throw new HttpException(409, 'External history membership count does not reconcile.');
+        if ($total['records'] !== (int) $header->Expected_Rows) throw new HttpException(409, 'External history membership count does not reconcile.');
         return ['request_id' => strtolower((string) $run->Request_ID), 'reporting' => 'Live Status',
-            'tiers' => array_map(static fn (int $i): array => ['tier' => 'T'.$i] + $empty, range(1, 9)),
-            'unknown_tier' => ['tier' => 'Unknown original tier'] + $unknown, 'total' => $unknown,
+            'tiers' => array_map(static fn (string $tier, array $counts): array => ['tier' => $tier] + $counts, array_keys($tiers), $tiers),
+            'unknown_tier' => ['tier' => 'Unknown original tier'] + $unknown, 'total' => $total,
             'response_metrics_available' => false, 'response_metrics_reason' => 'Historical registration does not establish contact response attribution.'];
+    }
+
+    /** Drops assigned to this event's history later, in the same shape ordinary runs return. */
+    private static function drops(object $run): array
+    {
+        return DB::connection('sqlsrv')->table('TblSMSDrops')->where('Request_ID', $run->Request_ID)->orderBy('Drop_Name')
+            ->get(['PK', 'Drop_Name', 'Debt_Tier', 'Amount_Dropped'])
+            ->map(fn ($d) => ['PK' => (int) $d->PK, 'Drop_Name' => (string) $d->Drop_Name, 'Debt_Tier' => $d->Debt_Tier, 'Amount_Dropped' => (int) $d->Amount_Dropped])
+            ->all();
     }
 
     private static function utc(mixed $text): string

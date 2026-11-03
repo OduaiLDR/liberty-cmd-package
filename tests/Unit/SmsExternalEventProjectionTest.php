@@ -89,6 +89,24 @@ final class SmsExternalEventProjectionTest extends TestCase
         self::assertNull($details['total']['contacted']);
     }
 
+    public function test_tiers_assigned_later_to_the_events_own_drops_are_reported_per_tier(): void
+    {
+        // Jacob, Nov 3: the 10/26 send is SMS0001-0009. Two members get their drop; one stays unknown.
+        foreach ([['SMS0001', 'T1'], ['SMS0004', 'T4']] as $index => [$name, $tier]) {
+            $drop = $this->db->table('TblSMSDrops')->insertGetId(['Drop_Name' => $name, 'Debt_Tier' => $tier, 'Drop_Date' => '2026-10-26',
+                'Amount_Dropped' => 1, 'Request_ID' => self::ID, 'Created_At' => '2026-11-03 12:00:00']);
+            $this->db->table('TblSMSHistory')->where('Request_ID', self::ID)->orderBy('PK')->offset($index)->limit(1)->get(['PK'])
+                ->each(fn ($row) => $this->db->table('TblSMSHistory')->where('PK', $row->PK)->update(['SMS_Drop_PK' => $drop, 'Drop_Name' => $name, 'Debt_Tier' => $tier]));
+        }
+        $run = $this->service->show(self::ID);
+        self::assertSame(['SMS0001', 'SMS0004'], array_column($run->drops, 'Drop_Name'));
+        $details = $this->service->details(self::ID);
+        $tiers = array_column($details['tiers'], 'records', 'tier');
+        self::assertSame([1, 1], [$tiers['T1'], $tiers['T4']]);
+        self::assertSame([1, 3], [$details['unknown_tier']['records'], $details['total']['records']]);
+        self::assertSame(1, $details['total']['opt_out']);
+    }
+
     public function test_all_ordinary_actions_and_direct_repositories_deny_external_without_changes(): void
     {
         $legacy = new SmsProspectExportRepository; $record = new SmsRecordExportRepository;

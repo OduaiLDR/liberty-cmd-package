@@ -32,7 +32,7 @@ class SmsReadinessCommand extends Command
         $recordSchema = $has('TblProspects', \Cmd\Reports\Services\SmsProspectSchema::recordColumns())
             && $has('TblSMSRuns', ['Selection_Policy', 'Never_Texted', 'Previously_Texted', 'Approved_At', 'Approved_By', 'File_Cleanup_Path'])
             && $has('TblProspectsExport', ['Was_Previously_Texted', 'Last_SMS_Date_At_Selection'])
-            && $has('TblSMSHistory', ['Was_Previously_Texted', 'Last_SMS_Date_At_Selection'])
+            && $has('TblSMSHistory', ['Was_Previously_Texted'])
             && $has('TblSMSResponseAttribution', ['Prospect_PK', 'Request_ID', 'Contact_At_UTC', 'Contacted_Date', 'Created_At']);
         if (\Cmd\Reports\Services\SmsProspectSchema::responseEnabled()) {
             try { \Cmd\Reports\Services\SmsProspectSchema::assertResponseReady($db); }

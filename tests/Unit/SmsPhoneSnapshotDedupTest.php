@@ -94,7 +94,8 @@ final class SmsPhoneSnapshotDedupTest extends TestCase
         self::assertSame([],array_values(array_diff(glob(sys_get_temp_dir().'/sync-phone-*'),$before)));
         $sql=$command->sourceSql[0]; self::assertStringContainsString('c.TP_ID::VARCHAR AS EXTERNAL_ID',$sql);
         self::assertStringContainsString("COUNT(DISTINCT TO_BINARY(NAME, 'UTF-8'))",$sql);
-        self::assertStringContainsString('LEFT JOIN source_names AS ds ON c.C_SOURCE = ds.ID',$sql);
+        self::assertStringContainsString('LEFT JOIN source_names AS ds ON ds.ID = NULLIF(c.C_SOURCE, 0)',$sql);
+        self::assertStringContainsString('NULLIF(c.C_SOURCE, 0)::VARCHAR AS DATA_SOURCE_ID',$sql);
         self::assertStringContainsString('PARTITION BY CONTACT_ID ORDER BY STAMP DESC, ID DESC',$sql);
         self::assertStringContainsString('COALESCE(_FIVETRAN_DELETED, FALSE) = FALSE',$sql);
         self::assertStringContainsString('latest_status.STATUS_RANK = 1',$sql);

@@ -469,8 +469,8 @@ class SmsRecordExportRepository extends SqlSrvRepository
             || $counts['never_texted'] + $counts['previously_texted'] !== $expected) throw new RuntimeException('The approved composition differs from the frozen batch.');
         if ($this->table('TblSMSHistory')->where('Request_ID', $requestId)->exists()) throw new RuntimeException('This pending batch already has history; reconcile before retrying.');
         $date = $approvedAt->copy()->setTimezone(SmsProspectExportRepository::TIMEZONE)->toDateString();
-        $columns = ['Request_ID','SMS_Drop_PK','Drop_Name','Prospect_PK','Phone','Debt_Amount','Debt_Tier','Debt_Source','Debt_Source_PK',
-            'Client','Address','City','State','Zip','Email','Was_Previously_Texted','Last_SMS_Date_At_Selection'];
+        // History keeps the prospect PK and the drop, never a copy of the address (Jacob, Nov 3).
+        $columns = SmsProspectExportRepository::HISTORY_COLUMNS;
         $updated = 0;
         $last = null;
         do {

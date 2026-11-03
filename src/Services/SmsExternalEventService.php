@@ -229,8 +229,9 @@ SELECT COUNT(*) AS n FROM @Changed;",[
                     }
                 }
                 $source=$db->table(self::MEMBERS)->where('Request_ID',$id)->where('Applied_Chunk',$chunk)->whereIn('Prospect_PK',$ids)
-                    ->selectRaw('? AS Request_ID,Prospect_PK,Original_Phone,? AS Export_Date,Original_Debt_Amount,Original_Address',[$id,SmsExternalEventSeal::OCCURRED]);
-                $db->table('TblSMSHistory')->insertUsing(['Request_ID','Prospect_PK','Phone','Export_Date','Debt_Amount','Address'],$source);
+                    ->selectRaw('? AS Request_ID,Prospect_PK,Original_Phone,? AS Export_Date,Original_Debt_Amount',[$id,SmsExternalEventSeal::OCCURRED]);
+                // The sealed member row keeps the original address; history holds the PK only (Jacob, Nov 3).
+                $db->table('TblSMSHistory')->insertUsing(['Request_ID','Prospect_PK','Phone','Export_Date','Debt_Amount'],$source);
                 if ($db->table('TblSMSHistory')->where('Request_ID',$id)->whereIn('Prospect_PK',$ids)->count()!==count($ids)) {
                     throw new RuntimeException('Historical immutable history does not reconcile.');
                 }
@@ -360,17 +361,19 @@ SELECT COUNT(*) AS n FROM @Changed;",[
                 ->orWhereNull('Recorded_Last_SMS_Date')->orWhereNull('Recorded_Latest_Export_Date');
         })->exists();
         if ($badAudit) throw new RuntimeException('Historical before/after attempts or dates do not reconcile.');
-        $addressDifferent=$db->getDriverName()==='sqlsrv'
-            ? 'CONVERT(varbinary(max),CONVERT(nvarchar(max),h.Address)) <> CONVERT(varbinary(max),CONVERT(nvarchar(max),m.Original_Address))'
-            : 'CAST(h.Address AS BLOB) <> CAST(m.Original_Address AS BLOB)';
+        // The original phone, debt and address stay sealed in the member rows. History may also carry the
+        // drop its tier was assigned to later (Jacob, Nov 3: the 10/26 send is SMS0001-0009), but only a
+        // drop of this same run whose name and tier match.
         $badHistory=$db->table('TblSMSHistory as h')->leftJoin(self::MEMBERS.' as m',function ($join): void {
             $join->on('m.Request_ID','=','h.Request_ID')->on('m.Prospect_PK','=','h.Prospect_PK');
-        })->where('h.Request_ID',$id)->where(function ($q) use ($addressDifferent): void {
+        })->leftJoin('TblSMSDrops as d','d.PK','=','h.SMS_Drop_PK')->where('h.Request_ID',$id)->where(function ($q): void {
             $q->whereNull('m.Prospect_PK')->orWhereNull('m.Applied_Chunk')->orWhereColumn('h.Phone','<>','m.Original_Phone')
-                ->orWhereRaw($addressDifferent)->orWhereNull('h.Address')
                 ->orWhereRaw('(h.Debt_Amount <> m.Original_Debt_Amount OR (h.Debt_Amount IS NULL AND m.Original_Debt_Amount IS NOT NULL) OR (h.Debt_Amount IS NOT NULL AND m.Original_Debt_Amount IS NULL))')
-                ->orWhere('h.Export_Date','<>',SmsExternalEventSeal::OCCURRED);
-            foreach (['SMS_Drop_PK','Drop_Name','Debt_Tier','Debt_Source','Debt_Source_PK','Client','City','State','Zip','Email','Was_Previously_Texted','Last_SMS_Date_At_Selection'] as $field) $q->orWhereNotNull('h.'.$field);
+                ->orWhere('h.Export_Date','<>',SmsExternalEventSeal::OCCURRED)
+                ->orWhereRaw('(h.SMS_Drop_PK IS NULL AND (h.Drop_Name IS NOT NULL OR h.Debt_Tier IS NOT NULL))')
+                ->orWhereRaw('(h.SMS_Drop_PK IS NOT NULL AND (d.PK IS NULL OR d.Request_ID IS NULL OR d.Request_ID<>h.Request_ID'
+                    .' OR h.Drop_Name IS NULL OR d.Drop_Name<>h.Drop_Name OR h.Debt_Tier IS NULL OR d.Debt_Tier<>h.Debt_Tier))');
+            $q->orWhereNotNull('h.Was_Previously_Texted');
         })->exists();
         if ($badHistory) throw new RuntimeException('Historical immutable history does not match known original metadata.');
         $after=null; $number=0; $total=0; $byNumber=[];
