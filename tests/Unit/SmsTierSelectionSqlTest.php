@@ -39,6 +39,23 @@ test('windowed selection resolves only the connection-local ordered page without
         ->and(strpos($sql, 'SELECT TOP (?) ?'))->toBeLessThan(strpos($sql, 'r.Tier IN (?,?)'));
 });
 
+test('a tier subset narrows to wanted mailer tiers with one join, in both tier spellings', function (): void {
+    $sql = SmsTierWindowSelectionSql::candidatesSql(['T4', 'T9']);
+    expect($sql)->toContain("Debt_Tier IN ('T4','4','T9','9')", 'INSERT #SmsTierCandidates (PK)', 'm.SMS_Zip5=LEFT(p.Zip,5)',
+        'p.Contacted=0 AND p.Opt_Out=0 AND p.Invalid_Phone=0 AND p.Phone IS NOT NULL', 'OPTION (HASH JOIN, MAXDOP 4)')
+        ->not->toContain('?', 'NOLOCK', 'UPDATE ', 'DELETE ');
+    expect(fn () => SmsTierWindowSelectionSql::candidatesSql(["T4'); DROP TABLE x;--"]))->toThrow(RuntimeException::class, 'tiers');
+    expect(fn () => SmsTierWindowSelectionSql::candidatesSql([]))->toThrow(RuntimeException::class, 'tier');
+});
+
+test('tier windows use the candidates only for a subset, and a run step can outlast a two hour selection', function (): void {
+    $repository = file_get_contents(dirname(__DIR__, 2).'/src/Repositories/SmsRecordExportRepository.php');
+    expect($repository)->toContain("\$narrowed = \$options['tiers'] !== SmsRunOptions::TIERS;", "from('#SmsTierCandidates as tc')");
+    $job = new ReflectionClass(Cmd\Reports\Jobs\SmsRunStepJob::class);
+    expect($job->getDefaultProperties()['timeout'])->toBe(Cmd\Reports\Services\SmsExportQueue::RUN_STEP_TIMEOUT)
+        ->and(Cmd\Reports\Services\SmsExportQueue::RUN_STEP_TIMEOUT)->toBeLessThan(14400);
+});
+
 test('lean v3 writes no second source id for Tier while old selectors retain their frozen shape', function (): void {
     $eligible = 'SELECT PK,Phone,Client,Address,City,State,Zip,Email,Creation_Date,Last_SMS_Date FROM TblProspects';
     $old = SmsTierSelectionSql::select($eligible, ['T2']);

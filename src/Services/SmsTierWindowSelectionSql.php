@@ -10,6 +10,34 @@ use RuntimeException;
 final class SmsTierWindowSelectionSql
 {
     /**
+     * One hash join finds everyone with a wanted mailer tier, so a tier subset doesn't resolve the
+     * whole pool person by person (3M T4-T9 would have meant checking 21M). A mailer tier only narrows
+     * who gets checked: insert() still decides each person's current debt and tier. Someone who is in
+     * a wanted tier only through TblTUData isn't a candidate.
+     */
+    public static function candidatesSql(array $tiers): string
+    {
+        $values = [];
+        foreach ($tiers as $tier) {
+            if (! is_string($tier) || ! in_array($tier, SmsRunOptions::TIERS, true)) {
+                throw new RuntimeException('Choose only tiers from T1 to T9.');
+            }
+            $values[] = "'{$tier}'";
+            $values[] = "'".substr($tier, 1)."'";
+        }
+        if ($values === []) throw new RuntimeException('Choose at least one tier.');
+        $wanted = implode(',', $values);
+
+        return <<<SQL
+WITH m AS (SELECT DISTINCT Client, Address, SMS_Zip5 FROM TblMailers WHERE Debt_Tier IN ({$wanted}))
+INSERT #SmsTierCandidates (PK)
+SELECT p.PK FROM TblProspects p JOIN m ON m.Client=p.Client AND m.Address=p.Address AND m.SMS_Zip5=LEFT(p.Zip,5)
+WHERE p.Contacted=0 AND p.Opt_Out=0 AND p.Invalid_Phone=0 AND p.Phone IS NOT NULL
+OPTION (HASH JOIN, MAXDOP 4)
+SQL;
+    }
+
+    /**
      * #SmsTierWanted is connection-local and populated by the repository from
      * the exact eligible keyset sequence. The caller owns SNAPSHOT/replay and
      * repeats this statement until target rows are frozen or candidates end.

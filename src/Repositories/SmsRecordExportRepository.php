@@ -195,14 +195,23 @@ class SmsRecordExportRepository extends SqlSrvRepository
         $progress->write($requestId, ['phase' => 'selecting', 'done' => 0, 'total' => $target, 'scanned' => 0]);
         $noCount = (int) $db->selectOne('SELECT CASE WHEN (@@OPTIONS & 512)=512 THEN 1 ELSE 0 END AS enabled')->enabled;
         $db->unprepared('SET NOCOUNT ON');
+        // All nine tiers accept almost everyone, so only a subset needs narrowing first.
+        $narrowed = $options['tiers'] !== SmsRunOptions::TIERS;
         try {
+            if ($narrowed) {
+                $cancellation?->checkpoint($requestId);
+                $db->unprepared('DROP TABLE IF EXISTS #SmsTierCandidates');
+                $db->unprepared('CREATE TABLE #SmsTierCandidates (PK int NOT NULL PRIMARY KEY)');
+                $db->statement(SmsTierWindowSelectionSql::candidatesSql($options['tiers']));
+                $cancellation?->checkpoint($requestId);
+            }
             foreach ([0, 1, 2] as $phase) {
                 $cursor = null;
                 while ($selected < $target) {
                     $cancellation?->checkpoint($requestId);
                     $loadStarted = hrtime(true);
                     $db->unprepared('TRUNCATE TABLE #SmsTierWanted');
-                    $window = $this->tierWindow($phase, $cursor, $windowSize);
+                    $window = $this->tierWindow($phase, $cursor, $windowSize, $narrowed);
                     $db->table('#SmsTierWanted')->insertUsing([
                         'Window_Position','Export_PK','Phone','Client','Address','City','State',
                         'Snapshot_Zip','Zip','Email','Creation_Date','Last_SMS_Date',
@@ -232,13 +241,13 @@ class SmsRecordExportRepository extends SqlSrvRepository
             }
             $metrics->finish($selected);
             $progress->write($requestId, ['phase' => 'finalizing_selection', 'done' => $selected, 'total' => $target, 'scanned' => $scanned]);
-            $db->unprepared('DROP TABLE #SmsTierWanted');
+            $db->unprepared('DROP TABLE #SmsTierWanted; DROP TABLE IF EXISTS #SmsTierCandidates;');
         } catch (\Throwable $error) {
             // A failed SNAPSHOT transaction rolls its temp DDL back. If it is
             // still committable, clear the connection-local table before reuse.
             try {
                 $state = (int) ($db->selectOne('SELECT XACT_STATE() AS state')->state ?? -1);
-                if ($state === 1) $db->unprepared('DROP TABLE IF EXISTS #SmsTierWanted');
+                if ($state === 1) $db->unprepared('DROP TABLE IF EXISTS #SmsTierWanted; DROP TABLE IF EXISTS #SmsTierCandidates;');
             } catch (\Throwable) {
                 // Preserve the selector exception; the next attempt drops stale temp state first.
             }
@@ -249,9 +258,12 @@ class SmsRecordExportRepository extends SqlSrvRepository
     }
 
     /** Exact priority page with disjoint seek ranges; never rescan a cursor prefix. */
-    private function tierWindow(int $phase, ?object $cursor, int $windowSize): Builder
+    private function tierWindow(int $phase, ?object $cursor, int $windowSize, bool $narrowed = false): Builder
     {
         $query = $this->eligible(true);
+        if ($narrowed) {
+            $query->whereExists(fn (Builder $q) => $q->selectRaw('1')->from('#SmsTierCandidates as tc')->whereColumn('tc.PK', 'TblProspects.PK'));
+        }
         if ($phase < 2) {
             $query->whereNull('Last_SMS_Date');
             if ($phase === 0) $query->whereNotNull('Creation_Date');
