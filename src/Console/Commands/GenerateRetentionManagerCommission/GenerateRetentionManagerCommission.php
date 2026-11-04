@@ -163,6 +163,186 @@ class GenerateRetentionManagerCommission extends Command
         }
     }
 
+    /** One saved leadership calculation, without unrelated sources, current lookups or file publication. */
+    public function buildPayrollReviewLeadershipSnapshot(string $reportKind, string $startDate, string $endDate, array $artifacts): array
+    {
+        $period = \DateTimeImmutable::createFromFormat('!Y-m-d', $startDate);
+        if (!$period || $period->format('Y-m-01') !== $startDate || $period->format('Y-m-t') !== $endDate
+            || !in_array($reportKind, ['retention_manager', 'retention_team_leader', 'nsf_team_leader'], true)) {
+            throw new \InvalidArgumentException('A supported leadership report and exact reporting month are required.');
+        }
+        $previousOutput = $this->output ?? null;
+        // The shared readers normally log through console output or Laravel; this GET-only path stays silent.
+        $this->setOutput(new \Illuminate\Console\OutputStyle(new \Symfony\Component\Console\Input\ArrayInput([]), new \Symfony\Component\Console\Output\NullOutput));
+        try {
+            $nsf = $reportKind === 'nsf_team_leader';
+            $rows = $roster = $readinessIds = [];
+            foreach (['ldr' => 'LDR', 'plaw' => 'Progress Law'] as $source => $display) {
+                $artifact = $artifacts[($nsf ? 'nsf_' : 'retention_') . $source] ?? [];
+                $path = $artifact['path'] ?? null;
+                if (!is_string($path)) throw new \RuntimeException('Both exact archived leadership source workbooks are required.');
+                $this->validateLeadershipWorkbook($path, $nsf, $startDate, $endDate);
+                if ($nsf) {
+                    $rows = array_merge($rows, $this->loadNsfCommissionRowsFromXlsx($path, $display, $readinessIds, $source));
+                    foreach ($this->archivedNsfRoster($path) as $name) $roster[$this->anthonyAgentKey($name)] = $name;
+                    continue;
+                }
+                $sourceRows = $this->loadRetentionReportRowsFromXlsx($path, $display);
+                if ($reportKind === 'retention_manager') {
+                    $context = $artifact['context'] ?? [];
+                    if (($context['trancheContextReady'] ?? false) !== true || !is_array($context['trancheByClient'] ?? null)) {
+                        throw new \RuntimeException('Archived Retention leadership tranche/cutoff context is unavailable.');
+                    }
+                    foreach ($sourceRows as &$row) {
+                        $frozen = $context['trancheByClient']['LLG-' . $row['ID']] ?? null;
+                        if (!is_array($frozen) || array_diff(['TRANCHE', 'CUT_OFF', 'MADE_CUT_OFF', 'BONUS_FLAG'], array_keys($frozen))
+                            || !is_string($frozen['TRANCHE']) || !is_bool($frozen['MADE_CUT_OFF'])
+                            || !in_array($frozen['BONUS_FLAG'], ['', 'Bonus', 'No Bonus'], true)) {
+                            throw new \RuntimeException('Archived Retention leadership tranche/cutoff context is incomplete.');
+                        }
+                        self::leadershipDate($frozen['CUT_OFF']);
+                        $row = [...$row, ...array_intersect_key($frozen, array_flip(['TRANCHE', 'CUT_OFF', 'MADE_CUT_OFF', 'BONUS_FLAG']))];
+                    }
+                    unset($row);
+                }
+                $rows = array_merge($rows, $sourceRows);
+            }
+            if (!$nsf) {
+                $rows = $this->dedupeRetentionRowsByContactId($this->filterRetentionRowsForPeriod($rows, $startDate, $endDate));
+                $this->sortRetentionRows($rows);
+                $snapshot = $reportKind === 'retention_manager' ? $this->buildRamaPayrollSnapshot($rows)
+                    : $this->buildNickPayrollSnapshot($rows, $startDate, $endDate);
+            } else {
+                if ($readinessIds && (count($readinessIds) !== 2 || count(array_unique($readinessIds)) !== 1)) {
+                    throw new \RuntimeException('Archived NSF leadership workbooks have inconsistent source run identities.');
+                }
+                foreach ($readinessIds as $source => $runId) {
+                    if (isset($artifacts['nsf_' . $source]['identity']) && $artifacts['nsf_' . $source]['identity'] !== $runId) {
+                        throw new \RuntimeException('Archived NSF leadership workbook does not match its captured source run.');
+                    }
+                }
+                $priorRoster = $this->anthonyRosterCache;
+                $priorValidity = $this->payrollFrozenNsfValidity;
+                $priorCalculation = $this->payrollCalculationContext;
+                $this->anthonyRosterCache = array_values($roster);
+                $this->payrollFrozenNsfValidity = true;
+                $this->payrollCalculationContext = self::currentPayrollCalculationContext();
+                try {
+                    $snapshot = $this->buildAnthonyPayrollSnapshot($rows);
+                    $snapshot['nsfReadinessRunIds'] = $readinessIds;
+                } finally {
+                    $this->anthonyRosterCache = $priorRoster;
+                    $this->payrollFrozenNsfValidity = $priorValidity;
+                    $this->payrollCalculationContext = $priorCalculation;
+                }
+            }
+            return [...$snapshot, 'periodStart' => $startDate, 'periodEnd' => $endDate];
+        } finally { $this->output = $previousOutput; }
+    }
+
+    /** Reject malformed detail before the legacy readers can turn missing columns into zero pay. */
+    private function validateLeadershipWorkbook(string $path, bool $nsf, string $startDate, string $endDate): void
+    {
+        if (!is_file($path) || is_link($path) || filesize($path) > 32 * 1024 * 1024) throw new \RuntimeException('An archived leadership source workbook is unavailable.');
+        $reader = IOFactory::createReader('Xlsx');
+        $reader->setReadDataOnly(true);
+        $book = $reader->load($path);
+        try {
+            $sheet = $nsf ? $book->getSheetByName('NSF Data')
+                : ($book->getSheetByName('Retention Data') ?? $book->getSheetByName('Retention Commission Report'));
+            if (!$sheet || $sheet->getHighestDataRow() > 100000 || \PhpOffice\PhpSpreadsheet\Cell\Coordinate::columnIndexFromString($sheet->getHighestDataColumn()) > 100) {
+                throw new \RuntimeException('The archived leadership detail sheet is missing or outside its supported scope.');
+            }
+            $required = $nsf ? ['ID', 'AGENT', 'NSF RETURNED DATE', 'NSF ACTION', 'NSF RECOUP DATE', 'CLEARED DATE', 'VALID COMMISSION']
+                : ['ID', 'RETENTION AGENT', 'IMMEDIATE RESULTS', 'ENROLLED DEBT', 'RETENTION PAYMENT DATE', 'CANCEL REQUEST DATE'];
+            $columns = [];
+            for ($c = 1; $c <= \PhpOffice\PhpSpreadsheet\Cell\Coordinate::columnIndexFromString($sheet->getHighestDataColumn()); $c++) {
+                $header = strtoupper(trim((string) $sheet->getCell([$c, 1])->getValue()));
+                if ($header === '') continue;
+                if (isset($columns[$header])) throw new \RuntimeException('The archived leadership detail has duplicate columns.');
+                $columns[$header] = $c;
+            }
+            if (array_diff($required, array_keys($columns))) throw new \RuntimeException('The archived leadership detail has incomplete headers.');
+            $seen = [];
+            for ($r = 2; $r <= $sheet->getHighestDataRow(); $r++) {
+                $values = [];
+                foreach ($columns as $header => $c) {
+                    if (!in_array($header, $required, true) && !str_ends_with($header, ' DATE')) continue;
+                    $cell = $sheet->getCell([$c, $r]);
+                    if ($cell->getDataType() === \PhpOffice\PhpSpreadsheet\Cell\DataType::TYPE_FORMULA) throw new \RuntimeException('Archived leadership inputs cannot contain formulas.');
+                    $values[$header] = $cell->getValue();
+                }
+                if (!array_filter($values, static fn ($value) => $value !== null && $value !== '')) continue;
+                $id = (string) ($values['ID'] ?? '');
+                $name = $values[$nsf ? 'AGENT' : 'RETENTION AGENT'] ?? null;
+                if (!preg_match('/^[1-9]\d*$/D', $id) || isset($seen[$id]) || !is_string($name) || trim($name) === '') {
+                    throw new \RuntimeException('Archived leadership detail contains an invalid, duplicate or unassigned account identity.');
+                }
+                $seen[$id] = true;
+                foreach ($values as $header => $value) if (str_ends_with($header, ' DATE')) self::leadershipDate($value);
+                if ($nsf) {
+                    $returned = self::leadershipDate($values['NSF RETURNED DATE']);
+                    if ($returned === null || $returned < $startDate || $returned > $endDate) throw new \RuntimeException('Archived NSF detail contains a different reporting month.');
+                    \Cmd\Reports\Services\CustomerServiceRosterAmendment::frozenValidity($values['VALID COMMISSION']);
+                } else {
+                    $debt = $values['ENROLLED DEBT'];
+                    if ((!is_int($debt) && !is_float($debt)) || !is_finite((float) $debt) || $debt < 0 || $debt > 1e12
+                        || ($values['IMMEDIATE RESULTS'] !== null && !is_string($values['IMMEDIATE RESULTS']))) {
+                        throw new \RuntimeException('Archived Retention leadership outcome or debt is invalid.');
+                    }
+                }
+            }
+            if ($nsf) {
+                $run = $book->getProperties()->getCustomPropertyValue(\Cmd\Reports\Console\Commands\GenerateNSFCommissionReport\Formatter::PROPERTY_RUN_ID);
+                if ($run !== null && (!is_string($run) || !preg_match('/^[a-f0-9]{32}$/D', $run))) throw new \RuntimeException('Archived NSF source run identity is invalid.');
+                if ($status = $book->getSheetByName('Run Status')) {
+                    if ($status->getHighestDataRow() > 1000) throw new \RuntimeException('Archived NSF run metadata is invalid.');
+                    $seenRun = false;
+                    for ($r = 1; $r <= $status->getHighestDataRow(); $r++) {
+                        if (strcasecmp(trim((string) $status->getCell('A' . $r)->getValue()), 'Run ID') !== 0) continue;
+                        $cell = $status->getCell('B' . $r);
+                        $sheetRun = $cell->getValue();
+                        if ($seenRun || $cell->getDataType() === \PhpOffice\PhpSpreadsheet\Cell\DataType::TYPE_FORMULA
+                            || !is_string($sheetRun) || !preg_match('/^[a-f0-9]{32}$/D', $sheetRun) || $run !== null && $run !== $sheetRun) {
+                            throw new \RuntimeException('Archived NSF source run identity is invalid or inconsistent.');
+                        }
+                        $seenRun = true;
+                    }
+                }
+                $summary = $book->getSheetByName('Agent Summary');
+                if (!$summary || $summary->getCell('A1')->getValue() !== 'NSF Agent' || $summary->getHighestDataRow() > 10000) throw new \RuntimeException('The archived NSF paid-agent roster is unavailable.');
+                $names = []; $paidEnded = false; $unassigned = false;
+                for ($r = 2; $r <= $summary->getHighestDataRow(); $r++) {
+                    $cell = $summary->getCell('A' . $r);
+                    $name = $cell->getValue();
+                    if ($cell->getDataType() === \PhpOffice\PhpSpreadsheet\Cell\DataType::TYPE_FORMULA || ($name !== null && !is_string($name))) throw new \RuntimeException('The archived NSF paid-agent roster has an invalid identity.');
+                    $name = trim((string) $name);
+                    if ($name === '') { $paidEnded = true; continue; }
+                    if (strcasecmp($name, 'Unassigned Agents') === 0) { $paidEnded = true; $unassigned = true; continue; }
+                    if ($unassigned) continue;
+                    if ($paidEnded) throw new \RuntimeException('The archived NSF paid-agent roster has an interrupted identity block.');
+                    $key = $this->anthonyAgentKey($name);
+                    if ($key === '' || isset($names[$key])) throw new \RuntimeException('The archived NSF paid-agent roster has an ambiguous identity.');
+                    $names[$key] = true;
+                }
+            }
+        } finally { $book->disconnectWorksheets(); }
+    }
+
+    private static function leadershipDate(mixed $value): ?string
+    {
+        if ($value === null || $value === '') return null;
+        if (is_int($value) || is_float($value)) {
+            if (!is_finite((float) $value) || $value < 1 || $value > 2958465) throw new \RuntimeException('An archived leadership date is invalid.');
+            return XlDate::excelToDateTimeObject($value)->format('Y-m-d');
+        }
+        if (is_string($value) && preg_match('/^(\d{4}-\d{2}-\d{2})(?:[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?)?$/D', $value, $parts)) {
+            $date = \DateTimeImmutable::createFromFormat('!Y-m-d', $parts[1]);
+            if ($date && $date->format('Y-m-d') === $parts[1]) return $parts[1];
+        }
+        throw new \RuntimeException('An archived leadership date is invalid.');
+    }
+
     private function archivedNsfRoster(string $path): array
     {
         $reader = IOFactory::createReaderForFile($path);
@@ -265,7 +445,9 @@ class GenerateRetentionManagerCommission extends Command
         $retained = $this->retainedCount($rows);
         $rate = $assigned > 0 ? $retained / $assigned : 0.0;
         $tier = $this->nickTier($rate);
-        $commission = $this->computeNickCommission($rows);
+        $uncappedCommission = $this->uncappedNickCommission($rows);
+        $commission = $this->capNickCommission($uncappedCommission);
+        $capReduction = round(max(0.0, $uncappedCommission - $commission), 2);
 
         return [
             'reportKind' => 'retention_team_leader',
@@ -280,10 +462,14 @@ class GenerateRetentionManagerCommission extends Command
                 'tier' => $tier,
                 'commissionRate' => $tier > 0 ? $this->nickRateForTier($tier, 0) : 0,
                 'commissionRateDisplay' => $tier > 0 ? '$' . number_format($this->nickRateForTier($tier, 0), 2) . '+ per retained account' : '$0.00',
+                'uncappedCommission' => round($uncappedCommission, 2),
+                'capReduction' => $capReduction,
+                'commissionCap' => self::NICK_COMMISSION_CAP,
                 'totalCommission' => round($commission, 2),
                 'totalPay' => round($commission, 2),
             ],
-            'lines' => $this->retentionTeamLines($rows, $startDate, $endDate, $rate),
+            'lines' => $this->retentionTeamLines($rows, $rate),
+            ...($capReduction > 0 ? ['calculationNote' => 'Team rows show uncapped commission. The existing monthly cap reduces the report total.'] : []),
         ];
     }
 
@@ -374,8 +560,6 @@ class GenerateRetentionManagerCommission extends Command
      */
     private function retentionTeamLines(
         array $rows,
-        string $startDate = '',
-        string $endDate = '',
         ?float $nickRateBasis = null
     ): array {
         $groups = [];
@@ -401,13 +585,11 @@ class GenerateRetentionManagerCommission extends Command
                 $groups[$key]['retainedCount']++;
             }
             if ($nickRateBasis !== null && $retained) {
-                $paymentDate = $this->toDate($this->col($row, 'RETENTION_PAYMENT_DATE'));
-                if ($paymentDate !== null && $paymentDate >= $startDate && $paymentDate <= $endDate) {
-                    $groups[$key]['commissionTotal'] += $this->nickCommissionRate(
-                        (float) $this->col($row, 'ENROLLED_DEBT', 0),
-                        $nickRateBasis
-                    );
-                }
+                // The rows already have Nick's cancel-request scope, as used by the authoritative total.
+                $groups[$key]['commissionTotal'] += $this->nickCommissionRate(
+                    (float) $this->col($row, 'ENROLLED_DEBT', 0),
+                    $nickRateBasis
+                );
             }
         }
 
@@ -2116,6 +2298,12 @@ class GenerateRetentionManagerCommission extends Command
     /** @param array<int,array<string,mixed>> $rows */
     private function computeNickCommission(array $rows): float
     {
+        return $this->capNickCommission($this->uncappedNickCommission($rows));
+    }
+
+    /** @param array<int,array<string,mixed>> $rows */
+    private function uncappedNickCommission(array $rows): float
+    {
         $assigned = count($rows);
         $retained = $this->retainedCount($rows);
         $pct = $assigned > 0 ? $retained / $assigned : 0.0;
@@ -2126,7 +2314,7 @@ class GenerateRetentionManagerCommission extends Command
             }
         }
 
-        return $this->capNickCommission($commission);
+        return $commission;
     }
 
     private function capNickCommission(float $commission): float
