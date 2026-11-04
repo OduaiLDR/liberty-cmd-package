@@ -53,6 +53,7 @@ class GenerateLendingTowerInvoices extends Command
                             {--review-terms : Use separate company-to-company review numbers; only for private or saved previews}
                             {--test-to= : Email the invoices only to this address, from the normal report sender, marked TEST}
                             {--replace-initial-ldr-invoice : Once only, replace the October 2026 LDR invoice if its receipt predates the fourth-day cutoff policy}
+                            {--allow-early-ldr : Explicitly authorize an October 2026 LDR-only forced early send, preserving the scheduled fifth-day correction}
                             {--force : Send even if this invoice number was already sent}';
 
     protected $description = 'Generate the monthly Lending Tower invoices: Progress Law per lead, LDR per enrollment less lookback.';
@@ -258,6 +259,10 @@ class GenerateLendingTowerInvoices extends Command
             [$start, $end, $label] = $this->resolvePeriod((string) $this->option('month'));
             $companies = $this->resolveCompanies((string) $this->option('company'));
             $period = $this->periodDetails($start, $end);
+            if ($this->option('allow-early-ldr') && (!$live || $companies !== ['LDR']
+                || $period['suffix'] !== LdrInvoiceWindow::FIRST_BILLING_MONTH || !$this->option('force'))) {
+                throw new RuntimeException('--allow-early-ldr requires normal live delivery, --company=LDR, --month=2026-10 and --force.');
+            }
 
             $this->info("Lending Tower invoices for {$label} ({$start} to {$period['last_day']}, " . self::TIMEZONE . ')');
 
@@ -273,7 +278,7 @@ class GenerateLendingTowerInvoices extends Command
 
             if (in_array('LDR', $companies, true)) {
                 $ldrDate = $this->invoiceDate('LDR', $period);
-                if ($today < $ldrDate && $live) {
+                if ($today < $ldrDate && $live && !$this->option('allow-early-ldr')) {
                     if (in_array('PLAW', $companies, true)) {
                         $companies = ['PLAW'];
                         $this->warn("[SKIP] LDR is due on {$ldrDate}. Continuing with Progress Law only.");
@@ -282,7 +287,9 @@ class GenerateLendingTowerInvoices extends Command
                     }
                 }
                 if ($today < $ldrDate) {
-                    $this->warn("[WARN] LDR is a preview until {$ldrDate}; additional first payments may still clear.");
+                    $this->warn($live && $this->option('allow-early-ldr')
+                        ? "[WARN] Explicit early LDR send authorized. Figures are current; the {$ldrDate} scheduled correction remains due."
+                        : "[WARN] LDR is a preview until {$ldrDate}; additional first payments may still clear.");
                 }
             }
 
@@ -370,6 +377,18 @@ class GenerateLendingTowerInvoices extends Command
         }
 
         return (new DateTimeImmutable($period['last_day']))->modify('+1 day')->format('Y-m-d');
+    }
+
+    private function earlyLdrSend(string $company, array $period): bool
+    {
+        return $company === 'LDR' && (bool) $this->option('allow-early-ldr')
+            && (new DateTimeImmutable('now', new DateTimeZone(self::TIMEZONE)))->format('Y-m-d') < $this->invoiceDate('LDR', $period);
+    }
+
+    private function ldrReceiptPolicy(array $period): array
+    {
+        $early = $this->earlyLdrSend('LDR', $period);
+        return ['billing_policy' => self::LDR_BILLING_POLICY . ($early ? '-early' : ''), 'early_send' => $early];
     }
 
     /** @return list<string> */
@@ -966,7 +985,7 @@ class GenerateLendingTowerInvoices extends Command
             'report_name' => self::REPORT_NAMES[$company],
             'from' => $this->liveSender(),
             ...($populationPath === null ? [] : ['population_path' => $populationPath]),
-            ...($company !== 'LDR' ? [] : ['billing_policy' => self::LDR_BILLING_POLICY]),
+            ...($company !== 'LDR' ? [] : $this->ldrReceiptPolicy($period)),
         ] + ($registered === null ? [] : ['invoice_number' => $number]), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
         if (!$receiptWritten && $populationPath !== null) {
             throw new RuntimeException('LDR invoice email was sent, but its receipt could not be saved. Check delivery before any retry.');
@@ -995,10 +1014,14 @@ class GenerateLendingTowerInvoices extends Command
 
         $notice = $testNotice === null ? '' : '<p style="padding:8px 12px;background:#fff4d6;border:1px solid #f0c36d;">'
             . '<strong>TEST</strong> ' . $e($testNotice) . '</p>';
+        $earlyNotice = $this->earlyLdrSend($company, $period)
+            ? '<p>This invoice was issued early using currently available data. The regular November 5 invoice remains scheduled and will supersede this early issue.</p>'
+            : '';
 
         return $notice
             . '<p>Hello,</p>'
             . '<p>Please refer to the attached invoice for ' . $e($subject) . '.</p>'
+            . $earlyNotice
             . '<p>Invoice ' . $e($document['number']) . '<br>Total due ' . $e($document['total_due'])
             . '<br>Due ' . $e($document['due_date']) . '</p>'
             . '<p>The attached spreadsheet lists the clients behind the total.</p>'
