@@ -25,7 +25,7 @@ use RuntimeException;
  * Deleted contacts and co-applicants are excluded.
  *
  * LDR is billed on enrollments: 5% of the debt basis (Sold_Debt, else Debt_Amount) of LDR clients
- * whose first scheduled payment is in the month and clears by the following fifth. Clients cancelled
+ * whose first scheduled payment is in the month and clears by the following fourth. Clients cancelled
  * through the fourth are excluded. TblEnrollment holds both firms' enrollments, so LDR is
  * scoped by TblContactsLDR; Progress Law's clients are billed per lead on their own invoice.
  * The first billing cohort is October 2026. Lookback stays at zero until February 2027,
@@ -52,6 +52,7 @@ class GenerateLendingTowerInvoices extends Command
                             {--send-to-me : Send only to oduai@libertydebtrelief.com with normal invoice wording and no CC or BCC}
                             {--review-terms : Use separate company-to-company review numbers; only for private or saved previews}
                             {--test-to= : Email the invoices only to this address, from the normal report sender, marked TEST}
+                            {--replace-initial-ldr-invoice : Once only, replace the October 2026 LDR invoice if its receipt predates the fourth-day cutoff policy}
                             {--force : Send even if this invoice number was already sent}';
 
     protected $description = 'Generate the monthly Lending Tower invoices: Progress Law per lead, LDR per enrollment less lookback.';
@@ -62,6 +63,7 @@ class GenerateLendingTowerInvoices extends Command
 
     /** 5%, in basis points so the fee stays in integer arithmetic. */
     private const LDR_FEE_BASIS_POINTS = 500;
+    private const LDR_BILLING_POLICY = 'first-payment-month-fourth-day-cutoff-v1';
     private ?ReviewInvoiceNumbers $reviewNumbers = null;
 
     public function useReviewInvoiceNumbers(ReviewInvoiceNumbers $numbers): void
@@ -161,6 +163,23 @@ class GenerateLendingTowerInvoices extends Command
         return self::ARCHIVE_PREFIX . '/' . $period['suffix'] . '/' . self::INVOICE_PREFIX[$company] . '-' . $period['suffix'] . '.sent.json';
     }
 
+    private function replaceInitialLdrInvoice(string $company, array $period): bool
+    {
+        if (!$this->option('replace-initial-ldr-invoice') || $company !== 'LDR' || $period['suffix'] !== LdrInvoiceWindow::FIRST_BILLING_MONTH) {
+            return false;
+        }
+        $disk = Storage::disk('local');
+        $marker = $this->sentMarker($company, $period);
+        if (!$disk->exists($marker)) {
+            return false;
+        }
+        $receipt = json_decode($disk->get($marker), true, 512, JSON_THROW_ON_ERROR);
+        if (!is_array($receipt)) {
+            throw new RuntimeException('The original LDR invoice receipt is invalid; check delivery before replacing it.');
+        }
+        return ($receipt['billing_policy'] ?? null) !== self::LDR_BILLING_POLICY;
+    }
+
     /**
      * Reserve the new-style number for a live send that is really going out. Null (old number, nothing
      * changes) when the switch is off, the invoice was already sent, or the registry fails.
@@ -170,7 +189,8 @@ class GenerateLendingTowerInvoices extends Command
     private function registerNumber(string $company, array $period): ?array
     {
         $gate = $this->invoiceGate($company);
-        if ($gate === null || (Storage::disk('local')->exists($this->sentMarker($company, $period)) && ! $this->option('force'))) {
+        if ($gate === null || (Storage::disk('local')->exists($this->sentMarker($company, $period))
+            && !$this->option('force') && !$this->replaceInitialLdrInvoice($company, $period))) {
             return null;
         }
         // Match the printed issue date: the first for PLAW, the fifth for LDR.
@@ -258,7 +278,7 @@ class GenerateLendingTowerInvoices extends Command
                         $companies = ['PLAW'];
                         $this->warn("[SKIP] LDR is due on {$ldrDate}. Continuing with Progress Law only.");
                     } else {
-                        throw new RuntimeException("The LDR cutoff is {$ldrDate}; production invoices cannot be sent before the fifth.");
+                        throw new RuntimeException("The LDR invoice date is {$ldrDate}; production invoices cannot be sent before the fifth, after the fourth-day cutoff closes.");
                     }
                 }
                 if ($today < $ldrDate) {
@@ -622,7 +642,7 @@ class GenerateLendingTowerInvoices extends Command
         ));
         $this->row('Total due', $this->money($invoice['total_cents']));
         $window = $invoice['window'];
-        $this->row('First payment clears by', (new DateTimeImmutable($window['invoice_date']))->format('F j, Y'));
+        $this->row('First payment clears by', (new DateTimeImmutable($window['cleared_before']))->modify('-1 day')->format('F j, Y'));
         $this->row('Exclude cancellations through', (new DateTimeImmutable($window['cancelled_before']))->modify('-1 day')->format('F j, Y'));
         $this->row('Lookback', $window['lookback_enabled'] ? $window['lookback_month'] : '$0 until the February 5, 2027 invoice');
 
@@ -670,7 +690,7 @@ class GenerateLendingTowerInvoices extends Command
             'lines' => [[
                 'description' => 'Enrollment fee',
                 'detail' => number_format(count($invoice['enrollments'])) . " enrollments with first payment due in {$period['month']}, cleared by "
-                    . (new DateTimeImmutable($invoice['window']['invoice_date']))->format('F j, Y')
+                    . (new DateTimeImmutable($invoice['window']['cleared_before']))->modify('-1 day')->format('F j, Y')
                     . '; excludes cancellations through '
                     . (new DateTimeImmutable($invoice['window']['cancelled_before']))->modify('-1 day')->format('F j, Y'),
                 'quantity' => $this->money($invoice['gross_basis_cents']),
@@ -895,7 +915,7 @@ class GenerateLendingTowerInvoices extends Command
         $folder = self::ARCHIVE_PREFIX . '/' . $period['suffix'];
         $marker = $this->sentMarker($company, $period);
 
-        if ($disk->exists($marker) && ! $this->option('force')) {
+        if ($disk->exists($marker) && !$this->option('force') && !$this->replaceInitialLdrInvoice($company, $period)) {
             $this->warn("[SKIP] {$number} was already sent (see storage/app/private/{$marker}). Use --force to send it again.");
 
             return true;
@@ -946,6 +966,7 @@ class GenerateLendingTowerInvoices extends Command
             'report_name' => self::REPORT_NAMES[$company],
             'from' => $this->liveSender(),
             ...($populationPath === null ? [] : ['population_path' => $populationPath]),
+            ...($company !== 'LDR' ? [] : ['billing_policy' => self::LDR_BILLING_POLICY]),
         ] + ($registered === null ? [] : ['invoice_number' => $number]), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
         if (!$receiptWritten && $populationPath !== null) {
             throw new RuntimeException('LDR invoice email was sent, but its receipt could not be saved. Check delivery before any retry.');
