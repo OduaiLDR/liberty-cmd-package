@@ -8,7 +8,7 @@ use DateTimeImmutable;
 use DateTimeZone;
 use InvalidArgumentException;
 
-/** LDR bills the prior first-payment month on the fifth, with a four-month cohort lookback. */
+/** LDR bills on the fifth using data through the fourth, with a four-month cohort lookback. */
 final class LdrInvoiceWindow
 {
     public const FIRST_BILLING_MONTH = '2026-10';
@@ -26,7 +26,7 @@ final class LdrInvoiceWindow
             'start' => $start->format('Y-m-d'),
             'end' => $end->format('Y-m-d'),
             'invoice_date' => $end->modify('+4 days')->format('Y-m-d'),
-            'cleared_before' => $end->modify('+5 days')->format('Y-m-d'),
+            'cleared_before' => $end->modify('+4 days')->format('Y-m-d'),
             'cancelled_before' => $end->modify('+4 days')->format('Y-m-d'),
             'lookback_enabled' => $cohort->format('Y-m') >= self::FIRST_BILLING_MONTH,
             'lookback_month' => $cohort->format('Y-m'),
