@@ -25,12 +25,11 @@ use RuntimeException;
  * Deleted contacts and co-applicants are excluded.
  *
  * LDR is billed on enrollments: 5% of the debt basis (Sold_Debt, else Debt_Amount) of LDR clients
- * whose first payment cleared in the month. TblEnrollment holds both firms' enrollments, so LDR is
- * scoped by TblContactsLDR; Progress Law's clients are billed per lead on their own invoice. A
- * Lookback Deduction then comes off for clients Lending Tower actually billed (from its first invoice
- * on, see billingStart()) whose first lookback or cancel date falls in the month. Each client is
- * deducted once, and clients who cancelled before any payment cleared are left out because they
- * were never billed.
+ * whose first scheduled payment is in the month and clears by the following fifth. Clients cancelled
+ * through the fourth are excluded. TblEnrollment holds both firms' enrollments, so LDR is
+ * scoped by TblContactsLDR; Progress Law's clients are billed per lead on their own invoice.
+ * The first billing cohort is October 2026. Lookback stays at zero until February 2027,
+ * when October's actually billed cohort is due for review.
  *
  * Money is carried as integer cents. The fee is taken once from the total debt basis, so the
  * per-client debt rows always add up to the figure the fee is computed on.
@@ -120,44 +119,19 @@ class GenerateLendingTowerInvoices extends Command
     private const LDR_ENROLLMENTS_SQL = <<<'SQL'
         SELECT e.LLG_ID,
                e.Client,
+               CONVERT(char(10), e.First_Payment_Date, 23) AS First_Payment_Date,
                CONVERT(char(10), e.First_Payment_Cleared_Date, 23) AS First_Payment_Cleared_Date,
+               CONVERT(char(10), e.Cancel_Date, 23) AS Cancel_Date,
                CASE WHEN e.Sold_Debt IS NULL THEN 'Debt_Amount' ELSE 'Sold_Debt' END AS Debt_Source,
                CAST(COALESCE(e.Sold_Debt, e.Debt_Amount) AS DECIMAL(18, 2)) AS Debt_Basis
         FROM TblEnrollment e
-        WHERE e.First_Payment_Cleared_Date >= ?
-          AND e.First_Payment_Cleared_Date < ?
-          AND EXISTS (SELECT 1 FROM TblContactsLDR l WHERE l.LLG_ID = e.LLG_ID)
-        ORDER BY e.First_Payment_Cleared_Date, e.LLG_ID
-        SQL;
-
-    /**
-     * LDR clients deducted in the month. Parameters, in order: period end; billing start; start and
-     * end of the lookback window; start and end of the cancel window; then (start, billing start)
-     * for the lookback and again for the cancel first-event rule.
-     *
-     * A client can only come off if Lending Tower actually billed them: first payment cleared on or
-     * after the billing start (see billingStart()) and before the period ended. The last two
-     * conditions leave out a client whose other event fell in an earlier invoiced month, because
-     * that month's invoice already deducted them; events before the billing start never triggered
-     * a deduction, so they do not block one. The explanation lives here rather than in SQL comments
-     * because PDO's placeholder scan does not reliably skip comments.
-     */
-    private const LDR_DEDUCTIONS_SQL = <<<'SQL'
-        SELECT e.LLG_ID,
-               e.Client,
-               CONVERT(char(10), e.First_Payment_Cleared_Date, 23) AS First_Payment_Cleared_Date,
-               CONVERT(char(10), e.Lookback_Date, 23) AS Lookback_Date,
-               CONVERT(char(10), e.Cancel_Date, 23) AS Cancel_Date,
-               CAST(COALESCE(e.Sold_Debt, e.Debt_Amount) AS DECIMAL(18, 2)) AS Debt_Basis
-        FROM TblEnrollment e
-        WHERE EXISTS (SELECT 1 FROM TblContactsLDR l WHERE l.LLG_ID = e.LLG_ID)
+        WHERE e.First_Payment_Date >= ?
+          AND e.First_Payment_Date < ?
           AND e.First_Payment_Cleared_Date IS NOT NULL
           AND e.First_Payment_Cleared_Date < ?
-          AND e.First_Payment_Cleared_Date >= ?
-          AND ((e.Lookback_Date >= ? AND e.Lookback_Date < ?) OR (e.Cancel_Date >= ? AND e.Cancel_Date < ?))
-          AND (e.Lookback_Date IS NULL OR e.Lookback_Date >= ? OR e.Lookback_Date < ?)
-          AND (e.Cancel_Date IS NULL OR e.Cancel_Date >= ? OR e.Cancel_Date < ?)
-        ORDER BY e.LLG_ID
+          AND (e.Cancel_Date IS NULL OR e.Cancel_Date >= ?)
+          AND EXISTS (SELECT 1 FROM TblContactsLDR l WHERE l.LLG_ID = e.LLG_ID)
+        ORDER BY e.First_Payment_Date, e.LLG_ID
         SQL;
 
     /** Inject a registry gate (tests); null forces the old behaviour for that company. */
@@ -199,8 +173,8 @@ class GenerateLendingTowerInvoices extends Command
         if ($gate === null || (Storage::disk('local')->exists($this->sentMarker($company, $period)) && ! $this->option('force'))) {
             return null;
         }
-        // Dated like the invoice itself (the day after the period ends, Pacific), so the number matches the printed date.
-        $date = (new DateTimeImmutable($period['last_day']))->modify('+1 day')->format('Y-m-d');
+        // Match the printed issue date: the first for PLAW, the fifth for LDR.
+        $date = $this->invoiceDate($company, $period);
         $series = self::REGISTRY_SERIES[$company];
         $number = $gate->reserve($series, $date, ['generator' => 'lending-tower-invoices', 'company' => $company, 'period' => $period['month']]);
 
@@ -277,6 +251,21 @@ class GenerateLendingTowerInvoices extends Command
                 $this->warn('[WARN] This month has not ended yet, so the figures are partial.');
             }
 
+            if (in_array('LDR', $companies, true)) {
+                $ldrDate = $this->invoiceDate('LDR', $period);
+                if ($today < $ldrDate && $live) {
+                    if (in_array('PLAW', $companies, true)) {
+                        $companies = ['PLAW'];
+                        $this->warn("[SKIP] LDR is due on {$ldrDate}. Continuing with Progress Law only.");
+                    } else {
+                        throw new RuntimeException("The LDR cutoff is {$ldrDate}; production invoices cannot be sent before the fifth.");
+                    }
+                }
+                if ($today < $ldrDate) {
+                    $this->warn("[WARN] LDR is a preview until {$ldrDate}; additional first payments may still clear.");
+                }
+            }
+
             $azure = DBConnector::fromEnvironment('ldr');
             $azure->initializeSqlServer();
 
@@ -334,8 +323,7 @@ class GenerateLendingTowerInvoices extends Command
     }
 
     /**
-     * Labels and dates printed on the invoices. An invoice is dated the day after its period ends,
-     * so re-running a past month produces the same document.
+     * Shared billing-period labels. invoiceDate() resolves each company's fixed issue date.
      *
      * @return array{month: string, range: string, last_day: string, suffix: string, issue_date: string, due_date: string}
      */
@@ -353,6 +341,15 @@ class GenerateLendingTowerInvoices extends Command
             'issue_date' => $issue->format('F j, Y'),
             'due_date' => 'Upon Receipt',
         ];
+    }
+
+    private function invoiceDate(string $company, array $period): string
+    {
+        if ($company === 'LDR') {
+            return LdrInvoiceWindow::forMonth($period['suffix'])['invoice_date'];
+        }
+
+        return (new DateTimeImmutable($period['last_day']))->modify('+1 day')->format('Y-m-d');
     }
 
     /** @return list<string> */
@@ -462,49 +459,102 @@ class GenerateLendingTowerInvoices extends Command
 
     private function ldrInvoice(DBConnector $azure, string $start, string $end): array
     {
-        $billingStart = $this->billingStart($start);
+        $window = LdrInvoiceWindow::forMonth(substr($start, 0, 7));
+        if ($start < LdrInvoiceWindow::FIRST_BILLING_MONTH . '-01') {
+            throw new RuntimeException('The first LDR billing month is October 2026.');
+        }
 
-        $enrollments = $this->sqlServerRows($azure, self::LDR_ENROLLMENTS_SQL, [$start, $end]);
-        $deductions = $this->sqlServerRows(
-            $azure,
-            self::LDR_DEDUCTIONS_SQL,
-            [$end, $billingStart, $start, $end, $start, $end, $start, $billingStart, $start, $billingStart]
-        );
+        $enrollments = $this->sqlServerRows($azure, self::LDR_ENROLLMENTS_SQL, [
+            $start, $end, $window['cleared_before'], $window['cancelled_before'],
+        ]);
+        if ($this->duplicateValues(array_column($enrollments, 'LLG_ID')) !== []) {
+            throw new RuntimeException('LDR enrollment query returned duplicate clients; invoice was not generated.');
+        }
+        $deductions = $window['lookback_enabled'] ? $this->ldrLookback($azure, $window) : [];
 
-        return $this->summarizeLdr($enrollments, $deductions, $start, $end) + ['billing_start' => $billingStart];
+        return $this->summarizeLdr($enrollments, $deductions, $start, $end) + ['window' => $window];
     }
 
-    /**
-     * First day of the first month Lending Tower actually invoiced LDR. Only clients billed from
-     * then on can come off as a Lookback Deduction. Jacob 2026-09-24: "The invoice is new so we
-     * only will be dealing with the prior month", so nothing billed before the first invoice counts.
-     *
-     * LENDING_TOWER_BILLING_START (YYYY-MM) pins it. Otherwise it is the earliest month with a live
-     * LDR invoice in the archive, or the month being invoiced when none has been sent yet: the first
-     * invoice deducts only its own month's clients, and later invoices pick up earlier ones.
-     */
-    private function billingStart(string $start): string
+    private function ldrLookback(DBConnector $azure, array $window): array
     {
-        $pinned = trim((string) env('LENDING_TOWER_BILLING_START', ''));
-
-        if ($pinned !== '') {
-            if (preg_match('/^\d{4}-(0[1-9]|1[0-2])$/', $pinned) !== 1) {
-                throw new RuntimeException("LENDING_TOWER_BILLING_START must be YYYY-MM, got '{$pinned}'.");
-            }
-
-            return min($pinned . '-01', $start);
+        $today = (new DateTimeImmutable('now', new DateTimeZone(self::TIMEZONE)))->format('Y-m-d');
+        if ($today < $window['invoice_date']) {
+            throw new RuntimeException('The LDR lookback cannot be finalized before ' . $window['invoice_date'] . '.');
         }
-
-        $earliest = $start;
-        $marker = '#/(\d{4}-\d{2})/' . preg_quote(self::INVOICE_PREFIX['LDR'], '#') . '-\d{4}-\d{2}\.sent\.json$#';
-
-        foreach (Storage::disk('local')->allFiles(self::ARCHIVE_PREFIX) as $path) {
-            if (preg_match($marker, $path, $m) === 1) {
-                $earliest = min($earliest, $m[1] . '-01');
+        $population = $this->billedLdrPopulation($window['lookback_month']);
+        if ($population === []) {
+            return [];
+        }
+        $current = [];
+        foreach (array_chunk(array_column($population, 'LLG_ID'), 400) as $ids) {
+            $placeholders = implode(', ', array_fill(0, count($ids), '?'));
+            $rows = $this->sqlServerRows($azure, "SELECT LLG_ID,
+                CONVERT(char(10), Cancel_Date, 23) AS Cancel_Date,
+                Payments, Payment_Frequency FROM TblEnrollment WHERE LLG_ID IN ({$placeholders})", $ids);
+            foreach ($rows as $row) {
+                $id = (string) $row['LLG_ID'];
+                if (isset($current[$id])) {
+                    throw new RuntimeException("Azure has duplicate enrollment rows for billed client {$id}.");
+                }
+                $current[$id] = $row;
             }
         }
+        // Match SyncEnrollmentData's two-source reconciliation and monthly-equivalent normalization,
+        // but stop each transaction history at that client's original first-clear + 3 months.
+        $counts = [];
+        foreach (['ldr', 'plaw'] as $source) {
+            $connector = DBConnector::fromEnvironment($source);
+            foreach (array_chunk($population, 200) as $batch) {
+                foreach ($this->snowflakeRows($connector, LdrInvoiceLookback::paymentSql($batch)) as $row) {
+                    $id = (string) $row['CONTACT_ID'];
+                    $counts[$id] = max($counts[$id] ?? 0, (int) $row['PAYMENT_COUNT']);
+                }
+            }
+        }
+        return LdrInvoiceLookback::evaluate($population, $current, $counts);
+    }
 
-        return $earliest;
+    private function billedLdrPopulation(string $month): array
+    {
+        $disk = Storage::disk('local');
+        $folder = self::ARCHIVE_PREFIX . '/' . $month;
+        $marker = $folder . '/LT-LDR-' . $month . '.sent.json';
+        if (!$disk->exists($marker)) {
+            $this->warn("[WARN] No sent LDR invoice is recorded for {$month}; no clients from that month will be taken back.");
+            return [];
+        }
+        $receipt = json_decode($disk->get($marker), true, 512, JSON_THROW_ON_ERROR);
+        $path = $receipt['population_path'] ?? '';
+        if (!is_string($path) || !str_starts_with($path, $folder . '/') || str_contains($path, '..') || !$disk->exists($path)) {
+            throw new RuntimeException("The {$month} invoice has no retained billed population. Reconcile its actual billed clients before applying any lookback.");
+        }
+        $snapshot = json_decode($disk->get($path), true, 512, JSON_THROW_ON_ERROR);
+        $expected = LdrInvoiceWindow::forMonth($month);
+        if (($snapshot['version'] ?? null) !== 1 || ($snapshot['billing_month'] ?? null) !== $month
+            || ($snapshot['invoice_number'] ?? null) !== ($receipt['number'] ?? null)
+            || ($snapshot['window'] ?? null) !== $expected
+            || ($snapshot['fee_basis_points'] ?? null) !== $this->ldrBasisPoints()
+            || !is_array($snapshot['enrollments'] ?? null)) {
+            throw new RuntimeException("The {$month} billed population does not match its invoice receipt and billing policy.");
+        }
+        $population = $snapshot['enrollments'];
+        if ($this->duplicateValues(array_column($population, 'LLG_ID')) !== []) {
+            throw new RuntimeException('The retained LDR billed population contains duplicate clients.');
+        }
+        foreach ($population as $row) {
+            $first = (string) ($row['First_Payment_Date'] ?? '');
+            $clear = (string) ($row['First_Payment_Cleared_Date'] ?? '');
+            $cancel = (string) ($row['Cancel_Date'] ?? '');
+            LdrInvoiceWindow::paymentCutoff($clear);
+            if (empty($row['LLG_ID']) || $first < $expected['start'] || $first >= $expected['end']
+                || $clear >= $expected['cleared_before'] || ($cancel !== '' && $cancel < $expected['cancelled_before'])) {
+                throw new RuntimeException('The retained LDR population contains a client outside the original billing rules.');
+            }
+        }
+        if ($this->sumBasis($population, 'retained LDR enrollment')['cents'] !== ($snapshot['gross_basis_cents'] ?? null)) {
+            throw new RuntimeException('The retained LDR debt basis does not reconcile to its billed population.');
+        }
+        return $population;
     }
 
     /**
@@ -523,8 +573,8 @@ class GenerateLendingTowerInvoices extends Command
 
         $events = ['lookback' => 0, 'cancelled' => 0, 'both' => 0];
         foreach ($deductions as $row) {
-            $lookback = $this->inPeriod($row['Lookback_Date'] ?? null, $start, $end);
-            $cancelled = $this->inPeriod($row['Cancel_Date'] ?? null, $start, $end);
+            $lookback = (bool) ($row['Insufficient_Payments'] ?? false);
+            $cancelled = (bool) ($row['Cancelled_By_Cutoff'] ?? false);
             $events[$lookback && $cancelled ? 'both' : ($lookback ? 'lookback' : 'cancelled')]++;
         }
 
@@ -554,7 +604,7 @@ class GenerateLendingTowerInvoices extends Command
 
         $this->newLine();
         $this->line('<options=bold>LDR</>');
-        $this->row('Enrollments (first payment cleared)', sprintf(
+        $this->row('Enrollments (first payment due in billing month)', sprintf(
             '%s (%s used Debt_Amount because Sold_Debt is empty)',
             number_format(count($invoice['enrollments'])),
             number_format($invoice['used_debt_amount'])
@@ -571,8 +621,10 @@ class GenerateLendingTowerInvoices extends Command
             $events['both']
         ));
         $this->row('Total due', $this->money($invoice['total_cents']));
-        $this->row('', 'Deductions count clients billed since '
-            . (new DateTimeImmutable($invoice['billing_start']))->format('F Y'));
+        $window = $invoice['window'];
+        $this->row('First payment clears by', (new DateTimeImmutable($window['invoice_date']))->format('F j, Y'));
+        $this->row('Exclude cancellations through', (new DateTimeImmutable($window['cancelled_before']))->modify('-1 day')->format('F j, Y'));
+        $this->row('Lookback', $window['lookback_enabled'] ? $window['lookback_month'] : '$0 until the February 5, 2027 invoice');
 
         if ($invoice['repeated_enrollments'] !== []) {
             $this->warn(sprintf(
@@ -617,7 +669,10 @@ class GenerateLendingTowerInvoices extends Command
             'columns' => ['quantity' => 'Debt basis', 'rate' => 'Rate'],
             'lines' => [[
                 'description' => 'Enrollment fee',
-                'detail' => number_format(count($invoice['enrollments'])) . " enrollments with first payment cleared in {$period['month']}",
+                'detail' => number_format(count($invoice['enrollments'])) . " enrollments with first payment due in {$period['month']}, cleared by "
+                    . (new DateTimeImmutable($invoice['window']['invoice_date']))->format('F j, Y')
+                    . '; excludes cancellations through '
+                    . (new DateTimeImmutable($invoice['window']['cancelled_before']))->modify('-1 day')->format('F j, Y'),
                 'quantity' => $this->money($invoice['gross_basis_cents']),
                 'rate' => $rate,
                 'amount' => $this->money($invoice['gross_cents']),
@@ -627,12 +682,12 @@ class GenerateLendingTowerInvoices extends Command
                 [
                     'label' => 'Lookback Deduction',
                     'amount' => $this->money(-$invoice['deduction_cents']),
-                    'detail' => sprintf(
-                        '%s of %s for %s billed clients with a lookback or cancellation in %s',
+                    'detail' => !$invoice['window']['lookback_enabled'] ? 'No lookback applies before the February 5, 2027 invoice.' : sprintf(
+                        '%s of %s for %s clients billed for %s who cancelled or had fewer than 3 payment equivalents by their first cleared payment + 3 months',
                         $rate,
                         $this->money($invoice['deduction_basis_cents']),
                         number_format(count($invoice['deductions'])),
-                        $period['month']
+                        (new DateTimeImmutable($invoice['window']['lookback_start']))->format('F Y')
                     ),
                 ],
             ],
@@ -660,15 +715,17 @@ class GenerateLendingTowerInvoices extends Command
                 $rate,
                 $this->money($invoice['gross_cents'])
             ),
-            ['LLG ID', 'Client', 'First Payment Cleared', 'Debt Source', 'Debt Basis'],
+            ['LLG ID', 'Client', 'First Payment Date', 'First Payment Cleared', 'Cancel Date', 'Debt Source', 'Debt Basis'],
             array_map(fn (array $row): array => [
                 (string) ($row['LLG_ID'] ?? ''),
                 (string) ($row['Client'] ?? ''),
+                (string) ($row['First_Payment_Date'] ?? ''),
                 (string) ($row['First_Payment_Cleared_Date'] ?? ''),
+                (string) ($row['Cancel_Date'] ?? ''),
                 (string) ($row['Debt_Source'] ?? ''),
                 $this->dollars($row['Debt_Basis'] ?? null),
             ], $invoice['enrollments']),
-            [4]
+            [6]
         );
         $book->addSheet(
             'Lookback Deduction',
@@ -680,16 +737,22 @@ class GenerateLendingTowerInvoices extends Command
                 $rate,
                 $this->money($invoice['deduction_cents'])
             ),
-            ['LLG ID', 'Client', 'First Payment Cleared', 'Lookback Date', 'Cancel Date', 'Debt Basis'],
+            ['LLG ID', 'Client', 'First Payment Date', 'First Payment Cleared', 'Individual Cutoff',
+                'Cancel Date', 'Payments at Cutoff', 'Azure Payments (Current)', 'Payment Frequency', 'Reason', 'Billed Debt Basis'],
             array_map(fn (array $row): array => [
                 (string) ($row['LLG_ID'] ?? ''),
                 (string) ($row['Client'] ?? ''),
+                (string) ($row['First_Payment_Date'] ?? ''),
                 (string) ($row['First_Payment_Cleared_Date'] ?? ''),
-                (string) ($row['Lookback_Date'] ?? ''),
-                (string) ($row['Cancel_Date'] ?? ''),
+                (string) ($row['Lookback_Cutoff'] ?? ''),
+                (string) ($row['Lookback_Cancel_Date'] ?? ''),
+                $row['Payments_At_Cutoff'] ?? 0,
+                $row['Azure_Payments_Current'] ?? '',
+                (string) ($row['Payment_Frequency'] ?? ''),
+                (string) ($row['Deduction_Reason'] ?? ''),
                 $this->dollars($row['Debt_Basis'] ?? null),
             ], $invoice['deductions']),
-            [5]
+            [10]
         );
 
         return $book->toBytes();
@@ -724,7 +787,7 @@ class GenerateLendingTowerInvoices extends Command
     {
         return [
             'number' => $number,
-            'issue_date' => $period['issue_date'],
+            'issue_date' => (new DateTimeImmutable($this->invoiceDate($company, $period)))->format('F j, Y'),
             'due_date' => $period['due_date'],
             'terms' => 'Upon Receipt',
             'period' => $period['range'],
@@ -756,7 +819,7 @@ class GenerateLendingTowerInvoices extends Command
             if ($this->usingReviewTerms()) {
                 $this->reviewNumbers ??= ReviewInvoiceNumbers::fromLocalStorage();
                 $reviewNumber = $this->reviewNumbers->next('LT', $company === 'PLAW' ? 'PL' : 'LDR',
-                    (new DateTimeImmutable($period['last_day']))->modify('+1 day')->format('Y-m-d'), $testTo !== '');
+                    $this->invoiceDate($company, $period), $testTo !== '');
             }
             $document = $company === 'PLAW'
                 ? $this->progressLawDocument($invoice, $period, $reviewNumber ?? $registered['number'] ?? null)
@@ -780,7 +843,17 @@ class GenerateLendingTowerInvoices extends Command
             if ($testTo !== '') {
                 $allSent = $this->sendTest($company, $document, $files, $period, $testTo) && $allSent;
             } elseif ($live) {
-                $allSent = $this->sendLive($company, $document, $files, $period, $azure, $registered === null ? null : $registered + ['cents' => (int) $invoice['total_cents']]) && $allSent;
+                $population = $company === 'LDR' ? [
+                    'version' => 1,
+                    'invoice_number' => $number,
+                    'billing_month' => $period['suffix'],
+                    'window' => $invoice['window'],
+                    'fee_basis_points' => $this->ldrBasisPoints(),
+                    'gross_basis_cents' => $invoice['gross_basis_cents'],
+                    'enrollments' => $invoice['enrollments'],
+                ] : null;
+                $allSent = $this->sendLive($company, $document, $files, $period, $azure,
+                    $registered === null ? null : $registered + ['cents' => (int) $invoice['total_cents']], $population) && $allSent;
             }
         }
 
@@ -815,7 +888,7 @@ class GenerateLendingTowerInvoices extends Command
     }
 
     /** @param array<string, string> $files */
-    private function sendLive(string $company, array $document, array $files, array $period, DBConnector $azure, ?array $registered = null): bool
+    private function sendLive(string $company, array $document, array $files, array $period, DBConnector $azure, ?array $registered = null, ?array $population = null): bool
     {
         $number = $document['number'];
         $disk = Storage::disk('local');
@@ -826,6 +899,13 @@ class GenerateLendingTowerInvoices extends Command
             $this->warn("[SKIP] {$number} was already sent (see storage/app/private/{$marker}). Use --force to send it again.");
 
             return true;
+        }
+
+        // A receipt links this exact population only after email succeeds. A failed send's
+        // unlinked snapshot is never evidence that any client was billed.
+        $populationPath = $population === null ? null : "{$folder}/{$number}." . bin2hex(random_bytes(8)) . '.population.json';
+        if ($populationPath !== null && !$disk->put($populationPath, json_encode($population, JSON_THROW_ON_ERROR))) {
+            throw new RuntimeException('Could not retain the LDR billed population; invoice email was not sent.');
         }
 
         $sent = $this->mailer()->sendMailUsingTblReportsHtml(
@@ -859,13 +939,17 @@ class GenerateLendingTowerInvoices extends Command
         foreach ($files as $name => $bytes) {
             $disk->put("{$folder}/{$name}", $bytes);
         }
-        $disk->put($marker, (string) json_encode([
+        $receiptWritten = $disk->put($marker, (string) json_encode([
             'number' => $number,
             'sent_at' => (new DateTimeImmutable('now', new DateTimeZone(self::TIMEZONE)))->format(DATE_ATOM),
             'total_due' => $document['total_due'],
             'report_name' => self::REPORT_NAMES[$company],
             'from' => $this->liveSender(),
+            ...($populationPath === null ? [] : ['population_path' => $populationPath]),
         ] + ($registered === null ? [] : ['invoice_number' => $number]), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+        if (!$receiptWritten && $populationPath !== null) {
+            throw new RuntimeException('LDR invoice email was sent, but its receipt could not be saved. Check delivery before any retry.');
+        }
         if ($registered !== null) {
             $this->recordRegistered($registered, 'sent', $files, $period, $registered['cents'], ['sentAt' => (new DateTimeImmutable('now', new DateTimeZone(self::TIMEZONE)))->format(DATE_ATOM)]);
         }
