@@ -301,6 +301,21 @@ final class ContactSyncTargets
                         throw new ContactSyncConflict("Conflicting source ownership for {$table}.{$target}; explicit repair required.");
                     }
                 }
+                if ($source === 'LT' && $selection !== null && $before !== null && $target === $id) {
+                    $stale = array_map(fn ($loser) => $loser['source'] . ':' . $loser['id'], $selection['stale_candidates'] ?? []);
+                    $losers = array_map(fn ($loser) => $loser['source'] . ':' . $loser['id'], $selection['losers'] ?? []);
+                    // Complete only a proven migration; retained SQL losers must all be stale in the same source read.
+                    if (($selection['reason'] ?? '') !== 'single_enrolled' || $losers === []
+                        || count($stale) !== count($losers) || array_diff($losers, $stale) !== []
+                        || array_filter($current, fn ($old) => (string) $old['llg_id'] === (string) $backend['llg_id']) !== []
+                        || $owners !== []) {
+                        throw new ContactSyncConflict("Selected migration for {$source}:{$id} requires an empty destination and stale competing files; skipped for review.");
+                    }
+                    $target = (string) $backend['llg_id'];
+                    $warnings[] = ['code' => 'verified_migration_remap', 'source' => $source, 'id' => $id,
+                        'message' => 'Native LT main identity moves to the sole enrolled backend; stale company and main records are preserved.',
+                        'winner' => $selection['winner'], 'stale_candidates' => $selection['stale_candidates']];
+                }
                 $campaignLinks = $source === 'LT' ? ($backend === null ? [] : [$backend])
                     : array_values(array_filter($main, fn ($other) => (string) $other['llg_id'] === $id
                         || (ContactSyncIdentity::validNativeId((string) $row['external_id'])
@@ -502,6 +517,11 @@ final class ContactSyncTargets
                     }
                 }
                 $sql .= ' WHERE ' . implode(' AND ', $where);
+                if ((string) $change['before']['llg_id'] !== (string) $change['after']['llg_id']) {
+                    $hint = $pdo->getAttribute(PDO::ATTR_DRIVER_NAME) === 'sqlsrv' ? ' WITH (UPDLOCK, HOLDLOCK)' : '';
+                    $sql .= " AND NOT EXISTS (SELECT 1 FROM {$table}{$hint} WHERE LLG_ID = ?)";
+                    $values[] = $change['after']['llg_id'];
+                }
             }
             $stmt = $pdo->prepare($sql);
             if ($stmt === false || !$stmt->execute($values) || $stmt->rowCount() !== 1) {

@@ -88,6 +88,34 @@ class PayrollLeadershipWorkbookBundleTest extends TestCase
         (new GenerateRetentionManagerCommission)->buildPayrollReviewWorkbookBundle('2098-09-01', '2098-09-30', $artifacts, $this->directory . '/output');
     }
 
+    public function test_rama_replays_archived_cutoff_and_bonus_inputs_after_original_files_are_gone(): void
+    {
+        $sources = array_intersect_key($this->sources(), array_flip(['retention_ldr', 'retention_plaw']));
+        $archive = new \Cmd\Reports\Services\PayrollReportArtifactArchive($this->directory . '/archive');
+        $saved = [];
+        foreach ($sources as $key => $artifact) {
+            $archive->capture($key, '2098-09-01', str_repeat('a', 32), $artifact + ['filename' => basename($artifact['path'])], $artifact['context']);
+            unlink($artifact['path']);
+            $saved[$key] = $archive->read($key, '2098-09-01', str_repeat('a', 32));
+            $this->assertSame($artifact['context'], $saved[$key]['context']);
+        }
+        $snapshot = $this->command()->buildPayrollReviewLeadershipSnapshot('retention_manager', '2098-09-01', '2098-09-30', $saved);
+        $this->assertSame('Rama Davis', $snapshot['managerName']);
+        $this->assertSame(1, $snapshot['summary']['bonusAssignedCount']);
+        $this->assertSame(1, $snapshot['summary']['bonusRetainedCount']);
+        $this->assertSame(2000.0, $snapshot['summary']['totalPay']);
+        $this->assertDirectoryDoesNotExist($this->directory . '/output');
+    }
+
+    public function test_rama_refuses_an_incomplete_client_cutoff_snapshot_without_current_lookup(): void
+    {
+        $sources = $this->sources();
+        unset($sources['retention_ldr']['context']['trancheByClient']['LLG-101']['CUT_OFF']);
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('context is incomplete');
+        $this->command()->buildPayrollReviewLeadershipSnapshot('retention_manager', '2098-09-01', '2098-09-30', $sources);
+    }
+
     private function command(): GenerateRetentionManagerCommission
     {
         $command = new GenerateRetentionManagerCommission;

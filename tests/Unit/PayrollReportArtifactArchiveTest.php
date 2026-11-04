@@ -73,11 +73,17 @@ class PayrollReportArtifactArchiveTest extends TestCase
             putenv('PAYROLL_CAPTURE_CUSTOMER_SERVICE_CONTEXT=1');
             putenv('PAYROLL_COMMISSION_RUN_ID=' . str_repeat('a', 32));
             $file = $this->workbook();
-            $context = ['trancheContextReady' => true, 'trancheByClient' => ['LLG-101' => ['BONUS_FLAG' => 'Bonus']]];
+            $context = ['trancheContextReady' => true, 'trancheByClient' => [
+                'LLG-101' => ['TRANCHE' => '53', 'CUT_OFF' => '2098-10-18', 'MADE_CUT_OFF' => true, 'BONUS_FLAG' => 'Bonus'],
+                'LLG-102' => ['TRANCHE' => '', 'CUT_OFF' => null, 'MADE_CUT_OFF' => false, 'BONUS_FLAG' => ''],
+            ]];
             $saved = PayrollReportArtifactArchive::captureFromEnvironment('retention', 'ldr', '2098-09-01', $file, $context);
             $this->assertSame($context, $saved['context']);
             $this->assertSame(hash_file('sha256', $file['path']), $saved['sha256']);
             $this->assertSame(file_get_contents($file['path']), file_get_contents($saved['path']));
+            $read = (new PayrollReportArtifactArchive)->read('retention_ldr', '2098-09-01', str_repeat('a', 32));
+            $this->assertSame($context, $read['context']);
+            $this->assertSame($saved['contextSha256'], $read['contextSha256']);
         } finally { \Illuminate\Container\Container::setInstance($previous); }
     }
     public function test_source_archive_retains_exact_workbook_after_temporary_source_is_deleted(): void
@@ -103,6 +109,24 @@ class PayrollReportArtifactArchiveTest extends TestCase
         $this->expectException(\RuntimeException::class);
         $archive->capture('lookback_plaw', '2098-09-01', str_repeat('b', 32), $this->workbook('changed data'));
     }
+    public function test_same_workbook_cannot_replace_an_existing_historical_cutoff_context(): void
+    {
+        $archive = new PayrollReportArtifactArchive($this->directory . '/archive');
+        $file = $this->workbook();
+        $context = ['trancheContextReady' => true, 'trancheByClient' => [
+            'LLG-101' => ['TRANCHE' => '53', 'CUT_OFF' => '2098-10-18', 'MADE_CUT_OFF' => true, 'BONUS_FLAG' => 'Bonus'],
+        ]];
+        $archive->capture('retention_ldr', '2098-09-01', str_repeat('a', 32), $file, $context);
+        $changed = $context;
+        $changed['trancheByClient']['LLG-101']['CUT_OFF'] = '2098-11-18';
+        try {
+            $archive->capture('retention_ldr', '2098-09-01', str_repeat('a', 32), $file, $changed);
+            $this->fail('Current cutoff replaced an immutable historical snapshot.');
+        } catch (\RuntimeException) {
+            $this->assertSame($context, $archive->read('retention_ldr', '2098-09-01', str_repeat('a', 32))['context']);
+        }
+    }
+
     public function test_scope_paths_and_invalid_non_workbook_bytes_are_rejected(): void
     {
         $archive = new PayrollReportArtifactArchive($this->directory . '/archive');
