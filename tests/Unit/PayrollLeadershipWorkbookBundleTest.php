@@ -165,6 +165,43 @@ class PayrollLeadershipWorkbookBundleTest extends TestCase
         $this->assertDirectoryDoesNotExist($this->directory . '/output');
     }
 
+    public function test_selective_retention_loading_preserves_named_precedence_and_legacy_name(): void
+    {
+        $sources = $this->sources();
+        $expected = $this->command()->buildPayrollReviewLeadershipSnapshot('retention_team_leader', '2098-09-01', '2098-09-30', $sources);
+        foreach ($sources as $key => $artifact) {
+            if (!str_starts_with($key, 'retention_')) continue;
+            $this->changeWorkbook($artifact['path'], static function ($book): void {
+                $book->createSheet()->setTitle('Agent Copy')->setCellValue('A1', '=SUM(1,2)');
+                $book->createSheet()->setTitle('Retention Commission Report')->fromArray([['Wrong legacy fallback'], ['Not calculation input']], null, 'A1');
+                $book->setActiveSheetIndex($book->getSheetCount() - 1);
+                $book->getSheetByName('Retention Data')->setCellValue('ZZ500', null);
+            });
+        }
+        $this->assertSame($expected, $this->command()->buildPayrollReviewLeadershipSnapshot('retention_team_leader', '2098-09-01', '2098-09-30', $sources));
+        foreach ($sources as $key => $artifact) {
+            if (!str_starts_with($key, 'retention_')) continue;
+            $this->changeWorkbook($artifact['path'], static function ($book): void {
+                $book->removeSheetByIndex($book->getIndex($book->getSheetByName('Retention Commission Report')));
+                $book->getSheetByName('Retention Data')->setTitle('Retention Commission Report');
+            });
+        }
+        $this->assertSame($expected, $this->command()->buildPayrollReviewLeadershipSnapshot('retention_team_leader', '2098-09-01', '2098-09-30', $sources));
+    }
+
+    public function test_regular_retention_reader_keeps_unknown_active_sheet_fallback(): void
+    {
+        $sources = $this->sources(); $path = $sources['retention_ldr']['path'];
+        $reader = new \ReflectionMethod(GenerateRetentionManagerCommission::class, 'loadRetentionReportRowsFromXlsx');
+        $expected = $reader->invoke($this->command(), $path, 'LDR');
+        $this->changeWorkbook($path, static function ($book): void {
+            $book->getSheetByName('Retention Data')->setTitle('Historical Detail');
+            $book->createSheet()->setTitle('Summary')->setCellValue('A1', 'Not input');
+            $book->setActiveSheetIndex(0);
+        });
+        $this->assertSame($expected, $reader->invoke($this->command(), $path, 'LDR'));
+    }
+
     public function test_independent_snapshots_need_no_console_output_or_laravel_facade(): void
     {
         $sources = $this->sources();

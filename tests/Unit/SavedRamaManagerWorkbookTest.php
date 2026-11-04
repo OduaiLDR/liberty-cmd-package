@@ -64,6 +64,26 @@ final class SavedRamaManagerWorkbookTest extends TestCase
         self::assertFalse($called);
     }
 
+    public function test_unrelated_display_worksheets_do_not_change_verified_source_facts_or_pay(): void
+    {
+        [$path, $artifacts] = $this->fixture();
+        $before = SavedRamaManagerWorkbook::read($path, hash_file('sha256', $path), '2098-09-01', $artifacts);
+        foreach ([$path, ...array_column($artifacts, 'path')] as $file) {
+            $book = IOFactory::load($file);
+            $sheet = $book->createSheet()->setTitle('Display Only');
+            for ($r = 1; $r <= 1000; $r++) $sheet->setCellValue('A' . $r, 'Unrelated presentation row');
+            $sheet->getStyle('B1:B10000')->getNumberFormat()->setFormatCode('0.00');
+            (new Xlsx($book))->save($file); $book->disconnectWorksheets();
+        }
+        foreach ($artifacts as &$artifact) $artifact['sha256'] = hash_file('sha256', $artifact['path']); unset($artifact);
+        $hash = hash_file('sha256', $path);
+        $after = SavedRamaManagerWorkbook::read($path, $hash, '2098-09-01', $artifacts);
+        self::assertSame($before['snapshot'], $after['snapshot']);
+        self::assertSame($before['managerWorkbookEvidence']['clientCount'], $after['managerWorkbookEvidence']['clientCount']);
+        self::assertFalse($after['managerWorkbookEvidence']['paymentEligible']);
+        self::assertSame($hash, hash_file('sha256', $path));
+    }
+
     public function test_ambiguous_context_changed_source_and_summary_cannot_be_accepted(): void
     {
         foreach (['R2' => 'yes', 'S2' => 'Maybe', 'P2' => 1.5, 'B2' => 'Changed Client', 'A3' => 101, 'Q2' => '2098-02-30'] as $cell => $value) {

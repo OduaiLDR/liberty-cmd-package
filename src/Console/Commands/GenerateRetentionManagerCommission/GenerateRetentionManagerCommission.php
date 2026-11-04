@@ -266,6 +266,8 @@ class GenerateRetentionManagerCommission extends Command
         if (!in_array($source, ['ldr', 'plaw'], true) || !$date || $date->format('Y-m-01') !== $period
             || !is_file($path) || is_link($path) || filesize($path) > 32 * 1024 * 1024) throw new \InvalidArgumentException('Exact saved NSF company and period are required.');
         $reader = IOFactory::createReader('Xlsx'); $reader->setReadDataOnly(true);
+        $reader->setReadEmptyCells(false);
+        $reader->setLoadSheetsOnly(['Run Status']);
         $book = $reader->load($path);
         try {
             $properties = $book->getProperties();
@@ -326,17 +328,22 @@ class GenerateRetentionManagerCommission extends Command
         if (!is_file($path) || is_link($path) || filesize($path) > 32 * 1024 * 1024) throw new \RuntimeException('An archived leadership source workbook is unavailable.');
         $reader = IOFactory::createReader('Xlsx');
         $reader->setReadDataOnly(true);
+        $reader->setReadEmptyCells(false);
+        $reader->setLoadSheetsOnly($nsf ? ['NSF Data', 'Run Status', 'Agent Summary'] : ['Retention Data', 'Retention Commission Report']);
         $book = $reader->load($path);
         try {
             $sheet = $nsf ? $book->getSheetByName('NSF Data')
                 : ($book->getSheetByName('Retention Data') ?? $book->getSheetByName('Retention Commission Report'));
-            if (!$sheet || $sheet->getHighestDataRow() > 100000 || \PhpOffice\PhpSpreadsheet\Cell\Coordinate::columnIndexFromString($sheet->getHighestDataColumn()) > 100) {
+            if (!$sheet) throw new \RuntimeException('The archived leadership detail sheet is missing or outside its supported scope.');
+            $highestRow = $sheet->getHighestDataRow();
+            $highestColumn = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::columnIndexFromString($sheet->getHighestDataColumn());
+            if ($highestRow > 100000 || $highestColumn > 100) {
                 throw new \RuntimeException('The archived leadership detail sheet is missing or outside its supported scope.');
             }
             $required = $nsf ? ['ID', 'AGENT', 'NSF RETURNED DATE', 'NSF ACTION', 'NSF RECOUP DATE', 'CLEARED DATE', 'VALID COMMISSION']
                 : ['ID', 'RETENTION AGENT', 'IMMEDIATE RESULTS', 'ENROLLED DEBT', 'RETENTION PAYMENT DATE', 'CANCEL REQUEST DATE'];
             $columns = [];
-            for ($c = 1; $c <= \PhpOffice\PhpSpreadsheet\Cell\Coordinate::columnIndexFromString($sheet->getHighestDataColumn()); $c++) {
+            for ($c = 1; $c <= $highestColumn; $c++) {
                 $header = strtoupper(trim((string) $sheet->getCell([$c, 1])->getValue()));
                 if ($header === '') continue;
                 if (isset($columns[$header])) throw new \RuntimeException('The archived leadership detail has duplicate columns.');
@@ -344,7 +351,7 @@ class GenerateRetentionManagerCommission extends Command
             }
             if (array_diff($required, array_keys($columns))) throw new \RuntimeException('The archived leadership detail has incomplete headers.');
             $seen = [];
-            for ($r = 2; $r <= $sheet->getHighestDataRow(); $r++) {
+            for ($r = 2; $r <= $highestRow; $r++) {
                 $values = [];
                 foreach ($columns as $header => $c) {
                     if (!in_array($header, $required, true) && !str_ends_with($header, ' DATE')) continue;
@@ -376,9 +383,10 @@ class GenerateRetentionManagerCommission extends Command
                 $run = $book->getProperties()->getCustomPropertyValue(\Cmd\Reports\Console\Commands\GenerateNSFCommissionReport\Formatter::PROPERTY_RUN_ID);
                 if ($run !== null && (!is_string($run) || !preg_match('/^[a-f0-9]{32}$/D', $run))) throw new \RuntimeException('Archived NSF source run identity is invalid.');
                 if ($status = $book->getSheetByName('Run Status')) {
-                    if ($status->getHighestDataRow() > 1000) throw new \RuntimeException('Archived NSF run metadata is invalid.');
+                    $statusHighestRow = $status->getHighestDataRow();
+                    if ($statusHighestRow > 1000) throw new \RuntimeException('Archived NSF run metadata is invalid.');
                     $seenRun = false;
-                    for ($r = 1; $r <= $status->getHighestDataRow(); $r++) {
+                    for ($r = 1; $r <= $statusHighestRow; $r++) {
                         if (strcasecmp(trim((string) $status->getCell('A' . $r)->getValue()), 'Run ID') !== 0) continue;
                         $cell = $status->getCell('B' . $r);
                         $sheetRun = $cell->getValue();
@@ -390,9 +398,11 @@ class GenerateRetentionManagerCommission extends Command
                     }
                 }
                 $summary = $book->getSheetByName('Agent Summary');
-                if (!$summary || $summary->getCell('A1')->getValue() !== 'NSF Agent' || $summary->getHighestDataRow() > 10000) throw new \RuntimeException('The archived NSF paid-agent roster is unavailable.');
+                if (!$summary || $summary->getCell('A1')->getValue() !== 'NSF Agent') throw new \RuntimeException('The archived NSF paid-agent roster is unavailable.');
+                $summaryHighestRow = $summary->getHighestDataRow();
+                if ($summaryHighestRow > 10000) throw new \RuntimeException('The archived NSF paid-agent roster is unavailable.');
                 $names = []; $paidEnded = false; $unassigned = false;
-                for ($r = 2; $r <= $summary->getHighestDataRow(); $r++) {
+                for ($r = 2; $r <= $summaryHighestRow; $r++) {
                     $cell = $summary->getCell('A' . $r);
                     $name = $cell->getValue();
                     if ($cell->getDataType() === \PhpOffice\PhpSpreadsheet\Cell\DataType::TYPE_FORMULA || ($name !== null && !is_string($name))) throw new \RuntimeException('The archived NSF paid-agent roster has an invalid identity.');
@@ -427,12 +437,15 @@ class GenerateRetentionManagerCommission extends Command
     {
         $reader = IOFactory::createReaderForFile($path);
         $reader->setReadDataOnly(true);
+        $reader->setReadEmptyCells(false);
+        $reader->setLoadSheetsOnly(['Agent Summary']);
         $book = $reader->load($path);
         try {
             $sheet = $book->getSheetByName('Agent Summary');
             if (!$sheet || trim((string) $sheet->getCell('A1')->getValue()) !== 'NSF Agent') throw new \RuntimeException('Archived NSF roster summary is missing.');
             $names = [];
-            for ($row = 2; $row <= $sheet->getHighestDataRow(); $row++) {
+            $highestRow = $sheet->getHighestDataRow();
+            for ($row = 2; $row <= $highestRow; $row++) {
                 $name = trim((string) $sheet->getCell('A' . $row)->getValue());
                 if ($name === '' || strcasecmp($name, 'Unassigned Agents') === 0) break;
                 $names[] = $name;
@@ -1131,6 +1144,13 @@ class GenerateRetentionManagerCommission extends Command
 
         $reader = IOFactory::createReaderForFile($path);
         $reader->setReadDataOnly(true);
+        $reader->setReadEmptyCells(false);
+        // Preserve named-sheet precedence and the legacy active-sheet fallback.
+        // Loading summaries and individual agent copies serves no calculation input.
+        $names = $reader->listWorksheetNames($path);
+        foreach (['Retention Data', 'Retention Commission Report'] as $name) {
+            if (in_array($name, $names, true)) { $reader->setLoadSheetsOnly([$name]); break; }
+        }
         $spreadsheet = $reader->load($path);
         // The detail sheet was renamed "Retention Commission Report" -> "Retention Data" on
         // 2026-09-04 (Jacob). Both names are accepted so older snapshots still load — the manager
@@ -1489,6 +1509,10 @@ class GenerateRetentionManagerCommission extends Command
 
         $reader = IOFactory::createReaderForFile($path);
         $reader->setReadDataOnly(true);
+        $reader->setReadEmptyCells(false);
+        if (in_array('NSF Data', $reader->listWorksheetNames($path), true)) {
+            $reader->setLoadSheetsOnly(['NSF Data', 'Run Status']);
+        }
         $spreadsheet = $reader->load($path);
         if ($readinessRunIds !== null && in_array($sourceCode, ['ldr', 'plaw'], true)) {
             // Since 2026-10-05 the run ID is a document property (Jacob had the Run Status sheet
@@ -1498,7 +1522,8 @@ class GenerateRetentionManagerCommission extends Command
             if (preg_match('/^[a-f0-9]{32}$/D', $propertyRunId)) {
                 $readinessRunIds[$sourceCode] = $propertyRunId;
             } elseif ($statusSheet = $spreadsheet->getSheetByName('Run Status')) {
-                for ($row = 1; $row <= $statusSheet->getHighestDataRow(); $row++) {
+                $statusHighestRow = $statusSheet->getHighestDataRow();
+                for ($row = 1; $row <= $statusHighestRow; $row++) {
                     if (strcasecmp(trim((string) $statusSheet->getCell("A{$row}")->getValue()), 'Run ID') !== 0) continue;
                     $runId = strtolower(trim((string) $statusSheet->getCell("B{$row}")->getValue()));
                     if (preg_match('/^[a-f0-9]{32}$/D', $runId)) $readinessRunIds[$sourceCode] = $runId;

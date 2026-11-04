@@ -32,7 +32,8 @@ final class SavedRamaManagerWorkbook
             $sheet = $book->getSheetByName('Retention Data');
             self::headers($sheet, true);
             $saved = $context = [];
-            for ($r = 2; $r <= $sheet->getHighestDataRow(); $r++) {
+            $lastRow = $sheet->getHighestDataRow();
+            for ($r = 2; $r <= $lastRow; $r++) {
                 $row = self::facts($sheet, $r);
                 if ($row[10] === null || $row[10] < $period || $row[10] > $end || isset($saved[$row[0]])) {
                     throw new RuntimeException('Saved manager client identity or reporting period differs.');
@@ -66,7 +67,8 @@ final class SavedRamaManagerWorkbook
             try {
                 $sourceSheet = $sourceBook->getSheetByName('Retention Data') ?? $sourceBook->getSheetByName('Retention Commission Report');
                 self::headers($sourceSheet, false);
-                for ($r = 2; $r <= $sourceSheet->getHighestDataRow(); $r++) {
+                $lastRow = $sourceSheet->getHighestDataRow();
+                for ($r = 2; $r <= $lastRow; $r++) {
                     $cancel = self::date(self::value($sourceSheet, 15, $r));
                     if ($cancel === null || $cancel < $period || $cancel > $end) continue;
                     $row = self::facts($sourceSheet, $r); $id = $row[0];
@@ -113,7 +115,13 @@ final class SavedRamaManagerWorkbook
     }
 
     private static function load(string $path): \PhpOffice\PhpSpreadsheet\Spreadsheet
-    { $reader = IOFactory::createReader('Xlsx'); $reader->setReadDataOnly(true); return $reader->load($path); }
+    {
+        $reader = IOFactory::createReader('Xlsx');
+        $reader->setReadDataOnly(true);
+        $reader->setReadEmptyCells(false);
+        $reader->setLoadSheetsOnly(['Retention Data', 'Retention Commission Report', 'Commission Summary']);
+        return $reader->load($path);
+    }
 
     private static function headers(?Worksheet $sheet, bool $manager): void
     {
