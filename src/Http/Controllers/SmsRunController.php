@@ -62,7 +62,7 @@ class SmsRunController extends Controller
         $data = Validator::make($request->all(), [
             'request_id' => ['required', 'uuid'],
             'target' => ['required', 'integer', 'min:1', 'max:'.SmsRunService::MAX_TARGET],
-            'csv_format' => ['required_with:rows_per_file,tiers,tier_selection_policy,options_version,send_date,filename_version,minimum_debt_amount,maximum_debt_amount', 'sometimes', 'string', 'in:'.SmsRunOptions::CSV_FORMAT],
+            'csv_format' => ['required_with:rows_per_file,tiers,tier_selection_policy,options_version,send_date,filename_version,minimum_debt_amount,maximum_debt_amount', 'sometimes', 'string', 'in:'.implode(',', SmsRunOptions::CSV_FORMATS)],
             // No 'sometimes' here: an absent minimum must still fail beside a maximum.
             'minimum_debt_amount' => ['required_with:maximum_debt_amount', 'integer', 'min:'.SmsDebtPolicy::FLOOR, 'max:'.SmsDebtPolicy::MAX],
             'maximum_debt_amount' => ['sometimes', 'integer', 'multiple_of:'.SmsDebtPolicy::MAXIMUM_STEP, 'min:'.SmsDebtPolicy::FLOOR, 'max:'.SmsDebtPolicy::MAX, 'gte:minimum_debt_amount'],

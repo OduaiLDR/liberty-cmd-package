@@ -17,7 +17,13 @@ final class SmsRunOptions
 {
     public const MAX_TARGET = 10000000;
 
+    /** Runs already frozen in this format keep it. */
     public const CSV_FORMAT = 'sms-four-column-v1';
+
+    /** First and last name in separate columns: the format of every new run. */
+    public const FIRST_LAST_CSV_FORMAT = 'sms-first-last-name-v1';
+
+    public const CSV_FORMATS = [self::CSV_FORMAT, self::FIRST_LAST_CSV_FORMAT];
 
     public const TIER_SELECTION_POLICY = 'current-source-tier-v1';
 
@@ -48,8 +54,11 @@ final class SmsRunOptions
      * @param array<int, string>|null $tiers
      * @return array{target:int, rows_per_file:int, tiers:list<string>, csv_format:string}
      */
-    public static function normalize(int $target, ?int $rowsPerFile = null, ?array $tiers = null, ?string $tierSelectionPolicy = null, ?string $optionsVersion = null, ?string $sendDate = null, ?string $filenameVersion = null, ?int $minimumDebtAmount = null, ?int $maximumDebtAmount = null): array
+    public static function normalize(int $target, ?int $rowsPerFile = null, ?array $tiers = null, ?string $tierSelectionPolicy = null, ?string $optionsVersion = null, ?string $sendDate = null, ?string $filenameVersion = null, ?int $minimumDebtAmount = null, ?int $maximumDebtAmount = null, string $csvFormat = self::CSV_FORMAT): array
     {
+        if (! in_array($csvFormat, self::CSV_FORMATS, true)) {
+            throw new InvalidArgumentException('Unknown SMS vendor CSV format.');
+        }
         if ($minimumDebtAmount !== null) {
             SmsDebtPolicy::validate($minimumDebtAmount);
             if (! self::isTierSelectionPolicy($tierSelectionPolicy)) {
@@ -99,7 +108,7 @@ final class SmsRunOptions
             'target' => $target,
             'rows_per_file' => $rowsPerFile,
             'tiers' => array_values(array_filter(self::TIERS, static fn (string $tier): bool => isset($seen[$tier]))),
-            'csv_format' => self::CSV_FORMAT,
+            'csv_format' => $csvFormat,
         ];
         // Never add a default selector to old four-key options or their hashes.
         if ($tierSelectionPolicy !== null) $options['tier_selection_policy'] = $tierSelectionPolicy;
@@ -151,12 +160,12 @@ final class SmsRunOptions
         if (! is_array($stored) || array_keys($stored) !== $keys
             || ! is_int($stored['target']) || $stored['target'] !== $target
             || ! is_int($stored['rows_per_file']) || ! is_array($stored['tiers'])
-            || $stored['csv_format'] !== self::CSV_FORMAT) {
+            || ! in_array($stored['csv_format'], self::CSV_FORMATS, true)) {
             throw new InvalidArgumentException('Stored SMS run options are incomplete or inconsistent.');
         }
         $canonical = self::normalize($target, $stored['rows_per_file'], $stored['tiers'], $stored['tier_selection_policy'] ?? null,
             $stored['options_version'] ?? null, $stored['send_date'] ?? null, $stored['filename_version'] ?? null, $stored['minimum_debt_amount'] ?? null,
-            $stored['maximum_debt_amount'] ?? null);
+            $stored['maximum_debt_amount'] ?? null, $stored['csv_format']);
         if ($stored !== $canonical) throw new InvalidArgumentException('Stored SMS run options are not canonical.');
         return $canonical;
     }

@@ -57,3 +57,29 @@ test('explicit legacy formats retain byte-equivalent headers and rows', function
         SmsDeliveryPolicy::rowForFormat($format, 'Ann Lee', '1, Test St', '1000.01', '0123456789', '2026-10-26')))
         ->toBe($csv($expectedHeader, $expectedRow));
 })->with([[false, 'legacy-nine-column-v1'], [true, 'legacy-five-column-v1']]);
+
+test('new runs carry first and last name in separate columns', function (): void {
+    expect(SmsDeliveryPolicy::headerForFormat(SmsRunOptions::FIRST_LAST_CSV_FORMAT))
+        ->toBe(['First name', 'Last name', 'debt load', 'phone1', 'send date']);
+
+    expect(SmsDeliveryPolicy::rowForFormat(SmsRunOptions::FIRST_LAST_CSV_FORMAT, '  Ann  Marie Lee ',
+        'PRIVATE ADDRESS, OMIT THIS', '13500.01', '0202555010', '2026-11-09'))
+        ->toBe(['Ann', 'Lee', '14000', '0202555010', '2026-11-09']);
+});
+
+test('the last name is the last word of Client, skipping a trailing suffix', function (string $client, string $last): void {
+    expect(SmsDeliveryPolicy::lastName($client))->toBe($last);
+})->with([
+    ['ANN LEE', 'LEE'], ['ANN MARIE LEE', 'LEE'], ['ANN LEE-SMITH', 'LEE-SMITH'],
+    ['JOHN SMITH JR', 'SMITH'], ['JOHN A SMITH JR.', 'SMITH'], ['JOHN SMITH III', 'SMITH'], ['John Smith sr', 'Smith'],
+    ['JOHN JR', 'JR'], ['ANN', ''], ['', ''], ['   ', ''],
+]);
+
+test('frozen runs keep their own format while new options use the requested one', function (): void {
+    $old = SmsRunOptions::normalize(5, 2);
+    $new = SmsRunOptions::normalize(5, 2, csvFormat: SmsRunOptions::FIRST_LAST_CSV_FORMAT);
+    expect($old['csv_format'])->toBe('sms-four-column-v1')->and($new['csv_format'])->toBe('sms-first-last-name-v1')
+        ->and(SmsRunOptions::fromStored(json_encode($old), 5))->toBe($old)
+        ->and(SmsRunOptions::fromStored(json_encode($new), 5))->toBe($new);
+    expect(fn () => SmsRunOptions::normalize(5, 2, csvFormat: 'legacy-five-column-v1'))->toThrow(InvalidArgumentException::class, 'format');
+});

@@ -1009,7 +1009,10 @@ class SmsRunService
     {
         if ($input === null) return null;
         try {
-            if (($input['csv_format'] ?? null) !== SmsRunOptions::CSV_FORMAT
+            // A retry keeps its frozen format; anything new uses the current one.
+            $format = $existing === null ? SmsRunOptions::FIRST_LAST_CSV_FORMAT
+                : ($this->fileOptions($existing)['csv_format'] ?? SmsRunOptions::FIRST_LAST_CSV_FORMAT);
+            if (($input['csv_format'] ?? null) !== $format
                 || array_diff(array_keys($input), ['target', 'csv_format', 'rows_per_file', 'tiers', 'tier_selection_policy', 'options_version', 'send_date', 'filename_version', 'minimum_debt_amount', 'maximum_debt_amount']) !== []
                 || (isset($input['target']) && $input['target'] !== $target)
                 || (isset($input['rows_per_file']) && ! is_int($input['rows_per_file']))
@@ -1028,7 +1031,7 @@ class SmsRunService
             $date = $planned ? ($input['send_date'] ?? $stored['send_date'] ?? SmsDeliveryPolicy::followingMonday()->toDateString()) : null;
             return SmsRunOptions::normalize($target, $input['rows_per_file'] ?? null, $input['tiers'] ?? null, $input['tier_selection_policy'] ?? null,
                 $planned ? SmsRunOptions::PLANNED_DATE_VERSION : null, $date, $input['filename_version'] ?? null, $input['minimum_debt_amount'] ?? null,
-                $input['maximum_debt_amount'] ?? null);
+                $input['maximum_debt_amount'] ?? null, $format);
         } catch (\InvalidArgumentException $error) {
             throw ValidationException::withMessages(['file_options' => $error->getMessage()]);
         }
@@ -1067,7 +1070,7 @@ class SmsRunService
         $windowSchemaReady = ! $tierSelection || ! $windowed || (SmsTierWindowSchema::ready(DB::connection('sqlsrv'))
             && (! $leanHistory || SmsLeanHistorySchema::ready(DB::connection('sqlsrv'))));
         if ($tierSelection && ! $windowSchemaReady) $tierSelection = false;
-        $capabilities = ['csv_format' => SmsRunOptions::CSV_FORMAT, 'rows_per_file' => true,
+        $capabilities = ['csv_format' => SmsRunOptions::FIRST_LAST_CSV_FORMAT, 'rows_per_file' => true,
             'tier_subset' => $tierSelection, 'max_parts' => SmsRunArtifactBundle::MAX_PARTS];
         if ($capabilities['tier_subset']) {
             $capabilities['tier_selection_policy'] = $windowed

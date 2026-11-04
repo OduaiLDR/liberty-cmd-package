@@ -54,18 +54,20 @@ final class SmsRunArtifactBundle
         try {
             $this->writeJson($stage.'/.build.json', ['version' => 1, 'request_id' => $id, 'stem' => $stem, 'parts' => $parts]);
             $manifestParts = []; $total = 0; $partRows = 0; $part = 0; $name = '';
+            $columns = count(SmsDeliveryPolicy::headerForFormat($options['csv_format']));
             $this->report($progress, 'writing', 0, 0, $parts);
             foreach ($cells as $row) {
                 if (++$total > $expected) throw new RuntimeException('SMS artifact row count exceeds the frozen selection.');
-                if (! is_array($row) || ! array_is_list($row) || count($row) !== 4
+                if (! is_array($row) || ! array_is_list($row) || count($row) !== $columns
                     || array_filter($row, static fn ($cell): bool => ! is_string($cell))) {
-                    throw new RuntimeException('Each SMS artifact row must contain exactly four string cells.');
+                    throw new RuntimeException('Each SMS artifact row must contain exactly the string cells of its frozen format.');
                 }
-                if (isset($options['send_date']) && $row[3] !== $options['send_date']) {
+                if (isset($options['send_date']) && $row[$columns - 1] !== $options['send_date']) {
                     throw new RuntimeException('The SMS row date differs from the frozen planned send date.');
                 }
-                if (isset($options['minimum_debt_amount']) && (! preg_match('/\A[0-9]+\z/D', $row[1])
-                    || (int) $row[1] < $options['minimum_debt_amount'] || (int) $row[1] > ($options['maximum_debt_amount'] ?? SmsDebtPolicy::MAX))) {
+                $debt = $row[$columns - 3];
+                if (isset($options['minimum_debt_amount']) && (! preg_match('/\A[0-9]+\z/D', $debt)
+                    || (int) $debt < $options['minimum_debt_amount'] || (int) $debt > ($options['maximum_debt_amount'] ?? SmsDebtPolicy::MAX))) {
                     throw new RuntimeException('The SMS row debt is below its frozen minimum, above its frozen maximum or outside the supported debt range.');
                 }
                 if ($handle === null) {
@@ -225,7 +227,7 @@ final class SmsRunArtifactBundle
         }
         if (! $deep) return $path;
         if ($manifest['download']['format'] === 'csv') {
-            $this->verifyCsvFile($path, $manifest['parts'][0]);
+            $this->verifyCsvFile($path, $manifest['parts'][0], $manifest['csv_format']);
         } else {
             if (! class_exists(ZipArchive::class)) throw new RuntimeException('PHP ZipArchive is required to verify the SMS archive.');
             $zip = new ZipArchive;
@@ -243,7 +245,7 @@ final class SmsRunArtifactBundle
                     } finally { fclose($stream); }
                     $stream = $zip->getStream($entry['name']);
                     if ($stream === false) throw new RuntimeException('Unable to count an SMS archive part.');
-                    try { $this->verifyCsvStream($stream, $entry['rows']); } finally { fclose($stream); }
+                    try { $this->verifyCsvStream($stream, $entry['rows'], $manifest['csv_format']); } finally { fclose($stream); }
                 }
             } finally { $zip->close(); }
         }
@@ -321,9 +323,10 @@ final class SmsRunArtifactBundle
         if (! isset($options['target'], $options['rows_per_file'], $options['tiers'], $options['csv_format'])
             || ! is_int($options['target']) || ! is_int($options['rows_per_file']) || ! is_array($options['tiers'])
             || (array_key_exists('tier_selection_policy', $options) && ! SmsRunOptions::isTierSelectionPolicy($options['tier_selection_policy']))
+            || ! in_array($options['csv_format'], SmsRunOptions::CSV_FORMATS, true)
             || $options !== SmsRunOptions::normalize($options['target'], $options['rows_per_file'], $options['tiers'], $options['tier_selection_policy'] ?? null,
                 $options['options_version'] ?? null, $options['send_date'] ?? null, $options['filename_version'] ?? null, $options['minimum_debt_amount'] ?? null,
-                $options['maximum_debt_amount'] ?? null)) {
+                $options['maximum_debt_amount'] ?? null, $options['csv_format'])) {
             throw new RuntimeException('The SMS artifact requires complete canonical versioned run options.');
         }
         if ($expected < 1 || $expected > $options['target']) throw new RuntimeException('The SMS artifact requires a positive selected count no greater than its target.');
@@ -434,7 +437,7 @@ final class SmsRunArtifactBundle
             || $manifest['version'] !== 1 || $manifest['request_id'] !== $id || ! $this->hash($manifest['options_sha256'])
             || ! is_int($manifest['rows']) || $manifest['rows'] < 1 || $manifest['rows'] > SmsRunOptions::MAX_TARGET
             || ! is_int($manifest['rows_per_file']) || $manifest['rows_per_file'] < 1 || $manifest['rows_per_file'] > SmsRunOptions::MAX_TARGET
-            || $manifest['csv_format'] !== SmsRunOptions::CSV_FORMAT || ! is_array($manifest['parts']) || ! array_is_list($manifest['parts'])
+            || ! in_array($manifest['csv_format'], SmsRunOptions::CSV_FORMATS, true) || ! is_array($manifest['parts']) || ! array_is_list($manifest['parts'])
             || ! is_array($manifest['download']) || array_keys($manifest['download']) !== ['name','format','bytes','sha256']) throw new RuntimeException('Invalid SMS artifact manifest.');
         $parts = intdiv($manifest['rows'] - 1, $manifest['rows_per_file']) + 1;
         $format = $parts === 1 ? 'csv' : 'zip';
@@ -471,20 +474,21 @@ final class SmsRunArtifactBundle
         $this->finish($handle);
     }
 
-    private function verifyCsvFile(string $path, array $entry): void
+    private function verifyCsvFile(string $path, array $entry, string $format): void
     {
         if ($this->fileInfo($path) !== ['bytes' => $entry['bytes'], 'sha256' => $entry['sha256']]) throw new RuntimeException('An SMS CSV part hash differs from the manifest.');
         $stream = fopen($path, 'rb');
         if ($stream === false) throw new RuntimeException('Unable to read the retained SMS CSV.');
-        try { $this->verifyCsvStream($stream, $entry['rows']); } finally { fclose($stream); }
+        try { $this->verifyCsvStream($stream, $entry['rows'], $format); } finally { fclose($stream); }
     }
 
-    private function verifyCsvStream($stream, int $expected): void
+    private function verifyCsvStream($stream, int $expected, string $format): void
     {
-        if (fgetcsv($stream, escape: '') !== SmsDeliveryPolicy::headerForFormat(SmsRunOptions::CSV_FORMAT)) throw new RuntimeException('The SMS CSV header differs from its explicit format.');
+        $header = SmsDeliveryPolicy::headerForFormat($format);
+        if (fgetcsv($stream, escape: '') !== $header) throw new RuntimeException('The SMS CSV header differs from its explicit format.');
         $rows = 0;
         while (($row = fgetcsv($stream, escape: '')) !== false) {
-            if (count($row) !== 4 || ++$rows > $expected) throw new RuntimeException('SMS CSV part count or columns do not reconcile.');
+            if (count($row) !== count($header) || ++$rows > $expected) throw new RuntimeException('SMS CSV part count or columns do not reconcile.');
         }
         if (! feof($stream) || $rows !== $expected) throw new RuntimeException('SMS CSV part count does not reconcile.');
     }

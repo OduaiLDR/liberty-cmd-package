@@ -82,7 +82,7 @@ class SmsSelectionCancellation
         if (($run->Selection_Policy ?? null) !== SmsRecordPolicy::RECORDS) return false;
         try {
             $options = SmsRunOptions::fromStored($run->Run_Options_JSON ?? null, (int) $run->Target);
-            return ($options['csv_format'] ?? null) === SmsRunOptions::CSV_FORMAT
+            return in_array($options['csv_format'] ?? null, SmsRunOptions::CSV_FORMATS, true)
                 && ($options['filename_version'] ?? null) === SmsRunOptions::APPROVAL_FILENAME_VERSION
                 && SmsRunOptions::isWindowedTierSelectionPolicy($options['tier_selection_policy'] ?? null);
         } catch (Throwable) { return false; }
