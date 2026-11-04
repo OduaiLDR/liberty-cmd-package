@@ -26,7 +26,7 @@ class SmsRunStepJob implements ShouldQueue
 
     public int $createdAt;
 
-    public int $timeout = SmsExportQueue::JOB_TIMEOUT;
+    public int $timeout = SmsExportQueue::RUN_STEP_TIMEOUT;
 
     public function __construct(public string $requestId, public string $step)
     {

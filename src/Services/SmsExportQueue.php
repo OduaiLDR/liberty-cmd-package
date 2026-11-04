@@ -8,6 +8,9 @@ class SmsExportQueue
 {
     public const JOB_TIMEOUT = 7000;
 
+    /** One run step can pick a tier subset from millions of people. Must stay under the queue's retry_after (14400). */
+    public const RUN_STEP_TIMEOUT = 14000;
+
     public function assertReady(): void
     {
         $connection = (string) config('queue.default');
