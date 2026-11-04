@@ -116,6 +116,26 @@ class PayrollLeadershipWorkbookBundleTest extends TestCase
         $this->command()->buildPayrollReviewLeadershipSnapshot('retention_manager', '2098-09-01', '2098-09-30', $sources);
     }
 
+    public function test_rama_requires_tranche_context_only_for_the_selected_reporting_cohort(): void
+    {
+        $sources = array_intersect_key($this->sources(), array_flip(['retention_ldr', 'retention_plaw']));
+        $this->changeWorkbook($sources['retention_ldr']['path'], static function ($book): void {
+            $book->getSheetByName('Retention Data')->fromArray([
+                [103, 'Historical Client', 'Historical Agent', '2098-08-05', 'RETAINED', 10000, 2, '2098-09-10', '2098-08-31'],
+            ], null, 'A3');
+        });
+        // The frozen map contains only LLG-101 and LLG-102, not out-of-period 103.
+        $snapshot = $this->command()->buildPayrollReviewLeadershipSnapshot('retention_manager', '2098-09-01', '2098-09-30', $sources);
+        $this->assertSame(2, $snapshot['summary']['assignedCount']);
+        $this->assertSame(1, $snapshot['summary']['retainedCount']);
+        $this->assertSame(1, $snapshot['summary']['bonusAssignedCount']);
+        $this->assertSame(2000.0, $snapshot['summary']['totalPay']);
+        unset($sources['retention_ldr']['context']['trancheByClient']['LLG-101']);
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('tranche/cutoff context is incomplete');
+        $this->command()->buildPayrollReviewLeadershipSnapshot('retention_manager', '2098-09-01', '2098-09-30', $sources);
+    }
+
     private function command(): GenerateRetentionManagerCommission
     {
         $command = new GenerateRetentionManagerCommission;
@@ -306,13 +326,15 @@ class PayrollLeadershipWorkbookBundleTest extends TestCase
         $this->command()->buildPayrollReviewLeadershipSnapshot('nsf_team_leader', '2098-09-01', '2098-09-30', $sources);
     }
 
-    public function test_nsf_workbooks_must_share_any_present_source_run_identity(): void
+    public function test_nsf_company_readiness_ids_need_not_equal_each_other_or_the_capture_id(): void
     {
         $sources = $this->sources();
-        foreach (['ldr' => 'a', 'plaw' => 'b'] as $source => $letter) $this->changeWorkbook($sources['nsf_' . $source]['path'], static fn ($book) => $book->getProperties()->setCustomProperty('NSF Run ID', str_repeat($letter, 32)));
-        $this->expectException(\RuntimeException::class);
-        $this->expectExceptionMessage('inconsistent source run');
-        $this->command()->buildPayrollReviewLeadershipSnapshot('nsf_team_leader', '2098-09-01', '2098-09-30', $sources);
+        foreach (['ldr' => 'a', 'plaw' => 'b'] as $source => $letter) {
+            $this->changeWorkbook($sources['nsf_' . $source]['path'], static fn ($book) => $book->getProperties()->setCustomProperty('NSF Run ID', str_repeat($letter, 32)));
+            $sources['nsf_' . $source]['identity'] = str_repeat('c', 32);
+        }
+        $snapshot = $this->command()->buildPayrollReviewLeadershipSnapshot('nsf_team_leader', '2098-09-01', '2098-09-30', $sources);
+        $this->assertSame(['ldr' => str_repeat('a', 32), 'plaw' => str_repeat('b', 32)], $snapshot['nsfReadinessRunIds']);
     }
 
     public function test_nsf_run_status_sheet_cannot_contradict_the_document_property(): void

@@ -176,19 +176,38 @@ class GenerateRetentionManagerCommission extends Command
         $this->setOutput(new \Illuminate\Console\OutputStyle(new \Symfony\Component\Console\Input\ArrayInput([]), new \Symfony\Component\Console\Output\NullOutput));
         try {
             $nsf = $reportKind === 'nsf_team_leader';
-            $rows = $roster = $readinessIds = [];
+            $rows = $roster = $readinessIds = $outerIds = [];
             foreach (['ldr' => 'LDR', 'plaw' => 'Progress Law'] as $source => $display) {
-                $artifact = $artifacts[($nsf ? 'nsf_' : 'retention_') . $source] ?? [];
+                $key = ($nsf ? 'nsf_' : 'retention_') . $source;
+                $artifact = $artifacts[$key] ?? [];
                 $path = $artifact['path'] ?? null;
                 if (!is_string($path)) throw new \RuntimeException('Both exact archived leadership source workbooks are required.');
+                if (isset($artifact['key']) && $artifact['key'] !== $key || isset($artifact['period']) && $artifact['period'] !== $startDate
+                    || isset($artifact['sha256']) && (!is_string($artifact['sha256']) || !hash_equals($artifact['sha256'], (string) hash_file('sha256', $path)))) {
+                    throw new \RuntimeException('Archived leadership source company, period or hash differs.');
+                }
+                if ($nsf && isset($artifact['identity'])) {
+                    if (!is_string($artifact['identity']) || !preg_match('/^[a-f0-9]{32}$/D', $artifact['identity'])) throw new \RuntimeException('Archived NSF capture identity is invalid.');
+                    $outerIds[] = $artifact['identity'];
+                }
+                if ($nsf && isset($artifact['context']['commissionResults'])) {
+                    $scope = $artifact['context']['commissionResults'];
+                    if (($scope['reportKind'] ?? null) !== 'nsf' || ($scope['source'] ?? null) !== $source || ($scope['period'] ?? null) !== $startDate) {
+                        throw new \RuntimeException('Archived NSF source company or period differs.');
+                    }
+                }
                 $this->validateLeadershipWorkbook($path, $nsf, $startDate, $endDate);
                 if ($nsf) {
+                    self::payrollNsfReadinessEvidence($path, $source, $startDate);
                     $rows = array_merge($rows, $this->loadNsfCommissionRowsFromXlsx($path, $display, $readinessIds, $source));
                     foreach ($this->archivedNsfRoster($path) as $name) $roster[$this->anthonyAgentKey($name)] = $name;
                     continue;
                 }
                 $sourceRows = $this->loadRetentionReportRowsFromXlsx($path, $display);
                 if ($reportKind === 'retention_manager') {
+                    // Tranche/cutoff evidence is needed for this report's cohort,
+                    // not historical rows merely retained in the source file.
+                    $sourceRows = $this->filterRetentionRowsForPeriod($sourceRows, $startDate, $endDate);
                     $context = $artifact['context'] ?? [];
                     if (($context['trancheContextReady'] ?? false) !== true || !is_array($context['trancheByClient'] ?? null)) {
                         throw new \RuntimeException('Archived Retention leadership tranche/cutoff context is unavailable.');
@@ -213,14 +232,14 @@ class GenerateRetentionManagerCommission extends Command
                 $snapshot = $reportKind === 'retention_manager' ? $this->buildRamaPayrollSnapshot($rows)
                     : $this->buildNickPayrollSnapshot($rows, $startDate, $endDate);
             } else {
-                if ($readinessIds && (count($readinessIds) !== 2 || count(array_unique($readinessIds)) !== 1)) {
-                    throw new \RuntimeException('Archived NSF leadership workbooks have inconsistent source run identities.');
+                // LDR and PLAW each own a readiness identity. The enclosing
+                // orchestration capture is a third namespace, not either ID.
+                if ($readinessIds && (count($readinessIds) !== 2 || array_diff(['ldr', 'plaw'], array_keys($readinessIds))
+                    || array_filter($readinessIds, static fn ($id) => !is_string($id) || !preg_match('/^[a-f0-9]{32}$/D', $id)))) {
+                    throw new \RuntimeException('Archived NSF leadership workbooks have incomplete company readiness identities.');
                 }
-                foreach ($readinessIds as $source => $runId) {
-                    if (isset($artifacts['nsf_' . $source]['identity']) && $artifacts['nsf_' . $source]['identity'] !== $runId) {
-                        throw new \RuntimeException('Archived NSF leadership workbook does not match its captured source run.');
-                    }
-                }
+                if ($outerIds && count($outerIds) !== 2) throw new \RuntimeException('Archived NSF orchestration capture evidence is incomplete.');
+                if (count(array_unique($outerIds)) > 1) throw new \RuntimeException('Archived NSF workbooks belong to different orchestration captures.');
                 $priorRoster = $this->anthonyRosterCache;
                 $priorValidity = $this->payrollFrozenNsfValidity;
                 $priorCalculation = $this->payrollCalculationContext;
@@ -238,6 +257,67 @@ class GenerateRetentionManagerCommission extends Command
             }
             return [...$snapshot, 'periodStart' => $startDate, 'periodEnd' => $endDate];
         } finally { $this->output = $previousOutput; }
+    }
+
+    /** Company readiness metadata from this saved file only; never reads mutable SQL. */
+    public static function payrollNsfReadinessEvidence(string $path, string $source, string $period): array
+    {
+        $date = \DateTimeImmutable::createFromFormat('!Y-m-d', $period);
+        if (!in_array($source, ['ldr', 'plaw'], true) || !$date || $date->format('Y-m-01') !== $period
+            || !is_file($path) || is_link($path) || filesize($path) > 32 * 1024 * 1024) throw new \InvalidArgumentException('Exact saved NSF company and period are required.');
+        $reader = IOFactory::createReader('Xlsx'); $reader->setReadDataOnly(true);
+        $book = $reader->load($path);
+        try {
+            $properties = $book->getProperties();
+            $run = $properties->getCustomPropertyValue(\Cmd\Reports\Console\Commands\GenerateNSFCommissionReport\Formatter::PROPERTY_RUN_ID);
+            $status = $properties->getCustomPropertyValue(\Cmd\Reports\Console\Commands\GenerateNSFCommissionReport\Formatter::PROPERTY_RUN_STATUS);
+            $normalizeStatus = static function (mixed $value): string {
+                return match ($value) {
+                    'PROVISIONAL', 'PROVISIONAL — NOT READY FOR FINAL PAYROLL' => 'PROVISIONAL',
+                    'FINAL', 'FINAL-CUTOFF DATA' => 'FINAL',
+                    default => throw new \RuntimeException('Archived NSF readiness status is invalid.'),
+                };
+            };
+            if ($run !== null && (!is_string($run) || !preg_match('/^[a-f0-9]{32}$/D', $run))) throw new \RuntimeException('Archived NSF source run identity is invalid.');
+            if ($status !== null) $status = $normalizeStatus($status);
+            if ($sheet = $book->getSheetByName('Run Status')) {
+                if ($sheet->getHighestDataRow() > 1000) throw new \RuntimeException('Archived NSF run metadata is invalid.');
+                $seen = [];
+                foreach ($sheet->rangeToArray('A1:B' . $sheet->getHighestDataRow(), null, false, false) as $index => $row) {
+                    $label = strtolower(trim((string) $row[0]));
+                    if (!in_array($label, ['run id', 'nsf report run status', 'run status', 'status', 'source', 'period start', 'period end'], true)) continue;
+                    if (isset($seen[$label]) || $sheet->getCell('B' . ($index + 1))->getDataType() === \PhpOffice\PhpSpreadsheet\Cell\DataType::TYPE_FORMULA) throw new \RuntimeException('Archived NSF run metadata is duplicated or unverifiable.');
+                    $seen[$label] = true; $value = $row[1];
+                    if ($label === 'run id') {
+                        if (!is_string($value) || !preg_match('/^[a-f0-9]{32}$/D', $value) || $run !== null && $run !== $value) throw new \RuntimeException('Archived NSF source run identity is invalid or inconsistent.');
+                        $run = $value;
+                    } elseif (in_array($label, ['nsf report run status', 'run status', 'status'], true)) {
+                        $saved = $normalizeStatus($value);
+                        if ($status !== null && $saved !== $status) throw new \RuntimeException('Archived NSF readiness status is inconsistent.');
+                        $status = $saved;
+                    } elseif ($label === 'source') {
+                        $saved = strtolower(trim((string) $value));
+                        if (!in_array($saved, $source === 'ldr' ? ['ldr', 'liberty debt relief'] : ['plaw', 'progress law'], true)) throw new \RuntimeException('Archived NSF readiness company differs.');
+                    } elseif (self::leadershipDate($value) !== ($label === 'period start' ? $period : $date->format('Y-m-t'))) {
+                        throw new \RuntimeException('Archived NSF readiness period differs.');
+                    }
+                }
+            }
+            // Modern properties bind the saved provisional/final label to the
+            // original company start, not to today's date or the outer run ID.
+            $started = $properties->getCustomPropertyValue('NSF Run Started (UTC)');
+            $after = $properties->getCustomPropertyValue('NSF Final Runs After (UTC)');
+            $cutoff = $properties->getCustomPropertyValue('NSF Payment Cutoff (Pacific)');
+            if ($started !== null || $after !== null || $cutoff !== null) {
+                if (!is_string($started) || !preg_match('/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{6}$/D', $started)) throw new \RuntimeException('Archived NSF readiness start is invalid.');
+                $time = \DateTimeImmutable::createFromFormat('!Y-m-d H:i:s.u', $started, new \DateTimeZone('UTC'));
+                if (!$time || $time->format('Y-m-d H:i:s.u') !== $started) throw new \RuntimeException('Archived NSF readiness start is invalid.');
+                $timing = \Cmd\Reports\Services\NsfReportReadiness::timing($period, $time);
+                if ($after !== $timing['finalAfter'] || $cutoff !== $timing['cutoffPacific']
+                    || $status !== ($timing['isProvisional'] ? 'PROVISIONAL' : 'FINAL')) throw new \RuntimeException('Archived NSF readiness status or period differs from its saved timing.');
+            }
+            return ['source' => $source, 'period' => $period, 'runId' => $run, 'status' => $status];
+        } finally { $book->disconnectWorksheets(); }
     }
 
     /** Reject malformed detail before the legacy readers can turn missing columns into zero pay. */
