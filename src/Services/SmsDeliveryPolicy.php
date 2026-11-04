@@ -66,11 +66,20 @@ final class SmsDeliveryPolicy
         return [...$row, ...($singlePhone ? [] : ['', '', '', '']), $sendDate];
     }
 
+    /** Client joins first, middle and last, so the surname is its last word, ignoring a trailing suffix. */
+    public static function lastName(string $client): string
+    {
+        $words = preg_split('/\s+/', trim($client), -1, PREG_SPLIT_NO_EMPTY);
+        while (count($words) > 2 && preg_match('/\A(JR|SR|II|III|IV|V)\.?\z/i', end($words))) array_pop($words);
+        return count($words) > 1 ? end($words) : '';
+    }
+
     /** Explicit frozen format for a versioned run, never inferred from configuration. */
     public static function headerForFormat(string $format): array
     {
         return match ($format) {
             SmsRunOptions::CSV_FORMAT => ['First name', 'debt load', 'phone1', 'send date'],
+            SmsRunOptions::FIRST_LAST_CSV_FORMAT => ['First name', 'Last name', 'debt load', 'phone1', 'send date'],
             'legacy-nine-column-v1' => self::header(false),
             'legacy-five-column-v1' => self::header(true),
             default => throw new InvalidArgumentException('Unknown SMS vendor CSV format.'),
@@ -82,6 +91,7 @@ final class SmsDeliveryPolicy
     {
         return match ($format) {
             SmsRunOptions::CSV_FORMAT => [explode(' ', trim($client))[0], self::debtLoad($amount), $phone, $sendDate],
+            SmsRunOptions::FIRST_LAST_CSV_FORMAT => [explode(' ', trim($client))[0], self::lastName($client), self::debtLoad($amount), $phone, $sendDate],
             'legacy-nine-column-v1' => self::row($client, $address, $amount, $phone, $sendDate, false),
             'legacy-five-column-v1' => self::row($client, $address, $amount, $phone, $sendDate, true),
             default => throw new InvalidArgumentException('Unknown SMS vendor CSV format.'),

@@ -40,7 +40,7 @@ final class SmsRunHandoffPreview
         $file = $view['file'] ?? null;
         if ($selected === null || ! self::date($date)
             || ! in_array($view['status'] ?? null, ['file_ready', 'approving', 'approved'], true)
-            || ($options['csv_format'] ?? null) !== SmsRunOptions::CSV_FORMAT
+            || ! in_array($options['csv_format'] ?? null, SmsRunOptions::CSV_FORMATS, true)
             || ! is_array($file) || ! is_array($file['files'] ?? null) || ! array_is_list($file['files'])) {
             return $preview;
         }

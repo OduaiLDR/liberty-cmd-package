@@ -15,15 +15,15 @@ final class SmsRunEmailMessage
         if (! is_int($target) || SmsRunOptions::fromStored(json_encode($options, JSON_THROW_ON_ERROR), $target) !== $options
             || ($options['options_version'] ?? null) !== SmsRunOptions::PLANNED_DATE_VERSION
             || ($options['filename_version'] ?? null) !== SmsRunOptions::APPROVAL_FILENAME_VERSION
-            || ($options['csv_format'] ?? null) !== SmsRunOptions::CSV_FORMAT
+            || ! in_array($options['csv_format'] ?? null, SmsRunOptions::CSV_FORMATS, true)
             || $selected < 1 || $selected > $target) {
-            throw new InvalidArgumentException('SMS email requires canonical approved four-column run options and a nonempty selection.');
+            throw new InvalidArgumentException('SMS email requires canonical approved run options and a nonempty selection.');
         }
         $parts = $manifest['parts'] ?? null;
         $count = (int) ceil($selected / $options['rows_per_file']);
         if (($manifest['version'] ?? null) !== 1 || ($manifest['rows'] ?? null) !== $selected
             || ($manifest['rows_per_file'] ?? null) !== $options['rows_per_file']
-            || ($manifest['csv_format'] ?? null) !== SmsRunOptions::CSV_FORMAT
+            || ($manifest['csv_format'] ?? null) !== $options['csv_format']
             || ($manifest['options_sha256'] ?? null) !== hash('sha256', json_encode($options, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR))
             || ! is_array($parts) || ! array_is_list($parts) || count($parts) !== $count
             || ! array_is_list($links) || count($links) !== $count || $count > SmsRunArtifactBundle::MAX_PARTS) {

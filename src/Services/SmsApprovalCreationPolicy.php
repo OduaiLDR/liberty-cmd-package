@@ -20,7 +20,7 @@ final class SmsApprovalCreationPolicy
         SmsRecordPolicy::assertReady();
         if (($options['filename_version'] ?? null) !== SmsRunOptions::APPROVAL_FILENAME_VERSION
             || ($options['options_version'] ?? null) !== SmsRunOptions::PLANNED_DATE_VERSION
-            || ($options['csv_format'] ?? null) !== SmsRunOptions::CSV_FORMAT) {
+            || ! in_array($options['csv_format'] ?? null, SmsRunOptions::CSV_FORMATS, true)) {
             throw new HttpException(409, 'New SMS batches require the approval workflow. Refresh the SMS page before creating a batch.');
         }
     }
