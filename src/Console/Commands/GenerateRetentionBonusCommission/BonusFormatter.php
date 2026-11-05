@@ -160,7 +160,8 @@ class BonusFormatter
         ?string $agentFilter = null,
         string $sourceCode = '',
         ?array $rosterAgents = null,
-        array $unassigned = []
+        array $unassigned = [],
+        ?string $outputDirectory = null
     ): ?array {
         try {
             $rows = RetentionAgentIdentity::canonicalizeRows($rows);
@@ -353,7 +354,7 @@ class BonusFormatter
 
             $suffix   = $agentFilter !== null ? $this->safeFilenamePart($agentFilter) : 'All';
             $filename = "Retention Lookback Commission - {$source} - {$suffix}.xlsx";
-            $path     = storage_path("app/{$filename}");
+            $path     = $outputDirectory === null ? storage_path("app/{$filename}") : rtrim($outputDirectory, '/\\') . '/' . $filename;
             (new Xlsx($sp))->save($path);
 
             return ['filename' => $filename, 'path' => $path];

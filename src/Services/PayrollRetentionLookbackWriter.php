@@ -12,9 +12,11 @@ final class PayrollRetentionLookbackWriter
      * success is required in addition to this feed marker: a failed feed leaves
      * the completed bonus component in Azure but can never mark payroll ready.
      */
-    public static function replaceCalculatedResults(DBConnector $sql, string $source, string $periodStart, string $runId, array $calculatedRows, array $bonusResults): array
+    public static function replaceCalculatedResults(DBConnector $sql, string $source, string $periodStart, string $runId, array $calculatedRows, array $bonusResults, ?array $prepared = null): array
     {
-        $prepared = self::prepare($sql, $source, $periodStart, $runId, $calculatedRows);
+        $prepared ??= self::prepare($sql, $source, $periodStart, $runId, $calculatedRows);
+        self::validateManifest($prepared);
+        if ($prepared['source'] !== $source || $prepared['periodStart'] !== $periodStart || $prepared['runId'] !== $runId) throw new \InvalidArgumentException('Lookback prepared identity differs from publication.');
         $result = CommissionResultsWriter::replaceComponent($sql, 'retention', $source, $periodStart, 'Bonus_Commission', $bonusResults);
         self::publish($sql, $prepared);
         return $result;
@@ -99,16 +101,96 @@ final class PayrollRetentionLookbackWriter
     /** Atomic source replacement and completion marker; previous source data survives failure. */
     public static function publish(DBConnector $sql, array $prepared): array
     {
-        self::validateScope($prepared['source'] ?? '', $prepared['periodStart'] ?? '', $prepared['runId'] ?? '');
-        if (!is_array($prepared['rows'] ?? null)
-            || self::manifest($prepared['source'], $prepared['periodStart'], $prepared['runId'], $prepared['rows']) !== $prepared) {
-            throw new \InvalidArgumentException('Lookback deduction feed manifest changed after identity validation.');
-        }
+        self::validateManifest($prepared);
         $pdo = $sql->getSqlServerConnection();
         if ($pdo->inTransaction()) throw new \LogicException('Lookback deduction feed replacement requires its own transaction.');
         self::ensureTables($sql);
         if (!$pdo->beginTransaction()) throw new \RuntimeException('Lookback deduction feed transaction could not begin.');
         try {
+            self::publishInTransaction($sql, $prepared);
+            if (!$pdo->commit()) throw new \RuntimeException('Commit was not confirmed.');
+            return array_diff_key($prepared, ['rows' => true]);
+        } catch (\Throwable $error) {
+            if ($pdo->inTransaction()) $pdo->rollBack();
+            throw new \RuntimeException('Lookback deduction feed replacement failed; do not mark this report ready. ' . $error->getMessage(), 0, $error);
+        }
+    }
+
+    public static function supportsArchivedApplication(): bool { return true; }
+
+    /** Both reviewed manifests commit together; a retry never appends deductions. */
+    public static function publishBoth(DBConnector $sql, array $manifests, string $capturedAt): array
+    {
+        if (array_keys($manifests) !== ['ldr', 'plaw']) throw new \InvalidArgumentException('Exactly both archived Lookback brands are required.');
+        if (!preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$/D', $capturedAt)) throw new \InvalidArgumentException('An actual Lookback capture start is required.');
+        $captured = (new \DateTimeImmutable($capturedAt))->setTimezone(new \DateTimeZone('UTC'));
+        foreach ($manifests as $source => $manifest) {
+            self::validateManifest($manifest);
+            if ($manifest['source'] !== $source || $manifest['periodStart'] !== $manifests['ldr']['periodStart'] || $manifest['runId'] !== $manifests['ldr']['runId']) throw new \InvalidArgumentException('Archived Lookback scopes differ.');
+        }
+        $seen = [];
+        foreach ($manifests as $manifest) foreach ($manifest['rows'] as $row) {
+            if (isset($seen[$row['CID']])) throw new \InvalidArgumentException('A client occurs in both archived Lookback brands.');
+            $seen[$row['CID']] = true;
+        }
+        $pdo = $sql->getSqlServerConnection();
+        if ($pdo->inTransaction()) throw new \LogicException('Archived Lookback application requires its own transaction.');
+        self::ensureTables($sql);
+        self::execute($sql, "IF COL_LENGTH('dbo.TblPayrollRetentionLookbackRuns','Capture_Started_At') IS NULL ALTER TABLE dbo.TblPayrollRetentionLookbackRuns ADD Capture_Started_At DATETIME2 NULL;");
+        if (!$pdo->beginTransaction()) throw new \RuntimeException('Archived Lookback transaction could not begin.');
+        try {
+            $period = $manifests['ldr']['periodStart'];
+            // DBConnector fetches rows only for batches beginning SELECT/WITH.
+            // Let SQL enforce the lock result; an EXEC batch returns no data.
+            self::execute($sql, "DECLARE @result INT; EXEC @result=sys.sp_getapplock @Resource=?,@LockMode='Exclusive',@LockOwner='Transaction',@LockTimeout=10000; IF @result<0 THROW 51000,'Lookback application lock is unavailable.',1;", ['payroll-lookback-apply:' . $period]);
+            $current = self::read($sql, 'SELECT Source,Run_ID,Payload_SHA256,Capture_Started_At,Completed_At FROM dbo.TblPayrollRetentionLookbackRuns WITH (UPDLOCK,HOLDLOCK) WHERE Period_Start=CAST(? AS DATE) ORDER BY Source', [$period]);
+            $same = count($current) === 2;
+            foreach ($current as $marker) {
+                $source = $marker['Source'] ?? '';
+                if (!isset($manifests[$source])) throw new \RuntimeException('An unknown Lookback brand is present.');
+                $same = $same && ($marker['Run_ID'] ?? null) === $manifests[$source]['runId'] && ($marker['Payload_SHA256'] ?? null) === $manifests[$source]['payloadSha256'];
+                $previous = $marker['Capture_Started_At'] ?? $marker['Completed_At'] ?? null;
+                $previous = $previous instanceof \DateTimeInterface ? $previous->format('Y-m-d H:i:s.u') : (string) $previous;
+                $previous = preg_replace('/(\.\d{6})\d+/', '$1', $previous) ?? $previous;
+                if ($previous !== '') $previous = (new \DateTimeImmutable($previous, new \DateTimeZone('UTC')))->format('Y-m-d H:i:s.u');
+                if (($marker['Run_ID'] ?? null) !== $manifests[$source]['runId'] && $previous !== '' && $previous >= $captured->format('Y-m-d H:i:s.u')) throw new \RuntimeException('A newer or concurrent Lookback capture is already applied.');
+            }
+            if (!$same) foreach ($manifests as $manifest) {
+                self::publishInTransaction($sql, $manifest);
+                self::execute($sql, 'UPDATE dbo.TblPayrollRetentionLookbackRuns SET Capture_Started_At=CAST(? AS DATETIME2) WHERE Source=? AND Period_Start=CAST(? AS DATE) AND Run_ID=?', [$captured->format('Y-m-d H:i:s.u'), $manifest['source'], $period, $manifest['runId']]);
+            }
+            if (!$pdo->commit()) throw new \RuntimeException('Archived Lookback commit was not confirmed.');
+            return ['ready' => true, 'applied' => true, 'alreadyApplied' => $same, 'period' => $period, 'runId' => $manifests['ldr']['runId'],
+                'markers' => array_map(static fn ($m) => array_diff_key($m, ['rows' => true]), $manifests)];
+        } catch (\Throwable $error) {
+            if ($pdo->inTransaction()) $pdo->rollBack();
+            throw new \RuntimeException('Archived Lookback application failed; both previous brands were preserved. ' . $error->getMessage(), 0, $error);
+        }
+    }
+
+    public static function validateManifest(array $prepared): void
+    {
+        self::validateScope($prepared['source'] ?? '', $prepared['periodStart'] ?? '', $prepared['runId'] ?? '');
+        if (count($prepared) !== 8 || !is_array($prepared['rows'] ?? null) || !array_is_list($prepared['rows'])) throw new \InvalidArgumentException('Lookback deduction manifest requires canonical rows.');
+        $previous = null;
+        foreach ($prepared['rows'] as $row) {
+            $amount = $row['Agent_Deduction'] ?? null; $pk = $row['Employee_PK'] ?? null; $agent = $row['Agent'] ?? null;
+            if (!is_array($row) || count($row) !== 5 || !is_string($row['CID'] ?? null) || !preg_match('/^LLG-[1-9]\d*$/D', $row['CID']) || strlen($row['CID']) > 64
+                || ($previous !== null && strcmp($previous, $row['CID']) >= 0)
+                || ($pk !== null && (!is_int($pk) || $pk < 1 || $pk > 2147483647))
+                || ($agent !== null && (!is_string($agent) || $agent === '' || strlen($agent) > 200 || self::cleanName($agent) !== $agent))
+                || ($amount === null ? ($row['Exclusion_Reason'] ?? null) !== 'default_rate_no_deduction'
+                    : ((!is_int($amount) && !is_float($amount)) || !is_finite((float) $amount) || $amount < 0 || $amount > 9999999999999999.99 || round($amount, 2) != $amount || ($row['Exclusion_Reason'] ?? null) !== null))
+                || ($amount > 0 && ($pk === null || $agent === null))) throw new \InvalidArgumentException('Lookback deduction manifest contains an invalid canonical row.');
+            $previous = $row['CID'];
+        }
+        if (self::manifest($prepared['source'], $prepared['periodStart'], $prepared['runId'], $prepared['rows']) !== $prepared) {
+            throw new \InvalidArgumentException('Lookback deduction feed manifest changed after identity validation.');
+        }
+    }
+
+    private static function publishInTransaction(DBConnector $sql, array $prepared): void
+    {
             // Serialize replacement even when the first source-period marker has
             // not been inserted yet. The primary key makes this a range lock.
             self::execute($sql, 'SELECT Source FROM dbo.TblPayrollRetentionLookbackRuns WITH (UPDLOCK,HOLDLOCK) WHERE Source=? AND Period_Start=CAST(? AS DATE)', [$prepared['source'], $prepared['periodStart']]);
@@ -128,12 +210,6 @@ final class PayrollRetentionLookbackWriter
                 WHEN NOT MATCHED THEN INSERT(Source,Period_Start,Run_ID,Row_Count,Deduction_Row_Count,Exclusion_Row_Count,Payload_SHA256,Completed_At)
                     VALUES(s.Source,s.Period_Start,s.Run_ID,s.Row_Count,s.Deduction_Row_Count,s.Exclusion_Row_Count,s.Payload_SHA256,SYSUTCDATETIME());',
                 [$prepared['source'], $prepared['periodStart'], $prepared['runId'], $prepared['rowCount'], $prepared['deductionRowCount'], $prepared['exclusionRowCount'], $prepared['payloadSha256']]);
-            if (!$pdo->commit()) throw new \RuntimeException('Commit was not confirmed.');
-            return array_diff_key($prepared, ['rows' => true]);
-        } catch (\Throwable $error) {
-            if ($pdo->inTransaction()) $pdo->rollBack();
-            throw new \RuntimeException('Lookback deduction feed replacement failed; do not mark this report ready. ' . $error->getMessage(), 0, $error);
-        }
     }
 
     private static function manifest(string $source, string $periodStart, string $runId, array $rows): array
