@@ -14,6 +14,153 @@ use ZipArchive;
 /** Employee-only explanation of immutable prices. No source queries, tier lookup or allocation from totals. */
 final class CustomerServiceCalculationSnapshot
 {
+    /** Select an employee from independently captured components, without requiring an unrelated complete CS bundle. */
+    public static function forArchivedAgent(array $artifacts, string $period, string $report, string $agentKey, string $sourceScope): array
+    {
+        self::validateArchivedSelection($period, $report, $agentKey, $sourceScope);
+        $family = match ($report) { 'retention_lookback' => 'lookback', 'retention_regular' => 'retention', default => 'nsf' };
+        return self::selectArchivedAgent($artifacts, $period, $report, $family, $agentKey, $sourceScope);
+    }
+
+    public static function validateArchivedSelection(string $period, string $report, string $agentKey, string $sourceScope): void
+    {
+        if (!in_array($report, ['nsf', 'retention_lookback', 'retention_regular'], true)
+            || !in_array($sourceScope, ['ldr', 'plaw', 'both'], true)
+            || !preg_match('/^[1-9]\d{3}-(0[1-9]|1[0-2])-01$/D', $period)
+            || !mb_check_encoding($agentKey, 'UTF-8') || mb_strlen($agentKey, 'UTF-8') < 1 || mb_strlen($agentKey, 'UTF-8') > 200
+            || preg_match('/[\x00-\x1f\x7f]/u', $agentKey) || self::key($agentKey) !== $agentKey) {
+            throw new \InvalidArgumentException('Archived calculation requires an exact normalized employee, report, company and month.');
+        }
+    }
+
+    private static function selectArchivedAgent(array $artifacts, string $period, string $report, string $family, string $agentKey, string $sourceScope): array
+    {
+        if (count($artifacts) !== 2 || array_diff([$family . '_ldr', $family . '_plaw'], array_keys($artifacts))) self::invalid();
+        // Both source files and contexts are validated even for a one-company request.
+        $validated = [];
+        foreach (['ldr', 'plaw'] as $source) {
+            $key = $family . '_' . $source;
+            $artifact = $artifacts[$key];
+            self::validateArchivedArtifact($artifact, $key, $period);
+            if ($report === 'retention_regular' && isset($artifact['context']['legacyEvidence'])) {
+                $evidence = $artifact['context']['legacyEvidence'];
+                if (($evidence['source'] ?? null) !== $source || ($evidence['period'] ?? null) !== $period
+                    || ($evidence['workbookSha256'] ?? null) !== $artifact['sha256']
+                    || ($evidence['historicalLinePricing'] ?? null) !== 'unverified' || ($evidence['eligibleForPayment'] ?? null) !== false
+                    || array_key_exists('commissionResults', $artifact['context'])) self::invalid();
+                $parsed = LegacyRetentionWorkbook::read($artifact['path'], $source, $artifact['sha256']);
+                if ($parsed['entries'] !== ($evidence['summaryEntries'] ?? null)) self::invalid();
+                $matches = array_values(array_filter($parsed['entries'], static fn ($row) => self::archivedAgentKey(self::key($row['agent'])) === self::archivedAgentKey($agentKey)));
+                if (count($matches) > 1) self::invalid();
+                $amount = $matches ? $matches[0]['commission_cents'] / 100 : null;
+                $validated[$source] = [$artifact, $amount, true, $matches ? self::key($matches[0]['agent']) : $agentKey];
+            } else {
+                $context = $artifact['context']['commissionResults'] ?? null;
+                $kind = $family === 'nsf' ? 'nsf' : 'retention';
+                $component = $family === 'lookback' ? 'bonusCommission' : 'commission';
+                if (!is_array($context) || ($context['reportKind'] ?? null) !== $kind || ($context['source'] ?? null) !== $source
+                    || ($context['period'] ?? null) !== $period || ($context['component'] ?? null) !== $component
+                    || ($context['complete'] ?? null) !== true || !is_array($context['rows'] ?? null)
+                    || !array_is_list($context['rows']) || ($family === 'nsf' && ($context['coverageBasis'] ?? null) !== PayrollCommissionResultSnapshot::NSF_ALL_PRICED_AGENTS)) self::invalid();
+                $checked = PayrollCommissionResultSnapshot::component($kind, $source, $period, $component, $context['rows'], $context['coverageBasis'] ?? null);
+                if (json_encode($checked, JSON_THROW_ON_ERROR) !== json_encode($context, JSON_THROW_ON_ERROR)) self::invalid();
+                $matches = array_values(array_filter($context['rows'], static fn ($row) => self::archivedAgentKey($row['agentKey']) === self::archivedAgentKey($agentKey)));
+                if (count($matches) > 1) self::invalid();
+                $validated[$source] = [$artifact, $matches ? (float) $matches[0]['amount'] : null, false, $matches ? $matches[0]['agentKey'] : $agentKey];
+            }
+        }
+        $components = [];
+        foreach ($sourceScope === 'both' ? ['ldr', 'plaw'] : [$sourceScope] as $source) {
+            [$artifact, $amount, $legacy, $sourceAgentKey] = $validated[$source];
+            if ($amount === null) {
+                if ($sourceScope !== 'both') throw new \RuntimeException('The pinned source has no exact captured employee identity.');
+                continue;
+            }
+            $entry = ['reportKey' => $family . '_' . $source, 'source' => $source,
+                'sourceAgentKey' => $sourceAgentKey,
+                'artifactSha256' => $artifact['sha256'], 'contextSha256' => $artifact['contextSha256'],
+                'component' => $family === 'lookback' ? 'bonusCommission' : 'commission', 'amount' => $amount,
+                'status' => 'verified', 'lines' => []];
+            if ($legacy) {
+                $entry = self::unavailable($entry, 'The original workbook preserves account data and the saved total, but not verified historical selected line prices.');
+                $entry['originalRows'] = self::legacyOriginalRows($artifact, $sourceAgentKey);
+            } elseif ($family === 'retention' && isset($artifact['context']['regularPricing'])) {
+                $entry['lines'] = self::regular($artifact, $period, $sourceAgentKey);
+            } elseif ($amount != 0.0) {
+                $lines = match ($family) { 'nsf' => self::nsf($artifact, $sourceAgentKey, $amount), 'lookback' => self::lookback($artifact, $sourceAgentKey), default => null };
+                if ($lines === null) $entry = self::unavailable($entry, 'The original workbook does not retain trustworthy selected line prices for this component.');
+                else $entry['lines'] = $lines;
+            }
+            if (count($entry['lines']) > 20000) self::invalid();
+            if ($entry['status'] === 'verified' && round(array_sum(array_column($entry['lines'], 'amount')), 2) !== round((float) $amount, 2)) self::invalid();
+            if (is_link($artifact['path']) || !hash_equals($artifact['sha256'], (string) hash_file('sha256', $artifact['path']))) self::invalid();
+            $components[] = $entry;
+        }
+        return ['kind' => 'cs_archived_agent_calculation_v1', 'version' => 1, 'period' => $period,
+            'report' => $report, 'agentKey' => $agentKey, 'sourceScope' => $sourceScope, 'components' => $components];
+    }
+
+    /** Existing explicitly allowlisted spellings only; never fuzzy identity or mailbox matching. */
+    private static function archivedAgentKey(string $key): string
+    {
+        return ['aleph bolanos' => 'aleph bolaños', 'andrea mendoze' => 'andrea mendoza', 'andrea galves' => 'andrea galvez'][$key] ?? $key;
+    }
+
+    private static function validateArchivedArtifact(mixed $artifact, string $key, string $period): void
+    {
+        if (!is_array($artifact) || ($artifact['key'] ?? null) !== $key || ($artifact['period'] ?? $period) !== $period
+            || !is_array($artifact['context'] ?? null) || !is_string($artifact['path'] ?? null)
+            || is_link($artifact['path']) || !is_file($artifact['path']) || !is_readable($artifact['path'])
+            || !is_string($artifact['sha256'] ?? null) || !preg_match('/^[a-f0-9]{64}$/D', $artifact['sha256'])
+            || !is_string($artifact['contextSha256'] ?? null) || !preg_match('/^[a-f0-9]{64}$/D', $artifact['contextSha256'])
+            || hash('sha256', json_encode($artifact['context'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)) !== $artifact['contextSha256']) self::invalid();
+        clearstatcache(true, $artifact['path']);
+        if (filesize($artifact['path']) < 4 || filesize($artifact['path']) > 32 * 1024 * 1024
+            || isset($artifact['byteLength']) && $artifact['byteLength'] !== filesize($artifact['path'])
+            || !hash_equals($artifact['sha256'], (string) hash_file('sha256', $artifact['path']))) self::invalid();
+        $zip = new ZipArchive;
+        if ($zip->open($artifact['path'], ZipArchive::RDONLY) !== true) self::invalid();
+        try {
+            $size = 0;
+            for ($i = 0; $i < $zip->numFiles; $i++) { $entry = $zip->statIndex($i); if (!is_array($entry)) self::invalid(); $size += (int) ($entry['size'] ?? 0); }
+            if ($size > 128 * 1024 * 1024 || $zip->locateName('xl/workbook.xml') === false || $zip->locateName('[Content_Types].xml') === false) self::invalid();
+        } finally { $zip->close(); }
+    }
+
+    /** Unpriced original facts are deliberately separate from selected payable calculation lines. */
+    private static function legacyOriginalRows(array $artifact, string $agentKey): array
+    {
+        $book = self::book($artifact);
+        try {
+            $sheet = $book->getSheetByName('Retention Data');
+            if (!$sheet || $sheet->getHighestDataRow() > 100000) self::invalid();
+            $headers = self::headers($sheet);
+            foreach (['id', 'retention agent', 'retention date', 'retention payment date', 't1 rate', 't2 rate', 't3 rate'] as $required) if (!isset($headers[$required])) self::invalid();
+            $rows = [];
+            for ($r = 2; $r <= $sheet->getHighestDataRow(); $r++) {
+                $name = self::value($sheet, $headers['retention agent'], $r);
+                if (!is_string($name) || self::key($name) !== $agentKey) continue;
+                $row = ['detailRow' => $r, 'clientId' => self::id(self::value($sheet, $headers['id'], $r))];
+                foreach (['retention date' => 'retentionDate', 'retention payment date' => 'paymentDate'] as $header => $field) {
+                    $value = self::dateValue(self::value($sheet, $headers[$header], $r));
+                    if ($value !== null) $row[$field] = $value;
+                }
+                $rates = [null, null, null, null];
+                foreach ([1, 2, 3, 4] as $tier) if (isset($headers['t' . $tier . ' rate'])) {
+                    $value = self::value($sheet, $headers['t' . $tier . ' rate'], $r);
+                    if ($value === null || $value === '') continue;
+                    $rate = self::number($value);
+                    if ($rate < 0) self::invalid();
+                    $rates[$tier - 1] = $rate;
+                }
+                $row['rates'] = $rates;
+                $rows[] = $row;
+                if (count($rows) > 20000) self::invalid();
+            }
+            return $rows;
+        } finally { $book->disconnectWorksheets(); }
+    }
+
     public static function forAgent(array $artifacts, string $period, string $reportKind, string $agentKey, string $sourceScope): array
     {
         if (!in_array($reportKind, ['retention', 'nsf'], true) || !in_array($sourceScope, ['ldr', 'plaw', 'both'], true)
