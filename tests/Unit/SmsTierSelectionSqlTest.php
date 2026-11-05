@@ -48,9 +48,16 @@ test('a tier subset narrows to wanted mailer tiers with one join, in both tier s
     expect(fn () => SmsTierWindowSelectionSql::candidatesSql([]))->toThrow(RuntimeException::class, 'tier');
 });
 
+test('a debt range narrows on the mailer amount, alone or with a tier subset', function (): void {
+    $all = SmsTierWindowSelectionSql::candidatesSql(SmsRunOptions::TIERS, 26000);
+    expect($all)->toContain('WHERE Debt_Amount>=26000)')->not->toContain('Debt_Tier');
+    expect(SmsTierWindowSelectionSql::candidatesSql(['T5'], 26000))->toContain("Debt_Tier IN ('T5','5') AND Debt_Amount>=26000");
+    expect(fn () => SmsTierWindowSelectionSql::candidatesSql(SmsRunOptions::TIERS))->toThrow(RuntimeException::class, 'minimum');
+});
+
 test('tier windows use the candidates only for a subset, and a run step can outlast a two hour selection', function (): void {
     $repository = file_get_contents(dirname(__DIR__, 2).'/src/Repositories/SmsRecordExportRepository.php');
-    expect($repository)->toContain("\$narrowed = \$options['tiers'] !== SmsRunOptions::TIERS;", "from('#SmsTierCandidates as tc')");
+    expect($repository)->toContain("\$narrowed = \$options['tiers'] !== SmsRunOptions::TIERS || \$minimumDebt > 0;", "from('#SmsTierCandidates as tc')");
     $job = new ReflectionClass(Cmd\Reports\Jobs\SmsRunStepJob::class);
     expect($job->getDefaultProperties()['timeout'])->toBe(Cmd\Reports\Services\SmsExportQueue::RUN_STEP_TIMEOUT)
         ->and(Cmd\Reports\Services\SmsExportQueue::RUN_STEP_TIMEOUT)->toBeLessThan(14400);
