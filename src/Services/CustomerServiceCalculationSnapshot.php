@@ -83,7 +83,7 @@ final class CustomerServiceCalculationSnapshot
                 'status' => 'verified', 'lines' => []];
             if ($legacy) {
                 $entry = self::unavailable($entry, 'The original workbook preserves account data and the saved total, but not verified historical selected line prices.');
-                $entry['originalRows'] = self::legacyOriginalRows($artifact, $sourceAgentKey);
+                $entry['originalRows'] = self::legacyOriginalRows($artifact, $period, $sourceAgentKey);
             } elseif ($family === 'retention' && isset($artifact['context']['regularPricing'])) {
                 $entry['lines'] = self::regular($artifact, $period, $sourceAgentKey);
             } elseif ($amount != 0.0) {
@@ -128,7 +128,7 @@ final class CustomerServiceCalculationSnapshot
     }
 
     /** Unpriced original facts are deliberately separate from selected payable calculation lines. */
-    private static function legacyOriginalRows(array $artifact, string $agentKey): array
+    private static function legacyOriginalRows(array $artifact, string $period, string $agentKey): array
     {
         $book = self::book($artifact);
         try {
@@ -145,6 +145,10 @@ final class CustomerServiceCalculationSnapshot
                     $value = self::dateValue(self::value($sheet, $headers[$header], $r));
                     if ($value !== null) $row[$field] = $value;
                 }
+                // These are only candidate earnings for this saved report, not
+                // verified selected prices. Never mix historical assignments
+                // or unretained accounts into the reporting-month detail.
+                if (!isset($row['retentionDate'], $row['paymentDate']) || substr($row['paymentDate'], 0, 7) !== substr($period, 0, 7)) continue;
                 $rates = [null, null, null, null];
                 foreach ([1, 2, 3, 4] as $tier) if (isset($headers['t' . $tier . ' rate'])) {
                     $value = self::value($sheet, $headers['t' . $tier . ' rate'], $r);

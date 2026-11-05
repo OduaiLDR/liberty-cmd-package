@@ -147,6 +147,11 @@ final class CustomerServiceCalculationSnapshotTest extends TestCase
                 ], null, 'A1', true);
                 $book->getSheetByName('Retention Data')->setCellValue('C2', 'Andrea Mendoze');
                 $book->getSheetByName('Retention Data')->setCellValue('I2', null);
+                $book->getSheetByName('Retention Data')->fromArray([
+                    [102, 'Out of period', 'Andrea Mendoze', '2098-01-10', '2098-01-31', 10, 20, 30],
+                    [103, 'Not retained', 'Andrea Mendoze', null, '2098-02-05', 10, 20, 30],
+                    [104, 'No payment', 'Andrea Mendoze', '2098-01-10', null, 10, 20, 30],
+                ], null, 'A4', true);
             });
             $parsed = \Cmd\Reports\Services\LegacyRetentionWorkbook::read($this->artifacts[$key]['path'], $source, $this->artifacts[$key]['sha256']);
             $this->artifacts[$key]['context'] = ['legacyEvidence' => ['source' => $source, 'period' => self::PERIOD,
