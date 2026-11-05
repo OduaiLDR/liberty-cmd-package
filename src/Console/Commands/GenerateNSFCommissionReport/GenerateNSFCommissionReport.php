@@ -68,8 +68,14 @@ class GenerateNSFCommissionReport extends Command
     // Keep monthly NSF/commission snapshots for current month + previous 5 months.
     private const SNAPSHOT_RETENTION_MONTHS = 6;
 
+    public static function supportsQueryOnlyCapture(): bool { return true; }
+
     public function handle(): int
     {
+        if (getenv('PAYROLL_NSF_QUERY_ONLY') === '1' && (!PayrollReportArtifactArchive::captureRequested() || !$this->option('no-email'))) {
+            $this->error('Query-only NSF requires a reserved capture and no email.');
+            return Command::FAILURE;
+        }
         $arg     = strtolower((string) $this->argument('source'));
         $sources = ($arg === 'both') ? ['ldr', 'plaw'] : [$arg];
 
@@ -100,7 +106,7 @@ class GenerateNSFCommissionReport extends Command
         $this->info("[INFO] Period: $startDate → $endDate");
 
         try {
-            $sf  = DBConnector::fromEnvironment($source);
+            $sf  = $this->initSnowflake($source);
             $sql = $this->initSqlServer($source);
         } catch (\Throwable $e) {
             $this->error("[$display] Connector init: " . $e->getMessage());
@@ -111,10 +117,15 @@ class GenerateNSFCommissionReport extends Command
         try {
             // Session ownership survives the writer's COMMIT. All entry points,
             // including scheduled and manual CLI runs, share this source/month lock.
-            $runLock = CommissionReportRunLock::acquire($sql, 'nsf', $source, $startDate);
+            $queryOnly = getenv('PAYROLL_NSF_QUERY_ONLY') === '1';
+            $runLock = $queryOnly ? null : CommissionReportRunLock::acquire($sql, 'nsf', $source, $startDate);
             $readiness = null;
+            $allFile = null;
+            $outputDirectory = null;
             try {
-            $readiness = NsfReportReadiness::begin($sql, $source, $startDate);
+            $readiness = $queryOnly
+                ? NsfReportReadiness::timing($startDate) + ['source' => $source, 'runId' => bin2hex(random_bytes(16))]
+                : NsfReportReadiness::begin($sql, $source, $startDate);
             $dataRows = $this->fetchNSFRows($sf, $cfg, $startDate, $endDate);
             $this->info("[INFO] [$display] NSF rows fetched: " . count($dataRows));
 
@@ -123,7 +134,7 @@ class GenerateNSFCommissionReport extends Command
                 // workbook consumed by CS managers. Returning here leaves both
                 // old payable amounts and an old manager-input snapshot in place.
                 $this->info("[INFO] [$display] Source returned no NSF data; rebuilding this period with zero earnings.");
-                Log::info("GenerateNSFCommissionReport[$display]: no data for $startDate–$endDate");
+                Log::info("GenerateNSFCommissionReport[$display]: no data for {$startDate}–{$endDate}");
             }
 
             // Enrich each row with its valid_commission flag before passing to formatter
@@ -188,8 +199,12 @@ class GenerateNSFCommissionReport extends Command
             // Build before changing payable amounts: failed workbook generation must not
             // leave Azure updated while the manager still has the previous report.
             $formatter = new Formatter();
+            if ($queryOnly) {
+                $outputDirectory = storage_path('app/payroll-nsf-query-tmp/' . getenv('PAYROLL_COMMISSION_RUN_ID') . '/' . $source);
+                if (!is_dir($outputDirectory) && !@mkdir($outputDirectory, 0700, true) && !is_dir($outputDirectory)) throw new \RuntimeException('Cannot create query-only workbook directory.');
+            }
             $allFile = $formatter->buildWorkbook(
-                $dataRows, $commissionRows, $display, $startDate, $endDate, null, $source, $unassigned, $readiness
+                $dataRows, $commissionRows, $display, $startDate, $endDate, null, $source, $unassigned, $readiness, $outputDirectory
             );
             $this->info("[INFO] [$display] Workbook: {$allFile['filename']}");
 
@@ -203,7 +218,7 @@ class GenerateNSFCommissionReport extends Command
             // Verify a staged snapshot before SQL, then publish only after SQL commits.
             // This is ordered publication, not a filesystem/database transaction.
             $nsfResults = array_map(fn ($r) => ['agent' => $r['agent'], 'amount' => $r['commission']], $commissionRows);
-            $snapshotPath = $this->persistWithSnapshot($allFile, $startDate, function () use ($sql, $source, $startDate, $nsfResults): void {
+            $snapshotPath = $queryOnly ? null : $this->persistWithSnapshot($allFile, $startDate, function () use ($sql, $source, $startDate, $nsfResults): void {
                 CommissionResultsWriter::replaceComponent(
                     $sql, 'nsf', $source, $startDate, 'Commission',
                     $nsfResults
@@ -211,11 +226,13 @@ class GenerateNSFCommissionReport extends Command
             });
             $context = PayrollReportArtifactArchive::captureRequested()
                 ? ['commissionResults' => PayrollCommissionResultSnapshot::component('nsf', $source, $startDate, 'commission', $payloads['sourceResults'],
-                    PayrollCommissionResultSnapshot::NSF_ALL_PRICED_AGENTS)] : [];
+                    PayrollCommissionResultSnapshot::NSF_ALL_PRICED_AGENTS)] + ($queryOnly ? ['queryOnly' => true] : []) : [];
             PayrollReportArtifactArchive::captureFromEnvironment('nsf', $source, $startDate, $allFile, $context);
-            NsfReportReadiness::complete($sql, $readiness);
-            $this->info("[INFO] [$display] Snapshot saved: {$snapshotPath}");
-            $this->cleanupOldSnapshots($startDate);
+            if (!$queryOnly) {
+                NsfReportReadiness::complete($sql, $readiness);
+                $this->info("[INFO] [$display] Snapshot saved: {$snapshotPath}");
+                $this->cleanupOldSnapshots($startDate);
+            }
 
             if ($this->option('no-email')) {
                 $this->info("[INFO] [$display] --no-email set; skipping email send.");
@@ -229,7 +246,7 @@ class GenerateNSFCommissionReport extends Command
                 }
             }
             } catch (\Throwable $error) {
-                if ($readiness !== null) {
+                if (!$queryOnly && $readiness !== null) {
                     try { NsfReportReadiness::fail($sql, $readiness); }
                     catch (\Throwable $markerError) {
                         Log::error('NSF readiness failure could not be recorded; payroll readiness is unverified.', ['error' => $markerError->getMessage()]);
@@ -237,7 +254,9 @@ class GenerateNSFCommissionReport extends Command
                 }
                 throw $error;
             } finally {
-                $runLock->release();
+                if ($queryOnly && is_array($allFile) && isset($allFile['path']) && is_file($allFile['path'])) @unlink($allFile['path']);
+                if ($queryOnly && $outputDirectory !== null && is_dir($outputDirectory)) @rmdir($outputDirectory);
+                if ($runLock !== null) $runLock->release();
             }
         } catch (\Throwable $e) {
             $this->error("[$display] Failed: " . $e->getMessage());
@@ -247,7 +266,7 @@ class GenerateNSFCommissionReport extends Command
         return true;
     }
 
-    private function fetchNSFRows(DBConnector $sf, array $cfg, string $startDate, string $endDate): array
+    protected function fetchNSFRows(DBConnector $sf, array $cfg, string $startDate, string $endDate): array
     {
         return NsfCommissionSource::fetch($sf, $cfg, $startDate, $endDate);
     }
@@ -600,7 +619,9 @@ class GenerateNSFCommissionReport extends Command
         @rmdir($path);
     }
 
-    private function initSqlServer(string $source): DBConnector
+    protected function initSnowflake(string $source): DBConnector { return DBConnector::fromEnvironment($source); }
+
+    protected function initSqlServer(string $source): DBConnector
     {
         $c = DBConnector::fromEnvironment($source);
         $c->initializeSqlServer();

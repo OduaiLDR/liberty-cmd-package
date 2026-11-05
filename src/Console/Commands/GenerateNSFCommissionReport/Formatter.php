@@ -38,7 +38,8 @@ class Formatter
         ?string $agentFilter = null,
         string $sourceCode = '',
         array $unassigned = [],
-        ?array $readiness = null
+        ?array $readiness = null,
+        ?string $outputDirectory = null
     ): array {
         $spreadsheet = new Spreadsheet();
 
@@ -73,7 +74,7 @@ class Formatter
         $period   = date('m-Y', strtotime($startDate));
         $suffix   = $agentFilter !== null ? $this->safeFilenamePart($agentFilter) : 'All';
         $filename = "NSF Commission Report - {$source} - {$period} - {$suffix}.xlsx";
-        $path     = storage_path("app/{$filename}");
+        $path     = $outputDirectory === null ? storage_path("app/{$filename}") : $outputDirectory . DIRECTORY_SEPARATOR . $filename;
 
         $writer = new Xlsx($spreadsheet);
         $writer->setPreCalculateFormulas(false);

@@ -109,11 +109,11 @@ class GenerateRetentionManagerCommission extends Command
     }
 
     /** Actual leadership workbooks and matching JSON from archived source bytes only. No email or database lookup. */
-    public function buildPayrollReviewWorkbookBundle(string $startDate, string $endDate, array $artifacts, string $outputDirectory, ?array $calculationContext = null): array
+    public function buildPayrollReviewWorkbookBundle(string $startDate, string $endDate, array $artifacts, string $outputDirectory, ?array $calculationContext = null, bool $onlyNsf = false): array
     {
         $calculationContext = self::validatePayrollCalculationContext($calculationContext ?? self::currentPayrollCalculationContext());
         $retentionRows = [];
-        foreach (['ldr' => 'LDR', 'plaw' => 'Progress Law'] as $source => $display) {
+        foreach ($onlyNsf ? [] : ['ldr' => 'LDR', 'plaw' => 'Progress Law'] as $source => $display) {
             $artifact = $artifacts['retention_' . $source] ?? [];
             $context = $artifact['context'] ?? [];
             if (($context['trancheContextReady'] ?? false) !== true || !is_array($context['trancheByClient'] ?? null)) throw new \RuntimeException('Archived retention leadership context is missing. Rerun the correlated source.');
@@ -146,6 +146,12 @@ class GenerateRetentionManagerCommission extends Command
         $this->payrollFrozenNsfValidity = true;
         $this->payrollCalculationContext = $calculationContext;
         try {
+            if ($onlyNsf) {
+                $snapshot = $this->buildAnthonyPayrollSnapshot($nsfRows);
+                $snapshot['nsfReadinessRunIds'] = $readinessIds;
+                return ['reports' => ['nsf_team_leader' => $snapshot], 'calculationContext' => $calculationContext,
+                    'files' => ['nsf_team_leader' => $this->buildAnthonyWorkbook('NSF Team Leader', $nsfRows)]];
+            }
             $reports = ['retention_manager' => $this->buildRamaPayrollSnapshot($retentionRows),
                 'retention_team_leader' => $this->buildNickPayrollSnapshot($retentionRows, $startDate, $endDate),
                 'nsf_team_leader' => $this->buildAnthonyPayrollSnapshot($nsfRows)];

@@ -16,6 +16,61 @@ class PayrollRetentionLookbackWriterTest extends TestCase
 {
     private const RUN_ID = '40fa42ab6e184576aa34ccd880b45529';
 
+    public function test_archived_both_brand_apply_commits_once_and_retries_without_duplicate_rows(): void
+    {
+        $sql = new LookbackFeedConnector;
+        $manifests = [];
+        foreach (['ldr', 'plaw'] as $source) $manifests[$source] = PayrollRetentionLookbackWriter::prepare($sql, $source, '2098-09-01', self::RUN_ID, []);
+        $result = PayrollRetentionLookbackWriter::publishBoth($sql, $manifests, '2098-10-05T12:00:00+00:00');
+        $this->assertTrue($result['ready']); $this->assertFalse($result['alreadyApplied']);
+        $this->assertSame(1, $sql->pdo->commits);
+        $writes = $sql->writes;
+        $retry = PayrollRetentionLookbackWriter::publishBoth($sql, $manifests, '2098-10-05T12:00:00Z');
+        $this->assertTrue($retry['alreadyApplied']);
+        $this->assertSame(['ldr' => [], 'plaw' => []], $sql->pdo->rows);
+        $this->assertSame($writes + 2, $sql->writes, 'Retry only checks schema; no data replacement.');
+        $this->assertSame(2, $sql->pdo->commits);
+    }
+
+    public function test_second_brand_failure_rolls_back_both_brands_and_prior_markers(): void
+    {
+        $sql = new LookbackFeedConnector;
+        $before = [$sql->pdo->rows, $sql->pdo->markers];
+        $manifests = [];
+        foreach (['ldr', 'plaw'] as $source) $manifests[$source] = PayrollRetentionLookbackWriter::prepare($sql, $source, '2098-09-01', self::RUN_ID, []);
+        $sql->failure = 'second_marker';
+        try { PayrollRetentionLookbackWriter::publishBoth($sql, $manifests, '2098-10-05T12:00:00Z'); $this->fail('Both-brand failure must reject.'); }
+        catch (\RuntimeException $e) { $this->assertStringContainsString('both previous brands were preserved', $e->getMessage()); }
+        $this->assertSame($before, [$sql->pdo->rows, $sql->pdo->markers]);
+        $this->assertSame(0, $sql->pdo->commits); $this->assertSame(1, $sql->pdo->rollbacks);
+    }
+
+    public function test_older_archive_cannot_replace_a_newer_applied_capture(): void
+    {
+        $sql = new LookbackFeedConnector;
+        $manifests = [];
+        foreach (['ldr', 'plaw'] as $source) $manifests[$source] = PayrollRetentionLookbackWriter::prepare($sql, $source, '2098-09-01', self::RUN_ID, []);
+        PayrollRetentionLookbackWriter::publishBoth($sql, $manifests, '2098-10-06T12:00:00Z');
+        $older = [];
+        foreach (['ldr', 'plaw'] as $source) $older[$source] = PayrollRetentionLookbackWriter::prepare($sql, $source, '2098-09-01', str_repeat('c', 32), []);
+        $before = [$sql->pdo->rows, $sql->pdo->markers];
+        try { PayrollRetentionLookbackWriter::publishBoth($sql, $older, '2098-10-05T12:00:00Z'); $this->fail('Older capture must reject.'); }
+        catch (\RuntimeException $e) { $this->assertStringContainsString('newer or concurrent', $e->getMessage()); }
+        $this->assertSame($before, [$sql->pdo->rows, $sql->pdo->markers]);
+    }
+
+    public function test_lock_failure_preserves_both_sources_and_never_requires_exec_batch_rows(): void
+    {
+        $sql = new LookbackFeedConnector;
+        $manifests = [];
+        foreach (['ldr', 'plaw'] as $source) $manifests[$source] = PayrollRetentionLookbackWriter::prepare($sql, $source, '2098-09-01', self::RUN_ID, []);
+        $before = [$sql->pdo->rows, $sql->pdo->markers];
+        $sql->failure = 'lock';
+        try { PayrollRetentionLookbackWriter::publishBoth($sql, $manifests, '2098-10-06T12:00:00Z'); $this->fail('Unavailable lock must reject.'); }
+        catch (\RuntimeException) { $this->assertSame($before, [$sql->pdo->rows, $sql->pdo->markers]); }
+        $this->assertSame(1, $sql->pdo->rollbacks);
+    }
+
     public function test_calculated_sales_deductions_publish_canonical_identity_and_completed_run(): void
     {
         $sql = new LookbackFeedConnector;
@@ -255,11 +310,14 @@ final class LookbackFeedConnector extends DBConnector
     public function querySqlServer(string $sql, array $params = []): array
     {
         $this->queries[] = $sql;
+        if (str_starts_with($sql, 'DECLARE @result')) return ['success' => $this->failure !== 'lock', 'data' => []];
+        if (str_starts_with($sql, 'SELECT Source,Run_ID')) return ['success' => true, 'data' => array_map(static fn ($source, $m) => ['Source' => $source, 'Run_ID' => $m['runId'], 'Payload_SHA256' => $m['payloadSha256'] ?? null, 'Capture_Started_At' => $m['capturedAt'] ?? null], array_keys($this->pdo->markers), array_values($this->pdo->markers))];
         if (str_starts_with($sql, 'SELECT LLG_ID')) return ['success' => true, 'data' => $this->enrollments];
         if (str_starts_with($sql, 'SELECT PK')) return ['success' => true, 'data' => $this->employees];
         if (str_starts_with($sql, 'SELECT Source')) return ['success' => true, 'data' => []];
         $this->writes++;
-        if (str_starts_with($sql, 'IF OBJECT_ID') || str_starts_with($sql, 'IF NOT EXISTS')) return ['success' => true];
+        if (str_starts_with($sql, 'IF OBJECT_ID') || str_starts_with($sql, 'IF NOT EXISTS') || str_starts_with($sql, 'IF COL_LENGTH')) return ['success' => true];
+        if (str_starts_with($sql, 'UPDATE dbo.TblPayrollRetentionLookbackRuns SET Capture_Started_At')) { $this->pdo->markers[$params[1]]['capturedAt'] = $params[0]; return ['success' => true]; }
         if (str_starts_with($sql, 'UPDATE dbo.TblCommissionReviewResults')) {
             foreach ($this->pdo->bonusRows as &$value) $value = 0.0;
             return ['success' => true];
@@ -276,8 +334,8 @@ final class LookbackFeedConnector extends DBConnector
             return ['success' => true];
         }
         if (str_starts_with($sql, 'MERGE dbo.TblPayrollRetentionLookbackRuns')) {
-            if ($this->failure === 'marker') return ['success' => false];
-            $this->pdo->markers[$params[0]] = ['runId' => $params[2], 'rowCount' => $params[3]];
+            if ($this->failure === 'marker' || $this->failure === 'second_marker' && $params[0] === 'plaw') return ['success' => false];
+            $this->pdo->markers[$params[0]] = ['runId' => $params[2], 'rowCount' => $params[3], 'payloadSha256' => $params[6]];
             $this->pdo->failCommit = $this->failure === 'commit';
             return ['success' => true];
         }

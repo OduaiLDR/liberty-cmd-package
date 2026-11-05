@@ -41,6 +41,8 @@ class GenerateRetentionBonusCommission extends Command
 
     protected $description = 'Generate Retention Lookback Commission report for LDR and/or PLAW.';
 
+    public static function supportsQueryOnlyCapture(): bool { return true; }
+
     private const SOURCE_CONFIG = [
         'ldr' => [
             'display'           => 'LDR',
@@ -60,6 +62,10 @@ class GenerateRetentionBonusCommission extends Command
 
     public function handle(): int
     {
+        if (getenv('PAYROLL_LOOKBACK_QUERY_ONLY') === '1' && (!PayrollReportArtifactArchive::captureRequested() || !$this->option('no-email'))) {
+            $this->error('Query-only Lookback requires a reserved archive capture and --no-email.');
+            return Command::FAILURE;
+        }
         $arg     = strtolower((string)$this->argument('source'));
         $sources = ($arg === 'both') ? ['ldr', 'plaw'] : [$arg];
         $period  = trim((string) $this->argument('period'));
@@ -116,13 +122,16 @@ class GenerateRetentionBonusCommission extends Command
         $this->info("[INFO] Report cutoff period: $reportStartDate → $endDate; reconsideration on or before each client's cutoff");
 
         try {
-            $sf  = DBConnector::fromEnvironment($source);
+            $sf  = $this->initSnowflake($source);
             $sql = $this->initSqlServer($source);
         } catch (\Throwable $e) {
             $this->error("[$display] Connector init: " . $e->getMessage());
             return false;
         }
 
+        $queryOnly = getenv('PAYROLL_LOOKBACK_QUERY_ONLY') === '1';
+        $outputDirectory = null;
+        $allFile = null;
         try {
             // Actual reconsideration events select the population; custom fields
             // supply attribution only and cannot substitute for status history.
@@ -200,7 +209,7 @@ class GenerateRetentionBonusCommission extends Command
             // Read dated deposits once and count only those cleared by each client's cutoff.
             if ($rows !== []) {
                 $otherSource = $source === 'ldr' ? 'plaw' : 'ldr';
-                $otherPayments = DBConnector::fromEnvironment($otherSource);
+                $otherPayments = $this->initSnowflake($otherSource);
                 $rows = $this->applyPaymentCountsByCutoff($rows, $sf, $otherPayments, $idList);
             }
 
@@ -305,8 +314,12 @@ class GenerateRetentionBonusCommission extends Command
             }
 
             $formatter = new BonusFormatter();
+            if ($queryOnly) {
+                $outputDirectory = storage_path('app/payroll-lookback-query-tmp/' . $runId . '/' . $source);
+                if (!is_dir($outputDirectory) && !@mkdir($outputDirectory, 0700, true) && !is_dir($outputDirectory)) throw new \RuntimeException('Cannot create isolated Lookback workbook directory.');
+            }
             $allFile = $formatter->buildWorkbook(
-                $rows, $display, $reportStartDate, $endDate, $employeeMap, null, $source, $rosterAgents, $unassigned
+                $rows, $display, $reportStartDate, $endDate, $employeeMap, null, $source, $rosterAgents, $unassigned, $outputDirectory
             );
 
             if (!$allFile) {
@@ -315,18 +328,22 @@ class GenerateRetentionBonusCommission extends Command
 
             // A reviewable workbook must exist before replacing payable Azure
             // rows. Reset and replacement then share one transaction.
+            $salesManifest = PayrollReportArtifactArchive::captureRequested()
+                ? PayrollRetentionLookbackWriter::prepare($sql, $source, $reportStartDate, $runId, $rows) : null;
             $persisted = $this->persistBonusResults(
                 $sql, $source, $reportStartDate, $bonusResults,
-                (bool) $this->option('no-azure-write'), $rows, $runId
+                $queryOnly || (bool) $this->option('no-azure-write'), $rows, $runId, $salesManifest
             );
             if ($persisted === null) {
                 $this->info("[INFO] [$display] --no-azure-write set; calculated results were not written to Azure.");
             } elseif ($notice = CommissionResultsWriter::failureNotice($persisted, $display)) {
                 $this->warn($notice);
             }
-            if (!(bool) $this->option('no-azure-write')) {
+            if ($queryOnly || !(bool) $this->option('no-azure-write')) {
                 $context = PayrollReportArtifactArchive::captureRequested()
                     ? ['commissionResults' => PayrollCommissionResultSnapshot::component('retention', $source, $reportStartDate, 'bonusCommission', $bonusResults)] : [];
+                if ($salesManifest !== null) $context['salesDeductions'] = $salesManifest;
+                if ($queryOnly) $context['queryOnly'] = true;
                 PayrollReportArtifactArchive::captureFromEnvironment('lookback', $source, $reportStartDate, $allFile, $context);
             }
 
@@ -358,6 +375,9 @@ class GenerateRetentionBonusCommission extends Command
             $this->error("[$display] Failed: " . $e->getMessage());
             Log::error("GenerateRetentionBonusCommission[$display]: failed", ['ex' => $e]);
             return false;
+        } finally {
+            if ($queryOnly && is_array($allFile) && isset($allFile['path']) && is_file($allFile['path'])) @unlink($allFile['path']);
+            if ($queryOnly && $outputDirectory !== null && is_dir($outputDirectory)) @rmdir($outputDirectory);
         }
         return true;
     }
@@ -426,7 +446,8 @@ class GenerateRetentionBonusCommission extends Command
         array $bonusResults,
         bool $noAzureWrite,
         array $lookbackRows = [],
-        ?string $runId = null
+        ?string $runId = null,
+        ?array $preparedSales = null
     ): ?array {
         if ($noAzureWrite) {
             return null;
@@ -443,7 +464,7 @@ class GenerateRetentionBonusCommission extends Command
         // command complete only when both succeed, before any report delivery.
         return PayrollRetentionLookbackWriter::replaceCalculatedResults(
             $sql, $source, $periodStart, $correlatedRunId,
-            $lookbackRows, $bonusResults
+            $lookbackRows, $bonusResults, $preparedSales
         );
     }
 
@@ -534,7 +555,7 @@ class GenerateRetentionBonusCommission extends Command
     }
 
     /** Raw candidates; the caller checks duplicates after narrowing to the cutoff month. */
-    private function fetchBase(DBConnector $sf, array $cfg, string $end): array
+    protected function fetchBase(DBConnector $sf, array $cfg, string $end): array
     {
         $ca = (int)$cfg['custom_agent'];
         $cd = (int)$cfg['custom_date'];
@@ -661,7 +682,7 @@ class GenerateRetentionBonusCommission extends Command
      * First reconsideration on or before $end. The earliest event is used: if any
      * reconsideration up to the cutoff was retained by the cutoff, the earliest one was too.
      */
-    private function fetchReconsiderationDates(DBConnector $sf, int $statusId, string $idList, string $end): array
+    protected function fetchReconsiderationDates(DBConnector $sf, int $statusId, string $idList, string $end): array
     {
         $nextDay = date('Y-m-d', strtotime('+1 day', strtotime($end)));
         $sql = "
@@ -680,7 +701,7 @@ class GenerateRetentionBonusCommission extends Command
         return $map;
     }
 
-    private function fetchRetainedDates(DBConnector $sf, string $idList): array
+    protected function fetchRetainedDates(DBConnector $sf, string $idList): array
     {
         $sql = "
             SELECT cs.CONTACT_ID, TO_VARCHAR(CAST(CONVERT_TIMEZONE('America/Los_Angeles', cs.STAMP) AS DATE), 'YYYY-MM-DD') AS RETAINED_DATE
@@ -841,7 +862,9 @@ class GenerateRetentionBonusCommission extends Command
         return $map;
     }
 
-    private function initSqlServer(string $source): DBConnector
+    protected function initSnowflake(string $source): DBConnector { return DBConnector::fromEnvironment($source); }
+
+    protected function initSqlServer(string $source): DBConnector
     {
         $c = DBConnector::fromEnvironment($source);
         $c->initializeSqlServer();
