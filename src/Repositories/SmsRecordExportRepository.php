@@ -195,14 +195,15 @@ class SmsRecordExportRepository extends SqlSrvRepository
         $progress->write($requestId, ['phase' => 'selecting', 'done' => 0, 'total' => $target, 'scanned' => 0]);
         $noCount = (int) $db->selectOne('SELECT CASE WHEN (@@OPTIONS & 512)=512 THEN 1 ELSE 0 END AS enabled')->enabled;
         $db->unprepared('SET NOCOUNT ON');
-        // All nine tiers accept almost everyone, so only a subset needs narrowing first.
-        $narrowed = $options['tiers'] !== SmsRunOptions::TIERS;
+        // All nine tiers with no minimum accept almost everyone, so only a subset or a minimum needs narrowing first.
+        $minimumDebt = SmsDebtPolicy::lowerBound($options);
+        $narrowed = $options['tiers'] !== SmsRunOptions::TIERS || $minimumDebt > 0;
         try {
             if ($narrowed) {
                 $cancellation?->checkpoint($requestId);
                 $db->unprepared('DROP TABLE IF EXISTS #SmsTierCandidates');
                 $db->unprepared('CREATE TABLE #SmsTierCandidates (PK int NOT NULL PRIMARY KEY)');
-                $db->statement(SmsTierWindowSelectionSql::candidatesSql($options['tiers']));
+                $db->statement(SmsTierWindowSelectionSql::candidatesSql($options['tiers'], $minimumDebt));
                 $cancellation?->checkpoint($requestId);
             }
             foreach ([0, 1, 2] as $phase) {

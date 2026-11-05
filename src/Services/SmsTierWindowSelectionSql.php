@@ -10,12 +10,12 @@ use RuntimeException;
 final class SmsTierWindowSelectionSql
 {
     /**
-     * One hash join finds everyone with a wanted mailer tier, so a tier subset doesn't resolve the
-     * whole pool person by person (3M T4-T9 would have meant checking 21M). A mailer tier only narrows
-     * who gets checked: insert() still decides each person's current debt and tier. Someone who is in
-     * a wanted tier only through TblTUData isn't a candidate.
+     * One hash join finds everyone with a wanted mailer tier or debt, so a tier subset or debt minimum
+     * doesn't resolve the whole pool person by person (3M T4-T9 would have meant checking 21M). A mailer
+     * only narrows who gets checked: insert() still decides each person's current debt and tier. Someone
+     * who qualifies only through TblTUData isn't a candidate.
      */
-    public static function candidatesSql(array $tiers): string
+    public static function candidatesSql(array $tiers, int $minimumDebt = 0): string
     {
         $values = [];
         foreach ($tiers as $tier) {
@@ -26,10 +26,14 @@ final class SmsTierWindowSelectionSql
             $values[] = "'".substr($tier, 1)."'";
         }
         if ($values === []) throw new RuntimeException('Choose at least one tier.');
-        $wanted = implode(',', $values);
+        $filters = [];
+        if ($tiers !== SmsRunOptions::TIERS) $filters[] = 'Debt_Tier IN ('.implode(',', $values).')';
+        if ($minimumDebt > 0) $filters[] = 'Debt_Amount>='.$minimumDebt;
+        if ($filters === []) throw new RuntimeException('Narrowing needs a tier subset or a minimum debt.');
+        $wanted = implode(' AND ', $filters);
 
         return <<<SQL
-WITH m AS (SELECT DISTINCT Client, Address, SMS_Zip5 FROM TblMailers WHERE Debt_Tier IN ({$wanted}))
+WITH m AS (SELECT DISTINCT Client, Address, SMS_Zip5 FROM TblMailers WHERE {$wanted})
 INSERT #SmsTierCandidates (PK)
 SELECT p.PK FROM TblProspects p JOIN m ON m.Client=p.Client AND m.Address=p.Address AND m.SMS_Zip5=LEFT(p.Zip,5)
 WHERE p.Contacted=0 AND p.Opt_Out=0 AND p.Invalid_Phone=0 AND p.Phone IS NOT NULL
