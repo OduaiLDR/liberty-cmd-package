@@ -345,9 +345,13 @@ class CapitalReportBuilder
      */
     private function applyEpfColumns(array $row): array
     {
-        $row['LDR EPF Remaining'] = $row['LDR EPF Current'] - $row['LDR EPF Paid'];
-        $row['PLAW EPF Remaining'] = $row['PLAW EPF Current'] - $row['PLAW EPF Paid'];
-        $row['Pro Law EPF Remaining'] = $row['Pro Law EPF Current'] - $row['Pro Law EPF Paid'];
+        // $row['LDR EPF Remaining'] = $row['LDR EPF Current'] - $row['LDR EPF Paid'];
+        // $row['PLAW EPF Remaining'] = $row['PLAW EPF Current'] - $row['PLAW EPF Paid'];
+        // $row['Pro Law EPF Remaining'] = $row['Pro Law EPF Current'] - $row['Pro Law EPF Paid'];
+
+        $row['LDR EPF Remaining'] = max($row['LDR EPF Current'] - $row['LDR EPF Paid'], 0.0);
+        $row['PLAW EPF Remaining'] = max($row['PLAW EPF Current'] - $row['PLAW EPF Paid'], 0.0);
+        $row['Pro Law EPF Remaining'] = max($row['Pro Law EPF Current'] - $row['Pro Law EPF Paid'], 0.0);
 
         $row['Total EPF Original'] = $row['LDR EPF Original'] + $row['PLAW EPF Original'] + $row['Pro Law EPF Original'];
         $row['Total EPF Current'] = $row['LDR EPF Current'] + $row['PLAW EPF Current'] + $row['Pro Law EPF Current'];
