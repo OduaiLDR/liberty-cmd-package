@@ -209,7 +209,7 @@ final class SmsRecordSqlServerTest extends TestCase
             'sms-exports.tier_selection_windowed_enabled' => true, 'sms-exports.tier_selection_window_size' => 2,
             'sms-exports.tier_selection_narrowing_enabled' => false,
             'sms-exports.lean_history_enabled' => SmsRunOptions::usesLeanDebtSources($policy)]);
-        $options = SmsRunOptions::normalize($target, 1, $tiers, $policy, null, null, null, $minimum, csvFormat: SmsRunOptions::FIRST_LAST_CSV_FORMAT);
+        $options = SmsRunOptions::normalize($target, 1, $tiers, $policy, null, null, null, $minimum, csvFormat: SmsRunOptions::FIELD_NAME_CSV_FORMAT);
         $this->runs->start(self::ID, $target, 'synthetic@example.invalid', $options);
         return $options;
     }
@@ -830,7 +830,7 @@ final class SmsRecordSqlServerTest extends TestCase
         $options = $this->tierRun($target, $tiers, SmsRunOptions::LEAN_WINDOWED_TIER_SELECTION_POLICY, $minimum);
         if ($maximum !== null) {
             $this->db->table('TblSMSRuns')->where('Request_ID', self::ID)->delete();
-            $options = SmsRunOptions::normalize($target, 1, $tiers, SmsRunOptions::LEAN_WINDOWED_TIER_SELECTION_POLICY, null, null, null, $minimum, $maximum, csvFormat: SmsRunOptions::FIRST_LAST_CSV_FORMAT);
+            $options = SmsRunOptions::normalize($target, 1, $tiers, SmsRunOptions::LEAN_WINDOWED_TIER_SELECTION_POLICY, null, null, null, $minimum, $maximum, csvFormat: SmsRunOptions::FIELD_NAME_CSV_FORMAT);
             $this->runs->start(self::ID, $target, 'synthetic@example.invalid', $options);
         }
         $this->db->table('TblSMSRuns')->where('Request_ID', self::ID)->update(['Status' => 'selecting']);
@@ -956,7 +956,7 @@ final class SmsRecordSqlServerTest extends TestCase
         config(['sms-exports.run_file_options_enabled' => true, 'sms-exports.tier_selection_enabled' => true, 'sms-exports.tier_selection_windowed_enabled' => true,
             'sms-exports.tier_selection_window_size' => 3, 'sms-exports.lean_history_enabled' => true]);
         $send = Carbon::now('America/Los_Angeles')->addDays(9)->toDateString();
-        $options = SmsRunOptions::normalize($people, 1, ['T5'], SmsRunOptions::LEAN_WINDOWED_TIER_SELECTION_POLICY, SmsRunOptions::PLANNED_DATE_VERSION, $send, SmsRunOptions::APPROVAL_FILENAME_VERSION, csvFormat: SmsRunOptions::FIRST_LAST_CSV_FORMAT);
+        $options = SmsRunOptions::normalize($people, 1, ['T5'], SmsRunOptions::LEAN_WINDOWED_TIER_SELECTION_POLICY, SmsRunOptions::PLANNED_DATE_VERSION, $send, SmsRunOptions::APPROVAL_FILENAME_VERSION, csvFormat: SmsRunOptions::FIELD_NAME_CSV_FORMAT);
         $this->runs->start(self::ID, $people, 'synthetic@example.invalid', $options);
         $this->runs->prepare(self::ID);
         $this->runs->requestFile(self::ID);
@@ -1244,7 +1244,7 @@ final class SmsRecordSqlServerTest extends TestCase
         config(['sms-exports.run_file_options_enabled' => true, 'sms-exports.tier_selection_enabled' => true,
             'sms-exports.tier_selection_windowed_enabled' => false, 'sms-exports.tier_selection_window_size' => 2]);
 
-        $v1 = SmsRunOptions::normalize(3, 3, ['T5'], SmsRunOptions::TIER_SELECTION_POLICY, csvFormat: SmsRunOptions::FIRST_LAST_CSV_FORMAT);
+        $v1 = SmsRunOptions::normalize(3, 3, ['T5'], SmsRunOptions::TIER_SELECTION_POLICY, csvFormat: SmsRunOptions::FIELD_NAME_CSV_FORMAT);
         $this->runs->start(self::ID, 3, 'synthetic@example.invalid', $v1);
         $this->db->table('TblSMSRuns')->where('Request_ID', self::ID)->update(['Status' => 'selecting']);
         $repo = new SmsRecordExportRepository;
@@ -1258,7 +1258,7 @@ final class SmsRecordSqlServerTest extends TestCase
         $this->db->table('TblSMSRuns')->where('Request_ID', self::ID)->update(['Status' => 'discarded']);
         $this->db->table('TblProspectsExport')->where('Request_ID', self::ID)->delete();
         config(['sms-exports.tier_selection_windowed_enabled' => true]);
-        $v2 = SmsRunOptions::normalize(3, 3, ['T5'], SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY, csvFormat: SmsRunOptions::FIRST_LAST_CSV_FORMAT);
+        $v2 = SmsRunOptions::normalize(3, 3, ['T5'], SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY, csvFormat: SmsRunOptions::FIELD_NAME_CSV_FORMAT);
         $this->runs->start($v2id, 3, 'synthetic@example.invalid', $v2);
         $this->db->table('TblSMSRuns')->where('Request_ID', $v2id)->update(['Status' => 'selecting']);
         self::assertSame(3, $repo->select($v2id, 3)['selected']);
@@ -1273,7 +1273,7 @@ final class SmsRecordSqlServerTest extends TestCase
         $this->db->unprepared('DROP INDEX IX_TblMarketing_SMS_Drop_SendDate ON dbo.TblMarketing');
         try {
             self::assertFalse($this->runs->overview()['capabilities']['tier_subset']);
-            $options = SmsRunOptions::normalize(1, 1, ['T5'], SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY, csvFormat: SmsRunOptions::FIRST_LAST_CSV_FORMAT);
+            $options = SmsRunOptions::normalize(1, 1, ['T5'], SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY, csvFormat: SmsRunOptions::FIELD_NAME_CSV_FORMAT);
             try { $this->runs->start(self::ID, 1, 'synthetic@example.invalid', $options); self::fail('Expected missing seek schema refusal.'); }
             catch (HttpException $error) { self::assertSame(503, $error->getStatusCode()); }
             self::assertSame(0, $this->db->table('TblSMSRuns')->count());
@@ -1404,7 +1404,7 @@ final class SmsRecordSqlServerTest extends TestCase
         config(['sms-exports.run_file_options_enabled' => true,'sms-exports.tier_selection_enabled' => true]);
         $repo = new SmsRecordExportRepository;
         $columns = ['Prospect_PK','Debt_Tier','Debt_Amount','Debt_Source','Debt_Source_PK','Was_Previously_Texted','Last_SMS_Date_At_Selection'];
-        $v1 = SmsRunOptions::normalize(9, 9, ['T5'], SmsRunOptions::TIER_SELECTION_POLICY, csvFormat: SmsRunOptions::FIRST_LAST_CSV_FORMAT);
+        $v1 = SmsRunOptions::normalize(9, 9, ['T5'], SmsRunOptions::TIER_SELECTION_POLICY, csvFormat: SmsRunOptions::FIELD_NAME_CSV_FORMAT);
         $this->runs->start(self::ID, 9, 'synthetic@example.invalid', $v1);
         $this->db->table('TblSMSRuns')->update(['Status' => 'selecting']);
         self::assertSame(6, $repo->select(self::ID, 9)['selected']);
@@ -1435,7 +1435,7 @@ final class SmsRecordSqlServerTest extends TestCase
             'sms-exports.tier_selection_windowed_enabled' => true,'sms-exports.tier_selection_window_size' => 5000]);
         foreach (array_values(array_unique([100,1000,100000,$population])) as $target) {
             $id = sprintf('%08d-bbbb-4ccc-8ddd-eeeeeeeeeeee', $target);
-            $options = SmsRunOptions::normalize($target, 100000, ['T5'], SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY, csvFormat: SmsRunOptions::FIRST_LAST_CSV_FORMAT);
+            $options = SmsRunOptions::normalize($target, 100000, ['T5'], SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY, csvFormat: SmsRunOptions::FIELD_NAME_CSV_FORMAT);
             $this->runs->start($id, $target, 'synthetic@example.invalid', $options);
             $this->db->table('TblSMSRuns')->where('Request_ID', $id)->update(['Status' => 'selecting']);
             $started = microtime(true); $result = (new SmsRecordExportRepository)->select($id, $target);
@@ -1498,7 +1498,7 @@ final class SmsRecordSqlServerTest extends TestCase
             if (! in_array($i, [1,4], true)) $expected[] = $pk;
         }
         config(['sms-exports.run_file_options_enabled' => true,'sms-exports.tier_selection_enabled' => true]);
-        $this->runs->start(self::ID, 18, 'synthetic@example.invalid', SmsRunOptions::normalize(18, 18, ['T5'], SmsRunOptions::TIER_SELECTION_POLICY, csvFormat: SmsRunOptions::FIRST_LAST_CSV_FORMAT));
+        $this->runs->start(self::ID, 18, 'synthetic@example.invalid', SmsRunOptions::normalize(18, 18, ['T5'], SmsRunOptions::TIER_SELECTION_POLICY, csvFormat: SmsRunOptions::FIELD_NAME_CSV_FORMAT));
         $this->db->table('TblSMSRuns')->update(['Status' => 'selecting']);
         $repo = new SmsRecordExportRepository;
         self::assertSame(16, $repo->select(self::ID, 18)['selected']);
@@ -1526,7 +1526,7 @@ final class SmsRecordSqlServerTest extends TestCase
             ['Phone' => '110005550104'], ['Phone' => '00005550105'], ['Phone' => null],
         ]);
         config(['sms-exports.run_file_options_enabled' => true,'sms-exports.tier_selection_enabled' => true]);
-        $v1 = SmsRunOptions::normalize(7, 7, ['T5'], SmsRunOptions::TIER_SELECTION_POLICY, csvFormat: SmsRunOptions::FIRST_LAST_CSV_FORMAT);
+        $v1 = SmsRunOptions::normalize(7, 7, ['T5'], SmsRunOptions::TIER_SELECTION_POLICY, csvFormat: SmsRunOptions::FIELD_NAME_CSV_FORMAT);
         $this->runs->start(self::ID, 7, 'synthetic@example.invalid', $v1);
         $this->db->table('TblSMSRuns')->update(['Status' => 'selecting']);
         $repo = new SmsRecordExportRepository;
@@ -1602,7 +1602,7 @@ final class SmsRecordSqlServerTest extends TestCase
         $this->db->table('TblMarketing')->insert(['Drop_Name' => 'RANGE-DROP', 'Send_Date' => '2026-10-01']);
         config(['sms-exports.run_file_options_enabled' => true, 'sms-exports.tier_selection_enabled' => true,
             'sms-exports.tier_selection_windowed_enabled' => true, 'sms-exports.tier_selection_window_size' => 1]);
-        $options = SmsRunOptions::normalize(4, 1, null, SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY, null, null, null, 25000, 35000, csvFormat: SmsRunOptions::FIRST_LAST_CSV_FORMAT);
+        $options = SmsRunOptions::normalize(4, 1, null, SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY, null, null, null, 25000, 35000, csvFormat: SmsRunOptions::FIELD_NAME_CSV_FORMAT);
         $this->runs->start(self::ID, 4, 'synthetic@example.invalid', $options);
         $this->runs->prepare(self::ID);
         self::assertSame([$exact, $rounded], array_map('intval', $this->db->table('TblProspectsExport')->orderBy('PK')->pluck('Prospect_PK')->all()));
@@ -1679,7 +1679,7 @@ final class SmsRecordSqlServerTest extends TestCase
     public function test_real_closed_history_keysets_preserve_mixed_runs_without_writes_or_counts(): void
     {
         $ids = $keys = [];
-        $options = SmsRunOptions::normalize(100, 50, ['T2', 'T9'], SmsRunOptions::TIER_SELECTION_POLICY, csvFormat: SmsRunOptions::FIRST_LAST_CSV_FORMAT);
+        $options = SmsRunOptions::normalize(100, 50, ['T2', 'T9'], SmsRunOptions::TIER_SELECTION_POLICY, csvFormat: SmsRunOptions::FIELD_NAME_CSV_FORMAT);
         for ($i = 1; $i <= 25; $i++) {
             $id = sprintf('%08d-1111-4111-8111-%012d', $i, $i);
             $ids[] = $id;
@@ -1796,7 +1796,7 @@ final class SmsRecordSqlServerTest extends TestCase
             $this->person(['Address' => $address]); $this->source($i + 1, $address, $i === 3 ? 'T9' : 'T5');
         }
         $input = ['request_id' => self::ID, 'target' => 5, 'rows_per_file' => 2,
-            'csv_format' => SmsRunOptions::FIRST_LAST_CSV_FORMAT, 'tiers' => ['T5'], 'tier_selection_policy' => SmsRunOptions::TIER_SELECTION_POLICY,
+            'csv_format' => SmsRunOptions::FIELD_NAME_CSV_FORMAT, 'tiers' => ['T5'], 'tier_selection_policy' => SmsRunOptions::TIER_SELECTION_POLICY,
             'options_version' => SmsRunOptions::PLANNED_DATE_VERSION, 'send_date' => '2026-10-26',
             'filename_version' => SmsRunOptions::APPROVAL_FILENAME_VERSION];
         self::assertSame(403, $http('POST', 'runs', $input, 'agent')->getStatusCode());
@@ -1858,7 +1858,7 @@ final class SmsRecordSqlServerTest extends TestCase
             foreach ($manifest['parts'] as $part) {
                 $stream = $zip->getStream($part['name']); self::assertIsResource($stream);
                 try {
-                    self::assertSame(['First name', 'Last name', 'debt load', 'phone1', 'send date'], fgetcsv($stream, null, ',', '"', ''));
+                    self::assertSame(['first_name', 'last_name', 'debt_load', 'phone1', 'send_date'], fgetcsv($stream, null, ',', '"', ''));
                     $partRows = 0;
                     while (($row = fgetcsv($stream, null, ',', '"', '')) !== false) {
                         self::assertCount(5, $row); self::assertSame(['31000', '0005550100', '2026-10-26'], array_slice($row, 2));
