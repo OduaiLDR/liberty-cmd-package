@@ -37,6 +37,56 @@ final class SmsFrozenEligibility
         self::assertMembers($db, $requestId, 'TblSMSHistory');
     }
 
+    /**
+     * Who a hold is about, so one person can come out without losing the batch. Read only, and only
+     * for a pending batch. It matches the check below: a person listed here is what stops the batch.
+     *
+     * @return list<int>
+     */
+    public static function heldMembers(ConnectionInterface $db, string $requestId): array
+    {
+        $native = $db->getDriverName() === 'sqlsrv';
+        $members = fn (): Builder => $db->table('TblProspectsExport as x')->useWritePdo()
+            ->leftJoin('TblProspects as p', 'p.PK', '=', 'x.Prospect_PK')->where('x.Request_ID', $requestId);
+        $state = SmsStatePolicy::sqlPredicate('p.State', $db->getDriverName());
+        $frozenState = SmsStatePolicy::sqlPredicate('x.State', $db->getDriverName());
+        $sameState = SmsStatePolicy::normalizedSql('p.State', $db->getDriverName()).' = '.SmsStatePolicy::normalizedSql('x.State', $db->getDriverName());
+        $phoneValid = self::phoneValidSql($native);
+        $samePhone = self::samePhoneSql($native);
+        $people = $members()->where(function (Builder $q) use ($state, $frozenState, $sameState, $phoneValid, $samePhone): void {
+            $q->whereNull('p.PK')->orWhereRaw("NOT ({$state})")->orWhereRaw("NOT ({$frozenState})")->orWhereRaw("NOT ({$sameState})");
+            foreach (['Contacted','Opt_Out','Invalid_Phone'] as $flag) $q->orWhereNull('p.'.$flag)->orWhere('p.'.$flag, '<>', 0);
+            $q->orWhereNull('p.Phone')->orWhereNull('x.Phone')->orWhereRaw("NOT ({$phoneValid})")->orWhereRaw("NOT ({$samePhone})");
+        })->pluck('x.Prospect_PK')->all();
+        $contactRows = config('sms-exports.wide_phone_contacts_enabled', false)
+            ? SmsPhoneNumbersSql::from('c', '', true) : 'TblPhoneNumbers as c';
+        foreach ($db->select("SELECT x.Prospect_PK FROM TblProspectsExport AS x
+ JOIN TblSMSSuppressions AS s ON s.Phone=x.Phone WHERE x.Request_ID=? AND (s.Opt_Out=1 OR s.Invalid_Phone=1)
+ UNION
+ SELECT x.Prospect_PK FROM TblProspectsExport AS x JOIN {$contactRows} ON c.Phone=x.Phone WHERE x.Request_ID=?
+ UNION
+ SELECT x.Prospect_PK FROM TblProspectsExport AS x JOIN {$contactRows} ON c.Phone='1'+x.Phone WHERE x.Request_ID=?
+OPTION (HASH JOIN)", [$requestId, $requestId, $requestId], false) as $row) {
+            $people[] = $row->Prospect_PK;
+        }
+        $people = array_values(array_unique(array_map('intval', $people)));
+        sort($people);
+
+        return $people;
+    }
+
+    private static function samePhoneSql(bool $native): string
+    {
+        return $native ? 'CONVERT(nvarchar(max),p.Phone) COLLATE Latin1_General_100_BIN2 = CONVERT(nvarchar(max),x.Phone) COLLATE Latin1_General_100_BIN2 AND DATALENGTH(CONVERT(nvarchar(max),p.Phone))=DATALENGTH(CONVERT(nvarchar(max),x.Phone))'
+            : 'p.Phone COLLATE BINARY = x.Phone COLLATE BINARY';
+    }
+
+    private static function phoneValidSql(bool $native): string
+    {
+        return $native ? "DATALENGTH(CONVERT(nvarchar(max),x.Phone))=20 AND CONVERT(nvarchar(max),x.Phone) COLLATE Latin1_General_100_BIN2 LIKE '".str_repeat('[0-9]', 10)."'"
+            : "length(x.Phone)=10 AND x.Phone NOT GLOB '*[^0-9]*'";
+    }
+
     private static function assertMembers(ConnectionInterface $db, string $requestId, string $table): void
     {
         $native = $db->getDriverName() === 'sqlsrv';
@@ -63,10 +113,8 @@ WHERE x.Request_ID=? ORDER BY p.PK", [$requestId], false);
         // prospects may be varchar. Compare a common, lossless Unicode width,
         // not native storage bytes. Keep exact ASCII digits and trailing-space
         // rejection; SQL Server string equality alone pads trailing spaces.
-        $phoneValid = $native ? "DATALENGTH(CONVERT(nvarchar(max),x.Phone))=20 AND CONVERT(nvarchar(max),x.Phone) COLLATE Latin1_General_100_BIN2 LIKE '".str_repeat('[0-9]', 10)."'"
-            : "length(x.Phone)=10 AND x.Phone NOT GLOB '*[^0-9]*'";
-        $samePhone = $native ? 'CONVERT(nvarchar(max),p.Phone) COLLATE Latin1_General_100_BIN2 = CONVERT(nvarchar(max),x.Phone) COLLATE Latin1_General_100_BIN2 AND DATALENGTH(CONVERT(nvarchar(max),p.Phone))=DATALENGTH(CONVERT(nvarchar(max),x.Phone))'
-            : 'p.Phone COLLATE BINARY = x.Phone COLLATE BINARY';
+        $phoneValid = self::phoneValidSql($native);
+        $samePhone = self::samePhoneSql($native);
         $contactPhone = $native ? "(c.Phone=x.Phone OR c.Phone='1'+x.Phone)"
             : "(c.Phone=x.Phone OR c.Phone='1'||x.Phone)";
         $hint = $locking ? ' WITH (UPDLOCK,HOLDLOCK)' : '';

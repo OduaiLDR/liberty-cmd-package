@@ -149,6 +149,13 @@ class SmsRunController extends Controller
         return $this->json($this->runs->requestApprove($requestId, $this->actor($request)), 202);
     }
 
+    public function removeHeld(Request $request, string $requestId): JsonResponse
+    {
+        $this->ensureSchemaReady();
+        Validator::make($request->all(), ['confirmed_removal' => ['required', 'accepted']])->validate();
+        return $this->json($this->runs->requestRemoveHeld($requestId, $this->actor($request)), 202);
+    }
+
     public function details(string $requestId): JsonResponse
     {
         $this->ensureSchemaReady();

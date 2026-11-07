@@ -30,6 +30,10 @@ return [
     // Deleting a run above this many rows closes it at once and a worker removes the rows in pages,
     // because one 3M delete can't finish inside a request. Those rows don't affect selection.
     'discard_background_rows' => (int) env('CMD_SMS_DISCARD_BACKGROUND_ROWS', 100000),
+    // On, Approve returns at once and the worker runs the checks. Off until a real Approve has been timed.
+    'approve_at_once' => (bool) env('CMD_SMS_APPROVE_AT_ONCE', false),
+    // More people than this stops the button: that many at once means something else is wrong.
+    'remove_held_max' => (int) env('CMD_SMS_REMOVE_HELD_MAX', 200),
     // Jacob, Nov 7, 2026. Off until the back fill is done and compared.
     'stored_debt_selection' => (bool) env('CMD_SMS_STORED_DEBT_SELECTION', false),
     'stored_debt_window_size' => (int) env('CMD_SMS_STORED_DEBT_WINDOW_SIZE', 250000),

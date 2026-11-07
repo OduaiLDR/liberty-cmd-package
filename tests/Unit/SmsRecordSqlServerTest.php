@@ -90,6 +90,9 @@ final class SmsRecordSqlServerTest extends TestCase
         mkdir($this->directory, 0700);
         $container->instance('config', new Repository(['app' => ['env' => 'testing'], 'sms-exports' => [
             'tier_selection_narrowing_enabled' => false, 'record_workflow_enabled' => true, 'durable_availability_enabled' => true, 'local_root' => $this->directory], 'database' => ['default' => 'sqlsrv']]));
+        // The saved Approve hold lives in the file cache on a real server.
+        config(['cache' => ['default' => 'array', 'stores' => ['file' => ['driver' => 'array'], 'array' => ['driver' => 'array']], 'prefix' => 'sms-test']]);
+        $container->instance('cache', new \Illuminate\Cache\CacheManager($container));
         // Selection validates its options, so a real run needs the validator bound.
         $container->singleton('validator', static fn ($app) => new \Illuminate\Validation\Factory(new \Illuminate\Translation\Translator(new \Illuminate\Translation\ArrayLoader, 'en'), $app));
         $capsule = new Manager($container);
@@ -940,6 +943,248 @@ final class SmsRecordSqlServerTest extends TestCase
         self::assertSame(3, (new SmsRecordExportRepository)->select(self::ID, 3)['selected']);
         self::assertSame(0, $this->db->table('TblProspects')->whereNotNull('Current_Debt_Source')->count());
         self::assertSame($people['tu'], (int) $this->db->table('TblProspectsExport')->orderBy('PK')->value('Prospect_PK'));
+    }
+
+    /** A real pending batch with its file published, the way a person reaches Approve. */
+    private function readyToApprove(int $people): array
+    {
+        $pks = [];
+        for ($i = 1; $i <= $people; $i++) {
+            $pks[$i] = $this->person(['Address' => "Held {$i}", 'Phone' => sprintf('000555%04d', $i), 'Creation_Date' => '2026-10-20']);
+            $this->source($i, "Held {$i}");
+        }
+        config(['sms-exports.run_file_options_enabled' => true, 'sms-exports.tier_selection_enabled' => true, 'sms-exports.tier_selection_windowed_enabled' => true,
+            'sms-exports.tier_selection_window_size' => 3, 'sms-exports.lean_history_enabled' => true]);
+        $send = Carbon::now('America/Los_Angeles')->addDays(9)->toDateString();
+        $options = SmsRunOptions::normalize($people, 1, ['T5'], SmsRunOptions::LEAN_WINDOWED_TIER_SELECTION_POLICY, SmsRunOptions::PLANNED_DATE_VERSION, $send, SmsRunOptions::APPROVAL_FILENAME_VERSION, csvFormat: SmsRunOptions::FIRST_LAST_CSV_FORMAT);
+        $this->runs->start(self::ID, $people, 'synthetic@example.invalid', $options);
+        $this->runs->prepare(self::ID);
+        $this->runs->requestFile(self::ID);
+        $this->runs->buildFile(self::ID);
+        self::assertSame('file_ready', $this->db->table('TblSMSRuns')->value('Status'));
+
+        return $pks;
+    }
+
+    private function fileRows(): int
+    {
+        $path = (string) $this->db->table('TblSMSRuns')->value('File_Path');
+        self::assertFileExists($path);
+        if (! str_ends_with(strtolower($path), '.zip')) return count(file($path)) - 1;
+        $zip = new \ZipArchive;
+        self::assertTrue($zip->open($path) === true);
+        $rows = 0;
+        for ($i = 0; $i < $zip->numFiles; $i++) $rows += count(explode("\n", trim((string) $zip->getFromIndex($i)))) - 1;
+        $zip->close();
+
+        return $rows;
+    }
+
+    private function stopAtApprove(): void
+    {
+        try {
+            $this->runs->requestApprove(self::ID, 'synthetic@example.invalid');
+            self::fail('Approve must stop on a held person.');
+        } catch (HttpException $hold) {
+            self::assertSame(409, $hold->getStatusCode());
+        }
+        self::assertSame('file_ready', $this->db->table('TblSMSRuns')->value('Status'));
+    }
+
+    public function test_real_one_new_contact_comes_out_the_file_is_rebuilt_without_them_and_approve_goes_through(): void
+    {
+        $pks = $this->readyToApprove(4);
+        $this->db->table('TblPhoneNumbers')->insert(['Phone' => '10005550002']);
+        $this->stopAtApprove();
+        $held = $this->runs->show(self::ID);
+        self::assertTrue($held->can_remove_held);
+        self::assertStringContainsString('frozen SMS member', $held->approval_hold, 'the reason reaches the page even if the 409 never does');
+        self::assertSame(4, $this->fileRows());
+
+        $this->runs->requestRemoveHeld(self::ID, 'synthetic@example.invalid');
+        self::assertSame([self::ID, 'remove_held'], end($this->runs->queued));
+        self::assertSame('building_file', $this->db->table('TblSMSRuns')->value('Status'));
+        $this->runs->removeHeld(self::ID);
+
+        $run = $this->db->table('TblSMSRuns')->first();
+        self::assertSame(['file_ready', 3, 3, 0, 3], [$run->Status, (int) $run->Selected, (int) $run->Never_Texted, (int) $run->Previously_Texted, (int) $run->Debt_TU]);
+        self::assertSame(3, $this->fileRows());
+        self::assertSame(0, $this->db->table('TblProspectsExport')->where('Prospect_PK', $pks[2])->count());
+        self::assertSame(3, $this->db->table('TblProspectsExport')->count());
+        $view = $this->runs->show(self::ID);
+        self::assertSame(1, $view->held_removed);
+        self::assertFalse($view->can_remove_held);
+
+        $this->runs->requestApprove(self::ID, 'synthetic@example.invalid');
+        self::assertSame('approving', $this->db->table('TblSMSRuns')->value('Status'));
+        $this->runs->markApproved(self::ID);
+        self::assertSame('approved', $this->db->table('TblSMSRuns')->value('Status'));
+        self::assertSame(3, $this->db->table('TblSMSHistory')->count());
+        self::assertSame(0, $this->db->table('TblSMSHistory')->where('Prospect_PK', $pks[2])->count());
+        self::assertSame(3, (int) $this->db->table('TblSMSDrops')->sum('Amount_Dropped'));
+    }
+
+    public function test_real_every_kind_of_hold_is_found_and_only_those_people_come_out(): void
+    {
+        $pks = $this->readyToApprove(8);
+        $this->db->table('TblPhoneNumbers')->insert(['Phone' => '0005550001']);
+        $this->db->table('TblProspects')->where('PK', $pks[2])->update(['Contacted' => 1]);
+        $this->db->table('TblProspects')->where('PK', $pks[3])->update(['Opt_Out' => 1]);
+        $this->db->table('TblProspects')->where('PK', $pks[4])->update(['Invalid_Phone' => 1]);
+        $this->db->table('TblProspects')->where('PK', $pks[5])->update(['Phone' => '0009999999']);
+        $this->db->table('TblSMSSuppressions')->insert(['Phone' => '0005550006', 'Opt_Out' => 1, 'Invalid_Phone' => 0, 'Updated_At' => '2026-10-20 00:00:00']);
+        $this->db->table('TblProspects')->where('PK', $pks[7])->update(['State' => 'CO']);
+        self::assertSame([$pks[1], $pks[2], $pks[3], $pks[4], $pks[5], $pks[6], $pks[7]], \Cmd\Reports\Services\SmsFrozenEligibility::heldMembers($this->db, self::ID));
+        $this->stopAtApprove();
+        $this->runs->requestRemoveHeld(self::ID, 'synthetic@example.invalid');
+        $this->runs->removeHeld(self::ID);
+        self::assertSame([$pks[8]], array_map('intval', $this->db->table('TblProspectsExport')->pluck('Prospect_PK')->all()));
+        self::assertSame(1, $this->fileRows());
+        \Cmd\Reports\Services\SmsFrozenEligibility::assertPending($this->db, self::ID);
+    }
+
+    public function test_real_a_batch_stopped_at_the_file_step_recovers_the_same_way(): void
+    {
+        $pks = $this->readyToApprove(3);
+        $this->db->table('TblSMSRuns')->update(['Status' => 'failed', 'Failed_Step' => 'file', 'Error' => 'A frozen SMS member is contacted, suppressed, invalid or has a changed phone.']);
+        $this->db->table('TblProspects')->where('PK', $pks[1])->update(['Contacted' => 1]);
+        self::assertTrue($this->runs->show(self::ID)->can_remove_held);
+        $this->runs->requestRemoveHeld(self::ID, 'synthetic@example.invalid');
+        $this->runs->removeHeld(self::ID);
+        $run = $this->db->table('TblSMSRuns')->first();
+        self::assertSame(['file_ready', null, null, 2], [$run->Status, $run->Failed_Step, $run->Error, (int) $run->Selected]);
+        self::assertSame(2, $this->fileRows());
+    }
+
+    public function test_real_too_many_held_people_removes_nobody_and_says_why(): void
+    {
+        $pks = $this->readyToApprove(4);
+        config(['sms-exports.remove_held_max' => 1]);
+        $this->db->table('TblProspects')->whereIn('PK', [$pks[1], $pks[2]])->update(['Contacted' => 1]);
+        $this->stopAtApprove();
+        $this->runs->requestRemoveHeld(self::ID, 'synthetic@example.invalid');
+        try {
+            $this->runs->removeHeld(self::ID);
+            self::fail('Too many held people must stop the removal.');
+        } catch (\RuntimeException $error) {
+            self::assertStringContainsString('2 people are held', $error->getMessage());
+            $this->runs->fail(self::ID, 'remove_held', $error->getMessage());
+        }
+        $run = $this->db->table('TblSMSRuns')->first();
+        self::assertSame(['failed', 'file', 4], [$run->Status, $run->Failed_Step, (int) $run->Selected]);
+        self::assertSame(4, $this->db->table('TblProspectsExport')->count());
+        self::assertTrue($this->runs->show(self::ID)->can_remove_held);
+    }
+
+    public function test_real_nobody_held_or_everybody_held_removes_nobody(): void
+    {
+        $pks = $this->readyToApprove(2);
+        $this->db->table('TblProspects')->where('PK', $pks[1])->update(['Contacted' => 1]);
+        $this->stopAtApprove();
+        $this->runs->requestRemoveHeld(self::ID, 'synthetic@example.invalid');
+        $this->db->table('TblProspects')->where('PK', $pks[1])->update(['Contacted' => 0]);
+        try { $this->runs->removeHeld(self::ID); self::fail('Nobody held must stop.'); }
+        catch (\RuntimeException $error) { self::assertStringContainsString('Nobody in this batch is held', $error->getMessage()); }
+        self::assertSame(2, $this->db->table('TblProspectsExport')->count());
+
+        $this->db->table('TblProspects')->update(['Contacted' => 1]);
+        try { $this->runs->removeHeld(self::ID); self::fail('Everyone held must stop.'); }
+        catch (\RuntimeException $error) { self::assertStringContainsString('Everyone in this batch is held', $error->getMessage()); }
+        self::assertSame(2, $this->db->table('TblProspectsExport')->count());
+    }
+
+    public function test_real_a_failure_during_removal_puts_everything_back(): void
+    {
+        $pks = $this->readyToApprove(3);
+        $this->db->table('TblProspects')->where('PK', $pks[1])->update(['Contacted' => 1]);
+        $this->stopAtApprove();
+        $this->runs->requestRemoveHeld(self::ID, 'synthetic@example.invalid');
+        $file = (string) $this->db->table('TblSMSRuns')->value('File_Path');
+        $this->db->unprepared("CREATE TRIGGER dbo.RemovalFails ON dbo.TblSMSRuns AFTER UPDATE AS BEGIN SET NOCOUNT ON; IF UPDATE(Selected) THROW 52997,'Fails on purpose.',1; END");
+        try {
+            try { $this->runs->removeHeld(self::ID); self::fail('The failure must reach the caller.'); }
+            catch (\Throwable $error) { self::assertStringContainsString('Fails on purpose', $error->getMessage()); }
+        } finally {
+            $this->db->unprepared('DROP TRIGGER dbo.RemovalFails');
+        }
+        self::assertSame(3, $this->db->table('TblProspectsExport')->count());
+        self::assertSame(3, (int) $this->db->table('TblSMSRuns')->value('Selected'));
+        self::assertFileExists($file);
+    }
+
+    public function test_real_approve_at_once_returns_without_the_checks_and_the_worker_still_runs_them(): void
+    {
+        $pks = $this->readyToApprove(3);
+        config(['sms-exports.approve_at_once' => true]);
+        $this->db->table('TblProspects')->where('PK', $pks[3])->update(['Contacted' => 1]);
+        $view = $this->runs->requestApprove(self::ID, 'synthetic@example.invalid');
+        self::assertSame('approving', $view->status, 'accepted at once, even with a held person');
+        self::assertSame([self::ID, 'approve'], end($this->runs->queued));
+
+        $this->runs->markApproved(self::ID);
+        $run = $this->db->table('TblSMSRuns')->first();
+        self::assertSame(['file_ready', null, null], [$run->Status, $run->Approved_By, $run->Approved_At], 'nothing has happened, so it goes back');
+        self::assertSame(0, $this->db->table('TblSMSDrops')->count());
+        self::assertSame(0, $this->db->table('TblSMSHistory')->count());
+        $held = $this->runs->show(self::ID);
+        self::assertStringContainsString('frozen SMS member', $held->approval_hold);
+        self::assertTrue($held->can_remove_held);
+
+        $this->runs->requestRemoveHeld(self::ID, 'synthetic@example.invalid');
+        $this->runs->removeHeld(self::ID);
+        self::assertSame('approving', $this->runs->requestApprove(self::ID, 'synthetic@example.invalid')->status);
+        $this->runs->markApproved(self::ID);
+        self::assertSame('approved', $this->db->table('TblSMSRuns')->value('Status'));
+        self::assertSame(2, $this->db->table('TblSMSHistory')->count());
+    }
+
+    public function test_real_approve_at_once_with_nobody_held_finishes_like_a_normal_approve(): void
+    {
+        $this->readyToApprove(2);
+        config(['sms-exports.approve_at_once' => true]);
+        $this->runs->requestApprove(self::ID, 'synthetic@example.invalid');
+        $this->runs->markApproved(self::ID);
+        $run = $this->db->table('TblSMSRuns')->first();
+        self::assertSame(['approved', 'synthetic@example.invalid'], [$run->Status, $run->Sent_By]);
+        self::assertSame(2, $this->db->table('TblSMSHistory')->count());
+        self::assertSame(2, (int) $this->db->table('TblSMSDrops')->sum('Amount_Dropped'));
+    }
+
+    public function test_real_with_the_switch_off_approve_stops_in_the_request_like_today(): void
+    {
+        $pks = $this->readyToApprove(2);
+        $this->db->table('TblProspects')->where('PK', $pks[1])->update(['Contacted' => 1]);
+        $this->stopAtApprove();
+        self::assertSame([], array_values(array_filter($this->runs->queued, static fn ($job) => $job[1] === 'approve')));
+    }
+
+    public function test_real_removal_is_refused_when_nothing_stopped_the_batch_or_it_is_past_approval(): void
+    {
+        $this->readyToApprove(2);
+        $refused = function (): void {
+            try { $this->runs->requestRemoveHeld(self::ID, 'synthetic@example.invalid'); self::fail('This must be refused.'); }
+            catch (HttpException $error) { self::assertSame(409, $error->getStatusCode()); }
+        };
+        $refused();
+        self::assertFalse($this->runs->show(self::ID)->can_remove_held);
+        $this->db->table('TblSMSRuns')->update(['Status' => 'failed', 'Failed_Step' => 'file', 'Error' => 'Disk full.']);
+        $refused();
+        $this->db->table('TblSMSRuns')->update(['Status' => 'failed', 'Failed_Step' => 'select', 'Error' => 'A frozen SMS member is contacted.']);
+        $refused();
+        $this->db->table('TblSMSRuns')->update(['Status' => 'approved', 'Failed_Step' => null, 'Error' => null]);
+        $refused();
+        $this->db->table('TblSMSRuns')->update(['Status' => 'failed', 'Failed_Step' => 'approve', 'Error' => 'A frozen SMS member is contacted.']);
+        $this->db->table('TblSMSDrops')->insert(['Request_ID' => self::ID, 'Drop_Name' => 'SMS0001', 'Debt_Tier' => 'T5', 'Amount_Dropped' => 2, 'Drop_Date' => '2026-10-19', 'Created_At' => '2026-10-20 00:00:00']);
+        $refused();
+    }
+
+    public function test_real_the_worker_step_does_nothing_on_a_run_that_is_not_waiting_for_it(): void
+    {
+        $pks = $this->readyToApprove(2);
+        $this->db->table('TblProspects')->where('PK', $pks[1])->update(['Contacted' => 1]);
+        $this->runs->removeHeld(self::ID);
+        self::assertSame(2, $this->db->table('TblProspectsExport')->count());
+        self::assertSame('file_ready', $this->db->table('TblSMSRuns')->value('Status'));
     }
 
     public function test_lean_v3_keeps_exact_tu_pk_and_gives_tier_fallback_no_second_source_id(): void
