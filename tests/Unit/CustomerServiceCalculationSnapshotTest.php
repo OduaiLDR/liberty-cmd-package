@@ -113,6 +113,81 @@ final class CustomerServiceCalculationSnapshotTest extends TestCase
     {
         return CustomerServiceCalculationSnapshot::forAgent($this->artifacts, self::PERIOD, $kind, $agent, $scope);
     }
+    private function archivedSources(string $family): array
+    {
+        $sources = array_intersect_key($this->artifacts, array_flip([$family . '_ldr', $family . '_plaw']));
+        foreach ($sources as &$artifact) $artifact['contextSha256'] = hash('sha256', json_encode($artifact['context'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
+        return $sources;
+    }
+
+    public function test_independent_components_have_frozen_detail_without_any_other_family(): void
+    {
+        foreach (['nsf' => ['nsf', 4.5, ['301', '302']], 'lookback' => ['retention_lookback', 7.25, ['201', '202']],
+            'retention' => ['retention_regular', 10.0, ['101']]] as $family => [$report, $amount, $ids]) {
+            $result = CustomerServiceCalculationSnapshot::forArchivedAgent($this->archivedSources($family), self::PERIOD, $report, 'jane doe', 'ldr');
+            $this->assertSame('cs_archived_agent_calculation_v1', $result['kind']);
+            $this->assertCount(1, $result['components']); $entry = $result['components'][0];
+            $this->assertSame('verified', $entry['status']); $this->assertSame($amount, $entry['amount']);
+            $this->assertSame($ids, array_column($entry['lines'], 'clientId'));
+            $this->assertSame('jane doe', $entry['sourceAgentKey']);
+            $this->assertStringNotContainsString('Private Client', json_encode($result));
+            $this->assertStringNotContainsString('Other Secret', json_encode($result));
+            $this->assertStringNotContainsString('"path"', json_encode($result));
+        }
+    }
+
+    public function test_legacy_original_rows_are_visible_without_inventing_historical_selected_prices(): void
+    {
+        foreach (['ldr', 'plaw'] as $source) {
+            $key = 'retention_' . $source;
+            $this->mutate($key, static function ($book) {
+                $book->createSheet()->setTitle('Commission Summary')->fromArray([
+                    ['Retention Agent', 'Assigned', 'Retained', '% Retained', 'Tier', 'Commission', 'Location', 'Company'],
+                    ['Andrea Mendoze', 1, 1, 1, 3, 10], ['Other Secret Agent', 1, 1, 1, 1, 999],
+                ], null, 'A1', true);
+                $book->getSheetByName('Retention Data')->setCellValue('C2', 'Andrea Mendoze');
+                $book->getSheetByName('Retention Data')->setCellValue('I2', null);
+                $book->getSheetByName('Retention Data')->fromArray([
+                    [102, 'Out of period', 'Andrea Mendoze', '2098-01-10', '2098-01-31', 10, 20, 30],
+                    [103, 'Not retained', 'Andrea Mendoze', null, '2098-02-05', 10, 20, 30],
+                    [104, 'No payment', 'Andrea Mendoze', '2098-01-10', null, 10, 20, 30],
+                ], null, 'A4', true);
+            });
+            $parsed = \Cmd\Reports\Services\LegacyRetentionWorkbook::read($this->artifacts[$key]['path'], $source, $this->artifacts[$key]['sha256']);
+            $this->artifacts[$key]['context'] = ['legacyEvidence' => ['source' => $source, 'period' => self::PERIOD,
+                'workbookSha256' => $this->artifacts[$key]['sha256'], 'summaryEntries' => $parsed['entries'],
+                'historicalLinePricing' => 'unverified', 'eligibleForPayment' => false]];
+        }
+        $result = CustomerServiceCalculationSnapshot::forArchivedAgent($this->archivedSources('retention'), self::PERIOD, 'retention_regular', 'andrea mendoza', 'ldr');
+        $entry = $result['components'][0];
+        $this->assertSame('unavailable', $entry['status']); $this->assertSame(10, $entry['amount']);
+        $this->assertSame('andrea mendoze', $entry['sourceAgentKey']); $this->assertSame([], $entry['lines']);
+        $this->assertSame(['101'], array_column($entry['originalRows'], 'clientId'));
+        $this->assertSame([10.0, 20.0, 30.0, null], $entry['originalRows'][0]['rates']);
+        $this->assertSame(2, $entry['originalRows'][0]['detailRow']);
+        $this->assertArrayNotHasKey('amount', $entry['originalRows'][0]); $this->assertArrayNotHasKey('appliedTier', $entry['originalRows'][0]);
+        $this->assertStringNotContainsString('Other Secret', json_encode($result));
+    }
+
+    public function test_independent_component_rejects_tampered_unselected_company_and_missing_context_proof(): void
+    {
+        $sources = $this->archivedSources('nsf'); unset($sources['nsf_plaw']['contextSha256']);
+        try { CustomerServiceCalculationSnapshot::forArchivedAgent($sources, self::PERIOD, 'nsf', 'jane doe', 'ldr'); $this->fail('Missing other-company proof accepted.'); }
+        catch (\RuntimeException) { $this->addToAssertionCount(1); }
+        $sources = $this->archivedSources('nsf'); file_put_contents($sources['nsf_plaw']['path'], 'changed', FILE_APPEND);
+        $this->expectException(\RuntimeException::class);
+        CustomerServiceCalculationSnapshot::forArchivedAgent($sources, self::PERIOD, 'nsf', 'jane doe', 'ldr');
+    }
+
+    public function test_independent_component_rejects_noncanonical_identity_and_does_not_fuzzily_match(): void
+    {
+        $sources = $this->archivedSources('lookback');
+        foreach (['Jane Doe', ' jane doe', 'jane  doe', "bad\0name"] as $name) {
+            try { CustomerServiceCalculationSnapshot::forArchivedAgent($sources, self::PERIOD, 'retention_lookback', $name, 'both'); $this->fail('Bad identity accepted.'); }
+            catch (\InvalidArgumentException) { $this->addToAssertionCount(1); }
+        }
+        $this->assertSame([], CustomerServiceCalculationSnapshot::forArchivedAgent($sources, self::PERIOD, 'retention_lookback', 'jane do', 'both')['components']);
+    }
     private function mutate(string $key, callable $edit): void
     {
         $book = IOFactory::load($this->artifacts[$key]['path']);

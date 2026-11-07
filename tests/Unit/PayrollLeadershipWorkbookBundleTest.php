@@ -88,6 +88,18 @@ class PayrollLeadershipWorkbookBundleTest extends TestCase
         (new GenerateRetentionManagerCommission)->buildPayrollReviewWorkbookBundle('2098-09-01', '2098-09-30', $artifacts, $this->directory . '/output');
     }
 
+    public function test_nsf_only_workbook_builder_does_not_read_or_rebuild_retention_leadership(): void
+    {
+        $artifacts = $this->sources();
+        foreach (['retention_ldr', 'retention_plaw'] as $key) { unlink($artifacts[$key]['path']); unset($artifacts[$key]); }
+        $built = $this->command()->buildPayrollReviewWorkbookBundle('2098-09-01', '2098-09-30', $artifacts, $this->directory . '/nsf-only', null, true);
+        $this->assertSame(['nsf_team_leader'], array_keys($built['reports']));
+        $this->assertSame(['nsf_team_leader'], array_keys($built['files']));
+        $this->assertSame(['Archived NSF Agent', 'Zero Activity Agent'], array_column($built['reports']['nsf_team_leader']['team'], 'employeeName'));
+        $this->assertCount(1, glob($this->directory . '/nsf-only/*/*.xlsx'));
+        $this->assertFileExists($built['files']['nsf_team_leader']['path']);
+    }
+
     public function test_rama_replays_archived_cutoff_and_bonus_inputs_after_original_files_are_gone(): void
     {
         $sources = array_intersect_key($this->sources(), array_flip(['retention_ldr', 'retention_plaw']));
