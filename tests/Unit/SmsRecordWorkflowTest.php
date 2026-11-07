@@ -518,6 +518,73 @@ final class SmsRecordWorkflowTest extends TestCase
         $this->refuses(fn () => $this->runs->grantArtifactPath(self::ID), 404);
     }
 
+    public function test_big_pending_file_is_checked_on_the_worker_and_then_released_without_a_second_check(): void
+    {
+        $check = new class extends \Cmd\Reports\Services\SmsPendingDownloadCheck {
+            public array $state = [];
+            public int $started = 0;
+            public function ready(string $requestId): bool { if (($this->state[0] ?? null) === 'passed') return true; $this->started++; return false; }
+            public function passed(string $requestId): bool { return ($this->state[0] ?? null) === 'passed'; }
+            public function recordPass(string $requestId): void { $this->state = ['passed']; }
+            public function recordHeld(string $requestId, string $message): void { $this->state = ['held', $message]; }
+        };
+        Container::getInstance()->instance(\Cmd\Reports\Services\SmsPendingDownloadCheck::class, $check);
+        config(['sms-exports.pending_check_background_rows' => 0]);
+        $pk = $this->prospect(); $this->fileReady(1);
+
+        self::assertFalse($this->runs->pendingDownloadReady(self::ID));
+        self::assertSame(1, $check->started);
+        $this->runs->runPendingDownloadCheck(self::ID);
+        self::assertTrue($this->runs->pendingDownloadReady(self::ID));
+
+        // The fresh pass stands in for the check in the download request, and only there.
+        $this->db->table('TblProspects')->where('PK', $pk)->update(['Contacted' => 1]);
+        self::assertSame($this->runs->grantArtifactPath(self::ID), $this->runs->downloadPath(self::ID));
+        try { $this->runs->filePath(self::ID); self::fail('Approve must keep its own check.'); }
+        catch (\RuntimeException $error) { self::assertStringContainsString('held without changing membership', $error->getMessage()); }
+
+        // Once the pass is gone, the same member stops the download, and the worker reports the hold.
+        $check->state = [];
+        try { $this->runs->downloadPath(self::ID); self::fail('A late suppressed frozen member was released.'); }
+        catch (\RuntimeException $error) { self::assertStringContainsString('held without changing membership', $error->getMessage()); }
+        $this->runs->runPendingDownloadCheck(self::ID);
+        self::assertSame('held', $check->state[0]);
+        self::assertStringContainsString('held without changing membership', $check->state[1]);
+    }
+
+    public function test_a_live_progress_heartbeat_stops_the_false_stuck_alarm(): void
+    {
+        $stalled = new \ReflectionMethod(\Cmd\Reports\Services\SmsRunService::class, 'stalled');
+        $old = now()->subHours(3)->toDateTimeString();
+        $run = (object) ['Request_ID' => self::ID, 'Status' => 'selecting', 'Updated_At' => $old];
+        self::assertTrue($stalled->invoke($this->runs, $run), 'No heartbeat and an old row is stuck.');
+
+        $beating = new class extends \Cmd\Reports\Services\SmsRunProgress {
+            public ?string $at = null;
+            public function forRun(object $run): ?array { return $this->at === null ? null : ['updated_at' => $this->at]; }
+        };
+        Container::getInstance()->instance(\Cmd\Reports\Services\SmsRunProgress::class, $beating);
+        $beating->at = now()->subMinutes(2)->toIso8601String();
+        self::assertFalse($stalled->invoke($this->runs, $run), 'Fresh progress means the worker is alive.');
+        $beating->at = now()->subHours(3)->toIso8601String();
+        self::assertTrue($stalled->invoke($this->runs, $run), 'A stale heartbeat is still stuck.');
+        self::assertFalse($stalled->invoke($this->runs, (object) ['Status' => 'review', 'Updated_At' => $old]));
+    }
+
+    public function test_small_pending_file_keeps_its_check_in_the_download_request(): void
+    {
+        $check = new class extends \Cmd\Reports\Services\SmsPendingDownloadCheck {
+            public function ready(string $requestId): bool { throw new \LogicException('A small file must not wait on the worker.'); }
+            public function passed(string $requestId): bool { return false; }
+        };
+        Container::getInstance()->instance(\Cmd\Reports\Services\SmsPendingDownloadCheck::class, $check);
+        $pk = $this->prospect(); $this->fileReady(1);
+        self::assertTrue($this->runs->pendingDownloadReady(self::ID));
+        $this->db->table('TblProspects')->where('PK', $pk)->update(['Contacted' => 1]);
+        try { $this->runs->downloadPath(self::ID); self::fail('A late suppressed frozen member was released.'); }
+        catch (\RuntimeException $error) { self::assertStringContainsString('held without changing membership', $error->getMessage()); }
+    }
+
     public function test_delete_removes_pending_file_and_membership_without_a_send_or_history(): void
     {
         $this->prospect(); $this->fileReady(1);

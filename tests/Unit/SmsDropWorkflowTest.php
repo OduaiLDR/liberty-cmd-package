@@ -168,6 +168,25 @@ test('contacted phone lookups bind every number as text for SQL Server', functio
     expect($lookup['bindings'])->toBe(['3147577081', '13147577081']);
 });
 
+test('drop rows are read in full first when the connection has no MARS', function () {
+    smsFixture($this->db, 1, 'T1', '2026-10-05', ['2025550101', '2025550102']);
+    $repo = new class extends MailDropExportRepository {
+        public function sources(string $drop): iterable
+        {
+            return $this->sourceRowsForDrop($drop);
+        }
+    };
+
+    expect($repo->sources('DROP1'))->toBeInstanceOf(\Illuminate\Support\LazyCollection::class);
+
+    $config = new ReflectionProperty($this->db, 'config');
+    $config->setValue($this->db, [...$config->getValue($this->db), 'multiple_active_result_sets' => false]);
+
+    $rows = $repo->sources('DROP1');
+    expect($rows)->toBeInstanceOf(\Illuminate\Support\Collection::class);
+    expect($rows)->toHaveCount(2);
+});
+
 test('whitespace identity variants remain adjacent and suppress the complete merged lead', function () {
     smsFixture($this->db, 1, 'T1', '2026-10-05', ['2025550101', '2025550102']);
     $this->db->table('TblMailersUniqueEnriched')->insert([

@@ -35,16 +35,17 @@ final class SmsBackfillSerialCapturePdo extends PDO
     public function __construct(){}
     public function prepare(string $query,array $options=[]): PDOStatement|false
     {
-        $this->sql=$query;return $this->statement=new SmsBackfillSerialCaptureStatement();
+        $this->sql=$query;return $this->statement=new SmsBackfillSerialCaptureStatement($query);
     }
 }
 
 final class SmsBackfillSerialCaptureStatement extends PDOStatement
 {
     public array $bindings=[];
-    public function __construct(){}
+    public function __construct(private string $captured=''){}
     public function execute(?array $params=null): bool{$this->bindings=$params??[];return true;}
     public function columnCount(): int{return 1;}
-    public function fetchAll(int $mode=PDO::FETCH_DEFAULT,mixed ...$args): array{return [['Added'=>0,'Existing'=>0,'Deferred'=>0]];}
+    // The schema probe finds no wide phone columns, so the classic contact reader is used.
+    public function fetchAll(int $mode=PDO::FETCH_DEFAULT,mixed ...$args): array{return str_contains($this->captured,'sys.columns')?[]:[['Added'=>0,'Existing'=>0,'Deferred'=>0]];}
     public function closeCursor(): bool{return true;}
 }

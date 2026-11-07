@@ -203,10 +203,13 @@ class SmsRecordExportRepository extends SqlSrvRepository
                 $cancellation?->checkpoint($requestId);
                 $db->unprepared('DROP TABLE IF EXISTS #SmsTierCandidates');
                 $db->unprepared('CREATE TABLE #SmsTierCandidates (PK int NOT NULL PRIMARY KEY)');
+                // This one statement takes about half an hour at 3M, so the page names it instead of showing 0%.
+                $progress->write($requestId, ['phase' => 'finding_candidates', 'done' => 0, 'total' => $target, 'scanned' => 0]);
                 $db->statement(SmsTierWindowSelectionSql::candidatesSql($options['tiers'], $minimumDebt));
+                $progress->write($requestId, ['phase' => 'selecting', 'done' => 0, 'total' => $target, 'scanned' => 0]);
                 $cancellation?->checkpoint($requestId);
             }
-            foreach ([0, 1, 2] as $phase) {
+            foreach (self::selectionPhases() as $phase) {
                 $cursor = null;
                 while ($selected < $target) {
                     $cancellation?->checkpoint($requestId);
@@ -256,6 +259,12 @@ class SmsRecordExportRepository extends SqlSrvRepository
         } finally {
             $db->unprepared('SET NOCOUNT '.($noCount === 1 ? 'ON' : 'OFF'));
         }
+    }
+
+    /** 0 never texted with a date, 1 never texted with no date, 2 previously texted. Monther, Nov 5, 2026: a run can stop at never texted. */
+    public static function selectionPhases(): array
+    {
+        return config('sms-exports.selection_never_texted_only', false) === true ? [0, 1] : [0, 1, 2];
     }
 
     /** Exact priority page with disjoint seek ranges; never rescan a cursor prefix. */
@@ -506,6 +515,8 @@ class SmsRecordExportRepository extends SqlSrvRepository
             }
             $updated += $changed;
             $last = $ids[array_key_last($ids)];
+            // Cache only, so nothing is added to this transaction, and a cache failure can't stop it.
+            app(SmsRunProgress::class)->write($requestId, ['phase' => 'approving', 'done' => $updated, 'total' => $expected]);
         } while ($count === self::APPROVAL_WRITE_PAGE);
         if ($updated !== $expected || $this->table('TblProspectsExport')->where('Request_ID', $requestId)->exists()) {
             throw new RuntimeException('Not all frozen prospect IDs could be moved; approval was rolled back.');

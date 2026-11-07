@@ -488,8 +488,11 @@ class MailDropExportRepository extends SqlSrvRepository
         $identity = $this->connection()->getDriverName() === 'sqlsrv'
             ? SmsPhoneCounter::identitySql('External_ID')
             : 'LOWER(TRIM(External_ID, char(9) || char(10) || char(11) || char(13) || char(32) || char(0))) COLLATE BINARY';
-        return $this->connection()->query()->fromSub($enriched, 'sources')
-            ->orderByRaw($identity)->orderBy('PK')->cursor();
+        $sources = $this->connection()->query()->fromSub($enriched, 'sources')
+            ->orderByRaw($identity)->orderBy('PK');
+
+        // rowsForDrop runs eligibility lookups while it reads these rows, and those need MARS.
+        return $this->connection()->getConfig('multiple_active_result_sets') === false ? $sources->get() : $sources->cursor();
     }
 
     protected function rowsForDrop(string $dropName): iterable

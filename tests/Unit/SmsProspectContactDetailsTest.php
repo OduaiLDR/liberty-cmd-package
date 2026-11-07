@@ -30,14 +30,62 @@ final class SmsProspectContactDetailsTest extends TestCase
         self::assertSame('unchanged', $replay['state']);
     }
 
-    public function test_insert_order_does_not_choose_between_genuine_contacts(): void
+    public function test_the_newest_contact_wins_whatever_the_order(): void
     {
         $rows = [$this->contact('123'), $this->contact('124', '2026-10-11')];
+        foreach ([$rows, array_reverse($rows)] as $candidates) {
+            $plan = SmsProspectContactDetails::plan(null, null, null, $candidates, ['DP_LT'], true);
+            self::assertSame('ready', $plan['state']);
+            self::assertSame($this->contact('123'), $plan['details']);
+        }
+    }
+
+    public function test_a_contact_with_no_date_keeps_the_person_held(): void
+    {
+        $rows = [$this->contact('123'), $this->contact('124', null)];
         foreach ([$rows, array_reverse($rows)] as $candidates) {
             $plan = SmsProspectContactDetails::plan(null, null, null, $candidates, ['DP_LT'], true);
             self::assertSame('held', $plan['state']);
             self::assertSame('ambiguous_contact', $plan['reason']);
         }
+    }
+
+    public function test_on_the_same_day_the_higher_id_wins_inside_one_source(): void
+    {
+        $rows = [$this->contact('99'), $this->contact('100'), $this->contact('98', '2026-10-01')];
+        foreach ([$rows, array_reverse($rows)] as $candidates) {
+            $plan = SmsProspectContactDetails::plan(null, null, null, $candidates, ['DP_LT'], true);
+            self::assertSame($this->contact('100'), $plan['details'], 'IDs compare as numbers, not as text.');
+        }
+    }
+
+    public function test_a_same_day_tie_across_sources_stays_held(): void
+    {
+        $rows = [$this->contact('123', '2026-10-12', 'DP_LDR'), $this->contact('124', '2026-10-12', 'DP_PLAW')];
+        $plan = SmsProspectContactDetails::plan(null, null, null, $rows, ['DP_LDR', 'DP_PLAW'], true);
+        self::assertSame('ambiguous_contact', $plan['reason']);
+    }
+
+    public function test_one_id_under_two_companies_stays_held_even_with_different_dates(): void
+    {
+        $rows = [$this->contact('123', '2026-10-12', 'DP_LDR'), $this->contact('123', '2026-10-13', 'DP_PLAW')];
+        $plan = SmsProspectContactDetails::plan(null, null, null, $rows, ['DP_LDR', 'DP_PLAW'], true);
+        self::assertSame('ambiguous_contact', $plan['reason']);
+    }
+
+    public function test_different_companies_with_different_ids_take_the_newest(): void
+    {
+        $rows = [$this->contact('123', '2026-10-12', 'DP_LDR'), $this->contact('124', '2026-10-13', 'DP_PLAW')];
+        $plan = SmsProspectContactDetails::plan(null, null, null, $rows, ['DP_LDR', 'DP_PLAW'], true);
+        self::assertSame($rows[1], $plan['details']);
+    }
+
+    public function test_a_saved_contact_stays_when_a_newer_one_appears(): void
+    {
+        $rows = [$this->contact('123'), $this->contact('124', '2026-10-13')];
+        $plan = SmsProspectContactDetails::plan('123', '2026-10-12', null, $rows, ['DP_LT'], true);
+        self::assertSame('unchanged', $plan['state']);
+        self::assertSame($this->contact('123'), $plan['details']);
     }
 
     public function test_existing_identity_is_preserved_and_missing_date_only_comes_from_that_identity(): void

@@ -35,6 +35,8 @@ final class SmsExternalEventSqlServerTest extends SmsExternalEventServiceTest
 
     protected function tearDown(): void
     {
+        // A skipped test never connected, so there is nothing to close.
+        if (getenv('SMS_EXTERNAL_SQLSERVER_FIXTURE')!=='1') return;
         try { parent::tearDown(); } finally { $this->cleanupDatabase(); }
     }
 

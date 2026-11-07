@@ -85,6 +85,20 @@ final class SmsRunProgressTest extends TestCase
         self::assertSame(1, $progress->read($other)['done']);
     }
 
+    public function test_approving_and_finding_candidates_reach_the_run_view(): void
+    {
+        $progress = $this->clocked();
+        $run = (object) ['Request_ID' => self::ID, 'Status' => 'approving', 'Updated_At' => '2026-11-02T09:00:00Z'];
+        $progress->write(self::ID, ['phase' => 'approving', 'done' => 1000, 'total' => 3000]);
+        self::assertSame(1000, $progress->forRun($run)['done']);
+        self::assertNull($progress->forRun((object) ['Request_ID' => self::ID, 'Status' => 'approved', 'Updated_At' => '2026-11-02T09:00:00Z']));
+
+        $progress->write(self::ID, ['phase' => 'finding_candidates', 'done' => 0, 'total' => 3000]);
+        $selecting = (object) ['Request_ID' => self::ID, 'Status' => 'selecting', 'Updated_At' => '2026-11-02T09:00:00Z'];
+        self::assertSame('finding_candidates', $progress->forRun($selecting)['phase']);
+        self::assertNull($progress->forRun($run), 'A selection phase is never shown on an approving run.');
+    }
+
     public function test_forget_removes_the_snapshot_and_resets_its_throttle(): void
     {
         $progress = $this->clocked();

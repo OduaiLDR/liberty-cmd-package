@@ -173,7 +173,7 @@ final class SmsProspectBackfillSqlServerTest extends TestCase
 
         $result = SmsProspectBackfill::applyBatch($f->db, self::RUN, 0, $candidates);
         self::assertSame([0, 0, 1], [$result['added'], $result['existing'], $result['deferred']]);
-        self::assertSame(1, $f->rows('SELECT COUNT(*) AS n FROM dbo.TblProspects')[0]['n']);
+        self::assertSame(1, (int) $f->rows('SELECT COUNT(*) AS n FROM dbo.TblProspects')[0]['n']);
         $receipt = $f->rows('SELECT Decision,Reason,Source_SHA256,Prospect_PK FROM dbo.TblSMSProspectBackfillRows')[0];
         self::assertSame('deferred', $receipt['Decision']);
         self::assertSame('blocked_state', $receipt['Reason']);
