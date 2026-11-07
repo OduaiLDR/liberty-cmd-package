@@ -154,6 +154,7 @@ class SmsRunService
                 'Debt_Tier_Default' => (int) $sources->TierDefault, 'Debt_Missing' => (int) $sources->Missing];
         }
         $checkpoint();
+        if ($selected > 0) app(SmsRunReviewSummary::class)->record($requestId);
         if ($cancellable) {
             $cancellation->finishSelection($run,
                 fn () => $this->publishSelectionReview($requestId, $counts));
@@ -320,6 +321,16 @@ class SmsRunService
     }
 
     /** Approval time is accepted once, in UTC, before the asynchronous atomic commit. */
+    /** A member changing is a plain stop with its reason, not a server error the page calls safe to repeat. */
+    protected function assertFrozenForApproval(string $requestId, int $selected, bool $newFiles): void
+    {
+        try {
+            app(SmsRecordExportRepository::class)->assertFrozen($requestId, $selected, $newFiles);
+        } catch (SmsFrozenEligibilityHold $hold) {
+            throw new HttpException(409, $hold->getMessage(), $hold);
+        }
+    }
+
     public function requestApprove(string $requestId, string $actor): object
     {
         $preflight = $this->mustRun($requestId);
@@ -343,7 +354,7 @@ class SmsRunService
             if ($run->Status !== 'file_ready' || (int) $run->Selected < 1) throw new HttpException(409, 'Approve only a complete, ready record batch.');
             if ($newFiles) $this->assertApprovalReceiptUnchanged($run, $preflight);
             else $this->filePath($requestId);
-            app(SmsRecordExportRepository::class)->assertFrozen($requestId, (int) $run->Selected, $newFiles);
+            $this->assertFrozenForApproval($requestId, (int) $run->Selected, $newFiles);
             $precise = SmsContactAttribution::enabled();
             if ($precise) SmsContactAttribution::assertReady();
             $at = Carbon::now('UTC')->format($precise ? 'Y-m-d H:i:s.u' : 'Y-m-d H:i:s');
@@ -787,6 +798,10 @@ class SmsRunService
 
         // Worker cache snapshot, never SQL; Updated_At stays the stall/elapsed clock.
         if (in_array($run->Status, ['queued', 'selecting', 'building_file', 'approving'], true)) $view['progress'] = app(SmsRunProgress::class)->forRun($run);
+        if (in_array($run->Status, ['review', 'building_file', 'file_ready'], true)) {
+            $review = app(SmsRunReviewSummary::class)->read($requestId);
+            if ($review !== null) $view['review'] = $review;
+        }
         $view += $this->approvalFileView($run, $view['options']);
         if (($run->Progress_Step ?? null) === SmsSelectionCancellation::CANCELLED_STEP) $view['selection_cancelled'] = true;
         $cancellation = app(SmsSelectionCancellation::class)->projection($run);
