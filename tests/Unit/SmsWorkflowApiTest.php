@@ -295,6 +295,7 @@ test('API routes are host gated and bind correct methods and CMD report permissi
         ['POST', "mail-drop-export-report/runs/{$run}/cancel-selection", 'cmd.mail_drop_export.runs.cancel_selection'],
         ['POST', "mail-drop-export-report/runs/{$run}/sent", 'cmd.mail_drop_export.runs.sent'],
         ['POST', "mail-drop-export-report/runs/{$run}/approve", 'cmd.mail_drop_export.runs.approve'],
+        ['POST', "mail-drop-export-report/runs/{$run}/remove-held", 'cmd.mail_drop_export.runs.remove_held'],
         ['GET', "mail-drop-export-report/runs/{$run}/details", 'cmd.mail_drop_export.runs.details'],
         ['POST', "mail-drop-export-report/runs/{$run}/discard", 'cmd.mail_drop_export.runs.discard'],
         ['POST', "mail-drop-export-report/runs/{$run}/retry", 'cmd.mail_drop_export.runs.retry'],

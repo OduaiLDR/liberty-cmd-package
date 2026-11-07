@@ -45,6 +45,7 @@ class SmsRunStepJob implements ShouldQueue
             match ($this->step) {
                 'prepare' => $runs->prepare($this->requestId),
                 'file' => $runs->buildFile($this->requestId),
+                'remove_held' => $runs->removeHeld($this->requestId),
                 'send' => $runs->markSent($this->requestId),
                 'reverse' => $runs->reverseSent($this->requestId),
                 'approve' => $runs->markApproved($this->requestId),
