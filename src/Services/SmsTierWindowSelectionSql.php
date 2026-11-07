@@ -42,6 +42,28 @@ SQL;
     }
 
     /**
+     * Stored debt: the window already holds only people who match, so this just freezes them.
+     * Binding order: remaining quantity, request ID. Same columns and rounding as insert().
+     */
+    public static function insertStored(): string
+    {
+        $debt = SmsStoredDebt::ROUNDED_DEBT_SQL;
+
+        return <<<SQL
+INSERT INTO TblProspectsExport (Request_ID, Prospect_PK, Phone, Debt_Tier, Debt_Amount,
+    Debt_Source, Debt_Source_PK, Client, Address, City, State, Zip, Email,
+    Was_Previously_Texted, Last_SMS_Date_At_Selection)
+SELECT TOP (?) ?, w.Export_PK, w.Phone, w.Current_Tier, {$debt},
+    w.Current_Debt_Source, CASE WHEN w.Current_Debt_Source='Tier' THEN NULL ELSE w.Current_Debt_Source_PK END,
+    w.Client, w.Address, w.City, w.State, w.Snapshot_Zip, w.Email,
+    CASE WHEN w.Last_SMS_Date IS NULL THEN 0 ELSE 1 END, w.Last_SMS_Date
+FROM #SmsTierWanted w
+ORDER BY w.Window_Position ASC
+OPTION (RECOMPILE)
+SQL;
+    }
+
+    /**
      * #SmsTierWanted is connection-local and populated by the repository from
      * the exact eligible keyset sequence. The caller owns SNAPSHOT/replay and
      * repeats this statement until target rows are frozen or candidates end.

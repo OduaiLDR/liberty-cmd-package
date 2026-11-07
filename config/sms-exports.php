@@ -30,6 +30,15 @@ return [
     // Deleting a run above this many rows closes it at once and a worker removes the rows in pages,
     // because one 3M delete can't finish inside a request. Those rows don't affect selection.
     'discard_background_rows' => (int) env('CMD_SMS_DISCARD_BACKGROUND_ROWS', 100000),
+    // Jacob, Nov 7, 2026. Off until the back fill is done and compared.
+    'stored_debt_selection' => (bool) env('CMD_SMS_STORED_DEBT_SELECTION', false),
+    'stored_debt_window_size' => (int) env('CMD_SMS_STORED_DEBT_WINDOW_SIZE', 250000),
+    // Off until the back fill has finished. The refresh keeps values current after that.
+    'stored_debt_refresh' => (bool) env('CMD_SMS_STORED_DEBT_REFRESH', false),
+    // The nightly jobs, in UTC, while the back fill and refresh wait.
+    'stored_debt_pause_utc' => (string) env('CMD_SMS_STORED_DEBT_PAUSE_UTC', '09:20-10:25'),
+    // The temporary mailer join. Stored selection doesn't use it.
+    'tier_selection_narrowing_enabled' => (bool) env('CMD_SMS_TIER_SELECTION_NARROWING', true),
     // Opt in only after the additive summary migration, all eligibility writers and
     // the refresh scheduler have been deployed together. No live rollout is implicit.
     'durable_availability_enabled' => env('CMD_SMS_DURABLE_AVAILABILITY_ENABLED', false),

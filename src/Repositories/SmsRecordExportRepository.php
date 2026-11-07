@@ -14,6 +14,7 @@ use Cmd\Reports\Services\SmsRunOptions;
 use Cmd\Reports\Services\SmsRunArtifactFilename;
 use Cmd\Reports\Services\SmsRunProgress;
 use Cmd\Reports\Services\SmsStepLog;
+use Cmd\Reports\Services\SmsStoredDebt;
 use Cmd\Reports\Services\SmsTierSelectionMetrics;
 use Cmd\Reports\Services\SmsTierSelectionSql;
 use Cmd\Reports\Services\SmsTierWindowSchema;
@@ -185,11 +186,19 @@ class SmsRecordExportRepository extends SqlSrvRepository
             Client varchar(150) COLLATE database_default NULL, Address varchar(200) COLLATE database_default NULL, City varchar(100) COLLATE database_default NULL,
             State char(2) COLLATE database_default NULL, Snapshot_Zip varchar(10) COLLATE database_default NULL, Zip varchar(5) COLLATE database_default NULL,
             Email varchar(254) COLLATE database_default NULL, Creation_Date date NULL, Last_SMS_Date date NULL,
+            Current_Debt decimal(18,2) NULL, Current_Tier char(2) COLLATE database_default NULL,
+            Current_Debt_Source varchar(10) COLLATE database_default NULL, Current_Debt_Source_PK int NULL,
             PRIMARY KEY CLUSTERED (Window_Position), UNIQUE (Export_PK)
         )');
 
+        // Stored values need the lean history shape, which is the only one that keeps no source PK for a tier row.
+        $stored = SmsStoredDebt::selectionEnabled() && SmsRunOptions::usesLeanDebtSources($options['tier_selection_policy']);
+        if ($stored) {
+            SmsStoredDebt::assertReady($db);
+            $windowSize = max(1, (int) config('sms-exports.stored_debt_window_size', 250000));
+        }
         $debt = SmsDebtPolicy::bindings($options);
-        $sql = SmsTierWindowSelectionSql::insert($options['tiers'], (string) config('sms-exports.mailer_recency_date', 'Send_Date'),
+        $sql = $stored ? SmsTierWindowSelectionSql::insertStored() : SmsTierWindowSelectionSql::insert($options['tiers'], (string) config('sms-exports.mailer_recency_date', 'Send_Date'),
             SmsRunOptions::usesLeanDebtSources($options['tier_selection_policy']), SmsDebtPolicy::maximum($options) !== null);
         $selected = 0;
         $scanned = 0;
@@ -201,7 +210,8 @@ class SmsRecordExportRepository extends SqlSrvRepository
         $db->unprepared('SET NOCOUNT ON');
         // All nine tiers with no minimum accept almost everyone, so only a subset or a minimum needs narrowing first.
         $minimumDebt = SmsDebtPolicy::lowerBound($options);
-        $narrowed = $options['tiers'] !== SmsRunOptions::TIERS || $minimumDebt > 0;
+        $narrowed = ! $stored && config('sms-exports.tier_selection_narrowing_enabled', true) === true
+            && ($options['tiers'] !== SmsRunOptions::TIERS || $minimumDebt > 0);
         try {
             if ($narrowed) {
                 $cancellation?->checkpoint($requestId);
@@ -219,10 +229,11 @@ class SmsRecordExportRepository extends SqlSrvRepository
                     $cancellation?->checkpoint($requestId);
                     $loadStarted = hrtime(true);
                     $db->unprepared('TRUNCATE TABLE #SmsTierWanted');
-                    $window = $this->tierWindow($phase, $cursor, $windowSize, $narrowed);
+                    $window = $this->tierWindow($phase, $cursor, $windowSize, $narrowed, $stored ? $options : null);
                     $db->table('#SmsTierWanted')->insertUsing([
                         'Window_Position','Export_PK','Phone','Client','Address','City','State',
                         'Snapshot_Zip','Zip','Email','Creation_Date','Last_SMS_Date',
+                        ...($stored ? SmsStoredDebt::COLUMNS : []),
                     ], $window);
                     // Window_Position is ROW_NUMBER(), so the last position is this window's candidate count.
                     $last = $db->table('#SmsTierWanted')->orderByDesc('Window_Position')->first([
@@ -235,7 +246,8 @@ class SmsRecordExportRepository extends SqlSrvRepository
                     // Read the statement's own count on the server: shared worker
                     // sessions/trigger NOCOUNT settings make PDO rowCount unreliable.
                     $resolveStarted = hrtime(true);
-                    $receipt = $db->selectOne($sql.'; SELECT CONVERT(int,@@ROWCOUNT) AS inserted_rows', [$remaining, $requestId, ...$options['tiers'], ...$debt]);
+                    $bindings = $stored ? [$remaining, $requestId] : [$remaining, $requestId, ...$options['tiers'], ...$debt];
+                    $receipt = $db->selectOne($sql.'; SELECT CONVERT(int,@@ROWCOUNT) AS inserted_rows', $bindings);
                     $inserted = (int) $receipt->inserted_rows;
                     if ($inserted < 0 || $inserted > $remaining) throw new RuntimeException('Invalid window selection count.');
                     $selected += $inserted;
@@ -272,9 +284,19 @@ class SmsRecordExportRepository extends SqlSrvRepository
     }
 
     /** Exact priority page with disjoint seek ranges; never rescan a cursor prefix. */
-    private function tierWindow(int $phase, ?object $cursor, int $windowSize, bool $narrowed = false): Builder
+    private function tierWindow(int $phase, ?object $cursor, int $windowSize, bool $narrowed = false, ?array $storedOptions = null): Builder
     {
         $query = $this->eligible(true);
+        $storedColumns = [];
+        if ($storedOptions !== null) {
+            // Only people with a usable stored value. NULL (not worked out) and 'None' never reach a run.
+            $query->whereIn('Current_Debt_Source', SmsStoredDebt::SOURCES)
+                ->whereIn('Current_Tier', $storedOptions['tiers'])
+                ->where('Current_Debt', '>=', SmsDebtPolicy::lowerBound($storedOptions));
+            $maximum = SmsDebtPolicy::maximum($storedOptions);
+            if ($maximum !== null) $query->where('Current_Debt', '<=', $maximum);
+            $storedColumns = SmsStoredDebt::COLUMNS;
+        }
         if ($narrowed) {
             $query->whereExists(fn (Builder $q) => $q->selectRaw('1')->from('#SmsTierCandidates as tc')->whereColumn('tc.PK', 'TblProspects.PK'));
         }
@@ -300,7 +322,7 @@ class SmsRecordExportRepository extends SqlSrvRepository
             // and reread millions of already-visited records on every page.
             $same = clone $query;
             $otherDates = clone $query;
-            $columns = ['PK','Phone','Client','Address','City','State','Zip','Email','Creation_Date','Last_SMS_Date'];
+            $columns = ['PK','Phone','Client','Address','City','State','Zip','Email','Creation_Date','Last_SMS_Date', ...$storedColumns];
             $same->where($date, $cursor->$date)->where('PK', '>', (int) $cursor->Export_PK)
                 ->select($columns)->orderByRaw($order)->limit($windowSize);
             $otherDates->where($date, $phase === 0 ? '<' : '>', $cursor->$date)
@@ -308,9 +330,11 @@ class SmsRecordExportRepository extends SqlSrvRepository
             $query = $this->connection()->query()->fromSub($same->unionAll($otherDates), 'SmsTierPage');
         }
 
+        $extra = $storedColumns === [] ? '' : ','.implode(',', $storedColumns);
+
         return $query->selectRaw("ROW_NUMBER() OVER (ORDER BY {$order}) AS Window_Position,
             PK AS Export_PK,Phone,Client,Address,City,State,Zip AS Snapshot_Zip,LEFT(Zip,5) AS Zip,
-            Email,Creation_Date,Last_SMS_Date")->orderByRaw($order)->limit($windowSize);
+            Email,Creation_Date,Last_SMS_Date{$extra}")->orderByRaw($order)->limit($windowSize);
     }
 
     /** Validate immutable selected prices, never look up current sources again. */

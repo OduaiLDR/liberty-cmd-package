@@ -57,7 +57,7 @@ test('a debt range narrows on the mailer amount, alone or with a tier subset', f
 
 test('tier windows use the candidates only for a subset, and a run step can outlast a two hour selection', function (): void {
     $repository = file_get_contents(dirname(__DIR__, 2).'/src/Repositories/SmsRecordExportRepository.php');
-    expect($repository)->toContain("\$narrowed = \$options['tiers'] !== SmsRunOptions::TIERS || \$minimumDebt > 0;", "from('#SmsTierCandidates as tc')");
+    expect($repository)->toContain("&& (\$options['tiers'] !== SmsRunOptions::TIERS || \$minimumDebt > 0);", "from('#SmsTierCandidates as tc')");
     $job = new ReflectionClass(Cmd\Reports\Jobs\SmsRunStepJob::class);
     expect($job->getDefaultProperties()['timeout'])->toBe(Cmd\Reports\Services\SmsExportQueue::RUN_STEP_TIMEOUT)
         ->and(Cmd\Reports\Services\SmsExportQueue::RUN_STEP_TIMEOUT)->toBeLessThan(14400);

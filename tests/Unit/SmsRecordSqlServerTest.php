@@ -12,6 +12,8 @@ use Cmd\Reports\Services\SmsContactAttribution;
 use Cmd\Reports\Services\SmsContactEvent;
 use Cmd\Reports\Services\SmsRunService;
 use Cmd\Reports\Services\SmsRunOptions;
+use Cmd\Reports\Services\SmsStoredDebt;
+use Cmd\Reports\Services\SmsStoredDebtRefresh;
 use Cmd\Reports\Services\SmsRunProgress;
 use Cmd\Reports\Services\SmsLeanHistorySchema;
 use Cmd\Reports\Services\SmsTierWindowSchema;
@@ -87,7 +89,7 @@ final class SmsRecordSqlServerTest extends TestCase
         $this->directory = sys_get_temp_dir().'/sms-tier-record-test-'.bin2hex(random_bytes(8));
         mkdir($this->directory, 0700);
         $container->instance('config', new Repository(['app' => ['env' => 'testing'], 'sms-exports' => [
-            'record_workflow_enabled' => true, 'durable_availability_enabled' => true, 'local_root' => $this->directory], 'database' => ['default' => 'sqlsrv']]));
+            'tier_selection_narrowing_enabled' => false, 'record_workflow_enabled' => true, 'durable_availability_enabled' => true, 'local_root' => $this->directory], 'database' => ['default' => 'sqlsrv']]));
         // Selection validates its options, so a real run needs the validator bound.
         $container->singleton('validator', static fn ($app) => new \Illuminate\Validation\Factory(new \Illuminate\Translation\Translator(new \Illuminate\Translation\ArrayLoader, 'en'), $app));
         $capsule = new Manager($container);
@@ -106,6 +108,9 @@ final class SmsRecordSqlServerTest extends TestCase
                 '2026_10_20_000001_create_sms_availability_summary.php', '2026_10_20_000003_add_sms_record_approval.php'] as $file) {
                 (require dirname(__DIR__, 2).'/database/sms-migrations/'.$file)->up();
             }
+        }
+        if (! $this->db->getSchemaBuilder()->hasColumn('TblProspects', 'Current_Debt')) {
+            $this->db->unprepared('ALTER TABLE dbo.TblProspects ADD Current_Debt decimal(18,2) NULL, Current_Tier char(2) NULL, Current_Debt_Source varchar(10) NULL, Current_Debt_Source_PK int NULL');
         }
         if (! $this->db->getSchemaBuilder()->hasColumn('TblSMSRuns', 'Run_Options_JSON')) {
             (require dirname(__DIR__, 2).'/database/sms-migrations/2026_10_22_000001_add_sms_run_file_options.php')->up();
@@ -199,8 +204,9 @@ final class SmsRecordSqlServerTest extends TestCase
     {
         config(['sms-exports.run_file_options_enabled' => true, 'sms-exports.tier_selection_enabled' => true,
             'sms-exports.tier_selection_windowed_enabled' => true, 'sms-exports.tier_selection_window_size' => 2,
+            'sms-exports.tier_selection_narrowing_enabled' => false,
             'sms-exports.lean_history_enabled' => SmsRunOptions::usesLeanDebtSources($policy)]);
-        $options = SmsRunOptions::normalize($target, 1, $tiers, $policy, null, null, null, $minimum);
+        $options = SmsRunOptions::normalize($target, 1, $tiers, $policy, null, null, null, $minimum, csvFormat: SmsRunOptions::FIRST_LAST_CSV_FORMAT);
         $this->runs->start(self::ID, $target, 'synthetic@example.invalid', $options);
         return $options;
     }
@@ -773,6 +779,169 @@ final class SmsRecordSqlServerTest extends TestCase
         (new SmsRecordExportRepository)->assertCurrentStates(self::ID);
     }
 
+    /** Everyone a real run has to get right, and everyone it has to leave out. */
+    private function storedFixture(): array
+    {
+        $wrong = $this->person(['Address' => 'Stored wrong', 'Creation_Date' => '2026-10-26']);
+        $held = $this->person(['Address' => 'Stored held', 'Creation_Date' => '2026-10-25']);
+        $none = $this->person(['Address' => 'Stored none', 'Creation_Date' => '2026-10-24']);
+        $contacted = $this->person(['Address' => 'Stored contact', 'Creation_Date' => '2026-10-23', 'Phone' => '0005550777']);
+        $tu = $this->person(['Address' => 'Stored TU', 'Creation_Date' => '2026-10-22']);
+        $mailer = $this->person(['Address' => 'Stored mailer', 'Creation_Date' => '2026-10-21']);
+        $tier = $this->person(['Address' => 'Stored tier', 'Creation_Date' => '2026-10-20']);
+        $sameDay = $this->person(['Address' => 'Stored same day', 'Creation_Date' => '2026-10-20']);
+        $noDate = $this->person(['Address' => 'Stored no date', 'Creation_Date' => null]);
+        $previous = $this->person(['Address' => 'Stored previous', 'Creation_Date' => '2026-10-28', 'Last_SMS_Date' => '2026-01-01']);
+        $this->db->table('TblPhoneNumbers')->insert(['Phone' => '10005550777']);
+        $this->source(1, 'Stored wrong', 'T9');
+        $this->source(2, 'Stored held', 'T5', '0');
+        $this->source(3, 'Stored contact');
+        $this->source(4, 'Stored TU', 'T5', '30500.25');
+        $this->source(5, 'Stored same day');
+        $this->source(6, 'Stored no date');
+        $this->source(7, 'Stored previous');
+        $this->db->table('TblMailers')->insert(['PK' => 61, 'Client' => 'Synthetic Person', 'Address' => 'Stored mailer',
+            'Zip' => '00123', 'Drop_Name' => 'STORED-DROP', 'Debt_Amount' => 30501, 'Debt_Tier' => 'T5']);
+        $this->db->table('TblMailers')->insert(['PK' => 62, 'Client' => 'Synthetic Person', 'Address' => 'Stored tier',
+            'Zip' => '00123', 'Drop_Name' => 'STORED-DROP', 'Debt_Amount' => null, 'Debt_Tier' => 'T5']);
+        $this->db->table('TblMarketing')->insert(['Drop_Name' => 'STORED-DROP', 'Send_Date' => '2026-10-01']);
+
+        return compact('wrong', 'held', 'none', 'contacted', 'tu', 'mailer', 'tier', 'sameDay', 'noDate', 'previous');
+    }
+
+    private function backFill(): void
+    {
+        (new SmsStoredDebtRefresh($this->db))->refresh(array_map('intval', $this->db->table('TblProspects')->pluck('PK')->all()));
+    }
+
+    private function frozen(string $id): string
+    {
+        return $this->db->table('TblProspectsExport')->where('Request_ID', $id)->orderBy('PK')->get(['Prospect_PK','Phone','Debt_Tier','Debt_Amount','Debt_Source',
+            'Debt_Source_PK','Client','Address','City','State','Zip','Email','Was_Previously_Texted','Last_SMS_Date_At_Selection'])->toJson();
+    }
+
+    /** Runs the same request through the live rule, then stored values, and returns both frozen results. */
+    private function liveThenStored(int $target, array $tiers, ?int $minimum = null, ?int $maximum = null): array
+    {
+        $this->backFill();
+        $options = $this->tierRun($target, $tiers, SmsRunOptions::LEAN_WINDOWED_TIER_SELECTION_POLICY, $minimum);
+        if ($maximum !== null) {
+            $this->db->table('TblSMSRuns')->where('Request_ID', self::ID)->delete();
+            $options = SmsRunOptions::normalize($target, 1, $tiers, SmsRunOptions::LEAN_WINDOWED_TIER_SELECTION_POLICY, null, null, null, $minimum, $maximum, csvFormat: SmsRunOptions::FIRST_LAST_CSV_FORMAT);
+            $this->runs->start(self::ID, $target, 'synthetic@example.invalid', $options);
+        }
+        $this->db->table('TblSMSRuns')->where('Request_ID', self::ID)->update(['Status' => 'selecting']);
+        $live = (new SmsRecordExportRepository)->select(self::ID, $target);
+        $liveRows = $this->frozen(self::ID);
+        $this->db->table('TblSMSRuns')->where('Request_ID', self::ID)->update(['Status' => 'discarded']);
+        $this->db->table('TblProspectsExport')->where('Request_ID', self::ID)->delete();
+        $second = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff';
+        config(['sms-exports.stored_debt_selection' => true, 'sms-exports.stored_debt_window_size' => 3]);
+        $this->runs->start($second, $target, 'synthetic@example.invalid', $options);
+        $this->db->table('TblSMSRuns')->where('Request_ID', $second)->update(['Status' => 'selecting']);
+        $stored = (new SmsRecordExportRepository)->select($second, $target);
+
+        return [$live, $stored, $liveRows, $this->frozen($second)];
+    }
+
+    public function test_real_stored_selection_freezes_exactly_what_the_live_rule_froze_by_tier(): void
+    {
+        $this->storedFixture();
+        [$live, $stored, $liveRows, $storedRows] = $this->liveThenStored(10, ['T5']);
+        self::assertSame($liveRows, $storedRows);
+        self::assertSame($live, $stored);
+        self::assertSame(6, $stored['selected']);
+    }
+
+    public function test_real_stored_selection_matches_the_live_rule_on_a_debt_range_and_a_maximum(): void
+    {
+        $people = $this->storedFixture();
+        [, , $liveRows, $storedRows] = $this->liveThenStored(10, ['T1','T2','T3','T4','T5','T6','T7','T8','T9'], 30500, 31000);
+        self::assertSame($liveRows, $storedRows);
+        self::assertContains($people['wrong'], array_map('intval', array_column(json_decode($storedRows, true), 'Prospect_PK')), 'all tiers, so the T9 person is in range');
+    }
+
+    public function test_real_stored_selection_stops_at_never_texted_and_at_the_quantity_like_the_live_rule(): void
+    {
+        $people = $this->storedFixture();
+        config(['sms-exports.selection_never_texted_only' => true]);
+        [, $stored, $liveRows, $storedRows] = $this->liveThenStored(10, ['T5']);
+        self::assertSame($liveRows, $storedRows);
+        self::assertSame(5, $stored['selected']);
+        self::assertNotContains($people['previous'], array_map('intval', array_column(json_decode($storedRows, true), 'Prospect_PK')));
+        $this->db->table('TblProspectsExport')->delete(); $this->db->table('TblSMSRuns')->delete();
+        config(['sms-exports.stored_debt_selection' => false]);
+        [, $two, , $rows] = $this->liveThenStored(2, ['T5']);
+        self::assertSame(2, $two['selected']);
+        self::assertSame([$people['tu'], $people['mailer']], array_map('intval', array_column(json_decode($rows, true), 'Prospect_PK')));
+    }
+
+    public function test_real_stored_selection_keeps_every_person_with_no_usable_value_out_of_the_run(): void
+    {
+        $people = $this->storedFixture();
+        $this->backFill();
+        self::assertSame('None', $this->db->table('TblProspects')->where('PK', $people['held'])->value('Current_Debt_Source'));
+        $this->db->table('TblProspects')->where('PK', $people['mailer'])->update(array_fill_keys(SmsStoredDebt::COLUMNS, null));
+        config(['sms-exports.stored_debt_selection' => true, 'sms-exports.stored_debt_window_size' => 2]);
+        $this->tierRun(10, ['T5'], SmsRunOptions::LEAN_WINDOWED_TIER_SELECTION_POLICY);
+        config(['sms-exports.stored_debt_selection' => true, 'sms-exports.stored_debt_window_size' => 2]);
+        $this->db->table('TblSMSRuns')->where('Request_ID', self::ID)->update(['Status' => 'selecting']);
+        (new SmsRecordExportRepository)->select(self::ID, 10);
+        $picked = array_map('intval', $this->db->table('TblProspectsExport')->pluck('Prospect_PK')->all());
+        foreach (['held', 'none', 'wrong', 'contacted', 'mailer'] as $out) self::assertNotContains($people[$out], $picked, $out);
+        self::assertContains($people['tu'], $picked);
+    }
+
+    public function test_real_a_stored_value_is_what_freezes_even_when_a_newer_mailer_came_in_later(): void
+    {
+        $person = $this->person(['Address' => 'Stored kept', 'Creation_Date' => '2026-10-20']);
+        $this->db->table('TblMailers')->insert(['PK' => 71, 'Client' => 'Synthetic Person', 'Address' => 'Stored kept', 'Zip' => '00123', 'Drop_Name' => 'OLD-DROP', 'Debt_Amount' => 30000, 'Debt_Tier' => 'T5']);
+        $this->db->table('TblMarketing')->insert(['Drop_Name' => 'OLD-DROP', 'Send_Date' => '2026-01-01']);
+        $this->backFill();
+        $this->db->table('TblMailers')->insert(['PK' => 72, 'Client' => 'Synthetic Person', 'Address' => 'Stored kept', 'Zip' => '00123', 'Drop_Name' => 'NEW-DROP', 'Debt_Amount' => 90000, 'Debt_Tier' => 'T9']);
+        $this->db->table('TblMarketing')->insert(['Drop_Name' => 'NEW-DROP', 'Send_Date' => '2026-09-01']);
+        config(['sms-exports.stored_debt_selection' => true]);
+        $this->tierRun(1, ['T5'], SmsRunOptions::LEAN_WINDOWED_TIER_SELECTION_POLICY);
+        config(['sms-exports.stored_debt_selection' => true]);
+        $this->db->table('TblSMSRuns')->where('Request_ID', self::ID)->update(['Status' => 'selecting']);
+        self::assertSame(1, (new SmsRecordExportRepository)->select(self::ID, 1)['selected']);
+        $row = $this->db->table('TblProspectsExport')->first();
+        self::assertSame([$person, 'T5', 30000, 'TblMailers', 71], [(int) $row->Prospect_PK, $row->Debt_Tier, (int) $row->Debt_Amount, $row->Debt_Source, (int) $row->Debt_Source_PK]);
+    }
+
+    public function test_real_the_switch_on_with_the_columns_missing_refuses_the_run_and_never_falls_back(): void
+    {
+        $this->storedFixture();
+        $this->db->unprepared('ALTER TABLE dbo.TblProspects DROP COLUMN Current_Debt_Source_PK');
+        try {
+            config(['sms-exports.stored_debt_selection' => true]);
+            $this->tierRun(3, ['T5'], SmsRunOptions::LEAN_WINDOWED_TIER_SELECTION_POLICY);
+            config(['sms-exports.stored_debt_selection' => true]);
+            $this->db->table('TblSMSRuns')->where('Request_ID', self::ID)->update(['Status' => 'selecting']);
+            try {
+                (new SmsRecordExportRepository)->select(self::ID, 3);
+                self::fail('A stored run must not fall back to anything.');
+            } catch (\RuntimeException $error) {
+                self::assertStringContainsString('reviewed shape', $error->getMessage());
+            }
+            self::assertSame(0, $this->db->table('TblProspectsExport')->count());
+        } finally {
+            $this->db->unprepared('ALTER TABLE dbo.TblProspects ADD Current_Debt_Source_PK int NULL');
+        }
+    }
+
+    public function test_real_the_switch_leaves_older_selection_policies_on_the_live_rule(): void
+    {
+        $people = $this->storedFixture();
+        config(['sms-exports.stored_debt_selection' => true]);
+        $this->tierRun(3, ['T5'], SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY);
+        config(['sms-exports.stored_debt_selection' => true]);
+        $this->db->table('TblSMSRuns')->where('Request_ID', self::ID)->update(['Status' => 'selecting']);
+        self::assertSame(3, (new SmsRecordExportRepository)->select(self::ID, 3)['selected']);
+        self::assertSame(0, $this->db->table('TblProspects')->whereNotNull('Current_Debt_Source')->count());
+        self::assertSame($people['tu'], (int) $this->db->table('TblProspectsExport')->orderBy('PK')->value('Prospect_PK'));
+    }
+
     public function test_lean_v3_keeps_exact_tu_pk_and_gives_tier_fallback_no_second_source_id(): void
     {
         $tu = $this->person(['Address' => 'Lean TU']);
@@ -830,7 +999,7 @@ final class SmsRecordSqlServerTest extends TestCase
         config(['sms-exports.run_file_options_enabled' => true, 'sms-exports.tier_selection_enabled' => true,
             'sms-exports.tier_selection_windowed_enabled' => false, 'sms-exports.tier_selection_window_size' => 2]);
 
-        $v1 = SmsRunOptions::normalize(3, 3, ['T5'], SmsRunOptions::TIER_SELECTION_POLICY);
+        $v1 = SmsRunOptions::normalize(3, 3, ['T5'], SmsRunOptions::TIER_SELECTION_POLICY, csvFormat: SmsRunOptions::FIRST_LAST_CSV_FORMAT);
         $this->runs->start(self::ID, 3, 'synthetic@example.invalid', $v1);
         $this->db->table('TblSMSRuns')->where('Request_ID', self::ID)->update(['Status' => 'selecting']);
         $repo = new SmsRecordExportRepository;
@@ -844,7 +1013,7 @@ final class SmsRecordSqlServerTest extends TestCase
         $this->db->table('TblSMSRuns')->where('Request_ID', self::ID)->update(['Status' => 'discarded']);
         $this->db->table('TblProspectsExport')->where('Request_ID', self::ID)->delete();
         config(['sms-exports.tier_selection_windowed_enabled' => true]);
-        $v2 = SmsRunOptions::normalize(3, 3, ['T5'], SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY);
+        $v2 = SmsRunOptions::normalize(3, 3, ['T5'], SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY, csvFormat: SmsRunOptions::FIRST_LAST_CSV_FORMAT);
         $this->runs->start($v2id, 3, 'synthetic@example.invalid', $v2);
         $this->db->table('TblSMSRuns')->where('Request_ID', $v2id)->update(['Status' => 'selecting']);
         self::assertSame(3, $repo->select($v2id, 3)['selected']);
@@ -859,7 +1028,7 @@ final class SmsRecordSqlServerTest extends TestCase
         $this->db->unprepared('DROP INDEX IX_TblMarketing_SMS_Drop_SendDate ON dbo.TblMarketing');
         try {
             self::assertFalse($this->runs->overview()['capabilities']['tier_subset']);
-            $options = SmsRunOptions::normalize(1, 1, ['T5'], SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY);
+            $options = SmsRunOptions::normalize(1, 1, ['T5'], SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY, csvFormat: SmsRunOptions::FIRST_LAST_CSV_FORMAT);
             try { $this->runs->start(self::ID, 1, 'synthetic@example.invalid', $options); self::fail('Expected missing seek schema refusal.'); }
             catch (HttpException $error) { self::assertSame(503, $error->getStatusCode()); }
             self::assertSame(0, $this->db->table('TblSMSRuns')->count());
@@ -990,7 +1159,7 @@ final class SmsRecordSqlServerTest extends TestCase
         config(['sms-exports.run_file_options_enabled' => true,'sms-exports.tier_selection_enabled' => true]);
         $repo = new SmsRecordExportRepository;
         $columns = ['Prospect_PK','Debt_Tier','Debt_Amount','Debt_Source','Debt_Source_PK','Was_Previously_Texted','Last_SMS_Date_At_Selection'];
-        $v1 = SmsRunOptions::normalize(9, 9, ['T5'], SmsRunOptions::TIER_SELECTION_POLICY);
+        $v1 = SmsRunOptions::normalize(9, 9, ['T5'], SmsRunOptions::TIER_SELECTION_POLICY, csvFormat: SmsRunOptions::FIRST_LAST_CSV_FORMAT);
         $this->runs->start(self::ID, 9, 'synthetic@example.invalid', $v1);
         $this->db->table('TblSMSRuns')->update(['Status' => 'selecting']);
         self::assertSame(6, $repo->select(self::ID, 9)['selected']);
@@ -1021,7 +1190,7 @@ final class SmsRecordSqlServerTest extends TestCase
             'sms-exports.tier_selection_windowed_enabled' => true,'sms-exports.tier_selection_window_size' => 5000]);
         foreach (array_values(array_unique([100,1000,100000,$population])) as $target) {
             $id = sprintf('%08d-bbbb-4ccc-8ddd-eeeeeeeeeeee', $target);
-            $options = SmsRunOptions::normalize($target, 100000, ['T5'], SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY);
+            $options = SmsRunOptions::normalize($target, 100000, ['T5'], SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY, csvFormat: SmsRunOptions::FIRST_LAST_CSV_FORMAT);
             $this->runs->start($id, $target, 'synthetic@example.invalid', $options);
             $this->db->table('TblSMSRuns')->where('Request_ID', $id)->update(['Status' => 'selecting']);
             $started = microtime(true); $result = (new SmsRecordExportRepository)->select($id, $target);
@@ -1084,7 +1253,7 @@ final class SmsRecordSqlServerTest extends TestCase
             if (! in_array($i, [1,4], true)) $expected[] = $pk;
         }
         config(['sms-exports.run_file_options_enabled' => true,'sms-exports.tier_selection_enabled' => true]);
-        $this->runs->start(self::ID, 18, 'synthetic@example.invalid', SmsRunOptions::normalize(18, 18, ['T5'], SmsRunOptions::TIER_SELECTION_POLICY));
+        $this->runs->start(self::ID, 18, 'synthetic@example.invalid', SmsRunOptions::normalize(18, 18, ['T5'], SmsRunOptions::TIER_SELECTION_POLICY, csvFormat: SmsRunOptions::FIRST_LAST_CSV_FORMAT));
         $this->db->table('TblSMSRuns')->update(['Status' => 'selecting']);
         $repo = new SmsRecordExportRepository;
         self::assertSame(16, $repo->select(self::ID, 18)['selected']);
@@ -1112,7 +1281,7 @@ final class SmsRecordSqlServerTest extends TestCase
             ['Phone' => '110005550104'], ['Phone' => '00005550105'], ['Phone' => null],
         ]);
         config(['sms-exports.run_file_options_enabled' => true,'sms-exports.tier_selection_enabled' => true]);
-        $v1 = SmsRunOptions::normalize(7, 7, ['T5'], SmsRunOptions::TIER_SELECTION_POLICY);
+        $v1 = SmsRunOptions::normalize(7, 7, ['T5'], SmsRunOptions::TIER_SELECTION_POLICY, csvFormat: SmsRunOptions::FIRST_LAST_CSV_FORMAT);
         $this->runs->start(self::ID, 7, 'synthetic@example.invalid', $v1);
         $this->db->table('TblSMSRuns')->update(['Status' => 'selecting']);
         $repo = new SmsRecordExportRepository;
@@ -1188,7 +1357,7 @@ final class SmsRecordSqlServerTest extends TestCase
         $this->db->table('TblMarketing')->insert(['Drop_Name' => 'RANGE-DROP', 'Send_Date' => '2026-10-01']);
         config(['sms-exports.run_file_options_enabled' => true, 'sms-exports.tier_selection_enabled' => true,
             'sms-exports.tier_selection_windowed_enabled' => true, 'sms-exports.tier_selection_window_size' => 1]);
-        $options = SmsRunOptions::normalize(4, 1, null, SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY, null, null, null, 25000, 35000);
+        $options = SmsRunOptions::normalize(4, 1, null, SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY, null, null, null, 25000, 35000, csvFormat: SmsRunOptions::FIRST_LAST_CSV_FORMAT);
         $this->runs->start(self::ID, 4, 'synthetic@example.invalid', $options);
         $this->runs->prepare(self::ID);
         self::assertSame([$exact, $rounded], array_map('intval', $this->db->table('TblProspectsExport')->orderBy('PK')->pluck('Prospect_PK')->all()));
@@ -1265,7 +1434,7 @@ final class SmsRecordSqlServerTest extends TestCase
     public function test_real_closed_history_keysets_preserve_mixed_runs_without_writes_or_counts(): void
     {
         $ids = $keys = [];
-        $options = SmsRunOptions::normalize(100, 50, ['T2', 'T9'], SmsRunOptions::TIER_SELECTION_POLICY);
+        $options = SmsRunOptions::normalize(100, 50, ['T2', 'T9'], SmsRunOptions::TIER_SELECTION_POLICY, csvFormat: SmsRunOptions::FIRST_LAST_CSV_FORMAT);
         for ($i = 1; $i <= 25; $i++) {
             $id = sprintf('%08d-1111-4111-8111-%012d', $i, $i);
             $ids[] = $id;
@@ -1382,7 +1551,7 @@ final class SmsRecordSqlServerTest extends TestCase
             $this->person(['Address' => $address]); $this->source($i + 1, $address, $i === 3 ? 'T9' : 'T5');
         }
         $input = ['request_id' => self::ID, 'target' => 5, 'rows_per_file' => 2,
-            'csv_format' => SmsRunOptions::CSV_FORMAT, 'tiers' => ['T5'], 'tier_selection_policy' => SmsRunOptions::TIER_SELECTION_POLICY,
+            'csv_format' => SmsRunOptions::FIRST_LAST_CSV_FORMAT, 'tiers' => ['T5'], 'tier_selection_policy' => SmsRunOptions::TIER_SELECTION_POLICY,
             'options_version' => SmsRunOptions::PLANNED_DATE_VERSION, 'send_date' => '2026-10-26',
             'filename_version' => SmsRunOptions::APPROVAL_FILENAME_VERSION];
         self::assertSame(403, $http('POST', 'runs', $input, 'agent')->getStatusCode());
@@ -1444,10 +1613,10 @@ final class SmsRecordSqlServerTest extends TestCase
             foreach ($manifest['parts'] as $part) {
                 $stream = $zip->getStream($part['name']); self::assertIsResource($stream);
                 try {
-                    self::assertSame(['First name', 'debt load', 'phone1', 'send date'], fgetcsv($stream, null, ',', '"', ''));
+                    self::assertSame(['First name', 'Last name', 'debt load', 'phone1', 'send date'], fgetcsv($stream, null, ',', '"', ''));
                     $partRows = 0;
                     while (($row = fgetcsv($stream, null, ',', '"', '')) !== false) {
-                        self::assertCount(4, $row); self::assertSame(['31000', '0005550100', '2026-10-26'], array_slice($row, 1));
+                        self::assertCount(5, $row); self::assertSame(['31000', '0005550100', '2026-10-26'], array_slice($row, 2));
                         $partRows++; $rowsRead++;
                     }
                     self::assertSame($part['rows'], $partRows);
