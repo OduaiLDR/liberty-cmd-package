@@ -27,6 +27,9 @@ return [
     // Pending files above this many rows are checked on the worker before the download starts,
     // because the load balancer drops a request after 60 seconds without a byte.
     'pending_check_background_rows' => (int) env('CMD_SMS_PENDING_CHECK_BACKGROUND_ROWS', 500000),
+    // Deleting a run above this many rows closes it at once and a worker removes the rows in pages,
+    // because one 3M delete can't finish inside a request. Those rows don't affect selection.
+    'discard_background_rows' => (int) env('CMD_SMS_DISCARD_BACKGROUND_ROWS', 100000),
     // Opt in only after the additive summary migration, all eligibility writers and
     // the refresh scheduler have been deployed together. No live rollout is implicit.
     'durable_availability_enabled' => env('CMD_SMS_DURABLE_AVAILABILITY_ENABLED', false),

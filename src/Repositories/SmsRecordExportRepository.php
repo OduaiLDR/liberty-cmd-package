@@ -13,6 +13,7 @@ use Cmd\Reports\Services\SmsRunArtifactBundle;
 use Cmd\Reports\Services\SmsRunOptions;
 use Cmd\Reports\Services\SmsRunArtifactFilename;
 use Cmd\Reports\Services\SmsRunProgress;
+use Cmd\Reports\Services\SmsStepLog;
 use Cmd\Reports\Services\SmsTierSelectionMetrics;
 use Cmd\Reports\Services\SmsTierSelectionSql;
 use Cmd\Reports\Services\SmsTierWindowSchema;
@@ -30,7 +31,10 @@ class SmsRecordExportRepository extends SqlSrvRepository
 {
     // Stay below SQL Server's 2,100 parameter limit and keep log-throttled
     // approval writes bounded without committing partial campaign history.
-    public const APPROVAL_WRITE_PAGE = 1000;
+    // A run small enough to stay under SQL Server's 5,000 locks keeps row locks. A bigger run usually
+    // takes a table lock on TblProspects at the locked frozen check, before the first page, and holds it
+    // to commit, so this size isn't what keeps a big run clear of escalation. SQL Server decides that.
+    public const APPROVAL_WRITE_PAGE = 2000;
 
     private function eligible(bool $seekContactPhones = false): Builder
     {
@@ -477,13 +481,33 @@ class SmsRecordExportRepository extends SqlSrvRepository
         });
     }
 
+    /**
+     * One page of the approval's prospect update. The join order and loop join are forced, because a
+     * scan of TblProspects repeated once per page would be far slower than the list this replaced.
+     */
+    private function approveProspectPage(string $requestId, array $ids, int $first, int $final, string $date): int
+    {
+        $db = $this->connection();
+        if ($db->getDriverName() !== 'sqlsrv') {
+            return $this->table('TblProspects')->whereIn('PK', $ids)->update([
+                'Last_SMS_Date' => $date, 'Latest_Export_Date' => $date, 'SMS_Attempts' => $db->raw('SMS_Attempts + 1'),
+            ]);
+        }
+
+        return $db->update('UPDATE p SET p.Last_SMS_Date=?,p.Latest_Export_Date=?,p.SMS_Attempts=p.SMS_Attempts+1
+FROM dbo.TblProspectsExport AS x INNER LOOP JOIN dbo.TblProspects AS p ON p.PK=x.Prospect_PK
+WHERE x.Request_ID=? AND x.Prospect_PK>=? AND x.Prospect_PK<=? OPTION (FORCE ORDER, MAXDOP 1)', [$date, $date, $requestId, $first, $final]);
+    }
+
     /** Called in the service's same approval transaction, with the run row already locked. */
     public function approve(string $requestId, Carbon $approvedAt, int $expected): int
     {
         SmsRecordPolicy::assertReady();
         $db = $this->connection();
         if ($db->transactionLevel() < 1) throw new RuntimeException('Record approval requires the batch transaction.');
+        SmsStepLog::mark($requestId, 'final_eligibility_check');
         $this->assertFrozen($requestId, $expected);
+        SmsStepLog::mark($requestId, 'writing_history');
         $counts = $this->composition($requestId);
         $run = $this->table('TblSMSRuns')->where('Request_ID', $requestId)->first();
         if (! SmsRecordPolicy::isRecord($run) || $run->Status !== 'approving'
@@ -503,11 +527,12 @@ class SmsRecordExportRepository extends SqlSrvRepository
             $ids = $page->orderBy('Prospect_PK')->limit(self::APPROVAL_WRITE_PAGE)->pluck('Prospect_PK')->all();
             if ($ids === []) break;
             $count = count($ids);
-            $changed = $this->table('TblProspects')->whereIn('PK', $ids)->update([
-                'Last_SMS_Date' => $date, 'Latest_Export_Date' => $date, 'SMS_Attempts' => $db->raw('SMS_Attempts + 1'),
-            ]);
+            // A key range on the unique request+prospect key, not a list: one small statement, however big the page.
+            $first = (int) $ids[0];
+            $final = (int) $ids[$count - 1];
+            $changed = $this->approveProspectPage($requestId, $ids, $first, $final, $date);
             if ($changed !== $count) throw new RuntimeException('Not all frozen prospect IDs could be updated; approval was rolled back.');
-            $members = fn (): Builder => $this->table('TblProspectsExport')->where('Request_ID', $requestId)->whereIn('Prospect_PK', $ids);
+            $members = fn (): Builder => $this->table('TblProspectsExport')->where('Request_ID', $requestId)->whereBetween('Prospect_PK', [$first, $final]);
             $inserted = $this->table('TblSMSHistory')->insertUsing([...$columns,'Export_Date'], $members()
                 ->select($columns)->selectRaw('? AS Export_Date', [$approvedAt->copy()->utc()->format('Y-m-d H:i:s')]));
             if ($inserted !== $count || $members()->delete() !== $count) {

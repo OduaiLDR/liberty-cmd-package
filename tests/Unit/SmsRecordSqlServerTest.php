@@ -88,6 +88,8 @@ final class SmsRecordSqlServerTest extends TestCase
         mkdir($this->directory, 0700);
         $container->instance('config', new Repository(['app' => ['env' => 'testing'], 'sms-exports' => [
             'record_workflow_enabled' => true, 'durable_availability_enabled' => true, 'local_root' => $this->directory], 'database' => ['default' => 'sqlsrv']]));
+        // Selection validates its options, so a real run needs the validator bound.
+        $container->singleton('validator', static fn ($app) => new \Illuminate\Validation\Factory(new \Illuminate\Translation\Translator(new \Illuminate\Translation\ArrayLoader, 'en'), $app));
         $capsule = new Manager($container);
         $capsule->addConnection(['driver' => 'sqlsrv', 'host' => '127.0.0.1,14337', 'database' => self::$database,
             'username' => 'sa', 'password' => self::$password, 'encrypt' => 'no', 'trust_server_certificate' => 'yes'], 'sqlsrv');
@@ -483,9 +485,9 @@ final class SmsRecordSqlServerTest extends TestCase
         self::assertSame(0, $this->db->table('TblSMSLegacySends')->count());
     }
 
-    private function pagedApproval(): int
+    private function pagedApproval(int $people = SmsRecordExportRepository::APPROVAL_WRITE_PAGE + 1): int
     {
-        $rows = array_fill(0, SmsRecordExportRepository::APPROVAL_WRITE_PAGE + 1, [
+        $rows = array_fill(0, $people, [
             'Client' => 'Synthetic Person', 'Address' => 'Fixture St', 'Phone' => '0005550100',
             'State' => 'CA', 'Zip' => '00123', 'Creation_Date' => '2026-10-10', 'SMS_Attempts' => 4,
         ]);
@@ -507,7 +509,7 @@ final class SmsRecordSqlServerTest extends TestCase
             ['SmsApprovalBoundedHistory','TblSMSHistory','INSERT','inserted'],
             ['SmsApprovalBoundedExports','TblProspectsExport','DELETE','deleted']] as [$name,$table,$event,$rows]) {
             $this->db->unprepared("CREATE TRIGGER dbo.{$name} ON dbo.{$table} AFTER {$event} AS BEGIN
-                SET NOCOUNT ON; IF (SELECT COUNT(*) FROM {$rows})>1000 THROW 52904,'Unbounded approval write.',1; END");
+                SET NOCOUNT ON; IF (SELECT COUNT(*) FROM {$rows})>".SmsRecordExportRepository::APPROVAL_WRITE_PAGE." THROW 52904,'Unbounded approval write.',1; END");
         }
         $this->runs->markApproved(self::ID);
         $this->runs->markApproved(self::ID);
@@ -520,6 +522,123 @@ final class SmsRecordSqlServerTest extends TestCase
         self::assertNull($this->db->table('TblProspects')->where('PK', $outside)->value('Last_SMS_Date'));
         self::assertSame(1, (int) $this->db->table('TblSMSAvailabilitySummary')->value('revision'));
         self::assertSame('approved', $this->db->table('TblSMSRuns')->value('Status'));
+    }
+
+    public function test_real_approval_never_touches_a_person_inside_the_key_range_who_is_not_in_the_batch(): void
+    {
+        // A key range can span people who aren't members, so only the export row may decide who is updated.
+        $first = $this->person(['SMS_Attempts' => 4]);
+        $stranger = $this->person(['SMS_Attempts' => 9, 'Opt_Out' => 1]);
+        $last = $this->person(['SMS_Attempts' => 4]);
+        self::assertTrue($first < $stranger && $stranger < $last);
+        $this->readyApproval(2);
+        self::assertSame(2, $this->db->table('TblProspectsExport')->where('Request_ID', self::ID)->count());
+        // Another run's row on the same key and inside the range stays exactly where it is.
+        $other = (array) $this->db->table('TblProspectsExport')->where('Prospect_PK', $first)->first();
+        unset($other['PK']);
+        $other['Request_ID'] = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff';
+        $this->db->table('TblProspectsExport')->insert($other);
+        $other['Prospect_PK'] = $stranger;
+        $this->db->table('TblProspectsExport')->insert($other);
+        $this->runs->markApproved(self::ID);
+        self::assertSame(5, (int) $this->db->table('TblProspects')->where('PK', $first)->value('SMS_Attempts'));
+        self::assertSame(5, (int) $this->db->table('TblProspects')->where('PK', $last)->value('SMS_Attempts'));
+        self::assertSame(9, (int) $this->db->table('TblProspects')->where('PK', $stranger)->value('SMS_Attempts'));
+        self::assertNull($this->db->table('TblProspects')->where('PK', $stranger)->value('Last_SMS_Date'));
+        self::assertSame(2, $this->db->table('TblSMSHistory')->where('Request_ID', self::ID)->count());
+        self::assertSame(0, $this->db->table('TblSMSHistory')->where('Prospect_PK', $stranger)->count());
+        self::assertSame(2, $this->db->table('TblProspectsExport')->where('Request_ID', 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff')->count());
+        self::assertSame(0, $this->db->table('TblProspectsExport')->where('Request_ID', self::ID)->count());
+    }
+
+    public function test_real_approval_of_exactly_one_page_and_of_one_person_finishes_cleanly(): void
+    {
+        $page = SmsRecordExportRepository::APPROVAL_WRITE_PAGE;
+        $rows = array_fill(0, $page, ['Client' => 'Synthetic Person', 'Address' => 'Fixture St', 'Phone' => '0005550100',
+            'State' => 'CA', 'Zip' => '00123', 'Creation_Date' => '2026-10-10', 'SMS_Attempts' => 4]);
+        foreach (array_chunk($rows, 100) as $chunk) $this->db->table('TblProspects')->insert($chunk);
+        $this->readyApproval($page);
+        $this->runs->markApproved(self::ID);
+        self::assertSame($page, $this->db->table('TblSMSHistory')->where('Request_ID', self::ID)->count());
+        self::assertSame($page, $this->db->table('TblProspects')->where('SMS_Attempts', 5)->count());
+        self::assertSame('approved', $this->db->table('TblSMSRuns')->value('Status'));
+    }
+
+    public function test_real_big_approval_moves_every_row_once_whichever_locks_sql_server_takes(): void
+    {
+        // Past 5,000 locks the frozen check usually escalates before the first page. SQL Server decides
+        // that, so this checks the result, never a lock count.
+        $people = SmsRecordExportRepository::APPROVAL_WRITE_PAGE * 3 + 1;
+        $outside = $this->pagedApproval($people);
+        $this->runs->markApproved(self::ID);
+        self::assertSame('approved', $this->db->table('TblSMSRuns')->value('Status'));
+        self::assertSame($people, $this->db->table('TblSMSHistory')->where('Request_ID', self::ID)->count());
+        self::assertSame($people, $this->db->table('TblSMSHistory')->where('Request_ID', self::ID)->distinct()->count('Prospect_PK'));
+        self::assertSame(0, $this->db->table('TblProspectsExport')->where('Request_ID', self::ID)->count());
+        self::assertSame($people, $this->db->table('TblProspects')->where('SMS_Attempts', 5)->count());
+        $stranger = $this->db->table('TblProspects')->where('PK', $outside)->first();
+        self::assertSame(7, (int) $stranger->SMS_Attempts);
+        self::assertNull($stranger->Last_SMS_Date);
+    }
+
+    public function test_real_approval_page_plan_seeks_and_never_scans_prospects(): void
+    {
+        $this->pagedApproval();
+        $this->runs->markApproved(self::ID);
+        $plan = $this->db->selectOne("SELECT TOP (1) CONVERT(nvarchar(max), p.query_plan) AS xml FROM sys.dm_exec_query_stats s
+            CROSS APPLY sys.dm_exec_sql_text(s.sql_handle) t CROSS APPLY sys.dm_exec_query_plan(s.plan_handle) p
+            WHERE t.text LIKE '%INNER LOOP JOIN dbo.TblProspects%' AND t.text NOT LIKE '%dm_exec_query_stats%' ORDER BY s.last_execution_time DESC");
+        self::assertNotNull($plan);
+        self::assertStringContainsString('Nested Loops', $plan->xml);
+        self::assertDoesNotMatchRegularExpression('/PhysicalOp="(Clustered Index Scan|Table Scan|Index Scan|Hash Match)"/', $plan->xml);
+    }
+
+    public function test_real_big_delete_closes_at_once_and_a_worker_removes_rows_in_pages_and_can_resume(): void
+    {
+        config(['sms-exports.discard_background_rows' => 3]);
+        foreach (range(1, 5) as $n) $this->person();
+        $this->selecting(5);
+        (new SmsRecordExportRepository)->select(self::ID, 5);
+        $this->db->table('TblSMSRuns')->update(['Status' => 'review', 'Selected' => 5]);
+        // Another run's row must survive the whole thing.
+        $other = (array) $this->db->table('TblProspectsExport')->first();
+        unset($other['PK']);
+        $other['Request_ID'] = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff';
+        $this->db->table('TblProspectsExport')->insert($other);
+        $this->runs->discard(self::ID);
+        self::assertSame('discarded', $this->db->table('TblSMSRuns')->where('Request_ID', self::ID)->value('Status'));
+        self::assertSame(5, $this->db->table('TblProspectsExport')->where('Request_ID', self::ID)->count(), 'rows wait for the worker');
+        // This fixture has no queue, so the line above also proves a queue failure can't undo a finished delete.
+        $this->db->table('TblProspectsExport')->where('Request_ID', self::ID)->limit(1)->delete();
+        // A job killed part way leaves the rest, and the retry finishes without an error.
+        self::assertSame(4, $this->runs->purgeDiscardedMembers(self::ID, 2));
+        self::assertSame(0, $this->db->table('TblProspectsExport')->where('Request_ID', self::ID)->count());
+        self::assertSame(0, $this->runs->purgeDiscardedMembers(self::ID));
+        self::assertSame(1, $this->db->table('TblProspectsExport')->where('Request_ID', 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff')->count());
+    }
+
+    public function test_real_a_small_delete_still_removes_rows_inside_its_own_transaction(): void
+    {
+        config(['sms-exports.discard_background_rows' => 3]);
+        $this->person(); $this->person();
+        $this->selecting(2);
+        (new SmsRecordExportRepository)->select(self::ID, 2);
+        $this->db->table('TblSMSRuns')->update(['Status' => 'review', 'Selected' => 2]);
+        $this->runs->discard(self::ID);
+        self::assertSame('discarded', $this->db->table('TblSMSRuns')->value('Status'));
+        self::assertSame(0, $this->db->table('TblProspectsExport')->count());
+    }
+
+    public function test_real_purge_refuses_a_run_that_was_not_deleted(): void
+    {
+        $this->person(); $this->readyApproval(1);
+        self::assertSame(0, $this->runs->purgeDiscardedMembers(self::ID));
+        self::assertSame(1, $this->db->table('TblProspectsExport')->where('Request_ID', self::ID)->count(), 'an open run keeps its members');
+        $this->db->table('TblSMSRuns')->update(['Status' => 'discarded']);
+        $this->db->table('TblSMSHistory')->insert(['Request_ID' => self::ID] + (array) $this->db->table('TblProspectsExport')->select(['Prospect_PK', 'Phone', 'SMS_Drop_PK', 'Drop_Name', 'Debt_Tier', 'Debt_Amount'])->first() + ['Export_Date' => '2026-10-20 00:00:00']);
+        try { $this->runs->purgeDiscardedMembers(self::ID); self::fail('History must stop the purge.'); }
+        catch (\RuntimeException $error) { self::assertStringContainsString('History exists', $error->getMessage()); }
+        self::assertSame(1, $this->db->table('TblProspectsExport')->where('Request_ID', self::ID)->count());
     }
 
     public static function approvalPageFailures(): array
