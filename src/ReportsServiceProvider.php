@@ -260,6 +260,7 @@ class ReportsServiceProvider extends ServiceProvider
                 \Cmd\Reports\Console\Commands\RecoverSmsRunDebtPleteImports::class,
                 \Cmd\Reports\Console\Commands\RecoverSmsAutomaticHandoffs::class,
                 \Cmd\Reports\Console\Commands\RefreshSmsAvailability::class,
+                \Cmd\Reports\Console\Commands\SmsStoredDebtCommand::class,
                 \Cmd\Reports\Console\Commands\RegisterJudeSmsEvent::class,
                 SyncCalls::class,
                 SyncNegotiatorPayrollData::class,
