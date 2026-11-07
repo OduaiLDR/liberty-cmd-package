@@ -129,6 +129,7 @@ class SmsRunController extends Controller
     {
         $link = ['download_url' => $this->runs->downloadUrl($requestId)];
         if (config('sms-exports.download_continuation_enabled', false) === true) {
+            if (! $this->runs->pendingDownloadReady($requestId)) return $this->json(['preparing' => true]);
             $link['download_request'] = app(\Cmd\Reports\Services\SmsDownloadContinuation::class)->issue($request, $requestId);
         }
         return $this->json($link);
@@ -182,7 +183,7 @@ class SmsRunController extends Controller
     /** Reached only through the signed link from link(). */
     public function download(string $requestId): BinaryFileResponse
     {
-        $path = $this->runs->filePath($requestId);
+        $path = $this->runs->downloadPath($requestId);
         $response = new BinaryFileResponse($path, 200, [
             'Content-Type' => str_ends_with(strtolower($path), '.zip') ? 'application/zip' : 'text/csv; charset=UTF-8',
             'Cache-Control' => 'private, no-store', 'X-Content-Type-Options' => 'nosniff',

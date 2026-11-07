@@ -15,9 +15,11 @@ use Throwable;
  */
 class SmsRunProgress
 {
-    public const SELECTION_PHASES = ['selecting', 'finalizing_selection'];
+    public const SELECTION_PHASES = ['finding_candidates', 'selecting', 'finalizing_selection'];
 
     public const BUILD_PHASES = ['checking', 'writing', 'packaging', 'verifying', 'final_check'];
+
+    public const APPROVAL_PHASES = ['approving'];
 
     public const TTL_SECONDS = 21600;
 
@@ -70,6 +72,7 @@ class SmsRunProgress
         $phases = match ($run->Status ?? null) {
             'queued', 'selecting' => self::SELECTION_PHASES,
             'building_file' => self::BUILD_PHASES,
+            'approving' => self::APPROVAL_PHASES,
             default => [],
         };
         $snapshot = $phases === [] ? null : $this->read((string) ($run->Request_ID ?? ''));
@@ -90,7 +93,7 @@ class SmsRunProgress
     /** Fixed public shape with non-negative JavaScript-safe integers. */
     private static function shape(array $value): ?array
     {
-        if (! in_array($value['phase'] ?? null, [...self::SELECTION_PHASES, ...self::BUILD_PHASES], true)
+        if (! in_array($value['phase'] ?? null, [...self::SELECTION_PHASES, ...self::BUILD_PHASES, ...self::APPROVAL_PHASES], true)
             || ! is_int($value['done'] ?? null) || ! is_int($value['total'] ?? null) || ! is_string($value['updated_at'] ?? null)) return null;
         $count = static fn (?int $number): ?int => $number === null ? null : max(0, min(self::SAFE_INTEGER, $number));
         $shape = ['phase' => $value['phase'], 'done' => $count($value['done']), 'total' => $count($value['total'])];

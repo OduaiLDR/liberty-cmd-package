@@ -413,4 +413,6 @@ final class DownloadContinuationRuns extends SmsRunService
         return $this->path;
     }
     public function grantArtifactPath(string $requestId): string { $this->grantCalls++;return $this->path; }
+    public function pendingDownloadReady(string $requestId): bool { return true; }
+    public function downloadPath(string $requestId): string { return $this->filePath($requestId); }
 }

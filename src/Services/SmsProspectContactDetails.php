@@ -44,8 +44,8 @@ final class SmsProspectContactDetails
                 && ($existingSource === null || $row['source'] === $existingSource));
         }
         if ($unique === []) return ['state' => 'unchanged', 'reason' => 'no_matching_contact', 'details' => null];
-        if (count($unique) !== 1) return self::held('ambiguous_contact');
-        $winner = array_values($unique)[0];
+        $winner = count($unique) === 1 ? array_values($unique)[0] : ($existingCid === null ? self::newest($unique) : null);
+        if ($winner === null) return self::held('ambiguous_contact');
         if ($existingDate !== null && $winner['date'] !== null && $existingDate !== $winner['date']) {
             return self::held('existing_date_conflict');
         }
@@ -54,6 +54,37 @@ final class SmsProspectContactDetails
             && ($existingSource === null || $existingSource === $winner['source']) ? 'unchanged' : 'ready';
         return ['state' => $state, 'reason' => $winner['date'] === null ? 'source_date_unknown' : null,
             'details' => $winner];
+    }
+
+    /**
+     * Jacob, Nov 4: a phone on several contacts belongs to the newest one created. Null when the
+     * data can't show which that is: a missing date, a same-day tie across sources or between
+     * equal IDs, or one CID under two companies, which the prospect's CID alone can't tell apart.
+     */
+    private static function newest(array $unique): ?array
+    {
+        $rows = array_values($unique);
+        foreach ($rows as $row) {
+            if ($row['date'] === null) return null;
+        }
+        $latest = max(array_column($rows, 'date'));
+        $newest = array_values(array_filter($rows, static fn (array $row): bool => $row['date'] === $latest));
+        if (count(array_unique(array_column($newest, 'source'))) !== 1) return null;
+        usort($newest, static fn (array $a, array $b): int => self::compareIds($b['cid'], $a['cid']));
+        if (count($newest) > 1 && self::compareIds($newest[0]['cid'], $newest[1]['cid']) === 0) return null;
+        foreach ($rows as $row) {
+            if ($row['cid'] === $newest[0]['cid'] && $row['source'] !== $newest[0]['source']) return null;
+        }
+
+        return $newest[0];
+    }
+
+    private static function compareIds(string $a, string $b): int
+    {
+        $a = ltrim($a, '0');
+        $b = ltrim($b, '0');
+
+        return strlen($a) <=> strlen($b) ?: strcmp($a, $b);
     }
 
     private static function held(string $reason): array

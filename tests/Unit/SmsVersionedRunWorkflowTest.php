@@ -325,7 +325,10 @@ test('planned-date status and history expose only pure reconciled file metadata 
     $recent = $this->service->history()['items'][0];
     expect($recent->file['files'])->toBe($view->file['files'])->and($recent->handoff)->toBe($view->handoff);
     $this->db->table('TblSMSRuns')->update(['File_Bytes' => 1]);
-    expect(fn () => $this->service->history())->toThrow(HttpException::class, 'metadata');
+    // One bad row must not fail the whole list (production, Nov 5, 2026). Opening that run still refuses.
+    $flagged = $this->service->history()['items'][0];
+    expect($flagged->file)->toBeNull()->and($flagged->file_problem)->toBeTrue();
+    expect(fn () => $this->service->show($this->id))->toThrow(HttpException::class, 'metadata');
 });
 
 test('opted-in drop range names use saved run drops not the next global counter and retain publication on recovery', function (): void {

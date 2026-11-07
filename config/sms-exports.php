@@ -24,6 +24,9 @@ return [
     'queue' => env('CMD_SMS_QUEUE', 'tu-export'),
     // Enable after the matching runner's mandatory grant/child-entry telemetry exclusion is verified.
     'download_continuation_enabled' => env('CMD_SMS_DOWNLOAD_CONTINUATION_ENABLED', false),
+    // Pending files above this many rows are checked on the worker before the download starts,
+    // because the load balancer drops a request after 60 seconds without a byte.
+    'pending_check_background_rows' => (int) env('CMD_SMS_PENDING_CHECK_BACKGROUND_ROWS', 500000),
     // Opt in only after the additive summary migration, all eligibility writers and
     // the refresh scheduler have been deployed together. No live rollout is implicit.
     'durable_availability_enabled' => env('CMD_SMS_DURABLE_AVAILABILITY_ENABLED', false),
@@ -68,6 +71,8 @@ return [
     // performance acceptance are complete; frozen v1 runs remain on v1.
     'tier_selection_windowed_enabled' => env('CMD_SMS_TIER_SELECTION_WINDOWED_ENABLED', false),
     'tier_selection_window_size' => env('CMD_SMS_TIER_SELECTION_WINDOW_SIZE', 5000),
+    // When true, a run stops at never-texted people and shows the shortfall, instead of topping up with people texted before.
+    'selection_never_texted_only' => env('CMD_SMS_SELECTION_NEVER_TEXTED_ONLY', false),
     // New-run v3 only. Tier fallback intentionally stores no Debt_Source_PK;
     // TU/mailer references require a unique non-null source PK. Old v1/v2 rows stay readable.
     'lean_history_enabled' => env('CMD_SMS_LEAN_HISTORY_ENABLED', false),

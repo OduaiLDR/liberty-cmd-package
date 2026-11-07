@@ -7,6 +7,7 @@ use Cmd\Reports\Jobs\SmsRunStepJob;
 use Cmd\Reports\Repositories\SmsProspectExportRepository;
 use Cmd\Reports\Repositories\SmsRecordExportRepository;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\URL;
 use Illuminate\Validation\ValidationException;
 use RuntimeException;
@@ -32,6 +33,8 @@ class SmsRunService
 
     /** A busy step with no progress for this long is shown as stuck and can be retried. */
     public const STALLED_AFTER_MINUTES = 120;
+
+    public const PENDING_CHECK_FRESH_SECONDS = 30;
 
     public function __construct(protected SmsProspectExportRepository $export) {}
 
@@ -783,7 +786,7 @@ class SmsRunService
         ];
 
         // Worker cache snapshot, never SQL; Updated_At stays the stall/elapsed clock.
-        if (in_array($run->Status, ['queued', 'selecting', 'building_file'], true)) $view['progress'] = app(SmsRunProgress::class)->forRun($run);
+        if (in_array($run->Status, ['queued', 'selecting', 'building_file', 'approving'], true)) $view['progress'] = app(SmsRunProgress::class)->forRun($run);
         $view += $this->approvalFileView($run, $view['options']);
         if (($run->Progress_Step ?? null) === SmsSelectionCancellation::CANCELLED_STEP) $view['selection_cancelled'] = true;
         $cancellation = app(SmsSelectionCancellation::class)->projection($run);
@@ -821,10 +824,11 @@ class SmsRunService
     private function historyView(object $run): object
     {
         if (SmsRecordPolicy::isExternal($run)) return (object) SmsExternalEventProjection::forRun($run);
+        [$options, $file, $fileProblem] = $this->historyFile($run);
         $view = [
             'request_id' => strtolower((string) $run->Request_ID), 'status' => $run->Status,
             'target' => (int) $run->Target, 'selected' => $run->Selected === null ? null : (int) $run->Selected,
-            'options' => $this->fileOptions($run), 'file' => $this->fileView($run),
+            'options' => $options, 'file' => $file, ...($fileProblem ? ['file_problem' => true] : []),
             'created_by' => $run->Created_By, 'created_at' => $this->iso($run->Created_At),
             'sent_by' => $run->Sent_By, 'sent_at' => $this->iso($run->Sent_At),
             'selection_policy' => $run->Selection_Policy ?? SmsRecordPolicy::LEGACY,
@@ -842,6 +846,21 @@ class SmsRunService
         if ($cancellation !== null) $view['selection_cancellation'] = $cancellation;
         $view['handoff'] = SmsRunDebtPleteImportProjection::forRun($view, SmsRunEmailProjection::forRun($view));
         return (object) $view;
+    }
+
+    /** One run with a broken file record must not hide every other run: history flags it and offers no file. */
+    private function historyFile(object $run): array
+    {
+        $options = null;
+        try {
+            $options = $this->fileOptions($run);
+            return [$options, $this->fileView($run), false];
+        } catch (HttpException $error) {
+            if ($error->getStatusCode() !== 409) throw $error;
+            // A logging failure must not bring the whole list back down.
+            try { Log::warning('SMS run history row has a file problem.', ['request_id' => strtolower((string) $run->Request_ID)]); } catch (Throwable) {}
+            return [$options, null, true];
+        }
     }
 
     /** A short-lived signed link straight to CMD runner, so the file never passes through the API proxy. */
@@ -886,22 +905,57 @@ class SmsRunService
         }
         if (SmsRecordPolicy::isRecord($run) && ! in_array($run->Status, ['file_ready','approving','approved'], true)) throw new HttpException(404, 'This batch has no downloadable file.');
         if ($checkPendingEligibility) $this->assertPendingDownloadStates($run, $requestId);
+        $checkedAt = microtime(true);
         if ($this->approvalFilenames($this->fileOptions($run)) && $run->Status === 'approving') throw new HttpException(409, 'SMS files are being finalized after approval.');
         $path = $this->verifiedRunArtifact($run, $this->artifactGeneration($run));
-        // Hashing can take time for a large bundle. Check again immediately before
-        // releasing a pending download, using the same frozen membership.
-        if ($checkPendingEligibility) $this->assertPendingDownloadStates($run, $requestId);
+        // Hashing can take time for a large bundle. If it did, check again immediately before
+        // releasing a pending download, using the same frozen membership. A check takes about
+        // 90 seconds at 3M, so repeating it after a one second hash only delays the first byte.
+        if ($checkPendingEligibility && self::pendingCheckIsStale($checkedAt, microtime(true))) $this->assertPendingDownloadStates($run, $requestId);
         return $path;
+    }
+
+    public static function pendingCheckIsStale(float $checkedAt, float $now): bool
+    {
+        return $now - $checkedAt >= self::PENDING_CHECK_FRESH_SECONDS;
+    }
+
+    /** False while a big pending file's check runs on the worker. A held check throws. */
+    public function pendingDownloadReady(string $requestId): bool
+    {
+        $run = $this->mustRun($requestId);
+        $check = app(SmsPendingDownloadCheck::class);
+
+        return ! $this->needsPendingDownloadCheck($run) || ! $check->runsInBackground($run) || $check->ready($requestId);
+    }
+
+    /** The page's download. A check that just passed on the worker stands in for the one here. */
+    public function downloadPath(string $requestId): string
+    {
+        return $this->releasableArtifact($requestId, ! app(SmsPendingDownloadCheck::class)->passed($requestId));
+    }
+
+    public function runPendingDownloadCheck(string $requestId): void
+    {
+        $check = app(SmsPendingDownloadCheck::class);
+        try {
+            $this->assertPendingDownloadStates($this->mustRun($requestId), $requestId);
+            $check->recordPass($requestId);
+        } catch (SmsFrozenEligibilityHold|HttpException $hold) {
+            $check->recordHeld($requestId, $hold->getMessage());
+        }
+    }
+
+    private function needsPendingDownloadCheck(object $run): bool
+    {
+        return in_array($run->Status, SmsRecordPolicy::isRecord($run) ? ['file_ready', 'approving'] : ['file_ready', 'sending'], true);
     }
 
     private function assertPendingDownloadStates(object $run, string $requestId): void
     {
-        if (SmsRecordPolicy::isRecord($run) && in_array($run->Status, ['file_ready','approving'], true)) {
-            app(SmsRecordExportRepository::class)->assertCurrentStates($requestId);
-        }
-        if (! SmsRecordPolicy::isRecord($run) && in_array($run->Status, ['file_ready','sending'], true)) {
-            $this->export->assertCurrentStates($requestId);
-        }
+        if (! $this->needsPendingDownloadCheck($run)) return;
+        if (SmsRecordPolicy::isRecord($run)) app(SmsRecordExportRepository::class)->assertCurrentStates($requestId);
+        else $this->export->assertCurrentStates($requestId);
     }
 
     private function verifiedRunArtifact(object $run, string $generation): string
@@ -949,8 +1003,11 @@ class SmsRunService
 
     protected function stalled(object $run): bool
     {
-        return in_array($run->Status, self::BUSY, true)
-            && Carbon::parse($run->Updated_At)->lt(Carbon::now()->subMinutes(self::STALLED_AFTER_MINUTES));
+        if (! in_array($run->Status, self::BUSY, true)) return false;
+        // Progress is a live heartbeat: a healthy selection can go hours without touching the run row.
+        $alive = app(SmsRunProgress::class)->forRun($run)['updated_at'] ?? $run->Updated_At;
+
+        return Carbon::parse($alive)->lt(Carbon::now()->subMinutes(self::STALLED_AFTER_MINUTES));
     }
 
     protected function runDirectory(string $requestId): string
