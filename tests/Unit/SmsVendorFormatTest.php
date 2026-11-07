@@ -58,13 +58,22 @@ test('explicit legacy formats retain byte-equivalent headers and rows', function
         ->toBe($csv($expectedHeader, $expectedRow));
 })->with([[false, 'legacy-nine-column-v1'], [true, 'legacy-five-column-v1']]);
 
-test('new runs carry first and last name in separate columns', function (): void {
+test('new runs carry first and last name under the field names Jude asked for', function (): void {
+    expect(SmsDeliveryPolicy::headerForFormat(SmsRunOptions::FIELD_NAME_CSV_FORMAT))
+        ->toBe(['first_name', 'last_name', 'debt_load', 'phone1', 'send_date']);
+
+    expect(SmsDeliveryPolicy::rowForFormat(SmsRunOptions::FIELD_NAME_CSV_FORMAT, '  Ann  Marie Lee ',
+        'PRIVATE ADDRESS, OMIT THIS', '13500.01', '0202555010', '2026-11-09'))
+        ->toBe(['Ann', 'Lee', '14000', '0202555010', '2026-11-09']);
+});
+
+test('runs frozen in the spaced headers keep them and the same row', function (): void {
     expect(SmsDeliveryPolicy::headerForFormat(SmsRunOptions::FIRST_LAST_CSV_FORMAT))
         ->toBe(['First name', 'Last name', 'debt load', 'phone1', 'send date']);
 
-    expect(SmsDeliveryPolicy::rowForFormat(SmsRunOptions::FIRST_LAST_CSV_FORMAT, '  Ann  Marie Lee ',
-        'PRIVATE ADDRESS, OMIT THIS', '13500.01', '0202555010', '2026-11-09'))
-        ->toBe(['Ann', 'Lee', '14000', '0202555010', '2026-11-09']);
+    $row = ['ANN LEE', 'PRIVATE ADDRESS', '13500.01', '0202555010', '2026-11-09'];
+    expect(SmsDeliveryPolicy::rowForFormat(SmsRunOptions::FIRST_LAST_CSV_FORMAT, ...$row))
+        ->toBe(SmsDeliveryPolicy::rowForFormat(SmsRunOptions::FIELD_NAME_CSV_FORMAT, ...$row));
 });
 
 test('the last name is the last word of Client, skipping a trailing suffix', function (string $client, string $last): void {
@@ -77,9 +86,11 @@ test('the last name is the last word of Client, skipping a trailing suffix', fun
 
 test('frozen runs keep their own format while new options use the requested one', function (): void {
     $old = SmsRunOptions::normalize(5, 2);
-    $new = SmsRunOptions::normalize(5, 2, csvFormat: SmsRunOptions::FIRST_LAST_CSV_FORMAT);
-    expect($old['csv_format'])->toBe('sms-four-column-v1')->and($new['csv_format'])->toBe('sms-first-last-name-v1')
+    $v1 = SmsRunOptions::normalize(5, 2, csvFormat: SmsRunOptions::FIRST_LAST_CSV_FORMAT);
+    $new = SmsRunOptions::normalize(5, 2, csvFormat: SmsRunOptions::FIELD_NAME_CSV_FORMAT);
+    expect($old['csv_format'])->toBe('sms-four-column-v1')->and($v1['csv_format'])->toBe('sms-first-last-name-v1')->and($new['csv_format'])->toBe('sms-first-last-name-v2')
         ->and(SmsRunOptions::fromStored(json_encode($old), 5))->toBe($old)
+        ->and(SmsRunOptions::fromStored(json_encode($v1), 5))->toBe($v1)
         ->and(SmsRunOptions::fromStored(json_encode($new), 5))->toBe($new);
     expect(fn () => SmsRunOptions::normalize(5, 2, csvFormat: 'legacy-five-column-v1'))->toThrow(InvalidArgumentException::class, 'format');
 });

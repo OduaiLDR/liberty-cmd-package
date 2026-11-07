@@ -20,10 +20,13 @@ final class SmsRunOptions
     /** Runs already frozen in this format keep it. */
     public const CSV_FORMAT = 'sms-four-column-v1';
 
-    /** First and last name in separate columns: the format of every new run. */
+    /** First and last name in separate columns, spaced headers. Runs already frozen in it keep it. */
     public const FIRST_LAST_CSV_FORMAT = 'sms-first-last-name-v1';
 
-    public const CSV_FORMATS = [self::CSV_FORMAT, self::FIRST_LAST_CSV_FORMAT];
+    /** Same five columns under the field names Jude asked for: the format of every new run. */
+    public const FIELD_NAME_CSV_FORMAT = 'sms-first-last-name-v2';
+
+    public const CSV_FORMATS = [self::CSV_FORMAT, self::FIRST_LAST_CSV_FORMAT, self::FIELD_NAME_CSV_FORMAT];
 
     public const TIER_SELECTION_POLICY = 'current-source-tier-v1';
 

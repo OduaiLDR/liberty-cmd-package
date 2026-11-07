@@ -80,6 +80,7 @@ final class SmsDeliveryPolicy
         return match ($format) {
             SmsRunOptions::CSV_FORMAT => ['First name', 'debt load', 'phone1', 'send date'],
             SmsRunOptions::FIRST_LAST_CSV_FORMAT => ['First name', 'Last name', 'debt load', 'phone1', 'send date'],
+            SmsRunOptions::FIELD_NAME_CSV_FORMAT => ['first_name', 'last_name', 'debt_load', 'phone1', 'send_date'],
             'legacy-nine-column-v1' => self::header(false),
             'legacy-five-column-v1' => self::header(true),
             default => throw new InvalidArgumentException('Unknown SMS vendor CSV format.'),
@@ -91,7 +92,7 @@ final class SmsDeliveryPolicy
     {
         return match ($format) {
             SmsRunOptions::CSV_FORMAT => [explode(' ', trim($client))[0], self::debtLoad($amount), $phone, $sendDate],
-            SmsRunOptions::FIRST_LAST_CSV_FORMAT => [explode(' ', trim($client))[0], self::lastName($client), self::debtLoad($amount), $phone, $sendDate],
+            SmsRunOptions::FIRST_LAST_CSV_FORMAT, SmsRunOptions::FIELD_NAME_CSV_FORMAT => [explode(' ', trim($client))[0], self::lastName($client), self::debtLoad($amount), $phone, $sendDate],
             'legacy-nine-column-v1' => self::row($client, $address, $amount, $phone, $sendDate, false),
             'legacy-five-column-v1' => self::row($client, $address, $amount, $phone, $sendDate, true),
             default => throw new InvalidArgumentException('Unknown SMS vendor CSV format.'),

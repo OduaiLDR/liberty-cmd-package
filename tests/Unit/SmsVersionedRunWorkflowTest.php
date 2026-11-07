@@ -30,7 +30,7 @@ use Symfony\Component\HttpKernel\Exception\HttpException;
 // pricing is stubbed here; the separate real-SQL fixture tests the waterfall.
 function currentFormatOptions(mixed ...$arguments): array
 {
-    return SmsRunOptions::normalize(...$arguments, csvFormat: SmsRunOptions::FIRST_LAST_CSV_FORMAT);
+    return SmsRunOptions::normalize(...$arguments, csvFormat: SmsRunOptions::FIELD_NAME_CSV_FORMAT);
 }
 
 beforeEach(function (): void {
@@ -211,7 +211,7 @@ test('creation flag changes do not reinterpret a versioned retry or old optionle
 
 test('capability requires the complete additive schema and explicit new requests fail before writes', function (): void {
     expect($this->service->overview()['capabilities'])->toBe([
-        'csv_format' => SmsRunOptions::FIRST_LAST_CSV_FORMAT, 'rows_per_file' => true, 'tier_subset' => false, 'max_parts' => 1000,
+        'csv_format' => SmsRunOptions::FIELD_NAME_CSV_FORMAT, 'rows_per_file' => true, 'tier_subset' => false, 'max_parts' => 1000,
         'options_version' => SmsRunOptions::PLANNED_DATE_VERSION, 'send_date' => true, 'default_send_date' => '2026-10-26',
         'min_send_date' => '2026-10-19', 'send_date_timezone' => 'America/Los_Angeles',
         'filename_version' => SmsRunOptions::APPROVAL_FILENAME_VERSION,
@@ -225,7 +225,7 @@ test('capability requires the complete additive schema and explicit new requests
 
 test('planned-date controller freezes the Monday default once and unchanged retries survive calendar rollover', function (): void {
     $request = Request::create('/', 'POST', ['request_id' => $this->id, 'target' => 7,
-        'csv_format' => SmsRunOptions::FIRST_LAST_CSV_FORMAT, 'rows_per_file' => 3, 'options_version' => SmsRunOptions::PLANNED_DATE_VERSION]);
+        'csv_format' => SmsRunOptions::FIELD_NAME_CSV_FORMAT, 'rows_per_file' => 3, 'options_version' => SmsRunOptions::PLANNED_DATE_VERSION]);
     $request->attributes->set('cmd_user', ['email' => 'editor@example.invalid']);
     $first = $this->controller->store($request)->getData(true);
     expect($first['options']['send_date'])->toBe('2026-10-26')->and($first['options']['options_version'])->toBe(SmsRunOptions::PLANNED_DATE_VERSION);
@@ -241,7 +241,7 @@ test('planned-date controller freezes the Monday default once and unchanged retr
 test('explicit California today is accepted while new past malformed and unversioned dates fail before writes', function (): void {
     foreach (['2026-10-18', '2026-02-29', '2026-10-19T00:00:00Z', null] as $date) {
         $request = Request::create('/', 'POST', ['request_id' => $this->id, 'target' => 7,
-            'csv_format' => SmsRunOptions::FIRST_LAST_CSV_FORMAT, 'send_date' => $date]);
+            'csv_format' => SmsRunOptions::FIELD_NAME_CSV_FORMAT, 'send_date' => $date]);
         $request->attributes->set('cmd_user', ['email' => 'editor@example.invalid']);
         expect(fn () => $this->controller->store($request))->toThrow(ValidationException::class);
         expect($this->db->table('TblSMSRuns')->count())->toBe(0);
@@ -249,7 +249,7 @@ test('explicit California today is accepted while new past malformed and unversi
     $request = Request::create('/', 'POST', ['request_id' => $this->id, 'target' => 7, 'send_date' => '2026-10-19']);
     expect(fn () => $this->controller->store($request))->toThrow(ValidationException::class);
     $request = Request::create('/', 'POST', ['request_id' => $this->id, 'target' => 7,
-        'csv_format' => SmsRunOptions::FIRST_LAST_CSV_FORMAT, 'send_date' => '2026-10-19']);
+        'csv_format' => SmsRunOptions::FIELD_NAME_CSV_FORMAT, 'send_date' => '2026-10-19']);
     $request->attributes->set('cmd_user', ['email' => 'editor@example.invalid']);
     expect($this->controller->store($request)->getData(true)['options']['send_date'])->toBe('2026-10-19');
 });
@@ -363,7 +363,7 @@ test('opted-in drop range names use saved run drops not the next global counter 
 test('drop-range filename markers fail closed without the planned contract or for changed malformed versions', function (): void {
     foreach ([['filename_version' => SmsRunOptions::DROP_RANGE_FILENAME_VERSION], ['options_version' => SmsRunOptions::PLANNED_DATE_VERSION, 'filename_version' => 'unknown'],
         ['options_version' => SmsRunOptions::PLANNED_DATE_VERSION, 'filename_version' => null]] as $extra) {
-        $request = Request::create('/', 'POST', ['request_id' => $this->id, 'target' => 7, 'csv_format' => SmsRunOptions::FIRST_LAST_CSV_FORMAT] + $extra);
+        $request = Request::create('/', 'POST', ['request_id' => $this->id, 'target' => 7, 'csv_format' => SmsRunOptions::FIELD_NAME_CSV_FORMAT] + $extra);
         $request->attributes->set('cmd_user', ['email' => 'editor@example.invalid']);
         expect(fn () => $this->controller->store($request))->toThrow(ValidationException::class);
         expect($this->db->table('TblSMSRuns')->count())->toBe(0);
@@ -584,22 +584,22 @@ test('post-commit callback failure cannot duplicate final approval business upda
 
 test('unsupported subsets excessive parts and malformed options create no run', function (): void {
     foreach ([currentFormatOptions(7, 3, ['T2']), currentFormatOptions(1001, 1),
-        ['csv_format' => 'unknown'], ['csv_format' => SmsRunOptions::FIRST_LAST_CSV_FORMAT, 'rows_per_file' => 0]] as $options) {
+        ['csv_format' => 'unknown'], ['csv_format' => SmsRunOptions::FIELD_NAME_CSV_FORMAT, 'rows_per_file' => 0]] as $options) {
         expect(fn () => $this->service->start($this->id, $options['target'] ?? 7, 'editor@example.invalid', $options))->toThrow(ValidationException::class);
     }
     expect($this->db->table('TblSMSRuns')->count())->toBe(0)->and($this->service->queued)->toBe([]);
 });
 
 test('controller validates explicit format cap and tiers instead of ignoring new fields', function (): void {
-    foreach ([['rows_per_file' => 3], ['csv_format' => 'unknown'], ['csv_format' => SmsRunOptions::FIRST_LAST_CSV_FORMAT, 'rows_per_file' => 0],
-        ['csv_format' => SmsRunOptions::FIRST_LAST_CSV_FORMAT, 'tiers' => []], ['csv_format' => SmsRunOptions::FIRST_LAST_CSV_FORMAT, 'tiers' => ['T1', 'T1']]] as $extra) {
+    foreach ([['rows_per_file' => 3], ['csv_format' => 'unknown'], ['csv_format' => SmsRunOptions::FIELD_NAME_CSV_FORMAT, 'rows_per_file' => 0],
+        ['csv_format' => SmsRunOptions::FIELD_NAME_CSV_FORMAT, 'tiers' => []], ['csv_format' => SmsRunOptions::FIELD_NAME_CSV_FORMAT, 'tiers' => ['T1', 'T1']]] as $extra) {
         $request = Request::create('/', 'POST', $extra + ['request_id' => $this->id, 'target' => 7]);
         $request->attributes->set('cmd_user', ['email' => 'editor@example.invalid']);
         expect(fn () => $this->controller->store($request))->toThrow(ValidationException::class);
     }
     expect($this->db->table('TblSMSRuns')->count())->toBe(0);
     $request = Request::create('/', 'POST', ['request_id' => $this->id, 'target' => 7,
-        'csv_format' => SmsRunOptions::FIRST_LAST_CSV_FORMAT, 'rows_per_file' => 3]);
+        'csv_format' => SmsRunOptions::FIELD_NAME_CSV_FORMAT, 'rows_per_file' => 3]);
     $request->attributes->set('cmd_user', ['email' => 'editor@example.invalid']);
     $response = $this->controller->store($request);
     expect($response->getStatusCode())->toBe(202)->and($response->getData(true)['options'])->toBe($this->fileOptions);
@@ -616,7 +616,7 @@ test('selected count drives ZIP parts while generation preserves prospects and f
         expect($zip->numFiles)->toBe(2);
         for ($index = 0; $index < $zip->numFiles; $index++) {
             $stream = $zip->getStream($zip->getNameIndex($index));
-            expect(fgetcsv($stream, escape: ''))->toBe(['First name', 'Last name', 'debt load', 'phone1', 'send date']);
+            expect(fgetcsv($stream, escape: ''))->toBe(['first_name', 'last_name', 'debt_load', 'phone1', 'send_date']);
             $count = 0;
             while (($row = fgetcsv($stream, escape: '')) !== false) {
                 expect($row)->toHaveCount(5)->and($row[2])->toBe('30000')->and($row[3])->toBe('0012345600')->and($row[4])->toBe('2026-10-26');
@@ -644,7 +644,7 @@ test('versioned single CSV ignores mutable legacy format settings and keeps orig
     config(['sms-exports.single_phone_csv' => false]);
     expect(hash_file('sha256', $this->service->filePath($this->id)))->toBe($before);
     $stream = fopen($path, 'rb');
-    try { expect(fgetcsv($stream, escape: ''))->toBe(['First name', 'Last name', 'debt load', 'phone1', 'send date']); }
+    try { expect(fgetcsv($stream, escape: ''))->toBe(['first_name', 'last_name', 'debt_load', 'phone1', 'send_date']); }
     finally { fclose($stream); }
 });
 
@@ -792,7 +792,7 @@ test('tier selector capability is opt-in and canonical choices replay with creat
     expect($this->service->overview()['capabilities']['tier_subset'])->toBeTrue()
         ->and($this->service->overview()['capabilities']['tier_selection_policy'])->toBe(SmsRunOptions::TIER_SELECTION_POLICY);
     $request = Request::create('/', 'POST', ['request_id' => $this->id, 'target' => 7,
-        'csv_format' => SmsRunOptions::FIRST_LAST_CSV_FORMAT, 'rows_per_file' => 3, 'tiers' => ['T9','T2'],
+        'csv_format' => SmsRunOptions::FIELD_NAME_CSV_FORMAT, 'rows_per_file' => 3, 'tiers' => ['T9','T2'],
         'tier_selection_policy' => SmsRunOptions::TIER_SELECTION_POLICY]);
     $request->attributes->set('cmd_user', ['email' => 'editor@example.invalid']);
     expect($this->controller->store($request)->getData(true)['options'])->toBe($marked);
@@ -822,7 +822,7 @@ test('minimum debt capabilities and create response freeze exact integer options
     $options = currentFormatOptions(7, 3, ['T5','T9'], SmsRunOptions::TIER_SELECTION_POLICY,
         null, null, null, 31000);
     $request = Request::create('/', 'POST', ['request_id' => $this->id, 'target' => 7,
-        'csv_format' => SmsRunOptions::FIRST_LAST_CSV_FORMAT, 'rows_per_file' => 3, 'tiers' => ['T9','T5'],
+        'csv_format' => SmsRunOptions::FIELD_NAME_CSV_FORMAT, 'rows_per_file' => 3, 'tiers' => ['T9','T5'],
         'tier_selection_policy' => SmsRunOptions::TIER_SELECTION_POLICY, 'minimum_debt_amount' => '31000']);
     $request->attributes->set('cmd_user', ['email' => 'editor@example.invalid']);
     expect($this->controller->store($request)->getData(true)['options'])->toBe($options);
@@ -838,7 +838,7 @@ test('invalid or formatless minimum debt input never creates a run', function ()
     config(['sms-exports.tier_selection_enabled' => true]);
     foreach ([24999, -1, 25000.5, null, '25000bad', 10000000000] as $minimum) {
         $request = Request::create('/', 'POST', ['request_id' => $this->id, 'target' => 7,
-            'csv_format' => SmsRunOptions::FIRST_LAST_CSV_FORMAT, 'tier_selection_policy' => SmsRunOptions::TIER_SELECTION_POLICY,
+            'csv_format' => SmsRunOptions::FIELD_NAME_CSV_FORMAT, 'tier_selection_policy' => SmsRunOptions::TIER_SELECTION_POLICY,
             'minimum_debt_amount' => $minimum]);
         expect(fn () => $this->controller->store($request))->toThrow(ValidationException::class);
     }
@@ -850,9 +850,9 @@ test('invalid or formatless minimum debt input never creates a run', function ()
 test('malformed or formatless selector requests fail before run insertion', function (): void {
     config(['sms-exports.tier_selection_enabled' => true]);
     foreach ([['tier_selection_policy' => SmsRunOptions::TIER_SELECTION_POLICY],
-        ['csv_format' => SmsRunOptions::FIRST_LAST_CSV_FORMAT, 'tier_selection_policy' => 'unknown'],
-        ['csv_format' => SmsRunOptions::FIRST_LAST_CSV_FORMAT, 'tier_selection_policy' => null],
-        ['csv_format' => SmsRunOptions::FIRST_LAST_CSV_FORMAT, 'tier_selection_policy' => SmsRunOptions::TIER_SELECTION_POLICY, 'tiers' => []]] as $extra) {
+        ['csv_format' => SmsRunOptions::FIELD_NAME_CSV_FORMAT, 'tier_selection_policy' => 'unknown'],
+        ['csv_format' => SmsRunOptions::FIELD_NAME_CSV_FORMAT, 'tier_selection_policy' => null],
+        ['csv_format' => SmsRunOptions::FIELD_NAME_CSV_FORMAT, 'tier_selection_policy' => SmsRunOptions::TIER_SELECTION_POLICY, 'tiers' => []]] as $extra) {
         $request = Request::create('/', 'POST', $extra + ['request_id' => $this->id, 'target' => 7]);
         expect(fn () => $this->controller->store($request))->toThrow(ValidationException::class);
     }
@@ -1117,7 +1117,7 @@ test('automatic queue and logging failures preserve committed approval and its r
 test('debt range capabilities sit inside the tier-subset block in exact order', function (): void {
     config(['sms-exports.tier_selection_enabled' => true]);
     expect($this->service->overview()['capabilities'])->toBe([
-        'csv_format' => SmsRunOptions::FIRST_LAST_CSV_FORMAT, 'rows_per_file' => true, 'tier_subset' => true, 'max_parts' => 1000,
+        'csv_format' => SmsRunOptions::FIELD_NAME_CSV_FORMAT, 'rows_per_file' => true, 'tier_subset' => true, 'max_parts' => 1000,
         'tier_selection_policy' => SmsRunOptions::TIER_SELECTION_POLICY,
         'minimum_debt_amount' => true, 'minimum_debt_floor' => 25000, 'minimum_debt_default' => 25000, 'minimum_debt_max' => 9999999000,
         'maximum_debt_amount' => true, 'maximum_debt_step' => 1000, 'maximum_debt_floor' => 25000, 'maximum_debt_max' => 9999999000,
@@ -1132,7 +1132,7 @@ test('debt range capabilities sit inside the tier-subset block in exact order', 
 test('debt range create freezes the maximum after the minimum and replays only the identical range', function (): void {
     config(['sms-exports.tier_selection_enabled' => true]);
     $range = currentFormatOptions(7, 3, null, SmsRunOptions::TIER_SELECTION_POLICY, null, null, null, 31000, 85000);
-    $request = Request::create('/', 'POST', ['request_id' => $this->id, 'target' => 7, 'csv_format' => SmsRunOptions::FIRST_LAST_CSV_FORMAT,
+    $request = Request::create('/', 'POST', ['request_id' => $this->id, 'target' => 7, 'csv_format' => SmsRunOptions::FIELD_NAME_CSV_FORMAT,
         'rows_per_file' => 3, 'tiers' => SmsRunOptions::TIERS, 'tier_selection_policy' => SmsRunOptions::TIER_SELECTION_POLICY,
         'minimum_debt_amount' => '31000', 'maximum_debt_amount' => '85000']);
     $request->attributes->set('cmd_user', ['email' => 'editor@example.invalid']);
@@ -1151,7 +1151,7 @@ test('debt range create freezes the maximum after the minimum and replays only t
 test('controller rejects a maximum without a minimum or outside whole thousands from the minimum to the supported max', function (array $debt, array $errors): void {
     config(['sms-exports.tier_selection_enabled' => true]);
     $request = Request::create('/', 'POST', $debt + ['request_id' => $this->id, 'target' => 7,
-        'csv_format' => SmsRunOptions::FIRST_LAST_CSV_FORMAT, 'tier_selection_policy' => SmsRunOptions::TIER_SELECTION_POLICY]);
+        'csv_format' => SmsRunOptions::FIELD_NAME_CSV_FORMAT, 'tier_selection_policy' => SmsRunOptions::TIER_SELECTION_POLICY]);
     try {
         $this->controller->store($request);
         $this->fail('An invalid maximum debt was accepted.');
@@ -1174,13 +1174,13 @@ test('formatless maximum and service-level maximum shapes never create a run', f
     config(['sms-exports.tier_selection_enabled' => true]);
     $request = Request::create('/', 'POST', ['request_id' => $this->id, 'target' => 7, 'minimum_debt_amount' => 25000, 'maximum_debt_amount' => 35000]);
     expect(fn () => $this->controller->store($request))->toThrow(ValidationException::class);
-    $base = ['csv_format' => SmsRunOptions::FIRST_LAST_CSV_FORMAT, 'tier_selection_policy' => SmsRunOptions::TIER_SELECTION_POLICY];
+    $base = ['csv_format' => SmsRunOptions::FIELD_NAME_CSV_FORMAT, 'tier_selection_policy' => SmsRunOptions::TIER_SELECTION_POLICY];
     foreach ([
         [$base + ['maximum_debt_amount' => 35000], 'A maximum debt requires a chosen minimum debt.'],
         [$base + ['minimum_debt_amount' => 25000, 'maximum_debt_amount' => 35500], SmsDebtPolicy::MAXIMUM_MESSAGE],
         [$base + ['minimum_debt_amount' => 31000, 'maximum_debt_amount' => 30000], SmsDebtPolicy::MAXIMUM_MESSAGE],
         [$base + ['minimum_debt_amount' => 25000, 'maximum_debt_amount' => '35000'], 'Use the explicit supported SMS format and valid file options.'],
-        [['csv_format' => SmsRunOptions::FIRST_LAST_CSV_FORMAT, 'minimum_debt_amount' => 25000, 'maximum_debt_amount' => 35000],
+        [['csv_format' => SmsRunOptions::FIELD_NAME_CSV_FORMAT, 'minimum_debt_amount' => 25000, 'maximum_debt_amount' => 35000],
             'A debt minimum requires explicit current-source selection before quantity.'],
     ] as [$options, $message]) {
         try {
@@ -1195,7 +1195,7 @@ test('formatless maximum and service-level maximum shapes never create a run', f
 
 test('by-tier mode freezes a subset without debt keys and binds no debt floor', function (): void {
     config(['sms-exports.tier_selection_enabled' => true]);
-    $request = Request::create('/', 'POST', ['request_id' => $this->id, 'target' => 7, 'csv_format' => SmsRunOptions::FIRST_LAST_CSV_FORMAT,
+    $request = Request::create('/', 'POST', ['request_id' => $this->id, 'target' => 7, 'csv_format' => SmsRunOptions::FIELD_NAME_CSV_FORMAT,
         'rows_per_file' => 3, 'tiers' => ['T7', 'T3'], 'tier_selection_policy' => SmsRunOptions::TIER_SELECTION_POLICY]);
     $request->attributes->set('cmd_user', ['email' => 'editor@example.invalid']);
     $options = $this->controller->store($request)->getData(true)['options'];
