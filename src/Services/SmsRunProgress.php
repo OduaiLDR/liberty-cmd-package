@@ -39,6 +39,7 @@ class SmsRunProgress
             if ($value === null) return;
             $now = $this->clock();
             $last = $this->written[$id] ?? null;
+            if ($last === null || $last['phase'] !== $value['phase']) SmsStepLog::mark($id, $value['phase']);
             if ($last !== null && $last['phase'] === $value['phase'] && $now - $last['at'] < self::THROTTLE_SECONDS) return;
             $this->written[$id] = ['phase' => $value['phase'], 'at' => $now];
             Cache::store('file')->put($this->key($id), ['request_id' => $id] + $value, self::TTL_SECONDS);

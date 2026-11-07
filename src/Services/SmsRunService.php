@@ -4,10 +4,13 @@ namespace Cmd\Reports\Services;
 
 use Carbon\Carbon;
 use Cmd\Reports\Jobs\SmsRunStepJob;
+use Cmd\Reports\Jobs\SmsPurgeDiscardedRunJob;
 use Cmd\Reports\Repositories\SmsProspectExportRepository;
 use Cmd\Reports\Repositories\SmsRecordExportRepository;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\URL;
 use Illuminate\Validation\ValidationException;
 use RuntimeException;
@@ -26,6 +29,10 @@ use Throwable;
 class SmsRunService
 {
     public const BUSY = ['queued', 'selecting', 'building_file', 'sending', 'reversing', 'approving', 'external_registering'];
+
+    public const PURGE_PAGE = 2000;
+
+    public const APPROVAL_HOLD_SECONDS = 900;
 
     public const CLOSED = ['sent', 'discarded', 'review_only', 'not_sent', 'approved', 'external_sent'];
 
@@ -114,6 +121,7 @@ class SmsRunService
         };
         $sourceFirst = SmsRunOptions::isTierSelectionPolicy($options['tier_selection_policy'] ?? null);
         if (! $this->move($requestId, ['queued'], 'selecting', ['Progress_Step' => 'contacts_and_selection'])) return;
+        SmsStepLog::start($requestId, 'selection_started');
         $checkpoint();
         $hasRows = DB::connection('sqlsrv')->table('TblProspectsExport')->where('Request_ID', $requestId)->exists();
         $selectionCommitted = $sourceFirst && $this->mustRun($requestId)->Selected !== null;
@@ -122,6 +130,7 @@ class SmsRunService
             $this->export->select($requestId, (int) $this->run($requestId)->Target);
         }
         $checkpoint();
+        SmsStepLog::mark($requestId, 'counting_members');
         $selected = DB::connection('sqlsrv')->table('TblProspectsExport')->where('Request_ID', $requestId)->count();
         if ($sourceFirst) {
             $completed = $this->mustRun($requestId)->Selected;
@@ -130,6 +139,7 @@ class SmsRunService
         $this->move($requestId, ['selecting'], 'selecting', ['Selected' => $selected, 'Progress_Step' => 'tu_debts']);
         $counts = ['Selected' => $selected, 'Debt_TU' => 0, 'Debt_Mailers' => 0, 'Debt_Tier_Default' => 0, 'Debt_Missing' => 0];
         if ($selected > 0) {
+            SmsStepLog::mark($requestId, 'checking_debts');
             if ($sourceFirst) {
                 // Prices/provenance were frozen in the same source-filtered selection.
                 // Do not reread mutable TU/mailer sources after membership was committed.
@@ -145,6 +155,7 @@ class SmsRunService
                 $this->export->assignDrops($requestId, isset($options['send_date'])
                     ? SmsDeliveryPolicy::assertNotPast($options['send_date']) : SmsDeliveryPolicy::followingMonday());
             }
+            SmsStepLog::mark($requestId, 'counting_sources');
             $sources = DB::connection('sqlsrv')->table('TblProspectsExport')->where('Request_ID', $requestId)
                 ->selectRaw("SUM(CASE WHEN Debt_Source = 'TblTUData' THEN 1 ELSE 0 END) AS TU,
                     SUM(CASE WHEN Debt_Source = 'TblMailers' THEN 1 ELSE 0 END) AS Mailers,
@@ -154,6 +165,7 @@ class SmsRunService
                 'Debt_Tier_Default' => (int) $sources->TierDefault, 'Debt_Missing' => (int) $sources->Missing];
         }
         $checkpoint();
+        SmsStepLog::mark($requestId, 'saving_summary');
         if ($selected > 0) app(SmsRunReviewSummary::class)->record($requestId);
         if ($cancellable) {
             $cancellation->finishSelection($run,
@@ -161,6 +173,7 @@ class SmsRunService
         } else {
             $this->move($requestId, ['selecting'], 'review', $counts + ['Progress_Step' => 'review']);
         }
+        SmsStepLog::finish($requestId);
         app(SmsRunProgress::class)->forget($requestId);
     }
 
@@ -327,7 +340,39 @@ class SmsRunService
         try {
             app(SmsRecordExportRepository::class)->assertFrozen($requestId, $selected, $newFiles);
         } catch (SmsFrozenEligibilityHold $hold) {
+            $this->rememberApprovalHold($requestId, $hold->getMessage());
             throw new HttpException(409, $hold->getMessage(), $hold);
+        }
+    }
+
+    /**
+     * On a big run the check outlasts the load balancer, so the 409 can reach a closed connection.
+     * The page's polling reads this instead. Cache only, so a failure here changes nothing.
+     */
+    protected function rememberApprovalHold(string $requestId, string $message): void
+    {
+        try {
+            Cache::store('file')->put('sms-approval-hold:'.strtolower($requestId), $message, self::APPROVAL_HOLD_SECONDS);
+        } catch (Throwable) {
+        }
+    }
+
+    protected function approvalHold(string $requestId): ?string
+    {
+        try {
+            $message = Cache::store('file')->get('sms-approval-hold:'.strtolower($requestId));
+
+            return is_string($message) && $message !== '' ? $message : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    protected function forgetApprovalHold(string $requestId): void
+    {
+        try {
+            Cache::store('file')->forget('sms-approval-hold:'.strtolower($requestId));
+        } catch (Throwable) {
         }
     }
 
@@ -368,6 +413,7 @@ class SmsRunService
             }
             return true;
         })));
+        $this->forgetApprovalHold($requestId);
         if ($queued) $this->dispatch($requestId, 'approve');
         return $this->show($requestId);
     }
@@ -400,6 +446,7 @@ class SmsRunService
     private function markApprovedFiles(string $requestId): void
     {
         $runSession = DB::connection('sqlsrv')->getPdo();
+        SmsStepLog::start($requestId, 'approval_started');
         $context = SmsWorkflowLock::run('run:'.$requestId, function () use ($requestId, $runSession): ?array {
             SmsContactAttribution::assertPinnedSession($runSession);
             $pending = $this->mustRun($requestId);
@@ -408,15 +455,19 @@ class SmsRunService
             $options = $this->fileOptions($pending);
             $manifest = $this->artifactManifest($pending);
             $this->verifiedRunArtifact($pending, 'v1');
+            SmsStepLog::mark($requestId, 'assigning_ids');
             // Hold the global allocator lock until this OUTER transaction
             // commits, including when assignDrops starts a nested transaction.
             $range = $this->allocateApprovalDrops($requestId, $pending, $options, $runSession);
             SmsContactAttribution::assertPinnedSession($runSession);
+            SmsStepLog::mark($requestId, 'publishing_files');
             $bundle = $this->publishApprovedFiles($requestId, $manifest, $options, (int) $pending->Selected, $range);
             return compact('pending', 'options', 'manifest', 'range', 'bundle');
         });
         if ($context === null) return;
+        SmsStepLog::mark($requestId, 'recording_history');
         $this->commitApprovedFiles($requestId, $context);
+        SmsStepLog::finish($requestId);
     }
 
     /** Caller holds the run lock on this exact PDO; allocator lock covers commit. */
@@ -660,10 +711,10 @@ class SmsRunService
     /** Quarantine first, then commit membership deletion. Physical cleanup is retryable. */
     private function discardRecord(string $requestId): object
     {
-        $quarantine = null; $original = null; $previousFilePath = null; $versioned = false;
+        $quarantine = null; $original = null; $previousFilePath = null; $versioned = false; $purgeLater = false;
         try {
             $db = DB::connection('sqlsrv');
-            $db->transaction(function () use ($db, $requestId, &$quarantine, &$original, &$previousFilePath, &$versioned): void {
+            $db->transaction(function () use ($db, $requestId, &$quarantine, &$original, &$previousFilePath, &$versioned, &$purgeLater): void {
                 $run = $this->runs()->where('Request_ID', $requestId)->lockForUpdate()->first();
                 $this->assertPolicyReady($run);
                 if ($run->Status === 'discarded') return;
@@ -686,7 +737,8 @@ class SmsRunService
                         throw new RuntimeException('The pending file could not be quarantined; nothing was deleted.');
                     }
                 }
-                $db->table('TblProspectsExport')->where('Request_ID', $requestId)->delete();
+                $purgeLater = (int) $run->Selected >= max(1, (int) config('sms-exports.discard_background_rows', 100000));
+                if (! $purgeLater) $db->table('TblProspectsExport')->where('Request_ID', $requestId)->delete();
                 $db->table('TblSMSDrops')->where('Request_ID', $requestId)->delete();
                 if (! $this->move($requestId, ['review','file_ready','failed'], 'discarded', ['File_Path' => null,
                     'File_Cleanup_Path' => $quarantine, 'Closed_At' => $this->now()])) throw new RuntimeException('The batch changed before deletion.');
@@ -708,7 +760,38 @@ class SmsRunService
             throw $error;
         }
         try { $this->cleanupDeletedFile($requestId); } catch (Throwable) { /* Persisted cleanup receipt remains retryable. */ }
+        if ($purgeLater) $this->startMemberPurge($requestId);
         return $this->show($requestId);
+    }
+
+    /** The run is closed either way. Rows left behind take up space but never affect a selection. */
+    protected function startMemberPurge(string $requestId): void
+    {
+        try {
+            SmsPurgeDiscardedRunJob::dispatch($requestId);
+        } catch (Throwable $error) {
+            // The delete has already committed, so nothing here may turn it into an error.
+            try {
+                Log::warning('SMS deleted run rows were not queued for removal', ['run' => strtolower($requestId), 'error' => $error->getMessage()]);
+            } catch (Throwable) {
+            }
+        }
+    }
+
+    /** Small pages, each its own commit, so a long delete can't hold one huge transaction. Safe to repeat. */
+    public function purgeDiscardedMembers(string $requestId, int $page = self::PURGE_PAGE): int
+    {
+        $run = $this->mustRun($requestId);
+        if (! SmsRecordPolicy::isRecord($run) || $run->Status !== 'discarded') return 0;
+        if (DB::connection('sqlsrv')->table('TblSMSHistory')->where('Request_ID', $requestId)->exists()) {
+            throw new RuntimeException('History exists for this deleted batch; its rows were left in place.');
+        }
+        $removed = 0;
+        do {
+            $deleted = DB::connection('sqlsrv')->table('TblProspectsExport')->where('Request_ID', $requestId)->limit($page)->delete();
+            $removed += $deleted;
+        } while ($deleted === $page);
+        return $removed;
     }
 
     public function cleanupDeletedFile(string $requestId): void
@@ -798,6 +881,14 @@ class SmsRunService
 
         // Worker cache snapshot, never SQL; Updated_At stays the stall/elapsed clock.
         if (in_array($run->Status, ['queued', 'selecting', 'building_file', 'approving'], true)) $view['progress'] = app(SmsRunProgress::class)->forRun($run);
+        if ($run->Status === 'file_ready') {
+            $hold = $this->approvalHold($requestId);
+            if ($hold !== null) $view['approval_hold'] = $hold;
+        }
+        if ($run->Status === 'queued') {
+            $ahead = $this->queueAhead();
+            if ($ahead !== null) $view['queue_ahead'] = $ahead;
+        }
         if (in_array($run->Status, ['review', 'building_file', 'file_ready'], true)) {
             $review = app(SmsRunReviewSummary::class)->read($requestId);
             if ($review !== null) $view['review'] = $review;
@@ -1006,6 +1097,16 @@ class SmsRunService
         } catch (Throwable $error) {
             $this->fail($requestId, $job, 'The step could not be queued: '.$error->getMessage());
             throw $error;
+        }
+    }
+
+    /** Jobs waiting on the one SMS worker, not counting this run's own. Advisory: unknown stays unknown. */
+    protected function queueAhead(): ?int
+    {
+        try {
+            return max(0, (int) Queue::size((string) config('sms-exports.queue', 'tu-export')) - 1);
+        } catch (Throwable) {
+            return null;
         }
     }
 
