@@ -1245,7 +1245,7 @@ class SmsRunService
     protected function dispatch(string $requestId, string $job): void
     {
         try {
-            app(SmsExportQueue::class)->assertReady();
+            app(SmsExportQueue::class)->assertReadyForRunSteps();
             SmsRunStepJob::dispatch($requestId, $job);
         } catch (Throwable $error) {
             $this->fail($requestId, $job, 'The step could not be queued: '.$error->getMessage());
