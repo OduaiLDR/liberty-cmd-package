@@ -538,7 +538,7 @@ class GenerateAdvanceRecoupReport extends Command
 
     protected function emailSender(): EmailSenderService
     {
-        return new EmailSenderService();
+        return new EmailSenderService('PLAW_MS');
     }
 
     private function esc(string $value): string
