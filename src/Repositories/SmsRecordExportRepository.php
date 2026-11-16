@@ -195,6 +195,7 @@ class SmsRecordExportRepository extends SqlSrvRepository
         $stored = SmsStoredDebt::selectionEnabled() && SmsRunOptions::usesLeanDebtSources($options['tier_selection_policy']);
         if ($stored) {
             SmsStoredDebt::assertReady($db);
+            SmsStoredDebt::assertCurrent($db);
             $windowSize = max(1, (int) config('sms-exports.stored_debt_window_size', 250000));
         }
         $debt = SmsDebtPolicy::bindings($options);

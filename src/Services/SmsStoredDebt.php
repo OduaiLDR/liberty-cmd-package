@@ -26,9 +26,76 @@ final class SmsStoredDebt
     /** Debt is raw here and rounds at freeze, the same as the live rule. */
     public const ROUNDED_DEBT_SQL = 'CAST(CEILING(w.Current_Debt/CAST(1000 AS decimal(12,2)))*1000 AS decimal(12,2))';
 
+    /** The refresh's saved progress, relative to storage_path(); the command and the run guard read the same file. */
+    public const STATE_FILE = 'app/private/sms-stored-debt/state.json';
+
+    /** The tables stored values point into (Current_Debt_Source_PK). */
+    public const SOURCE_TABLES = ['TblTUData', 'TblMailers'];
+
     public static function selectionEnabled(): bool
     {
         return config('sms-exports.stored_debt_selection', false) === true;
+    }
+
+    public static function statePath(): string
+    {
+        return storage_path(self::STATE_FILE);
+    }
+
+    /**
+     * Identity and highest row of each source table (plan review M2, Nov 11 2026): a swapped table has another
+     * OBJECT_ID even when its count and highest PK match, and a reload usually brings the highest PK down.
+     *
+     * @return array<string, array{object_id: int, max_pk: int}>
+     */
+    public static function sourceMarks(ConnectionInterface $db): array
+    {
+        $marks = [];
+        foreach (self::SOURCE_TABLES as $table) {
+            $row = $db->selectOne("SELECT OBJECT_ID(N'dbo.{$table}') AS object_id, (SELECT MAX(PK) FROM dbo.{$table}) AS max_pk");
+            $marks[$table] = ['object_id' => (int) ($row->object_id ?? 0), 'max_pk' => (int) ($row->max_pk ?? 0)];
+        }
+
+        return $marks;
+    }
+
+    /** Why stored values no longer fit the live tables, or null when they still do. Tables never saved are not judged. */
+    public static function sourceChange(array $saved, array $live): ?string
+    {
+        foreach (self::SOURCE_TABLES as $table) {
+            if (! is_array($saved[$table] ?? null)) continue;
+            if ((int) $saved[$table]['object_id'] !== (int) ($live[$table]['object_id'] ?? 0)) {
+                return "{$table} was replaced after the stored debt was worked out.";
+            }
+            if ((int) ($live[$table]['max_pk'] ?? 0) < (int) $saved[$table]['max_pk']) {
+                return "{$table} was reloaded (its highest row number went down) after the stored debt was worked out.";
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Refuses a run on stored values that can't be trusted: a source table was swapped or reloaded since they were
+     * worked out, or TU rows arrived that the refresh hasn't handled yet (those people would keep an old debt or be
+     * missing). New mailers don't count: the refresh never starts on them (Jacob, Nov 7). No state file or another
+     * database driver: nothing to compare, so nothing is refused.
+     */
+    public static function assertCurrent(ConnectionInterface $db, ?string $statePath = null): void
+    {
+        if ($db->getDriverName() !== 'sqlsrv') return;
+        $path = $statePath ?? self::statePath();
+        if (! is_file($path)) return;
+        $state = json_decode((string) file_get_contents($path), true);
+        if (! is_array($state)) throw new RuntimeException('The stored debt state file is unreadable, so a run on stored debt is stopped. Look at it first.');
+        $live = self::sourceMarks($db);
+        if (is_array($state['sources'] ?? null) && ($change = self::sourceChange($state['sources'], $live)) !== null) {
+            throw new RuntimeException($change.' Runs on stored debt are stopped until it is worked out again.');
+        }
+        if (isset($state['tu_watermark']) && $live['TblTUData']['max_pk'] > (int) $state['tu_watermark']) {
+            throw new RuntimeException(sprintf('Stored debt is still catching up with %s new TU rows. The refresh runs every 30 minutes; generate again after it.',
+                number_format($live['TblTUData']['max_pk'] - (int) $state['tu_watermark'])));
+        }
     }
 
     /** Refuses a run that would silently fall back or read columns that aren't there. */

@@ -67,6 +67,8 @@ final class SmsStoredDebtWorker
         $state = $this->state();
         // Anything TU adds from here on is picked up by the refresh, so nobody filled early goes stale.
         $state['tu_watermark'] ??= (int) ($this->db->selectOne('SELECT MAX(PK) AS n FROM dbo.TblTUData')->n ?? 0);
+        // Which tables the values point into, so a later swap or reload is caught (plan review M2).
+        $state['sources'] ??= SmsStoredDebt::sourceMarks($this->db);
         $state['cursor'][$scope] ??= 0;
         $this->save($state);
         $deadline = $minutes > 0 ? ($this->now)() + $minutes * 60 : null;
@@ -120,6 +122,11 @@ final class SmsStoredDebtWorker
         $reason = $this->pauseReason();
         if ($reason !== null) return ['stopped' => $reason] + $result;
         SmsStoredDebt::assertReady($this->db);
+        // A swapped or reloaded source makes stored values point at the wrong rows; never paper over it here.
+        $live = SmsStoredDebt::sourceMarks($this->db);
+        if (is_array($state['sources'] ?? null) && ($change = SmsStoredDebt::sourceChange($state['sources'], $live)) !== null) {
+            return ['stopped' => $change.' The stored debt has to be worked out again before runs use it.'] + $result;
+        }
         $this->db->unprepared('SET LOCK_TIMEOUT 30000');
         $deadline = $minutes > 0 ? ($this->now)() + $minutes * 60 : null;
         $from = (int) $state['tu_watermark'];
@@ -138,6 +145,9 @@ final class SmsStoredDebtWorker
             $this->save($state);
             $result['tu_rows'] = $to - $from;
         }
+        // Same tables as before (checked above), so their newest marks are kept; the back fills below save their own state.
+        $state['sources'] = $live;
+        $this->save($state);
         foreach (array_keys(self::SCOPES) as $scope) {
             if (($state['finished'][$scope] ?? false) !== true) continue;
             $fill = $this->backfill($scope, $batch, 0, $deadline === null ? 0 : max(1, (int) ceil(($deadline - ($this->now)()) / 60)));

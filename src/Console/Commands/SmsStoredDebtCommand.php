@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Cmd\Reports\Console\Commands;
 
+use Cmd\Reports\Services\SmsStoredDebt;
 use Cmd\Reports\Services\SmsStoredDebtWorker;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
@@ -24,7 +25,7 @@ class SmsStoredDebtCommand extends Command
 
     public function handle(): int
     {
-        $worker = new SmsStoredDebtWorker(DB::connection('sqlsrv'), storage_path('app/private/sms-stored-debt/state.json'),
+        $worker = new SmsStoredDebtWorker(DB::connection('sqlsrv'), SmsStoredDebt::statePath(),
             function (string $line): void {
                 $this->line($line);
                 Log::info('SMS stored debt', ['detail' => $line]);

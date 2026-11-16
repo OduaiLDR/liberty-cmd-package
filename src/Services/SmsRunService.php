@@ -60,6 +60,11 @@ class SmsRunService
         }
         SmsApprovalCreationPolicy::assertNewRun($options);
         if ($options !== null) $this->assertNewFileOptionsReady($options);
+        // Say why at the click; the selection checks again before it reads a stored value (Nov 11 2026).
+        if ($options !== null && SmsStoredDebt::selectionEnabled() && SmsRunOptions::usesLeanDebtSources($options['tier_selection_policy'] ?? null)) {
+            try { SmsStoredDebt::assertCurrent(DB::connection('sqlsrv')); }
+            catch (RuntimeException $error) { throw new HttpException(409, $error->getMessage(), $error); }
+        }
         if (isset($options['send_date'])) {
             try { SmsDeliveryPolicy::assertNotPast($options['send_date']); }
             catch (\InvalidArgumentException $error) { throw ValidationException::withMessages(['send_date' => $error->getMessage()]); }
