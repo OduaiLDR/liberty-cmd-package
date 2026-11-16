@@ -138,6 +138,52 @@ test('feedback replay does not refresh unchanged eligibility and rollback does n
     expect($this->db->table('TblSMSSuppressions')->where('Phone', '2025550102')->exists())->toBeFalse();
 });
 
+test('feedback finds prospects by one keyed phone lookup, flags them by PK and leaves contacted ones', function () {
+    $person = fn (array $row): int => $this->db->table('TblProspects')->insertGetId($row + ['Client' => 'Test Person']);
+    $first = $person(['Phone' => '2025550101']); $second = $person(['Phone' => '2025550101']);
+    $contacted = $person(['Phone' => '2025550101', 'Contacted' => 1]);
+    $invalid = $person(['Phone' => '2025550102']); $already = $person(['Phone' => '2025550103', 'Opt_Out' => 1]);
+    $other = $person(['Phone' => '2025550199']);
+    $flags = fn (int $pk): array => array_map('intval', array_values((array) $this->db->table('TblProspects')->where('PK', $pk)->first(['Opt_Out', 'Invalid_Phone'])));
+    $rows = [['phone' => '2025550101', 'status' => 'opt_out'], ['phone' => '+1 (202) 555-0101', 'status' => 'opt_out'],
+        ['phone' => '2025550102', 'status' => 'invalid_phone'], ['phone' => '2025550103', 'status' => 'opt_out'], ['phone' => '2025550104', 'status' => 'opt_out']];
+
+    $this->db->enableQueryLog();
+    $result = (new SmsFeedbackService)->import($this->id, 0, $rows, 'test@example.invalid');
+    $sql = array_column($this->db->getQueryLog(), 'query');
+    $this->db->disableQueryLog();
+
+    expect($result)->toBe(['records' => 5, 'matched' => 3, 'updated' => 3, 'replayed' => false]);
+    expect([$flags($first), $flags($second), $flags($invalid), $flags($already)])->toBe([[1, 0], [1, 0], [0, 1], [1, 0]]);
+    expect([$flags($contacted), $flags($other)])->toBe([[0, 0], [0, 0]], 'a contacted prospect and another phone keep their flags');
+    expect($this->db->table('TblSMSSuppressions')->orderBy('Phone')->pluck('Opt_Out', 'Phone')->map(fn ($v) => (int) $v)->all())
+        ->toBe(['2025550101' => 1, '2025550102' => 0, '2025550103' => 1, '2025550104' => 1], 'the block list gets every phone, matched or not');
+
+    $onProspects = array_values(array_filter($sql, fn (string $q) => str_contains($q, 'TblProspects')));
+    $lookups = array_values(array_filter($onProspects, fn (string $q) => stripos($q, 'select') === 0));
+    expect($lookups)->toHaveCount(1);
+    expect($lookups[0])->toContain('WHERE Contacted = 0 AND Phone IN (CAST(? AS varchar(10)),CAST(? AS varchar(10))');
+    expect(substr_count($lookups[0], 'CAST(? AS varchar(10))'))->toBe(4, 'one cast per different phone');
+    foreach (array_diff($onProspects, $lookups) as $write) {
+        expect($write)->toContain('"PK" in (')->not->toContain('"Phone"');
+    }
+
+    $again = (new SmsFeedbackService)->import($this->id, 1, $rows, 'test@example.invalid');
+    expect([$again['matched'], $again['updated'], $again['replayed']])->toBe([3, 0, false]);
+});
+
+test('feedback forces the phone index seek on SQL Server only', function () {
+    $lookup = new ReflectionMethod(SmsFeedbackService::class, 'prospects');
+    foreach (['sqlsrv' => 'FROM TblProspects WITH (FORCESEEK(IX_TblProspects_Phone(Phone))) WHERE Contacted = 0 AND Phone IN (CAST(? AS varchar(10)),CAST(? AS varchar(10)))',
+        'sqlite' => 'FROM TblProspects WHERE Contacted = 0 AND Phone IN (CAST(? AS varchar(10)),CAST(? AS varchar(10)))'] as $driver => $expected) {
+        $db = Mockery::mock(Illuminate\Database\ConnectionInterface::class);
+        $db->shouldReceive('getDriverName')->andReturn($driver);
+        $db->shouldReceive('select')->once()->withArgs(fn (string $sql, array $bindings) => str_ends_with($sql, $expected)
+            && str_starts_with($sql, 'SELECT PK, Phone, Opt_Out, Invalid_Phone ') && $bindings === ['2025550101', '2025550102'])->andReturn([]);
+        expect($lookup->invoke(new SmsFeedbackService, $db, ['2025550101', '2025550102']))->toBe([]);
+    }
+});
+
 test('the completed workflow migration refuses destructive rollback', function () {
     $migration = require __DIR__.'/../../database/sms-migrations/2026_10_19_000001_complete_sms_workflow.php';
     expect(fn () => $migration->down())->toThrow(RuntimeException::class);
