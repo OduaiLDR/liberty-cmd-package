@@ -2,6 +2,7 @@
 
 namespace Cmd\Reports\Services;
 
+use Illuminate\Database\ConnectionInterface;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\ValidationException;
 use Symfony\Component\HttpKernel\Exception\HttpException;
@@ -56,16 +57,43 @@ class SmsFeedbackService
             foreach (array_chunk(array_values($flags), 250) as $part) {
                 $db->table('TblSMSSuppressions')->upsert($part, ['Phone'], ['Opt_Out', 'Invalid_Phone', 'Updated_At']);
             }
-            $matched = $db->table('TblProspects')->whereIn('Phone', $phones)->distinct()->count('Phone');
+            $found = $this->prospects($db, $phones);
+            $matched = count(array_unique(array_map(fn ($p) => (string) $p->Phone, $found)));
             $updated = 0;
             foreach (['opt_out' => 'Opt_Out', 'invalid_phone' => 'Invalid_Phone'] as $status => $field) {
-                $numbers = array_values(array_unique(array_column(array_filter($rows, fn ($row) => $row['status'] === $status), 'phone')));
-                if ($numbers) $updated += $db->table('TblProspects')->whereIn('Phone', $numbers)->where($field, 0)->update([$field => 1]);
+                $numbers = array_flip(array_column(array_filter($rows, fn ($row) => $row['status'] === $status), 'phone'));
+                $pks = [];
+                foreach ($found as $p) {
+                    if (isset($numbers[(string) $p->Phone]) && (int) $p->{$field} === 0) $pks[] = (int) $p->PK;
+                }
+                foreach (array_chunk($pks, 1000) as $part) {
+                    $updated += $db->table('TblProspects')->whereIntegerInRaw('PK', $part)->where($field, 0)->update([$field => 1]);
+                }
             }
             $db->table('TblSMSFeedbackImports')->insert(['Request_ID' => $requestId, 'Chunk' => $chunk, 'Content_Hash' => $hash,
                 'Records' => count($rows), 'Matched' => $matched, 'Updated' => $updated, 'Created_By' => $actor, 'Created_At' => now()->toDateTimeString()]);
             if (! SmsAvailabilityRefresh::durableEnabled() || $updated > 0 || $suppressionChanged) SmsAvailabilityRefresh::afterCommit($db);
             return ['records' => count($rows), 'matched' => $matched, 'updated' => $updated, 'replayed' => false];
         }));
+    }
+
+    /**
+     * The prospects that can still be texted and have one of these phones: PK, Phone and both flags.
+     *
+     * The only phone index on TblProspects (IX_TblProspects_Phone) is filtered on Contacted = 0, and PHP sends text
+     * as nvarchar while Phone is varchar. Without the literal filter and the cast SQL Server reads the whole table
+     * for every chunk (39 million rows in Nov 2026). The seek is forced on SQL Server, so a missing index fails the
+     * chunk instead of scanning; the flags are then set by PK. A contacted prospect is never selected and its phone
+     * is in TblSMSSuppressions, so its own flag stays as it is.
+     *
+     * @param list<string> $phones 10-digit phones, at most 500
+     * @return list<object>
+     */
+    private function prospects(ConnectionInterface $db, array $phones): array
+    {
+        $from = $db->getDriverName() === 'sqlsrv' ? 'TblProspects WITH (FORCESEEK(IX_TblProspects_Phone(Phone)))' : 'TblProspects';
+        $in = implode(',', array_fill(0, count($phones), 'CAST(? AS varchar(10))'));
+
+        return $db->select("SELECT PK, Phone, Opt_Out, Invalid_Phone FROM {$from} WHERE Contacted = 0 AND Phone IN ({$in})", $phones);
     }
 }
