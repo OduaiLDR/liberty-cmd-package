@@ -16,18 +16,12 @@ use Illuminate\Support\Facades\Storage;
 use RuntimeException;
 
 /**
- * Monthly Lending Tower invoices to Progress Law and LDR (ticket cc039fe6, Jacob 2026-09-24).
+ * One monthly Lending Tower invoice to LDR, combining LDR and Progress Law.
+ * The former Progress Law per-lead calculation is retained but no longer dispatched.
  *
- * Both invoices cover one calendar month in Los Angeles time, by default the previous one.
- *
- * Progress Law is billed for Lending Tower contacts in a PLAW-classified state, once in the month of
- * its first qualifying status (Pacific Time). Current status is shown separately in the backup.
- * Deleted contacts and co-applicants are excluded.
- *
- * LDR is billed on enrollments: 5% of the debt basis (Sold_Debt, else Debt_Amount) of LDR clients
+ * LDR is billed on enrollments: 5% of the debt basis (Sold_Debt, else Debt_Amount) of both programs
  * whose first scheduled payment is in the month and clears by the following fourth. Clients cancelled
- * through the fourth are excluded. TblEnrollment holds both firms' enrollments, so LDR is
- * scoped by TblContactsLDR; Progress Law's clients are billed per lead on their own invoice.
+ * through the fourth are excluded. Both programs have separate invoice lines and backup labels.
  * The first billing cohort is October 2026. Lookback stays at zero until February 2027,
  * when October's actually billed cohort is due for review.
  *
@@ -46,7 +40,7 @@ class GenerateLendingTowerInvoices extends Command
 {
     protected $signature = 'reports:generate-lending-tower-invoices
                             {--month= : Billing month as YYYY-MM (defaults to the previous month, LA time)}
-                            {--company=all : PLAW, LDR or all}
+                            {--company=all : LDR or all generates one combined invoice; PLAW is disabled}
                             {--dry-run : Calculate and print the figures without creating or sending anything}
                             {--save= : Write the invoice PDFs and backup workbooks to this folder instead of emailing}
                             {--send-to-me : Send only to oduai@libertydebtrelief.com with normal invoice wording and no CC or BCC}
@@ -56,7 +50,7 @@ class GenerateLendingTowerInvoices extends Command
                             {--allow-early-ldr : Explicitly authorize an October 2026 LDR-only forced early send, preserving the scheduled fifth-day correction}
                             {--force : Send even if this invoice number was already sent}';
 
-    protected $description = 'Generate the monthly Lending Tower invoices: Progress Law per lead, LDR per enrollment less lookback.';
+    protected $description = 'Generate one Lending Tower invoice to LDR for LDR and Progress Law enrollments at 5% less lookback.';
 
     private const TIMEZONE = 'America/Los_Angeles';
 
@@ -122,6 +116,11 @@ class GenerateLendingTowerInvoices extends Command
     private const LDR_ENROLLMENTS_SQL = <<<'SQL'
         SELECT e.LLG_ID,
                e.Client,
+               CASE WHEN UPPER(COALESCE(e.Enrollment_Plan, '')) LIKE '%PROGRESS%'
+                          OR UPPER(COALESCE(e.Enrollment_Plan, '')) LIKE 'PLAW%'
+                          OR (EXISTS (SELECT 1 FROM TblContactsPLAW p WHERE p.LLG_ID = e.LLG_ID)
+                              AND NOT EXISTS (SELECT 1 FROM TblContactsLDR l WHERE l.LLG_ID = e.LLG_ID))
+                    THEN 'Progress Law' ELSE 'LDR' END AS Program,
                CONVERT(char(10), e.First_Payment_Date, 23) AS First_Payment_Date,
                CONVERT(char(10), e.First_Payment_Cleared_Date, 23) AS First_Payment_Cleared_Date,
                CONVERT(char(10), e.Cancel_Date, 23) AS Cancel_Date,
@@ -133,7 +132,8 @@ class GenerateLendingTowerInvoices extends Command
           AND e.First_Payment_Cleared_Date IS NOT NULL
           AND e.First_Payment_Cleared_Date < ?
           AND (e.Cancel_Date IS NULL OR e.Cancel_Date >= ?)
-          AND EXISTS (SELECT 1 FROM TblContactsLDR l WHERE l.LLG_ID = e.LLG_ID)
+          AND (EXISTS (SELECT 1 FROM TblContactsLDR l WHERE l.LLG_ID = e.LLG_ID)
+               OR EXISTS (SELECT 1 FROM TblContactsPLAW p WHERE p.LLG_ID = e.LLG_ID))
         ORDER BY e.First_Payment_Date, e.LLG_ID
         SQL;
 
@@ -258,6 +258,10 @@ class GenerateLendingTowerInvoices extends Command
         try {
             [$start, $end, $label] = $this->resolvePeriod((string) $this->option('month'));
             $companies = $this->resolveCompanies((string) $this->option('company'));
+            if ($companies === []) {
+                $this->info('[SKIP] The separate Progress Law invoice is disabled. Its enrollments are billed on the LDR invoice on the fifth.');
+                return self::SUCCESS;
+            }
             $period = $this->periodDetails($start, $end);
             if ($this->option('allow-early-ldr') && (!$live || $companies !== ['LDR']
                 || $period['suffix'] !== LdrInvoiceWindow::FIRST_BILLING_MONTH || !$this->option('force'))) {
@@ -397,8 +401,8 @@ class GenerateLendingTowerInvoices extends Command
         $company = strtoupper(trim($option));
 
         return match ($company) {
-            '', 'ALL' => ['PLAW', 'LDR'],
-            'PLAW', 'LDR' => [$company],
+            '', 'ALL', 'LDR' => ['LDR'],
+            'PLAW' => [],
             default => throw new RuntimeException("--company must be PLAW, LDR or all, got '{$option}'."),
         };
     }
@@ -605,10 +609,26 @@ class GenerateLendingTowerInvoices extends Command
      */
     private function summarizeLdr(array $enrollments, array $deductions, string $start, string $end): array
     {
+        foreach (array_merge($enrollments, $deductions) as $row) {
+            if (!in_array($row['Program'] ?? 'LDR', ['LDR', 'Progress Law'], true)) {
+                throw new RuntimeException('Unknown program in the combined invoice population.');
+            }
+        }
         $grossBasis = $this->sumBasis($enrollments, 'LDR enrollment');
         $deductionBasis = $this->sumBasis($deductions, 'LDR lookback deduction');
-        $gross = $this->ldrFee($grossBasis['cents']);
-        $deduction = $this->ldrFee($deductionBasis['cents']);
+        $programs = [];
+        foreach (['LDR', 'Progress Law'] as $program) {
+            // Historical snapshots without a program contain only LDR clients.
+            $rows = array_values(array_filter($enrollments, static fn (array $row): bool => ($row['Program'] ?? 'LDR') === $program));
+            $credits = array_values(array_filter($deductions, static fn (array $row): bool => ($row['Program'] ?? 'LDR') === $program));
+            $basis = $this->sumBasis($rows, $program . ' enrollment')['cents'];
+            $creditBasis = $this->sumBasis($credits, $program . ' lookback')['cents'];
+            $programs[$program] = ['count' => count($rows), 'basis_cents' => $basis,
+                'gross_cents' => $this->ldrFee($basis), 'deduction_cents' => $this->ldrFee($creditBasis)];
+        }
+        // Round each printed company line to cents, then sum those exact amounts.
+        $gross = array_sum(array_column($programs, 'gross_cents'));
+        $deduction = array_sum(array_column($programs, 'deduction_cents'));
 
         $events = ['lookback' => 0, 'cancelled' => 0, 'both' => 0];
         foreach ($deductions as $row) {
@@ -619,6 +639,7 @@ class GenerateLendingTowerInvoices extends Command
 
         return [
             'enrollments' => $enrollments,
+            'programs' => $programs,
             'deductions' => $deductions,
             'gross_basis_cents' => $grossBasis['cents'],
             'deduction_basis_cents' => $deductionBasis['cents'],
@@ -642,7 +663,11 @@ class GenerateLendingTowerInvoices extends Command
         $events = $invoice['deduction_events'];
 
         $this->newLine();
-        $this->line('<options=bold>LDR</>');
+        $this->line('<options=bold>LDR (including Progress Law)</>');
+        foreach ($invoice['programs'] as $program => $figures) {
+            $this->row($program . ' debt / fee at ' . $this->ldrRateLabel(),
+                $this->money($figures['basis_cents']) . ' / ' . $this->money($figures['gross_cents']));
+        }
         $this->row('Enrollments (first payment due in billing month)', sprintf(
             '%s (%s used Debt_Amount because Sold_Debt is empty)',
             number_format(count($invoice['enrollments'])),
@@ -706,16 +731,16 @@ class GenerateLendingTowerInvoices extends Command
 
         return $this->documentBase('LDR', $number, $period) + [
             'columns' => ['quantity' => 'Debt basis', 'rate' => 'Rate'],
-            'lines' => [[
-                'description' => 'Enrollment fee',
-                'detail' => number_format(count($invoice['enrollments'])) . " enrollments with first payment due in {$period['month']}, cleared by "
+            'lines' => array_map(fn (string $program): array => [
+                'description' => $program . ' enrollment fee',
+                'detail' => number_format($invoice['programs'][$program]['count']) . " enrollments with first payment due in {$period['month']}, cleared by "
                     . (new DateTimeImmutable($invoice['window']['cleared_before']))->modify('-1 day')->format('F j, Y')
                     . '; excludes cancellations through '
                     . (new DateTimeImmutable($invoice['window']['cancelled_before']))->modify('-1 day')->format('F j, Y'),
-                'quantity' => $this->money($invoice['gross_basis_cents']),
+                'quantity' => $this->money($invoice['programs'][$program]['basis_cents']),
                 'rate' => $rate,
-                'amount' => $this->money($invoice['gross_cents']),
-            ]],
+                'amount' => $this->money($invoice['programs'][$program]['gross_cents']),
+            ], ['LDR', 'Progress Law']),
             'totals' => [
                 ['label' => 'Gross bill', 'amount' => $this->money($invoice['gross_cents'])],
                 [
@@ -732,7 +757,7 @@ class GenerateLendingTowerInvoices extends Command
             ],
             'total_due' => $this->money($invoice['total_cents']),
             'notes' => [
-                'Debt basis is sold debt, or the enrolled debt amount where no sold debt is recorded.',
+                'Billed to Liberty Debt Relief, including Progress Law. Both programs are billed at 5% of sold debt, or enrolled debt where no sold debt is recorded.',
                 "Please include invoice number {$number} with your payment. Questions: " . $this->liveSender(),
             ],
         ];
@@ -754,7 +779,7 @@ class GenerateLendingTowerInvoices extends Command
                 $rate,
                 $this->money($invoice['gross_cents'])
             ),
-            ['LLG ID', 'Client', 'First Payment Date', 'First Payment Cleared', 'Cancel Date', 'Debt Source', 'Debt Basis'],
+            ['LLG ID', 'Client', 'First Payment Date', 'First Payment Cleared', 'Cancel Date', 'Debt Source', 'Debt Basis', 'Program'],
             array_map(fn (array $row): array => [
                 (string) ($row['LLG_ID'] ?? ''),
                 (string) ($row['Client'] ?? ''),
@@ -763,6 +788,7 @@ class GenerateLendingTowerInvoices extends Command
                 (string) ($row['Cancel_Date'] ?? ''),
                 (string) ($row['Debt_Source'] ?? ''),
                 $this->dollars($row['Debt_Basis'] ?? null),
+                (string) ($row['Program'] ?? 'LDR'),
             ], $invoice['enrollments']),
             [6]
         );
@@ -777,7 +803,7 @@ class GenerateLendingTowerInvoices extends Command
                 $this->money($invoice['deduction_cents'])
             ),
             ['LLG ID', 'Client', 'First Payment Date', 'First Payment Cleared', 'Individual Cutoff',
-                'Cancel Date', 'Payments at Cutoff', 'Azure Payments (Current)', 'Payment Frequency', 'Reason', 'Billed Debt Basis'],
+                'Cancel Date', 'Payments at Cutoff', 'Azure Payments (Current)', 'Payment Frequency', 'Reason', 'Billed Debt Basis', 'Program'],
             array_map(fn (array $row): array => [
                 (string) ($row['LLG_ID'] ?? ''),
                 (string) ($row['Client'] ?? ''),
@@ -790,6 +816,7 @@ class GenerateLendingTowerInvoices extends Command
                 (string) ($row['Payment_Frequency'] ?? ''),
                 (string) ($row['Deduction_Reason'] ?? ''),
                 $this->dollars($row['Debt_Basis'] ?? null),
+                (string) ($row['Program'] ?? 'LDR'),
             ], $invoice['deductions']),
             [10]
         );
