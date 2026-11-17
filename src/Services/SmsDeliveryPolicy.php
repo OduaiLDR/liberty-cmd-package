@@ -75,12 +75,43 @@ final class SmsDeliveryPolicy
     }
 
     /** Explicit frozen format for a versioned run, never inferred from configuration. */
+    /**
+     * date_first_received and date_last_received as YYYY-MM-DD. The first is never after the last; with only one of
+     * them known both are that day; with neither known both are blank rather than guessed.
+     *
+     * @return array{0: string, 1: string}
+     */
+    public static function receivedDates(?string $first, ?string $last): array
+    {
+        $day = static function (?string $value): ?string {
+            $text = substr(trim((string) $value), 0, 10);
+            if (preg_match('/\A([0-9]{4})-([0-9]{2})-([0-9]{2})\z/', $text, $m) !== 1 || ! checkdate((int) $m[2], (int) $m[3], (int) $m[1])) return null;
+
+            return $text;
+        };
+        $first = $day($first);
+        $last = $day($last);
+        if ($first === null && $last === null) return ['', ''];
+        $first ??= $last;
+        $last ??= $first;
+        if (strcmp($first, $last) > 0) $first = $last;
+
+        return [$first, $last];
+    }
+
+    /** How many columns a format has after send date (the two received dates), so callers can still find debt, phone and date. */
+    public static function columnsAfterSendDate(string $format): int
+    {
+        return $format === SmsRunOptions::RECEIVED_DATES_CSV_FORMAT ? 2 : 0;
+    }
+
     public static function headerForFormat(string $format): array
     {
         return match ($format) {
             SmsRunOptions::CSV_FORMAT => ['First name', 'debt load', 'phone1', 'send date'],
             SmsRunOptions::FIRST_LAST_CSV_FORMAT => ['First name', 'Last name', 'debt load', 'phone1', 'send date'],
             SmsRunOptions::FIELD_NAME_CSV_FORMAT => ['first_name', 'last_name', 'debt_load', 'phone1', 'send_date'],
+            SmsRunOptions::RECEIVED_DATES_CSV_FORMAT => ['first_name', 'last_name', 'debt_load', 'phone1', 'send_date', 'date_first_received', 'date_last_received'],
             'legacy-nine-column-v1' => self::header(false),
             'legacy-five-column-v1' => self::header(true),
             default => throw new InvalidArgumentException('Unknown SMS vendor CSV format.'),
@@ -88,9 +119,11 @@ final class SmsDeliveryPolicy
     }
 
     /** The legacy address argument is deliberately omitted by the four-column format. */
-    public static function rowForFormat(string $format, string $client, string $address, mixed $amount, string $phone, string $sendDate): array
+    public static function rowForFormat(string $format, string $client, string $address, mixed $amount, string $phone, string $sendDate, ?string $firstReceived = null, ?string $lastReceived = null): array
     {
         return match ($format) {
+            SmsRunOptions::RECEIVED_DATES_CSV_FORMAT => [explode(' ', trim($client))[0], self::lastName($client), self::debtLoad($amount), $phone, $sendDate,
+                ...self::receivedDates($firstReceived, $lastReceived)],
             SmsRunOptions::CSV_FORMAT => [explode(' ', trim($client))[0], self::debtLoad($amount), $phone, $sendDate],
             SmsRunOptions::FIRST_LAST_CSV_FORMAT, SmsRunOptions::FIELD_NAME_CSV_FORMAT => [explode(' ', trim($client))[0], self::lastName($client), self::debtLoad($amount), $phone, $sendDate],
             'legacy-nine-column-v1' => self::row($client, $address, $amount, $phone, $sendDate, false),

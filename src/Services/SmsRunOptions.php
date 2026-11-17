@@ -26,7 +26,13 @@ final class SmsRunOptions
     /** Same five columns under the field names Jude asked for: the format of every new run. */
     public const FIELD_NAME_CSV_FORMAT = 'sms-first-last-name-v2';
 
-    public const CSV_FORMATS = [self::CSV_FORMAT, self::FIRST_LAST_CSV_FORMAT, self::FIELD_NAME_CSV_FORMAT];
+    /**
+     * The five field-name columns plus date_first_received and date_last_received (Sam, Nov 2026), for the file that
+     * goes to the SMS vendor. Only new runs get it, and only when it is switched on and its two indexes exist.
+     */
+    public const RECEIVED_DATES_CSV_FORMAT = 'sms-first-last-name-v3';
+
+    public const CSV_FORMATS = [self::CSV_FORMAT, self::FIRST_LAST_CSV_FORMAT, self::FIELD_NAME_CSV_FORMAT, self::RECEIVED_DATES_CSV_FORMAT];
 
     public const TIER_SELECTION_POLICY = 'current-source-tier-v1';
 

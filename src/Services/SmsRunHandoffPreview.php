@@ -28,11 +28,11 @@ final class SmsRunHandoffPreview
             ],
             'email' => [
                 'status' => 'not_configured',
-                'note' => 'Preview only; opening this view does not send email. Recipients come from TblReports when an approved handoff is prepared; external download links and delivery setup are required. This preview alone does not establish past email activity.',
+                'note' => 'The handoff email is not set up.',
             ],
             'debtplete_import' => [
                 'status' => 'not_configured', 'processed' => null, 'total' => $selected,
-                'note' => 'Automatic import is not connected for this run. This view does not verify past manual imports.',
+                'note' => 'Automatic import is not connected.',
             ],
         ];
 

@@ -46,3 +46,24 @@ test('publication projection rejects false completion and malformed or mismatche
     [['status' => 'delivered']], [['files_done' => 1]], [['rows_done' => 2]], [['files_total' => 3]],
     [['rows_total' => 4]], [['files_done' => '2']], [['rows_done' => -1]], [['files_done' => 3]],
 ])->throws(RuntimeException::class);
+
+test('an open batch with publishing switched on says it starts after approval, without a publisher or the database', function (string $status, string $expected): void {
+    $previous = Container::getInstance();
+    $container = new Container;
+    $container->instance('config', new Repository(['sms-exports' => ['file_publication_enabled' => true]]));
+    $container->bind(SmsRunPublicationWorkflow::class, fn () => throw new RuntimeException('Unexpected publication resolution.'));
+    Container::setInstance($container);
+    try {
+        $view = ['status' => $status, 'options' => ['filename_version' => SmsRunOptions::APPROVAL_FILENAME_VERSION]];
+        $projected = SmsRunPublicationProjection::forRun($view, [])['file_publication'];
+        expect($projected['status'])->toBe($expected);
+        if ($expected === 'awaiting_approval') expect($projected['note'])->toContain('after this batch is approved');
+        // A batch frozen with an older filename version, or publishing switched off, still reads as not set up.
+        expect(SmsRunPublicationProjection::forRun(['status' => $status, 'options' => ['filename_version' => 'other']], [])['file_publication']['status'])->toBe('not_configured');
+        config(['sms-exports.file_publication_enabled' => false]);
+        expect(SmsRunPublicationProjection::forRun($view, [])['file_publication']['status'])->toBe('not_configured');
+    } finally {
+        Container::setInstance($previous);
+    }
+})->with([['review', 'awaiting_approval'], ['file_ready', 'awaiting_approval'], ['selecting', 'awaiting_approval'], ['approving', 'awaiting_approval'],
+    ['discarded', 'not_configured'], ['not_sent', 'not_configured'], ['review_only', 'not_configured'], ['sent', 'not_configured'], ['external_sent', 'not_configured']]);

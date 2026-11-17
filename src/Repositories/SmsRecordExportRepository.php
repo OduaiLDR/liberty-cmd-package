@@ -8,6 +8,7 @@ use Carbon\Carbon;
 use Cmd\Reports\Services\SmsAvailabilityRefresh;
 use Cmd\Reports\Services\SmsDebtPolicy;
 use Cmd\Reports\Services\SmsRecordPolicy;
+use Cmd\Reports\Services\SmsReceivedDates;
 use Cmd\Reports\Services\SmsDeliveryPolicy;
 use Cmd\Reports\Services\SmsRunArtifactBundle;
 use Cmd\Reports\Services\SmsRunOptions;
@@ -489,13 +490,17 @@ class SmsRecordExportRepository extends SqlSrvRepository
             $cells = (function () use ($requestId, $options): \Generator {
                 $pendingIds = ($options['filename_version'] ?? null) === SmsRunOptions::APPROVAL_FILENAME_VERSION;
                 $query = $this->table('TblProspectsExport', 'x')->where('x.Request_ID', $requestId);
+                $columns = ['x.Client', 'x.Address', 'x.Debt_Amount', 'x.Phone'];
+                $dates = $options['csv_format'] === SmsRunOptions::RECEIVED_DATES_CSV_FORMAT;
+                if ($dates) $columns = [...$columns, ...SmsReceivedDates::join($query, 'x')];
                 $rows = $pendingIds
-                    ? $query->orderBy('x.Debt_Tier')->orderBy('x.Prospect_PK')->select(['x.Client', 'x.Address', 'x.Debt_Amount', 'x.Phone'])->cursor()
+                    ? $query->orderBy('x.Debt_Tier')->orderBy('x.Prospect_PK')->select($columns)->cursor()
                     : $query->join('TblSMSDrops as d', 'd.PK', '=', 'x.SMS_Drop_PK')->orderBy('d.Drop_Name')->orderBy('x.Prospect_PK')
-                        ->select(['x.Client', 'x.Address', 'x.Debt_Amount', 'x.Phone', 'd.Drop_Date'])->cursor();
+                        ->select([...$columns, 'd.Drop_Date'])->cursor();
                 foreach ($rows as $row) {
                     yield SmsDeliveryPolicy::rowForFormat($options['csv_format'], (string) $row->Client, (string) $row->Address,
-                        $row->Debt_Amount, (string) $row->Phone, $pendingIds ? $options['send_date'] : Carbon::parse($row->Drop_Date)->toDateString());
+                        $row->Debt_Amount, (string) $row->Phone, $pendingIds ? $options['send_date'] : Carbon::parse($row->Drop_Date)->toDateString(),
+                        $dates ? SmsReceivedDates::text($row->First_Received) : null, $dates ? SmsReceivedDates::text($row->Last_Received) : null);
                 }
             })();
             $bundle = (new SmsRunArtifactBundle)->build($runDirectory, $stem, $cells, $expected, $options, $report);

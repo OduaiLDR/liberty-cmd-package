@@ -13,21 +13,35 @@ final class SmsRunPublicationProjection
     public static function forRun(array $view, ?array $handoff): ?array
     {
         if ($handoff === null) return null;
-        $handoff['file_publication'] = ['status' => 'not_configured', 'note' => 'External file publishing is disabled or not configured. Opening this view does not upload files or establish past provider activity.'];
-        if (config('sms-exports.file_publication_enabled', false) !== true || ($view['status'] ?? null) !== 'approved'
+        $handoff['file_publication'] = ['status' => 'not_configured', 'note' => 'File publishing is not switched on.'];
+        if (config('sms-exports.file_publication_enabled', false) !== true
             || ($view['options']['filename_version'] ?? null) !== SmsRunOptions::APPROVAL_FILENAME_VERSION) return $handoff;
+        if (self::awaitingApproval($view)) {
+            // Switched on, but there is nothing to publish before the batch is approved. "Setup pending" would be wrong here.
+            $handoff['file_publication'] = ['status' => 'awaiting_approval', 'note' => 'The approved files are published after this batch is approved.'];
+            return $handoff;
+        }
+        if (($view['status'] ?? null) !== 'approved') return $handoff;
         try {
             return self::apply($view, $handoff, app(SmsRunPublicationWorkflow::class)->status($view['request_id']));
         } catch (Throwable) {
-            $handoff['file_publication'] = ['status' => 'unavailable', 'note' => 'The saved publication progress could not be verified. No upload or provider check was initiated by this read.'];
+            $handoff['file_publication'] = ['status' => 'unavailable', 'note' => 'The publishing progress could not be read. Nothing was uploaded by opening this.'];
             return $handoff;
         }
+    }
+
+    /** An open batch that can still be approved: not approved, sent, discarded or otherwise closed. */
+    public static function awaitingApproval(array $view): bool
+    {
+        $status = $view['status'] ?? null;
+
+        return is_string($status) && $status !== '' && ! in_array($status, SmsRunService::CLOSED, true);
     }
 
     public static function apply(array $view, array $handoff, ?array $state): array
     {
         if ($state === null) {
-            $handoff['file_publication'] = ['status' => 'awaiting_publish', 'note' => 'This approved run has no tracked publication. Explicit publication requires the reviewed account, folder and sharing policy.'];
+            $handoff['file_publication'] = ['status' => 'awaiting_publish', 'note' => 'The approved files are not published yet.'];
             return $handoff;
         }
         if (! in_array($state['status'] ?? null, ['ready', 'publishing', 'published', 'failed', 'uncertain'], true)) {

@@ -59,7 +59,7 @@ test('missing saved receipt does not invent manual history or zero imported coun
     $result = SmsRunDebtPleteImportProjection::forRun(smsImportProjectionView(), $this->preview);
     expect($result['debtplete_import']['status'])->toBe('not_requested')
         ->and($result['debtplete_import']['processed'])->toBeNull()
-        ->and($result['debtplete_import']['note'])->toContain('Past manual imports are not inferred.')
+        ->and($result['debtplete_import']['note'])->toBe('No automatic import was recorded for this run.')
         ->and($this->fixture->calls)->toBe(1)->and(SmsDebtPleteImportPrivacy::active())->toBeFalse();
 });
 
