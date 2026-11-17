@@ -6,6 +6,11 @@ $dropboxLinkExpiryDays = env('CMD_SMS_DROPBOX_LINK_EXPIRY_DAYS');
 if (is_string($dropboxLinkExpiryDays) && preg_match('/^[1-9][0-9]?$/D', $dropboxLinkExpiryDays) === 1) {
     $dropboxLinkExpiryDays = (int) $dropboxLinkExpiryDays;
 }
+// A presigned S3 link cannot live longer than 7 days (an AWS limit).
+$s3LinkExpiryDays = env('CMD_SMS_S3_LINK_EXPIRY_DAYS', '7');
+if (is_string($s3LinkExpiryDays) && preg_match('/^[1-7]$/D', $s3LinkExpiryDays) === 1) {
+    $s3LinkExpiryDays = (int) $s3LinkExpiryDays;
+}
 
 return [
     // Keep SMS files on CMD runner's existing private persistent storage.
@@ -112,6 +117,14 @@ return [
     // Separate from private archives. No recipient data is published until the
     // approved account, namespace, existing folder and sharing policy are explicit.
     'file_publication_enabled' => env('CMD_SMS_FILE_PUBLICATION_ENABLED', false),
+    // Where the approved files are published: 'dropbox' (the first publisher) or 's3' (a private bucket and
+    // presigned links). Each needs its own explicit destination settings below.
+    'file_publication_provider' => env('CMD_SMS_FILE_PUBLICATION_PROVIDER', 'dropbox'),
+    's3_publication_bucket' => env('CMD_SMS_S3_PUBLICATION_BUCKET'),
+    's3_publication_region' => env('CMD_SMS_S3_PUBLICATION_REGION'),
+    's3_publication_prefix' => env('CMD_SMS_S3_PUBLICATION_PREFIX', 'sms-published'),
+    's3_publication_expected_owner' => env('CMD_SMS_S3_PUBLICATION_EXPECTED_OWNER'),
+    's3_link_expiry_days' => $s3LinkExpiryDays,
     // Captures only new approvals. Existing publication/email receipts stay independent.
     'handoff_automatic' => env('CMD_SMS_HANDOFF_AUTOMATIC', false),
     // Independent opt-in import. Never infer a tenant, destination or credential.

@@ -304,8 +304,12 @@ class ReportsServiceProvider extends ServiceProvider
         // status must not resolve a recipient database or contact Graph.
         $this->app->bind(\Cmd\Reports\Services\SmsRunEmailGateway::class,
             static fn () => new \Cmd\Reports\Services\SmsTableRunEmailGateway());
-        $this->app->bind(\Cmd\Reports\Services\SmsRunLinkPublisher::class,
-            static fn () => new \Cmd\Reports\Services\SmsDropboxRunLinkPublisher());
+        // 'dropbox' unless S3 is chosen explicitly; an unknown provider fails instead of falling back.
+        $this->app->bind(\Cmd\Reports\Services\SmsRunLinkPublisher::class, static fn () => match (config('sms-exports.file_publication_provider', 'dropbox')) {
+            'dropbox' => new \Cmd\Reports\Services\SmsDropboxRunLinkPublisher(),
+            's3' => new \Cmd\Reports\Services\SmsS3RunLinkPublisher(),
+            default => throw new \RuntimeException('Unknown SMS file publication provider.'),
+        });
         $this->app->bind(\Cmd\Reports\Services\SmsDebtPleteImportGateway::class,
             static fn () => new \Cmd\Reports\Services\SmsDebtPleteImportClient());
         // Lazy and disabled by default. Never reuse the legacy export disk's destination.

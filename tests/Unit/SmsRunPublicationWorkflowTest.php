@@ -473,3 +473,62 @@ test('SMS publication becoming held during email readiness is caught before comm
         ->and($gateway->sends)->toBe(0)->and($emails->status($this->publicationId)['status'])->toBe('ready')
         ->and($this->publicationDb->table('TblSMSEmailOutbox')->value('Attempted_At'))->toBeNull();
 });
+
+test('SMS publication through the S3 publisher stores each approved part once, links it for 7 days and feeds the email that is then accepted', function (): void {
+    $config = Container::getInstance()->make('config');
+    $host = 'synthetic-sms-published.s3.us-west-1.amazonaws.com';
+    $config->set('sms-exports', ['file_publication_provider' => 's3', 's3_publication_bucket' => 'synthetic-sms-published',
+        's3_publication_region' => 'us-west-1', 's3_publication_prefix' => 'sms-published', 's3_publication_expected_owner' => null,
+        's3_link_expiry_days' => 7, 'email_allowed_link_hosts' => [$host]] + $config->get('sms-exports'));
+    $objects = []; $calls = [];
+    $s3 = new Aws\S3\S3Client(['version' => 'latest', 'region' => 'us-west-1', 'credentials' => ['key' => 'AKIAFIXTUREFIXTURE00', 'secret' => 'fixture-secret-not-real'],
+        'handler' => function (Aws\CommandInterface $command) use (&$objects, &$calls) {
+            $calls[] = $command->getName(); $key = $command['Key'];
+            if ($command->getName() === 'PutObject') {
+                if (isset($objects[$key])) return GuzzleHttp\Promise\Create::rejectionFor(new Aws\S3\Exception\S3Exception('Exists', $command, ['response' => new GuzzleHttp\Psr7\Response(412), 'code' => 'PreconditionFailed']));
+                $body = (string) $command['Body'];
+                $objects[$key] = ['bytes' => strlen($body), 'sha256' => hash('sha256', $body), 'etag' => '"'.md5($body).'"'];
+
+                return GuzzleHttp\Promise\Create::promiseFor(new Aws\Result(['ETag' => $objects[$key]['etag']]));
+            }
+            if (! isset($objects[$key])) return GuzzleHttp\Promise\Create::rejectionFor(new Aws\S3\Exception\S3Exception('Not Found', $command, ['response' => new GuzzleHttp\Psr7\Response(404), 'code' => 'NotFound']));
+
+            return GuzzleHttp\Promise\Create::promiseFor(new Aws\Result(['ContentLength' => $objects[$key]['bytes'], 'ChecksumSHA256' => base64_encode(hex2bin($objects[$key]['sha256'])),
+                'ServerSideEncryption' => 'AES256', 'ETag' => $objects[$key]['etag']]));
+        }]);
+    $http = new GuzzleHttp\Client(['handler' => GuzzleHttp\HandlerStack::create(function (Psr\Http\Message\RequestInterface $request) use (&$objects) {
+        $object = $objects[ltrim(rawurldecode($request->getUri()->getPath()), '/')] ?? null;
+
+        return GuzzleHttp\Promise\Create::promiseFor($object === null ? new GuzzleHttp\Psr7\Response(404) : new GuzzleHttp\Psr7\Response(206, ['Content-Range' => 'bytes 0-0/'.$object['bytes']], 'F'));
+    })]);
+    $workflow = new SmsRunPublicationWorkflow(new Cmd\Reports\Services\SmsS3RunLinkPublisher($s3, $http), new SmsRunArtifactPartReader);
+    Container::getInstance()->instance(SmsRunPublicationWorkflow::class, $workflow);
+    $run = (array) $this->publicationDb->table('TblSMSRuns')->first();
+
+    $status = $workflow->publish($this->publicationId, 'fixture@example.invalid');
+    expect([$status['status'], $status['files_done'], $status['files_total'], $status['rows_done'], $status['rows_total']])->toBe(['published', 2, 2, 3, 3]);
+    $parts = $this->publicationBundle['manifest']['parts'];
+    expect(array_keys($objects))->toBe(array_map(fn (array $part): string => 'sms-published/'.$this->publicationId.'/v2/'.$part['name'], $parts))
+        ->and(array_column($objects, 'sha256'))->toBe(array_column($parts, 'sha256'))
+        ->and(array_column($objects, 'bytes'))->toBe(array_column($parts, 'bytes'));
+    $links = $workflow->links($this->publicationId);
+    expect(array_column($links, 'name'))->toBe(array_column($parts, 'name'))->and(count(array_unique(array_column($links, 'url'))))->toBe(2);
+    foreach ($links as $link) {
+        parse_str(parse_url($link['url'], PHP_URL_QUERY), $query);
+        expect(parse_url($link['url'], PHP_URL_HOST))->toBe($host)->and($query['X-Amz-Expires'])->toBe('604800');
+    }
+
+    // A second publish only verifies: nothing is uploaded again and the saved links stay the same.
+    $puts = count(array_keys($calls, 'PutObject'));
+    expect($workflow->publish($this->publicationId, 'fixture@example.invalid')['status'])->toBe('published')
+        ->and(count(array_keys($calls, 'PutObject')))->toBe($puts)->and($puts)->toBe(2)->and($workflow->links($this->publicationId))->toBe($links);
+
+    $gateway = new SmsPublicationFixtureEmailGateway;
+    $emails = new Cmd\Reports\Services\SmsRunEmailWorkflow($gateway);
+    $prepared = $emails->prepare($this->publicationId, $links, 'fixture@example.invalid');
+    $message = $emails->preparedMessage($this->publicationId);
+    expect($prepared['status'])->toBe('ready')->and($message['files'])->toBe($links)->and($message['total'])->toBe(3)->and($message['parts'])->toBe(2);
+    foreach ($links as $link) expect($message['text'])->toContain($link['url']);
+    expect($emails->send($this->publicationId, $prepared['payload_sha256'])['status'])->toBe('accepted')->and($gateway->sends)->toBe(1)
+        ->and((array) $this->publicationDb->table('TblSMSRuns')->first())->toBe($run, 'the approved run itself is never changed');
+});
