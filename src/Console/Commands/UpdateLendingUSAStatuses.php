@@ -407,7 +407,10 @@ class UpdateLendingUSAStatuses extends Command
         }
 
         if (!$proceed) {
-            $this->totalSkipped++;
+            // A payment change can replace the CRM status without changing the
+            // LendingUSA application. The source checkpoint is not proof that
+            // the CRM still agrees. Reconcile status only; never replay funding.
+            $this->reconcileUnchangedCrmStatus($record);
             return;
         }
 
@@ -455,7 +458,8 @@ class UpdateLendingUSAStatuses extends Command
         }
 
         // --- B) Funded workflow (after name is resolved) ---
-        if ($status === 'Funded') {
+        if ($status === 'Funded'
+            && ($crmStatus === '(No change)' || $crmStatus === $this->getLLGStatus($status, $plan))) {
             $this->handleFundedWorkflow($llgid, $clientName, $plan, $oldStatus, $state);
         }
 
@@ -478,7 +482,52 @@ class UpdateLendingUSAStatuses extends Command
         ];
 
         // --- C) Record status history ---
-        $this->recordStatusHistory($llgid, $status, $processTime, $statusDate);
+        // Failed reads/updates and a temporarily missing plan must be retried.
+        // Truly unmapped statuses (including Not Interested) retain their
+        // existing checkpoint behavior; no new business mapping is implied.
+        if (!in_array($crmStatus, ['(Error)', '(Not in CRM)'], true)
+            && !($crmStatus === '(No mapping)' && $plan === '')) {
+            $this->recordStatusHistory($llgid, $status, $processTime, $statusDate);
+        }
+    }
+
+    protected function reconcileUnchangedCrmStatus(array $record): void
+    {
+        $llgid = $record['llgid'];
+        $state = $this->getEnrollmentState($llgid);
+        if (in_array(strtoupper(trim($state)), self::BLOCKED_STATES, true)) {
+            $this->totalSkipped++;
+            return;
+        }
+
+        $plan = $this->categorizePlan($this->getEnrollmentPlanTitle($llgid));
+        $expected = $this->getLLGStatus($record['status'], $plan);
+        if ($expected === '') {
+            $this->totalSkipped++;
+            return;
+        }
+
+        $contact = null;
+        $result = $this->handleCrmStatusUpdate($llgid, $record['status'], $plan, $contact, true);
+        if (in_array($result, ['(No change)', '(Graduated)', '(Cancelled)', '(Protected status)'], true)) {
+            $this->totalSkipped++;
+            return;
+        }
+
+        $this->totalProcessed++;
+        $previous = $contact === null ? '(Unavailable)' : $this->crmStatusLabel($contact);
+        $this->line("  [CRM RECONCILE] CID={$llgid} | {$previous} -> {$expected} | Result={$result}");
+        $this->changedRecords[] = [
+            'cid' => $llgid,
+            'name' => $this->getClientName($llgid),
+            'old_status' => $previous,
+            'new_status' => $expected,
+            'crm_status' => $result,
+            'state' => $state,
+            'crm_reconciliation' => 1,
+        ];
+        // The application has not changed: do not rewrite its checkpoint or
+        // run funded registration, pausing, or negotiator assignment again.
     }
 
     // ─── Funded Workflow ──────────────────────────────────────────────
@@ -546,10 +595,27 @@ class UpdateLendingUSAStatuses extends Command
 
     // ─── CRM Status Update ────────────────────────────────────────────
 
-    protected function handleCrmStatusUpdate(string $llgid, string $lendingStatus, string $plan, ?array &$outContactData = null): string
+    protected function handleCrmStatusUpdate(string $llgid, string $lendingStatus, string $plan, ?array &$outContactData = null, bool $reconcileOnly = false): string
     {
+        $crmStatus = $this->getLLGStatus($lendingStatus, $plan);
+        if ($crmStatus === '') {
+            if ($plan === '') {
+                $this->warn("  [RETRY] CID {$llgid}: enrollment plan unavailable; status was not checkpointed.");
+            } elseif ($this->verboseDry) {
+                $this->line("    [SKIP-CRM] CID {$llgid}: No CRM mapping for '{$lendingStatus}' (plan={$plan})");
+            }
+            return '(No mapping)';
+        }
+
         // Check if contact exists in CRM
-        $contactData = $this->getCrmContactData($llgid);
+        try {
+            $contactData = $this->getCrmContactData($llgid);
+        } catch (\Throwable $e) {
+            $this->totalErrors++;
+            $this->addError($llgid, 'CRM status verification failed; left for retry.');
+            $this->warn("  [RETRY] CID {$llgid}: CRM status could not be verified.");
+            return '(Error)';
+        }
         $outContactData = $contactData;
 
         // If contact not found in CRM, skip CRM update (not an error - just doesn't exist)
@@ -560,7 +626,19 @@ class UpdateLendingUSAStatuses extends Command
             return '(Not in CRM)';
         }
 
-        $currentCrmStatus = $contactData['status_label'] ?? $contactData['client_status'] ?? $contactData['leadstatus'] ?? '';
+        $currentCrmStatus = $this->crmStatusLabel($contactData);
+        if ($currentCrmStatus === '') {
+            $this->totalErrors++;
+            $this->addError($llgid, 'CRM returned no usable status label; left for retry.');
+            $this->warn("  [RETRY] CID {$llgid}: CRM returned no usable status label.");
+            return '(Error)';
+        }
+
+        $currentStage = trim((string) ($contactData['stage_label'] ?? ''));
+        if (preg_match('/cancel|graduat|complet|\bNSF\b|reconsider/i', $currentStage)) {
+            $this->warn("  [REVIEW] CID {$llgid}: preserving protected CRM stage '{$currentStage}'.");
+            return '(Protected status)';
+        }
 
         // Check if contact is Graduated/Completed or Cancelled
         if (stripos($currentCrmStatus, 'Graduated') !== false
@@ -577,24 +655,22 @@ class UpdateLendingUSAStatuses extends Command
             return '(Cancelled)';
         }
 
-        // Translate LendingUSA status to CRM status
-        $crmStatus = $this->getLLGStatus($lendingStatus, $plan);
-
-        if ($crmStatus === '') {
-            // Per VBA: no CRM update for unmapped statuses (e.g. "Not Interested", "Hold")
-            // but status history is still recorded. Not an error, just skipped.
-            if ($this->verboseDry) {
-                $this->line("    [SKIP-CRM] CID {$llgid}: No CRM mapping for '{$lendingStatus}' (plan={$plan})");
-            }
-            return '(No mapping)';
-        }
-
         // Check if CRM already has this status (reuse $currentCrmStatus from line above)
         if (strcasecmp($currentCrmStatus, $crmStatus) === 0) {
             if ($this->verboseDry) {
                 $this->line("    [SKIP-CRM] CID {$llgid} already has status '{$crmStatus}'");
             }
             return '(No change)';
+        }
+
+        // Do not erase operational holds or a funded decision. Unknown statuses
+        // are also left alone during reconciliation rather than guessed to be
+        // payment changes. Only ordinary enrolled / known same-plan LUSA labels
+        // can be restored automatically.
+        if (preg_match('/\bNSF\b|reconsideration|manual review|LUSA-FUNDED/i', $currentCrmStatus)
+            || ($reconcileOnly && !$this->canRestoreCrmStatus($contactData, $plan))) {
+            $this->warn("  [REVIEW] CID {$llgid}: preserving CRM status '{$currentCrmStatus}'; LendingUSA maps to '{$crmStatus}'.");
+            return '(Protected status)';
         }
 
         if ($this->dryRun) {
@@ -614,6 +690,29 @@ class UpdateLendingUSAStatuses extends Command
             $this->totalErrors++;
             return '(Error)';
         }
+    }
+
+    protected function crmStatusLabel(array $contact): string
+    {
+        foreach (['status_label', 'client_status', 'leadstatus'] as $key) {
+            if (is_string($contact[$key] ?? null) && trim($contact[$key]) !== '') {
+                return trim($contact[$key]);
+            }
+        }
+        return '';
+    }
+
+    protected function canRestoreCrmStatus(array $contact, string $plan): bool
+    {
+        $stage = trim((string) ($contact['stage_label'] ?? ''));
+        if ($stage !== '' && strcasecmp($stage, 'Client') !== 0) return false;
+        $current = $this->crmStatusLabel($contact);
+        if (strcasecmp($current, "$plan Enrolled") === 0) return true;
+        foreach (array_keys(self::LUSA_STATUS_IDS) as $knownStatus) {
+            if (str_starts_with($knownStatus, "$plan Enrolled (LUSA-")
+                && strcasecmp($current, $knownStatus) === 0) return true;
+        }
+        return false;
     }
 
     // ─── Record Status History ────────────────────────────────────────
@@ -678,7 +777,7 @@ class UpdateLendingUSAStatuses extends Command
     {
         $apiKey = $this->resolveForthApiKey();
         if ($apiKey === '') {
-            return null;
+            throw new \RuntimeException('Forth credentials unavailable for contact status verification.');
         }
 
         try {
@@ -689,11 +788,16 @@ class UpdateLendingUSAStatuses extends Command
                 ],
             ]);
 
-            $data = json_decode((string) $response->getBody(), true);
-            return $data['response'] ?? $data ?? null;
+            $data = json_decode((string) $response->getBody(), true, 512, JSON_THROW_ON_ERROR);
+            $contact = $data['response'] ?? $data;
+            if (!is_array($contact)) throw new \RuntimeException('Invalid CRM contact response.');
+            return $contact;
         } catch (\Throwable $e) {
-            // 404 = contact not found, not an error
-            return null;
+            if ($e instanceof \GuzzleHttp\Exception\RequestException
+                && $e->hasResponse() && $e->getResponse()->getStatusCode() === 404) {
+                return null;
+            }
+            throw new \RuntimeException('Forth contact status could not be read.', 0, $e);
         }
     }
 
@@ -1082,7 +1186,9 @@ class UpdateLendingUSAStatuses extends Command
 
         $freshKey = $this->fetchForthApiKey();
         if ($freshKey !== '') {
-            $this->storeForthApiKey($cat, $freshKey);
+            if (!$this->dryRun) {
+                $this->storeForthApiKey($cat, $freshKey);
+            }
             $this->forthApiKeyCache = $freshKey;
             return $freshKey;
         }
@@ -1214,7 +1320,7 @@ class UpdateLendingUSAStatuses extends Command
                 ['API Records Fetched', $this->totalFetched, 'Total applications from LendingUSA'],
                 ['Filtered Out', $this->totalFiltered, 'Duplicate/Expired statuses removed'],
                 ['Unique Clients', $afterDedupe, 'After deduplication'],
-                ['Status Changes', $this->totalProcessed, 'New or changed statuses'],
+                ['Status Changes', $this->totalProcessed, 'Source changes or CRM reconciliation'],
                 ['No Change', $this->totalSkipped, 'Already up to date or blocked state'],
                 ['Errors', $this->totalErrors, $this->totalErrors > 0 ? 'Review needed' : 'None'],
             ]
@@ -1318,7 +1424,7 @@ class UpdateLendingUSAStatuses extends Command
             [
                 ['Funded workflow triggered', $this->totalFunded],
                 ['CRM status updates', $this->totalCrmUpdated],
-                ['Status history records', $this->totalProcessed],
+                ['Clients processed', $this->totalProcessed],
             ]
         );
 
