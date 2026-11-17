@@ -51,6 +51,9 @@ return [
     // Opt in only after the additive summary migration, all eligibility writers and
     // the refresh scheduler have been deployed together. No live rollout is implicit.
     'durable_availability_enabled' => env('CMD_SMS_DURABLE_AVAILABILITY_ENABLED', false),
+    // New runs get date_first_received and date_last_received on the vendor file. Needs the two covering indexes
+    // (TblTUData and TblMailers by PK); without them new runs keep the five-column file.
+    'received_dates_enabled' => env('CMD_SMS_RECEIVED_DATES_ENABLED', false),
     // Unset: recount only after a write marks the summary dirty or a person presses Refresh.
     // A positive number of seconds restores a time-based recount on top of that.
     'availability_fresh_seconds' => env('CMD_SMS_AVAILABILITY_FRESH_SECONDS'),

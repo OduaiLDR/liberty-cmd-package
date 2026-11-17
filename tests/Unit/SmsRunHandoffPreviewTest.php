@@ -46,8 +46,8 @@ test('planned SMS handoff is an honest preview with dynamic recipients unresolve
         ->and($result['debtplete_import']['status'])->toBe('not_configured')
         ->and($result['debtplete_import']['processed'])->toBeNull()
         ->and($result['debtplete_import']['total'])->toBe(3)
-        ->and($result['email']['note'])->toContain('does not send email', 'does not establish past email activity')
-        ->and($result['debtplete_import']['note'])->toContain('does not verify past manual imports')
+        ->and($result['email']['note'])->toBe('The handoff email is not set up.')
+        ->and($result['debtplete_import']['note'])->toBe('Automatic import is not connected.')
         ->and($view)->toBe(smsHandoffPreviewFixture());
 });
 

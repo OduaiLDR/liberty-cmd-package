@@ -20,14 +20,14 @@ final class SmsRunDebtPleteImportProjection
                 $status = app(SmsRunDebtPleteImportWorkflow::class)->status($view['request_id']);
                 if ($status === null) {
                     $preview['debtplete_import'] = ['status' => 'not_requested', 'processed' => null,
-                        'total' => $view['selected'], 'note' => 'No saved automatic-import receipt is available for this run. Past manual imports are not inferred.'];
+                        'total' => $view['selected'], 'note' => 'No automatic import was recorded for this run.'];
                     return $preview;
                 }
                 return self::apply($view, $preview, $status);
             });
         } catch (Throwable) {
             $preview['debtplete_import'] = ['status' => 'unavailable', 'processed' => null, 'total' => $view['selected'] ?? null,
-                'note' => 'Saved import progress could not be confirmed. No upload was started by opening this view.'];
+                'note' => 'The import progress could not be read. Nothing was uploaded by opening this.'];
             return $preview;
         }
     }

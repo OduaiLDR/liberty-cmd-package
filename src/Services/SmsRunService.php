@@ -1055,7 +1055,8 @@ class SmsRunService
         if (($run->Progress_Step ?? null) === SmsSelectionCancellation::CANCELLED_STEP) $view['selection_cancelled'] = true;
         $cancellation = app(SmsSelectionCancellation::class)->projection($run);
         if ($cancellation !== null) $view['selection_cancellation'] = $cancellation;
-        $view['handoff'] = SmsRunDebtPleteImportProjection::forRun($view, SmsRunEmailProjection::forRun($view));
+        $view['handoff'] = SmsRunAutomaticHandoffProjection::forRun($view,
+            SmsRunDebtPleteImportProjection::forRun($view, SmsRunEmailProjection::forRun($view)));
         return (object) $view;
     }
 
@@ -1341,7 +1342,7 @@ class SmsRunService
         if ($input === null) return null;
         try {
             // A retry keeps its frozen format; anything new uses the current one.
-            $format = $existing === null ? SmsRunOptions::FIELD_NAME_CSV_FORMAT
+            $format = $existing === null ? SmsReceivedDates::newRunFormat()
                 : ($this->fileOptions($existing)['csv_format'] ?? SmsRunOptions::FIELD_NAME_CSV_FORMAT);
             if (($input['csv_format'] ?? null) !== $format
                 || array_diff(array_keys($input), ['target', 'csv_format', 'rows_per_file', 'tiers', 'tier_selection_policy', 'options_version', 'send_date', 'filename_version', 'minimum_debt_amount', 'maximum_debt_amount']) !== []
@@ -1401,7 +1402,7 @@ class SmsRunService
         $windowSchemaReady = ! $tierSelection || ! $windowed || (SmsTierWindowSchema::ready(DB::connection('sqlsrv'))
             && (! $leanHistory || SmsLeanHistorySchema::ready(DB::connection('sqlsrv'))));
         if ($tierSelection && ! $windowSchemaReady) $tierSelection = false;
-        $capabilities = ['csv_format' => SmsRunOptions::FIELD_NAME_CSV_FORMAT, 'rows_per_file' => true,
+        $capabilities = ['csv_format' => SmsReceivedDates::newRunFormat(), 'rows_per_file' => true,
             'tier_subset' => $tierSelection, 'max_parts' => SmsRunArtifactBundle::MAX_PARTS];
         if ($capabilities['tier_subset']) {
             $capabilities['tier_selection_policy'] = $windowed

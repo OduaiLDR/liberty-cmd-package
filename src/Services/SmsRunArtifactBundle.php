@@ -55,6 +55,8 @@ final class SmsRunArtifactBundle
             $this->writeJson($stage.'/.build.json', ['version' => 1, 'request_id' => $id, 'stem' => $stem, 'parts' => $parts]);
             $manifestParts = []; $total = 0; $partRows = 0; $part = 0; $name = '';
             $columns = count(SmsDeliveryPolicy::headerForFormat($options['csv_format']));
+            // debt load, phone1 and send date end the row, except for columns a format adds after the send date.
+            $sendDateAt = $columns - 1 - SmsDeliveryPolicy::columnsAfterSendDate($options['csv_format']);
             $this->report($progress, 'writing', 0, 0, $parts);
             foreach ($cells as $row) {
                 if (++$total > $expected) throw new RuntimeException('SMS artifact row count exceeds the frozen selection.');
@@ -62,10 +64,10 @@ final class SmsRunArtifactBundle
                     || array_filter($row, static fn ($cell): bool => ! is_string($cell))) {
                     throw new RuntimeException('Each SMS artifact row must contain exactly the string cells of its frozen format.');
                 }
-                if (isset($options['send_date']) && $row[$columns - 1] !== $options['send_date']) {
+                if (isset($options['send_date']) && $row[$sendDateAt] !== $options['send_date']) {
                     throw new RuntimeException('The SMS row date differs from the frozen planned send date.');
                 }
-                $debt = $row[$columns - 3];
+                $debt = $row[$sendDateAt - 2];
                 if (isset($options['minimum_debt_amount']) && (! preg_match('/\A[0-9]+\z/D', $debt)
                     || (int) $debt < $options['minimum_debt_amount'] || (int) $debt > ($options['maximum_debt_amount'] ?? SmsDebtPolicy::MAX))) {
                     throw new RuntimeException('The SMS row debt is below its frozen minimum, above its frozen maximum or outside the supported debt range.');
