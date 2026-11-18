@@ -35,6 +35,10 @@ final class SmsDebtPolicyTest extends TestCase
         self::assertSame(35000, SmsDebtPolicy::minimum(['minimum_debt_amount' => 35000]));
         self::assertSame(35000, SmsDebtPolicy::lowerBound($range));
         self::assertSame(SmsDebtPolicy::MAX, SmsDebtPolicy::validate(SmsDebtPolicy::MAX));
+        // A chosen minimum may go under the 25,000 default, down to LOWEST.
+        self::assertSame([1000, 20000, 20000], [SmsDebtPolicy::validate(SmsDebtPolicy::LOWEST), SmsDebtPolicy::minimum(['minimum_debt_amount' => 20000]),
+            SmsDebtPolicy::lowerBound(SmsRunOptions::normalize(3, null, null, SmsRunOptions::LEAN_WINDOWED_TIER_SELECTION_POLICY, null, null, null, 20000))]);
+        self::assertSame(24000, SmsDebtPolicy::validateMaximum(24000, 20000));
     }
 
     public function test_by_tier_runs_without_a_minimum_release_low_debt_and_low_tier_fallbacks_but_hold_invalid_debt(): void
@@ -77,7 +81,7 @@ final class SmsDebtPolicyTest extends TestCase
 
     public static function invalidMinimums(): array
     {
-        return [[0], [24999], [SmsDebtPolicy::MAX + 1], ['25000'], [25000.0], [null], [true], ['25000 OR 1=1']];
+        return [[0], [999], [SmsDebtPolicy::MAX + 1], ['25000'], [25000.0], [null], [true], ['25000 OR 1=1']];
     }
 
     private function db(): SQLiteConnection

@@ -834,9 +834,20 @@ test('minimum debt capabilities and create response freeze exact integer options
     expect($this->db->table('TblSMSRuns')->count())->toBe(1)->and($this->db->table('TblProspectsExport')->count())->toBe(0);
 });
 
+test('a minimum debt under the 25,000 default is accepted down to the lowest', function (): void {
+    config(['sms-exports.tier_selection_enabled' => true]);
+    expect($this->service->overview()['capabilities']['minimum_debt_lowest'])->toBe(1000);
+    $options = currentFormatOptions(7, 3, ['T4','T5'], SmsRunOptions::TIER_SELECTION_POLICY, null, null, null, 20000, 24000);
+    $request = Request::create('/', 'POST', ['request_id' => $this->id, 'target' => 7,
+        'csv_format' => SmsRunOptions::FIELD_NAME_CSV_FORMAT, 'rows_per_file' => 3, 'tiers' => ['T5','T4'],
+        'tier_selection_policy' => SmsRunOptions::TIER_SELECTION_POLICY, 'minimum_debt_amount' => '20000', 'maximum_debt_amount' => '24000']);
+    $request->attributes->set('cmd_user', ['email' => 'editor@example.invalid']);
+    expect($this->controller->store($request)->getData(true)['options'])->toBe($options);
+});
+
 test('invalid or formatless minimum debt input never creates a run', function (): void {
     config(['sms-exports.tier_selection_enabled' => true]);
-    foreach ([24999, -1, 25000.5, null, '25000bad', 10000000000] as $minimum) {
+    foreach ([999, -1, 25000.5, null, '25000bad', 10000000000] as $minimum) {
         $request = Request::create('/', 'POST', ['request_id' => $this->id, 'target' => 7,
             'csv_format' => SmsRunOptions::FIELD_NAME_CSV_FORMAT, 'tier_selection_policy' => SmsRunOptions::TIER_SELECTION_POLICY,
             'minimum_debt_amount' => $minimum]);
@@ -1121,6 +1132,7 @@ test('debt range capabilities sit inside the tier-subset block in exact order', 
         'tier_selection_policy' => SmsRunOptions::TIER_SELECTION_POLICY,
         'minimum_debt_amount' => true, 'minimum_debt_floor' => 25000, 'minimum_debt_default' => 25000, 'minimum_debt_max' => 9999999000,
         'maximum_debt_amount' => true, 'maximum_debt_step' => 1000, 'maximum_debt_floor' => 25000, 'maximum_debt_max' => 9999999000,
+        'minimum_debt_lowest' => 1000,
         'options_version' => SmsRunOptions::PLANNED_DATE_VERSION, 'send_date' => true, 'default_send_date' => '2026-10-26',
         'min_send_date' => '2026-10-19', 'send_date_timezone' => 'America/Los_Angeles',
         'filename_version' => SmsRunOptions::APPROVAL_FILENAME_VERSION,
