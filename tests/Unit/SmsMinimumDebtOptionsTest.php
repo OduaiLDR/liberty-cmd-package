@@ -19,10 +19,10 @@ it('freezes a chosen minimum without upgrading old frozen options', function ():
     expect(hash('sha256', json_encode($new)))->not->toBe(hash('sha256', json_encode($old)));
 });
 
-it('rejects minimums outside the business floor or supported source debt range', function (int $minimum): void {
+it('rejects minimums under the lowest or over the supported source debt range', function (int $minimum): void {
     expect(fn () => SmsRunOptions::normalize(10, 10, null, SmsRunOptions::TIER_SELECTION_POLICY,
         null, null, null, $minimum))->toThrow(InvalidArgumentException::class);
-})->with([24999, 0, -1, 10000000000]);
+})->with([999, 0, -1, 10000000000]);
 
 it('rejects a debt minimum without canonical source selection before quantity', function (): void {
     expect(fn () => SmsRunOptions::normalize(10, 10, null, null, null, null, null, 25000))
@@ -34,7 +34,7 @@ it('rejects corrupt stored minimums instead of treating them as absent', functio
     $options['minimum_debt_amount'] = $value;
     expect(fn () => SmsRunOptions::fromStored(json_encode($options, JSON_THROW_ON_ERROR), 10))
         ->toThrow(InvalidArgumentException::class);
-})->with([null, '25000', 25000.5, false, 24999]);
+})->with([null, '25000', 25000.5, false, 999]);
 
 it('freezes an optional maximum after the minimum without upgrading minimum-only options', function (): void {
     $minimumOnly = SmsRunOptions::normalize(3000000, 1000000, null, SmsRunOptions::WINDOWED_TIER_SELECTION_POLICY,
