@@ -64,8 +64,8 @@ class SmsRunController extends Controller
             'target' => ['required', 'integer', 'min:1', 'max:'.SmsRunService::MAX_TARGET],
             'csv_format' => ['required_with:rows_per_file,tiers,tier_selection_policy,options_version,send_date,filename_version,minimum_debt_amount,maximum_debt_amount', 'sometimes', 'string', 'in:'.implode(',', SmsRunOptions::CSV_FORMATS)],
             // No 'sometimes' here: an absent minimum must still fail beside a maximum.
-            'minimum_debt_amount' => ['required_with:maximum_debt_amount', 'integer', 'min:'.SmsDebtPolicy::FLOOR, 'max:'.SmsDebtPolicy::MAX],
-            'maximum_debt_amount' => ['sometimes', 'integer', 'multiple_of:'.SmsDebtPolicy::MAXIMUM_STEP, 'min:'.SmsDebtPolicy::FLOOR, 'max:'.SmsDebtPolicy::MAX, 'gte:minimum_debt_amount'],
+            'minimum_debt_amount' => ['required_with:maximum_debt_amount', 'integer', 'min:'.SmsDebtPolicy::LOWEST, 'max:'.SmsDebtPolicy::MAX],
+            'maximum_debt_amount' => ['sometimes', 'integer', 'multiple_of:'.SmsDebtPolicy::MAXIMUM_STEP, 'min:'.SmsDebtPolicy::LOWEST, 'max:'.SmsDebtPolicy::MAX, 'gte:minimum_debt_amount'],
             'options_version' => ['sometimes', 'string', 'in:'.SmsRunOptions::PLANNED_DATE_VERSION],
             'filename_version' => ['sometimes', 'string', 'in:'.SmsRunOptions::DROP_RANGE_FILENAME_VERSION.','.SmsRunOptions::APPROVAL_FILENAME_VERSION],
             'send_date' => ['sometimes', 'string', 'date_format:Y-m-d'],

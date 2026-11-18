@@ -13,15 +13,21 @@ final class SmsDebtPolicy
 {
     public const FLOOR = 25000;
 
+    /**
+     * Lowest minimum a new run may choose (Nov 18, 2026: 20k+ was asked for once the 26k+ never-texted people ran out).
+     * FLOOR stays what a run with no chosen minimum means, and what the capability keys of the released page carry.
+     */
+    public const LOWEST = 1000;
+
     public const MAX = 9999999000;
 
     public const VERSION = 'source-debt-minimum-v1';
 
     public const MAXIMUM_STEP = 1000;
 
-    public const MAXIMUM_MESSAGE = 'The SMS maximum debt must be whole thousands from $25,000 to $9,999,999,000 and not below the minimum.';
+    public const MAXIMUM_MESSAGE = 'The SMS maximum debt must be whole thousands from $1,000 to $9,999,999,000 and not below the minimum.';
 
-    /** A frozen minimum (never below FLOOR), else FLOOR. By-tier runs use lowerBound(). */
+    /** A frozen minimum (never below LOWEST), else FLOOR. By-tier runs use lowerBound(). */
     public static function minimum(?array $options): int
     {
         if (! array_key_exists('minimum_debt_amount', $options ?? [])) {
@@ -36,8 +42,8 @@ final class SmsDebtPolicy
 
     public static function validate(int $minimum): int
     {
-        if ($minimum < self::FLOOR || $minimum > self::MAX) {
-            throw new InvalidArgumentException('The SMS debt minimum must be from 25,000 to 9,999,999,000 USD.');
+        if ($minimum < self::LOWEST || $minimum > self::MAX) {
+            throw new InvalidArgumentException('The SMS debt minimum must be from 1,000 to 9,999,999,000 USD.');
         }
 
         return $minimum;
@@ -59,7 +65,7 @@ final class SmsDebtPolicy
     /** Whole thousands keep the frozen CEILING-to-thousand amount exact: raw <= M iff rounded <= M. */
     public static function validateMaximum(int $maximum, int $minimum): int
     {
-        if ($maximum % self::MAXIMUM_STEP !== 0 || $maximum < self::FLOOR || $maximum > self::MAX || $maximum < $minimum) {
+        if ($maximum % self::MAXIMUM_STEP !== 0 || $maximum < self::LOWEST || $maximum > self::MAX || $maximum < $minimum) {
             throw new InvalidArgumentException(self::MAXIMUM_MESSAGE);
         }
 

@@ -1411,7 +1411,9 @@ class SmsRunService
             $capabilities += ['minimum_debt_amount' => true, 'minimum_debt_floor' => SmsDebtPolicy::FLOOR,
                 'minimum_debt_default' => SmsDebtPolicy::FLOOR, 'minimum_debt_max' => SmsDebtPolicy::MAX,
                 'maximum_debt_amount' => true, 'maximum_debt_step' => SmsDebtPolicy::MAXIMUM_STEP,
-                'maximum_debt_floor' => SmsDebtPolicy::FLOOR, 'maximum_debt_max' => SmsDebtPolicy::MAX];
+                'maximum_debt_floor' => SmsDebtPolicy::FLOOR, 'maximum_debt_max' => SmsDebtPolicy::MAX,
+                // The released page checks the floor values above exactly. A page that reads this key may go lower.
+                'minimum_debt_lowest' => SmsDebtPolicy::LOWEST];
         }
         $capabilities += ['options_version' => SmsRunOptions::PLANNED_DATE_VERSION, 'send_date' => true,
             'default_send_date' => SmsDeliveryPolicy::followingMonday()->toDateString(),
