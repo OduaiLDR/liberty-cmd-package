@@ -236,11 +236,12 @@ final class CustomerServiceCalculationSnapshot
                             if ($workbook === null) self::invalid();
                         }
                         $component = self::bundleComponent($artifact, $entry, $period, $calculation['agentKey'], $workbook, $regularPricing);
+                        $componentBytes = strlen(json_encode($component, JSON_THROW_ON_ERROR));
                     } catch (\Throwable) {
                         $results[$selectionIndex] = $failure;
                         continue;
                     }
-                    $bytes += strlen(json_encode($component, JSON_THROW_ON_ERROR));
+                    $bytes += $componentBytes;
                     if ($bytes > self::MAX_BATCH_BYTES) throw new \LengthException('Customer Service calculation results exceed the batch limit.');
                     $results[$selectionIndex]['calculation']['components'][$componentIndex] = $component;
                 }
