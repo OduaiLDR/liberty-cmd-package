@@ -261,6 +261,25 @@ final class CustomerServiceCalculationSnapshotTest extends TestCase
         }
     }
 
+    public function test_batch_isolates_unencodable_workbook_text_to_its_employee(): void
+    {
+        $selections = [
+            ['reportKind' => 'retention', 'agentKey' => 'jane doe', 'sourceScope' => 'ldr'],
+            ['reportKind' => 'retention', 'agentKey' => 'other secret agent', 'sourceScope' => 'ldr'],
+        ];
+        $peer = $this->read(agent: 'other secret agent', scope: 'ldr');
+        $readerType = IOFactory::createReader('Xlsx')::class;
+        IOFactory::registerReader('Xlsx', MalformedTextCalculationWorkbookReader::class);
+        try {
+            $results = CustomerServiceCalculationSnapshot::forAgents($this->artifacts, self::PERIOD, $selections);
+            $this->assertSame(['ok' => false,
+                'error' => 'Frozen Customer Service calculation evidence is invalid or incomplete for the selected employee.'], $results[0]);
+            $this->assertSame(['ok' => true, 'calculation' => $peer], $results[1]);
+        } finally {
+            IOFactory::registerReader('Xlsx', $readerType);
+        }
+    }
+
     public function test_out_of_range_pricing_proof_does_not_expand_the_shared_sheet_or_affect_a_peer(): void
     {
         $this->artifacts['retention_ldr']['context']['regularPricing']['rows'][1]['detailRow'] = 10_001;
@@ -529,6 +548,20 @@ final class CountingCalculationWorkbookReader extends XlsxReader
         if (self::$lastWorkbook?->get()?->getSheetCount() > 0) throw new \RuntimeException('A previous workbook is still loaded.');
         $book = parent::load($filename, $flags);
         self::$lastWorkbook = \WeakReference::create($book);
+        return $book;
+    }
+}
+
+final class MalformedTextCalculationWorkbookReader extends XlsxReader
+{
+    public function load(string $filename, int $flags = 0): Spreadsheet
+    {
+        $book = parent::load($filename, $flags);
+        if (basename($filename) === 'lookback_ldr.xlsx') {
+            // Inject the decoder's malformed result after normal cell setters sanitize text.
+            $cell = $book->getSheet(0)->getCell('A2');
+            (new ReflectionProperty($cell, 'value'))->setValue($cell, "client-\xff");
+        }
         return $book;
     }
 }
