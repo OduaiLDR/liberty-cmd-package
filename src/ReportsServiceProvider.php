@@ -55,6 +55,7 @@ use Cmd\Reports\Console\Commands\GenerateRetentionManagerCommission\GenerateRete
 use Cmd\Reports\Console\Commands\GenerateCancelRequestsAgentReport\GenerateCancelRequestsAgentReport;
 use Cmd\Reports\Console\Commands\GenerateRetentionBonusCommission\GenerateRetentionBonusCommission;
 use Cmd\Reports\Console\Commands\GenerateNSFCommissionReport\GenerateNSFCommissionReport;
+use Cmd\Reports\Console\Commands\CompareRetentionLeadershipShadow;
 use Cmd\Reports\Console\Commands\ExportNsfShadow;
 use Cmd\Reports\Console\Commands\ReadNsfTeamLeaderShadow;
 use Cmd\Reports\Console\Commands\ReadNsfWorkbook;
@@ -243,6 +244,7 @@ class ReportsServiceProvider extends ServiceProvider
                 GenerateCancelRequestsAgentReport::class,
                 GenerateRetentionBonusCommission::class,
                 GenerateNSFCommissionReport::class,
+                CompareRetentionLeadershipShadow::class,
                 ExportNsfShadow::class,
                 ReadNsfTeamLeaderShadow::class,
                 ReadNsfWorkbook::class,

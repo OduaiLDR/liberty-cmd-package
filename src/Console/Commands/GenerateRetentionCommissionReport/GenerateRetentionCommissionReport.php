@@ -17,6 +17,7 @@ use Cmd\Reports\Services\RetentionCommissionTierStore;
 use Cmd\Reports\Services\RetentionAgentIdentity;
 use Cmd\Reports\Services\RetentionPricingSnapshot;
 use Cmd\Reports\Services\RetentionCommissionReportBuilder;
+use Cmd\Reports\Services\RetentionStructuredCapture;
 use Cmd\Reports\Services\UnassignedCommissionAgents;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
@@ -46,6 +47,7 @@ class GenerateRetentionCommissionReport extends Command
                             {period? : Period start date YYYY-MM-01; defaults to first day of last month}
                             {--no-email : Build/save snapshot but do not send email}
                             {--no-azure-write : Preview calculation without replacing Azure results, saving a snapshot, or sending email}
+                            {--structured-shadow : Keep private comparison evidence from a query-only both-company run}
                             {--test-recipient= : Send EVERY email (All + agent copies) only to this address}';
 
     protected $description = 'Generate Retention Commission Report (sends to oduai only for testing).';
@@ -101,6 +103,21 @@ class GenerateRetentionCommissionReport extends Command
         $arg     = strtolower((string) $this->argument('source'));
         $sources = ($arg === 'both') ? ['ldr', 'plaw'] : [$arg];
         $failed = false;
+        $this->structuredShadow = null;
+
+        if ($this->input !== null && $this->option('structured-shadow')) {
+            try {
+                if ($arg !== 'both' || !$this->option('no-azure-write') || !$this->option('no-email') || $this->option('test-recipient') !== null
+                    || !PayrollReportArtifactArchive::captureRequested()) {
+                    throw new \InvalidArgumentException('Structured Retention comparison requires both companies, a reserved capture, --no-azure-write, --no-email and no test recipient.');
+                }
+                RetentionStructuredCapture::periodEnd((string) $this->argument('period'));
+            } catch (\InvalidArgumentException $error) {
+                $this->error($error->getMessage());
+                return Command::FAILURE;
+            }
+            $this->structuredShadow = ['runId' => (string) getenv('PAYROLL_COMMISSION_RUN_ID'), 'captureId' => bin2hex(random_bytes(16))];
+        }
 
         foreach ($sources as $src) {
             if (!isset(self::SOURCE_CONFIG[$src])) {
@@ -108,6 +125,9 @@ class GenerateRetentionCommissionReport extends Command
                 return Command::FAILURE;
             }
             if (!$this->runForSource($src)) {
+                if ($this->structuredShadow !== null) {
+                    return Command::FAILURE;
+                }
                 $failed = true;
             }
         }
@@ -119,6 +139,8 @@ class GenerateRetentionCommissionReport extends Command
     private array $lastSummaryRows = [];
     /** Actual choices made by the same pricing pass, keyed by raw worksheet row. */
     private array $lastPricingRows = [];
+    /** One invocation identity shared by both sources, even if a run ID is reused. */
+    private ?array $structuredShadow = null;
 
     protected function runForSource(string $source): bool
     {
@@ -137,7 +159,7 @@ class GenerateRetentionCommissionReport extends Command
         $this->info("[INFO] Period: $startDate → $endDate");
 
         try {
-            $sf  = DBConnector::fromEnvironment($source);
+            $sf  = $this->initSnowflake($source);
             $sql = $this->initSqlServer($source);
         } catch (\Throwable $e) {
             $this->error("[$display] Connector init failed: " . $e->getMessage());
@@ -345,7 +367,12 @@ class GenerateRetentionCommissionReport extends Command
             }
 
             if ($this->option('no-azure-write')) {
-                $this->info("[PREVIEW] [$display] Calculated " . count($this->lastSummaryRows) . ' agent summaries; Azure results and tier history were not changed. No snapshot or email was sent.');
+                if ($this->structuredShadow !== null) {
+                    $this->captureStructuredShadow($source, $startDate, $endDate, $rows, $file, $sql);
+                    $this->info("[PREVIEW] [$display] Saved private comparison evidence. Skipped Azure writes, canonical snapshot publication and email.");
+                } else {
+                    $this->info("[PREVIEW] [$display] Calculated " . count($this->lastSummaryRows) . ' agent summaries; Azure results and tier history were not changed. No snapshot or email was sent.');
+                }
                 $this->cleanupGeneratedWorkbook($file);
                 return true;
             }
@@ -424,6 +451,40 @@ class GenerateRetentionCommissionReport extends Command
             ]);
             return false;
         }
+    }
+
+    private function captureStructuredShadow(string $source, string $period, string $periodEnd, array $rows, array $file, DBConnector $sql): void
+    {
+        $cohort = [];
+        $trancheRows = [];
+        foreach ($rows as $row) {
+            $cancel = $this->workbookCalendarDate($this->col($row, 'CANCEL_REQUEST_DATE'));
+            if ($cancel === null || $cancel < $period || $cancel > $periodEnd) {
+                continue;
+            }
+            $id = $this->col($row, 'ID');
+            $debt = (float) $this->col($row, 'ENROLLED_DEBT', 0);
+            $cohort[] = [
+                'ID' => is_int($id) ? (string) $id : $id,
+                'RETENTION_AGENT' => $this->col($row, 'RETENTION_AGENT'),
+                'IMMEDIATE_RESULTS' => $this->col($row, 'IMMEDIATE_RESULTS'),
+                // XLSX serializes numeric cells as decimal text before the manager reads them.
+                'ENROLLED_DEBT' => is_finite($debt) ? (float) (string) $debt : $debt,
+                'CANCEL_REQUEST_DATE' => $cancel,
+                'RETENTION_PAYMENT_DATE' => $this->workbookCalendarDate($this->col($row, 'RETENTION_PAYMENT_DATE')),
+            ];
+            $trancheRows[] = $row;
+        }
+
+        // The legacy freeze uses the raw CRM date and always reads from LDR SQL.
+        $trancheSql = $sql;
+        if ($source !== 'ldr' && $trancheRows !== []) {
+            $trancheSql = $this->initSqlServer('ldr');
+        }
+        $trancheContext = (new GenerateRetentionManagerCommission)->buildPayrollRetentionContext($trancheRows, $trancheSql);
+        $runId = $this->structuredShadow['runId'];
+        $context = RetentionStructuredCapture::context($source, $period, $runId, $this->structuredShadow['captureId'], $cohort, $trancheContext);
+        RetentionStructuredCapture::archive()->capture('retention_' . $source, $period, $runId, $file, $context);
     }
 
     // ─── Data fetchers ────────────────────────────────────────────────────────
@@ -1239,7 +1300,7 @@ class GenerateRetentionCommissionReport extends Command
      * @param array<int,array{filename:string,path:string}>      $files
      * @param array<int,array{agent:string,amount:float}>         $unassigned Earners missing from the roster.
      */
-    private function sendReport(array $files, string $display, array $unassigned = [], bool $rosterUnavailable = false): void
+    protected function sendReport(array $files, string $display, array $unassigned = [], bool $rosterUnavailable = false): void
     {
         $sql   = $this->initSqlServer('ldr');
         $email = new EmailSenderService();
@@ -1527,20 +1588,36 @@ class GenerateRetentionCommissionReport extends Command
     /** Write full datetime (VBA dumps F_DATETIME / CLEARED_DATE with time). */
     private function setDateTime(\PhpOffice\PhpSpreadsheet\Worksheet\Worksheet $sheet, string $cell, mixed $val): void
     {
+        $serial = $this->workbookDateTime($val);
+        if ($serial !== null) {
+            $sheet->setCellValue($cell, $serial);
+            $sheet->getStyle($cell)->getNumberFormat()->setFormatCode('mm/dd/yyyy hh:mm:ss');
+        }
+    }
+
+    private function workbookCalendarDate(mixed $value): ?string
+    {
+        $serial = $this->workbookDateTime($value);
+        return $serial === null ? null : XlDate::excelToDateTimeObject($serial)->format('Y-m-d');
+    }
+
+    private function workbookDateTime(mixed $val): ?float
+    {
         if ($val === null || $val === '') {
-            return;
+            return null;
         }
         $ts = $val instanceof \DateTimeInterface
             ? $val->getTimestamp()
             : (is_numeric($val) ? (int) $val : strtotime((string) $val));
-        if ($ts === false) {
-            return;
-        }
-        $sheet->setCellValue($cell, XlDate::PHPToExcel($ts));
-        $sheet->getStyle($cell)->getNumberFormat()->setFormatCode('mm/dd/yyyy hh:mm:ss');
+        return $ts === false ? null : XlDate::PHPToExcel($ts);
     }
 
-    private function initSqlServer(string $source): DBConnector
+    protected function initSnowflake(string $source): DBConnector
+    {
+        return DBConnector::fromEnvironment($source);
+    }
+
+    protected function initSqlServer(string $source): DBConnector
     {
         $c = DBConnector::fromEnvironment($source);
         $c->initializeSqlServer();

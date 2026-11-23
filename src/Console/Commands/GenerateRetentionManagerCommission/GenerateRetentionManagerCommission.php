@@ -9,6 +9,7 @@ use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\EmailSenderService;
 use Cmd\Reports\Services\NsfStructuredTeamLeader;
 use Cmd\Reports\Services\RetentionCommissionReportBuilder;
+use Cmd\Reports\Services\RetentionStructuredCapture;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
 use PhpOffice\PhpSpreadsheet\IOFactory;
@@ -97,9 +98,9 @@ class GenerateRetentionManagerCommission extends Command
     }
 
     /** Freeze the existing Rama tranche/cutoff inputs when the source report completes. */
-    public function buildPayrollRetentionContext(array $rows): array
+    public function buildPayrollRetentionContext(array $rows, ?DBConnector $trancheSql = null): array
     {
-        $this->applyTrancheAssignments($rows, true);
+        $this->applyTrancheAssignments($rows, true, $trancheSql);
         $context = [];
         foreach ($rows as $row) {
             $id = trim((string) $this->col($row, 'ID', ''));
@@ -234,10 +235,7 @@ class GenerateRetentionManagerCommission extends Command
                 $rows = array_merge($rows, $sourceRows);
             }
             if (!$nsf) {
-                $rows = $this->dedupeRetentionRowsByContactId($this->filterRetentionRowsForPeriod($rows, $startDate, $endDate));
-                $this->sortRetentionRows($rows);
-                $snapshot = $reportKind === 'retention_manager' ? $this->buildRamaPayrollSnapshot($rows)
-                    : $this->buildNickPayrollSnapshot($rows, $startDate, $endDate);
+                $snapshot = $this->buildRetentionPayrollLeadershipSnapshot($reportKind, $startDate, $endDate, $rows);
             } else {
                 // LDR and PLAW each own a readiness identity. The enclosing
                 // orchestration capture is a third namespace, not either ID.
@@ -264,6 +262,28 @@ class GenerateRetentionManagerCommission extends Command
             }
             return [...$snapshot, 'periodStart' => $startDate, 'periodEnd' => $endDate];
         } finally { $this->output = $previousOutput; }
+    }
+
+    /** Calculate either Retention leadership report from verified archive metadata alone. */
+    public function buildPayrollReviewRetentionStructuredSnapshot(string $reportKind, string $period, string $runId, array $artifacts): array
+    {
+        if (!in_array($reportKind, ['retention_manager', 'retention_team_leader'], true)) {
+            throw new \InvalidArgumentException('A supported Regular Retention leadership report is required.');
+        }
+        $inputs = RetentionStructuredCapture::inputs($period, $runId, $artifacts);
+        $endDate = $inputs['periodEnd'];
+        $snapshot = $this->buildRetentionPayrollLeadershipSnapshot($reportKind, $period, $endDate, $inputs['rows']);
+
+        return [...$snapshot, 'periodStart' => $period, 'periodEnd' => $endDate];
+    }
+
+    private function buildRetentionPayrollLeadershipSnapshot(string $reportKind, string $startDate, string $endDate, array $rows): array
+    {
+        $rows = $this->dedupeRetentionRowsByContactId($this->filterRetentionRowsForPeriod($rows, $startDate, $endDate));
+        $this->sortRetentionRows($rows);
+
+        return $reportKind === 'retention_manager' ? $this->buildRamaPayrollSnapshot($rows)
+            : $this->buildNickPayrollSnapshot($rows, $startDate, $endDate);
     }
 
     /** Calculate leadership from the corresponding trusted v1 query-only NSF export. */
@@ -2275,7 +2295,7 @@ class GenerateRetentionManagerCommission extends Command
         return $count;
     }
 
-    private function applyTrancheAssignments(array &$rows, bool $strict = false): void
+    private function applyTrancheAssignments(array &$rows, bool $strict = false, ?DBConnector $trancheSql = null): void
     {
         if (empty($rows)) {
             return;
@@ -2292,7 +2312,7 @@ class GenerateRetentionManagerCommission extends Command
         $map = [];
 
         try {
-            $sql = $this->initSqlServer('ldr');
+            $sql = $trancheSql ?? $this->initSqlServer('ldr');
             foreach (array_chunk($ids, 1000) as $chunk) {
                 $res = $sql->querySqlServer(
                     "SELECT e.LLG_ID, e.Tranche, ts.Payment_Date

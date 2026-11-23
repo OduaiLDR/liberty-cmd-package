@@ -28,3 +28,42 @@ The exporter verifies the source workbooks when it creates the export. Once
 exported, the calculation can run from the captured rows alone. The command
 accepts exports up to 8 MiB. The JSON result carries employee details and is
 for comparison only.
+
+## Regular Retention leadership comparison
+
+Run the two-company shadow from CMD Runner with the updated package installed.
+Use an approved test data connection, an explicit reporting month, and a fresh
+32-character lowercase hexadecimal run ID. For example, in PowerShell:
+
+```powershell
+$period = '2026-10-01'
+$runId = php -r 'echo bin2hex(random_bytes(16));'
+$previousCapture = $env:PAYROLL_CAPTURE_CUSTOMER_SERVICE_CONTEXT
+$previousRunId = $env:PAYROLL_COMMISSION_RUN_ID
+try {
+    $env:PAYROLL_CAPTURE_CUSTOMER_SERVICE_CONTEXT = '1'
+    $env:PAYROLL_COMMISSION_RUN_ID = $runId
+    php artisan reports:retention-commission both $period --structured-shadow --no-azure-write --no-email
+    if ($LASTEXITCODE -eq 0) {
+        php artisan payroll:compare-retention-leadership-shadow $period $runId
+    }
+} finally {
+    $env:PAYROLL_CAPTURE_CUSTOMER_SERVICE_CONTEXT = $previousCapture
+    $env:PAYROLL_COMMISSION_RUN_ID = $previousRunId
+}
+```
+
+The preview stores both source workbooks and their structured evidence under
+`storage/app/payroll-retention-shadow` for that month and run. This directory
+contains payroll data and belongs in private storage. If capture fails partway,
+use a fresh run ID for the retry. The comparison requires both companies from
+the same invocation and compares the complete Rama and Nick Payroll Review
+results. It prints match flags and calculation timings, with a nonzero exit
+code for missing evidence or any difference. Timings exclude report generation
+and archive loading.
+
+The structured calculation uses the full cancel-request cohort and frozen
+tranche evidence. `buildPayrollReviewRetentionStructuredSnapshot` can replay
+the two saved `artifact.json` records keyed by `retention_ldr` and
+`retention_plaw` after the workbooks are removed. Use metadata from the trusted
+private archive. Historical payroll uses the existing workbook reader.
