@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Cmd\Reports\Services;
 
+use Illuminate\Filesystem\Filesystem;
 use ZipArchive;
 
 /** Private immutable source workbooks; callers select allowlisted report keys, never paths. */
@@ -41,6 +42,55 @@ final class PayrollReportArtifactArchive
     public function captureAmendment(string $key, string $period, string $bundleId, array $file, array $context = []): array
     {
         return $this->captureAt($key, $period, $bundleId, $file, $context, $this->amendmentDirectory($key, $period, $bundleId));
+    }
+
+    /** Publish the first rendered workbook and its metadata together. */
+    public function materializeLeadership(string $key, string $period, string $bundleId, array $context, callable $render): array
+    {
+        if (!in_array($key, self::LEADERSHIP_KEYS, true)) {
+            throw new \InvalidArgumentException('Only leadership workbooks can be rendered on demand.');
+        }
+        $destination = $this->directory($key, $period, $bundleId);
+        $parent = dirname($destination);
+        if (!is_dir($parent) && !@mkdir($parent, 0700, true) && !is_dir($parent)) {
+            throw new \RuntimeException('Leadership workbook archive directory is unavailable.');
+        }
+        $lockPath = $parent . '/.' . $key . '.lock';
+        if (is_link($parent) || is_link($lockPath)) {
+            throw new \RuntimeException('Leadership workbook archive cannot follow a symbolic link.');
+        }
+        $lock = fopen($lockPath, 'c');
+        if ($lock === false) {
+            throw new \RuntimeException('Leadership workbook archive lock is unavailable.');
+        }
+        $staging = null;
+        try {
+            if (!flock($lock, LOCK_EX | LOCK_NB)) {
+                throw new \DomainException('This leadership workbook is already being prepared. Retry the download.');
+            }
+            if (file_exists($destination) || is_link($destination)) {
+                $stored = $this->readAt($key, $period, $bundleId, $destination);
+                if ($stored['context'] !== $context) {
+                    throw new \RuntimeException('Leadership workbook evidence differs from the frozen export.');
+                }
+                return $stored;
+            }
+
+            $staging = $parent . '/.render-' . bin2hex(random_bytes(8));
+            if (!mkdir($staging, 0700)) {
+                throw new \RuntimeException('Leadership workbook staging directory is unavailable.');
+            }
+            $file = $render($staging . '/build');
+            $this->captureAt($key, $period, $bundleId, $file, $context, $staging . '/archive');
+            if (!rename($staging . '/archive', $destination)) {
+                throw new \RuntimeException('Leadership workbook archive could not be published.');
+            }
+            return $this->readAt($key, $period, $bundleId, $destination);
+        } finally {
+            if ($staging !== null) (new Filesystem)->deleteDirectory($staging);
+            flock($lock, LOCK_UN);
+            fclose($lock);
+        }
     }
 
     private function captureAt(string $key, string $period, string $identity, array $file, array $context, string $directory): array

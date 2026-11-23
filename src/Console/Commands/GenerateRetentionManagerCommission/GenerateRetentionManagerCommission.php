@@ -9,6 +9,7 @@ use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\EmailSenderService;
 use Cmd\Reports\Services\NsfStructuredCapture;
 use Cmd\Reports\Services\NsfStructuredTeamLeader;
+use Cmd\Reports\Services\PayrollReportArtifactArchive;
 use Cmd\Reports\Services\RetentionCommissionReportBuilder;
 use Cmd\Reports\Services\RetentionStructuredCapture;
 use Illuminate\Console\Command;
@@ -114,10 +115,34 @@ class GenerateRetentionManagerCommission extends Command
     /** Actual leadership workbooks and matching JSON from archived source bytes only. No email or database lookup. */
     public function buildPayrollReviewWorkbookBundle(string $startDate, string $endDate, array $artifacts, string $outputDirectory, ?array $calculationContext = null, bool $onlyNsf = false): array
     {
+        $keys = $onlyNsf ? ['nsf_team_leader'] : PayrollReportArtifactArchive::LEADERSHIP_KEYS;
+        return $this->buildArchivedLeadership($startDate, $endDate, $artifacts, $keys, $outputDirectory, $calculationContext);
+    }
+
+    /** Freeze the calculations and rules before any leadership workbook is requested. */
+    public function freezePayrollReviewLeadership(string $startDate, string $endDate, array $artifacts): array
+    {
+        return $this->buildArchivedLeadership($startDate, $endDate, $artifacts, PayrollReportArtifactArchive::LEADERSHIP_KEYS, null, null);
+    }
+
+    /** Reproduce one saved calculation and render only its workbook. */
+    public function renderFrozenPayrollReviewLeadershipWorkbook(string $key, string $startDate, string $endDate, array $artifacts, string $outputDirectory, array $calculationContext, array $savedReport): array
+    {
+        if (!in_array($key, PayrollReportArtifactArchive::LEADERSHIP_KEYS, true)) {
+            throw new \InvalidArgumentException('Unknown Customer Service leadership workbook.');
+        }
+        $built = $this->buildArchivedLeadership($startDate, $endDate, $artifacts, [$key], $outputDirectory, $calculationContext, $savedReport);
+        return $built['files'][$key];
+    }
+
+    private function buildArchivedLeadership(string $startDate, string $endDate, array $artifacts, array $keys, ?string $outputDirectory, ?array $calculationContext, ?array $savedReport = null): array
+    {
         $calculationContext = self::validatePayrollCalculationContext($calculationContext ?? self::currentPayrollCalculationContext());
-        $structuredRetention = $onlyNsf ? null : RetentionStructuredCapture::payrollInputs($startDate, $artifacts);
+        $includeNsf = in_array('nsf_team_leader', $keys, true);
+        $includeRetention = $keys !== ['nsf_team_leader'];
+        $structuredRetention = $includeRetention ? RetentionStructuredCapture::payrollInputs($startDate, $artifacts) : null;
         $retentionRows = $structuredRetention['rows'] ?? [];
-        foreach ($onlyNsf || $structuredRetention !== null ? [] : ['ldr' => 'LDR', 'plaw' => 'Progress Law'] as $source => $display) {
+        foreach ($includeRetention && $structuredRetention === null ? ['ldr' => 'LDR', 'plaw' => 'Progress Law'] : [] as $source => $display) {
             $artifact = $artifacts['retention_' . $source] ?? [];
             $context = $artifact['context'] ?? [];
             if (($context['trancheContextReady'] ?? false) !== true || !is_array($context['trancheByClient'] ?? null)) throw new \RuntimeException('Archived retention leadership context is missing. Rerun the correlated source.');
@@ -134,10 +159,10 @@ class GenerateRetentionManagerCommission extends Command
         $retentionRows = $this->dedupeRetentionRowsByContactId($retentionRows);
         $this->sortRetentionRows($retentionRows);
         $nsfRows = $roster = $readinessIds = [];
-        $structuredNsf = $this->archivedNsfLeadershipInputs($startDate, $artifacts, allowUnassigned: true);
+        $structuredNsf = $includeNsf ? $this->archivedNsfLeadershipInputs($startDate, $artifacts, allowUnassigned: true) : null;
         if ($structuredNsf !== null) {
             ['rows' => $nsfRows, 'roster' => $roster, 'readinessIds' => $readinessIds] = $structuredNsf;
-        } else {
+        } elseif ($includeNsf) {
             foreach (['ldr' => 'LDR', 'plaw' => 'Progress Law'] as $source => $display) {
                 $path = $artifacts['nsf_' . $source]['path'] ?? '';
                 $nsfRows = array_merge($nsfRows, $this->loadNsfCommissionRowsFromXlsx($path, $display, $readinessIds, $source));
@@ -153,21 +178,28 @@ class GenerateRetentionManagerCommission extends Command
         $this->payrollFrozenNsfValidity = true;
         $this->payrollCalculationContext = $calculationContext;
         try {
-            if ($onlyNsf) {
-                $snapshot = $this->buildAnthonyPayrollSnapshot($nsfRows);
-                $snapshot['nsfReadinessRunIds'] = $readinessIds;
-                return ['reports' => ['nsf_team_leader' => $snapshot], 'calculationContext' => $calculationContext,
-                    'files' => ['nsf_team_leader' => $this->buildAnthonyWorkbook('NSF Team Leader', $nsfRows)]];
+            $reports = $files = [];
+            foreach ($keys as $key) {
+                $report = match ($key) {
+                    'customer_support_manager' => $this->buildRamaPayrollSnapshot($retentionRows),
+                    'retention_team_leader' => $this->buildNickPayrollSnapshot($retentionRows, $startDate, $endDate),
+                    'nsf_team_leader' => [...$this->buildAnthonyPayrollSnapshot($nsfRows), 'nsfReadinessRunIds' => $readinessIds],
+                };
+                $reports[$report['reportKind']] = $report;
+                if ($savedReport !== null && json_encode($report, JSON_THROW_ON_ERROR) !== json_encode($savedReport, JSON_THROW_ON_ERROR)) {
+                    throw new \RuntimeException('The archived inputs cannot reproduce the frozen leadership report.');
+                }
             }
-            $reports = ['retention_manager' => $this->buildRamaPayrollSnapshot($retentionRows),
-                'retention_team_leader' => $this->buildNickPayrollSnapshot($retentionRows, $startDate, $endDate),
-                'nsf_team_leader' => $this->buildAnthonyPayrollSnapshot($nsfRows)];
-            $reports['nsf_team_leader']['nsfReadinessRunIds'] = $readinessIds;
-            return ['reports' => $reports, 'calculationContext' => $calculationContext, 'files' => [
-                'customer_support_manager' => $this->buildWorkbook('rama', 'Customer Support Manager', $retentionRows, $startDate, $endDate),
-                'retention_team_leader' => $this->buildWorkbook('nick', 'Retention Team Leader', $retentionRows, $startDate, $endDate),
-                'nsf_team_leader' => $this->buildAnthonyWorkbook('NSF Team Leader', $nsfRows),
-            ]];
+            if ($outputDirectory !== null) {
+                foreach ($keys as $key) {
+                    $files[$key] = match ($key) {
+                        'customer_support_manager' => $this->buildWorkbook('rama', 'Customer Support Manager', $retentionRows, $startDate, $endDate),
+                        'retention_team_leader' => $this->buildWorkbook('nick', 'Retention Team Leader', $retentionRows, $startDate, $endDate),
+                        'nsf_team_leader' => $this->buildAnthonyWorkbook('NSF Team Leader', $nsfRows),
+                    };
+                }
+            }
+            return ['reports' => $reports, 'calculationContext' => $calculationContext, 'files' => $files];
         } finally {
             $this->payrollOutputDirectory = $priorOutput;
             $this->anthonyRosterCache = $priorRoster;
