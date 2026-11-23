@@ -27,7 +27,7 @@ final class PayrollReportArtifactArchive
     {
         if (getenv('PAYROLL_CAPTURE_CUSTOMER_SERVICE_CONTEXT') !== '1') return false;
         $runId = getenv('PAYROLL_COMMISSION_RUN_ID');
-        if (!is_string($runId) || !preg_match('/^[a-f0-9]{32}$/', $runId)) {
+        if (!is_string($runId) || !preg_match('/^[a-f0-9]{32}$/D', $runId)) {
             throw new \InvalidArgumentException('Customer Service capture requires a reserved commission run id.');
         }
         return true;
@@ -131,7 +131,7 @@ final class PayrollReportArtifactArchive
         $source = in_array($key, self::SOURCE_KEYS, true);
         $date = \DateTimeImmutable::createFromFormat('!Y-m-d', $period);
         if ((!$source && !in_array($key, self::LEADERSHIP_KEYS, true)) || !$date || $date->format('Y-m-d') !== $period
-            || $date->format('d') !== '01' || !preg_match($source ? '/^[a-f0-9]{32}$/' : '/^[a-f0-9]{64}$/', $identity)) {
+            || $date->format('d') !== '01' || !preg_match($source ? '/^[a-f0-9]{32}$/D' : '/^[a-f0-9]{64}$/D', $identity)) {
             throw new \InvalidArgumentException('Payroll artifact scope requires an approved report, exact reporting month and correlated identity.');
         }
         return rtrim($this->root, '/\\') . '/' . $period . '/' . $identity . '/' . $key;

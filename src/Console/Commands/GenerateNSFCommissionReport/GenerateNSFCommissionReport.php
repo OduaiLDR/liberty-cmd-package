@@ -11,6 +11,7 @@ use Cmd\Reports\Services\CommissionResultsWriter;
 use Cmd\Reports\Services\CommissionReportRunLock;
 use Cmd\Reports\Services\NsfCommissionSource;
 use Cmd\Reports\Services\NsfReportReadiness;
+use Cmd\Reports\Services\NsfStructuredCapture;
 use Cmd\Reports\Services\CommissionRosterProvider;
 use Cmd\Reports\Services\UnassignedCommissionAgents;
 use Illuminate\Console\Command;
@@ -22,6 +23,7 @@ class GenerateNSFCommissionReport extends Command
                             {source=both : ldr | plaw | both}
                             {period? : Period start date YYYY-MM-01; defaults to first day of last month}
                             {--no-email : Build/save snapshot but do not send email}
+                            {--structured-shadow : Save structured evidence alongside a query-only workbook for comparison}
                             {--test-recipient= : Send EVERY email (All + agent copies) only to this address}';
 
     protected $description = 'Generate NSF Commission Report for LDR and/or Progress Law. Runs for the previous calendar month.';
@@ -72,7 +74,12 @@ class GenerateNSFCommissionReport extends Command
 
     public function handle(): int
     {
-        if (getenv('PAYROLL_NSF_QUERY_ONLY') === '1' && (!PayrollReportArtifactArchive::captureRequested() || !$this->option('no-email'))) {
+        $queryOnly = getenv('PAYROLL_NSF_QUERY_ONLY') === '1';
+        if ($this->option('structured-shadow') && !$queryOnly) {
+            $this->error('Structured NSF comparison requires query-only capture.');
+            return Command::FAILURE;
+        }
+        if ($queryOnly && (!PayrollReportArtifactArchive::captureRequested() || !$this->option('no-email'))) {
             $this->error('Query-only NSF requires a reserved capture and no email.');
             return Command::FAILURE;
         }
@@ -84,13 +91,13 @@ class GenerateNSFCommissionReport extends Command
                 $this->error("Unknown source: $src");
                 return Command::FAILURE;
             }
-            if (!$this->runForSource($src)) return Command::FAILURE;
+            if (!$this->runForSource($src, $queryOnly)) return Command::FAILURE;
         }
 
         return Command::SUCCESS;
     }
 
-    private function runForSource(string $source): bool
+    private function runForSource(string $source, bool $queryOnly): bool
     {
         $cfg     = self::SOURCE_CONFIG[$source];
         $display = $cfg['display'];
@@ -117,7 +124,6 @@ class GenerateNSFCommissionReport extends Command
         try {
             // Session ownership survives the writer's COMMIT. All entry points,
             // including scheduled and manual CLI runs, share this source/month lock.
-            $queryOnly = getenv('PAYROLL_NSF_QUERY_ONLY') === '1';
             $runLock = $queryOnly ? null : CommissionReportRunLock::acquire($sql, 'nsf', $source, $startDate);
             $readiness = null;
             $allFile = null;
@@ -196,11 +202,25 @@ class GenerateNSFCommissionReport extends Command
                 );
             }
 
+            $structuredCapture = $this->option('structured-shadow')
+                ? NsfStructuredCapture::fromCalculation(
+                    (string) getenv('PAYROLL_COMMISSION_RUN_ID'),
+                    $readiness,
+                    $dataRows,
+                    $pricedRows,
+                    $unassigned,
+                    $isOnRoster,
+                    $rosterAgents !== null,
+                )
+                : null;
+
             // Build before changing payable amounts: failed workbook generation must not
             // leave Azure updated while the manager still has the previous report.
             $formatter = new Formatter();
             if ($queryOnly) {
-                $outputDirectory = storage_path('app/payroll-nsf-query-tmp/' . getenv('PAYROLL_COMMISSION_RUN_ID') . '/' . $source);
+                // Each comparison attempt owns its workbook until the archive verifies it with its data.
+                $directory = $structuredCapture === null ? $source : $source . '-' . $readiness['runId'];
+                $outputDirectory = storage_path('app/payroll-nsf-query-tmp/' . getenv('PAYROLL_COMMISSION_RUN_ID') . '/' . $directory);
                 if (!is_dir($outputDirectory) && !@mkdir($outputDirectory, 0700, true) && !is_dir($outputDirectory)) throw new \RuntimeException('Cannot create query-only workbook directory.');
             }
             $allFile = $formatter->buildWorkbook(
@@ -227,6 +247,9 @@ class GenerateNSFCommissionReport extends Command
             $context = PayrollReportArtifactArchive::captureRequested()
                 ? ['commissionResults' => PayrollCommissionResultSnapshot::component('nsf', $source, $startDate, 'commission', $payloads['sourceResults'],
                     PayrollCommissionResultSnapshot::NSF_ALL_PRICED_AGENTS)] + ($queryOnly ? ['queryOnly' => true] : []) : [];
+            if ($structuredCapture !== null) {
+                $context['nsfStructuredCapture'] = $structuredCapture;
+            }
             PayrollReportArtifactArchive::captureFromEnvironment('nsf', $source, $startDate, $allFile, $context);
             if (!$queryOnly) {
                 NsfReportReadiness::complete($sql, $readiness);

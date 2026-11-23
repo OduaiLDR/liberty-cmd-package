@@ -57,9 +57,15 @@ class PayrollReportArtifactArchiveTest extends TestCase
         putenv('PAYROLL_CAPTURE_CUSTOMER_SERVICE_CONTEXT=1');
         putenv('PAYROLL_COMMISSION_RUN_ID=' . str_repeat('a', 32));
         $this->assertTrue(PayrollReportArtifactArchive::captureRequested());
-        putenv('PAYROLL_COMMISSION_RUN_ID=unreserved');
-        $this->expectException(\InvalidArgumentException::class);
-        PayrollReportArtifactArchive::captureRequested();
+        foreach (['unreserved', str_repeat('a', 32) . "\n"] as $identity) {
+            putenv('PAYROLL_COMMISSION_RUN_ID=' . $identity);
+            try {
+                PayrollReportArtifactArchive::captureRequested();
+                $this->fail('The capture accepted an invalid run identity.');
+            } catch (\InvalidArgumentException $error) {
+                $this->assertStringContainsString('reserved commission run id', $error->getMessage());
+            }
+        }
     }
     public function test_explicit_customer_service_capture_preserves_actual_workbook_and_context(): void
     {
@@ -130,7 +136,12 @@ class PayrollReportArtifactArchiveTest extends TestCase
     public function test_scope_paths_and_invalid_non_workbook_bytes_are_rejected(): void
     {
         $archive = new PayrollReportArtifactArchive($this->directory . '/archive');
-        foreach ([['../escape', '2098-09-01', str_repeat('a', 32)], ['nsf_ldr', '2098-09-31', str_repeat('a', 32)], ['nsf_ldr', '2098-09-01', '../escape']] as $scope) {
+        foreach ([
+            ['../escape', '2098-09-01', str_repeat('a', 32)],
+            ['nsf_ldr', '2098-09-31', str_repeat('a', 32)],
+            ['nsf_ldr', '2098-09-01', '../escape'],
+            ['nsf_ldr', '2098-09-01', str_repeat('a', 32) . "\n"],
+        ] as $scope) {
             try { $archive->read(...$scope); $this->fail('Caller supplied paths must be rejected.'); }
             catch (\InvalidArgumentException) { $this->addToAssertionCount(1); }
         }
