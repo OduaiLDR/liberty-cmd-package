@@ -84,6 +84,12 @@ class GenerateNSFCommissionReport extends Command
             return Command::FAILURE;
         }
         $arg     = strtolower((string) $this->argument('source'));
+        $captureStructured = $this->option('structured-shadow') || getenv('PAYROLL_NSF_STRUCTURED_CAPTURE') === '1';
+        if ($captureStructured && !$this->option('structured-shadow')
+            && ($arg !== 'both' || !$this->option('no-email') || !PayrollReportArtifactArchive::captureRequested())) {
+            $this->error('Payroll NSF structured capture requires a reserved two-company run and no email.');
+            return Command::FAILURE;
+        }
         $sources = ($arg === 'both') ? ['ldr', 'plaw'] : [$arg];
 
         foreach ($sources as $src) {
@@ -91,13 +97,13 @@ class GenerateNSFCommissionReport extends Command
                 $this->error("Unknown source: $src");
                 return Command::FAILURE;
             }
-            if (!$this->runForSource($src, $queryOnly)) return Command::FAILURE;
+            if (!$this->runForSource($src, $queryOnly, $captureStructured)) return Command::FAILURE;
         }
 
         return Command::SUCCESS;
     }
 
-    private function runForSource(string $source, bool $queryOnly): bool
+    private function runForSource(string $source, bool $queryOnly, bool $captureStructured): bool
     {
         $cfg     = self::SOURCE_CONFIG[$source];
         $display = $cfg['display'];
@@ -202,7 +208,7 @@ class GenerateNSFCommissionReport extends Command
                 );
             }
 
-            $structuredCapture = $this->option('structured-shadow')
+            $structuredCapture = $captureStructured
                 ? NsfStructuredCapture::fromCalculation(
                     (string) getenv('PAYROLL_COMMISSION_RUN_ID'),
                     $readiness,

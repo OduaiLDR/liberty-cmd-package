@@ -9,6 +9,7 @@ use Cmd\Reports\Console\Commands\GenerateRetentionManagerCommission\GenerateRete
 use Cmd\Reports\Console\Commands\ReadNsfTeamLeaderShadow;
 use Cmd\Reports\Services\CustomerServiceCalculationSnapshot;
 use Cmd\Reports\Services\DBConnector;
+use Cmd\Reports\Services\NsfStructuredCapture;
 use Cmd\Reports\Services\PayrollReportArtifactArchive;
 use Cmd\Reports\Tests\Support\RecordingSqlServerConnector;
 use Illuminate\Console\Application as Artisan;
@@ -57,7 +58,8 @@ final class NsfQueryOnlyCaptureTest extends TestCase
         };
         Container::setInstance($this->app);
         Log::swap(new NullLogger);
-        foreach (['PAYROLL_NSF_QUERY_ONLY' => '1', 'PAYROLL_CAPTURE_CUSTOMER_SERVICE_CONTEXT' => '1', 'PAYROLL_COMMISSION_RUN_ID' => self::RUN_ID] as $key => $value) {
+        foreach (['PAYROLL_NSF_QUERY_ONLY' => '1', 'PAYROLL_NSF_STRUCTURED_CAPTURE' => '0',
+            'PAYROLL_CAPTURE_CUSTOMER_SERVICE_CONTEXT' => '1', 'PAYROLL_COMMISSION_RUN_ID' => self::RUN_ID] as $key => $value) {
             $this->previousEnvironment[$key] = getenv($key);
             putenv($key . '=' . $value);
         }
@@ -434,6 +436,67 @@ final class NsfQueryOnlyCaptureTest extends TestCase
         }
     }
 
+    public function test_normal_runner_capture_freezes_both_sources_without_changing_the_writer(): void
+    {
+        putenv('PAYROLL_NSF_QUERY_ONLY=0');
+        putenv('PAYROLL_NSF_STRUCTURED_CAPTURE=1');
+        $statement = $this->createMock(\PDOStatement::class);
+        $statement->method('execute')->willReturn(true);
+        $statement->method('columnCount')->willReturn(1);
+        $statement->method('fetchColumn')->willReturn(0);
+        $connection = $this->createMock(\PDO::class);
+        $connection->method('prepare')->willReturn($statement);
+        $connection->expects($this->exactly(2))->method('beginTransaction')->willReturn(true);
+        $connection->expects($this->exactly(2))->method('commit')->willReturn(true);
+        $sql = new class($connection) extends DBConnector {
+            public array $readiness = [];
+            public array $sourceResets = [];
+
+            public function __construct(private \PDO $connection) {}
+            public function getSqlServerConnection(): \PDO { return $this->connection; }
+
+            public function querySqlServer(string $sql, array $params = []): array
+            {
+                $data = [];
+                if (str_starts_with($sql, 'MERGE dbo.TblNsfCommissionReadiness')) {
+                    $this->readiness[$params[0]] = ['Run_Id' => $params[2], 'Status' => 'running', 'Completed_At' => null];
+                } elseif (str_starts_with($sql, 'UPDATE dbo.TblNsfCommissionReadiness')) {
+                    $this->readiness[$params[0]]['Status'] = 'completed';
+                    $this->readiness[$params[0]]['Completed_At'] = 'fixture-completed';
+                } elseif (str_starts_with($sql, 'SELECT Source,Period_Start,Status')) {
+                    $data = [$this->readiness[$params[0]]];
+                } elseif (str_starts_with($sql, 'UPDATE dbo.TblCommissionReviewResults')) {
+                    $this->sourceResets[] = $params;
+                } elseif (str_starts_with($sql, 'SELECT Agent FROM')) {
+                    $data = [['Agent' => self::AGENT]];
+                }
+                return ['success' => true, 'data' => $data, 'row_count' => 1];
+            }
+
+            private const AGENT = 'A Synthetic Agent';
+        };
+        [$code, $output] = $this->runNsf($sql, [
+            'ldr' => [$this->sourceRow(101, self::ROSTERED, '2098-02-05')],
+            'plaw' => [$this->sourceRow(201, self::ROSTERED, '2098-02-05')],
+        ], ['--no-email' => true]);
+        self::assertSame(0, $code, $output);
+        self::assertSame([['nsf', 'ldr', self::PERIOD], ['nsf', 'plaw', self::PERIOD]], $sql->sourceResets);
+
+        $artifacts = $this->archivedArtifacts();
+        $envelope = json_decode(NsfStructuredCapture::export($artifacts, self::PERIOD, self::RUN_ID, false), true, flags: JSON_THROW_ON_ERROR);
+        foreach ($artifacts as $key => $artifact) {
+            $source = substr($key, 4);
+            self::assertArrayNotHasKey('queryOnly', $artifact['context']);
+            self::assertSame('completed', $sql->readiness[$source]['Status']);
+            self::assertSame($artifact['sha256'], $envelope['sources'][$source]['workbookSha256']);
+            self::assertSame($artifact['context']['nsfStructuredCapture'],
+                json_decode($envelope['sources'][$source]['captureJson'], true, flags: JSON_THROW_ON_ERROR));
+        }
+        [$exit, $stdout] = $this->runExport();
+        self::assertSame(1, $exit);
+        self::assertSame('', $stdout);
+    }
+
     #[DataProvider('invalidShadowModes')]
     public function test_structured_shadow_rejects_incomplete_opt_in_before_connectors(string $environment, array $options): void
     {
@@ -472,7 +535,7 @@ final class NsfQueryOnlyCaptureTest extends TestCase
         }
     }
 
-    private function runNsf(RecordingSqlServerConnector $sql, array $sourceRows, array $options): array
+    private function runNsf(DBConnector $sql, array $sourceRows, array $options): array
     {
         $command = new class($sql, $sourceRows) extends GenerateNSFCommissionReport {
             public array $connectorCalls = [];
