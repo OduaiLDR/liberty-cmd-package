@@ -181,6 +181,29 @@ final class LookbackQueryOnlyCaptureTest extends TestCase
         self::assertSame($workbookBundle, CustomerServiceCalculationSnapshot::forAgent(
             $bundleSources, self::PERIOD, 'retention', 'named retention', 'both',
         ));
+        $bundleSources['nsf_ldr']['context']['commissionResults'] = PayrollCommissionResultSnapshot::component(
+            'nsf', 'ldr', self::PERIOD, 'commission', [['agent' => 'NSF Fixture Agent', 'amount' => 0]],
+            PayrollCommissionResultSnapshot::NSF_ALL_PRICED_AGENTS,
+        );
+        $selections = [
+            ['reportKind' => 'retention', 'agentKey' => 'named retention', 'sourceScope' => 'both'],
+            ['reportKind' => 'nsf', 'agentKey' => 'nsf fixture agent', 'sourceScope' => 'ldr'],
+            ['reportKind' => 'retention', 'agentKey' => 'zero retention', 'sourceScope' => 'both'],
+        ];
+        $expected = array_map(static fn (array $selection): array => ['ok' => true, 'calculation' => CustomerServiceCalculationSnapshot::forAgent(
+            $bundleSources, self::PERIOD, ...$selection,
+        )], $selections);
+        self::assertSame($workbookBundle, $expected[0]['calculation']);
+        self::assertSame($expected, CustomerServiceCalculationSnapshot::forAgents($bundleSources, self::PERIOD, $selections));
+        $bundleSources['lookback_plaw']['context']['lookbackPricing']['captureId'] = str_repeat('e', 32);
+        $bundleSources['lookback_plaw']['contextSha256'] = hash('sha256', json_encode(
+            $bundleSources['lookback_plaw']['context'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR,
+        ));
+        $mixedBatch = CustomerServiceCalculationSnapshot::forAgents($bundleSources, self::PERIOD, $selections);
+        self::assertFalse($mixedBatch[0]['ok']);
+        self::assertSame($expected[1], $mixedBatch[1]);
+        self::assertFalse($mixedBatch[2]['ok']);
+
         $amended = $artifacts;
         foreach ($amended as &$artifact) $artifact['identity'] = str_repeat('d', 64);
         unset($artifact);

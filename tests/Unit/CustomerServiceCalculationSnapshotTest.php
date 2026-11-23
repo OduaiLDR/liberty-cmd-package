@@ -14,6 +14,7 @@ use Cmd\Reports\Tests\TestCase;
 use Illuminate\Container\Container;
 use Illuminate\Support\Facades\Log;
 use PhpOffice\PhpSpreadsheet\IOFactory;
+use PhpOffice\PhpSpreadsheet\Reader\Xlsx as XlsxReader;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 use Psr\Log\NullLogger;
@@ -210,6 +211,192 @@ final class CustomerServiceCalculationSnapshotTest extends TestCase
         $this->assertStringNotContainsString('999', json_encode(array_column($snapshot['components'], 'lines')));
     }
 
+    public function test_batch_returns_exact_single_employee_calculations_in_requested_order(): void
+    {
+        $selections = [
+            ['reportKind' => 'nsf', 'agentKey' => 'jane doe', 'sourceScope' => 'both'],
+            ['reportKind' => 'retention', 'agentKey' => 'other secret agent', 'sourceScope' => 'ldr'],
+            ['reportKind' => 'retention', 'agentKey' => 'jane doe', 'sourceScope' => 'both'],
+            ['reportKind' => 'nsf', 'agentKey' => 'other secret agent', 'sourceScope' => 'ldr'],
+            ['reportKind' => 'retention', 'agentKey' => 'zero agent', 'sourceScope' => 'plaw'],
+        ];
+        unset($this->artifacts['retention_plaw']['context']['regularPricing']);
+        $expected = array_map(fn (array $selection) => ['ok' => true,
+            'calculation' => $this->read($selection['reportKind'], $selection['agentKey'], $selection['sourceScope'])], $selections);
+        $readerType = IOFactory::createReader('Xlsx')::class;
+        CountingCalculationWorkbookReader::$loads = [];
+        CountingCalculationWorkbookReader::$lastWorkbook = null;
+        IOFactory::registerReader('Xlsx', CountingCalculationWorkbookReader::class);
+        try {
+            $this->assertSame($expected, CustomerServiceCalculationSnapshot::forAgents($this->artifacts, self::PERIOD, $selections));
+            $loads = array_count_values(CountingCalculationWorkbookReader::$loads);
+            ksort($loads);
+            $this->assertSame(['lookback_ldr.xlsx' => 1, 'lookback_plaw.xlsx' => 1, 'nsf_ldr.xlsx' => 1,
+                'nsf_plaw.xlsx' => 1, 'retention_ldr.xlsx' => 1], $loads);
+        } finally {
+            IOFactory::registerReader('Xlsx', $readerType);
+            CountingCalculationWorkbookReader::$loads = [];
+            CountingCalculationWorkbookReader::$lastWorkbook = null;
+        }
+    }
+
+    public function test_batch_isolates_missing_and_malformed_employee_details_from_other_selections(): void
+    {
+        $selections = [
+            ['reportKind' => 'retention', 'agentKey' => 'jane doe', 'sourceScope' => 'ldr'],
+            ['reportKind' => 'retention', 'agentKey' => 'other secret agent', 'sourceScope' => 'ldr'],
+            ['reportKind' => 'nsf', 'agentKey' => 'unknown agent', 'sourceScope' => 'plaw'],
+            ['reportKind' => 'nsf', 'agentKey' => 'jane doe', 'sourceScope' => 'both'],
+        ];
+        $this->mutate('lookback_ldr', static fn ($book) => $book->getSheet(0)->setCellValue('A3', '201 '));
+        $results = CustomerServiceCalculationSnapshot::forAgents($this->artifacts, self::PERIOD, $selections);
+        $this->assertSame([false, true, false, true], array_column($results, 'ok'));
+        foreach ([0, 2] as $index) {
+            $this->assertSame(['ok', 'error'], array_keys($results[$index]));
+            $this->assertStringNotContainsString($selections[$index]['agentKey'], mb_strtolower($results[$index]['error']));
+        }
+        foreach ([1, 3] as $index) {
+            $selection = $selections[$index];
+            $this->assertSame($this->read($selection['reportKind'], $selection['agentKey'], $selection['sourceScope']), $results[$index]['calculation']);
+        }
+    }
+
+    public function test_batch_isolates_unencodable_workbook_text_to_its_employee(): void
+    {
+        $selections = [
+            ['reportKind' => 'retention', 'agentKey' => 'jane doe', 'sourceScope' => 'ldr'],
+            ['reportKind' => 'retention', 'agentKey' => 'other secret agent', 'sourceScope' => 'ldr'],
+        ];
+        $peer = $this->read(agent: 'other secret agent', scope: 'ldr');
+        $readerType = IOFactory::createReader('Xlsx')::class;
+        IOFactory::registerReader('Xlsx', MalformedTextCalculationWorkbookReader::class);
+        try {
+            $results = CustomerServiceCalculationSnapshot::forAgents($this->artifacts, self::PERIOD, $selections);
+            $this->assertSame(['ok' => false,
+                'error' => 'Frozen Customer Service calculation evidence is invalid or incomplete for the selected employee.'], $results[0]);
+            $this->assertSame(['ok' => true, 'calculation' => $peer], $results[1]);
+        } finally {
+            IOFactory::registerReader('Xlsx', $readerType);
+        }
+    }
+
+    public function test_out_of_range_pricing_proof_does_not_expand_the_shared_sheet_or_affect_a_peer(): void
+    {
+        $this->artifacts['retention_ldr']['context']['regularPricing']['rows'][1]['detailRow'] = 10_001;
+        $artifact = $this->artifacts['retention_ldr'];
+        $proof = RetentionPricingSnapshot::validate($artifact['context']['regularPricing'], $artifact['context']['commissionResults']);
+        $book = IOFactory::load($artifact['path']);
+        try {
+            $sheet = $book->getSheetByName('Retention Data');
+            $lastRow = $sheet->getHighestDataRow();
+            $this->assertLessThan(10_001, $lastRow);
+            $this->assertFalse($sheet->cellExists('A10001'));
+            try {
+                (new ReflectionMethod(CustomerServiceCalculationSnapshot::class, 'regular'))->invoke(null, $artifact, self::PERIOD, 'other secret agent', $book, $proof);
+                $this->fail('The pricing proof references a nonexistent worksheet row.');
+            } catch (\RuntimeException) {
+                $this->assertSame($lastRow, $sheet->getHighestDataRow());
+                $this->assertFalse($sheet->cellExists('A10001'));
+            }
+            $this->assertFalse($sheet->cellExists('L3'));
+            $this->assertNull((new ReflectionMethod(CustomerServiceCalculationSnapshot::class, 'value'))->invoke(null, $sheet, 12, 3));
+            $this->assertFalse($sheet->cellExists('L3'));
+        } finally {
+            $book->disconnectWorksheets();
+        }
+
+        $results = CustomerServiceCalculationSnapshot::forAgents($this->artifacts, self::PERIOD, [
+            ['reportKind' => 'retention', 'agentKey' => 'other secret agent', 'sourceScope' => 'ldr'],
+            ['reportKind' => 'retention', 'agentKey' => 'jane doe', 'sourceScope' => 'ldr'],
+        ]);
+        $this->assertSame([false, true], array_column($results, 'ok'));
+        $this->assertSame($this->read(scope: 'ldr'), $results[1]['calculation']);
+    }
+
+    public function test_batch_refuses_corrupt_shared_archive_even_for_an_unselected_workbook(): void
+    {
+        $this->artifacts['nsf_plaw']['sha256'] = str_repeat('0', 64);
+        $this->expectException(\RuntimeException::class);
+        CustomerServiceCalculationSnapshot::forAgents($this->artifacts, self::PERIOD, [
+            ['reportKind' => 'retention', 'agentKey' => 'jane doe', 'sourceScope' => 'ldr'],
+        ]);
+    }
+
+    public function test_batch_refuses_invalid_shared_regular_pricing_proof(): void
+    {
+        $this->artifacts['retention_ldr']['context']['regularPricing']['rows'][0]['amount'] = 999;
+        try {
+            $this->read('nsf', 'jane doe', 'plaw');
+            $this->fail('The single selection ignored malformed shared pricing proof.');
+        } catch (\RuntimeException $error) {
+            $this->assertSame('Frozen Customer Service calculation evidence is invalid or incomplete.', $error->getMessage());
+        }
+        $this->expectException(\RuntimeException::class);
+        CustomerServiceCalculationSnapshot::forAgents($this->artifacts, self::PERIOD, [
+            ['reportKind' => 'retention', 'agentKey' => 'jane doe', 'sourceScope' => 'ldr'],
+            ['reportKind' => 'nsf', 'agentKey' => 'jane doe', 'sourceScope' => 'plaw'],
+        ]);
+    }
+
+    public function test_batch_isolates_a_workbook_load_failure_to_selections_that_need_its_rows(): void
+    {
+        $selections = [
+            ['reportKind' => 'retention', 'agentKey' => 'jane doe', 'sourceScope' => 'ldr'],
+            ['reportKind' => 'nsf', 'agentKey' => 'jane doe', 'sourceScope' => 'ldr'],
+            ['reportKind' => 'retention', 'agentKey' => 'zero agent', 'sourceScope' => 'ldr'],
+            ['reportKind' => 'retention', 'agentKey' => 'other secret agent', 'sourceScope' => 'ldr'],
+        ];
+        $nsf = $this->read('nsf', 'jane doe', 'ldr');
+        $zero = $this->read('retention', 'zero agent', 'ldr');
+        $readerType = IOFactory::createReader('Xlsx')::class;
+        CountingCalculationWorkbookReader::$failedFile = 'lookback_ldr.xlsx';
+        CountingCalculationWorkbookReader::$loads = [];
+        CountingCalculationWorkbookReader::$lastWorkbook = null;
+        IOFactory::registerReader('Xlsx', CountingCalculationWorkbookReader::class);
+        try {
+            $results = CustomerServiceCalculationSnapshot::forAgents($this->artifacts, self::PERIOD, $selections);
+            $this->assertSame([false, true, true, false], array_column($results, 'ok'));
+            $this->assertSame($nsf, $results[1]['calculation']);
+            $this->assertSame($zero, $results[2]['calculation']);
+            $this->assertSame(1, array_count_values(CountingCalculationWorkbookReader::$loads)['lookback_ldr.xlsx']);
+        } finally {
+            IOFactory::registerReader('Xlsx', $readerType);
+            CountingCalculationWorkbookReader::$failedFile = null;
+            CountingCalculationWorkbookReader::$loads = [];
+            CountingCalculationWorkbookReader::$lastWorkbook = null;
+        }
+    }
+
+    public function test_batch_refuses_unbounded_or_noncanonical_selections(): void
+    {
+        $selection = ['reportKind' => 'nsf', 'agentKey' => 'jane doe', 'sourceScope' => 'both'];
+        $this->assertCount(8, CustomerServiceCalculationSnapshot::forAgents($this->artifacts, self::PERIOD, array_fill(0, 8, $selection)));
+        foreach ([[], array_fill(0, 9, $selection), [2 => $selection], [array_replace($selection, ['agentKey' => 'Jane Doe'])], [$selection + ['extra' => true]]] as $invalid) {
+            try {
+                CustomerServiceCalculationSnapshot::forAgents($this->artifacts, self::PERIOD, $invalid);
+                $this->fail('Invalid batch selections were accepted.');
+            } catch (\InvalidArgumentException) {
+                $this->addToAssertionCount(1);
+            }
+        }
+    }
+
+    public function test_batch_rejects_an_oversized_combined_response_without_changing_single_read(): void
+    {
+        $this->mutate('lookback_ldr', static function ($book): void {
+            $sheet = $book->getSheet(0);
+            for ($row = 2; $row < 67; $row++) {
+                $sheet->setCellValue('A' . $row, $row . '-' . str_repeat('x', 30000));
+                $sheet->setCellValue('C' . $row, 'Jane Doe');
+                $sheet->setCellValue('G' . $row, $row === 2 ? 7.25 : 0);
+            }
+        });
+        $this->assertCount(65, $this->read(scope: 'ldr')['components'][1]['lines']);
+        $selection = ['reportKind' => 'retention', 'agentKey' => 'jane doe', 'sourceScope' => 'ldr'];
+        $this->expectException(\LengthException::class);
+        CustomerServiceCalculationSnapshot::forAgents($this->artifacts, self::PERIOD, array_fill(0, 8, $selection));
+    }
+
     public function test_nsf_uses_stored_selected_rate_and_frozen_valid_flags_without_recomputing_tiers(): void
     {
         $snapshot = $this->read('nsf', scope: 'ldr');
@@ -344,5 +531,37 @@ final class CustomerServiceCalculationSnapshotTest extends TestCase
         $later = $build(3);
         $this->assertSame(30.03, $later['context']['regularPricing']['rows'][0]['amount']);
         $this->assertSame($original, $this->read(scope: 'ldr'));
+    }
+}
+
+final class CountingCalculationWorkbookReader extends XlsxReader
+{
+    public static array $loads = [];
+    public static ?string $failedFile = null;
+    public static ?\WeakReference $lastWorkbook = null;
+
+    public function load(string $filename, int $flags = 0): Spreadsheet
+    {
+        $name = basename($filename);
+        self::$loads[] = $name;
+        if ($name === self::$failedFile) throw new \RuntimeException('Synthetic workbook load failure.');
+        if (self::$lastWorkbook?->get()?->getSheetCount() > 0) throw new \RuntimeException('A previous workbook is still loaded.');
+        $book = parent::load($filename, $flags);
+        self::$lastWorkbook = \WeakReference::create($book);
+        return $book;
+    }
+}
+
+final class MalformedTextCalculationWorkbookReader extends XlsxReader
+{
+    public function load(string $filename, int $flags = 0): Spreadsheet
+    {
+        $book = parent::load($filename, $flags);
+        if (basename($filename) === 'lookback_ldr.xlsx') {
+            // Inject the decoder's malformed result after normal cell setters sanitize text.
+            $cell = $book->getSheet(0)->getCell('A2');
+            (new ReflectionProperty($cell, 'value'))->setValue($cell, "client-\xff");
+        }
+        return $book;
     }
 }

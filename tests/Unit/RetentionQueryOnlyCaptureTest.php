@@ -7,7 +7,9 @@ namespace Cmd\Reports\Tests\Unit;
 use Cmd\Reports\Console\Commands\CompareRetentionLeadershipShadow;
 use Cmd\Reports\Console\Commands\GenerateRetentionCommissionReport\GenerateRetentionCommissionReport;
 use Cmd\Reports\Console\Commands\GenerateRetentionManagerCommission\GenerateRetentionManagerCommission;
+use Cmd\Reports\Services\CustomerServiceCalculationSnapshot;
 use Cmd\Reports\Services\DBConnector;
+use Cmd\Reports\Services\PayrollCommissionResultSnapshot;
 use Cmd\Reports\Services\PayrollReportArtifactArchive;
 use Illuminate\Console\Command;
 use Illuminate\Container\Container;
@@ -242,7 +244,7 @@ final class RetentionQueryOnlyCaptureTest extends TestCase
             ));
         }
         unset($artifact);
-        $read = static fn (array $sources): array => \Cmd\Reports\Services\CustomerServiceCalculationSnapshot::forArchivedAgent(
+        $read = static fn (array $sources): array => CustomerServiceCalculationSnapshot::forArchivedAgent(
             $sources, self::PERIOD, 'retention_regular', 'outside month paid', 'ldr',
         )['components'][0];
         $legacyPrice = $read($legacy);
@@ -278,6 +280,29 @@ final class RetentionQueryOnlyCaptureTest extends TestCase
             $book->disconnectWorksheets();
             $nsf[$key] = ['path' => $path];
         }
+        $bundleSources = $artifacts;
+        foreach (['ldr', 'plaw'] as $source) {
+            foreach (['lookback' => 'bonusCommission', 'nsf' => 'commission'] as $family => $component) {
+                $key = $family . '_' . $source;
+                $kind = $family === 'nsf' ? 'nsf' : 'retention';
+                $bundleSources[$key] = ['key' => $key, 'context' => ['commissionResults' =>
+                    PayrollCommissionResultSnapshot::component($kind, $source, self::PERIOD, $component, [],
+                        $family === 'nsf' ? PayrollCommissionResultSnapshot::NSF_ALL_PRICED_AGENTS : null),
+                ]] + $artifacts['retention_' . $source];
+            }
+        }
+        $selections = [
+            ['reportKind' => 'retention', 'agentKey' => 'outside month paid', 'sourceScope' => 'ldr'],
+            ['reportKind' => 'retention', 'agentKey' => 'plaw earlier day', 'sourceScope' => 'plaw'],
+        ];
+        $batch = CustomerServiceCalculationSnapshot::forAgents($bundleSources, self::PERIOD, $selections);
+        foreach ($selections as $index => $selection) {
+            self::assertSame(['ok' => true, 'calculation' => CustomerServiceCalculationSnapshot::forAgent(
+                $bundleSources, self::PERIOD, ...$selection,
+            )], $batch[$index]);
+        }
+        self::assertSame($structuredPrice['lines'], $batch[0]['calculation']['components'][0]['lines']);
+
         $legacyBundle = $leader->buildPayrollReviewWorkbookBundle(self::PERIOD, self::END, $legacy + $nsf, $this->root . '/legacy-bundle');
         foreach ($artifacts as &$artifact) {
             @chmod($artifact['path'], 0600);
