@@ -120,9 +120,10 @@ class GenerateRetentionManagerCommission extends Command
     }
 
     /** Freeze the calculations and rules before any leadership workbook is requested. */
-    public function freezePayrollReviewLeadership(string $startDate, string $endDate, array $artifacts): array
+    public function freezePayrollReviewLeadership(string $startDate, string $endDate, array $artifacts, ?array $calculationContext = null, bool $onlyNsf = false): array
     {
-        return $this->buildArchivedLeadership($startDate, $endDate, $artifacts, PayrollReportArtifactArchive::LEADERSHIP_KEYS, null, null);
+        $keys = $onlyNsf ? ['nsf_team_leader'] : PayrollReportArtifactArchive::LEADERSHIP_KEYS;
+        return $this->buildArchivedLeadership($startDate, $endDate, $artifacts, $keys, null, $calculationContext);
     }
 
     /** Reproduce one saved calculation and render only its workbook. */
