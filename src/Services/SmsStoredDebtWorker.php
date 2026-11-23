@@ -23,7 +23,7 @@ final class SmsStoredDebtWorker
     /** Which people, in the same terms as the two priority indexes. */
     public const SCOPES = ['never' => 'Last_SMS_Date IS NULL', 'previous' => 'Last_SMS_Date IS NOT NULL'];
 
-    private const ELIGIBLE = 'Contacted=0 AND Opt_Out=0 AND Invalid_Phone=0 AND Phone IS NOT NULL';
+    private const ELIGIBLE = SmsStoredDebt::ELIGIBLE_SQL;
 
     private const MAX_FAILURES = 5;
 
@@ -129,6 +129,8 @@ final class SmsStoredDebtWorker
         }
         $this->db->unprepared('SET LOCK_TIMEOUT 30000');
         $deadline = $minutes > 0 ? ($this->now)() + $minutes * 60 : null;
+        // Read before any work: people added while this pass runs are left for the next one.
+        $newest = (int) ($this->db->selectOne('SELECT MAX(PK) AS n FROM dbo.TblProspects')->n ?? 0);
         $from = (int) $state['tu_watermark'];
         $to = (int) ($this->db->selectOne('SELECT MAX(PK) AS n FROM dbo.TblTUData')->n ?? 0);
         if ($to > $from) {
@@ -148,11 +150,22 @@ final class SmsStoredDebtWorker
         // Same tables as before (checked above), so their newest marks are kept; the back fills below save their own state.
         $state['sources'] = $live;
         $this->save($state);
+        // New people only ever arrive with a higher PK. With nobody new since the last complete pass there is nobody to
+        // walk, so an idle pass reads a few index entries and can run every few minutes (the nightly sweep clears the
+        // mark and walks everyone). That is what lets the fill start right after TU's results are loaded.
+        if (isset($state['prospects_watermark']) && $newest <= (int) $state['prospects_watermark']) return $result;
+        $complete = true;
         foreach (array_keys(self::SCOPES) as $scope) {
-            if (($state['finished'][$scope] ?? false) !== true) continue;
+            if (($state['finished'][$scope] ?? false) !== true) { $complete = false; continue; }
             $fill = $this->backfill($scope, $batch, 0, $deadline === null ? 0 : max(1, (int) ceil(($deadline - ($this->now)()) / 60)));
             $result['written'] += $fill['written'];
             if ($fill['stopped'] !== null) return ['stopped' => $fill['stopped']] + $result;
+        }
+        if ($complete) {
+            // The back fills above saved their own cursors, so read the state again before adding the mark.
+            $state = $this->state();
+            $state['prospects_watermark'] = $newest;
+            $this->save($state);
         }
 
         return $result;
@@ -165,6 +178,8 @@ final class SmsStoredDebtWorker
         foreach (array_keys(self::SCOPES) as $scope) {
             if (($state['finished'][$scope] ?? false) === true) $state['cursor'][$scope] = 0;
         }
+        // The sweep is for people who gained a phone, wherever they sit: it must walk even with nobody new.
+        unset($state['prospects_watermark']);
         $this->save($state);
     }
 

@@ -18,8 +18,11 @@ final class SmsFrozenEligibility
 
     public static function assertPending(ConnectionInterface $db, string $requestId): void
     {
-        self::assertMembers($db, $requestId, 'TblProspectsExport');
-        SmsDebtPolicy::assertPending($db, $requestId);
+        // The debt-on-the-minimum proof rides on the same pass: it needs the same prospect rows the member check reads.
+        $stored = SmsDebtPolicy::storedBoundary($db, $requestId);
+        $unproven = self::assertMembers($db, $requestId, 'TblProspectsExport', $stored);
+        SmsStepLog::mark($requestId, 'check_debt');
+        SmsDebtPolicy::assertPending($db, $requestId, $stored === null ? null : ['unproven' => $unproven] + $stored);
     }
 
     /** New outward handoffs must use complete approved membership; history reads stay independent. */
@@ -87,13 +90,18 @@ OPTION (HASH JOIN)", [$requestId, $requestId, $requestId], false) as $row) {
             : "length(x.Phone)=10 AND x.Phone NOT GLOB '*[^0-9]*'";
     }
 
-    private static function assertMembers(ConnectionInterface $db, string $requestId, string $table): void
+    /**
+     * $stored: SmsDebtPolicy::storedBoundary(), read in the same pass. Returns whether any member on the debt minimum is
+     * not proven by their stored debt (always false without $stored).
+     */
+    private static function assertMembers(ConnectionInterface $db, string $requestId, string $table, ?array $stored = null): bool
     {
         $native = $db->getDriverName() === 'sqlsrv';
         $locking = $native && $db->transactionLevel() > 0;
         if ($locking) {
             // Current prospect rows and frozen rows remain locked through the caller's
             // approval transaction. No broad flag update or membership mutation occurs.
+            SmsStepLog::mark($requestId, 'check_lock');
             $db->select("SELECT p.PK FROM TblProspects p WITH (UPDLOCK,HOLDLOCK)
 JOIN {$table} x WITH (HOLDLOCK) ON x.Prospect_PK=p.PK
 WHERE x.Request_ID=? ORDER BY p.PK", [$requestId], false);
@@ -103,11 +111,9 @@ WHERE x.Request_ID=? ORDER BY p.PK", [$requestId], false);
         $state = SmsStatePolicy::sqlPredicate('p.State', $db->getDriverName());
         $frozenState = SmsStatePolicy::sqlPredicate('x.State', $db->getDriverName());
         $sameState = SmsStatePolicy::normalizedSql('p.State', $db->getDriverName()).' = '.SmsStatePolicy::normalizedSql('x.State', $db->getDriverName());
-        if ($members()->where(function (Builder $q) use ($state, $frozenState, $sameState): void {
+        $stateBad = static function (Builder $q) use ($state, $frozenState, $sameState): void {
             $q->whereNull('p.PK')->orWhereRaw("NOT ({$state})")->orWhereRaw("NOT ({$frozenState})")->orWhereRaw("NOT ({$sameState})");
-        })->exists()) {
-            throw new SmsFrozenEligibilityHold('A frozen SMS prospect State is missing, invalid, excluded or changed. The batch was held without changing membership.');
-        }
+        };
 
         // Frozen/history phones are nvarchar in the published migrations while
         // prospects may be varchar. Compare a common, lossless Unicode width,
@@ -120,13 +126,30 @@ WHERE x.Request_ID=? ORDER BY p.PK", [$requestId], false);
         $hint = $locking ? ' WITH (UPDLOCK,HOLDLOCK)' : '';
         $contactRows = config('sms-exports.wide_phone_contacts_enabled', false)
             ? SmsPhoneNumbersSql::from('c', $hint, true) : 'TblPhoneNumbers as c'.$hint;
-        $unsafeMember = $members()->where(function (Builder $q) use ($phoneValid, $samePhone, $contactPhone, $hint, $contactRows, $native): void {
+        $memberBad = static function (Builder $q) use ($phoneValid, $samePhone, $contactPhone, $hint, $contactRows, $native): void {
             foreach (['Contacted','Opt_Out','Invalid_Phone'] as $flag) $q->orWhereNull('p.'.$flag)->orWhere('p.'.$flag, '<>', 0);
             $q->orWhereNull('p.Phone')->orWhereNull('x.Phone')->orWhereRaw("NOT ({$phoneValid})")->orWhereRaw("NOT ({$samePhone})");
             if (! $native) $q->orWhereExists(fn (Builder $s) => $s->selectRaw('1')->fromRaw('TblSMSSuppressions as s'.$hint)
                     ->whereColumn('s.Phone', 'x.Phone')->where(fn (Builder $flags) => $flags->where('s.Opt_Out', 1)->orWhere('s.Invalid_Phone', 1)))
                 ->orWhereExists(fn (Builder $c) => $c->selectRaw('1')->fromRaw($contactRows)->whereRaw($contactPhone));
-        })->exists();
+        };
+        // One pass over the batch for State and for the flags and phone together. Each pass looks every member up in
+        // TblProspects by key: on the 3M run of Nov 18, 2026 that was about 100 seconds warm and up to 7 minutes cold, and
+        // the two ran one after the other. Only when someone is wrong are they read apart, to say which, State first as before.
+        SmsStepLog::mark($requestId, 'check_members');
+        $unsafeMember = false;
+        $unproven = false;
+        if ($members()->where(static function (Builder $q) use ($stateBad, $memberBad, $stored): void {
+            $q->where($stateBad)->orWhere($memberBad);
+            if ($stored !== null) $q->orWhereRaw($stored['sql'], $stored['bindings']);
+        })->exists()) {
+            if ($members()->where($stateBad)->exists()) {
+                throw new SmsFrozenEligibilityHold('A frozen SMS prospect State is missing, invalid, excluded or changed. The batch was held without changing membership.');
+            }
+            $unsafeMember = $members()->where($memberBad)->exists();
+            if ($stored !== null) $unproven = $members()->whereRaw($stored['sql'], $stored['bindings'])->exists();
+        }
+        SmsStepLog::mark($requestId, 'check_suppressions');
         // Keep suppression probes separate from the per-member OR predicate.
         // A row-goal nested-loop plan otherwise repeats every wide-phone branch
         // millions of times. Equality hash joins retain the identical raw-phone
@@ -146,5 +169,7 @@ FROM (
         if ($unsafeMember || $unsafeSuppression) {
             throw new SmsFrozenEligibilityHold('A frozen SMS member is contacted, suppressed, invalid or has a changed phone. The batch was held without changing membership.');
         }
+
+        return $unproven;
     }
 }

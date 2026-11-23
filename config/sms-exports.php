@@ -35,8 +35,10 @@ return [
     // Deleting a run above this many rows closes it at once and a worker removes the rows in pages,
     // because one 3M delete can't finish inside a request. Those rows don't affect selection.
     'discard_background_rows' => (int) env('CMD_SMS_DISCARD_BACKGROUND_ROWS', 100000),
-    // On, Approve returns at once and the worker runs the checks. Off until a real Approve has been timed.
-    'approve_at_once' => (bool) env('CMD_SMS_APPROVE_AT_ONCE', false),
+    // On, Approve returns at once and the worker runs the checks. On since Nov 19, 2026: the real Approve of
+    // Nov 18 ran the same check twice in the click and again on the worker, minutes each at 3M. Set it to
+    // false to get the two checks in the click back.
+    'approve_at_once' => (bool) env('CMD_SMS_APPROVE_AT_ONCE', true),
     // More people than this stops the button: that many at once means something else is wrong.
     'remove_held_max' => (int) env('CMD_SMS_REMOVE_HELD_MAX', 200),
     // Jacob, Nov 7, 2026. Off until the back fill is done and compared.
@@ -44,6 +46,11 @@ return [
     'stored_debt_window_size' => (int) env('CMD_SMS_STORED_DEBT_WINDOW_SIZE', 250000),
     // Off until the back fill has finished. The refresh keeps values current after that.
     'stored_debt_refresh' => (bool) env('CMD_SMS_STORED_DEBT_REFRESH', false),
+    // On, the debt-on-the-minimum proof of a frozen batch reads the stored debt on the prospect row and re-reads a
+    // source row only when the stored value has moved on (Monther, Nov 19, 2026). On Nov 18 re-reading the mailer
+    // row of each of 380,254 people took up to 850 seconds, one disk read a person. Only with stored selection on.
+    // Set it to false to get the source re-read for everyone back.
+    'stored_debt_boundary_proof' => (bool) env('CMD_SMS_STORED_DEBT_BOUNDARY_PROOF', true),
     // The nightly jobs, in UTC, while the back fill and refresh wait.
     'stored_debt_pause_utc' => (string) env('CMD_SMS_STORED_DEBT_PAUSE_UTC', '09:20-10:25'),
     // The temporary mailer join. Stored selection doesn't use it.

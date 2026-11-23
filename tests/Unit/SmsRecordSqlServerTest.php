@@ -1150,6 +1150,147 @@ final class SmsRecordSqlServerTest extends TestCase
         self::assertSame(2, (int) $this->db->table('TblSMSDrops')->sum('Amount_Dropped'));
     }
 
+    /**
+     * Nov 18, 2026: a day like this one read every member against the live rows about eleven times, minutes each at 3M.
+     * Now: the file step once, the removal by its own scan, the approval twice (before any SMS ID, and when it records).
+     */
+    public function test_real_a_day_with_a_held_person_reads_every_member_once_per_step(): void
+    {
+        $records = new class extends SmsRecordExportRepository
+        {
+            public int $memberChecks = 0;
+
+            public function assertCurrentStates(string $requestId): void
+            {
+                $this->memberChecks++;
+                parent::assertCurrentStates($requestId);
+            }
+        };
+        Container::getInstance()->instance(SmsRecordExportRepository::class, $records);
+        $pass = Container::getInstance()->make(\Cmd\Reports\Services\SmsPendingDownloadCheck::class);
+        config(['sms-exports.approve_at_once' => true]);
+        $pks = $this->readyToApprove(4);
+        self::assertSame(1, $records->memberChecks, 'the file step checks once, before writing');
+        self::assertTrue($pass->passed(self::ID), 'that check opens the review download');
+        $this->db->table('TblProspects')->where('PK', $pks[2])->update(['Opt_Out' => 1]);
+
+        self::assertSame('approving', $this->runs->requestApprove(self::ID, 'synthetic@example.invalid')->status);
+        self::assertSame(1, $records->memberChecks, 'the click checks nothing');
+        $this->runs->markApproved(self::ID);
+        self::assertSame(2, $records->memberChecks, 'the worker stops at its first check');
+        self::assertSame('file_ready', $this->db->table('TblSMSRuns')->value('Status'));
+        self::assertSame(0, $this->db->table('TblSMSDrops')->count(), 'before any SMS ID exists');
+        self::assertFalse($pass->passed(self::ID), 'a held batch does not download on an old pass');
+        self::assertTrue($this->runs->show(self::ID)->can_remove_held);
+
+        $this->runs->requestRemoveHeld(self::ID, 'synthetic@example.invalid');
+        $this->runs->removeHeld(self::ID);
+        self::assertSame(2, $records->memberChecks, 'the removal scan is the check; the rebuild does not read everyone again');
+        $run = $this->db->table('TblSMSRuns')->first();
+        self::assertSame(['file_ready', 3], [$run->Status, (int) $run->Selected]);
+        self::assertSame(3, $this->fileRows());
+        self::assertSame(0, $this->db->table('TblProspectsExport')->where('Prospect_PK', $pks[2])->count());
+        self::assertTrue($pass->passed(self::ID));
+
+        self::assertSame('approving', $this->runs->requestApprove(self::ID, 'synthetic@example.invalid')->status);
+        $this->runs->markApproved(self::ID);
+        self::assertSame(4, $records->memberChecks, 'once before the SMS IDs, once when the people are recorded');
+        self::assertSame('approved', $this->db->table('TblSMSRuns')->value('Status'));
+        self::assertSame(3, $this->db->table('TblSMSHistory')->count());
+        self::assertSame(0, $this->db->table('TblSMSHistory')->where('Prospect_PK', $pks[2])->count());
+    }
+
+    /** The removal scan does not look at debt, so the rebuild after it still does. */
+    public function test_real_the_rebuild_after_a_removal_still_stops_on_a_frozen_debt_problem(): void
+    {
+        $pks = $this->readyToApprove(3);
+        $this->db->table('TblProspects')->where('PK', $pks[1])->update(['Contacted' => 1]);
+        $this->stopAtApprove();
+        $this->db->table('TblProspectsExport')->where('Prospect_PK', $pks[3])->update(['Debt_Amount' => 0]);
+        $this->runs->requestRemoveHeld(self::ID, 'synthetic@example.invalid');
+        try {
+            $this->runs->removeHeld(self::ID);
+            self::fail('A frozen debt problem must stop the rebuild.');
+        } catch (\RuntimeException $error) {
+            self::assertStringNotContainsString('Nobody in this batch', $error->getMessage());
+        }
+        $run = $this->db->table('TblSMSRuns')->first();
+        self::assertSame(['building_file', 2, null], [$run->Status, (int) $run->Selected, $run->File_Path], 'the held person is out, no file was made');
+    }
+
+    /** The tick box at Approve on the real column type: written with the approval, cleared when the approval is sent back. */
+    public function test_real_the_handoff_choice_column_is_written_with_the_approval_and_cleared_when_it_is_sent_back(): void
+    {
+        if (! $this->db->getSchemaBuilder()->hasColumn('TblSMSRuns', 'Handoff_Requested')) {
+            self::assertFalse(\Cmd\Reports\Services\SmsRunHandoffChoice::stored());
+            (require dirname(__DIR__, 2).'/database/sms-migrations/2026_11_19_000001_add_sms_run_handoff_choice.php')->up();
+        }
+        self::assertTrue(\Cmd\Reports\Services\SmsRunHandoffChoice::stored());
+        self::assertSame('bit', $this->db->selectOne("SELECT t.name FROM sys.columns c JOIN sys.types t ON t.user_type_id=c.user_type_id WHERE c.object_id=OBJECT_ID('dbo.TblSMSRuns') AND c.name='Handoff_Requested'")->name);
+        config(['sms-exports.approve_at_once' => true]);
+        $pks = $this->readyToApprove(3);
+        self::assertNull($this->db->table('TblSMSRuns')->value('Handoff_Requested'));
+        self::assertSame('off', $this->runs->show(self::ID)->handoff['after_approval'], 'the email is not switched on in this fixture');
+        try {
+            $this->runs->requestApprove(self::ID, 'synthetic@example.invalid', true);
+            self::fail('A tick that cannot be honoured must be refused.');
+        } catch (HttpException $refused) {
+            self::assertSame(409, $refused->getStatusCode());
+        }
+        self::assertSame('file_ready', $this->db->table('TblSMSRuns')->value('Status'));
+
+        $this->db->table('TblProspects')->where('PK', $pks[2])->update(['Opt_Out' => 1]);
+        $this->runs->requestApprove(self::ID, 'synthetic@example.invalid', false);
+        self::assertSame(0, (int) $this->db->table('TblSMSRuns')->value('Handoff_Requested'));
+        self::assertNotNull($this->db->table('TblSMSRuns')->value('Handoff_Requested'));
+        $this->runs->markApproved(self::ID);
+        $run = $this->db->table('TblSMSRuns')->first();
+        self::assertSame(['file_ready', null], [$run->Status, $run->Handoff_Requested], 'sent back by the held person, the choice is forgotten');
+
+        $this->runs->requestRemoveHeld(self::ID, 'synthetic@example.invalid');
+        $this->runs->removeHeld(self::ID);
+        $this->runs->requestApprove(self::ID, 'synthetic@example.invalid');
+        $this->runs->markApproved(self::ID);
+        $run = $this->db->table('TblSMSRuns')->first();
+        self::assertSame(['approved', 0], [$run->Status, (int) $run->Handoff_Requested]);
+        self::assertSame(2, $this->db->table('TblSMSHistory')->count());
+    }
+
+    /**
+     * The price check asks "how many source rows are gone" instead of "is there one" (Nov 19, 2026), so SQL Server can
+     * sweep the small PK index for a big batch. What it finds must not change: a frozen debt whose source row is gone
+     * still stops the batch, and an intact batch still passes.
+     */
+    public function test_real_a_frozen_debt_whose_source_row_is_gone_still_stops_the_batch(): void
+    {
+        $pks = $this->readyToApprove(3);
+        $records = Container::getInstance()->make(SmsRecordExportRepository::class);
+        $this->db->flushQueryLog();
+        $this->db->enableQueryLog();
+        $records->assertFrozen(self::ID, 3, true);
+        $this->db->disableQueryLog();
+        $checks = array_values(array_filter(array_column($this->db->getQueryLog(), 'query'), static fn (string $sql): bool => str_contains($sql, 'AS missing')));
+        self::assertCount(2, $checks, 'one statement for TU rows and one for mailer rows');
+        foreach ($checks as $sql) {
+            self::assertStringContainsString('COUNT_BIG(*)', $sql);
+            self::assertStringContainsString('OPTION (RECOMPILE)', $sql);
+            self::assertStringNotContainsString('top 1', strtolower($sql));
+        }
+        $source = (int) $this->db->table('TblProspectsExport')->where('Prospect_PK', $pks[2])->value('Debt_Source_PK');
+        self::assertGreaterThan(0, $source);
+        $row = (array) $this->db->table('TblTUData')->where('PK', $source)->first();
+        $this->db->table('TblTUData')->where('PK', $source)->delete();
+        try {
+            $records->assertFrozen(self::ID, 3, true);
+            self::fail('A frozen debt with no source row must stop the batch.');
+        } catch (\RuntimeException $error) {
+            self::assertStringContainsString('TblTUData provenance no longer resolves to its exact source PK', $error->getMessage());
+        }
+        unset($row['SMS_Zip5']);
+        $this->db->table('TblTUData')->insert($row);
+        $records->assertFrozen(self::ID, 3, true);
+    }
+
     public function test_real_with_the_switch_off_approve_stops_in_the_request_like_today(): void
     {
         $pks = $this->readyToApprove(2);

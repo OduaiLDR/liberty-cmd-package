@@ -240,10 +240,12 @@ class SmsRunService
 
     public function buildFile(string $requestId): void
     {
+        SmsStepLog::start($requestId, 'file_started');
         SmsWorkflowLock::run('run:'.$requestId, fn () => $this->buildFileNow($requestId));
     }
 
-    protected function buildFileNow(string $requestId): void
+    /** $membersChecked: only removeHeld passes true, right after its own scan of the live rows. A Retry checks in full. */
+    protected function buildFileNow(string $requestId, bool $membersChecked = false): void
     {
         $run = $this->mustRun($requestId);
         $this->assertPolicyReady($run);
@@ -253,7 +255,7 @@ class SmsRunService
         // A publication may already exist after a worker died before the SQL receipt.
         // Adopt its original bytes/date, including a later-week recovery; never regenerate it.
         if ($options !== null && is_dir($dir.'/v1/published')) {
-            $this->buildVersionedFile($run, $dir, $options);
+            $this->buildVersionedFile($run, $dir, $options, $membersChecked);
             return;
         }
         // Do not silently move reviewed drops when generation/retry slips into another week.
@@ -268,7 +270,7 @@ class SmsRunService
                 : 'This reviewed batch no longer targets the following Monday. Start a fresh batch; existing dates were not changed.');
         }
         if ($options !== null) {
-            $this->buildVersionedFile($run, $dir, $options);
+            $this->buildVersionedFile($run, $dir, $options, $membersChecked);
             return;
         }
         if (! is_dir($dir) && ! mkdir($dir, 0750, true) && ! is_dir($dir)) throw new RuntimeException('Unable to create the SMS file folder.');
@@ -283,7 +285,7 @@ class SmsRunService
         ]);
     }
 
-    private function buildVersionedFile(object $run, string $directory, array $options): void
+    private function buildVersionedFile(object $run, string $directory, array $options, bool $membersChecked = false): void
     {
         if (! DB::connection('sqlsrv')->getSchemaBuilder()->hasColumns('TblSMSRuns', ['Run_Options_JSON', 'Artifact_Manifest_JSON'])) {
             throw new HttpException(503, 'The frozen SMS file-options schema is incomplete.');
@@ -300,7 +302,9 @@ class SmsRunService
                 ? $bundles->publishedStem($directory, $options, (int) $run->Selected)
                 : $stem.' - '.SmsRunArtifactFilename::rangeFromDrops($this->export->drops((string) $run->Request_ID));
         }
-        $bundle = app(SmsRecordExportRepository::class)->writeVersionedBundle((string) $run->Request_ID, $directory, $stem, $options);
+        // A pass from before this build says nothing about the files written now.
+        $this->forgetPendingDownloadPass((string) $run->Request_ID);
+        $bundle = app(SmsRecordExportRepository::class)->writeVersionedBundle((string) $run->Request_ID, $directory, $stem, $options, $membersChecked);
         if (! $this->move((string) $run->Request_ID, ['building_file'], 'file_ready', [
             'File_Path' => $bundle['path'], 'File_Bytes' => $bundle['bytes'], 'File_Sha256' => $bundle['sha256'],
             'Artifact_Manifest_JSON' => json_encode($bundle['manifest'], JSON_THROW_ON_ERROR), 'File_At' => $this->now(),
@@ -310,6 +314,24 @@ class SmsRunService
             throw new RuntimeException('The SMS file was published but its run changed before the receipt was saved.');
         }
         app(SmsRunProgress::class)->forget((string) $run->Request_ID);
+        // The check that opened this build stands for the download's own check for a while, so the review
+        // copy can be taken as soon as it is ready. Approve still checks everyone before it records them.
+        if ($this->approvalFilenames($options)) {
+            try {
+                app(SmsPendingDownloadCheck::class)->recordPass((string) $run->Request_ID);
+            } catch (Throwable) {
+                // No pass recorded only means the download runs the check itself.
+            }
+        }
+        SmsStepLog::finish((string) $run->Request_ID);
+    }
+
+    private function forgetPendingDownloadPass(string $requestId): void
+    {
+        try {
+            app(SmsPendingDownloadCheck::class)->forgetPass($requestId);
+        } catch (Throwable) {
+        }
     }
 
     public function requestSent(string $requestId, string $actor): object
@@ -356,6 +378,8 @@ class SmsRunService
      */
     protected function rememberApprovalHold(string $requestId, string $message): void
     {
+        // The files now hold someone who must not be texted: an earlier pass must not let them download.
+        $this->forgetPendingDownloadPass($requestId);
         try {
             Cache::store('file')->put('sms-approval-hold:'.strtolower($requestId), $message, self::APPROVAL_HOLD_SECONDS);
         } catch (Throwable) {
@@ -410,7 +434,8 @@ class SmsRunService
                 throw new HttpException(409, 'This batch already has SMS IDs, so nobody can be removed from it.');
             }
             if (! $this->move($requestId, [$run->Status], 'building_file', ['Approved_By' => null, 'Approved_At' => null,
-                'Failed_Step' => null, 'Error' => null, 'Progress_Step' => 'removing_held'])) {
+                'Failed_Step' => null, 'Error' => null, 'Progress_Step' => 'removing_held']
+                + (SmsRunHandoffChoice::stored() ? [SmsRunHandoffChoice::COLUMN => null] : []))) {
                 throw new HttpException(409, 'The run changed. Refresh the page.');
             }
         }));
@@ -442,7 +467,9 @@ class SmsRunService
             if ($run->Status !== 'building_file' || ($run->Progress_Step ?? null) !== 'removing_held') return;
             $this->assertPolicyReady($run);
             $db = DB::connection('sqlsrv');
+            SmsStepLog::start($requestId, 'finding_held');
             $people = SmsFrozenEligibility::heldMembers($db, $requestId);
+            SmsStepLog::mark($requestId, 'removing_held');
             if ($people === []) throw new RuntimeException('Nobody in this batch is held right now. Click Retry to build the file.');
             $limit = max(1, (int) config('sms-exports.remove_held_max', 200));
             if (count($people) > $limit) {
@@ -488,16 +515,25 @@ class SmsRunService
             } catch (Throwable) {
                 // The people are already out. A note must never fail the step.
             }
-            $this->buildFileNow($requestId);
+            // The scan above read every member against the live rows a moment ago and everyone it named is out,
+            // so the rebuild does not read them all again. It still checks the frozen content and the debt,
+            // which the scan does not look at. Approve checks everyone again before it records anyone.
+            $this->buildFileNow($requestId, true);
         });
     }
 
-    public function requestApprove(string $requestId, string $actor): object
+    /** $emailFiles: the tick box at Approve. Only true publishes and emails the files; see SmsRunHandoffChoice. */
+    public function requestApprove(string $requestId, string $actor, ?bool $emailFiles = null): object
     {
         $preflight = $this->mustRun($requestId);
         SmsRecordPolicy::assertOrdinary($preflight);
         if (SmsExternalEventService::pending()) throw new HttpException(409, 'Historical SMS registration must finish before another approval.');
         $newFiles = $this->approvalFilenames($this->fileOptions($preflight));
+        $choiceStored = SmsRunHandoffChoice::stored();
+        // Asked for by the person approving, so it is refused out loud, never dropped quietly.
+        if ($emailFiles === true && ! ($newFiles && $choiceStored && SmsRunHandoffChoice::switchedOn())) {
+            throw new HttpException(409, 'The files cannot be emailed from here right now. Untick the email and approve again.');
+        }
         // Off by default. On, the click returns at once and the worker runs these same checks.
         $atOnce = $newFiles && config('sms-exports.approve_at_once', false) === true;
         // Slow hashing stays outside SQL/contact coordination. The locked
@@ -515,7 +551,7 @@ class SmsRunService
                 }
             }
         }
-        $queued = SmsContactAttribution::coordinate(fn (?\PDO $session) => SmsWorkflowLock::run('run:'.$requestId, fn () => DB::connection('sqlsrv')->transaction(function () use ($requestId, $actor, $session, $preflight, $newFiles, $atOnce): bool {
+        $queued = SmsContactAttribution::coordinate(fn (?\PDO $session) => SmsWorkflowLock::run('run:'.$requestId, fn () => DB::connection('sqlsrv')->transaction(function () use ($requestId, $actor, $session, $preflight, $newFiles, $atOnce, $emailFiles, $choiceStored): bool {
             SmsContactAttribution::assertPinnedSession($session);
             $run = $this->runs()->where('Request_ID', $requestId)->lockForUpdate()->first();
             if (! $run) throw new HttpException(404, 'SMS run not found.');
@@ -533,7 +569,9 @@ class SmsRunService
                 throw new HttpException(409, 'SMS send date must be today or a future date in California when approval is accepted.');
             }
             $values = ['Approved_By' => $actor, 'Approved_At' => $at, 'Progress_Step' => $newFiles ? 'assigning_ids' : 'approval']
-                + ($precise ? ['Approved_At_Precision' => 6] : []);
+                + ($precise ? ['Approved_At_Precision' => 6] : [])
+                // Saved with the approval itself, so a retry of the approval keeps the same choice.
+                + ($choiceStored ? [SmsRunHandoffChoice::COLUMN => $emailFiles === true ? 1 : 0] : []);
             if (! $this->move($requestId, ['file_ready'], 'approving', $values)) {
                 throw new HttpException(409, 'This batch changed before approval. Refresh it.');
             }
@@ -581,7 +619,9 @@ class SmsRunService
             if (DB::connection('sqlsrv')->table('TblSMSDrops')->where('Request_ID', $requestId)->exists()
                 || DB::connection('sqlsrv')->table('TblSMSHistory')->where('Request_ID', $requestId)->exists()) return false;
 
-            return $this->move($requestId, ['approving'], 'file_ready', ['Approved_By' => null, 'Approved_At' => null, 'Progress_Step' => null]);
+            // The approval is undone, and its choice about the email with it: the next Approve asks again.
+            return $this->move($requestId, ['approving'], 'file_ready', ['Approved_By' => null, 'Approved_At' => null, 'Progress_Step' => null]
+                + (SmsRunHandoffChoice::stored() ? [SmsRunHandoffChoice::COLUMN => null] : []));
         });
         if ($released) $this->rememberApprovalHold($requestId, $reason);
 
@@ -641,13 +681,17 @@ class SmsRunService
                     || DB::connection('sqlsrv')->table('TblProspectsExport')->where('Request_ID', $requestId)
                         ->where(fn ($q) => $q->whereNotNull('SMS_Drop_PK')->orWhereNotNull('Drop_Name'))->exists();
                 if (! $hasIds) {
+                    // The check before any SMS ID exists: a hold found here still sends the batch back to ready.
                     $repository->assertFrozen($requestId, (int) $run->Selected, true);
                     // An accepted approval may execute after its planned date;
                     // never move that date or re-accept approval on a retry.
                     $this->export->assignDrops($requestId, SmsDeliveryPolicy::plannedDate($options['send_date']));
                 }
                 SmsContactAttribution::assertPinnedSession($runSession);
-                $range = $repository->assertAllocatedDrops($requestId, (int) $run->Selected, $options);
+                // Same transaction and locks as the check above, so only the saved IDs are reconciled here.
+                // A retry that finds its IDs already saved skipped that check and runs it in full.
+                $range = $repository->assertAllocatedDrops($requestId, (int) $run->Selected, $options,
+                    $hasIds ? SmsRecordExportRepository::CHECK_ALL : SmsRecordExportRepository::CHECK_CONTENT);
                 if (! $this->move($requestId, ['approving'], 'approving', ['Progress_Step' => 'finalizing_files'])) throw new RuntimeException('SMS allocation changed before its receipt committed.');
                 return $range;
             });
@@ -670,7 +714,8 @@ class SmsRunService
                     $this->assertAcceptedFileApproval($run);
                     $this->assertApprovalReceiptUnchanged($run, $context['pending']);
                     $repository = app(SmsRecordExportRepository::class);
-                    if ($repository->assertAllocatedDrops($requestId, (int) $run->Selected, $context['options']) !== $context['range']) {
+                    // approve() below runs the full check in this same transaction, right before it records anyone.
+                    if ($repository->assertAllocatedDrops($requestId, (int) $run->Selected, $context['options'], SmsRecordExportRepository::CHECK_CONTENT) !== $context['range']) {
                         throw new RuntimeException('The saved SMS drop range changed before the final approval commit.');
                     }
                     $bundle = $context['bundle'];
@@ -694,6 +739,8 @@ class SmsRunService
     protected function captureAutomaticHandoff(object $run): void
     {
         if (! $this->automaticHandoffEnabled()) return;
+        // With the choice stored, only an approval that ticked the email gets the handoff.
+        if (! SmsRunHandoffChoice::wanted($run)) return;
         SmsDebtPleteImportPrivacy::run(fn () => app(SmsRunAutomaticHandoffWorkflow::class)->captureApproved($run));
     }
 
@@ -1057,6 +1104,8 @@ class SmsRunService
         if ($cancellation !== null) $view['selection_cancellation'] = $cancellation;
         $view['handoff'] = SmsRunAutomaticHandoffProjection::forRun($view,
             SmsRunDebtPleteImportProjection::forRun($view, SmsRunEmailProjection::forRun($view)));
+        // So the page can say what really happens after approval, and show the tick box only when it decides something.
+        if (is_array($view['handoff'])) $view['handoff']['after_approval'] = SmsRunHandoffChoice::afterApproval($run);
         return (object) $view;
     }
 
@@ -1067,7 +1116,26 @@ class SmsRunService
         $page = $this->history();
         return ['open' => $open ? $this->show((string) $open->Request_ID) : null, 'recent' => $page['items'],
             'history_next_cursor' => $page['next_cursor'],
-            'selection_policy' => SmsRecordPolicy::current(), 'capabilities' => $this->fileCapabilities()];
+            'selection_policy' => SmsRecordPolicy::current(), 'capabilities' => $this->fileCapabilities(),
+            'new_run_wait' => $open ? null : $this->newRunWait()];
+    }
+
+    /**
+     * Why Generate should wait, for the page: new people from TU whose debt and tier are still being worked out, or
+     * stored values that cannot be trusted. Null when nothing is in the way. Read only; the click checks again itself.
+     *
+     * @return array{reason:string, people?:int, tu_rows?:int}|null
+     */
+    protected function newRunWait(): ?array
+    {
+        if (! SmsStoredDebt::selectionEnabled()) return null;
+        try {
+            $waiting = SmsStoredDebt::waiting(DB::connection('sqlsrv'));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $waiting === null ? null : array_intersect_key($waiting, ['reason' => true, 'people' => true, 'tu_rows' => true]);
     }
 
     /** Bounded read only; no COUNT/OFFSET, file hashing, regeneration or tracking writes. */
@@ -1082,11 +1150,13 @@ class SmsRunService
         $rows = $query->limit($limit + 1)->get();
         $hasMore = $rows->count() > $limit;
         $page = $rows->take($limit);
-        return ['items' => $page->map(fn ($run) => $this->historyView($run))->values()->all(),
+        // Read once for the page, not once per run.
+        $choiceStored = SmsRunHandoffChoice::switchedOn() && SmsRunHandoffChoice::stored();
+        return ['items' => $page->map(fn ($run) => $this->historyView($run, $choiceStored))->values()->all(),
             'next_cursor' => $hasMore ? (int) $page->last()->PK : null, 'limit' => $limit];
     }
 
-    private function historyView(object $run): object
+    private function historyView(object $run, bool $choiceStored = false): object
     {
         if (SmsRecordPolicy::isExternal($run)) return (object) SmsExternalEventProjection::forRun($run);
         [$options, $file, $fileProblem] = $this->historyFile($run);
@@ -1110,6 +1180,7 @@ class SmsRunService
         $cancellation = app(SmsSelectionCancellation::class)->projection($run);
         if ($cancellation !== null) $view['selection_cancellation'] = $cancellation;
         $view['handoff'] = SmsRunDebtPleteImportProjection::forRun($view, SmsRunEmailProjection::forRun($view));
+        if (is_array($view['handoff'])) $view['handoff']['after_approval'] = SmsRunHandoffChoice::afterApproval($run, $choiceStored);
         return (object) $view;
     }
 
@@ -1197,18 +1268,27 @@ class SmsRunService
     /** The page's download. A check that just passed on the worker stands in for the one here. */
     public function downloadPath(string $requestId): string
     {
-        return $this->releasableArtifact($requestId, ! app(SmsPendingDownloadCheck::class)->passed($requestId));
+        try {
+            return $this->releasableArtifact($requestId, ! app(SmsPendingDownloadCheck::class)->passed($requestId));
+        } catch (SmsFrozenEligibilityHold $hold) {
+            // Same as a hold at Approve: the page can then offer to take the held people out.
+            $this->rememberApprovalHold($requestId, $hold->getMessage());
+            throw $hold;
+        }
     }
 
     public function runPendingDownloadCheck(string $requestId): void
     {
         $check = app(SmsPendingDownloadCheck::class);
+        SmsStepLog::start($requestId, 'download_check');
         try {
             $this->assertPendingDownloadStates($this->mustRun($requestId), $requestId);
             $check->recordPass($requestId);
         } catch (SmsFrozenEligibilityHold|HttpException $hold) {
+            if ($hold instanceof SmsFrozenEligibilityHold) $this->rememberApprovalHold($requestId, $hold->getMessage());
             $check->recordHeld($requestId, $hold->getMessage());
         }
+        SmsStepLog::finish($requestId);
     }
 
     private function needsPendingDownloadCheck(object $run): bool

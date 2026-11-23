@@ -366,8 +366,14 @@ class SmsRecordExportRepository extends SqlSrvRepository
         if ($leanDebtSources && $this->connection()->getDriverName() === 'sqlsrv') {
             SmsLeanHistorySchema::assertReady($this->connection());
             foreach (['TblTUData','TblMailers'] as $source) {
-                if ($this->table('TblProspectsExport', 'x')->leftJoin($source.' as s', 's.PK', '=', 'x.Debt_Source_PK')
-                    ->where('x.Request_ID', $requestId)->where('x.Debt_Source', $source)->whereNull('s.PK')->exists()) {
+                // Counted, not "is there one": asked for one row, SQL Server plans as if it turns up at once and then looks
+                // every member up one at a time from disk (Nov 18, 2026: 243 s for mailers, 174 s for TU). Counting lets it
+                // sweep the small PK index for a big batch (measured Nov 19: 7 s for TU; a 6 GB mailer index in 28 s) and
+                // still look up one by one for a small batch. RECOMPILE: the plan is chosen for this batch's size.
+                $missing = $this->connection()->selectOne("SELECT COUNT_BIG(*) AS missing FROM dbo.TblProspectsExport AS x
+ LEFT JOIN dbo.{$source} AS s ON s.PK=x.Debt_Source_PK
+ WHERE x.Request_ID=? AND x.Debt_Source=? AND s.PK IS NULL OPTION (RECOMPILE)", [$requestId, $source]);
+                if ((int) ($missing->missing ?? 0) > 0) {
                     throw new RuntimeException('Frozen '.$source.' provenance no longer resolves to its exact source PK.');
                 }
             }
@@ -382,9 +388,24 @@ class SmsRecordExportRepository extends SqlSrvRepository
         return ['selected' => (int) $row->Selected, 'never_texted' => (int) $row->Never_Texted, 'previously_texted' => (int) $row->Previously_Texted];
     }
 
-    /** Validate frozen content and current suppression without changing the saved selection. */
-    public function assertFrozen(string $requestId, int $expected, bool $pendingIds = false): void
+    /** Everything: frozen prices and content, then every member against the live rows, then debt. */
+    public const CHECK_ALL = 'all';
+
+    /** Frozen prices, content and debt. For the rebuild right after held people were found and taken out by a scan of the live rows. */
+    public const CHECK_DEBT = 'debt';
+
+    /** Count and frozen content only. For a repeat inside a transaction whose full check has just run or runs next. */
+    public const CHECK_CONTENT = 'content';
+
+    /**
+     * Validate frozen content and current suppression without changing the saved selection.
+     * One full pass takes minutes at 3M (Nov 18, 2026: about eleven of them in one run), so a caller
+     * that sits beside a full pass in the same step asks for less. The pass that records people as
+     * texted (approve) is always full.
+     */
+    public function assertFrozen(string $requestId, int $expected, bool $pendingIds = false, string $check = self::CHECK_ALL): void
     {
+        if (! in_array($check, [self::CHECK_ALL, self::CHECK_DEBT, self::CHECK_CONTENT], true)) throw new RuntimeException('Unknown frozen SMS check.');
         $run = $this->table('TblSMSRuns')->where('Request_ID', $requestId)->first();
         if ($run !== null) SmsRecordPolicy::assertOrdinary($run);
         if ($pendingIds) {
@@ -395,7 +416,11 @@ class SmsRecordExportRepository extends SqlSrvRepository
                 throw new RuntimeException('Pending SMS IDs require the explicit approval workflow and no saved drops/history.');
             }
         }
-        if ($run && ($options = $this->tierSelectionOptions($run, (int) $run->Target)) !== null) $this->assertTierPrices($requestId, $options);
+        if ($check !== self::CHECK_CONTENT) {
+            SmsStepLog::mark($requestId, 'check_prices');
+            if ($run && ($options = $this->tierSelectionOptions($run, (int) $run->Target)) !== null) $this->assertTierPrices($requestId, $options);
+        }
+        SmsStepLog::mark($requestId, 'check_content');
         $rows = $this->table('TblProspectsExport')->where('Request_ID', $requestId);
         if ((clone $rows)->count() !== $expected || $expected < 1
             || (clone $rows)->where(function ($q) use ($pendingIds): void {
@@ -405,7 +430,13 @@ class SmsRecordExportRepository extends SqlSrvRepository
                     ->orWhereRaw('Debt_Amount <> CAST(Debt_Amount / 1000 AS bigint) * 1000')
                     ->orWhereNull('Debt_Amount')->orWhere('Debt_Amount', '<=', 0)->orWhereNull('Was_Previously_Texted')->orWhereNotIn('Was_Previously_Texted', [0,1]);
             })->exists()) throw new RuntimeException('Frozen SMS membership, tier, debt or count does not reconcile.');
-        $this->assertCurrentStates($requestId);
+        if ($check === self::CHECK_ALL) {
+            $this->assertCurrentStates($requestId);
+        } elseif ($check === self::CHECK_DEBT) {
+            SmsStepLog::mark($requestId, 'check_debt');
+            SmsDebtPolicy::assertPendingFromStored($this->connection(), $requestId);
+        }
+        SmsStepLog::mark($requestId, 'check_done');
     }
 
     /** Compatibility entry point: State, phone identity and authoritative suppressions. */
@@ -415,10 +446,10 @@ class SmsRecordExportRepository extends SqlSrvRepository
     }
 
     /** Allocation is committed separately; every saved tier/member reference must reconcile on replay. */
-    public function assertAllocatedDrops(string $requestId, int $expected, array $options): string
+    public function assertAllocatedDrops(string $requestId, int $expected, array $options, string $check = self::CHECK_ALL): string
     {
         if (($options['filename_version'] ?? null) !== SmsRunOptions::APPROVAL_FILENAME_VERSION) throw new RuntimeException('Approval-time SMS allocation requires its explicit version.');
-        $this->assertFrozen($requestId, $expected);
+        $this->assertFrozen($requestId, $expected, false, $check);
         if ($this->table('TblSMSHistory')->where('Request_ID', $requestId)->exists()) throw new RuntimeException('An uncommitted SMS approval cannot already contain history.');
         $bad = $this->table('TblProspectsExport', 'x')->leftJoin('TblSMSDrops as d', 'd.PK', '=', 'x.SMS_Drop_PK')
             ->where('x.Request_ID', $requestId)->where(function (Builder $q) use ($requestId, $options): void {
@@ -471,9 +502,15 @@ class SmsRecordExportRepository extends SqlSrvRepository
     }
 
     /** Stream the immutable record snapshot into one atomic, versioned CSV/ZIP bundle. */
-    public function writeVersionedBundle(string $requestId, string $runDirectory, string $stem, array $options): array
+    /**
+     * One check, before anything is written (Monther, Nov 18, 2026: "just one check enough"). Someone who changes
+     * while the files are written is caught by the approval, which checks everyone before it records them.
+     * $membersChecked: held people were found by a scan of the live rows and taken out a moment ago, so that scan
+     * stands for the member check and only the frozen content and debt are checked here.
+     */
+    public function writeVersionedBundle(string $requestId, string $runDirectory, string $stem, array $options, bool $membersChecked = false): array
     {
-        return $this->withQueryTimeout(SmsProspectExportRepository::STEP_QUERY_TIMEOUT, function () use ($requestId, $runDirectory, $stem, $options): array {
+        return $this->withQueryTimeout(SmsProspectExportRepository::STEP_QUERY_TIMEOUT, function () use ($requestId, $runDirectory, $stem, $options, $membersChecked): array {
             SmsRecordPolicy::assertReady();
             $run = $this->table('TblSMSRuns')->where('Request_ID', $requestId)->first();
             if (! $run || ! SmsRecordPolicy::isRecord($run) || $run->Status !== 'building_file'
@@ -486,7 +523,9 @@ class SmsRecordExportRepository extends SqlSrvRepository
             $report = static fn (string $phase, int $done, ?int $partsDone = null, ?int $partsTotal = null) => $progress->write($requestId,
                 ['phase' => $phase, 'done' => $done, 'total' => $expected, 'parts_done' => $partsDone, 'parts_total' => $partsTotal]);
             $report('checking', 0);
-            $this->assertFrozen($requestId, $expected, $pendingIds);
+            SmsStepLog::mark($requestId, 'file_check');
+            $this->assertFrozen($requestId, $expected, $pendingIds, $membersChecked ? self::CHECK_DEBT : self::CHECK_ALL);
+            SmsStepLog::mark($requestId, 'file_writing');
             $cells = (function () use ($requestId, $options): \Generator {
                 $pendingIds = ($options['filename_version'] ?? null) === SmsRunOptions::APPROVAL_FILENAME_VERSION;
                 $query = $this->table('TblProspectsExport', 'x')->where('x.Request_ID', $requestId);
@@ -504,9 +543,7 @@ class SmsRecordExportRepository extends SqlSrvRepository
                 }
             })();
             $bundle = (new SmsRunArtifactBundle)->build($runDirectory, $stem, $cells, $expected, $options, $report);
-            $parts = count($bundle['manifest']['parts']);
-            $report('final_check', $expected, $parts, $parts);
-            $this->assertCurrentStates($requestId);
+            SmsStepLog::mark($requestId, 'file_written');
             return $bundle;
         });
     }

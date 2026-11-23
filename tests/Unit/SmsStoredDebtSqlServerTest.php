@@ -401,6 +401,95 @@ SQL);
         $this->assertSame('TblTUData', $this->stored($late)[2]);
     }
 
+    /**
+     * Nov 19, 2026: a run started right after TU's results load left the new people out without a word, because their
+     * stored debt and tier are filled in the background. Now the same check stops the run and tells the page.
+     */
+    public function test_new_people_hold_a_run_until_the_refresh_has_given_them_their_debt_and_tier(): void
+    {
+        $this->eligiblePerson(1);
+        $this->worker()->backfill('never');
+        $this->worker()->backfill('previous');
+        $this->assertNull(SmsStoredDebt::waiting($this->db, $this->statePath), 'before the first complete refresh there is no mark, so it is judged as before');
+        $this->worker()->refresh();
+        $state = json_decode((string) file_get_contents($this->statePath), true);
+        $this->assertSame((int) $this->db->table('TblProspects')->max('PK'), $state['prospects_watermark']);
+        $this->assertNull(SmsStoredDebt::waiting($this->db, $this->statePath));
+
+        // Two new people with no new TU row: one who can be texted, one with no phone (never selected, so never waited for).
+        $new = $this->person('Bob Ray', '7 Main St');
+        $mailer = $this->mailer('31000.00', 'T5', 'OLD', '2026-01-01', 'Bob Ray', '7 Main St');
+        $noPhone = $this->person('Cal Roe', '8 Main St');
+        $this->db->table('TblProspects')->where('PK', $noPhone)->update(['Phone' => null]);
+        $waiting = SmsStoredDebt::waiting($this->db, $this->statePath);
+        $this->assertSame(['new_people', 1], [$waiting['reason'], $waiting['people']]);
+        try {
+            SmsStoredDebt::assertCurrent($this->db, $this->statePath);
+            $this->fail('A run must not start while new people have no stored value.');
+        } catch (RuntimeException $held) {
+            $this->assertStringContainsString('1 new people from TU are still being given their debt and tier', $held->getMessage());
+        }
+
+        $result = $this->worker()->refresh();
+        $this->assertSame(['tu_rows' => 0, 'tu_people' => 0, 'written' => 1, 'stopped' => null], $result);
+        $this->assertSame(['31000.00', 'T5', 'TblMailers', $mailer], $this->stored($new));
+        $this->assertNull(SmsStoredDebt::waiting($this->db, $this->statePath));
+        SmsStoredDebt::assertCurrent($this->db, $this->statePath);
+        $state = json_decode((string) file_get_contents($this->statePath), true);
+        $this->assertSame($noPhone, $state['prospects_watermark'], 'the mark moves to the newest person the pass saw');
+    }
+
+    /** With nobody new, a pass asks the prospects table for nobody, so it can run every few minutes. */
+    public function test_a_pass_with_nobody_new_does_not_walk_the_prospects_table(): void
+    {
+        $this->eligiblePerson(1);
+        $this->eligiblePerson(2, '2026-01-01');
+        $this->worker()->backfill('never');
+        $this->worker()->backfill('previous');
+        $walks = function (): int {
+            $this->db->flushQueryLog();
+            $this->db->enableQueryLog();
+            $result = $this->worker()->refresh();
+            $this->db->disableQueryLog();
+            $this->assertNull($result['stopped']);
+
+            return count(array_filter($this->db->getQueryLog(), static fn (array $query): bool => str_contains($query['query'], 'WITH (INDEX(1)) WHERE PK>')));
+        };
+        $this->assertGreaterThan(0, $walks(), 'the first complete pass walks both groups and saves the mark');
+        $this->assertSame(0, $walks(), 'nobody new: nobody is walked');
+        $this->assertSame(0, $walks());
+        $this->person('Bob Ray', '7 Main St');
+        $this->assertGreaterThan(0, $walks(), 'a new person is walked for');
+        $this->assertSame(0, $walks());
+        // The nightly sweep is for people who gained a phone, wherever they sit: it walks even with nobody new.
+        $this->worker()->restartSweep();
+        $this->assertGreaterThan(0, $walks());
+    }
+
+    public function test_a_pass_stopped_part_way_keeps_the_hold_and_saves_no_mark_until_a_pass_finishes(): void
+    {
+        $this->eligiblePerson(1);
+        $this->worker()->backfill('never');
+        $this->worker()->backfill('previous');
+        $this->worker()->refresh();
+        $mark = json_decode((string) file_get_contents($this->statePath), true)['prospects_watermark'];
+        foreach (['Bob Ray' => '7 Main St', 'Dee Poe' => '9 Main St'] as $client => $address) {
+            $this->person($client, $address);
+            $this->mailer('31000.00', 'T5', 'OLD', '2026-01-01', $client, $address);
+        }
+        $clock = 0;
+        $worker = new SmsStoredDebtWorker($this->db, $this->statePath, null, function (int $s) use (&$clock): void { $clock += $s; }, function () use (&$clock): int {
+            $clock += 3600;
+
+            return $this->clock + $clock;
+        });
+        $this->assertSame('time limit', $worker->refresh(1, 1)['stopped']);
+        $this->assertSame($mark, json_decode((string) file_get_contents($this->statePath), true)['prospects_watermark']);
+        $this->assertSame('new_people', SmsStoredDebt::waiting($this->db, $this->statePath)['reason'] ?? null);
+        $this->assertNull($this->worker()->refresh(1, 0)['stopped']);
+        $this->assertNull(SmsStoredDebt::waiting($this->db, $this->statePath));
+    }
+
     public function test_the_refresh_gives_way_and_does_nothing_while_a_run_is_working(): void
     {
         $this->worker()->backfill('never');

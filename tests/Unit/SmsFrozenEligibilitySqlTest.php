@@ -32,8 +32,8 @@ final class SmsFrozenEligibilitySqlTest extends TestCase
         $db = new SqlServerConnection(new PDO('sqlite::memory:'), 'owned', '', ['driver' => 'sqlsrv']);
         $queries = $db->pretend(fn () => SmsFrozenEligibility::assertPending($db, 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'));
         self::assertGreaterThanOrEqual(2, count($queries));
-        $state = $queries[0]['query'];
-        $phone = $queries[1]['query'];
+        // One pass reads State and the flags and phone together; the suppression probe follows it.
+        $state = $phone = $queries[0]['query'];
         self::assertStringContainsString('p.State', $state);
         self::assertStringContainsString('x.State', $state);
         self::assertStringContainsString('DATALENGTH(CONVERT(nvarchar(max),x.Phone))=20', $phone);
@@ -45,13 +45,13 @@ final class SmsFrozenEligibilitySqlTest extends TestCase
         self::assertStringNotContainsString('x.Phone COLLATE Latin1_General_100_BIN2', $phone);
         self::assertStringNotContainsString('p.Phone COLLATE Latin1_General_100_BIN2', $phone);
         foreach (['Contacted', 'Opt_Out', 'Invalid_Phone'] as $flag) self::assertStringContainsString('[p].['.$flag.']', $phone);
-        $suppression = $queries[2]['query'];
+        $suppression = $queries[1]['query'];
         self::assertStringNotContainsString('TblPhoneNumbers', $phone);
         self::assertStringContainsString('JOIN TblSMSSuppressions AS s', $suppression);
         self::assertStringContainsString('JOIN TblPhoneNumbers as c', $suppression);
         self::assertStringContainsString('ON c.Phone=x.Phone', $suppression);
         self::assertStringContainsString("ON c.Phone='1'+x.Phone", $suppression);
         self::assertStringContainsString('OPTION (HASH JOIN)', $suppression);
-        self::assertSame(array_fill(0, 3, 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'), $queries[2]['bindings']);
+        self::assertSame(array_fill(0, 3, 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'), $queries[1]['bindings']);
     }
 }

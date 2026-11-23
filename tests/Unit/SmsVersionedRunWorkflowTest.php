@@ -126,6 +126,8 @@ beforeEach(function (): void {
             }
             return $bundle;
         }
+        /** What removeHeld does once the held people are out. */
+        public function rebuildAfterRemovalForTest(string $id): void { $this->buildFileNow($id, true); }
         public function filePath(string $requestId): string
         {
             $path = parent::filePath($requestId);
@@ -1260,10 +1262,281 @@ test('busy run status carries only its matching cached progress phase without SQ
     expect($building->status)->toBe('building_file')->and($building->progress)->toBeNull();
     $progress->calls = [];
     $this->service->buildFile($this->id);
-    expect(array_column($progress->calls, 'phase'))->toBe(['checking', 'writing', 'writing', 'writing', 'packaging', 'verifying', 'final_check'])
+    // One check, before writing. There is no second one after the files are written.
+    expect(array_column($progress->calls, 'phase'))->toBe(['checking', 'writing', 'writing', 'writing', 'packaging', 'verifying'])
         ->and($progress->calls[0])->toBe(['phase' => 'checking', 'done' => 0, 'total' => 5, 'parts_done' => null, 'parts_total' => null])
-        ->and($progress->calls[2])->toBe(['phase' => 'writing', 'done' => 3, 'total' => 5, 'parts_done' => 1, 'parts_total' => 2])
-        ->and($progress->calls[6])->toBe(['phase' => 'final_check', 'done' => 5, 'total' => 5, 'parts_done' => 2, 'parts_total' => 2]);
+        ->and($progress->calls[2])->toBe(['phase' => 'writing', 'done' => 3, 'total' => 5, 'parts_done' => 1, 'parts_total' => 2]);
     $ready = $this->service->show($this->id);
     expect($ready->status)->toBe('file_ready')->and((array) $ready)->not->toHaveKey('progress')->and($progress->read($this->id))->toBeNull();
+});
+
+// One full check per step (Monther, Nov 18, 2026: "just one check enough"). The run of that day read every member
+// against the live rows about eleven times. These count the full member checks each step makes.
+function smsCountingRecords(): SmsRecordExportRepository
+{
+    $records = new class extends SmsRecordExportRepository {
+        /** @var list<string> the kind asked for by each assertFrozen */
+        public array $kinds = [];
+        /** How many times every member was read against the live rows. */
+        public int $memberChecks = 0;
+        public function assertFrozen(string $requestId, int $expected, bool $pendingIds = false, string $check = self::CHECK_ALL): void
+        {
+            $this->kinds[] = $check;
+            parent::assertFrozen($requestId, $expected, $pendingIds, $check);
+        }
+        public function assertCurrentStates(string $requestId): void
+        {
+            $this->memberChecks++;
+            parent::assertCurrentStates($requestId);
+        }
+    };
+    Container::getInstance()->instance(SmsRecordExportRepository::class, $records);
+
+    return $records;
+}
+
+function smsVersionedBindCache(): void
+{
+    $container = Container::getInstance();
+    config(['cache' => ['default' => 'array', 'stores' => ['file' => ['driver' => 'array'], 'array' => ['driver' => 'array']], 'prefix' => 'sms-test']]);
+    $container->instance('cache', new CacheManager($container));
+    Facade::clearResolvedInstances();
+}
+
+test('the file step reads every member once, before it writes, and never after', function (): void {
+    $records = smsCountingRecords();
+    ($this->prepareApprovalVersion)();
+    expect($this->service->show($this->id)->status)->toBe('file_ready')
+        ->and($records->memberChecks)->toBe(1)->and($records->kinds)->toBe([SmsRecordExportRepository::CHECK_ALL]);
+});
+
+test('approval reads every member twice on the worker: before any SMS ID exists and when it records them', function (): void {
+    config(['sms-exports.approve_at_once' => true]);
+    ($this->prepareApprovalVersion)();
+    $records = smsCountingRecords();
+    $this->service->requestApprove($this->id, 'editor@example.invalid');
+    expect($records->memberChecks)->toBe(0)->and($records->kinds)->toBe([])
+        ->and($this->service->show($this->id)->status)->toBe('approving');
+    $this->service->markApproved($this->id);
+    expect($this->service->show($this->id)->status)->toBe('approved')
+        ->and($records->kinds)->toBe([SmsRecordExportRepository::CHECK_ALL, SmsRecordExportRepository::CHECK_CONTENT,
+            SmsRecordExportRepository::CHECK_CONTENT, SmsRecordExportRepository::CHECK_ALL])
+        ->and($records->memberChecks)->toBe(2)
+        ->and($this->db->table('TblSMSHistory')->count())->toBe(5);
+});
+
+test('with approve at once switched off the click still runs its own two checks', function (): void {
+    config(['sms-exports.approve_at_once' => false]);
+    ($this->prepareApprovalVersion)();
+    $records = smsCountingRecords();
+    $this->service->requestApprove($this->id, 'editor@example.invalid');
+    expect($records->memberChecks)->toBe(2);
+    $this->service->markApproved($this->id);
+    expect($records->memberChecks)->toBe(4)->and($this->service->show($this->id)->status)->toBe('approved');
+});
+
+test('an approval retry that finds its SMS IDs saved runs the full check before it goes on', function (): void {
+    config(['sms-exports.approve_at_once' => true]);
+    ($this->prepareApprovalVersion)();
+    $this->service->requestApprove($this->id, 'editor@example.invalid');
+    $this->service->interruptBeforeApprovalFiles = true;
+    expect(fn () => $this->service->markApproved($this->id))->toThrow(RuntimeException::class, 'Synthetic interruption');
+    expect($this->db->table('TblSMSDrops')->count())->toBe(2);
+    $records = smsCountingRecords();
+    $this->service->markApproved($this->id);
+    expect($records->kinds)->toBe([SmsRecordExportRepository::CHECK_ALL, SmsRecordExportRepository::CHECK_CONTENT, SmsRecordExportRepository::CHECK_ALL])
+        ->and($records->memberChecks)->toBe(2)->and($this->service->show($this->id)->status)->toBe('approved');
+});
+
+test('someone who opts out after the files are made is caught by the worker and nobody is recorded', function (): void {
+    smsVersionedBindCache();
+    config(['sms-exports.approve_at_once' => true]);
+    ($this->prepareApprovalVersion)();
+    $this->db->table('TblProspects')->where('PK', $this->db->table('TblProspectsExport')->min('Prospect_PK'))->update(['Opt_Out' => 1]);
+    $this->service->requestApprove($this->id, 'editor@example.invalid');
+    $this->service->markApproved($this->id);
+    $view = $this->service->show($this->id);
+    expect($view->status)->toBe('file_ready')->and($view->can_remove_held)->toBeTrue()
+        ->and($view->approval_hold)->toContain('frozen SMS member')
+        ->and($this->db->table('TblSMSDrops')->count())->toBe(0)->and($this->db->table('TblSMSHistory')->count())->toBe(0)
+        ->and((int) $this->db->table('TblProspects')->sum('SMS_Attempts'))->toBe(0);
+});
+
+test('the rebuild after held people are taken out checks content and debt but does not read every member again', function (): void {
+    ($this->prepareApprovalVersion)();
+    $this->db->table('TblSMSRuns')->update(['Status' => 'building_file', 'File_Path' => null, 'File_Bytes' => null, 'File_Sha256' => null,
+        'File_At' => null, 'Artifact_Manifest_JSON' => null]);
+    $bundle = new Cmd\Reports\Services\SmsRunArtifactBundle;
+    expect($bundle->quarantine($this->versionedDirectory.'/runs/'.$this->id))->not->toBeNull();
+    $bundle->cleanup($this->versionedDirectory.'/runs/'.$this->id);
+    $records = smsCountingRecords();
+    $this->service->rebuildAfterRemovalForTest($this->id);
+    expect($this->service->show($this->id)->status)->toBe('file_ready')
+        ->and($records->memberChecks)->toBe(0)->and($records->kinds)->toBe([SmsRecordExportRepository::CHECK_DEBT]);
+});
+
+test('the rebuild after a removal still stops on a debt the removal scan does not look at', function (): void {
+    ($this->prepareApprovalVersion)();
+    $this->db->table('TblSMSRuns')->update(['Status' => 'building_file']);
+    $this->db->table('TblProspectsExport')->where('Prospect_PK', $this->db->table('TblProspectsExport')->max('Prospect_PK'))->update(['Debt_Amount' => 0]);
+    expect(fn () => $this->service->rebuildAfterRemovalForTest($this->id))->toThrow(RuntimeException::class);
+    expect($this->service->show($this->id)->status)->toBe('building_file');
+});
+
+test('a plain file build or retry reads every member even right after a removal', function (): void {
+    ($this->prepareApprovalVersion)();
+    $this->db->table('TblSMSRuns')->update(['Status' => 'building_file']);
+    $records = smsCountingRecords();
+    $this->service->buildFile($this->id);
+    expect($records->memberChecks)->toBe(1)->and($records->kinds)->toBe([SmsRecordExportRepository::CHECK_ALL]);
+});
+
+test('the file step check opens the review download for half an hour and then the download checks for itself', function (): void {
+    smsVersionedBindCache();
+    ($this->prepareApprovalVersion)();
+    $check = app(Cmd\Reports\Services\SmsPendingDownloadCheck::class);
+    $records = smsCountingRecords();
+    expect($check->passed($this->id))->toBeTrue();
+    expect(is_file($this->service->downloadPath($this->id)))->toBeTrue()->and($records->memberChecks)->toBe(0);
+    Carbon::setTestNow(now()->addSeconds(Cmd\Reports\Services\SmsPendingDownloadCheck::PASS_SECONDS + 1));
+    expect($check->passed($this->id))->toBeFalse();
+    expect(is_file($this->service->downloadPath($this->id)))->toBeTrue()->and($records->memberChecks)->toBe(1);
+});
+
+test('a hold at approval closes the open download and a held download offers to take the people out', function (): void {
+    smsVersionedBindCache();
+    config(['sms-exports.approve_at_once' => true]);
+    ($this->prepareApprovalVersion)();
+    $check = app(Cmd\Reports\Services\SmsPendingDownloadCheck::class);
+    expect($check->passed($this->id))->toBeTrue()->and($this->service->show($this->id)->can_remove_held)->toBeFalse();
+    $this->db->table('TblProspects')->where('PK', $this->db->table('TblProspectsExport')->min('Prospect_PK'))->update(['Opt_Out' => 1]);
+    // The pass is still open, so this download does not see the change. Approve does.
+    expect(is_file($this->service->downloadPath($this->id)))->toBeTrue();
+    $this->service->requestApprove($this->id, 'editor@example.invalid');
+    $this->service->markApproved($this->id);
+    expect($this->service->show($this->id)->status)->toBe('file_ready')->and($check->passed($this->id))->toBeFalse();
+    expect(fn () => $this->service->downloadPath($this->id))->toThrow(Cmd\Reports\Services\SmsFrozenEligibilityHold::class);
+});
+
+test('a hold first found by a download lights the remove held button', function (): void {
+    smsVersionedBindCache();
+    ($this->prepareApprovalVersion)();
+    Carbon::setTestNow(now()->addSeconds(Cmd\Reports\Services\SmsPendingDownloadCheck::PASS_SECONDS + 1));
+    $this->db->table('TblSMSRuns')->update(['Updated_At' => now('UTC')->format('Y-m-d H:i:s')]);
+    $this->db->table('TblProspects')->where('PK', $this->db->table('TblProspectsExport')->min('Prospect_PK'))->update(['Opt_Out' => 1]);
+    expect($this->service->show($this->id)->can_remove_held)->toBeFalse();
+    expect(fn () => $this->service->downloadPath($this->id))->toThrow(Cmd\Reports\Services\SmsFrozenEligibilityHold::class);
+    expect($this->service->show($this->id)->can_remove_held)->toBeTrue();
+    // The worker's check for a big file does the same.
+    $this->service->requestRemoveHeld($this->id, 'editor@example.invalid');
+    $this->db->table('TblSMSRuns')->update(['Status' => 'file_ready', 'Progress_Step' => null]);
+    expect($this->service->show($this->id)->can_remove_held)->toBeFalse();
+    $this->service->runPendingDownloadCheck($this->id);
+    expect($this->service->show($this->id)->can_remove_held)->toBeTrue();
+});
+
+// The tick box at Approve (Monther, Nov 18, 2026: "add a check box when approve to select if you want to send emails or what").
+function smsVersionedBindHandoffChoice(): void
+{
+    smsVersionedBindAutomaticHandoff();
+    (require dirname(__DIR__, 2).'/database/sms-migrations/2026_11_19_000001_add_sms_run_handoff_choice.php')->up();
+}
+
+test('with the choice stored an approval without the tick publishes and emails nothing', function (): void {
+    ($this->prepareApprovalVersion)(); smsVersionedBindHandoffChoice();
+    expect($this->service->show($this->id)->handoff['after_approval'])->toBe('choice');
+    $this->service->requestApprove($this->id, 'editor@example.invalid');
+    expect((int) $this->db->table('TblSMSRuns')->value('Handoff_Requested'))->toBe(0)
+        ->and($this->service->show($this->id)->handoff['after_approval'])->toBe('not_requested');
+    $this->service->markApproved($this->id);
+    $view = $this->service->show($this->id);
+    expect($view->status)->toBe('approved')->and($view->handoff['after_approval'])->toBe('not_requested')
+        ->and($view->handoff)->not->toHaveKey('automatic')
+        ->and($this->db->table('TblSMSAutomaticHandoffs')->count())->toBe(0)
+        ->and($this->db->table('TblSMSEmailOutbox')->count())->toBe(0)
+        ->and($this->db->table('TblSMSFilePublications')->count())->toBe(0)
+        ->and($this->service->automaticQueueRequests)->toBe([$this->id], 'the queue request is asked and finds nothing saved')
+        ->and($this->db->table('TblSMSHistory')->count())->toBe(5);
+    expect($this->service->history()['items'][0]->handoff['after_approval'])->toBe('not_requested');
+});
+
+test('with the choice stored an approval with the tick saves the handoff once and keeps the choice on a retry', function (): void {
+    ($this->prepareApprovalVersion)(); smsVersionedBindHandoffChoice();
+    $this->service->requestApprove($this->id, 'editor@example.invalid', true);
+    expect((int) $this->db->table('TblSMSRuns')->value('Handoff_Requested'))->toBe(1);
+    // A second click, now without the tick, is the same approval: the first choice stands.
+    $this->service->requestApprove($this->id, 'editor@example.invalid', false);
+    expect((int) $this->db->table('TblSMSRuns')->value('Handoff_Requested'))->toBe(1);
+    $this->service->interruptBeforeApprovalFiles = true;
+    expect(fn () => $this->service->markApproved($this->id))->toThrow(RuntimeException::class, 'Synthetic interruption');
+    expect($this->db->table('TblSMSAutomaticHandoffs')->count())->toBe(0);
+    $this->service->markApproved($this->id);
+    $row = $this->db->table('TblSMSAutomaticHandoffs')->first();
+    $view = $this->service->show($this->id);
+    expect($row->Request_ID)->toBe($this->id)->and($row->State)->toBe('queued')
+        ->and($view->status)->toBe('approved')->and($view->handoff['after_approval'])->toBe('requested');
+    $this->service->markApproved($this->id);
+    expect($this->db->table('TblSMSAutomaticHandoffs')->count())->toBe(1);
+});
+
+test('the tick is refused out loud when the email cannot go and nothing is approved', function (string $case): void {
+    ($this->prepareApprovalVersion)();
+    if ($case === 'switched off') {
+        smsVersionedBindHandoffChoice(); config(['sms-exports.handoff_automatic' => false]);
+        expect($this->service->show($this->id)->handoff['after_approval'])->toBe('off');
+    } elseif ($case === 'no column') {
+        smsVersionedBindAutomaticHandoff();
+        expect($this->service->show($this->id)->handoff['after_approval'])->toBe('automatic');
+    }
+    expect(fn () => $this->service->requestApprove($this->id, 'editor@example.invalid', true))->toThrow(HttpException::class, 'cannot be emailed');
+    expect($this->db->table('TblSMSRuns')->value('Status'))->toBe('file_ready');
+    // Without the tick the same batch approves as always.
+    $this->service->requestApprove($this->id, 'editor@example.invalid');
+    expect($this->db->table('TblSMSRuns')->value('Status'))->toBe('approving');
+})->with(['switched off', 'no column', 'nothing set up']);
+
+test('an approval sent back by a held person forgets its choice so the next approval asks again', function (): void {
+    config(['sms-exports.approve_at_once' => true]);
+    ($this->prepareApprovalVersion)(); smsVersionedBindHandoffChoice();
+    $this->db->table('TblProspects')->where('PK', $this->db->table('TblProspectsExport')->min('Prospect_PK'))->update(['Opt_Out' => 1]);
+    $this->service->requestApprove($this->id, 'editor@example.invalid', true);
+    expect((int) $this->db->table('TblSMSRuns')->value('Handoff_Requested'))->toBe(1);
+    $this->service->markApproved($this->id);
+    $run = $this->db->table('TblSMSRuns')->first();
+    expect($run->Status)->toBe('file_ready')->and($run->Handoff_Requested)->toBeNull()
+        ->and($this->service->show($this->id)->handoff['after_approval'])->toBe('choice')
+        ->and($this->db->table('TblSMSAutomaticHandoffs')->count())->toBe(0);
+});
+
+test('the approve route reads the tick as a yes or no and nothing else', function (): void {
+    ($this->prepareApprovalVersion)(); smsVersionedBindHandoffChoice();
+    $call = function (array $body) {
+        $request = Request::create('/sms', 'POST', $body);
+        $request->attributes->set('cmd_user', ['email' => 'editor@example.invalid']);
+
+        return $this->controller->approve($request, $this->id);
+    };
+    expect(fn () => $call(['confirmed_approval' => true, 'email_files' => 'maybe']))->toThrow(ValidationException::class);
+    expect($this->db->table('TblSMSRuns')->value('Status'))->toBe('file_ready');
+    expect($call(['confirmed_approval' => true, 'email_files' => true])->getStatusCode())->toBe(202);
+    expect((int) $this->db->table('TblSMSRuns')->value('Handoff_Requested'))->toBe(1);
+});
+
+test('an approve request from a page that knows no tick box emails nothing', function (): void {
+    ($this->prepareApprovalVersion)(); smsVersionedBindHandoffChoice();
+    $request = Request::create('/sms', 'POST', ['confirmed_approval' => true]);
+    $request->attributes->set('cmd_user', ['email' => 'editor@example.invalid']);
+    expect($this->controller->approve($request, $this->id)->getStatusCode())->toBe(202);
+    expect((int) $this->db->table('TblSMSRuns')->value('Handoff_Requested'))->toBe(0);
+    $this->service->markApproved($this->id);
+    expect($this->db->table('TblSMSAutomaticHandoffs')->count())->toBe(0);
+});
+
+test('the overview carries the new-run wait: nothing while nothing is in the way, and never beside an open run', function (): void {
+    expect($this->service->overview())->toHaveKey('new_run_wait')->and($this->service->overview()['new_run_wait'])->toBeNull();
+    config(['sms-exports.stored_debt_selection' => true]);
+    // This in-memory database is not SQL Server, so there are no stored values to wait for.
+    expect($this->service->overview()['new_run_wait'])->toBeNull();
+    ($this->prepareVersioned)();
+    expect($this->service->overview()['open'])->not->toBeNull()->and($this->service->overview()['new_run_wait'])->toBeNull();
 });
