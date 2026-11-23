@@ -56,6 +56,7 @@ use Cmd\Reports\Console\Commands\GenerateCancelRequestsAgentReport\GenerateCance
 use Cmd\Reports\Console\Commands\GenerateRetentionBonusCommission\GenerateRetentionBonusCommission;
 use Cmd\Reports\Console\Commands\GenerateNSFCommissionReport\GenerateNSFCommissionReport;
 use Cmd\Reports\Console\Commands\ExportNsfShadow;
+use Cmd\Reports\Console\Commands\ReadNsfTeamLeaderShadow;
 use Cmd\Reports\Console\Commands\ReadNsfWorkbook;
 use Cmd\Reports\Console\Commands\GenerateEnrollmentBonusReport\GenerateEnrollmentBonusReport;
 use Cmd\Reports\Console\Commands\GenerateLendingTowerInvoices\GenerateLendingTowerInvoices;
@@ -243,6 +244,7 @@ class ReportsServiceProvider extends ServiceProvider
                 GenerateRetentionBonusCommission::class,
                 GenerateNSFCommissionReport::class,
                 ExportNsfShadow::class,
+                ReadNsfTeamLeaderShadow::class,
                 ReadNsfWorkbook::class,
                 GenerateEnrollmentBonusReport::class,
                 GenerateLendingTowerInvoices::class,

@@ -7,6 +7,7 @@ namespace Cmd\Reports\Console\Commands\GenerateRetentionManagerCommission;
 use Cmd\Reports\Services\CommissionRosterProvider;
 use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\EmailSenderService;
+use Cmd\Reports\Services\NsfStructuredTeamLeader;
 use Cmd\Reports\Services\RetentionCommissionReportBuilder;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
@@ -263,6 +264,43 @@ class GenerateRetentionManagerCommission extends Command
             }
             return [...$snapshot, 'periodStart' => $startDate, 'periodEnd' => $endDate];
         } finally { $this->output = $previousOutput; }
+    }
+
+    /** Calculate leadership from the corresponding trusted v1 query-only NSF export. */
+    public function buildPayrollReviewNsfStructuredSnapshot(string $period, string $runId, array $envelope): array
+    {
+        $inputs = NsfStructuredTeamLeader::inputs($period, $runId, $envelope);
+        $roster = [];
+        foreach ($inputs['rosters'] as $names) {
+            $seen = [];
+            foreach ($names as $name) {
+                $key = $this->anthonyAgentKey($name);
+                if (isset($seen[$key])) {
+                    throw new \InvalidArgumentException('An NSF structured roster has an ambiguous identity.');
+                }
+                $seen[$key] = true;
+                $roster[$key] = $name;
+            }
+        }
+
+        $priorRoster = $this->anthonyRosterCache;
+        $priorValidity = $this->payrollFrozenNsfValidity;
+        $priorCalculation = $this->payrollCalculationContext;
+        $this->anthonyRosterCache = array_values($roster);
+        $this->payrollFrozenNsfValidity = true;
+        $this->payrollCalculationContext = self::currentPayrollCalculationContext();
+        try {
+            return [
+                ...$this->buildAnthonyPayrollSnapshot($inputs['rows']),
+                'nsfReadinessRunIds' => $inputs['readinessIds'],
+                'periodStart' => $period,
+                'periodEnd' => $inputs['periodEnd'],
+            ];
+        } finally {
+            $this->anthonyRosterCache = $priorRoster;
+            $this->payrollFrozenNsfValidity = $priorValidity;
+            $this->payrollCalculationContext = $priorCalculation;
+        }
     }
 
     /** Company readiness metadata from this saved file only; never reads mutable SQL. */
