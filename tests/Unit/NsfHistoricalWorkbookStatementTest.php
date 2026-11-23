@@ -239,7 +239,8 @@ final class NsfHistoricalWorkbookStatementTest extends TestCase
         return [['digest'], ['alias collision'], ['formula total'], ['fractional cent'], ['summary mismatch'], ['duplicate contact'],
             ['mixed versions'], ['wrong historical month'], ['wrong historical company'], ['wrong modern cutoff'],
             ['wrong old cutoff'], ['wrong old final after'], ['positive mismatch no detail'], ['positive mismatch partial flags'],
-            ['summary ratio without action field'], ['summary actions exceed assignments'], ['summary clears exceed assignments']];
+            ['summary ratio without action field'], ['summary actions exceed assignments'], ['summary clears exceed assignments'],
+            ['positive counts with no matching detail']];
     }
 
     #[DataProvider('invalidEvidence')]
@@ -265,6 +266,8 @@ final class NsfHistoricalWorkbookStatementTest extends TestCase
             'wrong old final after' => $book->createSheet()->setTitle('Run Status')->fromArray(['Final runs may start after (UTC)', '2098-04-06 07:00:00.000000']),
             'positive mismatch no detail' => [$summary->setCellValue('I2', 2.5), $book->removeSheetByIndex(0)],
             'positive mismatch partial flags' => [$summary->setCellValue('I2', 2.5), $book->getSheetByName('NSF Data')->setCellValue('E2', null)],
+            'positive counts with no matching detail' => $book->getSheetByName('NSF Data')->setCellValue('B2', 'Other private earner')
+                ->setCellValue('B3', 'Other private earner'),
         };
         $sha = $this->save($book);
         $this->expectException(\RuntimeException::class);

@@ -253,7 +253,10 @@ final class CustomerServiceCalculationSnapshot
             false => [$exactRows],
             null => $exactRows === $normalizedRows ? [$exactRows] : [$exactRows, $normalizedRows],
         };
-        if ($groups === [[]]) return null;
+        if ($groups === [[]]) {
+            if ($assignments > 0.0 || $actions > 0.0 || $clears > 0.0 || $saved['ratio'] > 0.0) self::invalid();
+            return null;
+        }
         $candidates = [];
         foreach ($groups as $rows) {
             if ($assignments !== null && count($rows) !== (int) $assignments) continue;
