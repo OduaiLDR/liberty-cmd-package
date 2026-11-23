@@ -110,21 +110,205 @@ final class CustomerServiceCalculationSnapshot
     {
         if (!is_array($artifact) || ($artifact['key'] ?? null) !== $key || ($artifact['period'] ?? $period) !== $period
             || !is_array($artifact['context'] ?? null) || !is_string($artifact['path'] ?? null)
-            || is_link($artifact['path']) || !is_file($artifact['path']) || !is_readable($artifact['path'])
-            || !is_string($artifact['sha256'] ?? null) || !preg_match('/^[a-f0-9]{64}$/D', $artifact['sha256'])
             || !is_string($artifact['contextSha256'] ?? null) || !preg_match('/^[a-f0-9]{64}$/D', $artifact['contextSha256'])
             || hash('sha256', json_encode($artifact['context'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)) !== $artifact['contextSha256']) self::invalid();
-        clearstatcache(true, $artifact['path']);
-        if (filesize($artifact['path']) < 4 || filesize($artifact['path']) > 32 * 1024 * 1024
-            || isset($artifact['byteLength']) && $artifact['byteLength'] !== filesize($artifact['path'])
-            || !hash_equals($artifact['sha256'], (string) hash_file('sha256', $artifact['path']))) self::invalid();
+        self::validateWorkbookFile($artifact['path'], $artifact['sha256'] ?? null, $artifact['byteLength'] ?? null);
+    }
+
+    private static function validateWorkbookFile(string $path, mixed $sha256, mixed $byteLength = null): void
+    {
+        if (preg_match('~^[a-z][a-z0-9+.-]*://~i', $path) || is_link($path) || !is_file($path) || !is_readable($path)
+            || !is_string($sha256) || !preg_match('/^[a-f0-9]{64}$/D', $sha256)) self::invalid();
+        clearstatcache(true, $path);
+        if (filesize($path) < 4 || filesize($path) > 32 * 1024 * 1024
+            || $byteLength !== null && $byteLength !== filesize($path)
+            || !hash_equals($sha256, (string) hash_file('sha256', $path))) self::invalid();
         $zip = new ZipArchive;
-        if ($zip->open($artifact['path'], ZipArchive::RDONLY) !== true) self::invalid();
+        if ($zip->open($path, ZipArchive::RDONLY) !== true) self::invalid();
         try {
             $size = 0;
             for ($i = 0; $i < $zip->numFiles; $i++) { $entry = $zip->statIndex($i); if (!is_array($entry)) self::invalid(); $size += (int) ($entry['size'] ?? 0); }
             if ($size > 128 * 1024 * 1024 || $zip->locateName('xl/workbook.xml') === false || $zip->locateName('[Content_Types].xml') === false) self::invalid();
         } finally { $zip->close(); }
+    }
+
+    /** Read a workbook selected from a trusted historical record, without creating a capture or claiming roster coverage. */
+    public static function forPinnedNsfWorkbook(string $path, string $sha256, string $period, string $source, string $agent): array
+    {
+        $agentKey = self::key($agent);
+        self::validateArchivedSelection($period, 'nsf', $agentKey, $source);
+        if ($source === 'both' || $agentKey === 'unassigned agents') self::invalid();
+        self::validateWorkbookFile($path, $sha256);
+        $reader = IOFactory::createReader('Xlsx');
+        $reader->setReadEmptyCells(false);
+        $reader->setLoadSheetsOnly(['Commission', 'Data', 'Agent Summary', 'NSF Data', 'Run Status']);
+        $book = $reader->load($path);
+        try {
+            $hasRunMetadata = self::checkPinnedNsfScope($book, $period, $source);
+            $old = $book->getSheetByName('Commission');
+            $modern = $book->getSheetByName('Agent Summary');
+            if (($old === null) === ($modern === null)) self::invalid();
+            $summary = $modern ?? $old;
+            $data = $book->getSheetByName($modern ? 'NSF Data' : 'Data');
+            if ($book->getSheetByName($modern ? 'Data' : 'NSF Data')) self::invalid();
+            $columns = self::headers($summary);
+            // The original PHP formatter called its NSF employee column "NGO".
+            if (!isset($columns['commission']) || isset($columns['ngo']) === isset($columns['nsf agent'])) self::invalid();
+            $nameColumn = $columns['nsf agent'] ?? $columns['ngo'];
+            $row = null;
+            $sourceName = null;
+            $lastRow = $summary->getHighestDataRow();
+            if ($lastRow > 10000 || ($data && $data->getHighestDataRow() > 100000)) self::invalid();
+            $headers = $data ? self::headers($data) : [];
+            if (isset($headers['nsf returned date'])) {
+                $lastContact = $data->getHighestDataRow();
+                for ($r = 2; $r <= $lastContact; $r++) {
+                    $returned = self::value($data, $headers['nsf returned date'], $r);
+                    if (!self::missingOriginalValue($returned) && substr(self::dateValue($returned), 0, 7) !== substr($period, 0, 7)) self::invalid();
+                }
+            }
+            for ($r = 2; $r <= $lastRow; $r++) {
+                $rawName = self::value($summary, $nameColumn, $r);
+                if (is_string($rawName) && str_starts_with($rawName, '=')) self::invalid();
+                $name = self::key((string) $rawName);
+                if (self::archivedAgentKey($name) !== self::archivedAgentKey($agentKey)) continue;
+                if ($row !== null) self::invalid();
+                $row = $r;
+                $sourceName = (string) $rawName;
+            }
+            $amountCents = $row === null ? null : self::nsfCents(self::value($summary, $columns['commission'], $row));
+            $status = $row === null ? 'missing' : ($amountCents === 0 ? 'verified' : 'total_only');
+            $lines = [];
+            if ($amountCents !== null) {
+                // The "NGO" layout priced exact raw strings. The later normalized calculator added run metadata.
+                $normalized = isset($columns['ngo']) ? false : ($hasRunMetadata ? true : null);
+                $detail = self::pinnedNsfLines($summary, $data, $columns, $headers, $row, $sourceName, $normalized, $amountCents);
+                if ($detail !== null) {
+                    $lines = $detail;
+                    $status = 'verified';
+                }
+            }
+            if (is_link($path) || !hash_equals($sha256, (string) hash_file('sha256', $path))) self::invalid();
+            return ['kind' => 'nsf_employee_statement_v1', 'period' => $period, 'source' => $source,
+                'agentKey' => $agentKey, 'workbookSha256' => $sha256, 'status' => $status, 'amountCents' => $amountCents, 'lines' => $lines];
+        } finally { $book->disconnectWorksheets(); }
+    }
+
+    private static function pinnedNsfLines(Worksheet $summary, ?Worksheet $data, array $columns, array $headers, int $row, string $sourceName, ?bool $normalized, int $amountCents): ?array
+    {
+        $rate = self::savedNsfRate($summary, $columns, $row);
+        $rateCents = $rate === null ? null : self::nsfCents($rate);
+        $saved = [];
+        foreach (['clears', 'assignments', 'actions', 'ratio'] as $field) {
+            $value = isset($columns[$field]) ? self::value($summary, $columns[$field], $row) : null;
+            $saved[$field] = self::missingOriginalValue($value) ? null : self::number($value);
+            $number = $saved[$field];
+            if ($number !== null && ($number < 0 || ($field === 'ratio' ? $number > 1 : floor($number) !== $number))) self::invalid();
+        }
+        $clears = $saved['clears'];
+        // Check independent saved facts even when the workbook cannot explain every account.
+        $assignments = $saved['assignments'];
+        $actions = $saved['actions'];
+        if ($assignments !== null && (($actions !== null && $actions > $assignments)
+            || ($clears !== null && $clears > $assignments)
+            || ($actions !== null && $saved['ratio'] !== null
+                && round($actions / max(1, $assignments), 4) !== round($saved['ratio'], 4)))) self::invalid();
+        if (($amountCents > 0 && ($clears === 0.0 || $rateCents === 0))
+            || ($rateCents !== null && $clears !== null && $rateCents * $clears !== (float) $amountCents)) self::invalid();
+        if (!$data || !isset($headers['agent'])) return null;
+        $exactRows = $normalizedRows = [];
+        $sourceKey = self::nsfProducerKey($sourceName);
+        $last = $data->getHighestDataRow();
+        for ($r = 2; $r <= $last; $r++) {
+            $name = (string) self::value($data, $headers['agent'], $r);
+            if ($name === $sourceName) $exactRows[] = $r;
+            if (self::nsfProducerKey($name) === $sourceKey) $normalizedRows[] = $r;
+        }
+        $groups = match ($normalized) {
+            true => [$normalizedRows],
+            false => [$exactRows],
+            null => $exactRows === $normalizedRows ? [$exactRows] : [$exactRows, $normalizedRows],
+        };
+        if ($groups === [[]]) return null;
+        $candidates = [];
+        foreach ($groups as $rows) {
+            if ($assignments !== null && count($rows) !== (int) $assignments) continue;
+            $facts = self::nsfContactFacts($data, $headers, $rows, true);
+            $detail = self::matchPinnedNsfEvidence($facts, $headers, $saved, $rateCents, $amountCents);
+            // Original NGO workbooks could contain the same contact twice. Their literal total is still readable.
+            if ($detail !== false && $facts['duplicateIds']) $detail = $normalized === false ? null : false;
+            if ($detail !== false) $candidates[] = $detail;
+        }
+        if (!$candidates) self::invalid();
+        // In an unmarked transition-era workbook both grouping rules can fit incomplete evidence.
+        if (count($candidates) === 2 && $candidates[0] !== $candidates[1]) return null;
+        return $candidates[0];
+    }
+
+    private static function nsfProducerKey(string $name): string
+    {
+        // Exact normalization of GenerateNSFCommissionReport::buildCommissionRows from 2686bdd onward.
+        return strtolower((string) preg_replace('/\s+/', ' ', trim($name)));
+    }
+
+    /** False means this grouping contradicts the summary; null preserves the recorded total without lines. */
+    private static function matchPinnedNsfEvidence(array $facts, array $headers, array $saved, ?int $rateCents, int $amountCents): array|false|null
+    {
+        $clears = $saved['clears'];
+        $eligible = count($facts['eligible']);
+        $possible = $eligible + $facts['unknownFlags'];
+        $denominator = max(1, $facts['assignments']);
+        $minRatio = round($facts['actions'] / $denominator, 4);
+        $maxRatio = round(($facts['actions'] + $facts['unknownActions']) / $denominator, 4);
+        if (($amountCents > 0 && $possible === 0)
+            || ($clears !== null && ($eligible > $clears || $possible < $clears))
+            || ($rateCents !== null && ($eligible * $rateCents > $amountCents || $possible * $rateCents < $amountCents))
+            || ($saved['assignments'] !== null && $saved['assignments'] !== (float) $facts['assignments'])
+            || ($saved['actions'] !== null && ($facts['actions'] > $saved['actions'] || $facts['actions'] + $facts['unknownActions'] < $saved['actions']))
+            || ($saved['ratio'] !== null && (round($saved['ratio'], 4) < $minRatio || round($saved['ratio'], 4) > $maxRatio))) return false;
+        if ($amountCents === 0) return [];
+        if ($clears === null || $rateCents === null || $facts['unknownFlags'] || $facts['incompleteDetail'] || !isset($headers['id'])) return null;
+        if ($eligible > 20000) self::invalid();
+        return array_map(static fn (array $line): array => ['clientId' => $line['clientId'], 'rateCents' => $rateCents, 'amountCents' => $rateCents]
+            + array_intersect_key($line, ['paymentDate' => true]), $facts['eligible']);
+    }
+
+    /** Old files can lack scope metadata. When it exists it must agree with the supplied archive record. */
+    private static function checkPinnedNsfScope(\PhpOffice\PhpSpreadsheet\Spreadsheet $book, string $period, string $source): bool
+    {
+        $properties = $book->getProperties();
+        $timing = NsfReportReadiness::timing($period);
+        foreach (['NSF Payment Cutoff (Pacific)' => 'cutoffPacific', 'NSF Final Runs After (UTC)' => 'finalAfter'] as $field => $key) {
+            $saved = $properties->getCustomPropertyValue($field);
+            if ($saved !== null && $saved !== $timing[$key]) self::invalid();
+        }
+        $sheet = $book->getSheetByName('Run Status');
+        $hasCutoff = $properties->getCustomPropertyValue('NSF Final Runs After (UTC)') !== null;
+        if (!$sheet) return $hasCutoff;
+        $lastRow = $sheet->getHighestDataRow();
+        if ($lastRow > 1000) self::invalid();
+        $brands = $source === 'ldr' ? ['ldr', 'liberty debt relief'] : ['plaw', 'progress law'];
+        $seen = [];
+        for ($row = 1; $row <= $lastRow; $row++) {
+            $key = self::key((string) self::value($sheet, 1, $row));
+            if (!in_array($key, ['source', 'period start', 'period end', 'payment cutoff (pacific)', 'final runs may start after (utc)'], true)) continue;
+            if (isset($seen[$key])) self::invalid();
+            $seen[$key] = true;
+            $value = self::value($sheet, 2, $row);
+            if ($key === 'source') {
+                if (!in_array(self::key((string) $value), $brands, true)) self::invalid();
+            } elseif ($key === 'payment cutoff (pacific)' || $key === 'final runs may start after (utc)') {
+                if ($value !== $timing[$key === 'payment cutoff (pacific)' ? 'cutoffPacific' : 'finalAfter']) self::invalid();
+            } elseif (self::dateValue($value) !== ($key === 'period start' ? $period : (new \DateTimeImmutable($period))->format('Y-m-t'))) self::invalid();
+        }
+        return $hasCutoff || isset($seen['source'], $seen['period start']);
+    }
+
+    private static function nsfCents(mixed $value): int
+    {
+        $number = self::number($value);
+        if ($number < 0 || $number > 90071992547409 || round($number, 2) !== $number) self::invalid();
+        return (int) round($number * 100);
     }
 
     /** Unpriced original facts are deliberately separate from selected payable calculation lines. */
@@ -330,43 +514,98 @@ final class CustomerServiceCalculationSnapshot
             if (count($matches) !== 1) self::invalid();
             $row = $matches[0];
             if (round(self::number(self::value($summary, $columns['commission'], $row)), 2) !== round($amount, 2)) self::invalid();
-            $rateValue = self::value($summary, $columns['rate'], $row);
-            if ($rateValue === null || $rateValue === '' || is_string($rateValue) && str_starts_with($rateValue, '=')) return null;
-            $rateCell = Coordinate::stringFromColumnIndex($columns['rate']) . $row;
-            $comment = $summary->getComments()[$rateCell] ?? null;
-            if ($comment && stripos($comment->getText()->getPlainText(), 'reconciled from the original frozen commission amount') !== false) return null;
-            $rate = self::number($rateValue);
-            $clears = self::number(self::value($summary, $columns['clears'], $row));
-            if ($clears < 0 || floor($clears) !== $clears) self::invalid();
-            $lines = []; $seen = []; $assignments = $actions = 0;
-            for ($r = 2; $r <= $data->getHighestDataRow(); $r++) {
-                if (self::key((string) self::value($data, $headers['agent'], $r)) !== $agentKey) continue;
-                $id = self::id(self::value($data, $headers['id'], $r));
-                if (isset($seen[$id])) self::invalid();
-                $seen[$id] = true; $assignments++;
-                if (isset($headers['nsf action']) && trim((string) self::value($data, $headers['nsf action'], $r)) !== '') $actions++;
-                $valid = CustomerServiceRosterAmendment::frozenValidity(self::value($data, $headers['valid commission'], $r));
-                if (!$valid) continue;
-                $line = ['clientId' => $id, 'rate' => $rate, 'amount' => $rate];
-                if (isset($headers['cleared date'])) {
-                    $date = self::dateValue(self::value($data, $headers['cleared date'], $r));
+            return self::nsfLines($summary, $data, $columns, $headers, $row, $agentKey);
+        } finally { $book->disconnectWorksheets(); }
+    }
+
+    private static function savedNsfRate(Worksheet $summary, array $columns, int $row): ?float
+    {
+        if (!isset($columns['rate'])) return null;
+        $value = self::value($summary, $columns['rate'], $row);
+        if (self::missingOriginalValue($value)) return null;
+        $cell = Coordinate::stringFromColumnIndex($columns['rate']) . $row;
+        $comment = $summary->getComments()[$cell] ?? null;
+        if ($comment && stripos($comment->getText()->getPlainText(), 'reconciled from the original frozen commission amount') !== false) return null;
+        return self::number($value);
+    }
+
+    private static function missingOriginalValue(mixed $value): bool
+    {
+        return $value === null || $value === '' || (is_string($value) && str_starts_with($value, '='));
+    }
+
+    private static function nsfLines(Worksheet $summary, Worksheet $data, array $columns, array $headers, int $row, string $agentKey): ?array
+    {
+        $rate = self::savedNsfRate($summary, $columns, $row);
+        if ($rate === null) return null;
+        $clears = self::number(self::value($summary, $columns['clears'], $row));
+        if ($clears < 0 || floor($clears) !== $clears) self::invalid();
+        $rows = [];
+        $last = $data->getHighestDataRow();
+        for ($r = 2; $r <= $last; $r++) {
+            if (self::key((string) self::value($data, $headers['agent'], $r)) === $agentKey) $rows[] = $r;
+        }
+        $facts = self::nsfContactFacts($data, $headers, $rows, false);
+        if ($facts['assignments'] === 0) return null;
+        if (!$facts['eligible'] || count($facts['eligible']) !== (int) $clears) self::invalid();
+        foreach (['assignments', 'actions'] as $header) if (isset($columns[$header])
+            && self::number(self::value($summary, $columns[$header], $row)) !== (float) $facts[$header]) self::invalid();
+        if (isset($columns['ratio']) && round(self::number(self::value($summary, $columns['ratio'], $row)), 4)
+            !== round($facts['actions'] / $facts['assignments'], 4)) self::invalid();
+        return array_map(static fn (array $line): array => ['clientId' => $line['clientId'], 'rate' => $rate, 'amount' => $rate]
+            + array_intersect_key($line, ['paymentDate' => true]), $facts['eligible']);
+    }
+
+    private static function nsfContactFacts(Worksheet $data, array $headers, array $rows, bool $allowIncomplete): array
+    {
+        $eligible = $seen = [];
+        $assignments = $actions = $unknownFlags = $unknownActions = 0;
+        $duplicateIds = $incompleteDetail = false;
+        foreach ($rows as $r) {
+            $assignments++;
+            $line = [];
+            if (isset($headers['id'])) {
+                $value = self::value($data, $headers['id'], $r);
+                if ($allowIncomplete && self::missingOriginalValue($value)) {
+                    $incompleteDetail = true;
+                } else {
+                    $id = self::id($value);
+                    if (isset($seen[$id])) {
+                        if (!$allowIncomplete) self::invalid();
+                        $duplicateIds = true;
+                    }
+                    $seen[$id] = true;
+                    $line['clientId'] = $id;
+                }
+            }
+            $action = isset($headers['nsf action']) ? (string) self::value($data, $headers['nsf action'], $r) : '';
+            if ($allowIncomplete && (!isset($headers['nsf action']) || str_starts_with($action, '='))) $unknownActions++;
+            elseif (trim($action) !== '') $actions++;
+            $flag = isset($headers['valid commission']) ? self::value($data, $headers['valid commission'], $r) : null;
+            if ($allowIncomplete && self::missingOriginalValue($flag)) {
+                $unknownFlags++;
+                continue;
+            }
+            if (!CustomerServiceRosterAmendment::frozenValidity($flag)) continue;
+            if (isset($headers['cleared date'])) {
+                $value = self::value($data, $headers['cleared date'], $r);
+                if ($allowIncomplete && is_string($value) && str_starts_with($value, '=')) {
+                    $incompleteDetail = true;
+                } else {
+                    $date = self::dateValue($value);
                     if ($date !== null) $line['paymentDate'] = $date;
                 }
-                $lines[] = $line;
             }
-            if ($assignments === 0) return null;
-            if (count($lines) !== (int) $clears || !$lines) self::invalid();
-            foreach (['assignments' => $assignments, 'actions' => $actions] as $header => $count) if (isset($columns[$header])
-                && self::number(self::value($summary, $columns[$header], $row)) !== (float) $count) self::invalid();
-            if (isset($columns['ratio']) && round(self::number(self::value($summary, $columns['ratio'], $row)), 4) !== round($actions / $assignments, 4)) self::invalid();
-            return $lines;
-        } finally { $book->disconnectWorksheets(); }
+            $eligible[] = $line;
+        }
+        return compact('eligible', 'assignments', 'actions', 'unknownActions', 'unknownFlags', 'duplicateIds', 'incompleteDetail');
     }
 
     private static function headers(Worksheet $sheet): array
     {
         $headers = [];
-        for ($c = 1; $c <= Coordinate::columnIndexFromString($sheet->getHighestDataColumn()); $c++) {
+        $lastColumn = Coordinate::columnIndexFromString($sheet->getHighestDataColumn());
+        for ($c = 1; $c <= $lastColumn; $c++) {
             $value = self::value($sheet, $c, 1);
             if ($value === null || $value === '') continue;
             $key = self::key((string) $value);
