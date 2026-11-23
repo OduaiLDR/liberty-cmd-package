@@ -45,6 +45,8 @@ final class CustomerServiceCalculationSnapshot
     private static function selectArchivedAgent(array $artifacts, string $period, string $report, string $family, string $agentKey, string $sourceScope, ?string $structuredRunId = null): array
     {
         if (count($artifacts) !== 2 || array_diff([$family . '_ldr', $family . '_plaw'], array_keys($artifacts))) self::invalid();
+        $regularLines = $family === 'retention' ? self::regularPayrollLines($artifacts, $period, $agentKey) : [];
+        $requiresWorkbook = $structuredRunId === null && $regularLines === [];
         // Validate both sources even for a one-company request.
         $validated = [];
         $structuredLines = [];
@@ -52,7 +54,7 @@ final class CustomerServiceCalculationSnapshot
         foreach (['ldr', 'plaw'] as $source) {
             $key = $family . '_' . $source;
             $artifact = $artifacts[$key];
-            self::validateArchivedArtifact($artifact, $key, $period, $structuredRunId === null);
+            self::validateArchivedArtifact($artifact, $key, $period, $requiresWorkbook);
             if ($report === 'retention_regular' && isset($artifact['context']['legacyEvidence'])) {
                 $evidence = $artifact['context']['legacyEvidence'];
                 if (($evidence['source'] ?? null) !== $source || ($evidence['period'] ?? null) !== $period
@@ -104,7 +106,8 @@ final class CustomerServiceCalculationSnapshot
                 $entry = self::unavailable($entry, 'The original workbook preserves account data and the saved total, but not verified historical selected line prices.');
                 $entry['originalRows'] = self::legacyOriginalRows($artifact, $period, $sourceAgentKey);
             } elseif ($family === 'retention' && isset($artifact['context']['regularPricing'])) {
-                $entry['lines'] = self::regular($artifact, $period, $sourceAgentKey);
+                $entry['lines'] = isset($regularLines[$source])
+                    ? ($regularLines[$source][$sourceAgentKey] ?? []) : self::regular($artifact, $period, $sourceAgentKey);
             } elseif ($amount != 0.0) {
                 $lines = match (true) {
                     $structuredRunId !== null => $structuredLines[$source][$sourceAgentKey],
@@ -117,7 +120,7 @@ final class CustomerServiceCalculationSnapshot
             }
             if (count($entry['lines']) > 20000) self::invalid();
             if ($entry['status'] === 'verified' && round(array_sum(array_column($entry['lines'], 'amount')), 2) !== round((float) $amount, 2)) self::invalid();
-            if ($structuredRunId === null && (is_link($artifact['path']) || !hash_equals($artifact['sha256'], (string) hash_file('sha256', $artifact['path'])))) self::invalid();
+            if ($requiresWorkbook && (is_link($artifact['path']) || !hash_equals($artifact['sha256'], (string) hash_file('sha256', $artifact['path'])))) self::invalid();
             $components[] = $entry;
         }
         return ['kind' => 'cs_archived_agent_calculation_v1', 'version' => 1, 'period' => $period,
@@ -384,6 +387,7 @@ final class CustomerServiceCalculationSnapshot
             || !preg_match('/^[1-9]\d{3}-(0[1-9]|1[0-2])-01$/D', $period)
             || $agentKey === '' || self::key($agentKey) !== $agentKey) throw new \InvalidArgumentException('Calculation lookup requires an exact normalized employee identity, report kind, source scope and month.');
         $sources = self::sources($artifacts, $period);
+        $regularLines = $reportKind === 'retention' ? self::regularPayrollLines($sources, $period, $agentKey) : [];
         $components = [];
         foreach ($sourceScope === 'both' ? ['ldr', 'plaw'] : [$sourceScope] as $source) {
             $families = $reportKind === 'nsf' ? ['nsf' => 'commission'] : ['retention' => 'commission', 'lookback' => 'bonusCommission'];
@@ -400,7 +404,8 @@ final class CustomerServiceCalculationSnapshot
                 $entry = ['reportKey' => $family . '_' . $source, 'source' => $source, 'artifactSha256' => $artifact['sha256'],
                     'component' => $component, 'amount' => $amount, 'status' => 'verified', 'lines' => []];
                 if ($family === 'retention' && array_key_exists('regularPricing', $artifact['context'])) {
-                    $entry['lines'] = self::regular($artifact, $period, $agentKey);
+                    $entry['lines'] = isset($regularLines[$source])
+                        ? ($regularLines[$source][$agentKey] ?? []) : self::regular($artifact, $period, $agentKey);
                 } elseif ($amount != 0.0) {
                     if ($family === 'retention') $entry = self::unavailable($entry, 'Original regular Retention line prices were not captured.');
                     else {
@@ -484,9 +489,7 @@ final class CustomerServiceCalculationSnapshot
                 }
                 if (isset($headers['applied tier']) && self::number(self::value($sheet, $headers['applied tier'], $r)) !== (float) $row['appliedTier']) self::invalid();
                 if (isset($headers['payable commission']) && self::number(self::value($sheet, $headers['payable commission'], $r)) !== (float) $row['amount']) self::invalid();
-                $selected[$r] = ['clientId' => $row['clientId'], 'retentionDate' => $row['retentionDate'], 'paymentDate' => $row['paymentDate'],
-                    'retainedMonth' => $row['retainedMonth'], 'appliedTier' => $row['appliedTier'],
-                    'rate' => $row['appliedTier'] === 0 ? 0 : $row['rates'][$row['appliedTier'] - 1], 'amount' => $row['amount']];
+                $selected[$r] = self::regularLine($row);
             }
             // A balanced omission could leave an unchanged aggregate. Bind every payable employee row, including tier zero.
             for ($r = 2; $r <= $sheet->getHighestDataRow(); $r++) {
@@ -497,6 +500,50 @@ final class CustomerServiceCalculationSnapshot
             }
             return array_values($selected);
         } finally { $book->disconnectWorksheets(); }
+    }
+
+    private static function regularPayrollLines(array $artifacts, string $period, string $agentKey): array
+    {
+        $inputs = RetentionStructuredCapture::payrollInputs($period, $artifacts);
+        if ($inputs === null) return [];
+        $output = [];
+        foreach ($inputs['rowsBySource'] as $source => $rows) {
+            $context = $artifacts['retention_' . $source]['context'];
+            if (!is_array($context['regularPricing'] ?? null) || !is_array($context['commissionResults'] ?? null)) self::invalid();
+            $proof = RetentionPricingSnapshot::validate($context['regularPricing'], $context['commissionResults']);
+            if ($proof['source'] !== $source || $proof['period'] !== $period) self::invalid();
+            $output[$source] = self::regularStructuredLines($rows, $proof['rows'], $period, $agentKey);
+        }
+        return $output;
+    }
+
+    private static function regularStructuredLines(array $rows, array $pricing, string $period, string $agentKey): array
+    {
+        $selected = $output = [];
+        foreach ($pricing as $price) {
+            $index = $price['detailRow'] - 2;
+            $row = $rows[$index] ?? null;
+            if ($row === null || $row['ID'] !== $price['clientId'] || self::key($row['RETENTION_AGENT']) !== $price['agentKey']
+                || $row['RETENTION_DATE'] !== $price['retentionDate'] || $row['RETENTION_PAYMENT_DATE'] !== $price['paymentDate']
+                || array_map(static fn ($rate) => $rate === null ? null : (float) $rate, [$row['T1'], $row['T2'], $row['T3'], $row['T4']])
+                    !== array_map(static fn ($rate) => (float) $rate, $price['rates'])) self::invalid();
+            $selected[$index] = true;
+            if (self::archivedAgentKey($price['agentKey']) === self::archivedAgentKey($agentKey)) {
+                $output[$price['agentKey']][] = self::regularLine($price);
+            }
+        }
+        foreach ($rows as $index => $row) {
+            if (self::key($row['RETENTION_AGENT']) !== '' && $row['RETENTION_DATE'] !== null && $row['RETENTION_PAYMENT_DATE'] !== null
+                && substr($row['RETENTION_PAYMENT_DATE'], 0, 7) === substr($period, 0, 7) && !isset($selected[$index])) self::invalid();
+        }
+        return $output;
+    }
+
+    private static function regularLine(array $row): array
+    {
+        return ['clientId' => $row['clientId'], 'retentionDate' => $row['retentionDate'], 'paymentDate' => $row['paymentDate'],
+            'retainedMonth' => $row['retainedMonth'], 'appliedTier' => $row['appliedTier'],
+            'rate' => $row['appliedTier'] === 0 ? 0 : $row['rates'][$row['appliedTier'] - 1], 'amount' => $row['amount']];
     }
 
     private static function lookback(array $artifact, string $agentKey): ?array

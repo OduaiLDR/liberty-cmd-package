@@ -115,8 +115,9 @@ class GenerateRetentionManagerCommission extends Command
     public function buildPayrollReviewWorkbookBundle(string $startDate, string $endDate, array $artifacts, string $outputDirectory, ?array $calculationContext = null, bool $onlyNsf = false): array
     {
         $calculationContext = self::validatePayrollCalculationContext($calculationContext ?? self::currentPayrollCalculationContext());
-        $retentionRows = [];
-        foreach ($onlyNsf ? [] : ['ldr' => 'LDR', 'plaw' => 'Progress Law'] as $source => $display) {
+        $structuredRetention = $onlyNsf ? null : RetentionStructuredCapture::payrollInputs($startDate, $artifacts);
+        $retentionRows = $structuredRetention['rows'] ?? [];
+        foreach ($onlyNsf || $structuredRetention !== null ? [] : ['ldr' => 'LDR', 'plaw' => 'Progress Law'] as $source => $display) {
             $artifact = $artifacts['retention_' . $source] ?? [];
             $context = $artifact['context'] ?? [];
             if (($context['trancheContextReady'] ?? false) !== true || !is_array($context['trancheByClient'] ?? null)) throw new \RuntimeException('Archived retention leadership context is missing. Rerun the correlated source.');
@@ -187,6 +188,18 @@ class GenerateRetentionManagerCommission extends Command
             $inputs = $this->archivedNsfLeadershipInputs($startDate, $artifacts);
             if ($inputs !== null) {
                 return $this->buildFrozenNsfLeadershipSnapshot($startDate, $inputs);
+            }
+        }
+        if ($preferStructured && $reportKind !== 'nsf_team_leader') {
+            $inputs = RetentionStructuredCapture::payrollInputs($startDate, $artifacts);
+            if ($inputs !== null) {
+                foreach ($inputs['rows'] as $row) {
+                    if (trim($row['RETENTION_AGENT']) === '') {
+                        throw new \RuntimeException('Archived leadership detail contains an unassigned account identity.');
+                    }
+                }
+                $snapshot = $this->buildRetentionPayrollLeadershipSnapshot($reportKind, $startDate, $endDate, $inputs['rows']);
+                return [...$snapshot, 'periodStart' => $startDate, 'periodEnd' => $endDate];
             }
         }
         $previousOutput = $this->output ?? null;

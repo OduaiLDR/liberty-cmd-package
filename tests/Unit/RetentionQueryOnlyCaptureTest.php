@@ -220,6 +220,93 @@ final class RetentionQueryOnlyCaptureTest extends TestCase
         }
     }
 
+    public function test_normal_payroll_capture_preserves_leadership_and_cross_month_employee_pricing(): void
+    {
+        [$code, $output, $producer] = $this->runReport(['--no-email' => true], allowWrites: true);
+        self::assertSame(Command::SUCCESS, $code, $output);
+        self::assertSame(0, $producer->emails);
+        self::assertSame(2, $producer->snapshotCopies);
+        $archive = new PayrollReportArtifactArchive;
+        $artifacts = [];
+        foreach (['ldr', 'plaw'] as $source) {
+            $key = 'retention_' . $source;
+            $artifacts[$key] = $archive->read($key, self::PERIOD, self::RUN_ID);
+            self::assertSame(2, $artifacts[$key]['context']['retentionStructuredCapture']['version']);
+        }
+        $legacy = $artifacts;
+        foreach ($legacy as &$artifact) {
+            unset($artifact['context']['retentionStructuredCapture']);
+            $artifact['contextSha256'] = hash('sha256', json_encode(
+                $artifact['context'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR,
+            ));
+        }
+        unset($artifact);
+        $read = static fn (array $sources): array => \Cmd\Reports\Services\CustomerServiceCalculationSnapshot::forArchivedAgent(
+            $sources, self::PERIOD, 'retention_regular', 'outside month paid', 'ldr',
+        )['components'][0];
+        $legacyPrice = $read($legacy);
+        $structuredPrice = $read($artifacts);
+        unset($legacyPrice['contextSha256'], $structuredPrice['contextSha256']);
+        self::assertSame($legacyPrice, $structuredPrice);
+        self::assertSame(['105'], array_column($structuredPrice['lines'], 'clientId'));
+        self::assertSame(5.0, $structuredPrice['amount']);
+        self::assertSame('2098-01-01', $structuredPrice['lines'][0]['retainedMonth']);
+        $mixed = $artifacts;
+        $mixed['retention_plaw']['context']['retentionStructuredCapture']['captureId'] = str_repeat('e', 32);
+        $mixed['retention_plaw']['contextSha256'] = hash('sha256', json_encode(
+            $mixed['retention_plaw']['context'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR,
+        ));
+        try {
+            $read($mixed);
+            self::fail('Mixed invocations cannot supply a company-scoped employee statement.');
+        } catch (\InvalidArgumentException $error) {
+            self::assertStringContainsString('capture scope', $error->getMessage());
+        }
+        $leader = new GenerateRetentionManagerCommission;
+        $legacyLeadership = [];
+        foreach (['retention_manager', 'retention_team_leader'] as $kind) {
+            $legacyLeadership[$kind] = $leader->buildPayrollReviewLeadershipSnapshot($kind, self::PERIOD, self::END, $legacy);
+        }
+        $nsf = [];
+        foreach (['nsf_ldr', 'nsf_plaw'] as $key) {
+            $book = new \PhpOffice\PhpSpreadsheet\Spreadsheet;
+            $book->getActiveSheet()->setTitle('NSF Data')->setCellValue('A1', 'ID');
+            $book->createSheet()->setTitle('Agent Summary')->setCellValue('A1', 'NSF Agent');
+            $path = $this->root . '/' . $key . '.xlsx';
+            (new \PhpOffice\PhpSpreadsheet\Writer\Xlsx($book))->save($path);
+            $book->disconnectWorksheets();
+            $nsf[$key] = ['path' => $path];
+        }
+        $legacyBundle = $leader->buildPayrollReviewWorkbookBundle(self::PERIOD, self::END, $legacy + $nsf, $this->root . '/legacy-bundle');
+        foreach ($artifacts as &$artifact) {
+            @chmod($artifact['path'], 0600);
+            self::assertTrue(unlink($artifact['path']));
+        }
+        unset($artifact);
+        $replayedPrice = $read($artifacts);
+        unset($replayedPrice['contextSha256']);
+        self::assertSame($structuredPrice, $replayedPrice);
+        foreach ($legacyLeadership as $kind => $snapshot) {
+            self::assertSame($snapshot, $leader->buildPayrollReviewLeadershipSnapshot($kind, self::PERIOD, self::END, $artifacts));
+        }
+        $structuredBundle = $leader->buildPayrollReviewWorkbookBundle(self::PERIOD, self::END,
+            $artifacts + $nsf, $this->root . '/structured-bundle');
+        self::assertSame($legacyBundle['reports'], $structuredBundle['reports']);
+        foreach (['customer_support_manager', 'retention_team_leader'] as $key) {
+            $oldBook = IOFactory::load($legacyBundle['files'][$key]['path']);
+            $newBook = IOFactory::load($structuredBundle['files'][$key]['path']);
+            try {
+                self::assertSame($oldBook->getSheetNames(), $newBook->getSheetNames());
+                foreach ($oldBook->getSheetNames() as $sheet) {
+                    self::assertSame($oldBook->getSheetByName($sheet)->toArray(), $newBook->getSheetByName($sheet)->toArray());
+                }
+            } finally {
+                $oldBook->disconnectWorksheets();
+                $newBook->disconnectWorksheets();
+            }
+        }
+    }
+
     public function test_structured_reader_rejects_incomplete_or_mismatched_source_evidence(): void
     {
         $artifacts = $this->capturePair();
@@ -410,7 +497,7 @@ final class RetentionQueryOnlyCaptureTest extends TestCase
         return $artifacts;
     }
 
-    private function runReport(array $arguments, bool $failPlawBaseRead = false): array
+    private function runReport(array $arguments, bool $failPlawBaseRead = false, bool $allowWrites = false): array
     {
         $connectors = [
             'ldr' => new RetentionShadowTestConnector([
@@ -432,12 +519,18 @@ final class RetentionQueryOnlyCaptureTest extends TestCase
             ], [103 => '2098-02-10', 106 => '2098-03-01', 109 => '2098-02-21']),
         ];
         $connectors['plaw']->failBaseRead = $failPlawBaseRead;
-        $command = new class($connectors) extends GenerateRetentionCommissionReport {
+        if ($allowWrites) {
+            $transaction = $this->createMock(\PDO::class);
+            $transaction->expects($this->exactly(2))->method('beginTransaction')->willReturn(true);
+            $transaction->expects($this->exactly(2))->method('commit')->willReturn(true);
+            foreach ($connectors as $connector) $connector->fixtureTransaction = $transaction;
+        }
+        $command = new class($connectors, $allowWrites) extends GenerateRetentionCommissionReport {
             public array $connectorCalls = [];
             public int $emails = 0;
             public int $snapshotCopies = 0;
 
-            public function __construct(private array $connectors) { parent::__construct(); }
+            public function __construct(private array $connectors, private bool $allowWrites) { parent::__construct(); }
 
             protected function initSnowflake(string $source): DBConnector
             {
@@ -459,7 +552,7 @@ final class RetentionQueryOnlyCaptureTest extends TestCase
             protected function copySnapshotFile(string $source, string $destination): bool
             {
                 $this->snapshotCopies++;
-                return false;
+                return $this->allowWrites && parent::copySnapshotFile($source, $destination);
             }
         };
         $command->setLaravel($this->app);
@@ -484,6 +577,7 @@ final class RetentionShadowTestConnector extends DBConnector
     public bool $failBaseRead = false;
     public array $sqlReads = [];
     public array $unexpectedOperations = [];
+    public ?\PDO $fixtureTransaction = null;
 
     public function __construct(private array $rows, private array $payments) {}
 
@@ -534,6 +628,9 @@ final class RetentionShadowTestConnector extends DBConnector
                     $data[] = ['LLG_ID' => $llg, 'Tranche' => 'Trial tranche', 'Payment_Date' => $date];
                 }
             }
+        } elseif ($this->fixtureTransaction !== null && preg_match('/^\s*(?:IF|UPDATE|MERGE)\b/i', $sql)
+            && (str_contains($sql, 'TblCommissionReviewResults') || str_contains($sql, 'TblRetentionCommissionTiers'))) {
+            return ['success' => true, 'data' => [], 'row_count' => 1];
         } else {
             $this->unexpectedOperations[] = $sql;
             throw new \LogicException('Unexpected Azure SQL operation.');
@@ -544,6 +641,7 @@ final class RetentionShadowTestConnector extends DBConnector
 
     public function getSqlServerConnection(): \PDO
     {
+        if ($this->fixtureTransaction !== null) return $this->fixtureTransaction;
         $this->unexpectedOperations[] = 'Direct SQL transaction connection';
         throw new \LogicException('Shadow command attempted to open an Azure SQL transaction.');
     }

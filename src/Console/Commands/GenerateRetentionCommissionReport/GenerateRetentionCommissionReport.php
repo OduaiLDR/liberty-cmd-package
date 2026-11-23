@@ -104,6 +104,8 @@ class GenerateRetentionCommissionReport extends Command
         $sources = ($arg === 'both') ? ['ldr', 'plaw'] : [$arg];
         $failed = false;
         $this->structuredShadow = null;
+        $this->payrollCaptureId = $this->input !== null && $arg === 'both' && $this->option('no-email')
+            && getenv('PAYROLL_CAPTURE_CUSTOMER_SERVICE_CONTEXT') === '1' ? bin2hex(random_bytes(16)) : null;
 
         if ($this->input !== null && $this->option('structured-shadow')) {
             try {
@@ -141,6 +143,7 @@ class GenerateRetentionCommissionReport extends Command
     private array $lastPricingRows = [];
     /** One invocation identity shared by both sources, even if a run ID is reused. */
     private ?array $structuredShadow = null;
+    private ?string $payrollCaptureId = null;
 
     protected function runForSource(string $source): bool
     {
@@ -384,12 +387,18 @@ class GenerateRetentionCommissionReport extends Command
             foreach ($this->lastSummaryRows as $agentName => $sum) {
                 $retResults[] = ['agent' => (string) $agentName, 'amount' => $sum['commission'] ?? 0];
             }
-            $archiveContext = PayrollReportArtifactArchive::captureRequested()
-                ? (new GenerateRetentionManagerCommission)->buildPayrollRetentionContext($rows) : [];
+            $archiveContext = [];
             if (PayrollReportArtifactArchive::captureRequested()) {
+                $trancheSql = $this->payrollCaptureId === null ? null : ($source === 'ldr' ? $sql : $this->initSqlServer('ldr'));
+                $archiveContext = (new GenerateRetentionManagerCommission)->buildPayrollRetentionContext($rows, $trancheSql);
                 $archiveContext['commissionResults'] = PayrollCommissionResultSnapshot::component('retention', $source, $startDate, 'commission', $retResults);
                 $archiveContext['regularPricing'] = RetentionPricingSnapshot::capture($source, $startDate, $useRetainedMonthTier,
                     array_values($this->lastPricingRows), $archiveContext['commissionResults']);
+                if ($this->payrollCaptureId !== null) {
+                    [$structuredRows] = $this->structuredLeadershipRows($rows, $startDate, $endDate, true);
+                    $archiveContext = RetentionStructuredCapture::context($source, $startDate, (string) getenv('PAYROLL_COMMISSION_RUN_ID'),
+                        $this->payrollCaptureId, $structuredRows, $archiveContext, false);
+                }
             }
             $snapshotPath = $this->persistWithSnapshot($file, $display, $startDate, function () use ($sql, $source, $startDate, $retResults, $display): void {
                 $persisted = CommissionResultsWriter::replaceComponent($sql, 'retention', $source, $startDate, 'Commission', $retResults);
@@ -455,27 +464,7 @@ class GenerateRetentionCommissionReport extends Command
 
     private function captureStructuredShadow(string $source, string $period, string $periodEnd, array $rows, array $file, DBConnector $sql): void
     {
-        $cohort = [];
-        $trancheRows = [];
-        foreach ($rows as $row) {
-            $cancel = $this->workbookCalendarDate($this->col($row, 'CANCEL_REQUEST_DATE'));
-            if ($cancel === null || $cancel < $period || $cancel > $periodEnd) {
-                continue;
-            }
-            $id = $this->col($row, 'ID');
-            $debt = (float) $this->col($row, 'ENROLLED_DEBT', 0);
-            $cohort[] = [
-                'ID' => is_int($id) ? (string) $id : $id,
-                'RETENTION_AGENT' => $this->col($row, 'RETENTION_AGENT'),
-                'IMMEDIATE_RESULTS' => $this->col($row, 'IMMEDIATE_RESULTS'),
-                // XLSX serializes numeric cells as decimal text before the manager reads them.
-                'ENROLLED_DEBT' => is_finite($debt) ? (float) (string) $debt : $debt,
-                'CANCEL_REQUEST_DATE' => $cancel,
-                'RETENTION_PAYMENT_DATE' => $this->workbookCalendarDate($this->col($row, 'RETENTION_PAYMENT_DATE')),
-            ];
-            $trancheRows[] = $row;
-        }
-
+        [$cohort, $trancheRows] = $this->structuredLeadershipRows($rows, $period, $periodEnd, false);
         // The legacy freeze uses the raw CRM date and always reads from LDR SQL.
         $trancheSql = $sql;
         if ($source !== 'ldr' && $trancheRows !== []) {
@@ -485,6 +474,43 @@ class GenerateRetentionCommissionReport extends Command
         $runId = $this->structuredShadow['runId'];
         $context = RetentionStructuredCapture::context($source, $period, $runId, $this->structuredShadow['captureId'], $cohort, $trancheContext);
         RetentionStructuredCapture::archive()->capture('retention_' . $source, $period, $runId, $file, $context);
+    }
+
+    private function structuredLeadershipRows(array $rows, string $period, string $periodEnd, bool $includeWorkbookFields): array
+    {
+        $cohort = [];
+        $trancheRows = [];
+        foreach ($rows as $row) {
+            $cancel = $this->workbookCalendarDate($this->col($row, 'CANCEL_REQUEST_DATE'));
+            if (!$includeWorkbookFields && ($cancel === null || $cancel < $period || $cancel > $periodEnd)) {
+                continue;
+            }
+            $id = $this->col($row, 'ID');
+            $debt = (float) $this->col($row, 'ENROLLED_DEBT', 0);
+            $projected = [
+                'ID' => is_int($id) ? (string) $id : $id,
+                'RETENTION_AGENT' => $this->col($row, 'RETENTION_AGENT'),
+                'IMMEDIATE_RESULTS' => $this->col($row, 'IMMEDIATE_RESULTS'),
+                // XLSX serializes numeric cells as decimal text before the manager reads them.
+                'ENROLLED_DEBT' => is_finite($debt) ? (float) (string) $debt : $debt,
+                'CANCEL_REQUEST_DATE' => $cancel,
+                'RETENTION_PAYMENT_DATE' => $this->workbookCalendarDate($this->col($row, 'RETENTION_PAYMENT_DATE')),
+            ];
+            if ($includeWorkbookFields) {
+                $projected['CLIENT'] = $this->col($row, 'CLIENT');
+                $projected['CLEARED_PAYMENTS'] = (int) $this->col($row, 'CLEARED_PAYMENTS', 0);
+                foreach (['RETENTION_DATE', 'RECONSIDERATION_DATE', 'DROPPED_DATE'] as $dateField) {
+                    $projected[$dateField] = $this->workbookCalendarDate($this->toDate($this->col($row, $dateField)));
+                }
+                foreach (['T1', 'T2', 'T3', 'T4'] as $tier) {
+                    $projected[$tier] = isset($row[$tier]) ? (float) $row[$tier] : null;
+                }
+            } else {
+                $trancheRows[] = $row;
+            }
+            $cohort[] = $projected;
+        }
+        return [$cohort, $trancheRows];
     }
 
     // ─── Data fetchers ────────────────────────────────────────────────────────
