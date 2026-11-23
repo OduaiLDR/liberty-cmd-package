@@ -54,6 +54,15 @@ final class RetentionStructuredCapture
             ],
             ...$trancheContext,
         ];
+        // SQL Server can return a numeric tranche. Keep the frozen review format textual.
+        if (is_array($context['trancheByClient'] ?? null)) {
+            foreach ($context['trancheByClient'] as $clientId => $tranche) {
+                $value = $tranche['TRANCHE'] ?? null;
+                if (is_int($value) || (is_float($value) && is_finite($value) && floor($value) === $value)) {
+                    $context['trancheByClient'][$clientId]['TRANCHE'] = (string) $value;
+                }
+            }
+        }
         self::sourceRows($period, self::periodEnd($period), $runId, $source, $context);
 
         return $context;

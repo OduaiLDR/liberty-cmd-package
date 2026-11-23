@@ -144,7 +144,7 @@ final class RetentionQueryOnlyCaptureTest extends TestCase
         self::assertSame('retained', $ldrRows[101]['IMMEDIATE_RESULTS']);
         self::assertEquals(60000.01, $plawRows[103]['ENROLLED_DEBT']);
         self::assertSame([
-            'TRANCHE' => 'Trial tranche',
+            'TRANCHE' => '53',
             'CUT_OFF' => self::PERIOD,
             'MADE_CUT_OFF' => true,
             'BONUS_FLAG' => 'Bonus',
@@ -232,6 +232,7 @@ final class RetentionQueryOnlyCaptureTest extends TestCase
             $key = 'retention_' . $source;
             $artifacts[$key] = $archive->read($key, self::PERIOD, self::RUN_ID);
             self::assertSame(2, $artifacts[$key]['context']['retentionStructuredCapture']['version']);
+            self::assertSame('53', $artifacts[$key]['context']['trancheByClient']['LLG-' . ($source === 'ldr' ? '101' : '103')]['TRANCHE']);
         }
         $legacy = $artifacts;
         foreach ($legacy as &$artifact) {
@@ -625,7 +626,7 @@ final class RetentionShadowTestConnector extends DBConnector
             foreach ($payments as $id => $date) {
                 $llg = 'LLG-' . $id;
                 if (str_contains($sql, "'" . $llg . "'")) {
-                    $data[] = ['LLG_ID' => $llg, 'Tranche' => 'Trial tranche', 'Payment_Date' => $date];
+                    $data[] = ['LLG_ID' => $llg, 'Tranche' => in_array($id, [101, 103], true) ? 53 : 'Trial tranche', 'Payment_Date' => $date];
                 }
             }
         } elseif ($this->fixtureTransaction !== null && preg_match('/^\s*(?:IF|UPDATE|MERGE)\b/i', $sql)
