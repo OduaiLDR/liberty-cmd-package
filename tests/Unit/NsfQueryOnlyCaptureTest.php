@@ -195,7 +195,7 @@ final class NsfQueryOnlyCaptureTest extends TestCase
             self::assertSame('2098-01-02', $ineligible[0]['recoupDate']);
         }
         self::assertNotSame($readinessIds['ldr'], $readinessIds['plaw']);
-        $legacyLeadership = $leader->buildPayrollReviewLeadershipSnapshot('nsf_team_leader', self::PERIOD, '2098-01-31', $artifacts);
+        $legacyLeadership = $leader->buildPayrollReviewLeadershipSnapshot('nsf_team_leader', self::PERIOD, '2098-01-31', $artifacts, false);
         self::assertSame($readinessIds, $legacyLeadership['nsfReadinessRunIds']);
         self::assertSame([self::LDR_ZERO, self::PLAW_ROSTERED, self::PLAW_ZERO], array_column($legacyLeadership['team'], 'employeeName'));
         self::assertSame([0, 200, 0], array_column($legacyLeadership['team'], 'clearCount'));
@@ -205,6 +205,11 @@ final class NsfQueryOnlyCaptureTest extends TestCase
         self::assertSame($legacyLeadership['team'], $legacyLeadership['lines']);
         self::assertSame(0.40, $legacyLeadership['summary']['commissionRate']);
         self::assertSame(80.0, $legacyLeadership['summary']['totalPay']);
+        $amendmentInputs = array_map(static fn (array $artifact): array => [
+            'path' => $artifact['path'], 'context' => $artifact['context'],
+        ], $artifacts);
+        $legacyBundle = $leader->buildPayrollReviewWorkbookBundle(self::PERIOD, '2098-01-31',
+            $amendmentInputs, $this->root . '/legacy-leader', null, true);
 
         [$exportCode, $stdout] = $this->runExport();
         self::assertSame(0, $exportCode);
@@ -232,6 +237,24 @@ final class NsfQueryOnlyCaptureTest extends TestCase
         }
         self::assertSame([1, ''], $this->runExport());
         self::assertSame($legacyLeadership, $leader->buildPayrollReviewNsfStructuredSnapshot(self::PERIOD, self::RUN_ID, $envelope));
+        self::assertSame($legacyLeadership, $leader->buildPayrollReviewLeadershipSnapshot('nsf_team_leader', self::PERIOD, '2098-01-31', $artifacts));
+        $structuredBundle = $leader->buildPayrollReviewWorkbookBundle(self::PERIOD, '2098-01-31',
+            $artifacts, $this->root . '/structured-leader', null, true);
+        self::assertSame($legacyBundle['reports'], $structuredBundle['reports']);
+        $leaderWorkbook = IOFactory::load($structuredBundle['files']['nsf_team_leader']['path']);
+        try {
+            self::assertSame(80.0, (float) $leaderWorkbook->getSheetByName('Commission Summary')->getCell('B8')->getValue());
+        } finally {
+            $leaderWorkbook->disconnectWorksheets();
+        }
+        $tampered = $artifacts;
+        $tampered['nsf_plaw']['context']['nsfStructuredCapture']['contacts'][0]['eligible'] = false;
+        try {
+            $leader->buildPayrollReviewLeadershipSnapshot('nsf_team_leader', self::PERIOD, '2098-01-31', $tampered);
+            self::fail('A changed structured leadership capture was accepted.');
+        } catch (\RuntimeException $error) {
+            self::assertStringContainsString('fingerprint', $error->getMessage());
+        }
 
         [$readerCode, $readerStdout, $readerStderr] = $this->runTeamLeaderReader($stdout);
         self::assertSame(0, $readerCode, $readerStderr);
@@ -267,7 +290,7 @@ final class NsfQueryOnlyCaptureTest extends TestCase
         }
 
         $leader = new GenerateRetentionManagerCommission;
-        $legacy = $leader->buildPayrollReviewLeadershipSnapshot('nsf_team_leader', self::PERIOD, '2098-01-31', $artifacts);
+        $legacy = $leader->buildPayrollReviewLeadershipSnapshot('nsf_team_leader', self::PERIOD, '2098-01-31', $artifacts, false);
         $envelope = json_decode($stdout, true, flags: JSON_THROW_ON_ERROR);
         $structured = $leader->buildPayrollReviewNsfStructuredSnapshot(self::PERIOD, self::RUN_ID, $envelope);
         self::assertSame($legacy, $structured);
@@ -495,6 +518,24 @@ final class NsfQueryOnlyCaptureTest extends TestCase
         [$exit, $stdout] = $this->runExport();
         self::assertSame(1, $exit);
         self::assertSame('', $stdout);
+
+        $leader = new GenerateRetentionManagerCommission;
+        $wanted = $leader->buildPayrollReviewLeadershipSnapshot('nsf_team_leader', self::PERIOD, '2098-01-31', $artifacts, false);
+        foreach ($artifacts as &$artifact) {
+            unset($artifact['path']);
+        }
+        unset($artifact);
+        self::assertSame($wanted, $leader->buildPayrollReviewLeadershipSnapshot('nsf_team_leader', self::PERIOD, '2098-01-31', $artifacts));
+        $capture = &$artifacts['nsf_ldr']['context']['nsfStructuredCapture'];
+        $capture['contacts'][] = [
+            'contactId' => '999', 'agent' => null, 'returnedDate' => self::PERIOD,
+            'action' => null, 'recoupDate' => null, 'clearedDate' => null, 'eligible' => false,
+        ];
+        unset($capture);
+        $artifacts['nsf_ldr']['contextSha256'] = hash('sha256', json_encode($artifacts['nsf_ldr']['context'], self::JSON_FLAGS));
+        $built = $leader->buildPayrollReviewWorkbookBundle(self::PERIOD, '2098-01-31', $artifacts, $this->root . '/normal-leader', null, true);
+        self::assertSame($wanted['summary'], $built['reports']['nsf_team_leader']['summary']);
+        self::assertFileExists($built['files']['nsf_team_leader']['path']);
     }
 
     #[DataProvider('invalidShadowModes')]

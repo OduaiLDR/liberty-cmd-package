@@ -15,7 +15,7 @@ use stdClass;
 /** Read the roster fields and frozen contact eligibility from a trusted v1 shadow export. */
 final class NsfStructuredTeamLeader
 {
-    public static function inputs(string $period, string $runId, array $envelope): array
+    public static function inputs(string $period, string $runId, array $envelope, bool $allowUnassigned = false): array
     {
         self::requireFields($envelope, ['version', 'period', 'runId', 'sources']);
         if (!preg_match('/^[0-9]{4}-(0[1-9]|1[0-2])-01$/D', $period) || !self::isHexId($runId, 32)
@@ -37,7 +37,7 @@ final class NsfStructuredTeamLeader
 
             $seen = [];
             foreach ($capture->contacts as $contact) {
-                $row = self::contact($contact, $period, $display);
+                $row = self::contact($contact, $period, $display, $allowUnassigned);
                 if (isset($seen[$row['ID']])) {
                     self::invalid();
                 }
@@ -122,14 +122,16 @@ final class NsfStructuredTeamLeader
         return array_map(static fn (array $row): string => trim($row['agent']), Formatter::sortByLocationCompanyAgent($roster));
     }
 
-    private static function contact(mixed $contact, string $period, string $display): array
+    private static function contact(mixed $contact, string $period, string $display, bool $allowUnassigned): array
     {
         if (!$contact instanceof stdClass) {
             self::invalid();
         }
         self::requireFields((array) $contact, ['contactId', 'agent', 'returnedDate', 'action', 'recoupDate', 'clearedDate', 'eligible']);
+        $unassigned = $allowUnassigned && $contact->eligible === false
+            && ($contact->agent === null || (is_string($contact->agent) && trim($contact->agent) === ''));
         if (!is_string($contact->contactId) || !preg_match('/^[1-9][0-9]*$/D', $contact->contactId)
-            || !self::isAgent($contact->agent) || !is_bool($contact->eligible)
+            || (!self::isAgent($contact->agent) && !$unassigned) || !is_bool($contact->eligible)
             || ($contact->action !== null && (!is_string($contact->action)
                 || DefaultValueBinder::dataTypeForValue($contact->action) === DataType::TYPE_FORMULA))
             || !self::isDate($contact->returnedDate) || substr($contact->returnedDate, 0, 7) !== substr($period, 0, 7)) {

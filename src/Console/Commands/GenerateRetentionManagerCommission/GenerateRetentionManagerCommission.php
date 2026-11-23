@@ -7,6 +7,7 @@ namespace Cmd\Reports\Console\Commands\GenerateRetentionManagerCommission;
 use Cmd\Reports\Services\CommissionRosterProvider;
 use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\EmailSenderService;
+use Cmd\Reports\Services\NsfStructuredCapture;
 use Cmd\Reports\Services\NsfStructuredTeamLeader;
 use Cmd\Reports\Services\RetentionCommissionReportBuilder;
 use Cmd\Reports\Services\RetentionStructuredCapture;
@@ -131,13 +132,16 @@ class GenerateRetentionManagerCommission extends Command
         $retentionRows = $this->filterRetentionRowsForPeriod($retentionRows, $startDate, $endDate);
         $retentionRows = $this->dedupeRetentionRowsByContactId($retentionRows);
         $this->sortRetentionRows($retentionRows);
-        $nsfRows = [];
-        $roster = [];
-        $readinessIds = [];
-        foreach (['ldr' => 'LDR', 'plaw' => 'Progress Law'] as $source => $display) {
-            $path = $artifacts['nsf_' . $source]['path'] ?? '';
-            $nsfRows = array_merge($nsfRows, $this->loadNsfCommissionRowsFromXlsx($path, $display, $readinessIds, $source));
-            foreach ($this->archivedNsfRoster($path) as $name) $roster[$this->anthonyAgentKey($name)] = $name;
+        $nsfRows = $roster = $readinessIds = [];
+        $structuredNsf = $this->archivedNsfLeadershipInputs($startDate, $artifacts, allowUnassigned: true);
+        if ($structuredNsf !== null) {
+            ['rows' => $nsfRows, 'roster' => $roster, 'readinessIds' => $readinessIds] = $structuredNsf;
+        } else {
+            foreach (['ldr' => 'LDR', 'plaw' => 'Progress Law'] as $source => $display) {
+                $path = $artifacts['nsf_' . $source]['path'] ?? '';
+                $nsfRows = array_merge($nsfRows, $this->loadNsfCommissionRowsFromXlsx($path, $display, $readinessIds, $source));
+                foreach ($this->archivedNsfRoster($path) as $name) $roster[$this->anthonyAgentKey($name)] = $name;
+            }
         }
         $priorOutput = $this->payrollOutputDirectory;
         $priorRoster = $this->anthonyRosterCache;
@@ -172,12 +176,18 @@ class GenerateRetentionManagerCommission extends Command
     }
 
     /** One saved leadership calculation, without unrelated sources, current lookups or file publication. */
-    public function buildPayrollReviewLeadershipSnapshot(string $reportKind, string $startDate, string $endDate, array $artifacts): array
+    public function buildPayrollReviewLeadershipSnapshot(string $reportKind, string $startDate, string $endDate, array $artifacts, bool $preferStructured = true): array
     {
         $period = \DateTimeImmutable::createFromFormat('!Y-m-d', $startDate);
         if (!$period || $period->format('Y-m-01') !== $startDate || $period->format('Y-m-t') !== $endDate
             || !in_array($reportKind, ['retention_manager', 'retention_team_leader', 'nsf_team_leader'], true)) {
             throw new \InvalidArgumentException('A supported leadership report and exact reporting month are required.');
+        }
+        if ($preferStructured && $reportKind === 'nsf_team_leader') {
+            $inputs = $this->archivedNsfLeadershipInputs($startDate, $artifacts);
+            if ($inputs !== null) {
+                return $this->buildFrozenNsfLeadershipSnapshot($startDate, $inputs);
+            }
         }
         $previousOutput = $this->output ?? null;
         // The shared readers normally log through console output or Laravel; this GET-only path stays silent.
@@ -289,7 +299,41 @@ class GenerateRetentionManagerCommission extends Command
     /** Calculate leadership from the corresponding trusted v1 query-only NSF export. */
     public function buildPayrollReviewNsfStructuredSnapshot(string $period, string $runId, array $envelope): array
     {
-        $inputs = NsfStructuredTeamLeader::inputs($period, $runId, $envelope);
+        return $this->buildFrozenNsfLeadershipSnapshot($period, $this->nsfLeadershipInputs($period, $runId, $envelope));
+    }
+
+    private function archivedNsfLeadershipInputs(string $period, array $artifacts, bool $allowUnassigned = false): ?array
+    {
+        $pair = [];
+        $hasStructured = false;
+        foreach (['nsf_ldr', 'nsf_plaw'] as $key) {
+            $artifact = $artifacts[$key] ?? [];
+            // Amendment inputs and saved amendment archives use their edited workbook roster.
+            if (!isset($artifact['identity']) || preg_match('/^[a-f0-9]{64}$/D', $artifact['identity'])) {
+                return null;
+            }
+            $pair[$key] = $artifact;
+            $hasStructured = $hasStructured || array_key_exists('nsfStructuredCapture', $artifact['context'] ?? []);
+        }
+        if (!$hasStructured) {
+            return null;
+        }
+
+        foreach ($pair as $artifact) {
+            $context = json_encode($artifact['context'] ?? [], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+            if (!is_string($artifact['contextSha256'] ?? null) || !hash_equals($artifact['contextSha256'], hash('sha256', $context))) {
+                throw new \RuntimeException('Archived NSF leadership context no longer matches its fingerprint.');
+            }
+        }
+        $runId = $pair['nsf_ldr']['identity'];
+        $queryOnly = $pair['nsf_ldr']['context']['queryOnly'] ?? false;
+        $envelope = json_decode(NsfStructuredCapture::export($pair, $period, $runId, $queryOnly), true, flags: JSON_THROW_ON_ERROR);
+        return $this->nsfLeadershipInputs($period, $runId, $envelope, $allowUnassigned);
+    }
+
+    private function nsfLeadershipInputs(string $period, string $runId, array $envelope, bool $allowUnassigned = false): array
+    {
+        $inputs = NsfStructuredTeamLeader::inputs($period, $runId, $envelope, $allowUnassigned);
         $roster = [];
         foreach ($inputs['rosters'] as $names) {
             $seen = [];
@@ -302,11 +346,15 @@ class GenerateRetentionManagerCommission extends Command
                 $roster[$key] = $name;
             }
         }
+        return $inputs + ['roster' => $roster];
+    }
 
+    private function buildFrozenNsfLeadershipSnapshot(string $period, array $inputs): array
+    {
         $priorRoster = $this->anthonyRosterCache;
         $priorValidity = $this->payrollFrozenNsfValidity;
         $priorCalculation = $this->payrollCalculationContext;
-        $this->anthonyRosterCache = array_values($roster);
+        $this->anthonyRosterCache = array_values($inputs['roster']);
         $this->payrollFrozenNsfValidity = true;
         $this->payrollCalculationContext = self::currentPayrollCalculationContext();
         try {
