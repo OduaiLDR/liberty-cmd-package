@@ -39,7 +39,7 @@ final class CompareLookbackShadow extends Command
             }
 
             $start = hrtime(true);
-            $workbook = @CustomerServiceCalculationSnapshot::forArchivedAgent($artifacts, $period, 'retention_lookback', $agentKey, 'both');
+            $workbook = @CustomerServiceCalculationSnapshot::forArchivedAgent($artifacts, $period, 'retention_lookback', $agentKey, 'both', false);
             $workbookMs = (hrtime(true) - $start) / 1_000_000;
             $matches = $structured === $workbook;
             $result = json_encode([

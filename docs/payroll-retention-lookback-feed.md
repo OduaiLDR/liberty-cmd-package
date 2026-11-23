@@ -114,6 +114,11 @@ The comparison prints a match flag and timing for each calculation path,
 excluding capture and archive access. Use a fresh run ID after a partial
 capture. Close the test shell after the comparison to clear the run settings.
 
+Reserved two-company Customer Service runs now save these account lines
+automatically. The employee calculation reads the same saved line amounts
+in the complete bundle and in separate component review. Older captures
+and roster-amended bundles retain their workbook reader.
+
 For workbook-free replay, pass the two private `artifact.json` records under
 `storage/app/payroll-report-artifacts/<period>/<runId>/lookback_<source>/`
 to `CustomerServiceCalculationSnapshot::forStructuredLookbackAgent`, keyed

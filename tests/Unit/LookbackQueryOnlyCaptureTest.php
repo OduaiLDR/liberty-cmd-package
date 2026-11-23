@@ -7,6 +7,7 @@ use Cmd\Reports\Console\Commands\CompareLookbackShadow;
 use Cmd\Reports\Console\Commands\GenerateRetentionBonusCommission\GenerateRetentionBonusCommission;
 use Cmd\Reports\Services\CustomerServiceCalculationSnapshot;
 use Cmd\Reports\Services\DBConnector;
+use Cmd\Reports\Services\PayrollCommissionResultSnapshot;
 use Cmd\Reports\Services\PayrollReportArtifactArchive;
 use PHPUnit\Framework\TestCase;
 use Illuminate\Container\Container;
@@ -37,7 +38,12 @@ final class LookbackQueryOnlyCaptureTest extends TestCase
         $this->runCapture(true, true);
     }
 
-    private function runCapture(bool $nonzero, bool $shadow = false): void
+    public function test_normal_payroll_capture_matches_employee_calculations_and_preserves_the_latest_files(): void
+    {
+        $this->runCapture(true, normal: true);
+    }
+
+    private function runCapture(bool $nonzero, bool $shadow = false, bool $normal = false): void
     {
         $root = sys_get_temp_dir() . '/lookback-query-test-' . bin2hex(random_bytes(8));
         mkdir($root . '/app/commission-snapshots/2098-01/retention-lookback', 0700, true);
@@ -52,9 +58,16 @@ final class LookbackQueryOnlyCaptureTest extends TestCase
         };
         Container::setInstance($app); Log::swap(new NullLogger);
         $old = []; foreach (['PAYROLL_LOOKBACK_QUERY_ONLY','PAYROLL_CAPTURE_CUSTOMER_SERVICE_CONTEXT','PAYROLL_COMMISSION_RUN_ID'] as $key) $old[$key] = getenv($key);
-        putenv('PAYROLL_LOOKBACK_QUERY_ONLY=1'); putenv('PAYROLL_CAPTURE_CUSTOMER_SERVICE_CONTEXT=1'); putenv('PAYROLL_COMMISSION_RUN_ID=' . str_repeat('a', 32));
-        $sql = new LookbackQueryConnector($nonzero, $shadow);
-        $command = new class($sql, $nonzero, $shadow) extends GenerateRetentionBonusCommission {
+        putenv('PAYROLL_LOOKBACK_QUERY_ONLY=' . ($normal ? '0' : '1')); putenv('PAYROLL_CAPTURE_CUSTOMER_SERVICE_CONTEXT=1'); putenv('PAYROLL_COMMISSION_RUN_ID=' . self::RUN_ID);
+        $transaction = null;
+        if ($normal) {
+            $transaction = $this->createMock(\PDO::class);
+            $transaction->expects($this->exactly(4))->method('beginTransaction')->willReturn(true);
+            $transaction->expects($this->exactly(4))->method('commit')->willReturn(true);
+        }
+        $extended = $shadow || $normal;
+        $sql = new LookbackQueryConnector($nonzero, $extended, $transaction);
+        $command = new class($sql, $nonzero, $extended) extends GenerateRetentionBonusCommission {
             public function __construct(private DBConnector $sql, private bool $nonzero, private bool $shadow) { parent::__construct(); }
             protected function initSnowflake(string $source): DBConnector { return $this->sql; }
             protected function initSqlServer(string $source): DBConnector { return $this->sql; }
@@ -91,33 +104,37 @@ final class LookbackQueryOnlyCaptureTest extends TestCase
             $code = $command->run(new ArrayInput($input, $command->getDefinition()), $output);
             self::assertSame(0, $code, $output->fetch());
             self::assertNotEmpty($sql->calls);
-            foreach ($sql->calls as $call) self::assertMatchesRegularExpression('/^\s*SELECT\b/i', $call['sql']);
             self::assertSame('original', file_get_contents($canonical));
-            foreach (['LDR', 'Progress Law'] as $company) self::assertSame('canonical-original', file_get_contents($root . '/app/Retention Lookback Commission - ' . $company . ' - All.xlsx'));
+            if (!$normal) {
+                foreach ($sql->calls as $call) self::assertMatchesRegularExpression('/^\s*SELECT\b/i', $call['sql']);
+                foreach (['LDR', 'Progress Law'] as $company) self::assertSame('canonical-original', file_get_contents($root . '/app/Retention Lookback Commission - ' . $company . ' - All.xlsx'));
+            }
             self::assertSame([], glob($root . '/app/payroll-lookback-query-tmp/*/*', GLOB_ONLYDIR));
+            self::assertSame([], glob($root . '/app/payroll-lookback-runs/*/*', GLOB_ONLYDIR));
             $archive = new PayrollReportArtifactArchive;
             $artifacts = [];
             foreach (['ldr','plaw'] as $source) {
                 $key = 'lookback_' . $source;
                 $artifact = $artifacts[$key] = $archive->read($key, self::PERIOD, self::RUN_ID);
-                self::assertTrue($artifact['context']['queryOnly']);
+                self::assertSame(!$normal, $artifact['context']['queryOnly'] ?? false);
+                if ($normal) {
+                    self::assertSame($artifact['sha256'], hash_file('sha256', $root . '/app/' . $artifact['fileName']));
+                }
                 self::assertSame('retention', $artifact['context']['commissionResults']['reportKind']);
                 self::assertSame($source, $artifact['context']['salesDeductions']['source']);
                 self::assertSame(str_repeat('a', 32), $artifact['context']['salesDeductions']['runId']);
                 $rows = $artifact['context']['salesDeductions']['rows'];
-                self::assertCount($shadow && $source === 'ldr' ? 4 : (int) $nonzero, $rows);
+                self::assertCount($extended && $source === 'ldr' ? 4 : (int) $nonzero, $rows);
                 if ($nonzero) {
                     self::assertSame(50, $rows[0]['Agent_Deduction']);
                     self::assertSame(701, $rows[0]['Employee_PK']);
                     self::assertSame('LLG-' . ($source === 'ldr' ? '101' : '201'), $rows[0]['CID']);
                     $totals = array_column($artifact['context']['commissionResults']['rows'], 'amount', 'agentKey');
-                    self::assertSame($shadow && $source === 'ldr' ? 71.11 : 50, $totals['named retention']);
+                    self::assertSame($extended && $source === 'ldr' ? 71.11 : 50, $totals['named retention']);
                 }
-                if (!$shadow) {
-                    self::assertArrayNotHasKey('lookbackPricing', $artifact['context']);
-                }
+                self::assertSame(1, $artifact['context']['lookbackPricing']['version']);
             }
-            if ($shadow) {
+            if ($extended) {
                 $this->assertShadowReplay($app, $artifacts);
             }
         } finally {
@@ -133,7 +150,7 @@ final class LookbackQueryOnlyCaptureTest extends TestCase
             CustomerServiceCalculationSnapshot::forStructuredLookbackAgent($evidence, self::PERIOD, self::RUN_ID, $agent, $scope);
         $legacy = [];
         foreach (['named retention', 'zero retention', 'andrea mendoze', 'absent employee'] as $agent) {
-            $legacy[$agent] = CustomerServiceCalculationSnapshot::forArchivedAgent($artifacts, self::PERIOD, 'retention_lookback', $agent, 'both');
+            $legacy[$agent] = CustomerServiceCalculationSnapshot::forArchivedAgent($artifacts, self::PERIOD, 'retention_lookback', $agent, 'both', false);
             self::assertSame($legacy[$agent], $read($artifacts, $agent));
         }
         self::assertSame([71.11, 50.0], array_column($legacy['named retention']['components'], 'amount'));
@@ -146,6 +163,30 @@ final class LookbackQueryOnlyCaptureTest extends TestCase
         self::assertSame('andrea mendoza', $legacy['andrea mendoze']['components'][0]['sourceAgentKey']);
         self::assertSame([], $legacy['absent employee']['components']);
         self::assertNull($artifacts['lookback_ldr']['context']['salesDeductions']['rows'][1]['Agent_Deduction']);
+
+        $bundleSources = $artifacts;
+        foreach (['ldr', 'plaw'] as $source) {
+            $file = $artifacts['lookback_' . $source];
+            foreach (['retention', 'nsf'] as $kind) {
+                $key = $kind . '_' . $source;
+                $bundleSources[$key] = ['key' => $key, 'context' => ['commissionResults' =>
+                    PayrollCommissionResultSnapshot::component($kind, $source, self::PERIOD, 'commission', [],
+                        $kind === 'nsf' ? PayrollCommissionResultSnapshot::NSF_ALL_PRICED_AGENTS : null),
+                ]] + $file;
+            }
+        }
+        $workbookBundle = CustomerServiceCalculationSnapshot::forAgent(
+            $bundleSources, self::PERIOD, 'retention', 'named retention', 'both', false,
+        );
+        self::assertSame($workbookBundle, CustomerServiceCalculationSnapshot::forAgent(
+            $bundleSources, self::PERIOD, 'retention', 'named retention', 'both',
+        ));
+        $amended = $artifacts;
+        foreach ($amended as &$artifact) $artifact['identity'] = str_repeat('d', 64);
+        unset($artifact);
+        self::assertSame($legacy['named retention'], CustomerServiceCalculationSnapshot::forArchivedAgent(
+            $amended, self::PERIOD, 'retention_lookback', 'named retention', 'both',
+        ));
 
         $command = new CompareLookbackShadow;
         $command->setLaravel($app);
@@ -173,6 +214,9 @@ final class LookbackQueryOnlyCaptureTest extends TestCase
         }
         unset($artifact);
         self::assertSame($legacy['named retention'], $read($artifacts, 'named retention'));
+        self::assertSame($legacy['named retention'], CustomerServiceCalculationSnapshot::forArchivedAgent(
+            $artifacts, self::PERIOD, 'retention_lookback', 'named retention', 'both',
+        ));
         $changed = $artifacts;
         $changed['lookback_plaw']['context']['lookbackPricing']['rows'][0]['amount'] = 51;
         $mixed = $artifacts;
@@ -182,13 +226,20 @@ final class LookbackQueryOnlyCaptureTest extends TestCase
         $invalidEvidence = [$changed, $this->rehashPlaw($mixed), $this->rehashPlaw($changed),
             $this->rehashPlaw($missingPayment), ['lookback_ldr' => $artifacts['lookback_ldr']]];
         foreach ($invalidEvidence as $invalid) {
-            try {
-                $read($invalid, 'named retention', 'ldr');
-            } catch (\RuntimeException | \InvalidArgumentException $error) {
-                self::assertNotSame('', $error->getMessage());
-                continue;
+            foreach ([
+                static fn () => $read($invalid, 'named retention', 'ldr'),
+                static fn () => CustomerServiceCalculationSnapshot::forArchivedAgent(
+                    $invalid, self::PERIOD, 'retention_lookback', 'named retention', 'ldr',
+                ),
+            ] as $readInvalid) {
+                try {
+                    $readInvalid();
+                } catch (\RuntimeException | \InvalidArgumentException $error) {
+                    self::assertNotSame('', $error->getMessage());
+                    continue;
+                }
+                self::fail('The reader accepted changed, incomplete or mixed evidence.');
             }
-            self::fail('The reader accepted changed, incomplete or mixed evidence.');
         }
     }
 
@@ -204,11 +255,21 @@ final class LookbackQueryOnlyCaptureTest extends TestCase
 final class LookbackQueryConnector extends DBConnector
 {
     public array $calls = [];
-    public function __construct(private bool $nonzero, private bool $shadow) {}
+    public function __construct(private bool $nonzero, private bool $shadow, private ?\PDO $fixtureTransaction = null) {}
+    public function getSqlServerConnection(): \PDO
+    {
+        return $this->fixtureTransaction ?? throw new \LogicException('Query-only mode requested a transaction.');
+    }
     public function querySqlServer(string $sql, array $params = []): array
     {
         $this->calls[] = ['sql' => $sql, 'params' => $params];
-        if (!preg_match('/^\s*SELECT\b/i', $sql)) throw new \LogicException('Query-only mode attempted a write.');
+        if (!preg_match('/^\s*SELECT\b/i', $sql)) {
+            if ($this->fixtureTransaction !== null && preg_match('/^\s*(?:IF|UPDATE|MERGE|DELETE|INSERT)\b/i', $sql)
+                && preg_match('/Tbl(?:CommissionReviewResults|PayrollRetentionLookbackResults|PayrollRetentionLookbackRuns)/', $sql)) {
+                return ['success' => true, 'data' => [], 'row_count' => 1];
+            }
+            throw new \LogicException('Unexpected write attempted in the fixture.');
+        }
         $data = [];
         if ($this->nonzero && str_starts_with($sql, 'SELECT LLG_ID, First_Payment')) {
             $rates = [101 => 1, 201 => 1] + ($this->shadow ? [102 => 0, 103 => 0, 104 => 0] : []);

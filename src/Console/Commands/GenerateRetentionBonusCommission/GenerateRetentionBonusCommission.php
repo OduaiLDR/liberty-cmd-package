@@ -92,6 +92,11 @@ class GenerateRetentionBonusCommission extends Command
             $this->error($error->getMessage());
             return Command::FAILURE;
         }
+        if ($captureId === null && $this->input !== null && $arg === 'both' && $runId !== null
+            && $this->option('no-email') && (!$this->option('no-azure-write') || getenv('PAYROLL_LOOKBACK_QUERY_ONLY') === '1')
+            && PayrollReportArtifactArchive::captureRequested()) {
+            $captureId = bin2hex(random_bytes(16));
+        }
         foreach ($sources as $src) {
             if (!isset(self::SOURCE_CONFIG[$src])) {
                 $this->error("Unknown source: $src");
@@ -325,10 +330,13 @@ class GenerateRetentionBonusCommission extends Command
             }
 
             $formatter = new BonusFormatter();
-            if ($queryOnly) {
+            if ($queryOnly || $captureId !== null) {
                 $temporaryRun = $captureId === null ? $runId : $runId . '-' . $captureId;
-                $outputDirectory = storage_path('app/payroll-lookback-query-tmp/' . $temporaryRun . '/' . $source);
-                if (!is_dir($outputDirectory) && !@mkdir($outputDirectory, 0700, true) && !is_dir($outputDirectory)) throw new \RuntimeException('Cannot create isolated Lookback workbook directory.');
+                $root = $queryOnly ? 'payroll-lookback-query-tmp' : 'payroll-lookback-runs';
+                $outputDirectory = storage_path('app/' . $root . '/' . $temporaryRun . '/' . $source);
+                if (!is_dir($outputDirectory) && !@mkdir($outputDirectory, 0700, true) && !is_dir($outputDirectory)) {
+                    throw new \RuntimeException('Cannot create isolated Lookback workbook directory.');
+                }
             }
             $allFile = $formatter->buildWorkbook(
                 $rows, $display, $reportStartDate, $endDate, $employeeMap, null, $source, $rosterAgents, $unassigned, $outputDirectory
@@ -342,6 +350,19 @@ class GenerateRetentionBonusCommission extends Command
             // rows. Reset and replacement then share one transaction.
             $salesManifest = PayrollReportArtifactArchive::captureRequested()
                 ? PayrollRetentionLookbackWriter::prepare($sql, $source, $reportStartDate, $runId, $rows) : null;
+            $archiveContext = null;
+            if ($queryOnly || !(bool) $this->option('no-azure-write')) {
+                $archiveContext = PayrollReportArtifactArchive::captureRequested()
+                    ? ['commissionResults' => PayrollCommissionResultSnapshot::component('retention', $source, $reportStartDate, 'bonusCommission', $bonusResults)] : [];
+                if ($salesManifest !== null) $archiveContext['salesDeductions'] = $salesManifest;
+                if ($queryOnly) $archiveContext['queryOnly'] = true;
+                if ($captureId !== null) {
+                    $archiveContext['lookbackPricing'] = LookbackPricingSnapshot::capture($captureId, $rows, $archiveContext['commissionResults']);
+                }
+            }
+            if (!$queryOnly && $captureId !== null) {
+                $this->publishLegacyWorkbook($allFile, $captureId);
+            }
             $persisted = $this->persistBonusResults(
                 $sql, $source, $reportStartDate, $bonusResults,
                 $queryOnly || (bool) $this->option('no-azure-write'), $rows, $runId, $salesManifest
@@ -351,15 +372,8 @@ class GenerateRetentionBonusCommission extends Command
             } elseif ($notice = CommissionResultsWriter::failureNotice($persisted, $display)) {
                 $this->warn($notice);
             }
-            if ($queryOnly || !(bool) $this->option('no-azure-write')) {
-                $context = PayrollReportArtifactArchive::captureRequested()
-                    ? ['commissionResults' => PayrollCommissionResultSnapshot::component('retention', $source, $reportStartDate, 'bonusCommission', $bonusResults)] : [];
-                if ($salesManifest !== null) $context['salesDeductions'] = $salesManifest;
-                if ($queryOnly) $context['queryOnly'] = true;
-                if ($captureId !== null) {
-                    $context['lookbackPricing'] = LookbackPricingSnapshot::capture($captureId, $rows, $context['commissionResults']);
-                }
-                PayrollReportArtifactArchive::captureFromEnvironment('lookback', $source, $reportStartDate, $allFile, $context);
+            if ($archiveContext !== null) {
+                PayrollReportArtifactArchive::captureFromEnvironment('lookback', $source, $reportStartDate, $allFile, $archiveContext);
             }
 
             if ($allFile) {
@@ -391,13 +405,27 @@ class GenerateRetentionBonusCommission extends Command
             Log::error("GenerateRetentionBonusCommission[$display]: failed", ['ex' => $e]);
             return false;
         } finally {
-            if ($queryOnly && is_array($allFile) && isset($allFile['path']) && is_file($allFile['path'])) @unlink($allFile['path']);
-            if ($queryOnly && $outputDirectory !== null && is_dir($outputDirectory)) {
+            if ($outputDirectory !== null && is_array($allFile) && is_file($allFile['path'])) @unlink($allFile['path']);
+            if ($outputDirectory !== null && is_dir($outputDirectory)) {
                 @rmdir($outputDirectory);
                 if ($captureId !== null) @rmdir(dirname($outputDirectory));
             }
         }
         return true;
+    }
+
+    private function publishLegacyWorkbook(array $file, string $captureId): void
+    {
+        // Preserve the existing latest file while keeping the captured bytes private to this invocation.
+        $destination = storage_path('app/' . $file['filename']);
+        $temporary = $destination . '.' . $captureId . '.tmp';
+        try {
+            if (!@copy($file['path'], $temporary) || !@rename($temporary, $destination)) {
+                throw new \RuntimeException('The current Lookback workbook could not be published.');
+            }
+        } finally {
+            if (is_file($temporary)) @unlink($temporary);
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────

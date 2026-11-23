@@ -15,11 +15,12 @@ use ZipArchive;
 final class CustomerServiceCalculationSnapshot
 {
     /** Select an employee from independently captured components, without requiring an unrelated complete CS bundle. */
-    public static function forArchivedAgent(array $artifacts, string $period, string $report, string $agentKey, string $sourceScope): array
+    public static function forArchivedAgent(array $artifacts, string $period, string $report, string $agentKey, string $sourceScope, bool $preferStructured = true): array
     {
         self::validateArchivedSelection($period, $report, $agentKey, $sourceScope);
         $family = match ($report) { 'retention_lookback' => 'lookback', 'retention_regular' => 'retention', default => 'nsf' };
-        return self::selectArchivedAgent($artifacts, $period, $report, $family, $agentKey, $sourceScope);
+        $lookbackRun = $preferStructured && $family === 'lookback' ? self::lookbackRun($artifacts) : null;
+        return self::selectArchivedAgent($artifacts, $period, $report, $family, $agentKey, $sourceScope, $lookbackRun);
     }
 
     /** Replay the employee's Lookback evidence using only trusted archive metadata. */
@@ -49,12 +50,11 @@ final class CustomerServiceCalculationSnapshot
         $requiresWorkbook = $structuredRunId === null && $regularLines === [];
         // Validate both sources even for a one-company request.
         $validated = [];
-        $structuredLines = [];
-        $captureId = null;
+        $structuredLines = $structuredRunId === null ? [] : self::verifiedLookbackLines($artifacts, $period, $structuredRunId);
         foreach (['ldr', 'plaw'] as $source) {
             $key = $family . '_' . $source;
             $artifact = $artifacts[$key];
-            self::validateArchivedArtifact($artifact, $key, $period, $requiresWorkbook);
+            if ($requiresWorkbook) self::validateArchivedArtifact($artifact, $key, $period);
             if ($report === 'retention_regular' && isset($artifact['context']['legacyEvidence'])) {
                 $evidence = $artifact['context']['legacyEvidence'];
                 if (($evidence['source'] ?? null) !== $source || ($evidence['period'] ?? null) !== $period
@@ -77,14 +77,6 @@ final class CustomerServiceCalculationSnapshot
                     || !array_is_list($context['rows']) || ($family === 'nsf' && ($context['coverageBasis'] ?? null) !== PayrollCommissionResultSnapshot::NSF_ALL_PRICED_AGENTS)) self::invalid();
                 $checked = PayrollCommissionResultSnapshot::component($kind, $source, $period, $component, $context['rows'], $context['coverageBasis'] ?? null);
                 if (json_encode($checked, JSON_THROW_ON_ERROR) !== json_encode($context, JSON_THROW_ON_ERROR)) self::invalid();
-                if ($structuredRunId !== null) {
-                    $pricing = $artifact['context']['lookbackPricing'] ?? null;
-                    if (($artifact['identity'] ?? null) !== $structuredRunId || ($artifact['period'] ?? null) !== $period
-                        || ($artifact['context']['queryOnly'] ?? null) !== true || !is_array($pricing)) self::invalid();
-                    $structuredLines[$source] = LookbackPricingSnapshot::validatedLines($pricing, $checked);
-                    if ($captureId !== null && $captureId !== $pricing['captureId']) self::invalid();
-                    $captureId = $pricing['captureId'];
-                }
                 $matches = array_values(array_filter($context['rows'], static fn ($row) => self::archivedAgentKey($row['agentKey']) === self::archivedAgentKey($agentKey)));
                 if (count($matches) > 1) self::invalid();
                 $validated[$source] = [$artifact, $matches ? (float) $matches[0]['amount'] : null, false, $matches ? $matches[0]['agentKey'] : $agentKey];
@@ -381,13 +373,15 @@ final class CustomerServiceCalculationSnapshot
         } finally { $book->disconnectWorksheets(); }
     }
 
-    public static function forAgent(array $artifacts, string $period, string $reportKind, string $agentKey, string $sourceScope): array
+    public static function forAgent(array $artifacts, string $period, string $reportKind, string $agentKey, string $sourceScope, bool $preferStructuredLookback = true): array
     {
         if (!in_array($reportKind, ['retention', 'nsf'], true) || !in_array($sourceScope, ['ldr', 'plaw', 'both'], true)
             || !preg_match('/^[1-9]\d{3}-(0[1-9]|1[0-2])-01$/D', $period)
             || $agentKey === '' || self::key($agentKey) !== $agentKey) throw new \InvalidArgumentException('Calculation lookup requires an exact normalized employee identity, report kind, source scope and month.');
         $sources = self::sources($artifacts, $period);
         $regularLines = $reportKind === 'retention' ? self::regularPayrollLines($sources, $period, $agentKey) : [];
+        $lookbackRun = $preferStructuredLookback && $reportKind === 'retention' ? self::lookbackRun($sources) : null;
+        $lookbackLines = $lookbackRun === null ? [] : self::verifiedLookbackLines($sources, $period, $lookbackRun);
         $components = [];
         foreach ($sourceScope === 'both' ? ['ldr', 'plaw'] : [$sourceScope] as $source) {
             $families = $reportKind === 'nsf' ? ['nsf' => 'commission'] : ['retention' => 'commission', 'lookback' => 'bonusCommission'];
@@ -409,7 +403,11 @@ final class CustomerServiceCalculationSnapshot
                 } elseif ($amount != 0.0) {
                     if ($family === 'retention') $entry = self::unavailable($entry, 'Original regular Retention line prices were not captured.');
                     else {
-                        $lines = $family === 'lookback' ? self::lookback($artifact, $agentKey) : self::nsf($artifact, $agentKey, $amount);
+                        $lines = match (true) {
+                            $family === 'nsf' => self::nsf($artifact, $agentKey, $amount),
+                            $lookbackRun !== null => $lookbackLines[$source][$agentKey],
+                            default => self::lookback($artifact, $agentKey),
+                        };
                         if ($lines === null) $entry = self::unavailable($entry, 'The original workbook does not retain trustworthy selected line prices for this component.');
                         else $entry['lines'] = $lines;
                     }
@@ -544,6 +542,46 @@ final class CustomerServiceCalculationSnapshot
         return ['clientId' => $row['clientId'], 'retentionDate' => $row['retentionDate'], 'paymentDate' => $row['paymentDate'],
             'retainedMonth' => $row['retainedMonth'], 'appliedTier' => $row['appliedTier'],
             'rate' => $row['appliedTier'] === 0 ? 0 : $row['rates'][$row['appliedTier'] - 1], 'amount' => $row['amount']];
+    }
+
+    private static function lookbackRun(array $artifacts): ?string
+    {
+        $ldr = $artifacts['lookback_ldr'] ?? [];
+        $plaw = $artifacts['lookback_plaw'] ?? [];
+        if (!array_key_exists('lookbackPricing', $ldr['context'] ?? [])
+            && !array_key_exists('lookbackPricing', $plaw['context'] ?? [])) return null;
+        $identity = $ldr['identity'] ?? null;
+        if (is_string($identity) && preg_match('/^[a-f0-9]{64}$/D', $identity) && ($plaw['identity'] ?? null) === $identity) {
+            return null;
+        }
+        if (!is_string($identity) || !preg_match('/^[a-f0-9]{32}$/D', $identity)) self::invalid();
+        return $identity;
+    }
+
+    private static function verifiedLookbackLines(array $artifacts, string $period, string $runId): array
+    {
+        $lines = [];
+        $captureId = $queryOnly = null;
+        foreach (['ldr', 'plaw'] as $source) {
+            $key = 'lookback_' . $source;
+            $artifact = $artifacts[$key] ?? null;
+            self::validateArchivedArtifact($artifact, $key, $period, false);
+            $context = $artifact['context'];
+            $pricing = $context['lookbackPricing'] ?? null;
+            $result = $context['commissionResults'] ?? null;
+            $mode = $context['queryOnly'] ?? false;
+            if (($artifact['identity'] ?? null) !== $runId || ($artifact['period'] ?? null) !== $period
+                || (array_key_exists('queryOnly', $context) && !is_bool($context['queryOnly']))
+                || ($queryOnly !== null && $queryOnly !== $mode)
+                || !is_array($pricing) || !is_array($result) || !is_array($result['rows'] ?? null)) self::invalid();
+            $checked = PayrollCommissionResultSnapshot::component('retention', $source, $period, 'bonusCommission', $result['rows']);
+            if (json_encode($checked, JSON_THROW_ON_ERROR) !== json_encode($result, JSON_THROW_ON_ERROR)) self::invalid();
+            $lines[$source] = LookbackPricingSnapshot::validatedLines($pricing, $checked);
+            if ($captureId !== null && $captureId !== $pricing['captureId']) self::invalid();
+            $captureId = $pricing['captureId'];
+            $queryOnly = $mode;
+        }
+        return $lines;
     }
 
     private static function lookback(array $artifact, string $agentKey): ?array

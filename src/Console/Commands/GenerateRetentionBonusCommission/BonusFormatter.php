@@ -163,6 +163,7 @@ class BonusFormatter
         array $unassigned = [],
         ?string $outputDirectory = null
     ): ?array {
+        $temporaryPath = null;
         try {
             $rows = RetentionAgentIdentity::canonicalizeRows($rows);
             if ($rosterAgents !== null) {
@@ -355,10 +356,12 @@ class BonusFormatter
             $suffix   = $agentFilter !== null ? $this->safeFilenamePart($agentFilter) : 'All';
             $filename = "Retention Lookback Commission - {$source} - {$suffix}.xlsx";
             $path     = $outputDirectory === null ? storage_path("app/{$filename}") : rtrim($outputDirectory, '/\\') . '/' . $filename;
+            if ($outputDirectory !== null && !file_exists($path)) $temporaryPath = $path;
             (new Xlsx($sp))->save($path);
 
             return ['filename' => $filename, 'path' => $path];
         } catch (\Throwable $e) {
+            if ($temporaryPath !== null && is_file($temporaryPath)) @unlink($temporaryPath);
             Log::error('RetentionBonusCommissionFormatter::buildWorkbook failed', ['err' => $e->getMessage()]);
             return null;
         }
