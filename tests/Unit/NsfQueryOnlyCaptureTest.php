@@ -3,20 +3,26 @@ declare(strict_types=1);
 
 namespace Cmd\Reports\Tests\Unit;
 
+use Cmd\Reports\Console\Commands\ExportNsfShadow;
 use Cmd\Reports\Console\Commands\GenerateNSFCommissionReport\GenerateNSFCommissionReport;
 use Cmd\Reports\Console\Commands\GenerateRetentionManagerCommission\GenerateRetentionManagerCommission;
 use Cmd\Reports\Services\CustomerServiceCalculationSnapshot;
 use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\PayrollReportArtifactArchive;
 use Cmd\Reports\Tests\Support\RecordingSqlServerConnector;
+use Illuminate\Console\Application as Artisan;
 use Illuminate\Container\Container;
+use Illuminate\Events\Dispatcher;
 use Illuminate\Support\Facades\Log;
 use PhpOffice\PhpSpreadsheet\IOFactory;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\NullLogger;
+use Symfony\Component\Console\Input\ArgvInput;
 use Symfony\Component\Console\Input\ArrayInput;
 use Symfony\Component\Console\Output\BufferedOutput;
+use Symfony\Component\Console\Output\ConsoleOutput;
+use Symfony\Component\Console\Output\OutputInterface;
 
 final class NsfQueryOnlyCaptureTest extends TestCase
 {
@@ -88,6 +94,7 @@ final class NsfQueryOnlyCaptureTest extends TestCase
             self::assertSame('nsf', $artifact['context']['commissionResults']['reportKind']);
             self::assertArrayNotHasKey('nsfStructuredCapture', $artifact['context']);
         }
+        self::assertSame([1, ''], $this->runExport());
     }
 
     public function test_structured_shadow_matches_legacy_employee_evidence_and_leadership(): void
@@ -102,7 +109,8 @@ final class NsfQueryOnlyCaptureTest extends TestCase
             }
             $sourceRows[$source][] = $this->sourceRow($startId + 101, self::ROSTERED, null);
             $sourceRows[$source][] = $this->sourceRow($startId + 102, self::UNASSIGNED, '2098-01-03');
-            $sourceRows[$source][] = $this->sourceRow($startId + 103, self::PLACEHOLDER, '2098-01-03');
+            $sourceRows[$source][] = ['NSF_ACTION' => '<info>Résumé / Ω</info>']
+                + $this->sourceRow($startId + 103, self::PLACEHOLDER, '2098-01-03');
         }
 
         [$code, $output] = $this->runNsf($sql, $sourceRows, ['--no-email' => true, '--structured-shadow' => true]);
@@ -191,6 +199,77 @@ final class NsfQueryOnlyCaptureTest extends TestCase
             usort($structuredLeadership[$field], $byEmployee);
         }
         self::assertSame($legacyLeadership, $structuredLeadership);
+
+        [$exportCode, $stdout] = $this->runExport();
+        self::assertSame(0, $exportCode);
+        self::assertCount(1, preg_split('/\R/', trim($stdout)));
+        self::assertStringContainsString('<info>Résumé / Ω</info>', $stdout);
+        self::assertStringNotContainsString($this->root, $stdout);
+        $envelope = json_decode($stdout, true, flags: JSON_THROW_ON_ERROR);
+        self::assertSame(['version', 'runId', 'period', 'sources'], array_keys($envelope));
+        self::assertSame(1, $envelope['version']);
+        self::assertSame(self::RUN_ID, $envelope['runId']);
+        self::assertSame(self::PERIOD, $envelope['period']);
+        self::assertSame(['ldr', 'plaw'], array_keys($envelope['sources']));
+        foreach ($envelope['sources'] as $source => $entry) {
+            $artifact = $artifacts['nsf_' . $source];
+            self::assertSame(['workbookSha256', 'captureJson', 'captureSha256'], array_keys($entry));
+            self::assertSame($artifact['sha256'], $entry['workbookSha256']);
+            self::assertSame(hash('sha256', $entry['captureJson']), $entry['captureSha256']);
+            self::assertSame($artifact['context']['nsfStructuredCapture'], json_decode($entry['captureJson'], true, flags: JSON_THROW_ON_ERROR));
+        }
+        self::assertSame($artifacts, $this->archivedArtifacts());
+    }
+
+    public function test_export_fails_silently_if_the_second_brand_is_missing_or_changed(): void
+    {
+        [$code, $output] = $this->runNsf(new RecordingSqlServerConnector, [], ['--no-email' => true, '--structured-shadow' => true]);
+        self::assertSame(0, $code, $output);
+        self::assertSame(0, $this->runExport()[0]);
+        self::assertSame([1, ''], $this->runExport('2098-01-02'));
+        self::assertSame([1, ''], $this->runExport(self::PERIOD, 'invalid'));
+
+        ['nsf_ldr' => $ldr, 'nsf_plaw' => $plaw] = $this->archivedArtifacts();
+        $metadataPath = dirname($plaw['path']) . '/artifact.json';
+        $metadata = json_decode(file_get_contents($metadataPath), true, flags: JSON_THROW_ON_ERROR);
+        $context = $metadata['context'];
+        $wrongContexts = [
+            'not query-only' => ['queryOnly' => 1] + $context,
+            'missing capture' => ['nsfStructuredCapture' => null] + $context,
+        ];
+        $capture = $context['nsfStructuredCapture'];
+        foreach ([
+            'unknown version' => ['version' => 2],
+            'wrong source' => ['source' => 'ldr'],
+            'wrong month' => ['period' => '2098-02-01'],
+            'wrong outer run' => ['runId' => str_repeat('b', 32)],
+            'missing result rows' => ['agents' => null],
+        ] as $case => $override) {
+            $wrongContexts[$case] = ['nsfStructuredCapture' => $override + $capture] + $context;
+        }
+        foreach ([
+            'wrong readiness source' => ['source' => 'ldr'],
+            'wrong readiness month' => ['period' => '2098-02-01'],
+            'invalid readiness ID' => ['runId' => 'invalid'],
+            'outer ID reused for readiness' => ['runId' => self::RUN_ID],
+            'other brand readiness ID reused' => ['runId' => $ldr['context']['nsfStructuredCapture']['readiness']['runId']],
+            'incorrect provisional status' => ['isProvisional' => !$capture['readiness']['isProvisional']],
+        ] as $case => $override) {
+            $wrongCapture = ['readiness' => $override + $capture['readiness']] + $capture;
+            $wrongContexts[$case] = ['nsfStructuredCapture' => $wrongCapture] + $context;
+        }
+        $jsonFlags = JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR;
+        foreach ($wrongContexts as $case => $wrongContext) {
+            $wrongMetadata = ['context' => $wrongContext, 'contextSha256' => hash('sha256', json_encode($wrongContext, $jsonFlags))] + $metadata;
+            file_put_contents($metadataPath, json_encode($wrongMetadata, $jsonFlags));
+            self::assertSame([1, ''], $this->runExport(), $case);
+        }
+
+        file_put_contents($metadataPath, json_encode($metadata, $jsonFlags));
+        file_put_contents($plaw['path'], 'workbook changed', FILE_APPEND);
+        self::assertSame([1, ''], $this->runExport(), 'changed workbook bytes');
+        unlink($metadataPath);
+        self::assertSame([1, ''], $this->runExport(), 'missing brand');
     }
 
     public static function invalidShadowModes(): array
@@ -200,6 +279,20 @@ final class NsfQueryOnlyCaptureTest extends TestCase
             'capture disabled' => ['PAYROLL_CAPTURE_CUSTOMER_SERVICE_CONTEXT=0', ['--no-email' => true]],
             'email still enabled' => ['PAYROLL_NSF_QUERY_ONLY=1', []],
         ];
+    }
+
+    public function test_automation_cannot_capture_an_export_in_its_log(): void
+    {
+        [$code, $output] = $this->runNsf(new RecordingSqlServerConnector, [], ['--no-email' => true, '--structured-shadow' => true]);
+        self::assertSame(0, $code, $output);
+        $artisan = new Artisan($this->app, new Dispatcher($this->app), 'test');
+        $artisan->add(new ExportNsfShadow);
+        self::assertSame(1, $artisan->call('payroll:export-nsf-shadow ' . self::PERIOD . ' ' . self::RUN_ID));
+        self::assertSame('', $artisan->output());
+        $log = new BufferedOutput;
+        $input = new ArgvInput(['artisan', 'payroll:export-nsf-shadow', self::PERIOD, self::RUN_ID]);
+        self::assertSame(1, $artisan->run($input, $log));
+        self::assertSame('', $log->fetch());
     }
 
     #[DataProvider('invalidShadowModes')]
@@ -283,5 +376,21 @@ final class NsfQueryOnlyCaptureTest extends TestCase
             'nsf_ldr' => $archive->read('nsf_ldr', self::PERIOD, self::RUN_ID),
             'nsf_plaw' => $archive->read('nsf_plaw', self::PERIOD, self::RUN_ID),
         ];
+    }
+
+    private function runExport(string $period = self::PERIOD, string $runId = self::RUN_ID): array
+    {
+        $artisan = new Artisan($this->app, new Dispatcher($this->app), 'test');
+        $artisan->add(new ExportNsfShadow);
+        $output = new class(OutputInterface::VERBOSITY_QUIET, true) extends ConsoleOutput {
+            public string $captured = '';
+            protected function doWrite(string $message, bool $newline): void
+            {
+                $this->captured .= $message . ($newline ? PHP_EOL : '');
+            }
+        };
+        $code = $artisan->run(new ArgvInput(['artisan', 'payroll:export-nsf-shadow', $period, $runId]), $output);
+
+        return [$code, $output->captured];
     }
 }
