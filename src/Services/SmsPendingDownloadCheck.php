@@ -17,8 +17,12 @@ use Throwable;
  */
 class SmsPendingDownloadCheck
 {
-    /** How long a passed check can stand in for the one in the download request. */
-    public const PASS_SECONDS = 120;
+    /**
+     * How long a passed check can stand in for the one in the download request. Half an hour since Nov 19, 2026
+     * (it was two minutes): the file step's own check counts too, so the review copy downloads without a second
+     * wait of minutes. A hold at approval or a rebuild forgets the pass; approval never relies on it.
+     */
+    public const PASS_SECONDS = 1800;
 
     private const OUTCOME_SECONDS = 300;
 
@@ -68,6 +72,12 @@ class SmsPendingDownloadCheck
     public function recordPass(string $requestId): void
     {
         Cache::store('file')->put($this->key($requestId), ['state' => 'passed'], self::PASS_SECONDS);
+    }
+
+    /** Drops a pass only: a check that is running, or an outcome not shown yet, stays. */
+    public function forgetPass(string $requestId): void
+    {
+        if ($this->passed($requestId)) Cache::store('file')->forget($this->key($requestId));
     }
 
     public function recordHeld(string $requestId, string $message): void

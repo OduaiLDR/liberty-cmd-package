@@ -87,7 +87,7 @@ final class SmsApprovalHoldTest extends TestCase
         {
             public function __construct(private \Throwable $error) {}
 
-            public function assertFrozen(string $requestId, int $expected, bool $pendingIds = false): void
+            public function assertFrozen(string $requestId, int $expected, bool $pendingIds = false, string $check = self::CHECK_ALL): void
             {
                 throw $this->error;
             }

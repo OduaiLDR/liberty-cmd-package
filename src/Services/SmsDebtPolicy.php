@@ -99,8 +99,52 @@ final class SmsDebtPolicy
         return $maximum === null ? [self::lowerBound($options)] : [self::lowerBound($options), $maximum];
     }
 
-    /** Pending snapshots only: approved historical evidence remains readable unchanged. */
-    public static function assertPending(ConnectionInterface $db, string $requestId): void
+    /**
+     * The debt-on-the-minimum proof from the stored debt, as a condition over the frozen row (x) and its prospect row (p)
+     * that is TRUE for a member the stored value does NOT prove: someone whose rounded frozen debt sits in the last
+     * thousand at the minimum, unless the prospect row still points at the same source row, with a stored debt inside
+     * the range that rounds to the frozen amount. The stored value was copied from that source row by the same rule
+     * the run selected with, so it proves the same thing without one disk read a person in the source table.
+     * Null when it does not apply: no minimum, another database, stored selection off, switched off, or the stored
+     * columns are not there. Then the source rows are re-read as before.
+     *
+     * @return array{sql:string, bindings:list<int>}|null
+     */
+    public static function storedBoundary(ConnectionInterface $db, string $requestId): ?array
+    {
+        if ($db->getDriverName() !== 'sqlsrv' || config('sms-exports.stored_debt_boundary_proof', true) !== true || ! SmsStoredDebt::selectionEnabled()) return null;
+        $run = $db->table('TblSMSRuns')->useWritePdo()->where('Request_ID', $requestId)->first();
+        $options = isset($run->Run_Options_JSON) ? SmsRunOptions::fromStored($run->Run_Options_JSON, (int) $run->Target) : null;
+        if (self::floorless($options)) return null;
+        try {
+            SmsStoredDebt::assertReady($db);
+        } catch (\RuntimeException) {
+            return null;
+        }
+        $minimum = self::minimum($options);
+        $rounded = 'CAST(CEILING(p.Current_Debt/CAST(1000 AS decimal(12,2)))*1000 AS decimal(12,2))';
+
+        return ['sql' => "(x.Debt_Amount-1000<? AND x.Debt_Source IN ('TblTUData','TblMailers') AND CASE WHEN p.Current_Debt_Source=x.Debt_Source"
+            ." AND p.Current_Debt_Source_PK=x.Debt_Source_PK AND p.Current_Debt>=? AND p.Current_Debt<=? AND {$rounded}=x.Debt_Amount THEN 1 ELSE 0 END=0)",
+            'bindings' => [$minimum, $minimum, self::maximum($options) ?? self::MAX]];
+    }
+
+    /** The same check where no pass over the members has just run (the rebuild after held people were taken out). */
+    public static function assertPendingFromStored(ConnectionInterface $db, string $requestId): void
+    {
+        $stored = self::storedBoundary($db, $requestId);
+        if ($stored !== null) {
+            $stored['unproven'] = $db->table('TblProspectsExport as x')->useWritePdo()->leftJoin('TblProspects as p', 'p.PK', '=', 'x.Prospect_PK')
+                ->where('x.Request_ID', $requestId)->whereRaw($stored['sql'], $stored['bindings'])->exists();
+        }
+        self::assertPending($db, $requestId, $stored);
+    }
+
+    /**
+     * Pending snapshots only: approved historical evidence remains readable unchanged.
+     * $stored: the result of the stored-debt proof (storedBoundary plus 'unproven'), or null to re-read every source row.
+     */
+    public static function assertPending(ConnectionInterface $db, string $requestId, ?array $stored = null): void
     {
         $run = $db->table('TblSMSRuns')->useWritePdo()->where('Request_ID', $requestId)->first();
         $options = isset($run->Run_Options_JSON) ? SmsRunOptions::fromStored($run->Run_Options_JSON, (int) $run->Target) : null;
@@ -149,7 +193,9 @@ final class SmsDebtPolicy
                 continue;
             }
             if ($native) {
-                self::assertNativeSource($db, $requestId, $table, $debt, $minimum, $upper);
+                // Everyone on the minimum is proven by their stored debt: no source row is read.
+                if ($stored !== null && ($stored['unproven'] ?? true) === false) continue;
+                self::assertNativeSource($db, $requestId, $table, $debt, $minimum, $upper, $stored);
 
                 continue;
             }
@@ -178,7 +224,7 @@ final class SmsDebtPolicy
     }
 
     /** Only the frozen boundary subset is visited, using a catalog-proven forced seek. */
-    private static function assertNativeSource(ConnectionInterface $db, string $requestId, string $table, string $debt, int $minimum, int $upper): void
+    private static function assertNativeSource(ConnectionInterface $db, string $requestId, string $table, string $debt, int $minimum, int $upper, ?array $stored = null): void
     {
         [$columns, $index, $identitySeek] = self::sourceAccess($db, $table, $debt);
         $casts = [];
@@ -212,25 +258,28 @@ final class SmsDebtPolicy
         $hint = ' WITH (FORCESEEK(['.str_replace(']', ']]', $index).'] (['.implode('],[', $seekKeys).']))'.($db->transactionLevel() > 0 ? ',HOLDLOCK' : '').')';
         $pk = $columns['PK']->type_name;
         $max = $upper;
+        // With the stored proof, only the members it does not prove are looked up in the source.
+        $storedJoin = $stored === null ? '' : "\nLEFT JOIN dbo.TblProspects p ON p.PK=x.Prospect_PK";
+        $storedFilter = $stored === null ? '' : "\n AND ".$stored['sql'];
         // TOP(2) is inside the aggregate, BEFORE debt validity/minimum filters.
         // Same-PK evidence for unrelated identities is deliberately irrelevant to
         // the v1/v2 frozen composite identity; the lean global PK gate is separate.
         $sql = <<<SQL
 SELECT TOP(1) 1 AS held
-FROM dbo.TblProspectsExport x
+FROM dbo.TblProspectsExport x{$storedJoin}
 OUTER APPLY (
  SELECT COUNT_BIG(*) AS versions,COUNT(v.Debt) AS known_debts,MIN(v.Debt) AS debt
  FROM (SELECT TOP(2) s.{$debt} AS Debt FROM dbo.{$table} s{$hint}
        WHERE s.PK=CONVERT({$pk},x.Debt_Source_PK) AND {$identity}) v
 ) proof
-WHERE x.Request_ID=? AND x.Debt_Source=? AND x.Debt_Amount-1000<?
+WHERE x.Request_ID=? AND x.Debt_Source=? AND x.Debt_Amount-1000<?{$storedFilter}
  AND (proof.versions<>1 OR proof.known_debts<>1 OR proof.debt<? OR proof.debt>{$max}
  OR CASE WHEN proof.debt BETWEEN 0 AND {$max}
      THEN CAST(CEILING(proof.debt/CAST(1000 AS decimal(12,2)))*1000 AS decimal(12,2))
      ELSE NULL END<>x.Debt_Amount)
 OPTION(LOOP JOIN,FORCE ORDER,RECOMPILE)
 SQL;
-        if ($db->selectOne($sql, [$requestId, $table, $minimum, $minimum], false) !== null) {
+        if ($db->selectOne($sql, [$requestId, $table, $minimum, ...($stored['bindings'] ?? []), $minimum], false) !== null) {
             self::holdSource();
         }
     }

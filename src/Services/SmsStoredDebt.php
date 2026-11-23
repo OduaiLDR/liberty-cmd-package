@@ -32,6 +32,9 @@ final class SmsStoredDebt
     /** The tables stored values point into (Current_Debt_Source_PK). */
     public const SOURCE_TABLES = ['TblTUData', 'TblMailers'];
 
+    /** Who can be texted, in the same words as the two priority indexes and the refresh. */
+    public const ELIGIBLE_SQL = 'Contacted=0 AND Opt_Out=0 AND Invalid_Phone=0 AND Phone IS NOT NULL';
+
     public static function selectionEnabled(): bool
     {
         return config('sms-exports.stored_debt_selection', false) === true;
@@ -83,19 +86,54 @@ final class SmsStoredDebt
      */
     public static function assertCurrent(ConnectionInterface $db, ?string $statePath = null): void
     {
-        if ($db->getDriverName() !== 'sqlsrv') return;
+        $waiting = self::waiting($db, $statePath);
+        if ($waiting !== null) throw new RuntimeException($waiting['message']);
+    }
+
+    /**
+     * What a new run has to wait for, or null when the stored values are current. The same answer stops the run at
+     * the click (assertCurrent) and tells the page why Generate is off, so nobody has to ask (Monther, Nov 18, 2026:
+     * "next time i wanna jude make everything without ask me").
+     *
+     * new_people: prospects added since the refresh last finished that can be texted and have no stored value yet.
+     * They only ever arrive with a higher PK, so only the rows above the saved mark are read. A run started before
+     * they are filled would leave them out without a word.
+     *
+     * @return array{reason:string, message:string, tu_rows?:int, people?:int}|null
+     */
+    public static function waiting(ConnectionInterface $db, ?string $statePath = null): ?array
+    {
+        if ($db->getDriverName() !== 'sqlsrv') return null;
         $path = $statePath ?? self::statePath();
-        if (! is_file($path)) return;
+        if (! is_file($path)) return null;
         $state = json_decode((string) file_get_contents($path), true);
-        if (! is_array($state)) throw new RuntimeException('The stored debt state file is unreadable, so a run on stored debt is stopped. Look at it first.');
+        if (! is_array($state)) {
+            return ['reason' => 'unreadable', 'message' => 'The stored debt state file is unreadable, so a run on stored debt is stopped. Look at it first.'];
+        }
         $live = self::sourceMarks($db);
         if (is_array($state['sources'] ?? null) && ($change = self::sourceChange($state['sources'], $live)) !== null) {
-            throw new RuntimeException($change.' Runs on stored debt are stopped until it is worked out again.');
+            return ['reason' => 'source_changed', 'message' => $change.' Runs on stored debt are stopped until it is worked out again.'];
         }
         if (isset($state['tu_watermark']) && $live['TblTUData']['max_pk'] > (int) $state['tu_watermark']) {
-            throw new RuntimeException(sprintf('Stored debt is still catching up with %s new TU rows. The refresh runs every 30 minutes; generate again after it.',
-                number_format($live['TblTUData']['max_pk'] - (int) $state['tu_watermark'])));
+            $rows = $live['TblTUData']['max_pk'] - (int) $state['tu_watermark'];
+
+            return ['reason' => 'new_tu_rows', 'tu_rows' => $rows, 'message' => sprintf(
+                'Stored debt is still catching up with %s new TU rows. It is worked out in the background; generate again when it is done.', number_format($rows))];
         }
+        if (isset($state['prospects_watermark'])) {
+            $mark = (int) $state['prospects_watermark'];
+            $newest = (int) ($db->selectOne('SELECT MAX(PK) AS newest FROM dbo.TblProspects')->newest ?? 0);
+            if ($newest > $mark) {
+                $people = (int) ($db->selectOne('SELECT COUNT_BIG(*) AS people FROM dbo.TblProspects WITH (INDEX(1)) WHERE PK>? AND PK<=? AND '
+                    .self::ELIGIBLE_SQL.' AND Current_Debt_Source IS NULL', [$mark, $newest])->people ?? 0);
+                if ($people > 0) {
+                    return ['reason' => 'new_people', 'people' => $people, 'message' => sprintf(
+                        '%s new people from TU are still being given their debt and tier. It is worked out in the background; generate again when it is done.', number_format($people))];
+                }
+            }
+        }
+
+        return null;
     }
 
     /** Refuses a run that would silently fall back or read columns that aren't there. */

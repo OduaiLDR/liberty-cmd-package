@@ -145,8 +145,9 @@ class SmsRunController extends Controller
     public function approve(Request $request, string $requestId): JsonResponse
     {
         $this->ensureSchemaReady();
-        Validator::make($request->all(), ['confirmed_approval' => ['required', 'accepted']])->validate();
-        return $this->json($this->runs->requestApprove($requestId, $this->actor($request)), 202);
+        // email_files: the tick box at Approve. Left out or false, nothing is published or emailed for this batch.
+        $input = Validator::make($request->all(), ['confirmed_approval' => ['required', 'accepted'], 'email_files' => ['sometimes', 'boolean']])->validate();
+        return $this->json($this->runs->requestApprove($requestId, $this->actor($request), filter_var($input['email_files'] ?? false, FILTER_VALIDATE_BOOLEAN)), 202);
     }
 
     public function removeHeld(Request $request, string $requestId): JsonResponse

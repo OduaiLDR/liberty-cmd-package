@@ -81,3 +81,37 @@ test('the marks query names each source table and reads its OBJECT_ID and highes
     $marks = SmsStoredDebt::sourceMarks(storedDebtDb($saved));
     expect($marks)->toBe($saved);
 });
+
+// Nov 19, 2026: the same answer stops the click and tells the page why Generate is off.
+test('the page is told what a new run waits for, with how many, and nothing when it can go', function () use ($saved): void {
+    $path = storedDebtState(['tu_watermark' => 5000, 'sources' => $saved, 'prospects_watermark' => 100]);
+    expect(SmsStoredDebt::waiting(storedDebtDb($saved + ['TblProspects' => ['newest' => 100]]), $path))->toBeNull();
+    // Newer prospects, all of them filled or not textable.
+    expect(SmsStoredDebt::waiting(storedDebtDb($saved + ['TblProspects' => ['newest' => 180, 'people' => 0]]), $path))->toBeNull();
+    $waiting = SmsStoredDebt::waiting(storedDebtDb($saved + ['TblProspects' => ['newest' => 173978, 'people' => 157686]]), $path);
+    expect($waiting['reason'])->toBe('new_people')->and($waiting['people'])->toBe(157686)
+        ->and($waiting['message'])->toContain('157,686 new people from TU are still being given their debt and tier');
+    expect(fn () => SmsStoredDebt::assertCurrent(storedDebtDb($saved + ['TblProspects' => ['newest' => 173978, 'people' => 157686]]), $path))
+        ->toThrow(RuntimeException::class, '157,686 new people from TU');
+    unlink($path);
+
+    $path = storedDebtState(['tu_watermark' => 5000, 'sources' => $saved, 'prospects_watermark' => 100]);
+    $tu = SmsStoredDebt::waiting(storedDebtDb(['TblTUData' => ['object_id' => 101, 'max_pk' => 655000], 'TblMailers' => $saved['TblMailers']]), $path);
+    expect($tu['reason'])->toBe('new_tu_rows')->and($tu['tu_rows'])->toBe(650000)->and($tu)->not->toHaveKey('people');
+    $swapped = SmsStoredDebt::waiting(storedDebtDb(['TblTUData' => ['object_id' => 555, 'max_pk' => 5000], 'TblMailers' => $saved['TblMailers']]), $path);
+    expect($swapped['reason'])->toBe('source_changed')->and($swapped['message'])->toContain('TblTUData was replaced');
+    unlink($path);
+
+    $broken = tempnam(sys_get_temp_dir(), 'sms-stored-debt-state-');
+    file_put_contents($broken, '{not json');
+    expect(SmsStoredDebt::waiting(storedDebtDb($saved), $broken)['reason'])->toBe('unreadable');
+    unlink($broken);
+    expect(SmsStoredDebt::waiting(storedDebtDb([], 'sqlite'), storedDebtState(['tu_watermark' => 1, 'prospects_watermark' => 1])))->toBeNull();
+});
+
+test('a state saved before the mark existed never reads the prospects table', function () use ($saved): void {
+    $path = storedDebtState(['tu_watermark' => 5000, 'sources' => $saved]);
+    // The made-up database throws on any query it does not know, so this passes only if TblProspects is not read.
+    expect(SmsStoredDebt::waiting(storedDebtDb($saved), $path))->toBeNull();
+    unlink($path);
+});

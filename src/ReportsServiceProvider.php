@@ -148,6 +148,8 @@ class ReportsServiceProvider extends ServiceProvider
         $this->publishes([
             __DIR__ . '/../database/sms-migrations/2026_10_26_000001_create_sms_automatic_handoffs.php'
                 => database_path('migrations/2026_10_26_000001_create_sms_automatic_handoffs.php'),
+            __DIR__ . '/../database/sms-migrations/2026_11_19_000001_add_sms_run_handoff_choice.php'
+                => database_path('migrations/2026_11_19_000001_add_sms_run_handoff_choice.php'),
         ], 'reports-sms-automatic-handoff-migrations');
         // PMOD migrations ship with the package but are NOT auto-loaded.
         // Consumers must explicitly opt in by publishing them:
