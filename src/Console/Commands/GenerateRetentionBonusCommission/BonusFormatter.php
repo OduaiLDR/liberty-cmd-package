@@ -382,9 +382,16 @@ class BonusFormatter
 
     private function setDateCell(\PhpOffice\PhpSpreadsheet\Worksheet\Worksheet $sheet, string $cell, ?string $val): void
     {
-        if ($val !== null && $val !== '' && strtotime($val) !== false) {
-            $sheet->setCellValue($cell, XlDate::PHPToExcel(strtotime($val)));
+        $serial = self::detailDateSerial($val);
+        if ($serial !== null) {
+            $sheet->setCellValue($cell, $serial);
             $sheet->getStyle($cell)->getNumberFormat()->setFormatCode(self::DATE_FMT);
         }
+    }
+
+    public static function detailDateSerial(?string $value): ?float
+    {
+        $timestamp = $value === null || $value === '' ? false : strtotime($value);
+        return $timestamp === false ? null : XlDate::PHPToExcel($timestamp);
     }
 }

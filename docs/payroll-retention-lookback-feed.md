@@ -86,3 +86,37 @@ explicit zeros and leaving absent employees absent. It never rereads the mutable
 
 The payment month remains separate from the source period. Payroll Review applies
 the verified prior month data to its selected payment month snapshot.
+
+## Employee calculation comparison
+
+Lookback's employee statement uses each account's calculated Retention amount.
+The Sales deduction carries its own amount or exclusion reason. A client at the
+default commission rate can earn Retention commission while carrying a blank
+Sales deduction.
+
+Use a CMD Runner shell configured for approved test data. Start a fresh
+two-company query-only capture and compare one captured employee by their
+normalized name. For example, in PowerShell:
+
+~~~powershell
+$period = '2098-01-01'
+$runId = php -r 'echo bin2hex(random_bytes(16));'
+$env:PAYROLL_LOOKBACK_QUERY_ONLY = '1'
+$env:PAYROLL_CAPTURE_CUSTOMER_SERVICE_CONTEXT = '1'
+$env:PAYROLL_COMMISSION_RUN_ID = $runId
+php artisan reports:generate-retention-bonus-commission both $period --structured-shadow --no-email
+if ($LASTEXITCODE -eq 0) {
+    php artisan payroll:compare-lookback-shadow $period $runId 'named retention'
+}
+~~~
+
+The comparison prints a match flag and timing for each calculation path,
+excluding capture and archive access. Use a fresh run ID after a partial
+capture. Close the test shell after the comparison to clear the run settings.
+
+For workbook-free replay, pass the two private `artifact.json` records under
+`storage/app/payroll-report-artifacts/<period>/<runId>/lookback_<source>/`
+to `CustomerServiceCalculationSnapshot::forStructuredLookbackAgent`, keyed
+by `lookback_ldr` and `lookback_plaw`. Replay verifies both metadata digests,
+the shared invocation identity, and reconciliation to the captured employee
+totals. Historical employee statements use the existing workbook reader.

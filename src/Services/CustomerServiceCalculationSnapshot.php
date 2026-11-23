@@ -22,6 +22,15 @@ final class CustomerServiceCalculationSnapshot
         return self::selectArchivedAgent($artifacts, $period, $report, $family, $agentKey, $sourceScope);
     }
 
+    /** Replay the employee's Lookback evidence using only trusted archive metadata. */
+    public static function forStructuredLookbackAgent(array $artifacts, string $period, string $runId, string $agentKey, string $sourceScope): array
+    {
+        self::validateArchivedSelection($period, 'retention_lookback', $agentKey, $sourceScope);
+        if (!preg_match('/^[a-f0-9]{32}$/D', $runId)) self::invalid();
+
+        return self::selectArchivedAgent($artifacts, $period, 'retention_lookback', 'lookback', $agentKey, $sourceScope, $runId);
+    }
+
     public static function validateArchivedSelection(string $period, string $report, string $agentKey, string $sourceScope): void
     {
         if (!in_array($report, ['nsf', 'retention_lookback', 'retention_regular'], true)
@@ -33,15 +42,17 @@ final class CustomerServiceCalculationSnapshot
         }
     }
 
-    private static function selectArchivedAgent(array $artifacts, string $period, string $report, string $family, string $agentKey, string $sourceScope): array
+    private static function selectArchivedAgent(array $artifacts, string $period, string $report, string $family, string $agentKey, string $sourceScope, ?string $structuredRunId = null): array
     {
         if (count($artifacts) !== 2 || array_diff([$family . '_ldr', $family . '_plaw'], array_keys($artifacts))) self::invalid();
-        // Both source files and contexts are validated even for a one-company request.
+        // Validate both sources even for a one-company request.
         $validated = [];
+        $structuredLines = [];
+        $captureId = null;
         foreach (['ldr', 'plaw'] as $source) {
             $key = $family . '_' . $source;
             $artifact = $artifacts[$key];
-            self::validateArchivedArtifact($artifact, $key, $period);
+            self::validateArchivedArtifact($artifact, $key, $period, $structuredRunId === null);
             if ($report === 'retention_regular' && isset($artifact['context']['legacyEvidence'])) {
                 $evidence = $artifact['context']['legacyEvidence'];
                 if (($evidence['source'] ?? null) !== $source || ($evidence['period'] ?? null) !== $period
@@ -64,6 +75,14 @@ final class CustomerServiceCalculationSnapshot
                     || !array_is_list($context['rows']) || ($family === 'nsf' && ($context['coverageBasis'] ?? null) !== PayrollCommissionResultSnapshot::NSF_ALL_PRICED_AGENTS)) self::invalid();
                 $checked = PayrollCommissionResultSnapshot::component($kind, $source, $period, $component, $context['rows'], $context['coverageBasis'] ?? null);
                 if (json_encode($checked, JSON_THROW_ON_ERROR) !== json_encode($context, JSON_THROW_ON_ERROR)) self::invalid();
+                if ($structuredRunId !== null) {
+                    $pricing = $artifact['context']['lookbackPricing'] ?? null;
+                    if (($artifact['identity'] ?? null) !== $structuredRunId || ($artifact['period'] ?? null) !== $period
+                        || ($artifact['context']['queryOnly'] ?? null) !== true || !is_array($pricing)) self::invalid();
+                    $structuredLines[$source] = LookbackPricingSnapshot::validatedLines($pricing, $checked);
+                    if ($captureId !== null && $captureId !== $pricing['captureId']) self::invalid();
+                    $captureId = $pricing['captureId'];
+                }
                 $matches = array_values(array_filter($context['rows'], static fn ($row) => self::archivedAgentKey($row['agentKey']) === self::archivedAgentKey($agentKey)));
                 if (count($matches) > 1) self::invalid();
                 $validated[$source] = [$artifact, $matches ? (float) $matches[0]['amount'] : null, false, $matches ? $matches[0]['agentKey'] : $agentKey];
@@ -87,13 +106,18 @@ final class CustomerServiceCalculationSnapshot
             } elseif ($family === 'retention' && isset($artifact['context']['regularPricing'])) {
                 $entry['lines'] = self::regular($artifact, $period, $sourceAgentKey);
             } elseif ($amount != 0.0) {
-                $lines = match ($family) { 'nsf' => self::nsf($artifact, $sourceAgentKey, $amount), 'lookback' => self::lookback($artifact, $sourceAgentKey), default => null };
+                $lines = match (true) {
+                    $structuredRunId !== null => $structuredLines[$source][$sourceAgentKey],
+                    $family === 'nsf' => self::nsf($artifact, $sourceAgentKey, $amount),
+                    $family === 'lookback' => self::lookback($artifact, $sourceAgentKey),
+                    default => null,
+                };
                 if ($lines === null) $entry = self::unavailable($entry, 'The original workbook does not retain trustworthy selected line prices for this component.');
                 else $entry['lines'] = $lines;
             }
             if (count($entry['lines']) > 20000) self::invalid();
             if ($entry['status'] === 'verified' && round(array_sum(array_column($entry['lines'], 'amount')), 2) !== round((float) $amount, 2)) self::invalid();
-            if (is_link($artifact['path']) || !hash_equals($artifact['sha256'], (string) hash_file('sha256', $artifact['path']))) self::invalid();
+            if ($structuredRunId === null && (is_link($artifact['path']) || !hash_equals($artifact['sha256'], (string) hash_file('sha256', $artifact['path'])))) self::invalid();
             $components[] = $entry;
         }
         return ['kind' => 'cs_archived_agent_calculation_v1', 'version' => 1, 'period' => $period,
@@ -106,13 +130,18 @@ final class CustomerServiceCalculationSnapshot
         return ['aleph bolanos' => 'aleph bolaños', 'andrea mendoze' => 'andrea mendoza', 'andrea galves' => 'andrea galvez'][$key] ?? $key;
     }
 
-    private static function validateArchivedArtifact(mixed $artifact, string $key, string $period): void
+    private static function validateArchivedArtifact(mixed $artifact, string $key, string $period, bool $requireWorkbook = true): void
     {
         if (!is_array($artifact) || ($artifact['key'] ?? null) !== $key || ($artifact['period'] ?? $period) !== $period
-            || !is_array($artifact['context'] ?? null) || !is_string($artifact['path'] ?? null)
+            || !is_array($artifact['context'] ?? null)
             || !is_string($artifact['contextSha256'] ?? null) || !preg_match('/^[a-f0-9]{64}$/D', $artifact['contextSha256'])
             || hash('sha256', json_encode($artifact['context'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)) !== $artifact['contextSha256']) self::invalid();
-        self::validateWorkbookFile($artifact['path'], $artifact['sha256'] ?? null, $artifact['byteLength'] ?? null);
+        if ($requireWorkbook) {
+            if (!is_string($artifact['path'] ?? null)) self::invalid();
+            self::validateWorkbookFile($artifact['path'], $artifact['sha256'] ?? null, $artifact['byteLength'] ?? null);
+        } elseif (!is_string($artifact['sha256'] ?? null) || !preg_match('/^[a-f0-9]{64}$/D', $artifact['sha256'])) {
+            self::invalid();
+        }
     }
 
     private static function validateWorkbookFile(string $path, mixed $sha256, mixed $byteLength = null): void

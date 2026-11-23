@@ -8,6 +8,7 @@ use Cmd\Reports\Services\CommissionAgentEmailFiles;
 use Cmd\Reports\Services\CommissionResultsWriter;
 use Cmd\Reports\Services\CommissionRosterProvider;
 use Cmd\Reports\Services\EmailSenderService;
+use Cmd\Reports\Services\LookbackPricingSnapshot;
 use Cmd\Reports\Services\RetentionAgentIdentity;
 use Cmd\Reports\Services\PayrollRetentionLookbackWriter;
 use Cmd\Reports\Services\PayrollReportArtifactArchive;
@@ -37,6 +38,7 @@ class GenerateRetentionBonusCommission extends Command
                             {period? : Period start date YYYY-MM-01; defaults to first day of last month}
                             {--no-email : Build workbooks only, skip email}
                             {--no-azure-write : Calculate/build without updating Azure commission results}
+                            {--structured-shadow : Save Lookback line prices alongside a query-only two-company capture}
                             {--test-recipient= : Send EVERY email (All + agent copies) only to this address}';
 
     protected $description = 'Generate Retention Lookback Commission report for LDR and/or PLAW.';
@@ -69,6 +71,15 @@ class GenerateRetentionBonusCommission extends Command
         $arg     = strtolower((string)$this->argument('source'));
         $sources = ($arg === 'both') ? ['ldr', 'plaw'] : [$arg];
         $period  = trim((string) $this->argument('period'));
+        $captureId = null;
+        if ($this->input !== null && $this->option('structured-shadow')) {
+            if (getenv('PAYROLL_LOOKBACK_QUERY_ONLY') !== '1' || $arg !== 'both' || $period === ''
+                || $this->option('test-recipient') !== null) {
+                $this->error('Lookback comparison requires a query-only run for both companies, an explicit month and no email recipient.');
+                return Command::FAILURE;
+            }
+            $captureId = bin2hex(random_bytes(16));
+        }
         if ($period !== '' && !$this->isValidPeriodStart($period)) {
             $this->error('period must be a valid YYYY-MM-01 date.');
             return Command::FAILURE;
@@ -86,7 +97,7 @@ class GenerateRetentionBonusCommission extends Command
                 $this->error("Unknown source: $src");
                 return Command::FAILURE;
             }
-            if (!$this->runForSource($src, $period ?: null, $runId)) {
+            if (!$this->runForSource($src, $period ?: null, $runId, $captureId)) {
                 return Command::FAILURE;
             }
         }
@@ -100,7 +111,7 @@ class GenerateRetentionBonusCommission extends Command
         return $date !== false && $date->format('Y-m-d') === $period && $date->format('d') === '01';
     }
 
-    private function runForSource(string $source, ?string $periodStart = null, ?string $runId = null): bool
+    private function runForSource(string $source, ?string $periodStart = null, ?string $runId = null, ?string $captureId = null): bool
     {
         $cfg     = self::SOURCE_CONFIG[$source];
         $display = $cfg['display'];
@@ -315,7 +326,8 @@ class GenerateRetentionBonusCommission extends Command
 
             $formatter = new BonusFormatter();
             if ($queryOnly) {
-                $outputDirectory = storage_path('app/payroll-lookback-query-tmp/' . $runId . '/' . $source);
+                $temporaryRun = $captureId === null ? $runId : $runId . '-' . $captureId;
+                $outputDirectory = storage_path('app/payroll-lookback-query-tmp/' . $temporaryRun . '/' . $source);
                 if (!is_dir($outputDirectory) && !@mkdir($outputDirectory, 0700, true) && !is_dir($outputDirectory)) throw new \RuntimeException('Cannot create isolated Lookback workbook directory.');
             }
             $allFile = $formatter->buildWorkbook(
@@ -344,6 +356,9 @@ class GenerateRetentionBonusCommission extends Command
                     ? ['commissionResults' => PayrollCommissionResultSnapshot::component('retention', $source, $reportStartDate, 'bonusCommission', $bonusResults)] : [];
                 if ($salesManifest !== null) $context['salesDeductions'] = $salesManifest;
                 if ($queryOnly) $context['queryOnly'] = true;
+                if ($captureId !== null) {
+                    $context['lookbackPricing'] = LookbackPricingSnapshot::capture($captureId, $rows, $context['commissionResults']);
+                }
                 PayrollReportArtifactArchive::captureFromEnvironment('lookback', $source, $reportStartDate, $allFile, $context);
             }
 
@@ -377,7 +392,10 @@ class GenerateRetentionBonusCommission extends Command
             return false;
         } finally {
             if ($queryOnly && is_array($allFile) && isset($allFile['path']) && is_file($allFile['path'])) @unlink($allFile['path']);
-            if ($queryOnly && $outputDirectory !== null && is_dir($outputDirectory)) @rmdir($outputDirectory);
+            if ($queryOnly && $outputDirectory !== null && is_dir($outputDirectory)) {
+                @rmdir($outputDirectory);
+                if ($captureId !== null) @rmdir(dirname($outputDirectory));
+            }
         }
         return true;
     }
