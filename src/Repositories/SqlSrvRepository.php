@@ -18,9 +18,8 @@ abstract class SqlSrvRepository
     }
 
     /**
-     * Runs $callback with a longer SQL Server query timeout (cmd-runner's default is
-     * CMD_DB_QUERY_TIMEOUT, 300 s), then puts the previous one back. For queue jobs and
-     * commands only; keep it below their own time limits.
+     * Temporarily applies a SQL Server query timeout for the callback. Keep it below
+     * the time limit of the request, job or command that runs the query.
      */
     protected function withQueryTimeout(int $seconds, callable $callback): mixed
     {
