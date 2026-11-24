@@ -10,6 +10,7 @@ use Cmd\Reports\Console\Commands\ReadNsfTeamLeaderShadow;
 use Cmd\Reports\Services\CustomerServiceCalculationSnapshot;
 use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\NsfStructuredCapture;
+use Cmd\Reports\Services\NsfStructuredTeamLeader;
 use Cmd\Reports\Services\PayrollReportArtifactArchive;
 use Cmd\Reports\Tests\Support\RecordingSqlServerConnector;
 use Illuminate\Console\Application as Artisan;
@@ -500,7 +501,7 @@ final class NsfQueryOnlyCaptureTest extends TestCase
         };
         [$code, $output] = $this->runNsf($sql, [
             'ldr' => [$this->sourceRow(101, self::ROSTERED, '2098-02-05')],
-            'plaw' => [$this->sourceRow(201, self::ROSTERED, '2098-02-05')],
+            'plaw' => [$this->sourceRow(201, self::ROSTERED, '2098-02-05'), $this->sourceRow(202, '0', null)],
         ], ['--no-email' => true]);
         self::assertSame(0, $code, $output);
         self::assertSame([['nsf', 'ldr', self::PERIOD], ['nsf', 'plaw', self::PERIOD]], $sql->sourceResets);
@@ -515,17 +516,55 @@ final class NsfQueryOnlyCaptureTest extends TestCase
             self::assertSame($artifact['context']['nsfStructuredCapture'],
                 json_decode($envelope['sources'][$source]['captureJson'], true, flags: JSON_THROW_ON_ERROR));
         }
+        $capture = $artifacts['nsf_plaw']['context']['nsfStructuredCapture'];
+        self::assertSame('0', $capture['contacts'][1]['agent']);
+        self::assertFalse($capture['contacts'][1]['eligible']);
+        self::assertNotContains('0', array_column($capture['agents'], 'agent'));
         [$exit, $stdout] = $this->runExport();
         self::assertSame(1, $exit);
         self::assertSame('', $stdout);
 
         $leader = new GenerateRetentionManagerCommission;
-        $wanted = $leader->buildPayrollReviewLeadershipSnapshot('nsf_team_leader', self::PERIOD, '2098-01-31', $artifacts, false);
+        $workbookInputs = array_map(static fn (array $artifact): array => ['path' => $artifact['path']], $artifacts);
+        $wanted = $leader->buildPayrollReviewWorkbookBundle(self::PERIOD, '2098-01-31',
+            $workbookInputs, $this->root . '/normal-legacy-leader', null, true);
+        self::assertSame([self::ROSTERED], array_column($wanted['reports']['nsf_team_leader']['team'], 'employeeName'));
+        self::assertSame(2, $wanted['reports']['nsf_team_leader']['summary']['clearCount']);
         foreach ($artifacts as &$artifact) {
             unset($artifact['path']);
         }
         unset($artifact);
-        self::assertSame($wanted, $leader->buildPayrollReviewLeadershipSnapshot('nsf_team_leader', self::PERIOD, '2098-01-31', $artifacts));
+        $frozen = $leader->freezePayrollReviewLeadership(self::PERIOD, '2098-01-31', $artifacts, null, true);
+        self::assertSame($wanted['reports'], $frozen['reports']);
+
+        $this->assertRejectsTeamLeaderEvidence($leader, 'zero placeholder in a strict shadow', self::PERIOD, self::RUN_ID, $envelope);
+        foreach ([
+            'eligible zero placeholder' => static function (array $capture): array {
+                $capture['contacts'][1]['eligible'] = true;
+                return $capture;
+            },
+            'on-roster zero' => static function (array $capture): array {
+                $capture['agents'][0]['agent'] = '0';
+                return $capture;
+            },
+            'other numeric placeholder' => static function (array $capture): array {
+                $capture['contacts'][1]['agent'] = '123';
+                return $capture;
+            },
+            'formula placeholder' => static function (array $capture): array {
+                $capture['contacts'][1]['agent'] = '=1+1';
+                return $capture;
+            },
+        ] as $case => $change) {
+            $bad = $this->changeCapture($envelope, 'plaw', $change);
+            try {
+                NsfStructuredTeamLeader::inputs(self::PERIOD, self::RUN_ID, $bad, allowUnassigned: true);
+                self::fail('Accepted ' . $case);
+            } catch (\InvalidArgumentException $error) {
+                self::assertStringContainsString('outside the supported leadership scope', $error->getMessage(), $case);
+            }
+        }
+
         $capture = &$artifacts['nsf_ldr']['context']['nsfStructuredCapture'];
         $capture['contacts'][] = [
             'contactId' => '999', 'agent' => null, 'returnedDate' => self::PERIOD,
@@ -534,7 +573,7 @@ final class NsfQueryOnlyCaptureTest extends TestCase
         unset($capture);
         $artifacts['nsf_ldr']['contextSha256'] = hash('sha256', json_encode($artifacts['nsf_ldr']['context'], self::JSON_FLAGS));
         $built = $leader->buildPayrollReviewWorkbookBundle(self::PERIOD, '2098-01-31', $artifacts, $this->root . '/normal-leader', null, true);
-        self::assertSame($wanted['summary'], $built['reports']['nsf_team_leader']['summary']);
+        self::assertSame($wanted['reports'], $built['reports']);
         self::assertFileExists($built['files']['nsf_team_leader']['path']);
     }
 

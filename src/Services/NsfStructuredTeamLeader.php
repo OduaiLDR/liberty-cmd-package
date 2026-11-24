@@ -129,7 +129,7 @@ final class NsfStructuredTeamLeader
         }
         self::requireFields((array) $contact, ['contactId', 'agent', 'returnedDate', 'action', 'recoupDate', 'clearedDate', 'eligible']);
         $unassigned = $allowUnassigned && $contact->eligible === false
-            && ($contact->agent === null || (is_string($contact->agent) && trim($contact->agent) === ''));
+            && ($contact->agent === null || (is_string($contact->agent) && in_array(trim($contact->agent), ['', '0'], true)));
         if (!is_string($contact->contactId) || !preg_match('/^[1-9][0-9]*$/D', $contact->contactId)
             || (!self::isAgent($contact->agent) && !$unassigned) || !is_bool($contact->eligible)
             || ($contact->action !== null && (!is_string($contact->action)
