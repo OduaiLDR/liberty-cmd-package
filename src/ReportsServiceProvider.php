@@ -107,6 +107,7 @@ class ReportsServiceProvider extends ServiceProvider
     public function boot()
     {
         $this->mergeConfigFrom(__DIR__ . '/../config/sms-exports.php', 'sms-exports');
+        $this->mergeConfigFrom(__DIR__ . '/../config/prospect-list-builder.php', 'prospect-list-builder');
         // Fail before routes, commands, or queue workers can touch any data if demo
         // simulation was accidentally enabled against a real connection.
         \Cmd\Reports\Services\SmsDemoGuard::enabled();
@@ -118,6 +119,7 @@ class ReportsServiceProvider extends ServiceProvider
         $this->loadRoutesFrom(__DIR__ . '/../routes/pmod.php');
         $this->loadRoutesFrom(__DIR__ . '/../routes/sms-api.php');
         $this->loadRoutesFrom(__DIR__ . '/../routes/sms-download.php');
+        $this->loadRoutesFrom(__DIR__ . '/../routes/prospect-list-builder.php');
         $this->loadViewsFrom(__DIR__ . '/../resources/views', 'reports');
 
         $this->publishes([
@@ -302,6 +304,13 @@ class ReportsServiceProvider extends ServiceProvider
 
     public function register()
     {
+        $inspectPath = 'api/internal/prospect-lists/*/inspect';
+        $this->app['config']->push('telescope.ignore_paths', $inspectPath);
+        $this->app['config']->push('debugbar.except', $inspectPath);
+        // Use a client without an event dispatcher so scrub credentials and phone numbers stay out of HTTP telemetry.
+        $this->app->bind(\Cmd\Reports\Services\TcpaLitigatorScrubber::class,
+            static fn () => new \Cmd\Reports\Services\TcpaLitigatorScrubber(new \Illuminate\Http\Client\Factory()));
+
         // Lightweight until explicitly preparing/sending a handoff. Reading run
         // status must not resolve a recipient database or contact Graph.
         $this->app->bind(\Cmd\Reports\Services\SmsRunEmailGateway::class,
