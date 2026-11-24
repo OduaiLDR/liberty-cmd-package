@@ -395,7 +395,8 @@ class GenerateRetentionCommissionReport extends Command
                 $archiveContext['regularPricing'] = RetentionPricingSnapshot::capture($source, $startDate, $useRetainedMonthTier,
                     array_values($this->lastPricingRows), $archiveContext['commissionResults']);
                 if ($this->payrollCaptureId !== null) {
-                    [$structuredRows] = $this->structuredLeadershipRows($rows, $startDate, $endDate, true);
+                    [$structuredRows, , $pricingDates] = $this->structuredLeadershipRows($rows, $startDate, $endDate, true);
+                    if ($pricingDates !== []) $archiveContext['regularPricingDates'] = $pricingDates;
                     $archiveContext = RetentionStructuredCapture::context($source, $startDate, (string) getenv('PAYROLL_COMMISSION_RUN_ID'),
                         $this->payrollCaptureId, $structuredRows, $archiveContext, false);
                 }
@@ -480,6 +481,7 @@ class GenerateRetentionCommissionReport extends Command
     {
         $cohort = [];
         $trancheRows = [];
+        $pricingDates = [];
         foreach ($rows as $row) {
             $cancel = $this->workbookCalendarDate($this->col($row, 'CANCEL_REQUEST_DATE'));
             if (!$includeWorkbookFields && ($cancel === null || $cancel < $period || $cancel > $periodEnd)) {
@@ -502,6 +504,13 @@ class GenerateRetentionCommissionReport extends Command
                 foreach (['RETENTION_DATE', 'RECONSIDERATION_DATE', 'DROPPED_DATE'] as $dateField) {
                     $projected[$dateField] = $this->workbookCalendarDate($this->toDate($this->col($row, $dateField)));
                 }
+                // Keep the Excel display dates and the dates used to select earnings when they differ.
+                foreach (['RETENTION_DATE', 'RETENTION_PAYMENT_DATE'] as $dateField) {
+                    $pricingDate = $this->toDate($this->col($row, $dateField));
+                    if ($pricingDate !== $projected[$dateField]) {
+                        $pricingDates['LLG-' . $projected['ID']][$dateField] = $pricingDate;
+                    }
+                }
                 foreach (['T1', 'T2', 'T3', 'T4'] as $tier) {
                     $projected[$tier] = isset($row[$tier]) ? (float) $row[$tier] : null;
                 }
@@ -510,7 +519,7 @@ class GenerateRetentionCommissionReport extends Command
             }
             $cohort[] = $projected;
         }
-        return [$cohort, $trancheRows];
+        return [$cohort, $trancheRows, $pricingDates];
     }
 
     // ─── Data fetchers ────────────────────────────────────────────────────────

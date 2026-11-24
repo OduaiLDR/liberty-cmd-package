@@ -15,6 +15,7 @@ use Illuminate\Console\Command;
 use Illuminate\Container\Container;
 use Illuminate\Support\Facades\Log;
 use PhpOffice\PhpSpreadsheet\IOFactory;
+use PhpOffice\PhpSpreadsheet\Shared\Date as ExcelDate;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\NullLogger;
@@ -222,6 +223,72 @@ final class RetentionQueryOnlyCaptureTest extends TestCase
         }
     }
 
+    public function test_normal_capture_keeps_the_pricing_day_when_the_workbook_shows_the_next_month(): void
+    {
+        $timezone = date_default_timezone_get();
+        date_default_timezone_set('America/Los_Angeles');
+        try {
+            [$code, $output] = $this->runReport(['--no-email' => true], allowWrites: true,
+                ldrPaymentOverrides: [105 => '2098-02-28 18:00:00']);
+            self::assertSame(Command::SUCCESS, $code, $output);
+            $archive = new PayrollReportArtifactArchive;
+            $artifacts = [];
+            foreach (['retention_ldr', 'retention_plaw'] as $key) $artifacts[$key] = $archive->read($key, self::PERIOD, self::RUN_ID);
+
+            $ldr = $artifacts['retention_ldr'];
+            $captured = array_column($ldr['context']['retentionStructuredCapture']['rows'], null, 'ID')['105'];
+            self::assertSame('2098-03-01', $captured['RETENTION_PAYMENT_DATE']);
+            self::assertSame(['RETENTION_PAYMENT_DATE' => self::END], $ldr['context']['regularPricingDates']['LLG-105']);
+            $price = array_column($ldr['context']['regularPricing']['rows'], null, 'clientId')['105'];
+            $book = IOFactory::load($ldr['path']);
+            try {
+                $cell = $book->getSheetByName('Retention Data')->getCell('J' . $price['detailRow'])->getValue();
+                self::assertSame('2098-03-01', ExcelDate::excelToDateTimeObject($cell)->format('Y-m-d'));
+            } finally { $book->disconnectWorksheets(); }
+
+            $selections = [
+                ['reportKind' => 'retention', 'agentKey' => 'outside month paid', 'sourceScope' => 'ldr'],
+                ['reportKind' => 'retention', 'agentKey' => 'ldr same day', 'sourceScope' => 'ldr'],
+            ];
+            $batch = CustomerServiceCalculationSnapshot::forAgents($this->completeBundleSources($artifacts), self::PERIOD, $selections);
+            self::assertTrue($batch[0]['ok']);
+            self::assertTrue($batch[1]['ok']);
+            self::assertSame(5.0, $batch[0]['calculation']['components'][0]['amount']);
+            self::assertSame(self::END, $batch[0]['calculation']['components'][0]['lines'][0]['paymentDate']);
+
+            $oldShape = $this->changeContext($artifacts, 'retention_ldr', static function (array $context): array {
+                unset($context['regularPricingDates']);
+                return $context;
+            });
+            $oldBatch = CustomerServiceCalculationSnapshot::forAgents($this->completeBundleSources($oldShape), self::PERIOD, $selections);
+            self::assertFalse($oldBatch[0]['ok']);
+            self::assertSame($batch[1], $oldBatch[1]);
+            $single = CustomerServiceCalculationSnapshot::forArchivedAgent($oldShape, self::PERIOD, 'retention_regular', 'ldr same day', 'ldr');
+            self::assertSame($batch[1]['calculation']['components'][0]['lines'], $single['components'][0]['lines']);
+            $manager = new GenerateRetentionManagerCommission;
+            foreach (['retention_manager', 'retention_team_leader'] as $report) {
+                $leadership = $manager->buildPayrollReviewLeadershipSnapshot($report, self::PERIOD, self::END, $artifacts);
+                self::assertSame(
+                    $manager->buildPayrollReviewLeadershipSnapshot($report, self::PERIOD, self::END, $oldShape),
+                    $leadership,
+                );
+                self::assertSame(
+                    $manager->buildPayrollReviewLeadershipSnapshot($report, self::PERIOD, self::END, $artifacts, false),
+                    $leadership,
+                );
+            }
+
+            $invalid = $this->changeContext($artifacts, 'retention_ldr', static function (array $context): array {
+                $context['regularPricingDates']['LLG-9999'] = ['RETENTION_PAYMENT_DATE' => self::END];
+                return $context;
+            });
+            $this->expectException(\InvalidArgumentException::class);
+            CustomerServiceCalculationSnapshot::forArchivedAgent($invalid, self::PERIOD, 'retention_regular', 'outside month paid', 'ldr');
+        } finally {
+            date_default_timezone_set($timezone);
+        }
+    }
+
     public function test_normal_payroll_capture_preserves_leadership_and_cross_month_employee_pricing(): void
     {
         [$code, $output, $producer] = $this->runReport(['--no-email' => true], allowWrites: true);
@@ -280,17 +347,7 @@ final class RetentionQueryOnlyCaptureTest extends TestCase
             $book->disconnectWorksheets();
             $nsf[$key] = ['path' => $path];
         }
-        $bundleSources = $artifacts;
-        foreach (['ldr', 'plaw'] as $source) {
-            foreach (['lookback' => 'bonusCommission', 'nsf' => 'commission'] as $family => $component) {
-                $key = $family . '_' . $source;
-                $kind = $family === 'nsf' ? 'nsf' : 'retention';
-                $bundleSources[$key] = ['key' => $key, 'context' => ['commissionResults' =>
-                    PayrollCommissionResultSnapshot::component($kind, $source, self::PERIOD, $component, [],
-                        $family === 'nsf' ? PayrollCommissionResultSnapshot::NSF_ALL_PRICED_AGENTS : null),
-                ]] + $artifacts['retention_' . $source];
-            }
-        }
+        $bundleSources = $this->completeBundleSources($artifacts);
         $selections = [
             ['reportKind' => 'retention', 'agentKey' => 'outside month paid', 'sourceScope' => 'ldr'],
             ['reportKind' => 'retention', 'agentKey' => 'plaw earlier day', 'sourceScope' => 'plaw'],
@@ -523,7 +580,23 @@ final class RetentionQueryOnlyCaptureTest extends TestCase
         return $artifacts;
     }
 
-    private function runReport(array $arguments, bool $failPlawBaseRead = false, bool $allowWrites = false): array
+    private function completeBundleSources(array $artifacts): array
+    {
+        $sources = $artifacts;
+        foreach (['ldr', 'plaw'] as $source) {
+            foreach (['lookback' => 'bonusCommission', 'nsf' => 'commission'] as $family => $component) {
+                $key = $family . '_' . $source;
+                $kind = $family === 'nsf' ? 'nsf' : 'retention';
+                $sources[$key] = ['key' => $key, 'context' => ['commissionResults' =>
+                    PayrollCommissionResultSnapshot::component($kind, $source, self::PERIOD, $component, [],
+                        $family === 'nsf' ? PayrollCommissionResultSnapshot::NSF_ALL_PRICED_AGENTS : null),
+                ]] + $artifacts['retention_' . $source];
+            }
+        }
+        return $sources;
+    }
+
+    private function runReport(array $arguments, bool $failPlawBaseRead = false, bool $allowWrites = false, array $ldrPaymentOverrides = []): array
     {
         $connectors = [
             'ldr' => new RetentionShadowTestConnector([
@@ -532,7 +605,7 @@ final class RetentionQueryOnlyCaptureTest extends TestCase
                 $this->row(103, 'LDR Later Day', '2098-02-12', 'Retained', '12000', '2098-02-13'),
                 $this->row(104, 'Last Day Unretained', (string) strtotime(self::END . ' 23:59:59') . '.000000000', 'Not Retained', '4555.55'),
                 $this->row(105, 'Outside Month Paid', '2098-01-31 23:59:59', 'Retained', '18000', '2098-01-31'),
-            ], [102 => '2098-02-06', 103 => '2098-02-15', 105 => '2098-02-03']),
+            ], $ldrPaymentOverrides + [102 => '2098-02-06', 103 => '2098-02-15', 105 => '2098-02-03']),
             'plaw' => new RetentionShadowTestConnector([
                 $this->row(101, 'Before Month Duplicate', '2098-01-31 23:59:59', 'Retained', '18000'),
                 $this->row(102, 'PLAW Same Day', '2098-02-05 00:00:00', 'Not Retained', '18000'),

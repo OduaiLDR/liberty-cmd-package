@@ -18,6 +18,7 @@ final class RetentionStructuredCapture
         'CANCEL_REQUEST_DATE', 'RETENTION_PAYMENT_DATE'];
     private const WORKBOOK_FIELDS = ['CLIENT', 'RETENTION_DATE', 'RECONSIDERATION_DATE', 'DROPPED_DATE',
         'CLEARED_PAYMENTS', 'T1', 'T2', 'T3', 'T4'];
+    private const PRICING_DATE_FIELDS = ['RETENTION_DATE', 'RETENTION_PAYMENT_DATE'];
     private const TRANCHE_FIELDS = ['TRANCHE', 'CUT_OFF', 'MADE_CUT_OFF', 'BONUS_FLAG'];
 
     public static function archive(): PayrollReportArtifactArchive
@@ -190,8 +191,21 @@ final class RetentionStructuredCapture
             self::validateTranche($tranche, $outcome);
             $rows[] = [...$row, ...$tranche];
         }
+        if ($payroll && array_key_exists('regularPricingDates', $context)) {
+            self::validatePricingDates($context['regularPricingDates'], $seen);
+        }
 
         return $rows;
+    }
+
+    private static function validatePricingDates(mixed $entries, array $clientIds): void
+    {
+        if (!is_array($entries)) self::invalid();
+        foreach ($entries as $clientKey => $dates) {
+            if (!is_string($clientKey) || !str_starts_with($clientKey, 'LLG-') || !isset($clientIds[substr($clientKey, 4)])
+                || !is_array($dates) || $dates === [] || array_diff(array_keys($dates), self::PRICING_DATE_FIELDS)) self::invalid();
+            foreach ($dates as $date) if ($date !== null && !self::date($date)) self::invalid();
+        }
     }
 
     private static function validateWorkbookFields(array $row): void

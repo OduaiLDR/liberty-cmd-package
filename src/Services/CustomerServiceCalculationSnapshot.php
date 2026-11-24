@@ -103,7 +103,7 @@ final class CustomerServiceCalculationSnapshot
                 $entry['originalRows'] = self::legacyOriginalRows($artifact, $period, $sourceAgentKey);
             } elseif ($family === 'retention' && isset($artifact['context']['regularPricing'])) {
                 $entry['lines'] = isset($regularLines[$source])
-                    ? ($regularLines[$source][$sourceAgentKey] ?? []) : self::regular($artifact, $period, $sourceAgentKey);
+                    ? self::structuredAgentLines($regularLines[$source], $sourceAgentKey) : self::regular($artifact, $period, $sourceAgentKey);
             } elseif ($amount != 0.0) {
                 $lines = match (true) {
                     $structuredRunId !== null => $structuredLines[$source][$sourceAgentKey],
@@ -390,7 +390,7 @@ final class CustomerServiceCalculationSnapshot
         $calculation = self::bundleCalculation($sources, $period, $reportKind, $agentKey, $sourceScope);
         foreach ($calculation['components'] as $index => $component) {
             $key = $component['reportKey'];
-            $lines = isset($structured[$key]) ? ($structured[$key][$agentKey] ?? []) : null;
+            $lines = isset($structured[$key]) ? self::structuredAgentLines($structured[$key], $agentKey) : null;
             $calculation['components'][$index] = self::bundleComponent($sources[$key], $component, $period, $agentKey, structuredLines: $lines);
         }
         return $calculation;
@@ -452,7 +452,7 @@ final class CustomerServiceCalculationSnapshot
                     $entry = $calculation['components'][$componentIndex];
                     try {
                         $agentKey = $calculation['agentKey'];
-                        $lines = isset($structured[$key]) ? ($structured[$key][$agentKey] ?? []) : null;
+                        $lines = isset($structured[$key]) ? self::structuredAgentLines($structured[$key], $agentKey) : null;
                         if ($lines === null && self::needsBundleWorkbook($artifact, $entry)) {
                             if (!$workbookAttempted) {
                                 $workbookAttempted = true;
@@ -635,31 +635,47 @@ final class CustomerServiceCalculationSnapshot
             if (!is_array($context['regularPricing'] ?? null) || !is_array($context['commissionResults'] ?? null)) self::invalid();
             $proof = RetentionPricingSnapshot::validate($context['regularPricing'], $context['commissionResults']);
             if ($proof['source'] !== $source || $proof['period'] !== $period) self::invalid();
-            $output[$source] = self::regularStructuredLines($rows, $proof['rows'], $period, $selectedAgents);
+            $output[$source] = self::regularStructuredLines($rows, $proof['rows'], $period, $selectedAgents, $context['regularPricingDates'] ?? []);
         }
         return $output;
     }
 
-    private static function regularStructuredLines(array $rows, array $pricing, string $period, array $selectedAgents): array
+    private static function regularStructuredLines(array $rows, array $pricing, string $period, array $selectedAgents, array $pricingDates): array
     {
-        $selected = $output = [];
+        $selected = $output = $unverified = [];
         foreach ($pricing as $price) {
+            $agentKey = $price['agentKey'];
+            if (!isset($selectedAgents[self::archivedAgentKey($agentKey)])) continue;
             $index = $price['detailRow'] - 2;
             $row = $rows[$index] ?? null;
-            if ($row === null || $row['ID'] !== $price['clientId'] || self::key($row['RETENTION_AGENT']) !== $price['agentKey']
+            if ($row !== null) $row = ($pricingDates['LLG-' . $row['ID']] ?? []) + $row;
+            if ($row === null || $row['ID'] !== $price['clientId'] || self::key($row['RETENTION_AGENT']) !== $agentKey
                 || $row['RETENTION_DATE'] !== $price['retentionDate'] || $row['RETENTION_PAYMENT_DATE'] !== $price['paymentDate']
                 || array_map(static fn ($rate) => $rate === null ? null : (float) $rate, [$row['T1'], $row['T2'], $row['T3'], $row['T4']])
-                    !== array_map(static fn ($rate) => (float) $rate, $price['rates'])) self::invalid();
-            $selected[$index] = true;
-            if (isset($selectedAgents[self::archivedAgentKey($price['agentKey'])])) {
-                $output[$price['agentKey']][] = self::regularLine($price);
+                    !== array_map(static fn ($rate) => (float) $rate, $price['rates'])) {
+                $unverified[$agentKey] = null;
+                continue;
             }
+            $selected[$index] = true;
+            $output[$agentKey][] = self::regularLine($price);
         }
         foreach ($rows as $index => $row) {
-            if (self::key($row['RETENTION_AGENT']) !== '' && $row['RETENTION_DATE'] !== null && $row['RETENTION_PAYMENT_DATE'] !== null
-                && substr($row['RETENTION_PAYMENT_DATE'], 0, 7) === substr($period, 0, 7) && !isset($selected[$index])) self::invalid();
+            if (isset($selected[$index])) continue;
+            $agentKey = self::key($row['RETENTION_AGENT']);
+            if (!isset($selectedAgents[self::archivedAgentKey($agentKey)])) continue;
+            $row = ($pricingDates['LLG-' . $row['ID']] ?? []) + $row;
+            if ($row['RETENTION_DATE'] !== null && $row['RETENTION_PAYMENT_DATE'] !== null
+                && substr($row['RETENTION_PAYMENT_DATE'], 0, 7) === substr($period, 0, 7)) {
+                $unverified[$agentKey] = null;
+            }
         }
-        return $output;
+        return array_replace($output, $unverified);
+    }
+
+    private static function structuredAgentLines(array $lines, string $agentKey): array
+    {
+        if (array_key_exists($agentKey, $lines) && $lines[$agentKey] === null) self::invalid();
+        return $lines[$agentKey] ?? [];
     }
 
     private static function regularLine(array $row): array
