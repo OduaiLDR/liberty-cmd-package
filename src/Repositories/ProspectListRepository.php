@@ -19,14 +19,72 @@ class ProspectListRepository extends SqlSrvRepository
 
     public function eachBatch(array $filters, array $columns, Carbon $asOf, int $rowLimit, callable $consume): void
     {
-        $this->withQueryTimeout(240, fn (): bool => $this->exportQuery($filters, $columns, $asOf)
-            ->limit($rowLimit)->chunkById(2000, $consume, 'p.PK', 'prospect_id'));
+        $this->withQueryTimeout(240, function () use ($filters, $columns, $asOf, $rowLimit, $consume): void {
+            $query = $this->exportQuery($filters, $columns, $asOf);
+            $lastId = null;
+            while ($rowLimit > 0) {
+                $pageSize = min(2000, $rowLimit);
+                $page = (clone $query)->forPageAfterId($pageSize, $lastId, 'p.PK');
+                $rows = $this->readExportPage($page, $filters);
+                if ($rows->isEmpty() || $consume($rows) === false || $rows->count() < $pageSize) {
+                    return;
+                }
+
+                $lastId = $rows->last()->prospect_id;
+                $rowLimit -= $rows->count();
+            }
+        });
     }
 
     public function preview(array $filters, array $columns, Carbon $asOf, int $rowLimit): Collection
     {
-        return $this->withQueryTimeout(8, fn (): Collection => $this->exportQuery($filters, $columns, $asOf)
-            ->orderBy('p.PK')->limit($rowLimit)->get());
+        return $this->withQueryTimeout(8, fn (): Collection => $this->readExportPage(
+            $this->exportQuery($filters, $columns, $asOf)->orderBy('p.PK')->limit($rowLimit),
+            $filters,
+        ));
+    }
+
+    /**
+     * @param list<int> $prospectIds
+     * @return array<int, string>
+     */
+    public function existingMailerIds(array $prospectIds): array
+    {
+        if ($prospectIds === []) {
+            return [];
+        }
+
+        $linked = $this->table('TblProspects', 'p')
+            ->join('TblMailers as m', 'm.PK', '=', 'p.Current_Debt_Source_PK')
+            ->whereIntegerInRaw('p.PK', $prospectIds)
+            ->where('p.Current_Debt_Source', 'TblMailers')
+            ->whereRaw("NULLIF(TRIM(m.External_ID), '') IS NOT NULL")
+            ->pluck('m.External_ID', 'p.PK')->all();
+
+        $unlinkedProspectIds = array_diff($prospectIds, array_keys($linked));
+        if ($unlinkedProspectIds === []) {
+            return $linked;
+        }
+
+        $externalId = 'TRIM(m.External_ID)';
+        // IDs with different casing can identify separate leads at the recipient.
+        $distinctId = $this->connection()->getDriverName() === 'sqlsrv' ? "CONVERT(varbinary(8000), $externalId)" : $externalId;
+        $matched = $this->table('TblProspects', 'p')
+            ->join('TblMailers as m', static function (JoinClause $join): void {
+                $join->on('m.Client', '=', 'p.Client')->on('m.Address', '=', 'p.Address')
+                    ->whereRaw('m.SMS_Zip5 = SUBSTRING(p.Zip, 1, 5)');
+            })
+            ->whereIntegerInRaw('p.PK', $unlinkedProspectIds)
+            ->where('p.Client', '<>', '')
+            ->where('p.Address', '<>', '')
+            ->where('p.Zip', 'like', '_____%')
+            ->whereRaw("NULLIF($externalId, '') IS NOT NULL")
+            ->selectRaw("p.PK, MIN($externalId) AS external_id")
+            ->groupBy('p.PK')
+            ->havingRaw("COUNT(DISTINCT $distinctId) = 1")
+            ->pluck('external_id', 'PK')->all();
+
+        return $linked + $matched;
     }
 
     private function exportQuery(array $filters, array $columns, Carbon $asOf): Builder
@@ -44,6 +102,19 @@ class ProspectListRepository extends SqlSrvRepository
         }
 
         return $this->filtered($filters, $asOf, $needsTu)->select($fields);
+    }
+
+    private function readExportPage(Builder $query, array $filters): Collection
+    {
+        $database = $query->getConnection();
+        if ($database->getDriverName() !== 'sqlsrv' || ! isset($filters['date_from'])) {
+            return $query->get();
+        }
+
+        // A small TOP can select a PK scan through older rows before reaching a recent date range.
+        $sql = $query->toSql()." OPTION (USE HINT('DISABLE_OPTIMIZER_ROWGOAL'))";
+
+        return new Collection($database->select($sql, $query->getBindings()));
     }
 
     /** Call after the private artifact is written and while holding the runner's prospect export lock. */

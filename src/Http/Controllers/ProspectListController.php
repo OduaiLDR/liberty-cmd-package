@@ -6,7 +6,9 @@ namespace Cmd\Reports\Http\Controllers;
 
 use Cmd\Reports\Http\Requests\ProspectListRequest;
 use Cmd\Reports\Jobs\BuildProspectList;
+use Cmd\Reports\Repositories\ProspectListExportFiles;
 use Cmd\Reports\Repositories\ProspectListRepository;
+use Cmd\Reports\Services\ProspectCampaignCsv;
 use Cmd\Reports\Services\ProspectExportInspector;
 use Cmd\Reports\Services\ProspectListFields;
 use Cmd\Reports\Services\ProspectListRuns;
@@ -45,8 +47,10 @@ final class ProspectListController
         }
 
         $rowsPerFile = $request->validated('rows_per_file');
+        $campaign = $request->validated('campaign');
+        $columns = $campaign === null ? $request->validated('columns') : array_keys(ProspectCampaignCsv::COLUMNS);
 
-        return $this->submit($request, $request->validated('columns'), $count['as_of'], $rowLimit, $rowsPerFile === null ? null : (int) $rowsPerFile);
+        return $this->submit($request, $columns, $count['as_of'], $rowLimit, $rowsPerFile === null ? null : (int) $rowsPerFile, $campaign);
     }
 
     public function show(Request $request, string $id): JsonResponse
@@ -63,10 +67,14 @@ final class ProspectListController
         abort_unless($partNumber !== false && $partNumber >= 1 && $partNumber <= $fileCount, 404);
 
         $split = isset($run['rows_per_file']);
-        $path = ProspectListRuns::artifact($this->key($request, $id), $split ? $partNumber : null);
-        $fileName = 'prospect-list-'.$run['id'].($split ? '-part-'.$partNumber : '').'.csv';
+        $key = $this->key($request, $id);
+        $path = ProspectListRuns::artifact($key, $split ? $partNumber : null);
         $disk = Storage::disk(config('prospect-list-builder.disk'));
         abort_unless($disk->exists($path), 404);
+        $campaignId = ProspectListExportFiles::find($key, $partNumber);
+        $fileName = $campaignId === null
+            ? 'prospect-list-'.$run['id'].($split ? '-part-'.$partNumber : '').'.csv'
+            : $campaignId.'.csv';
 
         return response()->json([
             'url' => $disk->temporaryUrl($path, now()->addMinutes(5), [
@@ -97,7 +105,7 @@ final class ProspectListController
             $previewRows = $prospects->preview($filters, $columns, Carbon::parse($run['as_of']), min(ProspectExportInspector::PREVIEW_ROW_LIMIT, $plannedRows));
             $inspection = $inspector->preview($previewRows, $columns, $position, $filter, $plannedRows);
         } else {
-            $type = ProspectListFields::columns()[$field][3];
+            $type = ProspectCampaignCsv::COLUMNS[$field] ?? ProspectListFields::columns()[$field][3];
             $streams = $this->savedFiles($this->key($request, $id), $run);
             $inspection = $inspector->inspectFiles($streams, $columns, $position, $type, $filter, (int) $run['count']);
         }
@@ -126,7 +134,7 @@ final class ProspectListController
         }
     }
 
-    private function submit(ProspectListRequest $request, ?array $columns, string $asOfDate, ?int $rowLimit = null, ?int $rowsPerFile = null): JsonResponse
+    private function submit(ProspectListRequest $request, ?array $columns, string $asOfDate, ?int $rowLimit = null, ?int $rowsPerFile = null, ?array $campaign = null): JsonResponse
     {
         $connection = config('queue.default');
         $timeout = $columns === null ? BuildProspectList::COUNT_TIMEOUT_SECONDS : BuildProspectList::EXPORT_TIMEOUT_SECONDS;
@@ -147,6 +155,7 @@ final class ProspectListController
             'columns' => $columns,
             'row_limit' => $rowLimit,
             'rows_per_file' => $rowsPerFile,
+            'campaign' => $campaign,
             'as_of' => $asOfDate,
         ];
 
@@ -173,6 +182,7 @@ final class ProspectListController
             abort_unless($existing['filter_hash'] === $run['filter_hash']
                 && $existing['columns'] === $columns && ($existing['row_limit'] ?? null) === $rowLimit
                 && ($existing['rows_per_file'] ?? null) === $rowsPerFile
+                && ($existing['campaign'] ?? null) === $campaign
                 && $existing['kind'] === $run['kind'], 409);
             $run = $existing;
         }

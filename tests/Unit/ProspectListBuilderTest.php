@@ -3,10 +3,13 @@
 declare(strict_types=1);
 
 use Cmd\Reports\Repositories\ProspectListRepository;
+use Cmd\Reports\Repositories\ProspectListExportFiles;
+use Cmd\Reports\Http\Controllers\ProspectListController;
 use Cmd\Reports\Http\Middleware\ProspectListServiceAuth;
 use Cmd\Reports\Http\Requests\ProspectListRequest;
 use Cmd\Reports\Jobs\BuildProspectList;
 use Cmd\Reports\Services\ProspectExportInspector;
+use Cmd\Reports\Services\ProspectCampaignCsv;
 use Cmd\Reports\Services\ProspectListCsvFiles;
 use Cmd\Reports\Services\ProspectListFields;
 use Cmd\Reports\Services\ProspectListRuns;
@@ -16,11 +19,13 @@ use Illuminate\Config\Repository;
 use Illuminate\Cache\ArrayStore;
 use Illuminate\Cache\Repository as CacheRepository;
 use Illuminate\Container\Container;
+use Illuminate\Contracts\Routing\ResponseFactory;
 use Illuminate\Database\ConnectionInterface;
 use Illuminate\Database\SqlServerConnection;
 use Illuminate\Database\SQLiteConnection;
 use Illuminate\Foundation\Application;
 use Illuminate\Http\Client\Factory as HttpFactory;
+use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
@@ -38,9 +43,17 @@ beforeEach(function (): void {
     $container->instance('config', new Repository(['prospect-list-builder' => ['dob_column' => 'DOB']]));
     Container::setInstance($container);
     $this->connection = new SQLiteConnection(new PDO('sqlite::memory:'));
+    $container->instance('db', $this->connection);
+    $this->previousFacadeApplication = Facade::getFacadeApplication();
+    Facade::setFacadeApplication($container);
+    Facade::clearResolvedInstance('db');
+
+    $migration = require __DIR__.'/../../database/prospect-list-migrations/2026_11_25_104441_create_prospect_list_export_files_table.php';
+    \Illuminate\Support\Facades\Schema::swap($this->connection->getSchemaBuilder());
+    $migration->up();
 
     $this->connection->statement('CREATE TABLE TblProspects (
-        PK INTEGER PRIMARY KEY, Client TEXT, Phone TEXT, Email TEXT, State TEXT, Creation_Date TEXT,
+        PK INTEGER PRIMARY KEY, Client TEXT, Address TEXT, Zip TEXT, Phone TEXT, Email TEXT, State TEXT, Creation_Date TEXT,
         Contacted INTEGER, Opt_Out INTEGER, Invalid_Phone INTEGER, Latest_Export_Date TEXT, Last_SMS_Date TEXT,
         Current_Debt INTEGER, Current_Debt_Source TEXT, Current_Debt_Source_PK INTEGER
     )');
@@ -79,6 +92,12 @@ beforeEach(function (): void {
             return $this->database;
         }
     };
+});
+
+afterEach(function (): void {
+    Facade::clearResolvedInstance('db');
+    Facade::clearResolvedInstance('db.schema');
+    Facade::setFacadeApplication($this->previousFacadeApplication);
 });
 
 test('saved CSV inspection preserves values and applies typed filters', function (): void {
@@ -312,6 +331,107 @@ test('a failed part upload discards only files belonging to that export', functi
         Mockery::close();
     }
 });
+
+test('campaign exports match the vendor layout and keep one campaign ID per downloaded file', function (?string $assignedMailerId): void {
+    config(['prospect-list-builder.disk' => 'fixture', 'prospect-list-builder.stamp_exports' => true]);
+    $this->connection->table('TblProspects')->where('PK', 1)->update([
+        'Phone' => '+1 (202) 555-0101', 'Address' => '10 Example Lane', 'Zip' => '90210-1234',
+    ]);
+    $this->connection->table('TblProspects')->where('PK', 5)->update(['Phone' => 'not a phone', 'Latest_Export_Date' => null]);
+    $this->connection->table('TblProspects')->where('PK', 7)->update([
+        'Client' => 'Morgan Example', 'Phone' => '202.555.0107', 'Current_Debt_Source_PK' => 702,
+    ]);
+    $this->connection->table('TblProspects')->where('PK', 8)->update(['Address' => '20 Example Lane', 'Zip' => '90210']);
+    $this->connection->statement('CREATE TABLE TblMailers (PK INTEGER PRIMARY KEY, Client TEXT, Address TEXT, SMS_Zip5 TEXT, External_ID TEXT)');
+    $this->connection->table('TblMailers')->insert([
+        ['PK' => 701, 'Client' => 'Taylor Example', 'Address' => '10 Example Lane', 'SMS_Zip5' => '90210', 'External_ID' => '000042'],
+        ['PK' => 702, 'Client' => 'Morgan Example', 'Address' => '1 Former Lane', 'SMS_Zip5' => '90210', 'External_ID' => 'Linked702'],
+        ['PK' => 703, 'Client' => 'Taylor Example', 'Address' => '20 Example Lane', 'SMS_Zip5' => '90210', 'External_ID' => 'MailerA'],
+        ['PK' => 704, 'Client' => 'Taylor Example', 'Address' => '20 Example Lane', 'SMS_Zip5' => '90210', 'External_ID' => 'MailerB'],
+    ]);
+
+    $id = '11111111-1111-4111-8111-111111111111';
+    $key = ProspectListRuns::key('lendingtower', 'actor', $id);
+    $filters = ['months_since_pull' => 1];
+    $headers = [
+        'campaign_id', 'first_name', 'last_name', 'country_code', 'state_code',
+        'mobile_number', 'external_system_id', 'source', 'personal_loan_amount',
+    ];
+    $store = new CacheRepository(new ArrayStore());
+    $campaign = ['source' => 'Direct Mail'];
+    if ($assignedMailerId !== null) {
+        $campaign['mailer_id'] = $assignedMailerId;
+    }
+    $store->put($key, [
+        'id' => $id, 'kind' => 'export', 'status' => 'pending', 'columns' => $headers,
+        'campaign' => $campaign,
+    ]);
+    $cache = Mockery::mock(\Illuminate\Cache\CacheManager::class);
+    $cache->shouldReceive('store')->with('database')->andReturn($store);
+    Cache::swap($cache);
+    $parts = [];
+    $disk = Mockery::mock(\Illuminate\Filesystem\FilesystemAdapter::class);
+    $disk->shouldReceive('put')->times(2)->andReturnUsing(function (string $path, $stream) use (&$parts): bool {
+        while (($row = fgetcsv($stream, escape: '')) !== false) {
+            $parts[$path][] = $row;
+        }
+
+        return true;
+    });
+    $disk->shouldReceive('exists')->andReturnUsing(static function (string $path) use (&$parts): bool {
+        return isset($parts[$path]);
+    });
+    $disk->shouldReceive('temporaryUrl')->andReturnUsing(static fn ($path, $expires, $options) => $options['ResponseContentDisposition']);
+    $storage = Mockery::mock(\Illuminate\Filesystem\FilesystemManager::class);
+    $storage->shouldReceive('disk')->with('fixture')->andReturn($disk);
+    Storage::swap($storage);
+    $logger = Mockery::mock(\Psr\Log\LoggerInterface::class);
+    $logger->shouldReceive('info')->once();
+    Log::swap($logger);
+    $responses = Mockery::mock(ResponseFactory::class);
+    $responses->shouldReceive('json')->andReturnUsing(static fn (array $response) => new JsonResponse($response));
+    Container::getInstance()->instance(ResponseFactory::class, $responses);
+
+    try {
+        $job = new BuildProspectList($key, 'lendingtower', 'actor', $id, $filters, array_keys(ProspectCampaignCsv::COLUMNS), '2026-11-24', 4, rowsPerFile: 2);
+        $job->handle($this->prospects);
+
+        $firstId = ProspectListExportFiles::find($key, 1);
+        $secondId = ProspectListExportFiles::find($key, 2);
+        expect($firstId)->toMatch('/\A[0-9]+\z/')
+            ->and($secondId)->toMatch('/\A[0-9]+\z/')->not->toBe($firstId)
+            ->and(ProspectListExportFiles::reserve($key, 1, $assignedMailerId))->toBe($firstId)
+            ->and($parts[ProspectListRuns::artifact($key, 1)])->toBe([
+                $headers,
+                [$firstId, 'Taylor', 'Example', 'US', 'CA', '(202) 555-0101', $assignedMailerId ?? '000042', 'Direct Mail', ''],
+                [$firstId, 'Morgan', 'Example', 'US', 'CA', '(202) 555-0107', $assignedMailerId ?? 'Linked702', 'Direct Mail', ''],
+            ])
+            ->and($parts[ProspectListRuns::artifact($key, 2)])->toBe([
+                $headers,
+                [$secondId, 'Taylor', 'Example', 'US', 'CA', '(555) 123-4567', $assignedMailerId ?? '', 'Direct Mail', ''],
+            ])
+            ->and($store->get($key)['export_summary']['invalid_mobile'])->toBe(1)
+            ->and($store->get($key)['export_summary']['missing_mailer_id'])->toBe($assignedMailerId === null ? 1 : 0)
+            ->and($this->connection->table('TblProspects')->where('PK', 5)->value('Latest_Export_Date'))->toBeNull()
+            ->and($this->connection->table('TblProspects')->where('PK', 1)->value('Latest_Export_Date'))->not->toBeNull();
+
+        $request = Request::create('/');
+        $request->headers->set('X-Prospect-Tenant', 'lendingtower');
+        $request->headers->set('X-Prospect-Actor', 'actor');
+        $controller = new ProspectListController();
+        foreach ([1 => $firstId, 2 => $secondId] as $part => $campaignId) {
+            $response = ['url' => 'attachment; filename="'.$campaignId.'.csv"'];
+            expect($controller->download($request, $id, (string) $part)->getData(true))->toBe($response)
+                ->and($controller->download($request, $id, (string) $part)->getData(true))->toBe($response);
+        }
+        expect($this->connection->table('prospect_list_export_files')->count())->toBe(2);
+    } finally {
+        foreach (['cache', 'filesystem', 'log'] as $accessor) {
+            Facade::clearResolvedInstance($accessor);
+        }
+        Mockery::close();
+    }
+})->with(['previously queued assigned ID' => ['Mailer007'], 'existing IDs' => [null]]);
 
 test('TCPA screening runs before publishing the selected CSV columns and stamps only cleared rows', function (string $scenario): void {
     config([
@@ -568,6 +688,22 @@ test('export part size is optional and must fit inside the row amount', function
         ->and($errors(3_000_001))->toBe(['rows_per_file'])
         ->and($errors(0))->toBe(['rows_per_file'])
         ->and($errors(1.5))->toBe(['rows_per_file']);
+});
+
+test('new campaign requests resolve external IDs without accepting an override', function (): void {
+    $validator = new Factory(new Translator(new ArrayLoader(), 'en'));
+    $errors = static function (array $campaign) use ($validator): array {
+        $request = ProspectListRequest::create('/', 'POST', [
+            'id' => '219ac986-0235-704b-9343-1c8c2850a3a0', 'count_id' => '219ac986-0235-704b-9343-1c8c2850a3a1',
+            'filters' => [], 'campaign' => $campaign, 'row_limit' => 1,
+        ]);
+        $request->setRouteResolver(static fn () => (new \Illuminate\Routing\Route(['POST'], 'exports', []))->name('cmd.prospect-list.exports'));
+
+        return $validator->make($request->all(), $request->rules())->errors()->keys();
+    };
+
+    expect($errors(['source' => 'Direct Mail']))->toBe([])
+        ->and($errors(['source' => 'Direct Mail', 'mailer_id' => 'Mailer007']))->toBe(['campaign']);
 });
 
 test('stamping advances two history dates only for selected people and preserves newer dates', function (): void {
