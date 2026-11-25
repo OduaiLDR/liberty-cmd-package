@@ -23,8 +23,7 @@ final class ProspectCampaignCsv
     public static function rules(): array
     {
         return [
-            'campaign' => ['sometimes', 'required', 'array:mailer_id,source,personal_loan_amount'],
-            'campaign.mailer_id' => ['sometimes', 'required', 'string', 'max:100', 'regex:/\A[A-Za-z0-9][A-Za-z0-9_. -]*\z/'],
+            'campaign' => ['sometimes', 'required', 'array:source,personal_loan_amount'],
             'campaign.source' => ['required_with:campaign', 'string', 'max:100', 'regex:/\A[A-Za-z0-9][A-Za-z0-9_. -]*\z/'],
             'campaign.personal_loan_amount' => ['sometimes', 'nullable', 'string', 'regex:/\A[0-9]{1,9}(?:\.[0-9]{1,2})?\z/'],
         ];

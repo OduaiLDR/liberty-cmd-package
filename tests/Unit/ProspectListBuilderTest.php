@@ -431,7 +431,7 @@ test('campaign exports match the vendor layout and keep one campaign ID per down
         }
         Mockery::close();
     }
-})->with(['assigned ID' => ['Mailer007'], 'existing IDs' => [null]]);
+})->with(['previously queued assigned ID' => ['Mailer007'], 'existing IDs' => [null]]);
 
 test('TCPA screening runs before publishing the selected CSV columns and stamps only cleared rows', function (string $scenario): void {
     config([
@@ -688,6 +688,22 @@ test('export part size is optional and must fit inside the row amount', function
         ->and($errors(3_000_001))->toBe(['rows_per_file'])
         ->and($errors(0))->toBe(['rows_per_file'])
         ->and($errors(1.5))->toBe(['rows_per_file']);
+});
+
+test('new campaign requests resolve external IDs without accepting an override', function (): void {
+    $validator = new Factory(new Translator(new ArrayLoader(), 'en'));
+    $errors = static function (array $campaign) use ($validator): array {
+        $request = ProspectListRequest::create('/', 'POST', [
+            'id' => '219ac986-0235-704b-9343-1c8c2850a3a0', 'count_id' => '219ac986-0235-704b-9343-1c8c2850a3a1',
+            'filters' => [], 'campaign' => $campaign, 'row_limit' => 1,
+        ]);
+        $request->setRouteResolver(static fn () => (new \Illuminate\Routing\Route(['POST'], 'exports', []))->name('cmd.prospect-list.exports'));
+
+        return $validator->make($request->all(), $request->rules())->errors()->keys();
+    };
+
+    expect($errors(['source' => 'Direct Mail']))->toBe([])
+        ->and($errors(['source' => 'Direct Mail', 'mailer_id' => 'Mailer007']))->toBe(['campaign']);
 });
 
 test('stamping advances two history dates only for selected people and preserves newer dates', function (): void {

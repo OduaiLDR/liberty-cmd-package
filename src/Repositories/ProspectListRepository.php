@@ -19,14 +19,29 @@ class ProspectListRepository extends SqlSrvRepository
 
     public function eachBatch(array $filters, array $columns, Carbon $asOf, int $rowLimit, callable $consume): void
     {
-        $this->withQueryTimeout(240, fn (): bool => $this->exportQuery($filters, $columns, $asOf)
-            ->limit($rowLimit)->chunkById(2000, $consume, 'p.PK', 'prospect_id'));
+        $this->withQueryTimeout(240, function () use ($filters, $columns, $asOf, $rowLimit, $consume): void {
+            $query = $this->exportQuery($filters, $columns, $asOf);
+            $lastId = null;
+            while ($rowLimit > 0) {
+                $pageSize = min(2000, $rowLimit);
+                $page = (clone $query)->forPageAfterId($pageSize, $lastId, 'p.PK');
+                $rows = $this->readExportPage($page, $filters);
+                if ($rows->isEmpty() || $consume($rows) === false || $rows->count() < $pageSize) {
+                    return;
+                }
+
+                $lastId = $rows->last()->prospect_id;
+                $rowLimit -= $rows->count();
+            }
+        });
     }
 
     public function preview(array $filters, array $columns, Carbon $asOf, int $rowLimit): Collection
     {
-        return $this->withQueryTimeout(8, fn (): Collection => $this->exportQuery($filters, $columns, $asOf)
-            ->orderBy('p.PK')->limit($rowLimit)->get());
+        return $this->withQueryTimeout(8, fn (): Collection => $this->readExportPage(
+            $this->exportQuery($filters, $columns, $asOf)->orderBy('p.PK')->limit($rowLimit),
+            $filters,
+        ));
     }
 
     /**
@@ -87,6 +102,19 @@ class ProspectListRepository extends SqlSrvRepository
         }
 
         return $this->filtered($filters, $asOf, $needsTu)->select($fields);
+    }
+
+    private function readExportPage(Builder $query, array $filters): Collection
+    {
+        $database = $query->getConnection();
+        if ($database->getDriverName() !== 'sqlsrv' || ! isset($filters['date_from'])) {
+            return $query->get();
+        }
+
+        // A small TOP can select a PK scan through older rows before reaching a recent date range.
+        $sql = $query->toSql()." OPTION (USE HINT('DISABLE_OPTIMIZER_ROWGOAL'))";
+
+        return new Collection($database->select($sql, $query->getBindings()));
     }
 
     /** Call after the private artifact is written and while holding the runner's prospect export lock. */
