@@ -19,6 +19,7 @@ use Illuminate\Container\Container;
 use Illuminate\Database\ConnectionInterface;
 use Illuminate\Database\SqlServerConnection;
 use Illuminate\Database\SQLiteConnection;
+use Illuminate\Foundation\Application;
 use Illuminate\Http\Client\Factory as HttpFactory;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
@@ -30,9 +31,10 @@ use Illuminate\Translation\ArrayLoader;
 use Illuminate\Translation\Translator;
 use Illuminate\Validation\Factory;
 use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\HttpKernel\Exception\HttpException;
 
 beforeEach(function (): void {
-    $container = new Container();
+    $container = new Application();
     $container->instance('config', new Repository(['prospect-list-builder' => ['dob_column' => 'DOB']]));
     Container::setInstance($container);
     $this->connection = new SQLiteConnection(new PDO('sqlite::memory:'));
@@ -586,18 +588,45 @@ test('the artifact keys are scoped by actor and the export catalog excludes SSN 
         ->toBe(ProspectListRuns::fingerprint(['debt_min' => 10, 'states' => ['TX', 'CA']]));
 });
 
-test('the internal route accepts an authenticated DebtPlete user UUID', function (): void {
-    config(['prospect-list-builder.token' => 'fixture-secret']);
+test('the internal route accepts an authenticated user for a configured tenant', function (string $tenantId): void {
+    config([
+        'prospect-list-builder.token' => 'fixture-secret',
+        'prospect-list-builder.allowed_tenant_ids' => ['lendingtower', '90148bb7-0a61-4599-a2bd-be10a4c1583f'],
+    ]);
     $request = Request::create('/api/internal/prospect-lists/catalog', server: [
         'HTTP_AUTHORIZATION' => 'Bearer fixture-secret',
-        'HTTP_X_PROSPECT_TENANT' => 'lendingtower',
+        'HTTP_X_PROSPECT_TENANT' => $tenantId,
         'HTTP_X_PROSPECT_ACTOR' => '019ac986-0235-704b-9343-1c8c2850a3a0',
     ]);
 
     $response = (new ProspectListServiceAuth())->handle($request, fn (): Response => new Response('ok'));
 
     expect($response->getStatusCode())->toBe(200);
-});
+})->with([
+    'legacy tenant slug' => ['lendingtower'],
+    'tenant UUID' => ['90148bb7-0a61-4599-a2bd-be10a4c1583f'],
+]);
+
+test('the internal route rejects unauthorized tenant requests', function (array $headers, int $status): void {
+    config([
+        'prospect-list-builder.token' => 'fixture-secret',
+        'prospect-list-builder.allowed_tenant_ids' => ['90148bb7-0a61-4599-a2bd-be10a4c1583f'],
+    ]);
+    $request = Request::create('/api/internal/prospect-lists/catalog', server: [
+        'HTTP_AUTHORIZATION' => 'Bearer fixture-secret',
+        'HTTP_X_PROSPECT_TENANT' => '90148bb7-0a61-4599-a2bd-be10a4c1583f',
+        'HTTP_X_PROSPECT_ACTOR' => '019ac986-0235-704b-9343-1c8c2850a3a0',
+        ...$headers,
+    ]);
+
+    expect(fn () => (new ProspectListServiceAuth())->handle($request, fn (): Response => new Response('ok')))
+        ->toThrow(fn (HttpException $exception) => expect($exception->getStatusCode())->toBe($status));
+})->with([
+    'tenant outside the allowlist' => [['HTTP_X_PROSPECT_TENANT' => 'lendingtower'], 403],
+    'missing tenant' => [['HTTP_X_PROSPECT_TENANT' => ''], 403],
+    'invalid actor' => [['HTTP_X_PROSPECT_ACTOR' => 'invalid'], 403],
+    'invalid token' => [['HTTP_AUTHORIZATION' => 'Bearer invalid'], 401],
+]);
 
 test('Azure age filters bind date bounds and parse the TU text field', function (): void {
     $connection = new SqlServerConnection(new PDO('sqlite::memory:'), config: ['driver' => 'sqlsrv']);
