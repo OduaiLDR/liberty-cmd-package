@@ -83,7 +83,7 @@ final class BuildProspectList implements ShouldQueue
         });
     }
 
-    /** @return array{count: int, file_count: int, rows_per_file: int|null, export_summary: array{fields: list<array{id: string, label: string, present: int}>, states: array<string, int>, invalid_mobile?: int, tcpa_scrub?: array{matched: int, invalid_phone: int}}} */
+    /** @return array{count: int, file_count: int, rows_per_file: int|null, export_summary: array{fields: list<array{id: string, label: string, present: int}>, states: array<string, int>, invalid_mobile?: int, missing_mailer_id?: int, tcpa_scrub?: array{matched: int, invalid_phone: int}}} */
     private function export(ProspectListRepository $prospects, Carbon $asOf, bool $stamp, ?array $campaign): array
     {
         $columns = $this->columns ?? [];
@@ -101,7 +101,11 @@ final class BuildProspectList implements ShouldQueue
         $definitions = ProspectListFields::columns();
         $headers = $campaign === null ? array_map(static fn (string $field): string => $definitions[$field][0], $columns) : $columns;
         $rowsPerFile = $this->rowsPerFile ?? null;
-        $files = new ProspectListCsvFiles(Storage::disk(config('prospect-list-builder.disk')), $this->key, $headers, $rowsPerFile, $campaign['mailer_id'] ?? null);
+        $files = new ProspectListCsvFiles(
+            Storage::disk(config('prospect-list-builder.disk')), $this->key, $headers, $rowsPerFile,
+            mailerId: $campaign['mailer_id'] ?? null, campaignFormat: $campaign !== null,
+        );
+        $useExistingMailerIds = $campaign !== null && ! isset($campaign['mailer_id']);
         $present = array_fill_keys($columns, 0);
         $states = [];
         $stateIndex = array_search($campaign === null ? 'state' : 'state_code', $columns, true);
@@ -111,18 +115,19 @@ final class BuildProspectList implements ShouldQueue
             }
             // Jobs already queued before this change have no requested size.
             $prospects->eachBatch($this->filters, $queryColumns, $asOf, $this->rowLimit ?? 10_000,
-                function (Collection $rows) use ($columns, $definitions, $stateIndex, $files, $idStream, $scrubber, $campaign, &$scrubSummary, &$count, &$present, &$states, &$invalidMobile): void {
+                function (Collection $rows) use ($columns, $definitions, $stateIndex, $files, $idStream, $scrubber, $campaign, $useExistingMailerIds, $prospects, &$scrubSummary, &$count, &$present, &$states, &$invalidMobile): void {
                     if ($scrubber !== null) {
                         $scrubbed = $scrubber->filter($rows);
                         $scrubSummary['matched'] += $scrubbed['matched'];
                         $scrubSummary['invalid_phone'] += $scrubbed['invalid_phone'];
                         $rows = $scrubbed['rows'];
                     }
+                    $mailerIds = $useExistingMailerIds ? $prospects->existingMailerIds($rows->pluck('prospect_id')->all()) : [];
                     $writtenIds = [];
                     foreach ($rows as $row) {
                         $cells = $campaign === null
                             ? array_map(static fn (string $field): mixed => ProspectListFields::csvCell($row, $field, $definitions[$field][3]), $columns)
-                            : ProspectCampaignCsv::cells($row, $campaign);
+                            : ProspectCampaignCsv::cells($row, $campaign, $mailerIds[$row->prospect_id] ?? null);
                         if ($cells === null) {
                             $invalidMobile++;
                             continue;
@@ -185,6 +190,7 @@ final class BuildProspectList implements ShouldQueue
         }
         if ($campaign !== null) {
             $summary['invalid_mobile'] = $invalidMobile;
+            $summary['missing_mailer_id'] = $count - $present['external_system_id'];
         }
 
         Log::info('Prospect list exported.', [

@@ -29,6 +29,49 @@ class ProspectListRepository extends SqlSrvRepository
             ->orderBy('p.PK')->limit($rowLimit)->get());
     }
 
+    /**
+     * @param list<int> $prospectIds
+     * @return array<int, string>
+     */
+    public function existingMailerIds(array $prospectIds): array
+    {
+        if ($prospectIds === []) {
+            return [];
+        }
+
+        $linked = $this->table('TblProspects', 'p')
+            ->join('TblMailers as m', 'm.PK', '=', 'p.Current_Debt_Source_PK')
+            ->whereIntegerInRaw('p.PK', $prospectIds)
+            ->where('p.Current_Debt_Source', 'TblMailers')
+            ->whereRaw("NULLIF(TRIM(m.External_ID), '') IS NOT NULL")
+            ->pluck('m.External_ID', 'p.PK')->all();
+
+        $unlinkedProspectIds = array_diff($prospectIds, array_keys($linked));
+        if ($unlinkedProspectIds === []) {
+            return $linked;
+        }
+
+        $externalId = 'TRIM(m.External_ID)';
+        // IDs with different casing can identify separate leads at the recipient.
+        $distinctId = $this->connection()->getDriverName() === 'sqlsrv' ? "CONVERT(varbinary(8000), $externalId)" : $externalId;
+        $matched = $this->table('TblProspects', 'p')
+            ->join('TblMailers as m', static function (JoinClause $join): void {
+                $join->on('m.Client', '=', 'p.Client')->on('m.Address', '=', 'p.Address')
+                    ->whereRaw('m.SMS_Zip5 = SUBSTRING(p.Zip, 1, 5)');
+            })
+            ->whereIntegerInRaw('p.PK', $unlinkedProspectIds)
+            ->where('p.Client', '<>', '')
+            ->where('p.Address', '<>', '')
+            ->where('p.Zip', 'like', '_____%')
+            ->whereRaw("NULLIF($externalId, '') IS NOT NULL")
+            ->selectRaw("p.PK, MIN($externalId) AS external_id")
+            ->groupBy('p.PK')
+            ->havingRaw("COUNT(DISTINCT $distinctId) = 1")
+            ->pluck('external_id', 'PK')->all();
+
+        return $linked + $matched;
+    }
+
     private function exportQuery(array $filters, array $columns, Carbon $asOf): Builder
     {
         $fields = ['p.PK as prospect_id'];

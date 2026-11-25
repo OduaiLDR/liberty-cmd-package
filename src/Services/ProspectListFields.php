@@ -68,11 +68,13 @@ final class ProspectListFields
             $names = preg_split('/\s+/', trim((string) $row->name_fallback), 2);
             $value = $names[$field === 'first_name' ? 0 : 1] ?? '';
         }
-        if ($type === 'text' && is_string($value) && preg_match('/\A(?:[\t\r\n]|\s*[=+@-])/u', $value) === 1) {
-            return "'".$value;
-        }
 
-        return $value;
+        return $type === 'text' && is_string($value) ? self::escapeCsvText($value) : $value;
+    }
+
+    public static function escapeCsvText(string $value): string
+    {
+        return preg_match('/\A(?:[\t\r\n]|\s*[=+@-])/u', $value) === 1 ? "'".$value : $value;
     }
 
     public static function usPhoneDigits(mixed $value): ?string

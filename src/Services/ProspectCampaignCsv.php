@@ -24,7 +24,7 @@ final class ProspectCampaignCsv
     {
         return [
             'campaign' => ['sometimes', 'required', 'array:mailer_id,source,personal_loan_amount'],
-            'campaign.mailer_id' => ['required_with:campaign', 'string', 'max:100', 'regex:/\A[A-Za-z0-9][A-Za-z0-9_. -]*\z/'],
+            'campaign.mailer_id' => ['sometimes', 'required', 'string', 'max:100', 'regex:/\A[A-Za-z0-9][A-Za-z0-9_. -]*\z/'],
             'campaign.source' => ['required_with:campaign', 'string', 'max:100', 'regex:/\A[A-Za-z0-9][A-Za-z0-9_. -]*\z/'],
             'campaign.personal_loan_amount' => ['sometimes', 'nullable', 'string', 'regex:/\A[0-9]{1,9}(?:\.[0-9]{1,2})?\z/'],
         ];
@@ -41,7 +41,7 @@ final class ProspectCampaignCsv
     }
 
     /** @return list<string>|null */
-    public static function cells(object $prospect, array $campaign): ?array
+    public static function cells(object $prospect, array $campaign, ?string $existingMailerId = null): ?array
     {
         $phone = ProspectListFields::usPhoneDigits($prospect->phone);
         if ($phone === null) {
@@ -57,7 +57,7 @@ final class ProspectCampaignCsv
             'US',
             preg_match('/\A[A-Z]{2}\z/', $state) === 1 ? $state : '',
             sprintf('(%s) %s-%s', substr($phone, 0, 3), substr($phone, 3, 3), substr($phone, 6)),
-            $campaign['mailer_id'],
+            $campaign['mailer_id'] ?? ProspectListFields::escapeCsvText(trim($existingMailerId ?? '')),
             $campaign['source'],
             $campaign['personal_loan_amount'] ?? '',
         ];

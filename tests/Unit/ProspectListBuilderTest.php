@@ -53,7 +53,7 @@ beforeEach(function (): void {
     $migration->up();
 
     $this->connection->statement('CREATE TABLE TblProspects (
-        PK INTEGER PRIMARY KEY, Client TEXT, Phone TEXT, Email TEXT, State TEXT, Creation_Date TEXT,
+        PK INTEGER PRIMARY KEY, Client TEXT, Address TEXT, Zip TEXT, Phone TEXT, Email TEXT, State TEXT, Creation_Date TEXT,
         Contacted INTEGER, Opt_Out INTEGER, Invalid_Phone INTEGER, Latest_Export_Date TEXT, Last_SMS_Date TEXT,
         Current_Debt INTEGER, Current_Debt_Source TEXT, Current_Debt_Source_PK INTEGER
     )');
@@ -332,11 +332,23 @@ test('a failed part upload discards only files belonging to that export', functi
     }
 });
 
-test('campaign exports match the vendor layout and keep one campaign ID per downloaded file', function (): void {
+test('campaign exports match the vendor layout and keep one campaign ID per downloaded file', function (?string $assignedMailerId): void {
     config(['prospect-list-builder.disk' => 'fixture', 'prospect-list-builder.stamp_exports' => true]);
-    $this->connection->table('TblProspects')->where('PK', 1)->update(['Phone' => '+1 (202) 555-0101']);
+    $this->connection->table('TblProspects')->where('PK', 1)->update([
+        'Phone' => '+1 (202) 555-0101', 'Address' => '10 Example Lane', 'Zip' => '90210-1234',
+    ]);
     $this->connection->table('TblProspects')->where('PK', 5)->update(['Phone' => 'not a phone', 'Latest_Export_Date' => null]);
-    $this->connection->table('TblProspects')->where('PK', 7)->update(['Client' => 'Morgan Example', 'Phone' => '202.555.0107']);
+    $this->connection->table('TblProspects')->where('PK', 7)->update([
+        'Client' => 'Morgan Example', 'Phone' => '202.555.0107', 'Current_Debt_Source_PK' => 702,
+    ]);
+    $this->connection->table('TblProspects')->where('PK', 8)->update(['Address' => '20 Example Lane', 'Zip' => '90210']);
+    $this->connection->statement('CREATE TABLE TblMailers (PK INTEGER PRIMARY KEY, Client TEXT, Address TEXT, SMS_Zip5 TEXT, External_ID TEXT)');
+    $this->connection->table('TblMailers')->insert([
+        ['PK' => 701, 'Client' => 'Taylor Example', 'Address' => '10 Example Lane', 'SMS_Zip5' => '90210', 'External_ID' => '000042'],
+        ['PK' => 702, 'Client' => 'Morgan Example', 'Address' => '1 Former Lane', 'SMS_Zip5' => '90210', 'External_ID' => 'Linked702'],
+        ['PK' => 703, 'Client' => 'Taylor Example', 'Address' => '20 Example Lane', 'SMS_Zip5' => '90210', 'External_ID' => 'MailerA'],
+        ['PK' => 704, 'Client' => 'Taylor Example', 'Address' => '20 Example Lane', 'SMS_Zip5' => '90210', 'External_ID' => 'MailerB'],
+    ]);
 
     $id = '11111111-1111-4111-8111-111111111111';
     $key = ProspectListRuns::key('lendingtower', 'actor', $id);
@@ -346,9 +358,13 @@ test('campaign exports match the vendor layout and keep one campaign ID per down
         'mobile_number', 'external_system_id', 'source', 'personal_loan_amount',
     ];
     $store = new CacheRepository(new ArrayStore());
+    $campaign = ['source' => 'Direct Mail'];
+    if ($assignedMailerId !== null) {
+        $campaign['mailer_id'] = $assignedMailerId;
+    }
     $store->put($key, [
         'id' => $id, 'kind' => 'export', 'status' => 'pending', 'columns' => $headers,
-        'campaign' => ['mailer_id' => 'Mailer007', 'source' => 'Direct Mail'],
+        'campaign' => $campaign,
     ]);
     $cache = Mockery::mock(\Illuminate\Cache\CacheManager::class);
     $cache->shouldReceive('store')->with('database')->andReturn($store);
@@ -384,17 +400,18 @@ test('campaign exports match the vendor layout and keep one campaign ID per down
         $secondId = ProspectListExportFiles::find($key, 2);
         expect($firstId)->toMatch('/\A[0-9]+\z/')
             ->and($secondId)->toMatch('/\A[0-9]+\z/')->not->toBe($firstId)
-            ->and(ProspectListExportFiles::reserve($key, 1, 'Mailer007'))->toBe($firstId)
+            ->and(ProspectListExportFiles::reserve($key, 1, $assignedMailerId))->toBe($firstId)
             ->and($parts[ProspectListRuns::artifact($key, 1)])->toBe([
                 $headers,
-                [$firstId, 'Taylor', 'Example', 'US', 'CA', '(202) 555-0101', 'Mailer007', 'Direct Mail', ''],
-                [$firstId, 'Morgan', 'Example', 'US', 'CA', '(202) 555-0107', 'Mailer007', 'Direct Mail', ''],
+                [$firstId, 'Taylor', 'Example', 'US', 'CA', '(202) 555-0101', $assignedMailerId ?? '000042', 'Direct Mail', ''],
+                [$firstId, 'Morgan', 'Example', 'US', 'CA', '(202) 555-0107', $assignedMailerId ?? 'Linked702', 'Direct Mail', ''],
             ])
             ->and($parts[ProspectListRuns::artifact($key, 2)])->toBe([
                 $headers,
-                [$secondId, 'Taylor', 'Example', 'US', 'CA', '(555) 123-4567', 'Mailer007', 'Direct Mail', ''],
+                [$secondId, 'Taylor', 'Example', 'US', 'CA', '(555) 123-4567', $assignedMailerId ?? '', 'Direct Mail', ''],
             ])
             ->and($store->get($key)['export_summary']['invalid_mobile'])->toBe(1)
+            ->and($store->get($key)['export_summary']['missing_mailer_id'])->toBe($assignedMailerId === null ? 1 : 0)
             ->and($this->connection->table('TblProspects')->where('PK', 5)->value('Latest_Export_Date'))->toBeNull()
             ->and($this->connection->table('TblProspects')->where('PK', 1)->value('Latest_Export_Date'))->not->toBeNull();
 
@@ -414,7 +431,7 @@ test('campaign exports match the vendor layout and keep one campaign ID per down
         }
         Mockery::close();
     }
-});
+})->with(['assigned ID' => ['Mailer007'], 'existing IDs' => [null]]);
 
 test('TCPA screening runs before publishing the selected CSV columns and stamps only cleared rows', function (string $scenario): void {
     config([
