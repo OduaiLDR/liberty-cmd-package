@@ -120,6 +120,9 @@ class ReportsServiceProvider extends ServiceProvider
         $this->loadRoutesFrom(__DIR__ . '/../routes/sms-api.php');
         $this->loadRoutesFrom(__DIR__ . '/../routes/sms-download.php');
         $this->loadRoutesFrom(__DIR__ . '/../routes/prospect-list-builder.php');
+        $this->publishes([
+            __DIR__ . '/../database/prospect-list-migrations' => database_path('migrations'),
+        ], 'prospect-list-builder-migrations');
         $this->loadViewsFrom(__DIR__ . '/../resources/views', 'reports');
 
         $this->publishes([

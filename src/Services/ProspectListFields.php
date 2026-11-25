@@ -75,6 +75,23 @@ final class ProspectListFields
         return $value;
     }
 
+    public static function usPhoneDigits(mixed $value): ?string
+    {
+        if (! is_string($value) && ! is_int($value)) {
+            return null;
+        }
+        $value = trim((string) $value, ' ');
+        if (preg_match('/\A\+?[0-9(). -]+\z/', $value) !== 1) {
+            return null;
+        }
+        $digits = str_replace(['+', '(', ')', '.', ' ', '-'], '', $value);
+        if (strlen($digits) === 11 && str_starts_with($digits, '1')) {
+            return substr($digits, 1);
+        }
+
+        return strlen($digits) === 10 && ! str_starts_with($value, '+') ? $digits : null;
+    }
+
     public static function catalog(): array
     {
         $columns = [];
@@ -91,6 +108,7 @@ final class ProspectListFields
 
         return [
             'columns' => $columns,
+            'campaign_columns' => ProspectCampaignCsv::catalog(),
             'age_filter' => self::birthDateColumn() !== null,
             'exclusion_overrides' => config('prospect-list-builder.allow_exclusion_overrides', false),
             'tcpa_scrub' => (bool) config('prospect-list-builder.tcpa_scrub.enabled'),

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Cmd\Reports\Services;
 
+use Cmd\Reports\Repositories\ProspectListExportFiles;
 use Illuminate\Filesystem\FilesystemAdapter;
 use RuntimeException;
 
@@ -17,6 +18,7 @@ final class ProspectListCsvFiles
     private int $fileCount = 0;
 
     private bool $uploadAttempted = false;
+    private string $campaignId;
 
     /** @param list<string> $headers */
     public function __construct(
@@ -24,12 +26,16 @@ final class ProspectListCsvFiles
         private string $key,
         private array $headers,
         private ?int $rowsPerFile,
+        private ?string $mailerId = null,
     ) {}
 
     public function write(array $row): void
     {
         if ($this->stream === null) {
             $this->open();
+        }
+        if ($this->mailerId !== null) {
+            $row[0] = $this->campaignId;
         }
         if (fputcsv($this->stream, $row, escape: '') === false) {
             throw new RuntimeException('Unable to write the prospect list.');
@@ -81,6 +87,7 @@ final class ProspectListCsvFiles
         }
         $this->stream = $stream;
         $this->rowsInFile = 0;
+        $this->campaignId = ProspectListExportFiles::reserve($this->key, $this->fileCount + 1, $this->mailerId);
         if (fputcsv($this->stream, $this->headers, escape: '') === false) {
             throw new RuntimeException('Unable to write the prospect list headers.');
         }
@@ -95,6 +102,7 @@ final class ProspectListCsvFiles
         if (! $this->disk->put($path, $this->stream, ['visibility' => 'private', 'ContentType' => 'text/csv; charset=UTF-8'])) {
             throw new RuntimeException('Unable to store the prospect list.');
         }
+        ProspectListExportFiles::recordRows($this->key, $this->fileCount + 1, $this->rowsInFile);
         $this->fileCount++;
         $this->close();
     }

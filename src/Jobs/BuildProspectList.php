@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Cmd\Reports\Jobs;
 
 use Cmd\Reports\Repositories\ProspectListRepository;
+use Cmd\Reports\Services\ProspectCampaignCsv;
 use Cmd\Reports\Services\ProspectListCsvFiles;
 use Cmd\Reports\Services\ProspectListFields;
 use Cmd\Reports\Services\ProspectListRuns;
@@ -73,55 +74,61 @@ final class BuildProspectList implements ShouldQueue
                 $result = ['count' => $count, 'diagnostics' => $diagnostics, 'count_stage' => 'complete'];
             } elseif (config('prospect-list-builder.stamp_exports')) {
                 $result = $store->lock('prospect-list:shared-export', $this->timeout + 60)
-                    ->block(15, fn (): array => $this->export($prospects, $asOf, true));
+                    ->block(15, fn (): array => $this->export($prospects, $asOf, true, $run['campaign'] ?? null));
             } else {
-                $result = $this->export($prospects, $asOf, false);
+                $result = $this->export($prospects, $asOf, false, $run['campaign'] ?? null);
             }
 
             $store->put($this->key, [...$run, ...$result, 'status' => 'completed'], ProspectListRuns::RETENTION_SECONDS);
         });
     }
 
-    /** @return array{count: int, file_count: int, rows_per_file: int|null, export_summary: array{fields: list<array{id: string, label: string, present: int}>, states: array<string, int>, tcpa_scrub?: array{matched: int, invalid_phone: int}}} */
-    private function export(ProspectListRepository $prospects, Carbon $asOf, bool $stamp): array
+    /** @return array{count: int, file_count: int, rows_per_file: int|null, export_summary: array{fields: list<array{id: string, label: string, present: int}>, states: array<string, int>, invalid_mobile?: int, tcpa_scrub?: array{matched: int, invalid_phone: int}}} */
+    private function export(ProspectListRepository $prospects, Carbon $asOf, bool $stamp, ?array $campaign): array
     {
         $columns = $this->columns ?? [];
         $scrubber = ($this->requireTcpaScrub ?? false) || config('prospect-list-builder.tcpa_scrub.enabled')
             ? app(TcpaLitigatorScrubber::class)
             : null;
-        $queryColumns = $columns;
+        $queryColumns = $campaign === null ? $columns : ProspectCampaignCsv::PROSPECT_COLUMNS;
         if ($scrubber !== null && ! in_array('phone', $queryColumns, true)) {
             $queryColumns[] = 'phone';
         }
         $scrubSummary = ['matched' => 0, 'invalid_phone' => 0];
         $idStream = null;
         $count = 0;
+        $invalidMobile = 0;
         $definitions = ProspectListFields::columns();
-        $headers = array_map(static fn (string $field): string => $definitions[$field][0], $columns);
+        $headers = $campaign === null ? array_map(static fn (string $field): string => $definitions[$field][0], $columns) : $columns;
         $rowsPerFile = $this->rowsPerFile ?? null;
-        $files = new ProspectListCsvFiles(Storage::disk(config('prospect-list-builder.disk')), $this->key, $headers, $rowsPerFile);
+        $files = new ProspectListCsvFiles(Storage::disk(config('prospect-list-builder.disk')), $this->key, $headers, $rowsPerFile, $campaign['mailer_id'] ?? null);
         $present = array_fill_keys($columns, 0);
         $states = [];
-        $stateIndex = array_search('state', $columns, true);
+        $stateIndex = array_search($campaign === null ? 'state' : 'state_code', $columns, true);
         try {
             if ($stamp && ($idStream = tmpfile()) === false) {
                 throw new RuntimeException('Unable to track prospect list history.');
             }
             // Jobs already queued before this change have no requested size.
             $prospects->eachBatch($this->filters, $queryColumns, $asOf, $this->rowLimit ?? 10_000,
-                function (Collection $rows) use ($columns, $definitions, $stateIndex, $files, $idStream, $scrubber, &$scrubSummary, &$count, &$present, &$states): void {
+                function (Collection $rows) use ($columns, $definitions, $stateIndex, $files, $idStream, $scrubber, $campaign, &$scrubSummary, &$count, &$present, &$states, &$invalidMobile): void {
                     if ($scrubber !== null) {
                         $scrubbed = $scrubber->filter($rows);
                         $scrubSummary['matched'] += $scrubbed['matched'];
                         $scrubSummary['invalid_phone'] += $scrubbed['invalid_phone'];
                         $rows = $scrubbed['rows'];
                     }
+                    $writtenIds = [];
                     foreach ($rows as $row) {
-                        $cells = [];
-                        foreach ($columns as $field) {
-                            $value = ProspectListFields::csvCell($row, $field, $definitions[$field][3]);
-                            $cells[] = $value;
-                            if (trim((string) $value) !== '') {
+                        $cells = $campaign === null
+                            ? array_map(static fn (string $field): mixed => ProspectListFields::csvCell($row, $field, $definitions[$field][3]), $columns)
+                            : ProspectCampaignCsv::cells($row, $campaign);
+                        if ($cells === null) {
+                            $invalidMobile++;
+                            continue;
+                        }
+                        foreach ($columns as $index => $field) {
+                            if (trim((string) $cells[$index]) !== '') {
                                 $present[$field]++;
                             }
                         }
@@ -135,13 +142,16 @@ final class BuildProspectList implements ShouldQueue
                             $states[$state] = ($states[$state] ?? 0) + 1;
                         }
                         $files->write($cells);
+                        $count++;
+                        if (is_resource($idStream)) {
+                            $writtenIds[] = $row->prospect_id;
+                        }
                     }
-                    if (is_resource($idStream) && $rows->isNotEmpty()) {
-                        $this->writeRow($idStream, $rows->pluck('prospect_id')->all());
+                    if ($writtenIds !== []) {
+                        $this->writeRow($idStream, $writtenIds);
                     }
-                    $count += $rows->count();
                 });
-            $fileCount = $files->finish(allowEmpty: $scrubber === null);
+            $fileCount = $files->finish(allowEmpty: $scrubber === null && $campaign === null);
 
             if (is_resource($idStream) && $count > 0) {
                 rewind($idStream);
@@ -161,6 +171,9 @@ final class BuildProspectList implements ShouldQueue
             }
         }
 
+        if ($campaign !== null) {
+            $present['campaign_id'] = $count;
+        }
         $summary = [
             'fields' => array_map(static fn (string $id, string $label): array => [
                 'id' => $id, 'label' => $label, 'present' => $present[$id],
@@ -170,12 +183,16 @@ final class BuildProspectList implements ShouldQueue
         if ($scrubber !== null) {
             $summary['tcpa_scrub'] = $scrubSummary;
         }
+        if ($campaign !== null) {
+            $summary['invalid_mobile'] = $invalidMobile;
+        }
 
         Log::info('Prospect list exported.', [
-            'id' => $this->id, 'tenant' => $this->tenant, 'actor' => $this->actor,
+            'id' => $this->id, 'tenant' => $this->tenant, 'actor' => $this->actor, 'export_key' => $this->key,
             'filter_keys' => array_keys($this->filters), 'field_filters' => array_keys($this->filters['fields'] ?? []),
             'columns' => $columns, 'row_limit' => $this->rowLimit ?? null, 'count' => $count,
             'tcpa_scrub' => $summary['tcpa_scrub'] ?? null,
+            'invalid_mobile' => $summary['invalid_mobile'] ?? null,
             'file_count' => $fileCount, 'rows_per_file' => $rowsPerFile,
         ]);
 

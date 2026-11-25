@@ -19,7 +19,7 @@ final class TcpaLitigatorScrubber
     /** @return array{rows: Collection, matched: int, invalid_phone: int} */
     public function filter(Collection $rows): array
     {
-        $phonesByRow = $rows->map(static fn (object $row): ?string => self::normalize($row->phone));
+        $phonesByRow = $rows->map(static fn (object $row): ?string => ProspectListFields::usPhoneDigits($row->phone));
         $phones = $phonesByRow->filter()->uniqueStrict()->values()->all();
         $decisions = $phones === [] ? [] : $this->decisions($phones);
 
@@ -69,7 +69,7 @@ final class TcpaLitigatorScrubber
         $expected = array_fill_keys($phones, true);
         $decisions = [];
         foreach ($results as $result) {
-            $phone = is_array($result) ? self::normalize($result['phone_number'] ?? null) : null;
+            $phone = is_array($result) ? ProspectListFields::usPhoneDigits($result['phone_number'] ?? null) : null;
             $clean = is_array($result) ? ($result['clean'] ?? null) : null;
             if ($phone === null || ! isset($expected[$phone]) || isset($decisions[$phone]) ||
                 ! in_array($clean, [0, '0', false, 1, '1', true], true)) {
@@ -87,22 +87,5 @@ final class TcpaLitigatorScrubber
         }
 
         return $decisions;
-    }
-
-    private static function normalize(mixed $value): ?string
-    {
-        if (! is_string($value) && ! is_int($value)) {
-            return null;
-        }
-        $value = trim((string) $value, ' ');
-        if (preg_match('/\A\+?[0-9(). -]+\z/', $value) !== 1) {
-            return null;
-        }
-        $digits = str_replace(['+', '(', ')', '.', ' ', '-'], '', $value);
-        if (strlen($digits) === 11 && str_starts_with($digits, '1')) {
-            return substr($digits, 1);
-        }
-
-        return strlen($digits) === 10 && ! str_starts_with($value, '+') ? $digits : null;
     }
 }

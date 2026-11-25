@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Cmd\Reports\Http\Requests;
 
+use Cmd\Reports\Services\ProspectCampaignCsv;
 use Cmd\Reports\Services\ProspectListFields;
 use Illuminate\Foundation\Http\FormRequest;
 use Illuminate\Validation\Rule;
@@ -15,6 +16,10 @@ final class ProspectListRequest extends FormRequest
         $columnDefinitions = ProspectListFields::columns();
         $inspection = $this->routeIs('cmd.prospect-list.inspect');
         if ($inspection && ! $this->has('columns')) {
+            foreach (ProspectCampaignCsv::COLUMNS as $field => $type) {
+                $columnDefinitions[$field] ??= [$field, null, null, $type];
+            }
+
             return $this->inspectionRules($columnDefinitions);
         }
         $rules = [
@@ -92,6 +97,9 @@ final class ProspectListRequest extends FormRequest
             $rules['count_id'] = ['required', 'uuid', 'different:id'];
             $rules['row_limit'] = ['required', 'integer', 'min:1'];
             $rules['rows_per_file'] = ['sometimes', 'nullable', 'integer', 'min:1', 'lte:row_limit'];
+            $rules['columns'][0] = 'required_without:campaign';
+            $rules['columns'][] = 'prohibits:campaign';
+            $rules += ProspectCampaignCsv::rules();
         }
 
         return $rules;
