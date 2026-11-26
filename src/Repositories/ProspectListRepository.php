@@ -9,24 +9,32 @@ use Illuminate\Database\Query\Builder;
 use Illuminate\Database\Query\JoinClause;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
+use RuntimeException;
+use SplTempFileObject;
 
 class ProspectListRepository extends SqlSrvRepository
 {
+    private const EXPORT_BATCH_SIZE = 2000;
+
     public function count(array $filters, Carbon $asOf): int
     {
-        return $this->withQueryTimeout(240, fn (): int => $this->filtered(
-            $filters, $asOf, mailDateBuild: $this->mailDateBuild($filters, $asOf),
-        )->count());
+        return $this->withQueryTimeout(240, fn (): int => $this->filtered($filters, $asOf)->count());
     }
 
     public function eachBatch(array $filters, array $columns, Carbon $asOf, int $rowLimit, callable $consume): void
     {
         $this->withQueryTimeout(240, function () use ($filters, $columns, $asOf, $rowLimit, $consume): void {
+            if (! empty($filters['fresh_mailed'])) {
+                $this->eachFreshBatch($filters, $columns, $asOf, $rowLimit, $consume);
+
+                return;
+            }
+
             $query = $this->exportQuery($filters, $columns, $asOf);
             $lastRow = null;
             while ($rowLimit > 0) {
-                $pageSize = min(2000, $rowLimit);
-                $page = $this->orderedExportPage(clone $query, $filters, $pageSize, $lastRow);
+                $pageSize = min(self::EXPORT_BATCH_SIZE, $rowLimit);
+                $page = (clone $query)->forPageAfterId($pageSize, $lastRow?->prospect_id, 'p.PK');
                 $rows = $this->readExportPage($page, $filters, $columns);
                 if ($rows->isEmpty() || $consume($rows) === false || $rows->count() < $pageSize) {
                     return;
@@ -40,11 +48,66 @@ class ProspectListRepository extends SqlSrvRepository
 
     public function preview(array $filters, array $columns, Carbon $asOf, int $rowLimit): Collection
     {
-        return $this->withQueryTimeout(8, fn (): Collection => $this->readExportPage(
-            $this->orderedExportPage($this->exportQuery($filters, $columns, $asOf), $filters, $rowLimit),
-            $filters,
-            $columns,
-        ));
+        return $this->withQueryTimeout(8, function () use ($filters, $columns, $asOf, $rowLimit): Collection {
+            $query = $this->exportQuery($filters, $columns, $asOf);
+            $page = empty($filters['fresh_mailed'])
+                ? $query->forPageAfterId($rowLimit, null, 'p.PK')
+                : $this->rankByMailDate($query, $asOf, $rowLimit);
+
+            return $this->readExportPage($page, $filters, $columns);
+        });
+    }
+
+    private function eachFreshBatch(array $filters, array $columns, Carbon $asOf, int $rowLimit, callable $consume): void
+    {
+        if ($rowLimit <= 0) {
+            return;
+        }
+        if ($rowLimit <= self::EXPORT_BATCH_SIZE) {
+            $query = $this->rankByMailDate($this->exportQuery($filters, $columns, $asOf), $asOf, $rowLimit);
+            $rows = $this->readExportPage($query, $filters, $columns);
+            if ($rows->isNotEmpty()) {
+                $consume($rows);
+            }
+
+            return;
+        }
+
+        $candidates = $this->filtered($filters, $asOf)->select('p.PK as prospect_id');
+        $ranked = $this->rankByMailDate($candidates, $asOf, $rowLimit);
+        // Close the SQL cursor before fetching CSV columns. Production connections disable MARS.
+        $rankedIds = new SplTempFileObject();
+        foreach ($ranked->cursor() as $row) {
+            if ($rankedIds->fputcsv([$row->prospect_id, $row->mailed_on], escape: '') === false) {
+                throw new RuntimeException('Unable to store the ranked prospect IDs.');
+            }
+        }
+        $rankedIds->rewind();
+
+        $eligibleRows = $this->exportQuery($filters, $columns, $asOf, matchMail: false);
+        while (! $rankedIds->eof()) {
+            $dates = [];
+            while (count($dates) < self::EXPORT_BATCH_SIZE && ($entry = $rankedIds->fgetcsv(escape: '')) !== false && $entry[0] !== null) {
+                $dates[(int) $entry[0]] = $entry[1];
+            }
+            if ($dates === []) {
+                return;
+            }
+
+            // Recheck eligibility and suppression in case another workflow updated a prospect.
+            $page = (clone $eligibleRows)->whereIntegerInRaw('p.PK', array_keys($dates));
+            $rows = $this->readExportPage($page, [], $columns)->keyBy('prospect_id');
+            $orderedRows = new Collection();
+            foreach ($dates as $id => $mailedOn) {
+                if ($row = $rows->get($id)) {
+                    $row->mailed_on = $mailedOn;
+                    $orderedRows->push($row);
+                }
+            }
+            if ($orderedRows->isNotEmpty() && $consume($orderedRows) === false) {
+                return;
+            }
+        }
     }
 
     /**
@@ -90,7 +153,7 @@ class ProspectListRepository extends SqlSrvRepository
         return $linked + $matched;
     }
 
-    private function exportQuery(array $filters, array $columns, Carbon $asOf): Builder
+    private function exportQuery(array $filters, array $columns, Carbon $asOf, bool $matchMail = true): Builder
     {
         $fields = ['p.PK as prospect_id'];
         if (array_intersect($columns, ['first_name', 'last_name']) !== []) {
@@ -112,36 +175,15 @@ class ProspectListRepository extends SqlSrvRepository
             $needsTu = $needsTu || str_starts_with($source, 't.');
         }
 
-        $mailDateBuild = $this->mailDateBuild($filters, $asOf);
-        $query = $this->filtered($filters, $asOf, $needsTu, $mailDateBuild)->select($fields);
-        if (empty($filters['fresh_mailed'])) {
-            return $query;
-        }
-
-        if ($mailDateBuild !== null) {
-            $query->addSelect('mail.Mailed_On as mailed_on');
-        } else {
-            $query->selectSub(ProspectMailDateIndex::history($this->connection(), $asOf)->selectRaw('MAX(d.Send_Date)'), 'mailed_on');
-        }
-
-        return $this->connection()->query()->fromSub($query, 'ranked_prospects');
+        return $this->filtered($filters, $asOf, $needsTu, $matchMail)->select($fields);
     }
 
-    private function orderedExportPage(Builder $query, array $filters, int $pageSize, ?object $lastRow = null): Builder
+    private function rankByMailDate(Builder $query, Carbon $asOf, int $rowLimit): Builder
     {
-        if (empty($filters['fresh_mailed'])) {
-            return $query->forPageAfterId($pageSize, $lastRow?->prospect_id, 'p.PK');
-        }
+        $query->selectSub($this->mailingHistory($asOf)->selectRaw('MAX(d.Send_Date)'), 'mailed_on');
 
-        if ($lastRow !== null) {
-            $query->where(fn (Builder $nextPage) => $nextPage
-                ->where('mailed_on', '<', $lastRow->mailed_on)
-                ->orWhere(fn (Builder $sameDate) => $sameDate
-                    ->where('mailed_on', $lastRow->mailed_on)
-                    ->where('prospect_id', '>', $lastRow->prospect_id)));
-        }
-
-        return $query->orderByDesc('mailed_on')->orderBy('prospect_id')->limit($pageSize);
+        return $this->connection()->query()->fromSub($query, 'ranked_prospects')
+            ->orderByDesc('mailed_on')->orderBy('prospect_id')->limit($rowLimit);
     }
 
     private function readExportPage(Builder $query, array $filters, array $columns): Collection
@@ -189,15 +231,12 @@ class ProspectListRepository extends SqlSrvRepository
         });
     }
 
-    private function filtered(array $filters, Carbon $asOf, bool $needsTu = false, ?int $mailDateBuild = null): Builder
+    private function filtered(array $filters, Carbon $asOf, bool $needsTu = false, bool $matchMail = true): Builder
     {
         $query = $this->table('TblProspects', 'p');
 
         $this->applyEligibility($query, $filters, $needsTu);
-        if ($mailDateBuild !== null) {
-            $this->joinMailDates($query, $mailDateBuild);
-        }
-        $this->applyFilters($query, $filters, $asOf, $mailDateBuild !== null);
+        $this->applyFilters($query, $filters, $asOf, $matchMail);
 
         return $query;
     }
@@ -220,7 +259,7 @@ class ProspectListRepository extends SqlSrvRepository
         }
     }
 
-    private function applyFilters(Builder $query, array $filters, Carbon $asOf, bool $hasMailDates = false): void
+    private function applyFilters(Builder $query, array $filters, Carbon $asOf, bool $matchMail = true): void
     {
         if (! empty($filters['states'])) {
             $query->whereIn('p.State', $filters['states']);
@@ -255,10 +294,8 @@ class ProspectListRepository extends SqlSrvRepository
         }
         if (! empty($filters['fresh_mailed'])) {
             $query->whereNull('p.Latest_Export_Date')->whereNull('p.Last_SMS_Date');
-            if ($hasMailDates) {
-                $query->whereNotNull('mail.Mailed_On');
-            } else {
-                $query->whereExists(ProspectMailDateIndex::history($this->connection(), $asOf));
+            if ($matchMail) {
+                $query->whereExists($this->mailingHistory($asOf));
             }
         } elseif (isset($filters['months_since_pull'])) {
             $cutoff = $asOf->copy()->subMonthsNoOverflow((int) $filters['months_since_pull'])->toDateString();
@@ -281,20 +318,16 @@ class ProspectListRepository extends SqlSrvRepository
         }
     }
 
-    private function mailDateBuild(array $filters, Carbon $asOf): ?int
+    private function mailingHistory(Carbon $asOf): Builder
     {
-        if (empty($filters['fresh_mailed']) || ! config('prospect-list-builder.indexed_mail_dates')) {
-            return null;
-        }
-
-        return (new ProspectMailDateIndex($this->connection()))->publishedBuild($asOf);
-    }
-
-    private function joinMailDates(Builder $query, int $buildId, string $type = 'inner'): void
-    {
-        $query->join('TblProspectMailDates as mail', static function (JoinClause $join) use ($buildId): void {
-            $join->on('mail.Prospect_PK', '=', 'p.PK')->where('mail.Build_ID', $buildId);
-        }, null, null, $type);
+        return $this->table('TblMailers', 'm')
+            ->join('TblMarketing as d', 'd.Drop_Name', '=', 'm.Drop_Name')
+            ->whereColumn('m.Client', 'p.Client')
+            ->whereColumn('m.Address', 'p.Address')
+            ->where('m.Client', '<>', '')
+            ->where('m.Address', '<>', '')
+            ->whereRaw('m.SMS_Zip5 = SUBSTRING(p.Zip, 1, 5)')
+            ->where('d.Send_Date', '<=', $asOf->toDateString());
     }
 
     /** @param array{string, string, string|null, string, string|null} $definition */
@@ -318,12 +351,8 @@ class ProspectListRepository extends SqlSrvRepository
         $query = $this->connection()->query()->fromSub($sample, 'p')->select('p.State')
             ->selectRaw('COUNT(*) as sample_size')->groupBy('p.State');
         $this->applyEligibility($query, $filters);
-        $mailDateBuild = $this->mailDateBuild($filters, $asOf);
-        if ($mailDateBuild !== null) {
-            $this->joinMailDates($query, $mailDateBuild, 'left');
-        }
         $combinedCriteria = $query->newQuery();
-        $this->applyFilters($combinedCriteria, $filters, $asOf, $mailDateBuild !== null);
+        $this->applyFilters($combinedCriteria, $filters, $asOf);
         $combinedCondition = substr($combinedCriteria->getGrammar()->compileWheres($combinedCriteria), strlen('where '));
         $query->selectRaw($combinedCondition === '' ? 'COUNT(*) as records' : "COUNT(CASE WHEN $combinedCondition THEN 1 END) as records",
             $combinedCriteria->getBindings());
@@ -342,7 +371,7 @@ class ProspectListRepository extends SqlSrvRepository
         $active = [];
         foreach ($selections as $group => $selection) {
             $criterion = $query->newQuery();
-            $this->applyFilters($criterion, $selection, $asOf, $mailDateBuild !== null);
+            $this->applyFilters($criterion, $selection, $asOf);
             $condition = substr($criterion->getGrammar()->compileWheres($criterion), strlen('where '));
             $query->selectRaw("COUNT(CASE WHEN $condition THEN 1 END) as [{$group}_matching]", $criterion->getBindings());
 

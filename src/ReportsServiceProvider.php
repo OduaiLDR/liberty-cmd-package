@@ -3,8 +3,6 @@
 namespace Cmd\Reports;
 
 use Illuminate\Support\ServiceProvider;
-use Illuminate\Console\Scheduling\Schedule;
-use Cmd\Reports\Console\Commands\RefreshProspectMailDates;
 use Cmd\Reports\Console\Commands\ImportCompanyHolidays;
 use Cmd\Reports\Console\Commands\ReferralCommissions\ProcessReferralCommissions;
 use Cmd\Reports\Console\Commands\SettlementApprovalEmails\ProcessSettlementApprovalEmails;
@@ -199,14 +197,6 @@ class ReportsServiceProvider extends ServiceProvider
 
         // Register console commands
         if ($this->app->runningInConsole()) {
-            $this->commands([RefreshProspectMailDates::class]);
-            $this->callAfterResolving(Schedule::class, static function (Schedule $schedule): void {
-                if (config('prospect-list-builder.indexed_mail_dates')) {
-                    $schedule->command(RefreshProspectMailDates::class, ['--batches' => 60])
-                        ->everyMinute()->withoutOverlapping(30)->runInBackground()
-                        ->appendOutputTo(storage_path('logs/prospect-mail-dates.log'));
-                }
-            });
             $this->commands([
                 TestDatabaseConnections::class,
                 SyncBalances::class,

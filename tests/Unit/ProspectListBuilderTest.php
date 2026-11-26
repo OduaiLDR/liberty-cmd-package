@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 use Cmd\Reports\Repositories\ProspectListRepository;
 use Cmd\Reports\Repositories\ProspectListExportFiles;
-use Cmd\Reports\Repositories\ProspectMailDateIndex;
 use Cmd\Reports\Http\Controllers\ProspectListController;
 use Cmd\Reports\Http\Middleware\ProspectListServiceAuth;
 use Cmd\Reports\Http\Requests\ProspectListRequest;
@@ -213,7 +212,7 @@ test('export honors a requested size above ten thousand across ordered batches',
     expect($ids)->toBe([1, 5, 6, 7, 8, ...range(100, 10597)]);
 });
 
-test('newest mailed pulls keep filters, cross page and date boundaries, and skip marked prospects', function (bool $indexed): void {
+test('newest mailed pulls keep filters, cross page and date boundaries, and skip marked prospects', function (): void {
     $db = $this->connection;
     $db->statement('CREATE TABLE TblMarketing (Drop_Name TEXT, Send_Date TEXT)');
     $db->statement('CREATE TABLE TblMailers (PK INTEGER PRIMARY KEY, Client TEXT, Address TEXT, SMS_Zip5 TEXT, Drop_Name TEXT)');
@@ -247,46 +246,37 @@ test('newest mailed pulls keep filters, cross page and date boundaries, and skip
     $columns = ['full_name'];
     $expected = [...range(10, 2010), 7];
     $exportIds = [];
-    if ($indexed) {
-        config(['prospect-list-builder.indexed_mail_dates' => true]);
-        expect($this->prospects->count($filters, $date))->toBe(count($expected));
 
-        $db->statement('CREATE TABLE TblProspectMailDateBuilds (
-            id INTEGER PRIMARY KEY, Source_Version TEXT, Source_Snapshot TEXT, Previous_Build_ID INTEGER, Reusable BOOLEAN DEFAULT 1,
-            Prospect_Max_PK INTEGER, Cursor_PK INTEGER DEFAULT 0, Published_At TEXT, Retired_At TEXT
-        )');
-        $db->statement('CREATE TABLE TblProspectMailDates (
-            Build_ID INTEGER, Prospect_PK INTEGER, Mailed_On TEXT, PRIMARY KEY (Build_ID, Prospect_PK)
-        )');
-        $index = new ProspectMailDateIndex($db);
-        $first = $index->refresh($date, 500, 1);
-        expect($first['published'])->toBeFalse()
-            ->and($index->publishedBuild($date))->toBeNull()
-            ->and($this->prospects->count($filters, $date))->toBe(count($expected));
-
-        $complete = $index->refresh($date, 500, 10);
-        expect($complete)->toBe(['build' => $first['build'], 'cursor' => 2012, 'published' => true])
-            ->and($index->publishedBuild($date))->toBe($first['build']);
-
-        $db->enableQueryLog();
-        expect($this->prospects->preview($filters, $columns, $date, 2)->pluck('prospect_id')->all())->toBe([10, 11]);
-        $previewQuery = $db->getQueryLog()[array_key_last($db->getQueryLog())]['query'];
-        $db->disableQueryLog();
-        expect($previewQuery)->toContain('TblProspectMailDates')->not->toContain('SMS_Zip5');
-
-        $nextDrop = Carbon::parse('2026-12-01');
-        expect($index->publishedBuild($nextDrop))->toBeNull()
-            ->and($this->prospects->preview($filters, $columns, $nextDrop, 2)->pluck('prospect_id')->all())->toBe([8, 2010]);
-    }
+    $nextDrop = Carbon::parse('2026-12-01');
+    expect($this->prospects->preview($filters, $columns, $nextDrop, 2)->pluck('prospect_id')->all())->toBe([8, 2010]);
     expect($this->prospects->count($filters, $date))->toBe(count($expected))
         ->and($this->prospects->preview($filters, $columns, $date, 2)->pluck('prospect_id')->all())->toBe([10, 11])
         ->and($this->prospects->diagnostics($filters, $date)['states'])->toBe(['CA' => count($expected)]);
 
+    $smallExport = [];
+    $this->prospects->eachBatch($filters, $columns, $date, 2, function ($rows) use (&$smallExport): void {
+        $smallExport = $rows->pluck('prospect_id')->all();
+    });
+    expect($smallExport)->toBe([10, 11]);
+
+    $db->enableQueryLog();
     $this->prospects->eachBatch($filters, $columns, $date, count($expected), function ($rows) use (&$exportIds): void {
         array_push($exportIds, ...$rows->pluck('prospect_id')->all());
     });
+    $queries = array_column($db->getQueryLog(), 'query');
+    $db->disableQueryLog();
 
-    expect($exportIds)->toBe($expected);
+    expect($exportIds)->toBe($expected)
+        ->and(array_filter($queries, static fn (string $sql): bool => str_contains($sql, 'TblMailers')))->toHaveCount(1)
+        ->and(array_filter($queries, static fn (string $sql): bool => ! str_starts_with($sql, 'select ')))->toBe([]);
+
+    $exportIds = [];
+    $this->prospects->eachBatch($filters, $columns, $date, count($expected), function ($rows) use (&$exportIds, $db): void {
+        array_push($exportIds, ...$rows->pluck('prospect_id')->all());
+        $db->table('TblProspects')->where('PK', 2010)->update(['Last_SMS_Date' => '2026-11-24']);
+    });
+    expect($exportIds)->toBe([...range(10, 2009), 7]);
+    $db->table('TblProspects')->where('PK', 2010)->update(['Last_SMS_Date' => null]);
     $this->prospects->stamp([range(10, 2009)], $date);
     expect($this->prospects->count($filters, $date))->toBe(2)
         ->and($this->prospects->preview($filters, $columns, $date, 2)->pluck('prospect_id')->all())->toBe([2010, 7]);
@@ -295,37 +285,15 @@ test('newest mailed pulls keep filters, cross page and date boundaries, and skip
     expect($this->prospects->count($filters, $date))->toBe(1)
         ->and($this->prospects->preview($filters, $columns, $date, 2)->pluck('prospect_id')->all())->toBe([7]);
 
-    if ($indexed) {
-        $db->table('TblMailers')->insert(['Client' => 'Older match', 'Address' => '1 Sample Way', 'SMS_Zip5' => '90210', 'Drop_Name' => 'recent']);
-        expect($index->publishedBuild($date))->toBeNull()
-            ->and($this->prospects->preview($filters, $columns, $date, 1)->first()->mailed_on)->toBe('2026-11-10');
+    $db->table('TblMailers')->insert(['Client' => 'Older match', 'Address' => '1 Sample Way', 'SMS_Zip5' => '90210', 'Drop_Name' => 'recent']);
+    expect($this->prospects->preview($filters, $columns, $date, 1)->first()->mailed_on)->toBe('2026-11-10');
 
-        $db->table('TblProspectMailDateBuilds')->where('id', $first['build'])->update(['Retired_At' => now('UTC')->subHours(4)]);
-        $pending = $index->refresh($date, 1000, 1);
-        expect($pending['published'])->toBeFalse()
-            ->and($index->publishedBuild($date))->toBeNull()
-            ->and($db->table('TblProspectMailDates')->where('Build_ID', $first['build'])->where('Prospect_PK', 7)->exists())->toBeTrue();
+    $db->table('TblMarketing')->where('Drop_Name', 'recent')->update(['Send_Date' => '2026-11-01']);
+    expect($this->prospects->preview($filters, $columns, $date, 1)->first()->mailed_on)->toBe('2026-11-01');
 
-        $refreshed = $index->refresh($date, 1000, 4);
-        expect($refreshed['published'])->toBeTrue()
-            ->and($refreshed['build'])->toBe($pending['build'])
-            ->and($index->publishedBuild($date))->toBe($refreshed['build'])
-            ->and($db->table('TblProspectMailDateBuilds')->where('id', $refreshed['build'])->value('Previous_Build_ID'))->toBe($first['build'])
-            ->and($this->prospects->preview($filters, $columns, $date, 1)->first()->mailed_on)->toBe('2026-11-10');
-
-        $db->table('TblMarketing')->where('Drop_Name', 'recent')->update(['Send_Date' => '2026-11-01']);
-        $corrected = $index->refresh($date, 1000, 4);
-        expect($corrected['published'])->toBeTrue()
-            ->and($db->table('TblProspectMailDateBuilds')->where('id', $corrected['build'])->value('Previous_Build_ID'))->toBeNull()
-            ->and($this->prospects->preview($filters, $columns, $date, 1)->first()->mailed_on)->toBe('2026-11-01');
-
-        $db->table('TblMailers')->where('Client', 'Older match')->where('Drop_Name', 'recent')->update(['Address' => 'Corrected away']);
-        $rebuilt = $index->refresh($date, 1000, 1, rebuild: true);
-        expect($rebuilt['published'])->toBeFalse()->and($index->publishedBuild($date))->toBeNull();
-        expect($index->refresh($date, 1000, 3)['build'])->toBe($rebuilt['build'])
-            ->and($this->prospects->preview($filters, $columns, $date, 1)->first()->mailed_on)->toBe('2026-09-15');
-    }
-})->with(['direct mailing history' => false, 'indexed mail dates' => true]);
+    $db->table('TblMailers')->where('Client', 'Older match')->where('Drop_Name', 'recent')->update(['Address' => 'Corrected away']);
+    expect($this->prospects->preview($filters, $columns, $date, 1)->first()->mailed_on)->toBe('2026-09-15');
+});
 
 test('export results reconcile with the headers and populated values actually written to each CSV', function (?int $rowsPerFile, array $partSizes): void {
     config(['prospect-list-builder.disk' => 'fixture', 'prospect-list-builder.stamp_exports' => false]);
