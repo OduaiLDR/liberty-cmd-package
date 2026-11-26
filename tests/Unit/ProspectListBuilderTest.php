@@ -13,6 +13,8 @@ use Cmd\Reports\Services\ProspectCampaignCsv;
 use Cmd\Reports\Services\ProspectListCsvFiles;
 use Cmd\Reports\Services\ProspectListFields;
 use Cmd\Reports\Services\ProspectListRuns;
+use Cmd\Reports\Services\ProspectMailerOffers;
+use Cmd\Reports\Services\ProspectMailerOffersUnavailable;
 use Cmd\Reports\Services\TcpaLitigatorScrubber;
 use Cmd\Reports\Services\TcpaScrubUnavailable;
 use Illuminate\Config\Repository;
@@ -30,6 +32,7 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Facade;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Translation\ArrayLoader;
@@ -332,8 +335,15 @@ test('a failed part upload discards only files belonging to that export', functi
     }
 });
 
-test('campaign exports match the vendor layout and keep one campaign ID per downloaded file', function (?string $assignedMailerId): void {
-    config(['prospect-list-builder.disk' => 'fixture', 'prospect-list-builder.stamp_exports' => true]);
+test('campaign exports match the vendor layout and keep one campaign ID per downloaded file', function (?string $assignedMailerId, ?int $lookupStatus = null): void {
+    $origin = 'https://staging.example.test';
+    config([
+        'prospect-list-builder.disk' => 'fixture',
+        'prospect-list-builder.stamp_exports' => true,
+        'prospect-list-builder.mailer_offer_origins' => [$origin],
+        'prospect-list-builder.token' => 'fixture-token',
+    ]);
+    $lookupFailed = $lookupStatus === 403;
     $this->connection->table('TblProspects')->where('PK', 1)->update([
         'Phone' => '+1 (202) 555-0101', 'Address' => '10 Example Lane', 'Zip' => '90210-1234',
     ]);
@@ -362,6 +372,14 @@ test('campaign exports match the vendor layout and keep one campaign ID per down
     if ($assignedMailerId !== null) {
         $campaign['mailer_id'] = $assignedMailerId;
     }
+    $http = new HttpFactory();
+    if ($lookupStatus !== null) {
+        $campaign['mailer_offer_origin'] = $origin;
+        $http->preventStrayRequests()->fake([$origin.'/api/v3/prospect-lists/mailer-offers' => HttpFactory::response([
+            'offers' => [['reference' => '000042', 'amount' => '18765.50']],
+        ], $lookupStatus)]);
+        Http::swap($http);
+    }
     $store->put($key, [
         'id' => $id, 'kind' => 'export', 'status' => 'pending', 'columns' => $headers,
         'campaign' => $campaign,
@@ -371,7 +389,7 @@ test('campaign exports match the vendor layout and keep one campaign ID per down
     Cache::swap($cache);
     $parts = [];
     $disk = Mockery::mock(\Illuminate\Filesystem\FilesystemAdapter::class);
-    $disk->shouldReceive('put')->times(2)->andReturnUsing(function (string $path, $stream) use (&$parts): bool {
+    $disk->shouldReceive('put')->times($lookupFailed ? 0 : 2)->andReturnUsing(function (string $path, $stream) use (&$parts): bool {
         while (($row = fgetcsv($stream, escape: '')) !== false) {
             $parts[$path][] = $row;
         }
@@ -386,7 +404,7 @@ test('campaign exports match the vendor layout and keep one campaign ID per down
     $storage->shouldReceive('disk')->with('fixture')->andReturn($disk);
     Storage::swap($storage);
     $logger = Mockery::mock(\Psr\Log\LoggerInterface::class);
-    $logger->shouldReceive('info')->once();
+    $logger->shouldReceive('info')->times($lookupFailed ? 0 : 1);
     Log::swap($logger);
     $responses = Mockery::mock(ResponseFactory::class);
     $responses->shouldReceive('json')->andReturnUsing(static fn (array $response) => new JsonResponse($response));
@@ -394,7 +412,22 @@ test('campaign exports match the vendor layout and keep one campaign ID per down
 
     try {
         $job = new BuildProspectList($key, 'lendingtower', 'actor', $id, $filters, array_keys(ProspectCampaignCsv::COLUMNS), '2026-11-24', 4, rowsPerFile: 2);
+        if ($lookupFailed) {
+            expect(fn () => $job->handle($this->prospects))->toThrow(ProspectMailerOffersUnavailable::class)
+                ->and($parts)->toBe([])
+                ->and($this->connection->table('prospect_list_export_files')->count())->toBe(0)
+                ->and($this->connection->table('TblProspects')->where('PK', 1)->value('Latest_Export_Date'))->toBeNull();
+
+            return;
+        }
         $job->handle($this->prospects);
+        if ($lookupStatus === 200) {
+            [$request] = $http->recorded()->sole();
+            expect($request->hasHeader('Authorization', 'Bearer '.hash_hmac('sha256', 'prospect-mailer-offers:lendingtower', 'fixture-token')))->toBeTrue()
+                ->and($request->hasHeader('X-Prospect-Tenant', 'lendingtower'))->toBeTrue()
+                ->and($request->data()['references'])->toEqualCanonicalizing(['000042', 'Linked702']);
+            expect($store->get($key)['export_summary']['missing_check_amount'])->toBe(2);
+        }
 
         $firstId = ProspectListExportFiles::find($key, 1);
         $secondId = ProspectListExportFiles::find($key, 2);
@@ -403,7 +436,7 @@ test('campaign exports match the vendor layout and keep one campaign ID per down
             ->and(ProspectListExportFiles::reserve($key, 1, $assignedMailerId))->toBe($firstId)
             ->and($parts[ProspectListRuns::artifact($key, 1)])->toBe([
                 $headers,
-                [$firstId, 'Taylor', 'Example', 'US', 'CA', '(202) 555-0101', $assignedMailerId ?? '000042', 'Direct Mail', ''],
+                [$firstId, 'Taylor', 'Example', 'US', 'CA', '(202) 555-0101', $assignedMailerId ?? '000042', 'Direct Mail', $lookupStatus === 200 ? '18765.50' : ''],
                 [$firstId, 'Morgan', 'Example', 'US', 'CA', '(202) 555-0107', $assignedMailerId ?? 'Linked702', 'Direct Mail', ''],
             ])
             ->and($parts[ProspectListRuns::artifact($key, 2)])->toBe([
@@ -426,12 +459,34 @@ test('campaign exports match the vendor layout and keep one campaign ID per down
         }
         expect($this->connection->table('prospect_list_export_files')->count())->toBe(2);
     } finally {
-        foreach (['cache', 'filesystem', 'log'] as $accessor) {
+        foreach (['cache', 'filesystem', 'log', HttpFactory::class] as $accessor) {
             Facade::clearResolvedInstance($accessor);
         }
         Mockery::close();
     }
-})->with(['previously queued assigned ID' => ['Mailer007'], 'existing IDs' => [null]]);
+})->with([
+    'previously queued assigned ID' => ['Mailer007'],
+    'existing IDs' => [null],
+    'recorded check amounts' => [null, 200],
+    'check amount lookup fails' => [null, 403],
+]);
+
+test('mailer check amount lookups reject responses with mismatched references', function (): void {
+    $origin = 'https://staging.example.test';
+    config(['prospect-list-builder.mailer_offer_origins' => [$origin], 'prospect-list-builder.token' => 'fixture-token']);
+    Http::swap((new HttpFactory())->preventStrayRequests()->fake([
+        $origin.'/api/v3/prospect-lists/mailer-offers' => HttpFactory::response([
+            'offers' => [['reference' => '42', 'amount' => '18765.50']],
+        ]),
+    ]));
+
+    try {
+        expect(fn () => (new ProspectMailerOffers())->forReferences($origin, 'lendingtower', ['000042']))
+            ->toThrow(ProspectMailerOffersUnavailable::class);
+    } finally {
+        Facade::clearResolvedInstance(HttpFactory::class);
+    }
+});
 
 test('TCPA screening runs before publishing the selected CSV columns and stamps only cleared rows', function (string $scenario): void {
     config([

@@ -23,9 +23,10 @@ final class ProspectCampaignCsv
     public static function rules(): array
     {
         return [
-            'campaign' => ['sometimes', 'required', 'array:source,personal_loan_amount'],
+            'campaign' => ['sometimes', 'required', 'array:source,personal_loan_amount,mailer_offer_origin'],
             'campaign.source' => ['required_with:campaign', 'string', 'max:100', 'regex:/\A[A-Za-z0-9][A-Za-z0-9_. -]*\z/'],
             'campaign.personal_loan_amount' => ['sometimes', 'nullable', 'string', 'regex:/\A[0-9]{1,9}(?:\.[0-9]{1,2})?\z/'],
+            'campaign.mailer_offer_origin' => ['sometimes', 'required', 'string', 'max:255', 'prohibits:campaign.personal_loan_amount'],
         ];
     }
 
@@ -40,7 +41,7 @@ final class ProspectCampaignCsv
     }
 
     /** @return list<string>|null */
-    public static function cells(object $prospect, array $campaign, ?string $existingMailerId = null): ?array
+    public static function cells(object $prospect, array $campaign, ?string $existingMailerId = null, ?string $recordedCheckAmount = null): ?array
     {
         $phone = ProspectListFields::usPhoneDigits($prospect->phone);
         if ($phone === null) {
@@ -58,7 +59,7 @@ final class ProspectCampaignCsv
             sprintf('(%s) %s-%s', substr($phone, 0, 3), substr($phone, 3, 3), substr($phone, 6)),
             $campaign['mailer_id'] ?? ProspectListFields::escapeCsvText(trim($existingMailerId ?? '')),
             $campaign['source'],
-            $campaign['personal_loan_amount'] ?? '',
+            $recordedCheckAmount ?? $campaign['personal_loan_amount'] ?? '',
         ];
     }
 }

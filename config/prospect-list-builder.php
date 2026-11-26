@@ -7,6 +7,7 @@ return [
         static fn (string $tenantId): bool => $tenantId !== '',
     )),
     'disk' => env('PROSPECT_LIST_BUILDER_DISK', 's3'),
+    'mailer_offer_origins' => array_map('trim', explode(',', (string) env('PROSPECT_LIST_BUILDER_MAILER_OFFER_ORIGINS', ''))),
     'dob_column' => env('PROSPECT_LIST_BUILDER_TU_DOB_COLUMN', 'dob'),
     'stamp_exports' => (bool) env('PROSPECT_LIST_BUILDER_STAMP_EXPORTS', false),
     'allow_exclusion_overrides' => (bool) env('PROSPECT_LIST_BUILDER_ALLOW_EXCLUSION_OVERRIDES', false),

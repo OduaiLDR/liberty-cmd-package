@@ -12,6 +12,7 @@ use Cmd\Reports\Services\ProspectCampaignCsv;
 use Cmd\Reports\Services\ProspectExportInspector;
 use Cmd\Reports\Services\ProspectListFields;
 use Cmd\Reports\Services\ProspectListRuns;
+use Cmd\Reports\Services\ProspectMailerOffers;
 use Generator;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -48,6 +49,9 @@ final class ProspectListController
 
         $rowsPerFile = $request->validated('rows_per_file');
         $campaign = $request->validated('campaign');
+        if (isset($campaign['mailer_offer_origin']) && ! ProspectMailerOffers::allowsOrigin($campaign['mailer_offer_origin'])) {
+            throw ValidationException::withMessages(['campaign.mailer_offer_origin' => 'Recorded mailer offers are unavailable for this DebtPlete site.']);
+        }
         $columns = $campaign === null ? $request->validated('columns') : array_keys(ProspectCampaignCsv::COLUMNS);
 
         return $this->submit($request, $columns, $count['as_of'], $rowLimit, $rowsPerFile === null ? null : (int) $rowsPerFile, $campaign);

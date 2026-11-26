@@ -9,6 +9,8 @@ use Cmd\Reports\Services\ProspectCampaignCsv;
 use Cmd\Reports\Services\ProspectListCsvFiles;
 use Cmd\Reports\Services\ProspectListFields;
 use Cmd\Reports\Services\ProspectListRuns;
+use Cmd\Reports\Services\ProspectMailerOffers;
+use Cmd\Reports\Services\ProspectMailerOffersUnavailable;
 use Cmd\Reports\Services\SmsExportQueue;
 use Cmd\Reports\Services\TcpaLitigatorScrubber;
 use Cmd\Reports\Services\TcpaScrubUnavailable;
@@ -106,6 +108,8 @@ final class BuildProspectList implements ShouldQueue
             mailerId: $campaign['mailer_id'] ?? null, campaignFormat: $campaign !== null,
         );
         $useExistingMailerIds = $campaign !== null && ! isset($campaign['mailer_id']);
+        $mailerOrigin = $campaign['mailer_offer_origin'] ?? null;
+        $mailerOffers = $mailerOrigin === null ? null : app(ProspectMailerOffers::class);
         $present = array_fill_keys($columns, 0);
         $states = [];
         $stateIndex = array_search($campaign === null ? 'state' : 'state_code', $columns, true);
@@ -115,7 +119,7 @@ final class BuildProspectList implements ShouldQueue
             }
             // Jobs already queued before this change have no requested size.
             $prospects->eachBatch($this->filters, $queryColumns, $asOf, $this->rowLimit ?? 10_000,
-                function (Collection $rows) use ($columns, $definitions, $stateIndex, $files, $idStream, $scrubber, $campaign, $useExistingMailerIds, $prospects, &$scrubSummary, &$count, &$present, &$states, &$invalidMobile): void {
+                function (Collection $rows) use ($columns, $definitions, $stateIndex, $files, $idStream, $scrubber, $campaign, $useExistingMailerIds, $mailerOrigin, $mailerOffers, $prospects, &$scrubSummary, &$count, &$present, &$states, &$invalidMobile): void {
                     if ($scrubber !== null) {
                         $scrubbed = $scrubber->filter($rows);
                         $scrubSummary['matched'] += $scrubbed['matched'];
@@ -123,11 +127,13 @@ final class BuildProspectList implements ShouldQueue
                         $rows = $scrubbed['rows'];
                     }
                     $mailerIds = $useExistingMailerIds ? $prospects->existingMailerIds($rows->pluck('prospect_id')->all()) : [];
+                    $checkAmounts = $mailerOffers?->forReferences($mailerOrigin, $this->tenant, array_values($mailerIds)) ?? [];
                     $writtenIds = [];
                     foreach ($rows as $row) {
+                        $reference = $mailerIds[$row->prospect_id] ?? null;
                         $cells = $campaign === null
                             ? array_map(static fn (string $field): mixed => ProspectListFields::csvCell($row, $field, $definitions[$field][3]), $columns)
-                            : ProspectCampaignCsv::cells($row, $campaign, $mailerIds[$row->prospect_id] ?? null);
+                            : ProspectCampaignCsv::cells($row, $campaign, $reference, $checkAmounts[trim($reference ?? '')] ?? null);
                         if ($cells === null) {
                             $invalidMobile++;
                             continue;
@@ -191,6 +197,9 @@ final class BuildProspectList implements ShouldQueue
         if ($campaign !== null) {
             $summary['invalid_mobile'] = $invalidMobile;
             $summary['missing_mailer_id'] = $count - $present['external_system_id'];
+            if ($mailerOffers !== null) {
+                $summary['missing_check_amount'] = $count - $present['personal_loan_amount'];
+            }
         }
 
         Log::info('Prospect list exported.', [
@@ -231,6 +240,8 @@ final class BuildProspectList implements ShouldQueue
             $run['status'] = 'failed';
             if ($error instanceof TcpaScrubUnavailable) {
                 $run['failure_reason'] = 'tcpa_scrub';
+            } elseif ($error instanceof ProspectMailerOffersUnavailable) {
+                $run['failure_reason'] = 'mailer_offers';
             }
             $store->put($this->key, $run, ProspectListRuns::RETENTION_SECONDS);
             if ($error instanceof TimeoutExceededException && ($this->rowsPerFile ?? null) !== null) {
