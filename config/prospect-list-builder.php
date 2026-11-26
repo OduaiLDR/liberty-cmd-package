@@ -9,6 +9,7 @@ return [
     'disk' => env('PROSPECT_LIST_BUILDER_DISK', 's3'),
     'dob_column' => env('PROSPECT_LIST_BUILDER_TU_DOB_COLUMN', 'dob'),
     'stamp_exports' => (bool) env('PROSPECT_LIST_BUILDER_STAMP_EXPORTS', false),
+    'indexed_mail_dates' => (bool) env('PROSPECT_LIST_BUILDER_INDEXED_MAIL_DATES', false),
     'allow_exclusion_overrides' => (bool) env('PROSPECT_LIST_BUILDER_ALLOW_EXCLUSION_OVERRIDES', false),
     'tcpa_scrub' => [
         'enabled' => (bool) env('PROSPECT_LIST_BUILDER_TCPA_SCRUB_ENABLED', false),
