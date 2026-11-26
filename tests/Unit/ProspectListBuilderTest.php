@@ -212,11 +212,69 @@ test('export honors a requested size above ten thousand across ordered batches',
     expect($ids)->toBe([1, 5, 6, 7, 8, ...range(100, 10597)]);
 });
 
+test('newest mailed pulls keep filters, cross page and date boundaries, and skip marked prospects', function (): void {
+    $db = $this->connection;
+    $db->statement('CREATE TABLE TblMarketing (Drop_Name TEXT, Send_Date TEXT)');
+    $db->statement('CREATE TABLE TblMailers (Client TEXT, Address TEXT, SMS_Zip5 TEXT, Drop_Name TEXT)');
+    $db->table('TblMarketing')->insert([
+        ['Drop_Name' => 'recent', 'Send_Date' => '2026-11-10'],
+        ['Drop_Name' => 'recent', 'Send_Date' => '2026-11-10'],
+        ['Drop_Name' => 'earlier', 'Send_Date' => '2026-09-15'],
+        ['Drop_Name' => 'future', 'Send_Date' => '2026-12-01'],
+    ]);
+    $db->statement("WITH RECURSIVE ids (id) AS (
+        SELECT 10 UNION ALL SELECT id + 1 FROM ids WHERE id < 2012
+    ) INSERT INTO TblProspects (PK, Client, Address, Zip, State, Contacted, Opt_Out, Invalid_Phone, Current_Debt)
+        SELECT id, 'Example ' || id, '1 Sample Way', '90210-1234', 'CA', 0, 0, 0, 20000 FROM ids");
+    $db->statement("INSERT INTO TblMailers (Client, Address, SMS_Zip5, Drop_Name)
+        SELECT Client, Address, '90210', 'recent' FROM TblProspects WHERE PK >= 10");
+    $db->table('TblProspects')->whereIn('PK', [1, 5, 6, 7, 8])->update(['Address' => '1 Sample Way', 'Zip' => '90210']);
+    $db->table('TblProspects')->where('PK', 7)->update(['Client' => 'Older match', 'Last_SMS_Date' => null]);
+    $db->table('TblProspects')->where('PK', 8)->update(['Client' => 'Future match', 'Last_SMS_Date' => null]);
+    $db->table('TblMailers')->insert([
+        ['Client' => 'Taylor Example', 'Address' => '1 Sample Way', 'SMS_Zip5' => '90210', 'Drop_Name' => 'recent'],
+        ['Client' => 'Example 10', 'Address' => '1 Sample Way', 'SMS_Zip5' => '90210', 'Drop_Name' => 'earlier'],
+        ['Client' => 'Older match', 'Address' => '1 Sample Way', 'SMS_Zip5' => '90210', 'Drop_Name' => 'earlier'],
+        ['Client' => 'Future match', 'Address' => '1 Sample Way', 'SMS_Zip5' => '90210', 'Drop_Name' => 'future'],
+        ['Client' => 'Example 2010', 'Address' => '1 Sample Way', 'SMS_Zip5' => '90210', 'Drop_Name' => 'future'],
+    ]);
+    $db->table('TblProspects')->where('PK', 2012)->update(['State' => 'NV']);
+    $db->table('TblProspects')->where('PK', 2011)->update(['Current_Debt' => 1000]);
+
+    $date = Carbon::parse('2026-11-24');
+    $filters = ['fresh_mailed' => true, 'states' => ['CA'], 'debt_min' => 10_000, 'months_since_pull' => 1];
+    $columns = ['full_name'];
+    $expected = [...range(10, 2010), 7];
+    $exportIds = [];
+    expect($this->prospects->count($filters, $date))->toBe(count($expected))
+        ->and($this->prospects->preview($filters, $columns, $date, 2)->pluck('prospect_id')->all())->toBe([10, 11])
+        ->and($this->prospects->diagnostics($filters, $date)['states'])->toBe(['CA' => count($expected)]);
+
+    $this->prospects->eachBatch($filters, $columns, $date, count($expected), function ($rows) use (&$exportIds): void {
+        array_push($exportIds, ...$rows->pluck('prospect_id')->all());
+    });
+
+    expect($exportIds)->toBe($expected);
+    $this->prospects->stamp([range(10, 2009)], $date);
+    expect($this->prospects->count($filters, $date))->toBe(2)
+        ->and($this->prospects->preview($filters, $columns, $date, 2)->pluck('prospect_id')->all())->toBe([2010, 7]);
+
+    $this->prospects->stamp([[2010]], $date);
+    expect($this->prospects->count($filters, $date))->toBe(1)
+        ->and($this->prospects->preview($filters, $columns, $date, 2)->pluck('prospect_id')->all())->toBe([7]);
+});
+
 test('export results reconcile with the headers and populated values actually written to each CSV', function (?int $rowsPerFile, array $partSizes): void {
-    config(['prospect-list-builder.disk' => 'fixture']);
+    config(['prospect-list-builder.disk' => 'fixture', 'prospect-list-builder.stamp_exports' => false]);
+    $this->connection->table('TblProspects')->where('PK', 1)->update(['Address' => '10 Example Lane', 'Zip' => '90210-1234']);
     $this->connection->table('TblProspects')->where('PK', 7)->update(['State' => null]);
     $this->connection->table('TblProspects')->where('PK', 8)->update(['Current_Debt' => 0]);
     $this->connection->table('TblTUData')->where('PK', 90)->update(['blto02_v001name' => '=1+1']);
+    $this->connection->statement('CREATE TABLE TblMailers (PK INTEGER PRIMARY KEY, Client TEXT, Address TEXT, SMS_Zip5 TEXT, External_ID TEXT)');
+    $this->connection->table('TblMailers')->insert([
+        ['PK' => 90, 'Client' => 'Taylor Example', 'Address' => '1 Former Lane', 'SMS_Zip5' => '90210', 'External_ID' => '1234567890'],
+        ['PK' => 91, 'Client' => 'Taylor Example', 'Address' => '10 Example Lane', 'SMS_Zip5' => '90210', 'External_ID' => '001234567890'],
+    ]);
 
     $previousApplication = Facade::getFacadeApplication();
     Facade::setFacadeApplication(Container::getInstance());
@@ -248,29 +306,52 @@ test('export results reconcile with the headers and populated values actually wr
         $key = ProspectListRuns::key('lendingtower', 'actor', 'export');
         $cache->put($key, ['status' => 'pending']);
         $filters = ['fields' => ['full_name' => ['operator' => 'equals', 'value' => 'Taylor Example']]];
-        $job = new BuildProspectList($key, 'lendingtower', 'actor', 'export', $filters, ['state', 'email', 'tu_blto02_v001name', 'debt'], '2026-11-24', 5, rowsPerFile: $rowsPerFile);
+        $columns = ['state', 'source', 'email', 'campaign_id', 'tu_blto02_v001name', 'debt', 'external_system_id', 'personal_loan_amount'];
+        $date = Carbon::parse('2026-11-24');
+        $plannedRows = $this->prospects->count($filters, $date);
+        $preview = (new ProspectExportInspector())->preview($this->prospects->preview($filters, $columns, $date, 2), $columns, 7, ['operator' => 'all'], $plannedRows);
+        expect($plannedRows)->toBe(5)
+            ->and($preview['examples'][0]['values'])->toBe(['CA', 'mailers', 'taylor@example.test', '', "'=1+1", '20000', '001234567890', '17000'])
+            ->and($this->connection->table('prospect_list_export_files')->count())->toBe(0);
+
+        $job = new BuildProspectList($key, 'lendingtower', 'actor', 'export', $filters, $columns, '2026-11-24', 5, rowsPerFile: $rowsPerFile);
         $job->handle($this->prospects);
 
         $run = $cache->get($key);
-        $headers = ['State', 'Email', 'BLTO02 V001 Name (BC102S)', 'Debt'];
+        $headers = ['State', 'source', 'Email', 'campaign_id', 'BLTO02 V001 Name (BC102S)', 'Debt', 'external_system_id', 'personal_loan_amount'];
         $rows = [];
+        $campaignIds = [];
         foreach ($partSizes as $index => $size) {
             $path = ProspectListRuns::artifact($key, $rowsPerFile === null ? null : $index + 1);
             expect($parts[$path][0])->toBe($headers)->and(count($parts[$path]) - 1)->toBe($size);
-            array_push($rows, ...array_slice($parts[$path], 1));
+            $fileRows = array_slice($parts[$path], 1);
+            $id = ProspectListExportFiles::find($key, $index + 1);
+            expect($id)->toMatch('/\A[0-9]+\z/')->and(array_unique(array_column($fileRows, 3)))->toBe([$id]);
+            $campaignIds[] = $id;
+            array_push($rows, ...$fileRows);
         }
-        expect($rows[0][2])->toBe("'=1+1")
+        expect(array_unique($campaignIds))->toBe($campaignIds)
+            ->and($rows[0][4])->toBe("'=1+1")
+            ->and(array_column($rows, 1))->toBe(array_fill(0, 5, 'mailers'))
+            ->and(array_column($rows, 6))->toBe(['001234567890', '', '', '1234567890', ''])
+            ->and(array_column($rows, 7))->toBe(['17000', '17000', '17000', '', '17000'])
+            ->and($this->connection->table('TblProspects')->where('PK', 1)->value('Latest_Export_Date'))->toBeNull()
             ->and($run['count'])->toBe(count($rows))
             ->and($run['file_count'])->toBe(count($partSizes))
             ->and($run['rows_per_file'])->toBe($rowsPerFile)
             ->and($run['export_summary'])->toBe([
                 'fields' => [
                     ['id' => 'state', 'label' => 'State', 'present' => 4],
+                    ['id' => 'source', 'label' => 'source', 'present' => 5],
                     ['id' => 'email', 'label' => 'Email', 'present' => 4],
+                    ['id' => 'campaign_id', 'label' => 'campaign_id', 'present' => 5],
                     ['id' => 'tu_blto02_v001name', 'label' => 'BLTO02 V001 Name (BC102S)', 'present' => 4],
                     ['id' => 'debt', 'label' => 'Debt', 'present' => 5],
+                    ['id' => 'external_system_id', 'label' => 'external_system_id', 'present' => 2],
+                    ['id' => 'personal_loan_amount', 'label' => 'personal_loan_amount', 'present' => 4],
                 ],
                 'states' => ['CA' => 4, 'Blank' => 1],
+                'missing_mailer_id' => 3,
             ]);
     } finally {
         foreach (['cache', 'filesystem', 'log'] as $accessor) {
@@ -314,6 +395,18 @@ test('CSV parts stream three million rows with one million rows in each file', f
         Mockery::close();
     }
 });
+
+test('personal loan amount rounds positive raw TU debt up by exactly one thousand-dollar increment', function (mixed $debt, ?string $amount): void {
+    expect(ProspectListFields::csvCell((object) ['personal_loan_amount' => $debt], 'personal_loan_amount', 'number'))->toBe($amount);
+})->with([
+    'below the boundary' => ['999.99', '1000'],
+    'exact boundary' => ['1000.00', '1000'],
+    'one cent above boundary' => ['1000.01', '2000'],
+    'large exact decimal' => ['9007199254740000.01', '9007199254741000'],
+    'missing' => [null, null],
+    'zero debt' => ['0.00', null],
+    'negative debt' => ['-0.01', null],
+]);
 
 test('a failed part upload discards only files belonging to that export', function (): void {
     $key = ProspectListRuns::key('lendingtower', 'actor', 'failed-export');
@@ -622,7 +715,10 @@ test('count progress advances only after the corresponding work and keeps failed
 test('workbook fields share the exported column definitions and their raw identifiers stay allowlisted', function (): void {
     $catalog = array_column(ProspectListFields::catalog()['columns'], null, 'id');
 
-    expect($catalog)->toHaveCount(211)
+    expect($catalog)->toHaveCount(215)
+        ->and($catalog['source']['csv_header'])->toBe('source')
+        ->and($catalog['personal_loan_amount']['type'])->toBe('number')
+        ->and($catalog['campaign_id']['export_only'])->toBeTrue()
         ->and($catalog['score']['description'])->toBe('VantageScore 4.0')
         ->and($catalog['tu_blto02_v001val']['column'])->toBe('t.blto02_v001val')
         ->and($catalog['tu_blto02_v001val']['description'])->toBe('Value of BC102S')

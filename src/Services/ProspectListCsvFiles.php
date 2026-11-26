@@ -27,7 +27,7 @@ final class ProspectListCsvFiles
         private array $headers,
         private ?int $rowsPerFile,
         private ?string $mailerId = null,
-        private bool $campaignFormat = false,
+        private ?int $campaignColumnIndex = null,
     ) {}
 
     public function write(array $row): void
@@ -35,8 +35,8 @@ final class ProspectListCsvFiles
         if ($this->stream === null) {
             $this->open();
         }
-        if ($this->campaignFormat) {
-            $row[0] = $this->campaignId;
+        if ($this->campaignColumnIndex !== null) {
+            $row[$this->campaignColumnIndex] = $this->campaignId;
         }
         if (fputcsv($this->stream, $row, escape: '') === false) {
             throw new RuntimeException('Unable to write the prospect list.');

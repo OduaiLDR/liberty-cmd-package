@@ -76,6 +76,9 @@ final class BuildProspectList implements ShouldQueue
                 $result = $store->lock('prospect-list:shared-export', $this->timeout + 60)
                     ->block(15, fn (): array => $this->export($prospects, $asOf, true, $run['campaign'] ?? null));
             } else {
+                if (! empty($this->filters['fresh_mailed'])) {
+                    throw new RuntimeException('Newest mailed exports require export history.');
+                }
                 $result = $this->export($prospects, $asOf, false, $run['campaign'] ?? null);
             }
 
@@ -99,11 +102,12 @@ final class BuildProspectList implements ShouldQueue
         $count = 0;
         $invalidMobile = 0;
         $definitions = ProspectListFields::columns();
-        $headers = $campaign === null ? array_map(static fn (string $field): string => $definitions[$field][0], $columns) : $columns;
+        $headers = $campaign === null ? array_map(ProspectListFields::csvHeader(...), $columns) : $columns;
+        $campaignIndex = array_search('campaign_id', $columns, true);
         $rowsPerFile = $this->rowsPerFile ?? null;
         $files = new ProspectListCsvFiles(
             Storage::disk(config('prospect-list-builder.disk')), $this->key, $headers, $rowsPerFile,
-            mailerId: $campaign['mailer_id'] ?? null, campaignFormat: $campaign !== null,
+            mailerId: $campaign['mailer_id'] ?? null, campaignColumnIndex: $campaignIndex === false ? null : $campaignIndex,
         );
         $useExistingMailerIds = $campaign !== null && ! isset($campaign['mailer_id']);
         $present = array_fill_keys($columns, 0);
@@ -176,7 +180,7 @@ final class BuildProspectList implements ShouldQueue
             }
         }
 
-        if ($campaign !== null) {
+        if ($campaignIndex !== false) {
             $present['campaign_id'] = $count;
         }
         $summary = [
@@ -190,6 +194,8 @@ final class BuildProspectList implements ShouldQueue
         }
         if ($campaign !== null) {
             $summary['invalid_mobile'] = $invalidMobile;
+        }
+        if (isset($present['external_system_id'])) {
             $summary['missing_mailer_id'] = $count - $present['external_system_id'];
         }
 
