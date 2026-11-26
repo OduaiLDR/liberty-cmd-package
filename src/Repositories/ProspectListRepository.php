@@ -14,7 +14,9 @@ class ProspectListRepository extends SqlSrvRepository
 {
     public function count(array $filters, Carbon $asOf): int
     {
-        return $this->withQueryTimeout(240, fn (): int => $this->filtered($filters, $asOf)->count());
+        return $this->withQueryTimeout(240, fn (): int => $this->filtered(
+            $filters, $asOf, mailDateBuild: $this->mailDateBuild($filters, $asOf),
+        )->count());
     }
 
     public function eachBatch(array $filters, array $columns, Carbon $asOf, int $rowLimit, callable $consume): void
@@ -110,12 +112,17 @@ class ProspectListRepository extends SqlSrvRepository
             $needsTu = $needsTu || str_starts_with($source, 't.');
         }
 
-        $query = $this->filtered($filters, $asOf, $needsTu)->select($fields);
+        $mailDateBuild = $this->mailDateBuild($filters, $asOf);
+        $query = $this->filtered($filters, $asOf, $needsTu, $mailDateBuild)->select($fields);
         if (empty($filters['fresh_mailed'])) {
             return $query;
         }
 
-        $query->selectSub($this->mailingHistory($asOf)->selectRaw('MAX(d.Send_Date)'), 'mailed_on');
+        if ($mailDateBuild !== null) {
+            $query->addSelect('mail.Mailed_On as mailed_on');
+        } else {
+            $query->selectSub(ProspectMailDateIndex::history($this->connection(), $asOf)->selectRaw('MAX(d.Send_Date)'), 'mailed_on');
+        }
 
         return $this->connection()->query()->fromSub($query, 'ranked_prospects');
     }
@@ -182,12 +189,15 @@ class ProspectListRepository extends SqlSrvRepository
         });
     }
 
-    private function filtered(array $filters, Carbon $asOf, bool $needsTu = false): Builder
+    private function filtered(array $filters, Carbon $asOf, bool $needsTu = false, ?int $mailDateBuild = null): Builder
     {
         $query = $this->table('TblProspects', 'p');
 
         $this->applyEligibility($query, $filters, $needsTu);
-        $this->applyFilters($query, $filters, $asOf);
+        if ($mailDateBuild !== null) {
+            $this->joinMailDates($query, $mailDateBuild);
+        }
+        $this->applyFilters($query, $filters, $asOf, $mailDateBuild !== null);
 
         return $query;
     }
@@ -210,7 +220,7 @@ class ProspectListRepository extends SqlSrvRepository
         }
     }
 
-    private function applyFilters(Builder $query, array $filters, Carbon $asOf): void
+    private function applyFilters(Builder $query, array $filters, Carbon $asOf, bool $hasMailDates = false): void
     {
         if (! empty($filters['states'])) {
             $query->whereIn('p.State', $filters['states']);
@@ -244,8 +254,12 @@ class ProspectListRepository extends SqlSrvRepository
             }
         }
         if (! empty($filters['fresh_mailed'])) {
-            $query->whereNull('p.Latest_Export_Date')->whereNull('p.Last_SMS_Date')
-                ->whereExists($this->mailingHistory($asOf));
+            $query->whereNull('p.Latest_Export_Date')->whereNull('p.Last_SMS_Date');
+            if ($hasMailDates) {
+                $query->whereNotNull('mail.Mailed_On');
+            } else {
+                $query->whereExists(ProspectMailDateIndex::history($this->connection(), $asOf));
+            }
         } elseif (isset($filters['months_since_pull'])) {
             $cutoff = $asOf->copy()->subMonthsNoOverflow((int) $filters['months_since_pull'])->toDateString();
             foreach (['Latest_Export_Date', 'Last_SMS_Date'] as $column) {
@@ -267,16 +281,20 @@ class ProspectListRepository extends SqlSrvRepository
         }
     }
 
-    private function mailingHistory(Carbon $asOf): Builder
+    private function mailDateBuild(array $filters, Carbon $asOf): ?int
     {
-        return $this->table('TblMailers', 'm')
-            ->join('TblMarketing as d', 'd.Drop_Name', '=', 'm.Drop_Name')
-            ->whereColumn('m.Client', 'p.Client')
-            ->whereColumn('m.Address', 'p.Address')
-            ->where('m.Client', '<>', '')
-            ->where('m.Address', '<>', '')
-            ->whereRaw('m.SMS_Zip5 = SUBSTRING(p.Zip, 1, 5)')
-            ->where('d.Send_Date', '<=', $asOf->toDateString());
+        if (empty($filters['fresh_mailed']) || ! config('prospect-list-builder.indexed_mail_dates')) {
+            return null;
+        }
+
+        return (new ProspectMailDateIndex($this->connection()))->publishedBuild($asOf);
+    }
+
+    private function joinMailDates(Builder $query, int $buildId, string $type = 'inner'): void
+    {
+        $query->join('TblProspectMailDates as mail', static function (JoinClause $join) use ($buildId): void {
+            $join->on('mail.Prospect_PK', '=', 'p.PK')->where('mail.Build_ID', $buildId);
+        }, null, null, $type);
     }
 
     /** @param array{string, string, string|null, string, string|null} $definition */
@@ -300,8 +318,12 @@ class ProspectListRepository extends SqlSrvRepository
         $query = $this->connection()->query()->fromSub($sample, 'p')->select('p.State')
             ->selectRaw('COUNT(*) as sample_size')->groupBy('p.State');
         $this->applyEligibility($query, $filters);
+        $mailDateBuild = $this->mailDateBuild($filters, $asOf);
+        if ($mailDateBuild !== null) {
+            $this->joinMailDates($query, $mailDateBuild, 'left');
+        }
         $combinedCriteria = $query->newQuery();
-        $this->applyFilters($combinedCriteria, $filters, $asOf);
+        $this->applyFilters($combinedCriteria, $filters, $asOf, $mailDateBuild !== null);
         $combinedCondition = substr($combinedCriteria->getGrammar()->compileWheres($combinedCriteria), strlen('where '));
         $query->selectRaw($combinedCondition === '' ? 'COUNT(*) as records' : "COUNT(CASE WHEN $combinedCondition THEN 1 END) as records",
             $combinedCriteria->getBindings());
@@ -320,7 +342,7 @@ class ProspectListRepository extends SqlSrvRepository
         $active = [];
         foreach ($selections as $group => $selection) {
             $criterion = $query->newQuery();
-            $this->applyFilters($criterion, $selection, $asOf);
+            $this->applyFilters($criterion, $selection, $asOf, $mailDateBuild !== null);
             $condition = substr($criterion->getGrammar()->compileWheres($criterion), strlen('where '));
             $query->selectRaw("COUNT(CASE WHEN $condition THEN 1 END) as [{$group}_matching]", $criterion->getBindings());
 
