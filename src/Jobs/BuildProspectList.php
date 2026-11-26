@@ -76,6 +76,9 @@ final class BuildProspectList implements ShouldQueue
                 $result = $store->lock('prospect-list:shared-export', $this->timeout + 60)
                     ->block(15, fn (): array => $this->export($prospects, $asOf, true, $run['campaign'] ?? null));
             } else {
+                if (! empty($this->filters['fresh_mailed'])) {
+                    throw new RuntimeException('Newest mailed exports require export history.');
+                }
                 $result = $this->export($prospects, $asOf, false, $run['campaign'] ?? null);
             }
 

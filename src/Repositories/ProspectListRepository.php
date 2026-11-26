@@ -21,16 +21,16 @@ class ProspectListRepository extends SqlSrvRepository
     {
         $this->withQueryTimeout(240, function () use ($filters, $columns, $asOf, $rowLimit, $consume): void {
             $query = $this->exportQuery($filters, $columns, $asOf);
-            $lastId = null;
+            $lastRow = null;
             while ($rowLimit > 0) {
                 $pageSize = min(2000, $rowLimit);
-                $page = (clone $query)->forPageAfterId($pageSize, $lastId, 'p.PK');
+                $page = $this->orderedExportPage(clone $query, $filters, $pageSize, $lastRow);
                 $rows = $this->readExportPage($page, $filters, $columns);
                 if ($rows->isEmpty() || $consume($rows) === false || $rows->count() < $pageSize) {
                     return;
                 }
 
-                $lastId = $rows->last()->prospect_id;
+                $lastRow = $rows->last();
                 $rowLimit -= $rows->count();
             }
         });
@@ -39,7 +39,7 @@ class ProspectListRepository extends SqlSrvRepository
     public function preview(array $filters, array $columns, Carbon $asOf, int $rowLimit): Collection
     {
         return $this->withQueryTimeout(8, fn (): Collection => $this->readExportPage(
-            $this->exportQuery($filters, $columns, $asOf)->orderBy('p.PK')->limit($rowLimit),
+            $this->orderedExportPage($this->exportQuery($filters, $columns, $asOf), $filters, $rowLimit),
             $filters,
             $columns,
         ));
@@ -110,7 +110,31 @@ class ProspectListRepository extends SqlSrvRepository
             $needsTu = $needsTu || str_starts_with($source, 't.');
         }
 
-        return $this->filtered($filters, $asOf, $needsTu)->select($fields);
+        $query = $this->filtered($filters, $asOf, $needsTu)->select($fields);
+        if (empty($filters['fresh_mailed'])) {
+            return $query;
+        }
+
+        $query->selectSub($this->mailingHistory($asOf)->selectRaw('MAX(d.Send_Date)'), 'mailed_on');
+
+        return $this->connection()->query()->fromSub($query, 'ranked_prospects');
+    }
+
+    private function orderedExportPage(Builder $query, array $filters, int $pageSize, ?object $lastRow = null): Builder
+    {
+        if (empty($filters['fresh_mailed'])) {
+            return $query->forPageAfterId($pageSize, $lastRow?->prospect_id, 'p.PK');
+        }
+
+        if ($lastRow !== null) {
+            $query->where(fn (Builder $nextPage) => $nextPage
+                ->where('mailed_on', '<', $lastRow->mailed_on)
+                ->orWhere(fn (Builder $sameDate) => $sameDate
+                    ->where('mailed_on', $lastRow->mailed_on)
+                    ->where('prospect_id', '>', $lastRow->prospect_id)));
+        }
+
+        return $query->orderByDesc('mailed_on')->orderBy('prospect_id')->limit($pageSize);
     }
 
     private function readExportPage(Builder $query, array $filters, array $columns): Collection
@@ -219,7 +243,10 @@ class ProspectListRepository extends SqlSrvRepository
                 $query->whereNotNull('p.Email')->where('p.Email', '<>', '');
             }
         }
-        if (isset($filters['months_since_pull'])) {
+        if (! empty($filters['fresh_mailed'])) {
+            $query->whereNull('p.Latest_Export_Date')->whereNull('p.Last_SMS_Date')
+                ->whereExists($this->mailingHistory($asOf));
+        } elseif (isset($filters['months_since_pull'])) {
             $cutoff = $asOf->copy()->subMonthsNoOverflow((int) $filters['months_since_pull'])->toDateString();
             foreach (['Latest_Export_Date', 'Last_SMS_Date'] as $column) {
                 $query->where(fn (Builder $dates) => $dates->whereNull("p.$column")->orWhere("p.$column", '<', $cutoff));
@@ -240,6 +267,18 @@ class ProspectListRepository extends SqlSrvRepository
         }
     }
 
+    private function mailingHistory(Carbon $asOf): Builder
+    {
+        return $this->table('TblMailers', 'm')
+            ->join('TblMarketing as d', 'd.Drop_Name', '=', 'm.Drop_Name')
+            ->whereColumn('m.Client', 'p.Client')
+            ->whereColumn('m.Address', 'p.Address')
+            ->where('m.Client', '<>', '')
+            ->where('m.Address', '<>', '')
+            ->whereRaw('m.SMS_Zip5 = SUBSTRING(p.Zip, 1, 5)')
+            ->where('d.Send_Date', '<=', $asOf->toDateString());
+    }
+
     /** @param array{string, string, string|null, string, string|null} $definition */
     private function missingCondition(Builder $query, array $definition): string
     {
@@ -254,7 +293,8 @@ class ProspectListRepository extends SqlSrvRepository
         $groups = [
             'states' => ['states'], 'debt' => ['debt_min', 'debt_max'], 'score' => ['score_min', 'score_max'],
             'age' => ['age_min', 'age_max'], 'date_added' => ['date_from', 'date_to'],
-            'contact' => ['contact'], 'last_pull' => ['months_since_pull'],
+            'contact' => ['contact'], 'last_pull' => empty($filters['fresh_mailed']) ? ['months_since_pull'] : [],
+            'fresh_mailed' => ['fresh_mailed'],
         ];
         $sample = $this->table('TblProspects')->orderByDesc('PK')->limit(2500);
         $query = $this->connection()->query()->fromSub($sample, 'p')->select('p.State')
@@ -269,7 +309,7 @@ class ProspectListRepository extends SqlSrvRepository
         $selections = [];
         foreach ($groups as $group => $keys) {
             $selection = array_intersect_key($filters, array_flip($keys));
-            if ($selection !== []) {
+            if ($selection !== [] && ($group !== 'fresh_mailed' || ! empty($selection['fresh_mailed']))) {
                 $selections[$group] = $selection;
             }
         }

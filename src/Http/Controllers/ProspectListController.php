@@ -35,6 +35,10 @@ final class ProspectListController
 
     public function export(ProspectListRequest $request): JsonResponse
     {
+        if ($request->boolean('filters.fresh_mailed') && ! config('prospect-list-builder.stamp_exports')) {
+            throw ValidationException::withMessages(['filters.fresh_mailed' => 'Enable export history on the runner to export newest mailed records.']);
+        }
+
         $count = $this->find($request, $request->validated('count_id'));
         abort_unless($count['kind'] === 'count' && $count['status'] === 'completed'
             && $count['count'] > 0
