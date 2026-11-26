@@ -22,10 +22,11 @@ final class ProspectListRequest extends FormRequest
 
             return $this->inspectionRules($columnDefinitions);
         }
+        $filterDefinitions = ProspectListFields::filterColumns();
         $rules = [
             'id' => ['required', 'uuid'],
             'filters' => ['present', 'array:states,debt_min,debt_max,score_min,score_max,age_min,age_max,date_from,date_to,contact,months_since_pull,include_opted_out,include_bad_phone,include_contacted,fields'],
-            'filters.fields' => ['sometimes', 'array:'.implode(',', array_keys($columnDefinitions))],
+            'filters.fields' => ['sometimes', 'array:'.implode(',', array_keys($filterDefinitions))],
             'filters.states' => ['sometimes', 'array', 'list', 'max:60'],
             'filters.states.*' => ['required', 'regex:/\A[A-Z]{2}\z/', 'distinct'],
             'filters.debt_min' => ['sometimes', 'numeric', 'between:0,100000000'],
@@ -59,7 +60,7 @@ final class ProspectListRequest extends FormRequest
             $rules['filters.date_to'][] = 'after_or_equal:filters.date_from';
         }
 
-        foreach (array_intersect_key($columnDefinitions, (array) $this->input('filters.fields', [])) as $id => $definition) {
+        foreach (array_intersect_key($filterDefinitions, (array) $this->input('filters.fields', [])) as $id => $definition) {
             $path = 'filters.fields.'.$id;
             $type = $definition[3];
             $operators = ['present', 'missing', $type === 'text' ? 'equals' : 'range'];

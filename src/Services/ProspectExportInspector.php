@@ -37,7 +37,7 @@ final class ProspectExportInspector
     public function preview(iterable $prospects, array $columns, int $position, array $filter, int $plannedRows): array
     {
         $definitions = ProspectListFields::columns();
-        $headers = array_map(static fn (string $field): string => $definitions[$field][0], $columns);
+        $headers = array_map(ProspectListFields::csvHeader(...), $columns);
         $rows = (static function () use ($prospects, $columns, $definitions): Generator {
             foreach ($prospects as $prospect) {
                 yield array_map(static fn (string $field): string => (string) ProspectListFields::csvCell($prospect, $field, $definitions[$field][3]), $columns);

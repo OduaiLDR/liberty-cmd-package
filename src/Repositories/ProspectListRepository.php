@@ -25,7 +25,7 @@ class ProspectListRepository extends SqlSrvRepository
             while ($rowLimit > 0) {
                 $pageSize = min(2000, $rowLimit);
                 $page = (clone $query)->forPageAfterId($pageSize, $lastId, 'p.PK');
-                $rows = $this->readExportPage($page, $filters);
+                $rows = $this->readExportPage($page, $filters, $columns);
                 if ($rows->isEmpty() || $consume($rows) === false || $rows->count() < $pageSize) {
                     return;
                 }
@@ -41,6 +41,7 @@ class ProspectListRepository extends SqlSrvRepository
         return $this->withQueryTimeout(8, fn (): Collection => $this->readExportPage(
             $this->exportQuery($filters, $columns, $asOf)->orderBy('p.PK')->limit($rowLimit),
             $filters,
+            $columns,
         ));
     }
 
@@ -96,7 +97,15 @@ class ProspectListRepository extends SqlSrvRepository
         $needsTu = false;
         $definitions = ProspectListFields::columns();
         foreach ($columns as $column) {
+            if ($column === 'personal_loan_amount') {
+                $fields[] = 'p.Current_Debt_Source as loan_source';
+                $fields[] = 'p.Current_Debt_Source_PK as loan_source_pk';
+                continue;
+            }
             $source = $definitions[$column][1];
+            if ($source === null) {
+                continue;
+            }
             $fields[] = "$source as $column";
             $needsTu = $needsTu || str_starts_with($source, 't.');
         }
@@ -104,17 +113,34 @@ class ProspectListRepository extends SqlSrvRepository
         return $this->filtered($filters, $asOf, $needsTu)->select($fields);
     }
 
-    private function readExportPage(Builder $query, array $filters): Collection
+    private function readExportPage(Builder $query, array $filters, array $columns): Collection
     {
         $database = $query->getConnection();
-        if ($database->getDriverName() !== 'sqlsrv' || ! isset($filters['date_from'])) {
-            return $query->get();
+        if ($database->getDriverName() === 'sqlsrv' && isset($filters['date_from'])) {
+            // A small TOP can select a PK scan through older rows before reaching a recent date range.
+            $sql = $query->toSql()." OPTION (USE HINT('DISABLE_OPTIMIZER_ROWGOAL'))";
+            $rows = new Collection($database->select($sql, $query->getBindings()));
+        } else {
+            $rows = $query->get();
         }
 
-        // A small TOP can select a PK scan through older rows before reaching a recent date range.
-        $sql = $query->toSql()." OPTION (USE HINT('DISABLE_OPTIMIZER_ROWGOAL'))";
+        if (in_array('external_system_id', $columns, true)) {
+            $mailerIds = $this->existingMailerIds($rows->pluck('prospect_id')->all());
+            foreach ($rows as $row) {
+                $row->external_system_id = isset($mailerIds[$row->prospect_id]) ? trim($mailerIds[$row->prospect_id]) : null;
+            }
+        }
+        if (in_array('personal_loan_amount', $columns, true)) {
+            // Resolve this projection after paging to avoid joining all qualifying prospects to TU.
+            $sourceKeys = $rows->where('loan_source', 'TblTUData')->pluck('loan_source_pk')->filter()->unique()->all();
+            $debtAmounts = $sourceKeys === [] ? [] : $this->table('TblTUData')->whereIntegerInRaw('PK', $sourceKeys)
+                ->pluck(ProspectListFields::TU_DEBT_COLUMN, 'PK')->all();
+            foreach ($rows as $row) {
+                $row->personal_loan_amount = $row->loan_source === 'TblTUData' ? ($debtAmounts[$row->loan_source_pk] ?? null) : null;
+            }
+        }
 
-        return new Collection($database->select($sql, $query->getBindings()));
+        return $rows;
     }
 
     /** Call after the private artifact is written and while holding the runner's prospect export lock. */
@@ -144,7 +170,7 @@ class ProspectListRepository extends SqlSrvRepository
 
     private function applyEligibility(Builder $query, array $filters, bool $needsTu = false): void
     {
-        foreach (array_intersect_key(ProspectListFields::columns(), $filters['fields'] ?? []) as $definition) {
+        foreach (array_intersect_key(ProspectListFields::filterColumns(), $filters['fields'] ?? []) as $definition) {
             $needsTu = $needsTu || str_starts_with($definition[1], 't.');
         }
         if ($needsTu || array_intersect(['age_min', 'age_max', 'score_min', 'score_max'], array_keys($filters)) !== []) {
@@ -200,7 +226,7 @@ class ProspectListRepository extends SqlSrvRepository
             }
         }
 
-        $definitions = ProspectListFields::columns();
+        $definitions = ProspectListFields::filterColumns();
         foreach ($filters['fields'] ?? [] as $id => $selection) {
             [, $column] = $definitions[$id];
             match ($selection['operator']) {
@@ -272,7 +298,7 @@ class ProspectListRepository extends SqlSrvRepository
             $label = null;
             if (isset($selection['fields'])) {
                 $id = array_key_first($selection['fields']);
-                $definition = ProspectListFields::columns()[$id];
+                $definition = ProspectListFields::filterColumns()[$id];
                 $operator = $selection['fields'][$id]['operator'];
                 $label = $definition[0].match ($operator) {
                     'present' => ' · has data', 'missing' => ' · is missing', 'range' => ' · in range', 'equals' => ' · exact value',

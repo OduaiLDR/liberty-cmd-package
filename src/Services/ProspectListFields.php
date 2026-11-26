@@ -4,8 +4,20 @@ declare(strict_types=1);
 
 namespace Cmd\Reports\Services;
 
+use Brick\Math\BigDecimal;
+use Brick\Math\RoundingMode;
+
 final class ProspectListFields
 {
+    public const TU_DEBT_COLUMN = 'derivedFields1_unsecdebtbalance';
+
+    private const EXPORT_COLUMNS = [
+        'source' => ['Source', null, null, 'text', null],
+        'external_system_id' => ['External ID', null, null, 'text', null],
+        'campaign_id' => ['Campaign', null, null, 'text', null],
+        'personal_loan_amount' => ['Personal Loan Amount', 't.'.self::TU_DEBT_COLUMN, null, 'number', null],
+    ];
+
     /** @var array<string, array{string, string, string|null, string, string|null}> */
     private const COLUMNS = [
         'first_name' => ['First Name', 't.ncoaAddr_frstNme', 'NCOA_ADDR / FirstName', 'text', null],
@@ -25,7 +37,7 @@ final class ProspectListFields
         'utilization' => ['Unsecured Utilization', 't.derivedFields_UnsecUtilization', 'Derived_Fields_1 / UnsecDebtUtilization', 'number', null],
     ];
 
-    /** @return array<string, array{string, string, string|null, string, string|null}> */
+    /** @return array<string, array{string, string|null, string|null, string, string|null}> */
     public static function columns(): array
     {
         static $columns;
@@ -41,7 +53,17 @@ final class ProspectListFields
             }
         }
 
-        return $columns;
+        return $columns += self::EXPORT_COLUMNS;
+    }
+
+    public static function filterColumns(): array
+    {
+        return array_diff_key(self::columns(), self::EXPORT_COLUMNS);
+    }
+
+    public static function csvHeader(string $field): string
+    {
+        return isset(self::EXPORT_COLUMNS[$field]) ? $field : self::columns()[$field][0];
     }
 
     /** @return array<string, array{string, string, string, string, string}> */
@@ -63,7 +85,18 @@ final class ProspectListFields
 
     public static function csvCell(object $row, string $field, string $type): mixed
     {
+        if ($field === 'source') {
+            return 'mailers';
+        }
+        if ($field === 'campaign_id') {
+            return null;
+        }
         $value = $row->{$field};
+        if ($field === 'personal_loan_amount') {
+            $debt = is_numeric($value) ? BigDecimal::of((string) $value) : null;
+
+            return $debt?->isPositive() ? (string) $debt->dividedBy(1000, 0, RoundingMode::Ceiling)->multipliedBy(1000) : null;
+        }
         if (in_array($field, ['first_name', 'last_name'], true) && trim((string) $value) === '') {
             $names = preg_split('/\s+/', trim((string) $row->name_fallback), 2);
             $value = $names[$field === 'first_name' ? 0 : 1] ?? '';
@@ -99,6 +132,14 @@ final class ProspectListFields
         $columns = [];
         $tuFields = self::tuFields();
         foreach (self::columns() as $id => [$label, $column, $tuName, $type, $filter]) {
+            if (isset(self::EXPORT_COLUMNS[$id])) {
+                $columns[] = [
+                    'id' => $id, 'label' => $label, 'column' => $column ?? $id, 'tuName' => null, 'type' => $type,
+                    'filter' => null, 'group' => 'Campaign details', 'description' => null,
+                    'csv_header' => $id, 'export_only' => true,
+                ];
+                continue;
+            }
             $tuField = str_starts_with($column, 't.') ? $tuFields[substr($column, 2)] ?? null : null;
             $group = $tuField[1] ?? 'Prospect details';
             $description = $tuField[3] ?? null;
