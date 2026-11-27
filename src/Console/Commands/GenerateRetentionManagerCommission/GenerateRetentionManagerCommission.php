@@ -12,6 +12,7 @@ use Cmd\Reports\Services\NsfStructuredTeamLeader;
 use Cmd\Reports\Services\PayrollReportArtifactArchive;
 use Cmd\Reports\Services\RetentionCommissionReportBuilder;
 use Cmd\Reports\Services\RetentionStructuredCapture;
+use Cmd\Reports\Services\RetentionLeadershipRules;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
 use PhpOffice\PhpSpreadsheet\IOFactory;
@@ -65,13 +66,13 @@ class GenerateRetentionManagerCommission extends Command
             'version' => 'nsf_team_leader_v1', 'actionRatioThresholds' => [0.40, 0.55],
             'clearThresholds' => [200, 300, 500],
             'rates' => [[0.0, 0.07, 0.40], [0.0, 0.10, 0.50], [0.0, 0.30, 0.70]],
-        ]];
+        ], 'retention' => RetentionLeadershipRules::V1];
     }
 
     public static function validatePayrollCalculationContext(array $context): array
     {
         $expected = ['version', 'nsfTeamLeader'];
-        if (array_diff(array_keys($context), $expected) || array_diff($expected, array_keys($context))
+        if (array_diff(array_keys($context), [...$expected, 'retention']) || array_diff($expected, array_keys($context))
             || $context['version'] !== 'cs_leadership_rules_v1' || !is_array($context['nsfTeamLeader'])) {
             throw new \InvalidArgumentException('Frozen leadership calculation context is invalid.');
         }
@@ -95,6 +96,12 @@ class GenerateRetentionManagerCommission extends Command
         foreach ($rules['rates'] as $row) {
             if (!is_array($row) || !array_is_list($row) || count($row) !== 3) throw new \InvalidArgumentException('Frozen NSF leadership rates are invalid.');
             foreach ($row as $rate) if ((!is_int($rate) && !is_float($rate)) || !is_finite((float) $rate) || $rate < 0) throw new \InvalidArgumentException('Frozen NSF leadership rates are invalid.');
+        }
+        if (array_key_exists('retention', $context)) {
+            if (!is_array($context['retention'])) {
+                throw new \InvalidArgumentException('Frozen Retention leadership rules are invalid.');
+            }
+            RetentionLeadershipRules::validate($context['retention']);
         }
         return $context;
     }
@@ -179,6 +186,16 @@ class GenerateRetentionManagerCommission extends Command
         $this->payrollFrozenNsfValidity = true;
         $this->payrollCalculationContext = $calculationContext;
         try {
+            // Older bundles captured the NSF rate table and kept the Retention cap in the saved report.
+            if ($savedReport !== null && $keys === ['retention_team_leader'] && !isset($calculationContext['retention'])) {
+                $savedCap = $savedReport['summary']['commissionCap'] ?? null;
+                if (is_int($savedCap) || is_float($savedCap)) {
+                    $legacyRules = RetentionLeadershipRules::V1;
+                    $legacyRules['teamLeaderCap'] = $savedCap;
+                    RetentionLeadershipRules::validate($legacyRules);
+                    $this->payrollCalculationContext['retention'] = $legacyRules;
+                }
+            }
             $reports = $files = [];
             foreach ($keys as $key) {
                 $report = match ($key) {
@@ -715,7 +732,7 @@ class GenerateRetentionManagerCommission extends Command
                 'commissionRateDisplay' => $tier > 0 ? '$' . number_format($this->nickRateForTier($tier, 0), 2) . '+ per retained account' : '$0.00',
                 'uncappedCommission' => round($uncappedCommission, 2),
                 'capReduction' => $capReduction,
-                'commissionCap' => self::NICK_COMMISSION_CAP,
+                'commissionCap' => (float) $this->retentionRules()['teamLeaderCap'],
                 'totalCommission' => round($commission, 2),
                 'totalPay' => round($commission, 2),
             ],
@@ -920,15 +937,6 @@ class GenerateRetentionManagerCommission extends Command
         ['max' => 100000,      't1' => 20, 't2' => 40, 't3' => 60, 't4' => 100],
         ['max' => PHP_INT_MAX, 't1' => 20, 't2' => 40, 't3' => 60, 't4' => 150],
     ];
-
-    private const NICK_RATE_BANDS = [
-        ['min' => 0.50, 'rates' => [8.0, 9.0, 10.0, 11.0]],
-        ['min' => 0.40, 'rates' => [4.0, 5.0, 6.0, 7.0]],
-        ['min' => 0.30, 'rates' => [0.9, 1.0, 2.0, 3.0]],
-    ];
-
-    /** Nick - Retention Team Leader total commission cap (Jacob 2026-08-06). */
-    private const NICK_COMMISSION_CAP = 2000.0;
 
     /** @var array<string,string> */
     /**
@@ -2276,23 +2284,11 @@ class GenerateRetentionManagerCommission extends Command
 
     private function ramaCommission(float $pct, bool $ngf): int
     {
-        if ($ngf) {
-            return match (true) {
-                $pct < 0.40 => 0,
-                $pct < 0.45 => 250,
-                $pct < 0.50 => 500,
-                $pct < 0.60 => 750,
-                default => 1000,
-            };
-        }
-
-        return match (true) {
-            $pct < 0.30 => 0,
-            $pct < 0.35 => 250,
-            $pct < 0.40 => 500,
-            $pct < 0.45 => 750,
-            default => 1000,
-        };
+        $rules = $this->retentionRules();
+        $thresholds = $ngf ? $rules['bonusThresholds'] : $rules['managerThresholds'];
+        $amounts = $ngf ? $rules['bonusAmounts'] : $rules['managerAmounts'];
+        $tier = count(array_filter($thresholds, static fn ($threshold) => $pct >= $threshold));
+        return $amounts[$tier];
     }
 
     /** @return array{assigned:int,retained:int,pct:float,tier:int,commission:float} */
@@ -2336,40 +2332,18 @@ class GenerateRetentionManagerCommission extends Command
 
     private function nickTier(float $pct): int
     {
-        return match (true) {
-            $pct >= 0.50 => 3,
-            $pct >= 0.40 => 2,
-            $pct >= 0.30 => 1,
-            default => 0,
-        };
+        return count(array_filter($this->retentionRules()['teamLeaderThresholds'], static fn ($threshold) => $pct >= $threshold));
     }
 
     private function nickCommissionRate(float $debt, float $pct): float
     {
-        $bracket = match (true) {
-            $debt <= 15000 => 0,
-            $debt <= 30000 => 1,
-            $debt <= 60000 => 2,
-            default => 3,
-        };
-
-        foreach (self::NICK_RATE_BANDS as $band) {
-            if ($pct >= $band['min']) {
-                return $band['rates'][$bracket];
-            }
-        }
-
-        return 0.0;
+        $bracket = count(array_filter($this->retentionRules()['teamLeaderDebtCeilings'], static fn ($ceiling) => $debt > $ceiling));
+        return $this->nickRateForTier($this->nickTier($pct), $bracket);
     }
 
     private function nickRateForTier(int $tier, int $bracket): float
     {
-        return match ($tier) {
-            3 => [8.0, 9.0, 10.0, 11.0][$bracket],
-            2 => [4.0, 5.0, 6.0, 7.0][$bracket],
-            1 => [0.9, 1.0, 2.0, 3.0][$bracket],
-            default => 0.0,
-        };
+        return $this->retentionRules()['teamLeaderRates'][$tier - 1][$bracket] ?? 0.0;
     }
 
     private function overallPct(array $rows): float
@@ -2582,7 +2556,12 @@ class GenerateRetentionManagerCommission extends Command
 
     private function capNickCommission(float $commission): float
     {
-        return min($commission, self::NICK_COMMISSION_CAP);
+        return min($commission, $this->retentionRules()['teamLeaderCap']);
+    }
+
+    private function retentionRules(): array
+    {
+        return $this->payrollCalculationContext['retention'] ?? RetentionLeadershipRules::V1;
     }
 
     private function highlightFinalCommissionCell(\PhpOffice\PhpSpreadsheet\Worksheet\Worksheet $sheet, string $cell): void

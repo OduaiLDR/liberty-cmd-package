@@ -161,6 +161,76 @@ class PayrollLeadershipWorkbookBundleTest extends TestCase
         $this->assertDirectoryDoesNotExist($this->directory . '/output');
     }
 
+    public function test_first_retention_download_uses_the_saved_pay_rules_in_both_sheets(): void
+    {
+        $leader = $this->command();
+        $start = '2098-09-01';
+        $end = '2098-09-30';
+        $sources = $this->sources();
+        $current = $leader->freezePayrollReviewLeadership($start, $end, $sources);
+        $rules = $current['calculationContext'];
+        $rules['retention']['managerAmounts'][4] = 1250;
+        $rules['retention']['bonusAmounts'][4] = 600;
+        $rules['retention']['teamLeaderRates'][2][0] = 14.0;
+        $rules['retention']['teamLeaderCap'] = 10.0;
+        $saved = $leader->freezePayrollReviewLeadership($start, $end, $sources, $rules);
+        $saved = json_decode(json_encode($saved, JSON_THROW_ON_ERROR), true, flags: JSON_THROW_ON_ERROR);
+        $this->assertSame(8.0, $current['reports']['retention_team_leader']['summary']['totalPay']);
+        $this->assertSame(10, $saved['reports']['retention_team_leader']['summary']['totalPay']);
+        $this->assertSame(1850, $saved['reports']['retention_manager']['summary']['totalPay']);
+        $this->assertSame([], glob($this->directory . '/*/*.xlsx'));
+
+        $export = $leader->renderFrozenPayrollReviewLeadershipWorkbook('retention_team_leader', $start, $end, $sources,
+            $this->directory . '/first-nick', $saved['calculationContext'], $saved['reports']['retention_team_leader']);
+        $book = IOFactory::load($export['path']);
+        try {
+            $this->assertEquals(10, $book->getSheetByName('Commission Summary')->getCell('B8')->getValue());
+            $this->assertEquals(14, $book->getSheetByName('Commission Summary')->getCell('D3')->getValue());
+            $this->assertEquals(14, $book->getSheetByName('Retention Data')->getCell('P2')->getValue());
+            $this->assertEquals(14, $book->getSheetByName('Retention Data')->getCell('Q2')->getValue());
+        } finally {
+            $book->disconnectWorksheets();
+        }
+        $export = $leader->renderFrozenPayrollReviewLeadershipWorkbook('customer_support_manager', $start, $end, $sources,
+            $this->directory . '/first-rama', $saved['calculationContext'], $saved['reports']['retention_manager']);
+        $book = IOFactory::load($export['path']);
+        try {
+            $this->assertEquals(1850, $book->getSheetByName('Commission Summary')->getCell('B15')->getValue());
+        } finally {
+            $book->disconnectWorksheets();
+        }
+
+        $corrupt = $saved['calculationContext'];
+        $corrupt['retention']['teamLeaderRates'][2][0] = 9.0;
+        $this->expectExceptionMessage('cannot reproduce the frozen leadership report');
+        $leader->renderFrozenPayrollReviewLeadershipWorkbook('retention_team_leader', $start, $end, $sources,
+            $this->directory . '/changed-rules', $corrupt, $saved['reports']['retention_team_leader']);
+    }
+
+    public function test_first_retention_download_supports_the_cap_in_an_older_saved_report(): void
+    {
+        $leader = $this->command();
+        $start = '2098-09-01';
+        $end = '2098-09-30';
+        $sources = $this->sources();
+        $context = GenerateRetentionManagerCommission::currentPayrollCalculationContext();
+        $context['retention']['teamLeaderCap'] = 1500;
+        $saved = $leader->freezePayrollReviewLeadership($start, $end, $sources, $context);
+        $savedReport = $saved['reports']['retention_team_leader'];
+        $this->assertSame(8.0, $savedReport['summary']['totalPay']);
+        $this->assertSame(1500.0, $savedReport['summary']['commissionCap']);
+        unset($context['retention']);
+
+        $file = $leader->renderFrozenPayrollReviewLeadershipWorkbook('retention_team_leader', $start, $end, $sources,
+            $this->directory . '/first-legacy', $context, $savedReport);
+        $book = IOFactory::load($file['path']);
+        try {
+            $this->assertEquals(8, $book->getSheetByName('Commission Summary')->getCell('B8')->getValue());
+        } finally {
+            $book->disconnectWorksheets();
+        }
+    }
+
     public function test_rama_refuses_an_incomplete_client_cutoff_snapshot_without_current_lookup(): void
     {
         $sources = $this->sources();
