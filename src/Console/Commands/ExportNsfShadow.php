@@ -13,7 +13,8 @@ use Symfony\Component\Console\Output\OutputInterface;
 
 final class ExportNsfShadow extends Command
 {
-    protected $signature = 'payroll:export-nsf-shadow {period} {runId}';
+    protected $signature = 'payroll:export-nsf-shadow {period} {runId}
+        {--with-invocation-proof : Include the invocation evidence required by the PHP Team Leader comparison reader}';
     protected $description = 'Export both verified NSF structured shadow captures for a payroll run';
 
     public function handle(PayrollReportArtifactArchive $archive): int
@@ -33,7 +34,7 @@ final class ExportNsfShadow extends Command
                 // Filesystem warnings can expose private archive paths.
                 $artifacts[$key] = @$archive->read($key, $period, $runId);
             }
-            $envelope = NsfStructuredCapture::export($artifacts, $period, $runId, true);
+            $envelope = NsfStructuredCapture::export($artifacts, $period, $runId, true, (bool) $this->option('with-invocation-proof'));
         } catch (\Throwable) {
             return self::FAILURE;
         }

@@ -211,7 +211,6 @@ class GenerateNSFCommissionReport extends Command
             $structuredCapture = $captureId !== null
                 ? NsfStructuredCapture::fromCalculation(
                     (string) getenv('PAYROLL_COMMISSION_RUN_ID'),
-                    $captureId,
                     $readiness,
                     $dataRows,
                     $pricedRows,
@@ -256,6 +255,7 @@ class GenerateNSFCommissionReport extends Command
                     PayrollCommissionResultSnapshot::NSF_ALL_PRICED_AGENTS)] + ($queryOnly ? ['queryOnly' => true] : []) : [];
             if ($structuredCapture !== null) {
                 $context['nsfStructuredCapture'] = $structuredCapture;
+                $context['nsfCaptureInvocationId'] = $captureId;
             }
             PayrollReportArtifactArchive::captureFromEnvironment('nsf', $source, $startDate, $allFile, $context);
             if (!$queryOnly) {
