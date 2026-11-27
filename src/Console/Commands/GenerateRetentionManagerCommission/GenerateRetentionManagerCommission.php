@@ -66,7 +66,7 @@ class GenerateRetentionManagerCommission extends Command
             'version' => 'nsf_team_leader_v1', 'actionRatioThresholds' => [0.40, 0.55],
             'clearThresholds' => [200, 300, 500],
             'rates' => [[0.0, 0.07, 0.40], [0.0, 0.10, 0.50], [0.0, 0.30, 0.70]],
-        ], 'retention' => RetentionLeadershipRules::V1];
+        ]];
     }
 
     public static function validatePayrollCalculationContext(array $context): array
@@ -130,6 +130,9 @@ class GenerateRetentionManagerCommission extends Command
     public function freezePayrollReviewLeadership(string $startDate, string $endDate, array $artifacts, ?array $calculationContext = null, bool $onlyNsf = false): array
     {
         $keys = $onlyNsf ? ['nsf_team_leader'] : PayrollReportArtifactArchive::LEADERSHIP_KEYS;
+        if ($calculationContext === null && !$onlyNsf) {
+            $calculationContext = self::currentPayrollCalculationContext() + ['retention' => RetentionLeadershipRules::V1];
+        }
         return $this->buildArchivedLeadership($startDate, $endDate, $artifacts, $keys, null, $calculationContext);
     }
 

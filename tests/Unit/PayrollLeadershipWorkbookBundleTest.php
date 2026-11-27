@@ -64,6 +64,7 @@ class PayrollLeadershipWorkbookBundleTest extends TestCase
         $command->setOutput(new OutputStyle(new ArrayInput([]), new BufferedOutput));
         $built = $command->buildPayrollReviewWorkbookBundle('2098-09-01', '2098-09-30', $this->sources(), $this->directory . '/output');
         $this->assertCount(3, $built['files']);
+        $this->assertSame(['version', 'nsfTeamLeader'], array_keys($built['calculationContext']));
         foreach (['retention_manager', 'retention_team_leader', 'nsf_team_leader'] as $kind) $this->assertSame($kind, $built['reports'][$kind]['reportKind']);
         $this->assertSame(2000.0, $built['reports']['retention_manager']['summary']['totalPay']);
         $this->assertSame(8.0, $built['reports']['retention_team_leader']['summary']['totalPay']);
@@ -112,7 +113,8 @@ class PayrollLeadershipWorkbookBundleTest extends TestCase
 
         $eager = $command->buildPayrollReviewWorkbookBundle($start, $end, $sources, $this->directory . '/eager');
         $this->assertSame($eager['reports'], $frozen['reports']);
-        $this->assertSame($eager['calculationContext'], $frozen['calculationContext']);
+        $this->assertSame($eager['calculationContext'], array_diff_key($frozen['calculationContext'], ['retention' => true]));
+        $this->assertArrayHasKey('retention', $frozen['calculationContext']);
         foreach (['customer_support_manager' => 'retention_manager', 'retention_team_leader' => 'retention_team_leader', 'nsf_team_leader' => 'nsf_team_leader'] as $key => $kind) {
             $prefix = $key === 'nsf_team_leader' ? 'nsf_' : 'retention_';
             $pair = array_filter($sources, static fn ($source) => str_starts_with($source, $prefix), ARRAY_FILTER_USE_KEY);
@@ -213,7 +215,7 @@ class PayrollLeadershipWorkbookBundleTest extends TestCase
         $start = '2098-09-01';
         $end = '2098-09-30';
         $sources = $this->sources();
-        $context = GenerateRetentionManagerCommission::currentPayrollCalculationContext();
+        $context = $leader->freezePayrollReviewLeadership($start, $end, $sources)['calculationContext'];
         $context['retention']['teamLeaderCap'] = 1500;
         $saved = $leader->freezePayrollReviewLeadership($start, $end, $sources, $context);
         $savedReport = $saved['reports']['retention_team_leader'];
@@ -229,6 +231,19 @@ class PayrollLeadershipWorkbookBundleTest extends TestCase
         } finally {
             $book->disconnectWorksheets();
         }
+    }
+
+    public function test_eager_bundle_preserves_explicitly_supplied_retention_rules(): void
+    {
+        $leader = $this->command();
+        $start = '2098-09-01';
+        $end = '2098-09-30';
+        $sources = $this->sources();
+        $rules = $leader->freezePayrollReviewLeadership($start, $end, $sources)['calculationContext'];
+        $rules['retention']['teamLeaderCap'] = 4.0;
+        $eager = $leader->buildPayrollReviewWorkbookBundle($start, $end, $sources, $this->directory . '/explicit', $rules);
+        $this->assertSame($rules, $eager['calculationContext']);
+        $this->assertSame(4.0, $eager['reports']['retention_team_leader']['summary']['totalPay']);
     }
 
     public function test_rama_refuses_an_incomplete_client_cutoff_snapshot_without_current_lookup(): void
