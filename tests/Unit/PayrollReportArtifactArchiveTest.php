@@ -57,9 +57,15 @@ class PayrollReportArtifactArchiveTest extends TestCase
         putenv('PAYROLL_CAPTURE_CUSTOMER_SERVICE_CONTEXT=1');
         putenv('PAYROLL_COMMISSION_RUN_ID=' . str_repeat('a', 32));
         $this->assertTrue(PayrollReportArtifactArchive::captureRequested());
-        putenv('PAYROLL_COMMISSION_RUN_ID=unreserved');
-        $this->expectException(\InvalidArgumentException::class);
-        PayrollReportArtifactArchive::captureRequested();
+        foreach (['unreserved', str_repeat('a', 32) . "\n"] as $identity) {
+            putenv('PAYROLL_COMMISSION_RUN_ID=' . $identity);
+            try {
+                PayrollReportArtifactArchive::captureRequested();
+                $this->fail('The capture accepted an invalid run identity.');
+            } catch (\InvalidArgumentException $error) {
+                $this->assertStringContainsString('reserved commission run id', $error->getMessage());
+            }
+        }
     }
     public function test_explicit_customer_service_capture_preserves_actual_workbook_and_context(): void
     {
@@ -100,6 +106,31 @@ class PayrollReportArtifactArchiveTest extends TestCase
         $this->assertSame('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', $saved['contentType']);
         $this->assertSame($file['filename'], $saved['fileName']);
     }
+
+    public function test_leadership_retry_reuses_workbook_with_json_equivalent_context(): void
+    {
+        $archive = new PayrollReportArtifactArchive($this->directory . '/leadership');
+        $bundleId = str_repeat('b', 64);
+        $file = $this->workbook();
+        $context = ['summary' => ['totalPay' => 0.0, 'rate' => 0.35], 'lines' => [5.0, 0]];
+        $first = $archive->materializeLeadership('nsf_team_leader', '2098-09-01', $bundleId, $context, static fn () => $file);
+        $unexpectedRender = static fn () => self::fail('An existing workbook must never be rendered again.');
+        $again = $archive->materializeLeadership('nsf_team_leader', '2098-09-01', $bundleId, $context, $unexpectedRender);
+        $this->assertSame($first, $again);
+        $reordered = ['lines' => [5, 0.0], 'summary' => ['rate' => 0.35, 'totalPay' => 0]];
+        $this->assertSame($first, $archive->materializeLeadership('nsf_team_leader', '2098-09-01', $bundleId, $reordered, $unexpectedRender));
+        foreach ([
+            ['summary' => ['totalPay' => '0', 'rate' => 0.35], 'lines' => [5, 0]],
+            ['summary' => $context['summary'], 'lines' => [0, 5]],
+        ] as $changed) {
+            try {
+                $archive->materializeLeadership('nsf_team_leader', '2098-09-01', $bundleId, $changed, $unexpectedRender);
+                self::fail('A changed archived value was accepted.');
+            } catch (\RuntimeException $error) {
+                self::assertStringContainsString('differs from the frozen export', $error->getMessage());
+            }
+        }
+    }
     public function test_existing_identity_is_immutable_but_same_bytes_can_be_retried(): void
     {
         $archive = new PayrollReportArtifactArchive($this->directory . '/archive');
@@ -130,7 +161,12 @@ class PayrollReportArtifactArchiveTest extends TestCase
     public function test_scope_paths_and_invalid_non_workbook_bytes_are_rejected(): void
     {
         $archive = new PayrollReportArtifactArchive($this->directory . '/archive');
-        foreach ([['../escape', '2098-09-01', str_repeat('a', 32)], ['nsf_ldr', '2098-09-31', str_repeat('a', 32)], ['nsf_ldr', '2098-09-01', '../escape']] as $scope) {
+        foreach ([
+            ['../escape', '2098-09-01', str_repeat('a', 32)],
+            ['nsf_ldr', '2098-09-31', str_repeat('a', 32)],
+            ['nsf_ldr', '2098-09-01', '../escape'],
+            ['nsf_ldr', '2098-09-01', str_repeat('a', 32) . "\n"],
+        ] as $scope) {
             try { $archive->read(...$scope); $this->fail('Caller supplied paths must be rejected.'); }
             catch (\InvalidArgumentException) { $this->addToAssertionCount(1); }
         }

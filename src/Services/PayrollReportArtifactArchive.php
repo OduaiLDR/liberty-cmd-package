@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Cmd\Reports\Services;
 
+use Illuminate\Filesystem\Filesystem;
 use ZipArchive;
 
 /** Private immutable source workbooks; callers select allowlisted report keys, never paths. */
@@ -12,6 +13,7 @@ final class PayrollReportArtifactArchive
     public const MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
     public const SOURCE_KEYS = ['retention_ldr', 'retention_plaw', 'lookback_ldr', 'lookback_plaw', 'nsf_ldr', 'nsf_plaw'];
     public const LEADERSHIP_KEYS = ['customer_support_manager', 'retention_team_leader', 'nsf_team_leader'];
+    private const CONTEXT_JSON_FLAGS = JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR;
     private string $root;
     public function __construct(?string $root = null) { $this->root = $root ?? storage_path('app/payroll-report-artifacts'); }
 
@@ -27,7 +29,7 @@ final class PayrollReportArtifactArchive
     {
         if (getenv('PAYROLL_CAPTURE_CUSTOMER_SERVICE_CONTEXT') !== '1') return false;
         $runId = getenv('PAYROLL_COMMISSION_RUN_ID');
-        if (!is_string($runId) || !preg_match('/^[a-f0-9]{32}$/', $runId)) {
+        if (!is_string($runId) || !preg_match('/^[a-f0-9]{32}$/D', $runId)) {
             throw new \InvalidArgumentException('Customer Service capture requires a reserved commission run id.');
         }
         return true;
@@ -41,6 +43,71 @@ final class PayrollReportArtifactArchive
     public function captureAmendment(string $key, string $period, string $bundleId, array $file, array $context = []): array
     {
         return $this->captureAt($key, $period, $bundleId, $file, $context, $this->amendmentDirectory($key, $period, $bundleId));
+    }
+
+    /** Publish the first rendered workbook and its metadata together. */
+    public function materializeLeadership(string $key, string $period, string $bundleId, array $context, callable $render): array
+    {
+        if (!in_array($key, self::LEADERSHIP_KEYS, true)) {
+            throw new \InvalidArgumentException('Only leadership workbooks can be rendered on demand.');
+        }
+        $destination = $this->directory($key, $period, $bundleId);
+        $parent = dirname($destination);
+        if (!is_dir($parent) && !@mkdir($parent, 0700, true) && !is_dir($parent)) {
+            throw new \RuntimeException('Leadership workbook archive directory is unavailable.');
+        }
+        $lockPath = $parent . '/.' . $key . '.lock';
+        if (is_link($parent) || is_link($lockPath)) {
+            throw new \RuntimeException('Leadership workbook archive cannot follow a symbolic link.');
+        }
+        $lock = fopen($lockPath, 'c');
+        if ($lock === false) {
+            throw new \RuntimeException('Leadership workbook archive lock is unavailable.');
+        }
+        $staging = null;
+        try {
+            if (!flock($lock, LOCK_EX | LOCK_NB)) {
+                throw new \DomainException('This leadership workbook is already being prepared. Retry the download.');
+            }
+            if (file_exists($destination) || is_link($destination)) {
+                $stored = $this->readAt($key, $period, $bundleId, $destination);
+                $persistedContext = json_decode(json_encode($context, self::CONTEXT_JSON_FLAGS), true, flags: JSON_THROW_ON_ERROR);
+                if (self::canonicalContext($stored['context']) !== self::canonicalContext($persistedContext)) {
+                    throw new \RuntimeException('Leadership workbook evidence differs from the frozen export.');
+                }
+                return $stored;
+            }
+
+            $staging = $parent . '/.render-' . bin2hex(random_bytes(8));
+            if (!mkdir($staging, 0700)) {
+                throw new \RuntimeException('Leadership workbook staging directory is unavailable.');
+            }
+            $file = $render($staging . '/build');
+            $this->captureAt($key, $period, $bundleId, $file, $context, $staging . '/archive');
+            if (!rename($staging . '/archive', $destination)) {
+                throw new \RuntimeException('Leadership workbook archive could not be published.');
+            }
+            return $this->readAt($key, $period, $bundleId, $destination);
+        } finally {
+            if ($staging !== null) (new Filesystem)->deleteDirectory($staging);
+            flock($lock, LOCK_UN);
+            fclose($lock);
+        }
+    }
+
+    /** JSON object key order does not affect evidence, but list order does. */
+    private static function canonicalContext(array $context): array
+    {
+        if (!array_is_list($context)) {
+            ksort($context);
+        }
+        foreach ($context as &$value) {
+            if (is_array($value)) {
+                $value = self::canonicalContext($value);
+            }
+        }
+        unset($value);
+        return $context;
     }
 
     private function captureAt(string $key, string $period, string $identity, array $file, array $context, string $directory): array
@@ -68,7 +135,7 @@ final class PayrollReportArtifactArchive
                 throw new \RuntimeException('Legacy evidence does not match the original workbook and unverified scope.');
             }
         }
-        $contextJson = json_encode($context, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+        $contextJson = json_encode($context, self::CONTEXT_JSON_FLAGS);
         $context = json_decode($contextJson, true, flags: JSON_THROW_ON_ERROR);
         $metadata = ['key' => $key, 'period' => $period, 'identity' => $identity, 'fileName' => $fileName,
             'contentType' => self::MIME, ...$evidence, 'context' => $context, 'contextSha256' => hash('sha256', $contextJson)];
@@ -119,7 +186,7 @@ final class PayrollReportArtifactArchive
         $metadata = json_decode((string) file_get_contents($directory . '/artifact.json'), true, flags: JSON_THROW_ON_ERROR);
         if (($metadata['key'] ?? null) !== $key || ($metadata['period'] ?? null) !== $period || ($metadata['identity'] ?? null) !== $identity
             || ($metadata['contentType'] ?? null) !== self::MIME || !is_array($metadata['context'] ?? null)
-            || hash('sha256', json_encode($metadata['context'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)) !== ($metadata['contextSha256'] ?? null)
+            || hash('sha256', json_encode($metadata['context'], self::CONTEXT_JSON_FLAGS)) !== ($metadata['contextSha256'] ?? null)
             || $this->verifyWorkbook($path) !== ['sha256' => $metadata['sha256'] ?? null, 'byteLength' => $metadata['byteLength'] ?? null]) {
             throw new \RuntimeException('The correlated payroll workbook archive no longer matches its immutable evidence.');
         }
@@ -131,7 +198,7 @@ final class PayrollReportArtifactArchive
         $source = in_array($key, self::SOURCE_KEYS, true);
         $date = \DateTimeImmutable::createFromFormat('!Y-m-d', $period);
         if ((!$source && !in_array($key, self::LEADERSHIP_KEYS, true)) || !$date || $date->format('Y-m-d') !== $period
-            || $date->format('d') !== '01' || !preg_match($source ? '/^[a-f0-9]{32}$/' : '/^[a-f0-9]{64}$/', $identity)) {
+            || $date->format('d') !== '01' || !preg_match($source ? '/^[a-f0-9]{32}$/D' : '/^[a-f0-9]{64}$/D', $identity)) {
             throw new \InvalidArgumentException('Payroll artifact scope requires an approved report, exact reporting month and correlated identity.');
         }
         return rtrim($this->root, '/\\') . '/' . $period . '/' . $identity . '/' . $key;

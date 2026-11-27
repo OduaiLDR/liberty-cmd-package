@@ -163,6 +163,7 @@ class BonusFormatter
         array $unassigned = [],
         ?string $outputDirectory = null
     ): ?array {
+        $temporaryPath = null;
         try {
             $rows = RetentionAgentIdentity::canonicalizeRows($rows);
             if ($rosterAgents !== null) {
@@ -355,10 +356,12 @@ class BonusFormatter
             $suffix   = $agentFilter !== null ? $this->safeFilenamePart($agentFilter) : 'All';
             $filename = "Retention Lookback Commission - {$source} - {$suffix}.xlsx";
             $path     = $outputDirectory === null ? storage_path("app/{$filename}") : rtrim($outputDirectory, '/\\') . '/' . $filename;
+            if ($outputDirectory !== null && !file_exists($path)) $temporaryPath = $path;
             (new Xlsx($sp))->save($path);
 
             return ['filename' => $filename, 'path' => $path];
         } catch (\Throwable $e) {
+            if ($temporaryPath !== null && is_file($temporaryPath)) @unlink($temporaryPath);
             Log::error('RetentionBonusCommissionFormatter::buildWorkbook failed', ['err' => $e->getMessage()]);
             return null;
         }
@@ -382,9 +385,16 @@ class BonusFormatter
 
     private function setDateCell(\PhpOffice\PhpSpreadsheet\Worksheet\Worksheet $sheet, string $cell, ?string $val): void
     {
-        if ($val !== null && $val !== '' && strtotime($val) !== false) {
-            $sheet->setCellValue($cell, XlDate::PHPToExcel(strtotime($val)));
+        $serial = self::detailDateSerial($val);
+        if ($serial !== null) {
+            $sheet->setCellValue($cell, $serial);
             $sheet->getStyle($cell)->getNumberFormat()->setFormatCode(self::DATE_FMT);
         }
+    }
+
+    public static function detailDateSerial(?string $value): ?float
+    {
+        $timestamp = $value === null || $value === '' ? false : strtotime($value);
+        return $timestamp === false ? null : XlDate::PHPToExcel($timestamp);
     }
 }

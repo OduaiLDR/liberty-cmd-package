@@ -64,6 +64,7 @@ class PayrollLeadershipWorkbookBundleTest extends TestCase
         $command->setOutput(new OutputStyle(new ArrayInput([]), new BufferedOutput));
         $built = $command->buildPayrollReviewWorkbookBundle('2098-09-01', '2098-09-30', $this->sources(), $this->directory . '/output');
         $this->assertCount(3, $built['files']);
+        $this->assertSame(['version', 'nsfTeamLeader'], array_keys($built['calculationContext']));
         foreach (['retention_manager', 'retention_team_leader', 'nsf_team_leader'] as $kind) $this->assertSame($kind, $built['reports'][$kind]['reportKind']);
         $this->assertSame(2000.0, $built['reports']['retention_manager']['summary']['totalPay']);
         $this->assertSame(8.0, $built['reports']['retention_team_leader']['summary']['totalPay']);
@@ -100,6 +101,49 @@ class PayrollLeadershipWorkbookBundleTest extends TestCase
         $this->assertFileExists($built['files']['nsf_team_leader']['path']);
     }
 
+    public function test_frozen_leadership_renders_one_matching_workbook_from_its_source_pair(): void
+    {
+        $command = $this->command();
+        $sources = $this->sources();
+        $start = '2098-09-01';
+        $end = '2098-09-30';
+        $frozen = $command->freezePayrollReviewLeadership($start, $end, $sources);
+        $this->assertSame([], $frozen['files']);
+        $this->assertSame([], glob($this->directory . '/*/*.xlsx'));
+
+        $eager = $command->buildPayrollReviewWorkbookBundle($start, $end, $sources, $this->directory . '/eager');
+        $this->assertSame($eager['reports'], $frozen['reports']);
+        $this->assertSame($eager['calculationContext'], array_diff_key($frozen['calculationContext'], ['retention' => true]));
+        $this->assertArrayHasKey('retention', $frozen['calculationContext']);
+        foreach (['customer_support_manager' => 'retention_manager', 'retention_team_leader' => 'retention_team_leader', 'nsf_team_leader' => 'nsf_team_leader'] as $key => $kind) {
+            $prefix = $key === 'nsf_team_leader' ? 'nsf_' : 'retention_';
+            $pair = array_filter($sources, static fn ($source) => str_starts_with($source, $prefix), ARRAY_FILTER_USE_KEY);
+            $directory = $this->directory . '/' . $key;
+            $savedReport = json_decode(json_encode($frozen['reports'][$kind], JSON_THROW_ON_ERROR), true, flags: JSON_THROW_ON_ERROR);
+            $file = $command->renderFrozenPayrollReviewLeadershipWorkbook($key, $start, $end, $pair, $directory, $frozen['calculationContext'], $savedReport);
+            $this->assertSame($eager['files'][$key]['filename'], $file['filename']);
+            $this->assertCount(1, glob($directory . '/*/*.xlsx'));
+            $original = IOFactory::load($eager['files'][$key]['path']);
+            $export = IOFactory::load($file['path']);
+            $this->assertSame($original->getSheetNames(), $export->getSheetNames());
+            foreach ($original->getSheetNames() as $title) {
+                $this->assertSame($original->getSheetByName($title)->toArray(null, false, false), $export->getSheetByName($title)->toArray(null, false, false));
+            }
+            $original->disconnectWorksheets();
+            $export->disconnectWorksheets();
+        }
+
+        $changed = $frozen['reports']['retention_manager'];
+        $changed['summary']['totalPay']++;
+        try {
+            $command->renderFrozenPayrollReviewLeadershipWorkbook('customer_support_manager', $start, $end, $sources, $this->directory . '/changed', $frozen['calculationContext'], $changed);
+            $this->fail('A different calculation must not produce a workbook.');
+        } catch (\RuntimeException $error) {
+            $this->assertStringContainsString('cannot reproduce the frozen', $error->getMessage());
+            $this->assertDirectoryDoesNotExist($this->directory . '/changed');
+        }
+    }
+
     public function test_rama_replays_archived_cutoff_and_bonus_inputs_after_original_files_are_gone(): void
     {
         $sources = array_intersect_key($this->sources(), array_flip(['retention_ldr', 'retention_plaw']));
@@ -117,6 +161,89 @@ class PayrollLeadershipWorkbookBundleTest extends TestCase
         $this->assertSame(1, $snapshot['summary']['bonusRetainedCount']);
         $this->assertSame(2000.0, $snapshot['summary']['totalPay']);
         $this->assertDirectoryDoesNotExist($this->directory . '/output');
+    }
+
+    public function test_first_retention_download_uses_the_saved_pay_rules_in_both_sheets(): void
+    {
+        $leader = $this->command();
+        $start = '2098-09-01';
+        $end = '2098-09-30';
+        $sources = $this->sources();
+        $current = $leader->freezePayrollReviewLeadership($start, $end, $sources);
+        $rules = $current['calculationContext'];
+        $rules['retention']['managerAmounts'][4] = 1250;
+        $rules['retention']['bonusAmounts'][4] = 600;
+        $rules['retention']['teamLeaderRates'][2][0] = 14.0;
+        $rules['retention']['teamLeaderCap'] = 10.0;
+        $saved = $leader->freezePayrollReviewLeadership($start, $end, $sources, $rules);
+        $saved = json_decode(json_encode($saved, JSON_THROW_ON_ERROR), true, flags: JSON_THROW_ON_ERROR);
+        $this->assertSame(8.0, $current['reports']['retention_team_leader']['summary']['totalPay']);
+        $this->assertSame(10, $saved['reports']['retention_team_leader']['summary']['totalPay']);
+        $this->assertSame(1850, $saved['reports']['retention_manager']['summary']['totalPay']);
+        $this->assertSame([], glob($this->directory . '/*/*.xlsx'));
+
+        $export = $leader->renderFrozenPayrollReviewLeadershipWorkbook('retention_team_leader', $start, $end, $sources,
+            $this->directory . '/first-nick', $saved['calculationContext'], $saved['reports']['retention_team_leader']);
+        $book = IOFactory::load($export['path']);
+        try {
+            $this->assertEquals(10, $book->getSheetByName('Commission Summary')->getCell('B8')->getValue());
+            $this->assertEquals(14, $book->getSheetByName('Commission Summary')->getCell('D3')->getValue());
+            $this->assertEquals(14, $book->getSheetByName('Retention Data')->getCell('P2')->getValue());
+            $this->assertEquals(14, $book->getSheetByName('Retention Data')->getCell('Q2')->getValue());
+        } finally {
+            $book->disconnectWorksheets();
+        }
+        $export = $leader->renderFrozenPayrollReviewLeadershipWorkbook('customer_support_manager', $start, $end, $sources,
+            $this->directory . '/first-rama', $saved['calculationContext'], $saved['reports']['retention_manager']);
+        $book = IOFactory::load($export['path']);
+        try {
+            $this->assertEquals(1850, $book->getSheetByName('Commission Summary')->getCell('B15')->getValue());
+        } finally {
+            $book->disconnectWorksheets();
+        }
+
+        $corrupt = $saved['calculationContext'];
+        $corrupt['retention']['teamLeaderRates'][2][0] = 9.0;
+        $this->expectExceptionMessage('cannot reproduce the frozen leadership report');
+        $leader->renderFrozenPayrollReviewLeadershipWorkbook('retention_team_leader', $start, $end, $sources,
+            $this->directory . '/changed-rules', $corrupt, $saved['reports']['retention_team_leader']);
+    }
+
+    public function test_first_retention_download_supports_the_cap_in_an_older_saved_report(): void
+    {
+        $leader = $this->command();
+        $start = '2098-09-01';
+        $end = '2098-09-30';
+        $sources = $this->sources();
+        $context = $leader->freezePayrollReviewLeadership($start, $end, $sources)['calculationContext'];
+        $context['retention']['teamLeaderCap'] = 1500;
+        $saved = $leader->freezePayrollReviewLeadership($start, $end, $sources, $context);
+        $savedReport = $saved['reports']['retention_team_leader'];
+        $this->assertSame(8.0, $savedReport['summary']['totalPay']);
+        $this->assertSame(1500.0, $savedReport['summary']['commissionCap']);
+        unset($context['retention']);
+
+        $file = $leader->renderFrozenPayrollReviewLeadershipWorkbook('retention_team_leader', $start, $end, $sources,
+            $this->directory . '/first-legacy', $context, $savedReport);
+        $book = IOFactory::load($file['path']);
+        try {
+            $this->assertEquals(8, $book->getSheetByName('Commission Summary')->getCell('B8')->getValue());
+        } finally {
+            $book->disconnectWorksheets();
+        }
+    }
+
+    public function test_eager_bundle_preserves_explicitly_supplied_retention_rules(): void
+    {
+        $leader = $this->command();
+        $start = '2098-09-01';
+        $end = '2098-09-30';
+        $sources = $this->sources();
+        $rules = $leader->freezePayrollReviewLeadership($start, $end, $sources)['calculationContext'];
+        $rules['retention']['teamLeaderCap'] = 4.0;
+        $eager = $leader->buildPayrollReviewWorkbookBundle($start, $end, $sources, $this->directory . '/explicit', $rules);
+        $this->assertSame($rules, $eager['calculationContext']);
+        $this->assertSame(4.0, $eager['reports']['retention_team_leader']['summary']['totalPay']);
     }
 
     public function test_rama_refuses_an_incomplete_client_cutoff_snapshot_without_current_lookup(): void

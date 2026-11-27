@@ -228,7 +228,7 @@ class Formatter
      * @param array<int,array<string,mixed>> $rows
      * @return array<int,array<string,mixed>>
      */
-    private static function sortByLocationCompanyAgent(array $rows): array
+    public static function sortByLocationCompanyAgent(array $rows): array
     {
         usort($rows, static function (array $a, array $b): int {
             $rank = static fn (string $v): array => [$v === '' ? 1 : 0, strtolower($v)];

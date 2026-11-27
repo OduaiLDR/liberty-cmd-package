@@ -19,11 +19,21 @@ final class CustomerServiceCalculationSnapshot
     private const MAX_BATCH_BYTES = 14 * 1024 * 1024;
 
     /** Select an employee from independently captured components, without requiring an unrelated complete CS bundle. */
-    public static function forArchivedAgent(array $artifacts, string $period, string $report, string $agentKey, string $sourceScope): array
+    public static function forArchivedAgent(array $artifacts, string $period, string $report, string $agentKey, string $sourceScope, bool $preferStructured = true): array
     {
         self::validateArchivedSelection($period, $report, $agentKey, $sourceScope);
         $family = match ($report) { 'retention_lookback' => 'lookback', 'retention_regular' => 'retention', default => 'nsf' };
-        return self::selectArchivedAgent($artifacts, $period, $report, $family, $agentKey, $sourceScope);
+        $lookbackRun = $preferStructured && $family === 'lookback' ? self::lookbackRun($artifacts) : null;
+        return self::selectArchivedAgent($artifacts, $period, $report, $family, $agentKey, $sourceScope, $lookbackRun);
+    }
+
+    /** Replay the employee's Lookback evidence using only trusted archive metadata. */
+    public static function forStructuredLookbackAgent(array $artifacts, string $period, string $runId, string $agentKey, string $sourceScope): array
+    {
+        self::validateArchivedSelection($period, 'retention_lookback', $agentKey, $sourceScope);
+        if (!preg_match('/^[a-f0-9]{32}$/D', $runId)) self::invalid();
+
+        return self::selectArchivedAgent($artifacts, $period, 'retention_lookback', 'lookback', $agentKey, $sourceScope, $runId);
     }
 
     public static function validateArchivedSelection(string $period, string $report, string $agentKey, string $sourceScope): void
@@ -37,15 +47,18 @@ final class CustomerServiceCalculationSnapshot
         }
     }
 
-    private static function selectArchivedAgent(array $artifacts, string $period, string $report, string $family, string $agentKey, string $sourceScope): array
+    private static function selectArchivedAgent(array $artifacts, string $period, string $report, string $family, string $agentKey, string $sourceScope, ?string $structuredRunId = null): array
     {
         if (count($artifacts) !== 2 || array_diff([$family . '_ldr', $family . '_plaw'], array_keys($artifacts))) self::invalid();
-        // Both source files and contexts are validated even for a one-company request.
+        $regularLines = $family === 'retention' ? self::regularPayrollLines($artifacts, $period, [$agentKey]) : [];
+        $requiresWorkbook = $structuredRunId === null && $regularLines === [];
+        // Validate both sources even for a one-company request.
         $validated = [];
+        $structuredLines = $structuredRunId === null ? [] : self::verifiedLookbackLines($artifacts, $period, $structuredRunId);
         foreach (['ldr', 'plaw'] as $source) {
             $key = $family . '_' . $source;
             $artifact = $artifacts[$key];
-            self::validateArchivedArtifact($artifact, $key, $period);
+            if ($requiresWorkbook) self::validateArchivedArtifact($artifact, $key, $period);
             if ($report === 'retention_regular' && isset($artifact['context']['legacyEvidence'])) {
                 $evidence = $artifact['context']['legacyEvidence'];
                 if (($evidence['source'] ?? null) !== $source || ($evidence['period'] ?? null) !== $period
@@ -89,15 +102,21 @@ final class CustomerServiceCalculationSnapshot
                 $entry = self::unavailable($entry, 'The original workbook preserves account data and the saved total, but not verified historical selected line prices.');
                 $entry['originalRows'] = self::legacyOriginalRows($artifact, $period, $sourceAgentKey);
             } elseif ($family === 'retention' && isset($artifact['context']['regularPricing'])) {
-                $entry['lines'] = self::regular($artifact, $period, $sourceAgentKey);
+                $entry['lines'] = isset($regularLines[$source])
+                    ? self::structuredAgentLines($regularLines[$source], $sourceAgentKey) : self::regular($artifact, $period, $sourceAgentKey);
             } elseif ($amount != 0.0) {
-                $lines = match ($family) { 'nsf' => self::nsf($artifact, $sourceAgentKey, $amount), 'lookback' => self::lookback($artifact, $sourceAgentKey), default => null };
+                $lines = match (true) {
+                    $structuredRunId !== null => $structuredLines[$source][$sourceAgentKey],
+                    $family === 'nsf' => self::nsf($artifact, $sourceAgentKey, $amount),
+                    $family === 'lookback' => self::lookback($artifact, $sourceAgentKey),
+                    default => null,
+                };
                 if ($lines === null) $entry = self::unavailable($entry, 'The original workbook does not retain trustworthy selected line prices for this component.');
                 else $entry['lines'] = $lines;
             }
             if (count($entry['lines']) > 20000) self::invalid();
             if ($entry['status'] === 'verified' && round(array_sum(array_column($entry['lines'], 'amount')), 2) !== round((float) $amount, 2)) self::invalid();
-            if (is_link($artifact['path']) || !hash_equals($artifact['sha256'], (string) hash_file('sha256', $artifact['path']))) self::invalid();
+            if ($requiresWorkbook && (is_link($artifact['path']) || !hash_equals($artifact['sha256'], (string) hash_file('sha256', $artifact['path'])))) self::invalid();
             $components[] = $entry;
         }
         return ['kind' => 'cs_archived_agent_calculation_v1', 'version' => 1, 'period' => $period,
@@ -110,25 +129,217 @@ final class CustomerServiceCalculationSnapshot
         return ['aleph bolanos' => 'aleph bolaños', 'andrea mendoze' => 'andrea mendoza', 'andrea galves' => 'andrea galvez'][$key] ?? $key;
     }
 
-    private static function validateArchivedArtifact(mixed $artifact, string $key, string $period): void
+    private static function validateArchivedArtifact(mixed $artifact, string $key, string $period, bool $requireWorkbook = true): void
     {
         if (!is_array($artifact) || ($artifact['key'] ?? null) !== $key || ($artifact['period'] ?? $period) !== $period
-            || !is_array($artifact['context'] ?? null) || !is_string($artifact['path'] ?? null)
-            || is_link($artifact['path']) || !is_file($artifact['path']) || !is_readable($artifact['path'])
-            || !is_string($artifact['sha256'] ?? null) || !preg_match('/^[a-f0-9]{64}$/D', $artifact['sha256'])
+            || !is_array($artifact['context'] ?? null)
             || !is_string($artifact['contextSha256'] ?? null) || !preg_match('/^[a-f0-9]{64}$/D', $artifact['contextSha256'])
             || hash('sha256', json_encode($artifact['context'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)) !== $artifact['contextSha256']) self::invalid();
-        clearstatcache(true, $artifact['path']);
-        if (filesize($artifact['path']) < 4 || filesize($artifact['path']) > 32 * 1024 * 1024
-            || isset($artifact['byteLength']) && $artifact['byteLength'] !== filesize($artifact['path'])
-            || !hash_equals($artifact['sha256'], (string) hash_file('sha256', $artifact['path']))) self::invalid();
+        if ($requireWorkbook) {
+            if (!is_string($artifact['path'] ?? null)) self::invalid();
+            self::validateWorkbookFile($artifact['path'], $artifact['sha256'] ?? null, $artifact['byteLength'] ?? null);
+        } elseif (!is_string($artifact['sha256'] ?? null) || !preg_match('/^[a-f0-9]{64}$/D', $artifact['sha256'])) {
+            self::invalid();
+        }
+    }
+
+    private static function validateWorkbookFile(string $path, mixed $sha256, mixed $byteLength = null): void
+    {
+        if (preg_match('~^[a-z][a-z0-9+.-]*://~i', $path) || is_link($path) || !is_file($path) || !is_readable($path)
+            || !is_string($sha256) || !preg_match('/^[a-f0-9]{64}$/D', $sha256)) self::invalid();
+        clearstatcache(true, $path);
+        if (filesize($path) < 4 || filesize($path) > 32 * 1024 * 1024
+            || $byteLength !== null && $byteLength !== filesize($path)
+            || !hash_equals($sha256, (string) hash_file('sha256', $path))) self::invalid();
         $zip = new ZipArchive;
-        if ($zip->open($artifact['path'], ZipArchive::RDONLY) !== true) self::invalid();
+        if ($zip->open($path, ZipArchive::RDONLY) !== true) self::invalid();
         try {
             $size = 0;
             for ($i = 0; $i < $zip->numFiles; $i++) { $entry = $zip->statIndex($i); if (!is_array($entry)) self::invalid(); $size += (int) ($entry['size'] ?? 0); }
             if ($size > 128 * 1024 * 1024 || $zip->locateName('xl/workbook.xml') === false || $zip->locateName('[Content_Types].xml') === false) self::invalid();
         } finally { $zip->close(); }
+    }
+
+    /** Read a workbook selected from a trusted historical record, without creating a capture or claiming roster coverage. */
+    public static function forPinnedNsfWorkbook(string $path, string $sha256, string $period, string $source, string $agent): array
+    {
+        $agentKey = self::key($agent);
+        self::validateArchivedSelection($period, 'nsf', $agentKey, $source);
+        if ($source === 'both' || $agentKey === 'unassigned agents') self::invalid();
+        self::validateWorkbookFile($path, $sha256);
+        $reader = IOFactory::createReader('Xlsx');
+        $reader->setReadEmptyCells(false);
+        $reader->setLoadSheetsOnly(['Commission', 'Data', 'Agent Summary', 'NSF Data', 'Run Status']);
+        $book = $reader->load($path);
+        try {
+            $hasRunMetadata = self::checkPinnedNsfScope($book, $period, $source);
+            $old = $book->getSheetByName('Commission');
+            $modern = $book->getSheetByName('Agent Summary');
+            if (($old === null) === ($modern === null)) self::invalid();
+            $summary = $modern ?? $old;
+            $data = $book->getSheetByName($modern ? 'NSF Data' : 'Data');
+            if ($book->getSheetByName($modern ? 'Data' : 'NSF Data')) self::invalid();
+            $columns = self::headers($summary);
+            // The original PHP formatter called its NSF employee column "NGO".
+            if (!isset($columns['commission']) || isset($columns['ngo']) === isset($columns['nsf agent'])) self::invalid();
+            $nameColumn = $columns['nsf agent'] ?? $columns['ngo'];
+            $row = null;
+            $sourceName = null;
+            $lastRow = $summary->getHighestDataRow();
+            if ($lastRow > 10000 || ($data && $data->getHighestDataRow() > 100000)) self::invalid();
+            $headers = $data ? self::headers($data) : [];
+            if (isset($headers['nsf returned date'])) {
+                $lastContact = $data->getHighestDataRow();
+                for ($r = 2; $r <= $lastContact; $r++) {
+                    $returned = self::value($data, $headers['nsf returned date'], $r);
+                    if (!self::missingOriginalValue($returned) && substr(self::dateValue($returned), 0, 7) !== substr($period, 0, 7)) self::invalid();
+                }
+            }
+            for ($r = 2; $r <= $lastRow; $r++) {
+                $rawName = self::value($summary, $nameColumn, $r);
+                if (is_string($rawName) && str_starts_with($rawName, '=')) self::invalid();
+                $name = self::key((string) $rawName);
+                if (self::archivedAgentKey($name) !== self::archivedAgentKey($agentKey)) continue;
+                if ($row !== null) self::invalid();
+                $row = $r;
+                $sourceName = (string) $rawName;
+            }
+            $amountCents = $row === null ? null : self::nsfCents(self::value($summary, $columns['commission'], $row));
+            $status = $row === null ? 'missing' : ($amountCents === 0 ? 'verified' : 'total_only');
+            $lines = [];
+            if ($amountCents !== null) {
+                // The "NGO" layout priced exact raw strings. The later normalized calculator added run metadata.
+                $normalized = isset($columns['ngo']) ? false : ($hasRunMetadata ? true : null);
+                $detail = self::pinnedNsfLines($summary, $data, $columns, $headers, $row, $sourceName, $normalized, $amountCents);
+                if ($detail !== null) {
+                    $lines = $detail;
+                    $status = 'verified';
+                }
+            }
+            if (is_link($path) || !hash_equals($sha256, (string) hash_file('sha256', $path))) self::invalid();
+            return ['kind' => 'nsf_employee_statement_v1', 'period' => $period, 'source' => $source,
+                'agentKey' => $agentKey, 'workbookSha256' => $sha256, 'status' => $status, 'amountCents' => $amountCents, 'lines' => $lines];
+        } finally { $book->disconnectWorksheets(); }
+    }
+
+    private static function pinnedNsfLines(Worksheet $summary, ?Worksheet $data, array $columns, array $headers, int $row, string $sourceName, ?bool $normalized, int $amountCents): ?array
+    {
+        $rate = self::savedNsfRate($summary, $columns, $row);
+        $rateCents = $rate === null ? null : self::nsfCents($rate);
+        $saved = [];
+        foreach (['clears', 'assignments', 'actions', 'ratio'] as $field) {
+            $value = isset($columns[$field]) ? self::value($summary, $columns[$field], $row) : null;
+            $saved[$field] = self::missingOriginalValue($value) ? null : self::number($value);
+            $number = $saved[$field];
+            if ($number !== null && ($number < 0 || ($field === 'ratio' ? $number > 1 : floor($number) !== $number))) self::invalid();
+        }
+        $clears = $saved['clears'];
+        // Check independent saved facts even when the workbook cannot explain every account.
+        $assignments = $saved['assignments'];
+        $actions = $saved['actions'];
+        if ($assignments !== null && (($actions !== null && $actions > $assignments)
+            || ($clears !== null && $clears > $assignments)
+            || ($actions !== null && $saved['ratio'] !== null
+                && round($actions / max(1, $assignments), 4) !== round($saved['ratio'], 4)))) self::invalid();
+        if (($amountCents > 0 && ($clears === 0.0 || $rateCents === 0))
+            || ($rateCents !== null && $clears !== null && $rateCents * $clears !== (float) $amountCents)) self::invalid();
+        if (!$data || !isset($headers['agent'])) return null;
+        $exactRows = $normalizedRows = [];
+        $sourceKey = self::nsfProducerKey($sourceName);
+        $last = $data->getHighestDataRow();
+        for ($r = 2; $r <= $last; $r++) {
+            $name = (string) self::value($data, $headers['agent'], $r);
+            if ($name === $sourceName) $exactRows[] = $r;
+            if (self::nsfProducerKey($name) === $sourceKey) $normalizedRows[] = $r;
+        }
+        $groups = match ($normalized) {
+            true => [$normalizedRows],
+            false => [$exactRows],
+            null => $exactRows === $normalizedRows ? [$exactRows] : [$exactRows, $normalizedRows],
+        };
+        if ($groups === [[]]) {
+            if ($assignments > 0.0 || $actions > 0.0 || $clears > 0.0 || $saved['ratio'] > 0.0) self::invalid();
+            return null;
+        }
+        $candidates = [];
+        foreach ($groups as $rows) {
+            if ($assignments !== null && count($rows) !== (int) $assignments) continue;
+            $facts = self::nsfContactFacts($data, $headers, $rows, true);
+            $detail = self::matchPinnedNsfEvidence($facts, $headers, $saved, $rateCents, $amountCents);
+            // Original NGO workbooks could contain the same contact twice. Their literal total is still readable.
+            if ($detail !== false && $facts['duplicateIds']) $detail = $normalized === false ? null : false;
+            if ($detail !== false) $candidates[] = $detail;
+        }
+        if (!$candidates) self::invalid();
+        // In an unmarked transition-era workbook both grouping rules can fit incomplete evidence.
+        if (count($candidates) === 2 && $candidates[0] !== $candidates[1]) return null;
+        return $candidates[0];
+    }
+
+    private static function nsfProducerKey(string $name): string
+    {
+        // Exact normalization of GenerateNSFCommissionReport::buildCommissionRows from 2686bdd onward.
+        return strtolower((string) preg_replace('/\s+/', ' ', trim($name)));
+    }
+
+    /** False means this grouping contradicts the summary; null preserves the recorded total without lines. */
+    private static function matchPinnedNsfEvidence(array $facts, array $headers, array $saved, ?int $rateCents, int $amountCents): array|false|null
+    {
+        $clears = $saved['clears'];
+        $eligible = count($facts['eligible']);
+        $possible = $eligible + $facts['unknownFlags'];
+        $denominator = max(1, $facts['assignments']);
+        $minRatio = round($facts['actions'] / $denominator, 4);
+        $maxRatio = round(($facts['actions'] + $facts['unknownActions']) / $denominator, 4);
+        if (($amountCents > 0 && $possible === 0)
+            || ($clears !== null && ($eligible > $clears || $possible < $clears))
+            || ($rateCents !== null && ($eligible * $rateCents > $amountCents || $possible * $rateCents < $amountCents))
+            || ($saved['assignments'] !== null && $saved['assignments'] !== (float) $facts['assignments'])
+            || ($saved['actions'] !== null && ($facts['actions'] > $saved['actions'] || $facts['actions'] + $facts['unknownActions'] < $saved['actions']))
+            || ($saved['ratio'] !== null && (round($saved['ratio'], 4) < $minRatio || round($saved['ratio'], 4) > $maxRatio))) return false;
+        if ($amountCents === 0) return [];
+        if ($clears === null || $rateCents === null || $facts['unknownFlags'] || $facts['incompleteDetail'] || !isset($headers['id'])) return null;
+        if ($eligible > 20000) self::invalid();
+        return array_map(static fn (array $line): array => ['clientId' => $line['clientId'], 'rateCents' => $rateCents, 'amountCents' => $rateCents]
+            + array_intersect_key($line, ['paymentDate' => true]), $facts['eligible']);
+    }
+
+    /** Old files can lack scope metadata. When it exists it must agree with the supplied archive record. */
+    private static function checkPinnedNsfScope(\PhpOffice\PhpSpreadsheet\Spreadsheet $book, string $period, string $source): bool
+    {
+        $properties = $book->getProperties();
+        $timing = NsfReportReadiness::timing($period);
+        foreach (['NSF Payment Cutoff (Pacific)' => 'cutoffPacific', 'NSF Final Runs After (UTC)' => 'finalAfter'] as $field => $key) {
+            $saved = $properties->getCustomPropertyValue($field);
+            if ($saved !== null && $saved !== $timing[$key]) self::invalid();
+        }
+        $sheet = $book->getSheetByName('Run Status');
+        $hasCutoff = $properties->getCustomPropertyValue('NSF Final Runs After (UTC)') !== null;
+        if (!$sheet) return $hasCutoff;
+        $lastRow = $sheet->getHighestDataRow();
+        if ($lastRow > 1000) self::invalid();
+        $brands = $source === 'ldr' ? ['ldr', 'liberty debt relief'] : ['plaw', 'progress law'];
+        $seen = [];
+        for ($row = 1; $row <= $lastRow; $row++) {
+            $key = self::key((string) self::value($sheet, 1, $row));
+            if (!in_array($key, ['source', 'period start', 'period end', 'payment cutoff (pacific)', 'final runs may start after (utc)'], true)) continue;
+            if (isset($seen[$key])) self::invalid();
+            $seen[$key] = true;
+            $value = self::value($sheet, 2, $row);
+            if ($key === 'source') {
+                if (!in_array(self::key((string) $value), $brands, true)) self::invalid();
+            } elseif ($key === 'payment cutoff (pacific)' || $key === 'final runs may start after (utc)') {
+                if ($value !== $timing[$key === 'payment cutoff (pacific)' ? 'cutoffPacific' : 'finalAfter']) self::invalid();
+            } elseif (self::dateValue($value) !== ($key === 'period start' ? $period : (new \DateTimeImmutable($period))->format('Y-m-t'))) self::invalid();
+        }
+        return $hasCutoff || isset($seen['source'], $seen['period start']);
+    }
+
+    private static function nsfCents(mixed $value): int
+    {
+        $number = self::number($value);
+        if ($number < 0 || $number > 90071992547409 || round($number, 2) !== $number) self::invalid();
+        return (int) round($number * 100);
     }
 
     /** Unpriced original facts are deliberately separate from selected payable calculation lines. */
@@ -171,13 +382,16 @@ final class CustomerServiceCalculationSnapshot
         } finally { $book->disconnectWorksheets(); }
     }
 
-    public static function forAgent(array $artifacts, string $period, string $reportKind, string $agentKey, string $sourceScope): array
+    public static function forAgent(array $artifacts, string $period, string $reportKind, string $agentKey, string $sourceScope, bool $preferStructuredLookback = true): array
     {
         self::validateBundleSelection($period, $reportKind, $agentKey, $sourceScope);
         $sources = self::sources($artifacts, $period);
+        $structured = $reportKind === 'retention' ? self::bundleStructuredLines($sources, $period, [$agentKey], $preferStructuredLookback) : [];
         $calculation = self::bundleCalculation($sources, $period, $reportKind, $agentKey, $sourceScope);
         foreach ($calculation['components'] as $index => $component) {
-            $calculation['components'][$index] = self::bundleComponent($sources[$component['reportKey']], $component, $period, $agentKey);
+            $key = $component['reportKey'];
+            $lines = isset($structured[$key]) ? self::structuredAgentLines($structured[$key], $agentKey) : null;
+            $calculation['components'][$index] = self::bundleComponent($sources[$key], $component, $period, $agentKey, structuredLines: $lines);
         }
         return $calculation;
     }
@@ -200,15 +414,24 @@ final class CustomerServiceCalculationSnapshot
 
         $sources = self::sources($artifacts, $period);
         $results = $locations = [];
+        $structured = null;
+        $structuredAttempted = false;
         $failure = ['ok' => false, 'error' => 'Frozen Customer Service calculation evidence is invalid or incomplete for the selected employee.'];
         foreach ($selections as $selectionIndex => $selection) {
             try {
+                if ($selection['reportKind'] === 'retention') {
+                    if (!$structuredAttempted) {
+                        $structuredAttempted = true;
+                        $structured = self::bundleStructuredLines($sources, $period, array_column($selections, 'agentKey'));
+                    }
+                    if ($structured === null) self::invalid();
+                }
                 $calculation = self::bundleCalculation($sources, $period, $selection['reportKind'], $selection['agentKey'], $selection['sourceScope']);
                 $results[] = ['ok' => true, 'calculation' => $calculation];
                 foreach ($calculation['components'] as $componentIndex => $component) {
                     $locations[$component['reportKey']][] = [$selectionIndex, $componentIndex];
                 }
-            } catch (\RuntimeException) {
+            } catch (\Throwable) {
                 $results[] = $failure;
             }
         }
@@ -228,14 +451,16 @@ final class CustomerServiceCalculationSnapshot
                     $calculation = $results[$selectionIndex]['calculation'];
                     $entry = $calculation['components'][$componentIndex];
                     try {
-                        if (self::needsBundleWorkbook($artifact, $entry)) {
+                        $agentKey = $calculation['agentKey'];
+                        $lines = isset($structured[$key]) ? self::structuredAgentLines($structured[$key], $agentKey) : null;
+                        if ($lines === null && self::needsBundleWorkbook($artifact, $entry)) {
                             if (!$workbookAttempted) {
                                 $workbookAttempted = true;
                                 $workbook = self::book($artifact);
                             }
                             if ($workbook === null) self::invalid();
                         }
-                        $component = self::bundleComponent($artifact, $entry, $period, $calculation['agentKey'], $workbook, $regularPricing);
+                        $component = self::bundleComponent($artifact, $entry, $period, $agentKey, $workbook, $regularPricing, $lines);
                         $componentBytes = strlen(json_encode($component, JSON_THROW_ON_ERROR));
                     } catch (\Throwable) {
                         $results[$selectionIndex] = $failure;
@@ -282,21 +507,36 @@ final class CustomerServiceCalculationSnapshot
             'sourceScope' => $sourceScope, 'components' => $components];
     }
 
+    private static function bundleStructuredLines(array $sources, string $period, array $agentKeys, bool $preferStructuredLookback = true): array
+    {
+        $lines = [];
+        foreach (self::regularPayrollLines($sources, $period, $agentKeys) as $source => $agents) {
+            $lines['retention_' . $source] = $agents;
+        }
+        $lookbackRun = $preferStructuredLookback ? self::lookbackRun($sources) : null;
+        if ($lookbackRun !== null) {
+            foreach (self::verifiedLookbackLines($sources, $period, $lookbackRun) as $source => $agents) {
+                $lines['lookback_' . $source] = $agents;
+            }
+        }
+        return $lines;
+    }
+
     private static function needsBundleWorkbook(array $artifact, array $entry): bool
     {
         return str_starts_with($entry['reportKey'], 'retention_')
             ? array_key_exists('regularPricing', $artifact['context']) : $entry['amount'] != 0.0;
     }
 
-    private static function bundleComponent(array $artifact, array $entry, string $period, string $agentKey, ?Spreadsheet $workbook = null, ?array $regularPricing = null): array
+    private static function bundleComponent(array $artifact, array $entry, string $period, string $agentKey, ?Spreadsheet $workbook = null, ?array $regularPricing = null, ?array $structuredLines = null): array
     {
         $family = explode('_', $entry['reportKey'], 2)[0];
         $amount = $entry['amount'];
         if ($family === 'retention' && array_key_exists('regularPricing', $artifact['context'])) {
-            $entry['lines'] = self::regular($artifact, $period, $agentKey, $workbook, $regularPricing);
+            $entry['lines'] = $structuredLines ?? self::regular($artifact, $period, $agentKey, $workbook, $regularPricing);
         } elseif ($amount != 0.0) {
             if ($family === 'retention') return self::unavailable($entry, 'Original regular Retention line prices were not captured.');
-            $lines = $family === 'lookback' ? self::lookback($artifact, $agentKey, $workbook) : self::nsf($artifact, $agentKey, $amount, $workbook);
+            $lines = $structuredLines ?? ($family === 'lookback' ? self::lookback($artifact, $agentKey, $workbook) : self::nsf($artifact, $agentKey, $amount, $workbook));
             if ($lines === null) return self::unavailable($entry, 'The original workbook does not retain trustworthy selected line prices for this component.');
             $entry['lines'] = $lines;
         }
@@ -371,9 +611,7 @@ final class CustomerServiceCalculationSnapshot
                 }
                 if (isset($headers['applied tier']) && self::number(self::value($sheet, $headers['applied tier'], $r)) !== (float) $row['appliedTier']) self::invalid();
                 if (isset($headers['payable commission']) && self::number(self::value($sheet, $headers['payable commission'], $r)) !== (float) $row['amount']) self::invalid();
-                $selected[$r] = ['clientId' => $row['clientId'], 'retentionDate' => $row['retentionDate'], 'paymentDate' => $row['paymentDate'],
-                    'retainedMonth' => $row['retainedMonth'], 'appliedTier' => $row['appliedTier'],
-                    'rate' => $row['appliedTier'] === 0 ? 0 : $row['rates'][$row['appliedTier'] - 1], 'amount' => $row['amount']];
+                $selected[$r] = self::regularLine($row);
             }
             // A balanced omission could leave an unchanged aggregate. Bind every payable employee row, including tier zero.
             for ($r = 2; $r <= $lastRow; $r++) {
@@ -384,6 +622,107 @@ final class CustomerServiceCalculationSnapshot
             }
             return array_values($selected);
         } finally { if ($ownsBook) $book->disconnectWorksheets(); }
+    }
+
+    private static function regularPayrollLines(array $artifacts, string $period, array $agentKeys): array
+    {
+        $inputs = RetentionStructuredCapture::payrollInputs($period, $artifacts);
+        if ($inputs === null) return [];
+        $output = [];
+        $selectedAgents = array_fill_keys(array_map(self::archivedAgentKey(...), $agentKeys), true);
+        foreach ($inputs['rowsBySource'] as $source => $rows) {
+            $context = $artifacts['retention_' . $source]['context'];
+            if (!is_array($context['regularPricing'] ?? null) || !is_array($context['commissionResults'] ?? null)) self::invalid();
+            $proof = RetentionPricingSnapshot::validate($context['regularPricing'], $context['commissionResults']);
+            if ($proof['source'] !== $source || $proof['period'] !== $period) self::invalid();
+            $output[$source] = self::regularStructuredLines($rows, $proof['rows'], $period, $selectedAgents, $context['regularPricingDates'] ?? []);
+        }
+        return $output;
+    }
+
+    private static function regularStructuredLines(array $rows, array $pricing, string $period, array $selectedAgents, array $pricingDates): array
+    {
+        $selected = $output = $unverified = [];
+        foreach ($pricing as $price) {
+            $agentKey = $price['agentKey'];
+            if (!isset($selectedAgents[self::archivedAgentKey($agentKey)])) continue;
+            $index = $price['detailRow'] - 2;
+            $row = $rows[$index] ?? null;
+            if ($row !== null) $row = ($pricingDates['LLG-' . $row['ID']] ?? []) + $row;
+            if ($row === null || $row['ID'] !== $price['clientId'] || self::key($row['RETENTION_AGENT']) !== $agentKey
+                || $row['RETENTION_DATE'] !== $price['retentionDate'] || $row['RETENTION_PAYMENT_DATE'] !== $price['paymentDate']
+                || array_map(static fn ($rate) => $rate === null ? null : (float) $rate, [$row['T1'], $row['T2'], $row['T3'], $row['T4']])
+                    !== array_map(static fn ($rate) => (float) $rate, $price['rates'])) {
+                $unverified[$agentKey] = null;
+                continue;
+            }
+            $selected[$index] = true;
+            $output[$agentKey][] = self::regularLine($price);
+        }
+        foreach ($rows as $index => $row) {
+            if (isset($selected[$index])) continue;
+            $agentKey = self::key($row['RETENTION_AGENT']);
+            if (!isset($selectedAgents[self::archivedAgentKey($agentKey)])) continue;
+            $row = ($pricingDates['LLG-' . $row['ID']] ?? []) + $row;
+            if ($row['RETENTION_DATE'] !== null && $row['RETENTION_PAYMENT_DATE'] !== null
+                && substr($row['RETENTION_PAYMENT_DATE'], 0, 7) === substr($period, 0, 7)) {
+                $unverified[$agentKey] = null;
+            }
+        }
+        return array_replace($output, $unverified);
+    }
+
+    private static function structuredAgentLines(array $lines, string $agentKey): array
+    {
+        if (array_key_exists($agentKey, $lines) && $lines[$agentKey] === null) self::invalid();
+        return $lines[$agentKey] ?? [];
+    }
+
+    private static function regularLine(array $row): array
+    {
+        return ['clientId' => $row['clientId'], 'retentionDate' => $row['retentionDate'], 'paymentDate' => $row['paymentDate'],
+            'retainedMonth' => $row['retainedMonth'], 'appliedTier' => $row['appliedTier'],
+            'rate' => $row['appliedTier'] === 0 ? 0 : $row['rates'][$row['appliedTier'] - 1], 'amount' => $row['amount']];
+    }
+
+    private static function lookbackRun(array $artifacts): ?string
+    {
+        $ldr = $artifacts['lookback_ldr'] ?? [];
+        $plaw = $artifacts['lookback_plaw'] ?? [];
+        if (!array_key_exists('lookbackPricing', $ldr['context'] ?? [])
+            && !array_key_exists('lookbackPricing', $plaw['context'] ?? [])) return null;
+        $identity = $ldr['identity'] ?? null;
+        if (is_string($identity) && preg_match('/^[a-f0-9]{64}$/D', $identity) && ($plaw['identity'] ?? null) === $identity) {
+            return null;
+        }
+        if (!is_string($identity) || !preg_match('/^[a-f0-9]{32}$/D', $identity)) self::invalid();
+        return $identity;
+    }
+
+    private static function verifiedLookbackLines(array $artifacts, string $period, string $runId): array
+    {
+        $lines = [];
+        $captureId = $queryOnly = null;
+        foreach (['ldr', 'plaw'] as $source) {
+            $key = 'lookback_' . $source;
+            $artifact = $artifacts[$key] ?? null;
+            self::validateArchivedArtifact($artifact, $key, $period, false);
+            $context = $artifact['context'];
+            $pricing = $context['lookbackPricing'] ?? null;
+            $result = $context['commissionResults'] ?? null;
+            $mode = $context['queryOnly'] ?? false;
+            if (($artifact['identity'] ?? null) !== $runId || ($artifact['period'] ?? null) !== $period
+                || (array_key_exists('queryOnly', $context) && !is_bool($context['queryOnly']))
+                || ($queryOnly !== null && $queryOnly !== $mode)
+                || !is_array($pricing) || !is_array($result) || !is_array($result['rows'] ?? null)) self::invalid();
+            $checked = PayrollCommissionResultSnapshot::component('retention', $source, $period, 'bonusCommission', $result['rows']);
+            if (json_encode($checked, JSON_THROW_ON_ERROR) !== json_encode($result, JSON_THROW_ON_ERROR)) self::invalid();
+            $lines[$source] = LookbackPricingSnapshot::validatedLines($pricing, $checked);
+            if ($captureId !== null && $captureId !== $pricing['captureId']) self::invalid();
+            $captureId = $pricing['captureId'];
+            $queryOnly = $mode;
+        }
+        return $lines;
     }
 
     private static function lookback(array $artifact, string $agentKey, ?Spreadsheet $book = null): ?array
@@ -435,37 +774,90 @@ final class CustomerServiceCalculationSnapshot
             if (count($matches) !== 1) self::invalid();
             $row = $matches[0];
             if (round(self::number(self::value($summary, $columns['commission'], $row)), 2) !== round($amount, 2)) self::invalid();
-            $rateValue = self::value($summary, $columns['rate'], $row);
-            if ($rateValue === null || $rateValue === '' || is_string($rateValue) && str_starts_with($rateValue, '=')) return null;
-            $rateCell = Coordinate::stringFromColumnIndex($columns['rate']) . $row;
-            $comment = $summary->getComments()[$rateCell] ?? null;
-            if ($comment && stripos($comment->getText()->getPlainText(), 'reconciled from the original frozen commission amount') !== false) return null;
-            $rate = self::number($rateValue);
-            $clears = self::number(self::value($summary, $columns['clears'], $row));
-            if ($clears < 0 || floor($clears) !== $clears) self::invalid();
-            $lines = []; $seen = []; $assignments = $actions = 0;
-            for ($r = 2; $r <= $lastDataRow; $r++) {
-                if (self::key((string) self::value($data, $headers['agent'], $r)) !== $agentKey) continue;
-                $id = self::id(self::value($data, $headers['id'], $r));
-                if (isset($seen[$id])) self::invalid();
-                $seen[$id] = true; $assignments++;
-                if (isset($headers['nsf action']) && trim((string) self::value($data, $headers['nsf action'], $r)) !== '') $actions++;
-                $valid = CustomerServiceRosterAmendment::frozenValidity(self::value($data, $headers['valid commission'], $r));
-                if (!$valid) continue;
-                $line = ['clientId' => $id, 'rate' => $rate, 'amount' => $rate];
-                if (isset($headers['cleared date'])) {
-                    $date = self::dateValue(self::value($data, $headers['cleared date'], $r));
+            return self::nsfLines($summary, $data, $columns, $headers, $row, $agentKey, $lastDataRow);
+        } finally { if ($ownsBook) $book->disconnectWorksheets(); }
+    }
+
+    private static function savedNsfRate(Worksheet $summary, array $columns, int $row): ?float
+    {
+        if (!isset($columns['rate'])) return null;
+        $value = self::value($summary, $columns['rate'], $row);
+        if (self::missingOriginalValue($value)) return null;
+        $cell = Coordinate::stringFromColumnIndex($columns['rate']) . $row;
+        $comment = $summary->getComments()[$cell] ?? null;
+        if ($comment && stripos($comment->getText()->getPlainText(), 'reconciled from the original frozen commission amount') !== false) return null;
+        return self::number($value);
+    }
+
+    private static function missingOriginalValue(mixed $value): bool
+    {
+        return $value === null || $value === '' || (is_string($value) && str_starts_with($value, '='));
+    }
+
+    private static function nsfLines(Worksheet $summary, Worksheet $data, array $columns, array $headers, int $row, string $agentKey, int $lastDataRow): ?array
+    {
+        $rate = self::savedNsfRate($summary, $columns, $row);
+        if ($rate === null) return null;
+        $clears = self::number(self::value($summary, $columns['clears'], $row));
+        if ($clears < 0 || floor($clears) !== $clears) self::invalid();
+        $rows = [];
+        for ($r = 2; $r <= $lastDataRow; $r++) {
+            if (self::key((string) self::value($data, $headers['agent'], $r)) === $agentKey) $rows[] = $r;
+        }
+        $facts = self::nsfContactFacts($data, $headers, $rows, false);
+        if ($facts['assignments'] === 0) return null;
+        if (!$facts['eligible'] || count($facts['eligible']) !== (int) $clears) self::invalid();
+        foreach (['assignments', 'actions'] as $header) if (isset($columns[$header])
+            && self::number(self::value($summary, $columns[$header], $row)) !== (float) $facts[$header]) self::invalid();
+        if (isset($columns['ratio']) && round(self::number(self::value($summary, $columns['ratio'], $row)), 4)
+            !== round($facts['actions'] / $facts['assignments'], 4)) self::invalid();
+        return array_map(static fn (array $line): array => ['clientId' => $line['clientId'], 'rate' => $rate, 'amount' => $rate]
+            + array_intersect_key($line, ['paymentDate' => true]), $facts['eligible']);
+    }
+
+    private static function nsfContactFacts(Worksheet $data, array $headers, array $rows, bool $allowIncomplete): array
+    {
+        $eligible = $seen = [];
+        $assignments = $actions = $unknownFlags = $unknownActions = 0;
+        $duplicateIds = $incompleteDetail = false;
+        foreach ($rows as $r) {
+            $assignments++;
+            $line = [];
+            if (isset($headers['id'])) {
+                $value = self::value($data, $headers['id'], $r);
+                if ($allowIncomplete && self::missingOriginalValue($value)) {
+                    $incompleteDetail = true;
+                } else {
+                    $id = self::id($value);
+                    if (isset($seen[$id])) {
+                        if (!$allowIncomplete) self::invalid();
+                        $duplicateIds = true;
+                    }
+                    $seen[$id] = true;
+                    $line['clientId'] = $id;
+                }
+            }
+            $action = isset($headers['nsf action']) ? (string) self::value($data, $headers['nsf action'], $r) : '';
+            if ($allowIncomplete && (!isset($headers['nsf action']) || str_starts_with($action, '='))) $unknownActions++;
+            elseif (trim($action) !== '') $actions++;
+            $flag = isset($headers['valid commission']) ? self::value($data, $headers['valid commission'], $r) : null;
+            if ($allowIncomplete && self::missingOriginalValue($flag)) {
+                $unknownFlags++;
+                continue;
+            }
+            if (!CustomerServiceRosterAmendment::frozenValidity($flag)) continue;
+            if (isset($headers['cleared date'])) {
+                $value = self::value($data, $headers['cleared date'], $r);
+                if ($allowIncomplete && is_string($value) && str_starts_with($value, '=')) {
+                    $incompleteDetail = true;
+                } else {
+                    $date = self::dateValue($value);
                     if ($date !== null) $line['paymentDate'] = $date;
                 }
-                $lines[] = $line;
             }
-            if ($assignments === 0) return null;
-            if (count($lines) !== (int) $clears || !$lines) self::invalid();
-            foreach (['assignments' => $assignments, 'actions' => $actions] as $header => $count) if (isset($columns[$header])
-                && self::number(self::value($summary, $columns[$header], $row)) !== (float) $count) self::invalid();
-            if (isset($columns['ratio']) && round(self::number(self::value($summary, $columns['ratio'], $row)), 4) !== round($actions / $assignments, 4)) self::invalid();
-            return $lines;
-        } finally { if ($ownsBook) $book->disconnectWorksheets(); }
+            $eligible[] = $line;
+        }
+        return compact('eligible', 'assignments', 'actions', 'unknownActions', 'unknownFlags', 'duplicateIds', 'incompleteDetail');
     }
 
     private static function headers(Worksheet $sheet): array

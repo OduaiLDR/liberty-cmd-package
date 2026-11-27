@@ -7,7 +7,12 @@ namespace Cmd\Reports\Console\Commands\GenerateRetentionManagerCommission;
 use Cmd\Reports\Services\CommissionRosterProvider;
 use Cmd\Reports\Services\DBConnector;
 use Cmd\Reports\Services\EmailSenderService;
+use Cmd\Reports\Services\NsfStructuredCapture;
+use Cmd\Reports\Services\NsfStructuredTeamLeader;
+use Cmd\Reports\Services\PayrollReportArtifactArchive;
 use Cmd\Reports\Services\RetentionCommissionReportBuilder;
+use Cmd\Reports\Services\RetentionStructuredCapture;
+use Cmd\Reports\Services\RetentionLeadershipRules;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
 use PhpOffice\PhpSpreadsheet\IOFactory;
@@ -67,7 +72,7 @@ class GenerateRetentionManagerCommission extends Command
     public static function validatePayrollCalculationContext(array $context): array
     {
         $expected = ['version', 'nsfTeamLeader'];
-        if (array_diff(array_keys($context), $expected) || array_diff($expected, array_keys($context))
+        if (array_diff(array_keys($context), [...$expected, 'retention']) || array_diff($expected, array_keys($context))
             || $context['version'] !== 'cs_leadership_rules_v1' || !is_array($context['nsfTeamLeader'])) {
             throw new \InvalidArgumentException('Frozen leadership calculation context is invalid.');
         }
@@ -92,13 +97,19 @@ class GenerateRetentionManagerCommission extends Command
             if (!is_array($row) || !array_is_list($row) || count($row) !== 3) throw new \InvalidArgumentException('Frozen NSF leadership rates are invalid.');
             foreach ($row as $rate) if ((!is_int($rate) && !is_float($rate)) || !is_finite((float) $rate) || $rate < 0) throw new \InvalidArgumentException('Frozen NSF leadership rates are invalid.');
         }
+        if (array_key_exists('retention', $context)) {
+            if (!is_array($context['retention'])) {
+                throw new \InvalidArgumentException('Frozen Retention leadership rules are invalid.');
+            }
+            RetentionLeadershipRules::validate($context['retention']);
+        }
         return $context;
     }
 
     /** Freeze the existing Rama tranche/cutoff inputs when the source report completes. */
-    public function buildPayrollRetentionContext(array $rows): array
+    public function buildPayrollRetentionContext(array $rows, ?DBConnector $trancheSql = null): array
     {
-        $this->applyTrancheAssignments($rows, true);
+        $this->applyTrancheAssignments($rows, true, $trancheSql);
         $context = [];
         foreach ($rows as $row) {
             $id = trim((string) $this->col($row, 'ID', ''));
@@ -111,9 +122,38 @@ class GenerateRetentionManagerCommission extends Command
     /** Actual leadership workbooks and matching JSON from archived source bytes only. No email or database lookup. */
     public function buildPayrollReviewWorkbookBundle(string $startDate, string $endDate, array $artifacts, string $outputDirectory, ?array $calculationContext = null, bool $onlyNsf = false): array
     {
+        $keys = $onlyNsf ? ['nsf_team_leader'] : PayrollReportArtifactArchive::LEADERSHIP_KEYS;
+        return $this->buildArchivedLeadership($startDate, $endDate, $artifacts, $keys, $outputDirectory, $calculationContext);
+    }
+
+    /** Freeze the calculations and rules before any leadership workbook is requested. */
+    public function freezePayrollReviewLeadership(string $startDate, string $endDate, array $artifacts, ?array $calculationContext = null, bool $onlyNsf = false): array
+    {
+        $keys = $onlyNsf ? ['nsf_team_leader'] : PayrollReportArtifactArchive::LEADERSHIP_KEYS;
+        if ($calculationContext === null && !$onlyNsf) {
+            $calculationContext = self::currentPayrollCalculationContext() + ['retention' => RetentionLeadershipRules::V1];
+        }
+        return $this->buildArchivedLeadership($startDate, $endDate, $artifacts, $keys, null, $calculationContext);
+    }
+
+    /** Reproduce one saved calculation and render only its workbook. */
+    public function renderFrozenPayrollReviewLeadershipWorkbook(string $key, string $startDate, string $endDate, array $artifacts, string $outputDirectory, array $calculationContext, array $savedReport): array
+    {
+        if (!in_array($key, PayrollReportArtifactArchive::LEADERSHIP_KEYS, true)) {
+            throw new \InvalidArgumentException('Unknown Customer Service leadership workbook.');
+        }
+        $built = $this->buildArchivedLeadership($startDate, $endDate, $artifacts, [$key], $outputDirectory, $calculationContext, $savedReport);
+        return $built['files'][$key];
+    }
+
+    private function buildArchivedLeadership(string $startDate, string $endDate, array $artifacts, array $keys, ?string $outputDirectory, ?array $calculationContext, ?array $savedReport = null): array
+    {
         $calculationContext = self::validatePayrollCalculationContext($calculationContext ?? self::currentPayrollCalculationContext());
-        $retentionRows = [];
-        foreach ($onlyNsf ? [] : ['ldr' => 'LDR', 'plaw' => 'Progress Law'] as $source => $display) {
+        $includeNsf = in_array('nsf_team_leader', $keys, true);
+        $includeRetention = $keys !== ['nsf_team_leader'];
+        $structuredRetention = $includeRetention ? RetentionStructuredCapture::payrollInputs($startDate, $artifacts) : null;
+        $retentionRows = $structuredRetention['rows'] ?? [];
+        foreach ($includeRetention && $structuredRetention === null ? ['ldr' => 'LDR', 'plaw' => 'Progress Law'] : [] as $source => $display) {
             $artifact = $artifacts['retention_' . $source] ?? [];
             $context = $artifact['context'] ?? [];
             if (($context['trancheContextReady'] ?? false) !== true || !is_array($context['trancheByClient'] ?? null)) throw new \RuntimeException('Archived retention leadership context is missing. Rerun the correlated source.');
@@ -129,13 +169,16 @@ class GenerateRetentionManagerCommission extends Command
         $retentionRows = $this->filterRetentionRowsForPeriod($retentionRows, $startDate, $endDate);
         $retentionRows = $this->dedupeRetentionRowsByContactId($retentionRows);
         $this->sortRetentionRows($retentionRows);
-        $nsfRows = [];
-        $roster = [];
-        $readinessIds = [];
-        foreach (['ldr' => 'LDR', 'plaw' => 'Progress Law'] as $source => $display) {
-            $path = $artifacts['nsf_' . $source]['path'] ?? '';
-            $nsfRows = array_merge($nsfRows, $this->loadNsfCommissionRowsFromXlsx($path, $display, $readinessIds, $source));
-            foreach ($this->archivedNsfRoster($path) as $name) $roster[$this->anthonyAgentKey($name)] = $name;
+        $nsfRows = $roster = $readinessIds = [];
+        $structuredNsf = $includeNsf ? $this->archivedNsfLeadershipInputs($startDate, $artifacts) : null;
+        if ($structuredNsf !== null) {
+            ['rows' => $nsfRows, 'roster' => $roster, 'readinessIds' => $readinessIds] = $structuredNsf;
+        } elseif ($includeNsf) {
+            foreach (['ldr' => 'LDR', 'plaw' => 'Progress Law'] as $source => $display) {
+                $path = $artifacts['nsf_' . $source]['path'] ?? '';
+                $nsfRows = array_merge($nsfRows, $this->loadNsfCommissionRowsFromXlsx($path, $display, $readinessIds, $source));
+                foreach ($this->archivedNsfRoster($path) as $name) $roster[$this->anthonyAgentKey($name)] = $name;
+            }
         }
         $priorOutput = $this->payrollOutputDirectory;
         $priorRoster = $this->anthonyRosterCache;
@@ -146,21 +189,38 @@ class GenerateRetentionManagerCommission extends Command
         $this->payrollFrozenNsfValidity = true;
         $this->payrollCalculationContext = $calculationContext;
         try {
-            if ($onlyNsf) {
-                $snapshot = $this->buildAnthonyPayrollSnapshot($nsfRows);
-                $snapshot['nsfReadinessRunIds'] = $readinessIds;
-                return ['reports' => ['nsf_team_leader' => $snapshot], 'calculationContext' => $calculationContext,
-                    'files' => ['nsf_team_leader' => $this->buildAnthonyWorkbook('NSF Team Leader', $nsfRows)]];
+            // Older bundles captured the NSF rate table and kept the Retention cap in the saved report.
+            if ($savedReport !== null && $keys === ['retention_team_leader'] && !isset($calculationContext['retention'])) {
+                $savedCap = $savedReport['summary']['commissionCap'] ?? null;
+                if (is_int($savedCap) || is_float($savedCap)) {
+                    $legacyRules = RetentionLeadershipRules::V1;
+                    $legacyRules['teamLeaderCap'] = $savedCap;
+                    RetentionLeadershipRules::validate($legacyRules);
+                    $this->payrollCalculationContext['retention'] = $legacyRules;
+                }
             }
-            $reports = ['retention_manager' => $this->buildRamaPayrollSnapshot($retentionRows),
-                'retention_team_leader' => $this->buildNickPayrollSnapshot($retentionRows, $startDate, $endDate),
-                'nsf_team_leader' => $this->buildAnthonyPayrollSnapshot($nsfRows)];
-            $reports['nsf_team_leader']['nsfReadinessRunIds'] = $readinessIds;
-            return ['reports' => $reports, 'calculationContext' => $calculationContext, 'files' => [
-                'customer_support_manager' => $this->buildWorkbook('rama', 'Customer Support Manager', $retentionRows, $startDate, $endDate),
-                'retention_team_leader' => $this->buildWorkbook('nick', 'Retention Team Leader', $retentionRows, $startDate, $endDate),
-                'nsf_team_leader' => $this->buildAnthonyWorkbook('NSF Team Leader', $nsfRows),
-            ]];
+            $reports = $files = [];
+            foreach ($keys as $key) {
+                $report = match ($key) {
+                    'customer_support_manager' => $this->buildRamaPayrollSnapshot($retentionRows),
+                    'retention_team_leader' => $this->buildNickPayrollSnapshot($retentionRows, $startDate, $endDate),
+                    'nsf_team_leader' => [...$this->buildAnthonyPayrollSnapshot($nsfRows), 'nsfReadinessRunIds' => $readinessIds],
+                };
+                $reports[$report['reportKind']] = $report;
+                if ($savedReport !== null && json_encode($report, JSON_THROW_ON_ERROR) !== json_encode($savedReport, JSON_THROW_ON_ERROR)) {
+                    throw new \RuntimeException('The archived inputs cannot reproduce the frozen leadership report.');
+                }
+            }
+            if ($outputDirectory !== null) {
+                foreach ($keys as $key) {
+                    $files[$key] = match ($key) {
+                        'customer_support_manager' => $this->buildWorkbook('rama', 'Customer Support Manager', $retentionRows, $startDate, $endDate),
+                        'retention_team_leader' => $this->buildWorkbook('nick', 'Retention Team Leader', $retentionRows, $startDate, $endDate),
+                        'nsf_team_leader' => $this->buildAnthonyWorkbook('NSF Team Leader', $nsfRows),
+                    };
+                }
+            }
+            return ['reports' => $reports, 'calculationContext' => $calculationContext, 'files' => $files];
         } finally {
             $this->payrollOutputDirectory = $priorOutput;
             $this->anthonyRosterCache = $priorRoster;
@@ -170,12 +230,30 @@ class GenerateRetentionManagerCommission extends Command
     }
 
     /** One saved leadership calculation, without unrelated sources, current lookups or file publication. */
-    public function buildPayrollReviewLeadershipSnapshot(string $reportKind, string $startDate, string $endDate, array $artifacts): array
+    public function buildPayrollReviewLeadershipSnapshot(string $reportKind, string $startDate, string $endDate, array $artifacts, bool $preferStructured = true): array
     {
         $period = \DateTimeImmutable::createFromFormat('!Y-m-d', $startDate);
         if (!$period || $period->format('Y-m-01') !== $startDate || $period->format('Y-m-t') !== $endDate
             || !in_array($reportKind, ['retention_manager', 'retention_team_leader', 'nsf_team_leader'], true)) {
             throw new \InvalidArgumentException('A supported leadership report and exact reporting month are required.');
+        }
+        if ($preferStructured && $reportKind === 'nsf_team_leader') {
+            $inputs = $this->archivedNsfLeadershipInputs($startDate, $artifacts);
+            if ($inputs !== null) {
+                return $this->buildFrozenNsfLeadershipSnapshot($startDate, $inputs);
+            }
+        }
+        if ($preferStructured && $reportKind !== 'nsf_team_leader') {
+            $inputs = RetentionStructuredCapture::payrollInputs($startDate, $artifacts);
+            if ($inputs !== null) {
+                foreach ($inputs['rows'] as $row) {
+                    if (trim($row['RETENTION_AGENT']) === '') {
+                        throw new \RuntimeException('Archived leadership detail contains an unassigned account identity.');
+                    }
+                }
+                $snapshot = $this->buildRetentionPayrollLeadershipSnapshot($reportKind, $startDate, $endDate, $inputs['rows']);
+                return [...$snapshot, 'periodStart' => $startDate, 'periodEnd' => $endDate];
+            }
         }
         $previousOutput = $this->output ?? null;
         // The shared readers normally log through console output or Laravel; this GET-only path stays silent.
@@ -233,10 +311,7 @@ class GenerateRetentionManagerCommission extends Command
                 $rows = array_merge($rows, $sourceRows);
             }
             if (!$nsf) {
-                $rows = $this->dedupeRetentionRowsByContactId($this->filterRetentionRowsForPeriod($rows, $startDate, $endDate));
-                $this->sortRetentionRows($rows);
-                $snapshot = $reportKind === 'retention_manager' ? $this->buildRamaPayrollSnapshot($rows)
-                    : $this->buildNickPayrollSnapshot($rows, $startDate, $endDate);
+                $snapshot = $this->buildRetentionPayrollLeadershipSnapshot($reportKind, $startDate, $endDate, $rows);
             } else {
                 // LDR and PLAW each own a readiness identity. The enclosing
                 // orchestration capture is a third namespace, not either ID.
@@ -263,6 +338,103 @@ class GenerateRetentionManagerCommission extends Command
             }
             return [...$snapshot, 'periodStart' => $startDate, 'periodEnd' => $endDate];
         } finally { $this->output = $previousOutput; }
+    }
+
+    /** Calculate either Retention leadership report from verified archive metadata alone. */
+    public function buildPayrollReviewRetentionStructuredSnapshot(string $reportKind, string $period, string $runId, array $artifacts): array
+    {
+        if (!in_array($reportKind, ['retention_manager', 'retention_team_leader'], true)) {
+            throw new \InvalidArgumentException('A supported Regular Retention leadership report is required.');
+        }
+        $inputs = RetentionStructuredCapture::inputs($period, $runId, $artifacts);
+        $endDate = $inputs['periodEnd'];
+        $snapshot = $this->buildRetentionPayrollLeadershipSnapshot($reportKind, $period, $endDate, $inputs['rows']);
+
+        return [...$snapshot, 'periodStart' => $period, 'periodEnd' => $endDate];
+    }
+
+    private function buildRetentionPayrollLeadershipSnapshot(string $reportKind, string $startDate, string $endDate, array $rows): array
+    {
+        $rows = $this->dedupeRetentionRowsByContactId($this->filterRetentionRowsForPeriod($rows, $startDate, $endDate));
+        $this->sortRetentionRows($rows);
+
+        return $reportKind === 'retention_manager' ? $this->buildRamaPayrollSnapshot($rows)
+            : $this->buildNickPayrollSnapshot($rows, $startDate, $endDate);
+    }
+
+    /** Calculate leadership from the corresponding trusted v1 query-only NSF export. */
+    public function buildPayrollReviewNsfStructuredSnapshot(string $period, string $runId, array $envelope): array
+    {
+        return $this->buildFrozenNsfLeadershipSnapshot($period, $this->nsfLeadershipInputs($period, $runId, $envelope, requireInvocation: true));
+    }
+
+    private function archivedNsfLeadershipInputs(string $period, array $artifacts): ?array
+    {
+        $pair = [];
+        $hasStructured = false;
+        foreach (['nsf_ldr', 'nsf_plaw'] as $key) {
+            $artifact = $artifacts[$key] ?? [];
+            // Amendment inputs and saved amendment archives use their edited workbook roster.
+            if (!isset($artifact['identity']) || preg_match('/^[a-f0-9]{64}$/D', $artifact['identity'])) {
+                return null;
+            }
+            $pair[$key] = $artifact;
+            $hasStructured = $hasStructured || array_key_exists('nsfStructuredCapture', $artifact['context'] ?? []);
+        }
+        if (!$hasStructured) {
+            return null;
+        }
+
+        foreach ($pair as $artifact) {
+            $context = json_encode($artifact['context'] ?? [], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+            if (!is_string($artifact['contextSha256'] ?? null) || !hash_equals($artifact['contextSha256'], hash('sha256', $context))) {
+                throw new \RuntimeException('Archived NSF leadership context no longer matches its fingerprint.');
+            }
+        }
+        $runId = $pair['nsf_ldr']['identity'];
+        $queryOnly = $pair['nsf_ldr']['context']['queryOnly'] ?? false;
+        $envelope = json_decode(NsfStructuredCapture::export($pair, $period, $runId, $queryOnly), true, flags: JSON_THROW_ON_ERROR);
+        return $this->nsfLeadershipInputs($period, $runId, $envelope);
+    }
+
+    private function nsfLeadershipInputs(string $period, string $runId, array $envelope, bool $requireInvocation = false): array
+    {
+        $inputs = NsfStructuredTeamLeader::inputs($period, $runId, $envelope, $requireInvocation);
+        $roster = [];
+        foreach ($inputs['rosters'] as $names) {
+            $seen = [];
+            foreach ($names as $name) {
+                $key = $this->anthonyAgentKey($name);
+                if (isset($seen[$key])) {
+                    throw new \InvalidArgumentException('An NSF structured roster has an ambiguous identity.');
+                }
+                $seen[$key] = true;
+                $roster[$key] = $name;
+            }
+        }
+        return $inputs + ['roster' => $roster];
+    }
+
+    private function buildFrozenNsfLeadershipSnapshot(string $period, array $inputs): array
+    {
+        $priorRoster = $this->anthonyRosterCache;
+        $priorValidity = $this->payrollFrozenNsfValidity;
+        $priorCalculation = $this->payrollCalculationContext;
+        $this->anthonyRosterCache = array_values($inputs['roster']);
+        $this->payrollFrozenNsfValidity = true;
+        $this->payrollCalculationContext = self::currentPayrollCalculationContext();
+        try {
+            return [
+                ...$this->buildAnthonyPayrollSnapshot($inputs['rows']),
+                'nsfReadinessRunIds' => $inputs['readinessIds'],
+                'periodStart' => $period,
+                'periodEnd' => $inputs['periodEnd'],
+            ];
+        } finally {
+            $this->anthonyRosterCache = $priorRoster;
+            $this->payrollFrozenNsfValidity = $priorValidity;
+            $this->payrollCalculationContext = $priorCalculation;
+        }
     }
 
     /** Company readiness metadata from this saved file only; never reads mutable SQL. */
@@ -563,7 +735,7 @@ class GenerateRetentionManagerCommission extends Command
                 'commissionRateDisplay' => $tier > 0 ? '$' . number_format($this->nickRateForTier($tier, 0), 2) . '+ per retained account' : '$0.00',
                 'uncappedCommission' => round($uncappedCommission, 2),
                 'capReduction' => $capReduction,
-                'commissionCap' => self::NICK_COMMISSION_CAP,
+                'commissionCap' => (float) $this->retentionRules()['teamLeaderCap'],
                 'totalCommission' => round($commission, 2),
                 'totalPay' => round($commission, 2),
             ],
@@ -768,15 +940,6 @@ class GenerateRetentionManagerCommission extends Command
         ['max' => 100000,      't1' => 20, 't2' => 40, 't3' => 60, 't4' => 100],
         ['max' => PHP_INT_MAX, 't1' => 20, 't2' => 40, 't3' => 60, 't4' => 150],
     ];
-
-    private const NICK_RATE_BANDS = [
-        ['min' => 0.50, 'rates' => [8.0, 9.0, 10.0, 11.0]],
-        ['min' => 0.40, 'rates' => [4.0, 5.0, 6.0, 7.0]],
-        ['min' => 0.30, 'rates' => [0.9, 1.0, 2.0, 3.0]],
-    ];
-
-    /** Nick - Retention Team Leader total commission cap (Jacob 2026-08-06). */
-    private const NICK_COMMISSION_CAP = 2000.0;
 
     /** @var array<string,string> */
     /**
@@ -2124,23 +2287,11 @@ class GenerateRetentionManagerCommission extends Command
 
     private function ramaCommission(float $pct, bool $ngf): int
     {
-        if ($ngf) {
-            return match (true) {
-                $pct < 0.40 => 0,
-                $pct < 0.45 => 250,
-                $pct < 0.50 => 500,
-                $pct < 0.60 => 750,
-                default => 1000,
-            };
-        }
-
-        return match (true) {
-            $pct < 0.30 => 0,
-            $pct < 0.35 => 250,
-            $pct < 0.40 => 500,
-            $pct < 0.45 => 750,
-            default => 1000,
-        };
+        $rules = $this->retentionRules();
+        $thresholds = $ngf ? $rules['bonusThresholds'] : $rules['managerThresholds'];
+        $amounts = $ngf ? $rules['bonusAmounts'] : $rules['managerAmounts'];
+        $tier = count(array_filter($thresholds, static fn ($threshold) => $pct >= $threshold));
+        return $amounts[$tier];
     }
 
     /** @return array{assigned:int,retained:int,pct:float,tier:int,commission:float} */
@@ -2184,40 +2335,18 @@ class GenerateRetentionManagerCommission extends Command
 
     private function nickTier(float $pct): int
     {
-        return match (true) {
-            $pct >= 0.50 => 3,
-            $pct >= 0.40 => 2,
-            $pct >= 0.30 => 1,
-            default => 0,
-        };
+        return count(array_filter($this->retentionRules()['teamLeaderThresholds'], static fn ($threshold) => $pct >= $threshold));
     }
 
     private function nickCommissionRate(float $debt, float $pct): float
     {
-        $bracket = match (true) {
-            $debt <= 15000 => 0,
-            $debt <= 30000 => 1,
-            $debt <= 60000 => 2,
-            default => 3,
-        };
-
-        foreach (self::NICK_RATE_BANDS as $band) {
-            if ($pct >= $band['min']) {
-                return $band['rates'][$bracket];
-            }
-        }
-
-        return 0.0;
+        $bracket = count(array_filter($this->retentionRules()['teamLeaderDebtCeilings'], static fn ($ceiling) => $debt > $ceiling));
+        return $this->nickRateForTier($this->nickTier($pct), $bracket);
     }
 
     private function nickRateForTier(int $tier, int $bracket): float
     {
-        return match ($tier) {
-            3 => [8.0, 9.0, 10.0, 11.0][$bracket],
-            2 => [4.0, 5.0, 6.0, 7.0][$bracket],
-            1 => [0.9, 1.0, 2.0, 3.0][$bracket],
-            default => 0.0,
-        };
+        return $this->retentionRules()['teamLeaderRates'][$tier - 1][$bracket] ?? 0.0;
     }
 
     private function overallPct(array $rows): float
@@ -2237,7 +2366,7 @@ class GenerateRetentionManagerCommission extends Command
         return $count;
     }
 
-    private function applyTrancheAssignments(array &$rows, bool $strict = false): void
+    private function applyTrancheAssignments(array &$rows, bool $strict = false, ?DBConnector $trancheSql = null): void
     {
         if (empty($rows)) {
             return;
@@ -2254,7 +2383,7 @@ class GenerateRetentionManagerCommission extends Command
         $map = [];
 
         try {
-            $sql = $this->initSqlServer('ldr');
+            $sql = $trancheSql ?? $this->initSqlServer('ldr');
             foreach (array_chunk($ids, 1000) as $chunk) {
                 $res = $sql->querySqlServer(
                     "SELECT e.LLG_ID, e.Tranche, ts.Payment_Date
@@ -2430,7 +2559,12 @@ class GenerateRetentionManagerCommission extends Command
 
     private function capNickCommission(float $commission): float
     {
-        return min($commission, self::NICK_COMMISSION_CAP);
+        return min($commission, $this->retentionRules()['teamLeaderCap']);
+    }
+
+    private function retentionRules(): array
+    {
+        return $this->payrollCalculationContext['retention'] ?? RetentionLeadershipRules::V1;
     }
 
     private function highlightFinalCommissionCell(\PhpOffice\PhpSpreadsheet\Worksheet\Worksheet $sheet, string $cell): void

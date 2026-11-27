@@ -8,6 +8,7 @@ use Cmd\Reports\Services\CommissionAgentEmailFiles;
 use Cmd\Reports\Services\CommissionResultsWriter;
 use Cmd\Reports\Services\CommissionRosterProvider;
 use Cmd\Reports\Services\EmailSenderService;
+use Cmd\Reports\Services\LookbackPricingSnapshot;
 use Cmd\Reports\Services\RetentionAgentIdentity;
 use Cmd\Reports\Services\PayrollRetentionLookbackWriter;
 use Cmd\Reports\Services\PayrollReportArtifactArchive;
@@ -37,6 +38,7 @@ class GenerateRetentionBonusCommission extends Command
                             {period? : Period start date YYYY-MM-01; defaults to first day of last month}
                             {--no-email : Build workbooks only, skip email}
                             {--no-azure-write : Calculate/build without updating Azure commission results}
+                            {--structured-shadow : Save Lookback line prices alongside a query-only two-company capture}
                             {--test-recipient= : Send EVERY email (All + agent copies) only to this address}';
 
     protected $description = 'Generate Retention Lookback Commission report for LDR and/or PLAW.';
@@ -69,6 +71,15 @@ class GenerateRetentionBonusCommission extends Command
         $arg     = strtolower((string)$this->argument('source'));
         $sources = ($arg === 'both') ? ['ldr', 'plaw'] : [$arg];
         $period  = trim((string) $this->argument('period'));
+        $captureId = null;
+        if ($this->input !== null && $this->option('structured-shadow')) {
+            if (getenv('PAYROLL_LOOKBACK_QUERY_ONLY') !== '1' || $arg !== 'both' || $period === ''
+                || $this->option('test-recipient') !== null) {
+                $this->error('Lookback comparison requires a query-only run for both companies, an explicit month and no email recipient.');
+                return Command::FAILURE;
+            }
+            $captureId = bin2hex(random_bytes(16));
+        }
         if ($period !== '' && !$this->isValidPeriodStart($period)) {
             $this->error('period must be a valid YYYY-MM-01 date.');
             return Command::FAILURE;
@@ -81,12 +92,17 @@ class GenerateRetentionBonusCommission extends Command
             $this->error($error->getMessage());
             return Command::FAILURE;
         }
+        if ($captureId === null && $this->input !== null && $arg === 'both' && $runId !== null
+            && $this->option('no-email') && (!$this->option('no-azure-write') || getenv('PAYROLL_LOOKBACK_QUERY_ONLY') === '1')
+            && PayrollReportArtifactArchive::captureRequested()) {
+            $captureId = bin2hex(random_bytes(16));
+        }
         foreach ($sources as $src) {
             if (!isset(self::SOURCE_CONFIG[$src])) {
                 $this->error("Unknown source: $src");
                 return Command::FAILURE;
             }
-            if (!$this->runForSource($src, $period ?: null, $runId)) {
+            if (!$this->runForSource($src, $period ?: null, $runId, $captureId)) {
                 return Command::FAILURE;
             }
         }
@@ -100,7 +116,7 @@ class GenerateRetentionBonusCommission extends Command
         return $date !== false && $date->format('Y-m-d') === $period && $date->format('d') === '01';
     }
 
-    private function runForSource(string $source, ?string $periodStart = null, ?string $runId = null): bool
+    private function runForSource(string $source, ?string $periodStart = null, ?string $runId = null, ?string $captureId = null): bool
     {
         $cfg     = self::SOURCE_CONFIG[$source];
         $display = $cfg['display'];
@@ -314,9 +330,13 @@ class GenerateRetentionBonusCommission extends Command
             }
 
             $formatter = new BonusFormatter();
-            if ($queryOnly) {
-                $outputDirectory = storage_path('app/payroll-lookback-query-tmp/' . $runId . '/' . $source);
-                if (!is_dir($outputDirectory) && !@mkdir($outputDirectory, 0700, true) && !is_dir($outputDirectory)) throw new \RuntimeException('Cannot create isolated Lookback workbook directory.');
+            if ($queryOnly || $captureId !== null) {
+                $temporaryRun = $captureId === null ? $runId : $runId . '-' . $captureId;
+                $root = $queryOnly ? 'payroll-lookback-query-tmp' : 'payroll-lookback-runs';
+                $outputDirectory = storage_path('app/' . $root . '/' . $temporaryRun . '/' . $source);
+                if (!is_dir($outputDirectory) && !@mkdir($outputDirectory, 0700, true) && !is_dir($outputDirectory)) {
+                    throw new \RuntimeException('Cannot create isolated Lookback workbook directory.');
+                }
             }
             $allFile = $formatter->buildWorkbook(
                 $rows, $display, $reportStartDate, $endDate, $employeeMap, null, $source, $rosterAgents, $unassigned, $outputDirectory
@@ -330,6 +350,19 @@ class GenerateRetentionBonusCommission extends Command
             // rows. Reset and replacement then share one transaction.
             $salesManifest = PayrollReportArtifactArchive::captureRequested()
                 ? PayrollRetentionLookbackWriter::prepare($sql, $source, $reportStartDate, $runId, $rows) : null;
+            $archiveContext = null;
+            if ($queryOnly || !(bool) $this->option('no-azure-write')) {
+                $archiveContext = PayrollReportArtifactArchive::captureRequested()
+                    ? ['commissionResults' => PayrollCommissionResultSnapshot::component('retention', $source, $reportStartDate, 'bonusCommission', $bonusResults)] : [];
+                if ($salesManifest !== null) $archiveContext['salesDeductions'] = $salesManifest;
+                if ($queryOnly) $archiveContext['queryOnly'] = true;
+                if ($captureId !== null) {
+                    $archiveContext['lookbackPricing'] = LookbackPricingSnapshot::capture($captureId, $rows, $archiveContext['commissionResults']);
+                }
+            }
+            if (!$queryOnly && $captureId !== null) {
+                $this->publishLegacyWorkbook($allFile, $captureId);
+            }
             $persisted = $this->persistBonusResults(
                 $sql, $source, $reportStartDate, $bonusResults,
                 $queryOnly || (bool) $this->option('no-azure-write'), $rows, $runId, $salesManifest
@@ -339,12 +372,8 @@ class GenerateRetentionBonusCommission extends Command
             } elseif ($notice = CommissionResultsWriter::failureNotice($persisted, $display)) {
                 $this->warn($notice);
             }
-            if ($queryOnly || !(bool) $this->option('no-azure-write')) {
-                $context = PayrollReportArtifactArchive::captureRequested()
-                    ? ['commissionResults' => PayrollCommissionResultSnapshot::component('retention', $source, $reportStartDate, 'bonusCommission', $bonusResults)] : [];
-                if ($salesManifest !== null) $context['salesDeductions'] = $salesManifest;
-                if ($queryOnly) $context['queryOnly'] = true;
-                PayrollReportArtifactArchive::captureFromEnvironment('lookback', $source, $reportStartDate, $allFile, $context);
+            if ($archiveContext !== null) {
+                PayrollReportArtifactArchive::captureFromEnvironment('lookback', $source, $reportStartDate, $allFile, $archiveContext);
             }
 
             if ($allFile) {
@@ -376,10 +405,27 @@ class GenerateRetentionBonusCommission extends Command
             Log::error("GenerateRetentionBonusCommission[$display]: failed", ['ex' => $e]);
             return false;
         } finally {
-            if ($queryOnly && is_array($allFile) && isset($allFile['path']) && is_file($allFile['path'])) @unlink($allFile['path']);
-            if ($queryOnly && $outputDirectory !== null && is_dir($outputDirectory)) @rmdir($outputDirectory);
+            if ($outputDirectory !== null && is_array($allFile) && is_file($allFile['path'])) @unlink($allFile['path']);
+            if ($outputDirectory !== null && is_dir($outputDirectory)) {
+                @rmdir($outputDirectory);
+                if ($captureId !== null) @rmdir(dirname($outputDirectory));
+            }
         }
         return true;
+    }
+
+    private function publishLegacyWorkbook(array $file, string $captureId): void
+    {
+        // Preserve the existing latest file while keeping the captured bytes private to this invocation.
+        $destination = storage_path('app/' . $file['filename']);
+        $temporary = $destination . '.' . $captureId . '.tmp';
+        try {
+            if (!@copy($file['path'], $temporary) || !@rename($temporary, $destination)) {
+                throw new \RuntimeException('The current Lookback workbook could not be published.');
+            }
+        } finally {
+            if (is_file($temporary)) @unlink($temporary);
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
