@@ -16,6 +16,7 @@ use Generator;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Validation\ValidationException;
 use League\Flysystem\UnableToReadFile;
@@ -37,6 +38,9 @@ final class ProspectListController
     {
         if ($request->boolean('filters.fresh_mailed') && ! config('prospect-list-builder.stamp_exports')) {
             throw ValidationException::withMessages(['filters.fresh_mailed' => 'Enable export history on the runner to export newest mailed records.']);
+        }
+        if ($request->validated('filters.suppression') !== null && ! config('prospect-list-builder.stamp_exports')) {
+            throw ValidationException::withMessages(['filters.suppression' => 'Export history must be enabled to use suppression.']);
         }
 
         $count = $this->find($request, $request->validated('count_id'));
@@ -79,6 +83,14 @@ final class ProspectListController
         $fileName = $campaignId === null
             ? 'prospect-list-'.$run['id'].($split ? '-part-'.$partNumber : '').'.csv'
             : $campaignId.'.csv';
+
+        Log::info('Prospect campaign download requested.', [
+            'campaign_id' => $campaignId,
+            'export_key' => $key,
+            'part' => $partNumber,
+            'tenant' => $request->header('X-Prospect-Tenant'),
+            'actor' => $request->header('X-Prospect-Actor'),
+        ]);
 
         return response()->json([
             'url' => $disk->temporaryUrl($path, now()->addMinutes(5), [

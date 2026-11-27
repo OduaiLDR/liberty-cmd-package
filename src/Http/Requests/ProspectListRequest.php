@@ -25,7 +25,7 @@ final class ProspectListRequest extends FormRequest
         $filterDefinitions = ProspectListFields::filterColumns();
         $rules = [
             'id' => ['required', 'uuid'],
-            'filters' => ['present', 'array:states,debt_min,debt_max,score_min,score_max,age_min,age_max,date_from,date_to,contact,months_since_pull,fresh_mailed,include_opted_out,include_bad_phone,include_contacted,fields'],
+            'filters' => ['present', 'array:states,debt_min,debt_max,score_min,score_max,age_min,age_max,date_from,date_to,contact,months_since_pull,fresh_mailed,recent_first,max_record_age_weeks,suppression,suppression_weeks,include_opted_out,include_bad_phone,include_contacted,fields'],
             'filters.fields' => ['sometimes', 'array:'.implode(',', array_keys($filterDefinitions))],
             'filters.states' => ['sometimes', 'array', 'list', 'max:60'],
             'filters.states.*' => ['required', 'regex:/\A[A-Z]{2}\z/', 'distinct'],
@@ -38,6 +38,10 @@ final class ProspectListRequest extends FormRequest
             'filters.contact' => ['sometimes', Rule::in(['phone', 'phone_email'])],
             'filters.months_since_pull' => ['sometimes', 'integer', 'between:1,120'],
             'filters.fresh_mailed' => ['sometimes', 'boolean'],
+            'filters.recent_first' => ['sometimes', 'boolean'],
+            'filters.max_record_age_weeks' => ['sometimes', 'integer', 'between:1,520'],
+            'filters.suppression' => ['sometimes', Rule::in(['weeks', 'all_time'])],
+            'filters.suppression_weeks' => ['required_if:filters.suppression,weeks', 'prohibited_unless:filters.suppression,weeks', 'integer', 'between:1,520'],
         ];
 
         foreach (['age_min', 'age_max'] as $key) {

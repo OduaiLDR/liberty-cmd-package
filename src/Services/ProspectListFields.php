@@ -154,6 +154,8 @@ final class ProspectListFields
             'campaign_columns' => ProspectCampaignCsv::catalog(),
             'age_filter' => self::birthDateColumn() !== null,
             'fresh_mailed_filter' => true,
+            'record_recency_filters' => true,
+            'export_suppression' => (bool) config('prospect-list-builder.stamp_exports'),
             'exclusion_overrides' => config('prospect-list-builder.allow_exclusion_overrides', false),
             'tcpa_scrub' => (bool) config('prospect-list-builder.tcpa_scrub.enabled'),
             'data_source' => config('prospect-list-builder.data_source'),

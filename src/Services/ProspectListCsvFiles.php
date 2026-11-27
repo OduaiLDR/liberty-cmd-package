@@ -12,6 +12,8 @@ final class ProspectListCsvFiles
 {
     /** @var resource|null */
     private $stream = null;
+    /** @var resource|null */
+    private $membership = null;
 
     private int $rowsInFile = 0;
 
@@ -30,7 +32,7 @@ final class ProspectListCsvFiles
         private ?int $campaignColumnIndex = null,
     ) {}
 
-    public function write(array $row): void
+    public function write(array $row, int $prospectId): void
     {
         if ($this->stream === null) {
             $this->open();
@@ -38,7 +40,9 @@ final class ProspectListCsvFiles
         if ($this->campaignColumnIndex !== null) {
             $row[$this->campaignColumnIndex] = $this->campaignId;
         }
-        if (fputcsv($this->stream, $row, escape: '') === false) {
+        $membershipLine = $prospectId."\n";
+        if (fputcsv($this->stream, $row, escape: '') === false
+            || fwrite($this->membership, $membershipLine) !== strlen($membershipLine)) {
             throw new RuntimeException('Unable to write the prospect list.');
         }
 
@@ -65,6 +69,7 @@ final class ProspectListCsvFiles
         if (! $this->uploadAttempted) {
             return;
         }
+        $this->disk->deleteDirectory(ProspectListRuns::membershipDirectory($this->key));
         if ($this->rowsPerFile === null) {
             $this->disk->delete(ProspectListRuns::artifact($this->key));
         } else {
@@ -78,6 +83,10 @@ final class ProspectListCsvFiles
             fclose($this->stream);
             $this->stream = null;
         }
+        if ($this->membership !== null) {
+            fclose($this->membership);
+            $this->membership = null;
+        }
     }
 
     private function open(): void
@@ -87,6 +96,11 @@ final class ProspectListCsvFiles
             throw new RuntimeException('Unable to create a temporary prospect list.');
         }
         $this->stream = $stream;
+        $membership = tmpfile();
+        if ($membership === false) {
+            throw new RuntimeException('Unable to track the campaign prospect IDs.');
+        }
+        $this->membership = $membership;
         $this->rowsInFile = 0;
         $this->campaignId = ProspectListExportFiles::reserve($this->key, $this->fileCount + 1, $this->mailerId);
         if (fputcsv($this->stream, $this->headers, escape: '') === false) {
@@ -102,6 +116,11 @@ final class ProspectListCsvFiles
         $this->uploadAttempted = true;
         if (! $this->disk->put($path, $this->stream, ['visibility' => 'private', 'ContentType' => 'text/csv; charset=UTF-8'])) {
             throw new RuntimeException('Unable to store the prospect list.');
+        }
+        rewind($this->membership);
+        $historyPath = ProspectListRuns::membershipDirectory($this->key).'/'.$this->campaignId.'.ids';
+        if (! $this->disk->put($historyPath, $this->membership, ['visibility' => 'private', 'ContentType' => 'text/plain'])) {
+            throw new RuntimeException('Unable to store the campaign prospect IDs.');
         }
         ProspectListExportFiles::recordRows($this->key, $this->fileCount + 1, $this->rowsInFile);
         $this->fileCount++;

@@ -295,6 +295,82 @@ test('newest mailed pulls keep filters, cross page and date boundaries, and skip
     expect($this->prospects->preview($filters, $columns, $date, 1)->first()->mailed_on)->toBe('2026-09-15');
 });
 
+test('lookback and suppression independently narrow the same records used by preview and export', function (): void {
+    $base = ['Contacted' => 0, 'Opt_Out' => 0, 'Invalid_Phone' => 0, 'Current_Debt' => 100000];
+    $this->connection->table('TblProspects')->insert([
+        [...$base, 'PK' => 30, 'Creation_Date' => '2026-10-27', 'Latest_Export_Date' => null, 'Last_SMS_Date' => null],
+        [...$base, 'PK' => 31, 'Creation_Date' => '2026-11-24', 'Latest_Export_Date' => '2026-10-12', 'Last_SMS_Date' => null],
+        [...$base, 'PK' => 32, 'Creation_Date' => '2026-11-22', 'Latest_Export_Date' => '2026-10-13', 'Last_SMS_Date' => null],
+        [...$base, 'PK' => 33, 'Creation_Date' => '2026-11-23', 'Latest_Export_Date' => null, 'Last_SMS_Date' => '2026-11-04'],
+        [...$base, 'PK' => 34, 'Creation_Date' => '2026-10-26', 'Latest_Export_Date' => null, 'Last_SMS_Date' => null],
+        [...$base, 'PK' => 35, 'Creation_Date' => '2026-11-25', 'Latest_Export_Date' => null, 'Last_SMS_Date' => null],
+        [...$base, 'PK' => 36, 'Creation_Date' => null, 'Latest_Export_Date' => null, 'Last_SMS_Date' => null],
+        [...$base, 'PK' => 37, 'Creation_Date' => '2026-11-24', 'Latest_Export_Date' => null, 'Last_SMS_Date' => null],
+    ]);
+    $asOf = Carbon::parse('2026-11-24');
+    $filters = ['recent_first' => true, 'max_record_age_weeks' => 4, 'debt_min' => 100000];
+    $weeks = $filters + ['suppression' => 'weeks', 'suppression_weeks' => 6];
+    $never = $filters + ['suppression' => 'all_time'];
+    expect($this->prospects->count($filters, $asOf))->toBe(5)
+        ->and($this->prospects->count($weeks, $asOf))->toBe(3)
+        ->and($this->prospects->count($never, $asOf))->toBe(2)
+        ->and($this->prospects->preview($weeks, ['debt'], $asOf, 10)->pluck('prospect_id')->all())->toBe([31, 37, 30])
+        ->and($this->prospects->preview($never, ['debt'], $asOf, 10)->pluck('prospect_id')->all())->toBe([37, 30])
+        ->and(array_column($this->prospects->diagnostics($weeks, $asOf)['filters'], 'key'))->toContain('record_age', 'suppression');
+
+    $ids = [];
+    $this->prospects->eachBatch($weeks, ['debt'], $asOf, 10, static function ($rows) use (&$ids): void {
+        array_push($ids, ...$rows->pluck('prospect_id')->all());
+    });
+    expect($ids)->toBe([31, 37, 30]);
+});
+
+test('newest records export paginates ties and missing dates without repeating prospects', function (): void {
+    $this->connection->statement("WITH RECURSIVE ids (id) AS (
+        SELECT 100 UNION ALL SELECT id + 1 FROM ids WHERE id < 4103
+    ) INSERT INTO TblProspects (PK, Creation_Date, Contacted, Opt_Out, Invalid_Phone, Current_Debt)
+        SELECT id, CASE WHEN id >= 2102 THEN '2026-11-24' WHEN id = 100 THEN '2026-11-20' END, 0, 0, 0, 100000 FROM ids");
+    $ids = [];
+    $filters = ['recent_first' => true, 'debt_min' => 100000];
+    $this->prospects->eachBatch($filters, ['debt'], Carbon::parse('2026-11-24'), 4004, static function ($rows) use (&$ids): void {
+        array_push($ids, ...$rows->pluck('prospect_id')->all());
+    });
+    expect($ids)->toBe([...range(2102, 4103), 100, ...range(101, 2101)]);
+});
+
+test('newest preview ranks before loading TU output and matches export ordering and overrides', function (): void {
+    $filters = ['recent_first' => true, 'include_contacted' => true];
+    $columns = ['full_name', 'score', 'first_name'];
+    $asOf = Carbon::parse('2026-11-24');
+    $export = [];
+    $this->prospects->eachBatch($filters, $columns, $asOf, 6, static function ($rows) use (&$export): void {
+        $export = $rows->all();
+    });
+
+    $preview = $this->prospects->preview($filters, $columns, $asOf, 6);
+    expect($preview->all())->toEqual($export)
+        ->and($preview->pluck('prospect_id')->all())->toContain(3)
+        ->and($preview->first()->score)->toBe(650);
+});
+
+test('suppression weeks are required and accepted only in the weeks mode', function (array $filters, array $errors): void {
+    $validator = new Factory(new Translator(new ArrayLoader(), 'en'));
+    $request = ProspectListRequest::create('/', 'POST', [
+        'id' => '219ac986-0235-704b-9343-1c8c2850a3a0',
+        'filters' => $filters,
+    ]);
+
+    expect($validator->make($request->all(), $request->rules())->errors()->keys())->toBe($errors);
+})->with([
+    'weekly suppression' => [['suppression' => 'weeks', 'suppression_weeks' => 6], []],
+    'no week count' => [['suppression' => 'weeks'], ['filters.suppression_weeks']],
+    'invalid week count' => [['suppression' => 'weeks', 'suppression_weeks' => 0], ['filters.suppression_weeks']],
+    'all time' => [['suppression' => 'all_time'], []],
+    'all time with weeks' => [['suppression' => 'all_time', 'suppression_weeks' => 6], ['filters.suppression_weeks']],
+    'lookback' => [['recent_first' => true, 'max_record_age_weeks' => 4], []],
+    'invalid lookback' => [['max_record_age_weeks' => 521], ['filters.max_record_age_weeks']],
+]);
+
 test('export results reconcile with the headers and populated values actually written to each CSV', function (?int $rowsPerFile, array $partSizes): void {
     config(['prospect-list-builder.disk' => 'fixture', 'prospect-list-builder.stamp_exports' => false]);
     $this->connection->table('TblProspects')->where('PK', 1)->update(['Address' => '10 Example Lane', 'Zip' => '90210-1234']);
@@ -313,13 +389,22 @@ test('export results reconcile with the headers and populated values actually wr
         $parts = [];
         $cache = new CacheRepository(new ArrayStore());
         $disk = Mockery::mock(\Illuminate\Filesystem\FilesystemAdapter::class);
-        $disk->shouldReceive('put')->times(count($partSizes))->andReturnUsing(function (string $path, $stream) use (&$parts): bool {
+        $disk->shouldReceive('put')->times(count($partSizes))->withArgs(static fn (string $path): bool => str_ends_with($path, '.csv'))
+            ->andReturnUsing(function (string $path, $stream) use (&$parts): bool {
             while (($record = fgetcsv($stream, escape: '')) !== false) {
                 $parts[$path][] = $record;
             }
 
             return true;
         });
+        $membership = [];
+        $disk->shouldReceive('put')->times(count($partSizes))->withArgs(static fn (string $path): bool => str_ends_with($path, '.ids'))
+            ->andReturnUsing(function (string $path, $stream, array $options) use (&$membership): bool {
+                expect($options['visibility'])->toBe('private');
+                $membership[$path] = array_map(intval(...), explode("\n", trim(stream_get_contents($stream))));
+
+                return true;
+            });
         $storage = Mockery::mock(\Illuminate\Filesystem\FilesystemManager::class);
         $storage->shouldReceive('disk')->with('fixture')->andReturn($disk);
         Storage::swap($storage);
@@ -362,6 +447,11 @@ test('export results reconcile with the headers and populated values actually wr
             array_push($rows, ...$fileRows);
         }
         expect(array_unique($campaignIds))->toBe($campaignIds)
+            ->and(array_keys($membership))->toBe(array_map(
+                static fn (string $campaignId): string => ProspectListRuns::membershipDirectory($key)."/$campaignId.ids",
+                $campaignIds,
+            ))
+            ->and(array_values($membership))->toBe(array_chunk([1, 5, 6, 7, 8], $rowsPerFile ?? 5))
             ->and($rows[0][4])->toBe("'=1+1")
             ->and(array_column($rows, 1))->toBe(array_fill(0, 5, 'mailers'))
             ->and(array_column($rows, 6))->toBe(['001234567890', '', '', '1234567890', ''])
@@ -401,7 +491,8 @@ test('CSV parts stream three million rows with one million rows in each file', f
     $key = ProspectListRuns::key('lendingtower', 'actor', 'large-export');
     $disk = Mockery::mock(\Illuminate\Filesystem\FilesystemAdapter::class);
     $published = [];
-    $disk->shouldReceive('put')->times(3)->andReturnUsing(function (string $path, $stream) use (&$published): bool {
+    $disk->shouldReceive('put')->times(3)->withArgs(static fn (string $path): bool => str_ends_with($path, '.csv'))
+        ->andReturnUsing(function (string $path, $stream) use (&$published): bool {
         expect(fgetcsv($stream, escape: ''))->toBe(['State']);
         $rows = 0;
         while (! feof($stream)) {
@@ -411,10 +502,11 @@ test('CSV parts stream three million rows with one million rows in each file', f
 
         return true;
     });
+    $disk->shouldReceive('put')->times(3)->withArgs(static fn (string $path): bool => str_ends_with($path, '.ids'))->andReturn(true);
     $files = new ProspectListCsvFiles($disk, $key, ['State'], 1_000_000);
     try {
         for ($row = 0; $row < 3_000_000; $row++) {
-            $files->write(['CA']);
+            $files->write(['CA'], $row + 1);
         }
         expect($files->finish(false))->toBe(3)->and($published)->toBe([
             ProspectListRuns::artifact($key, 1) => 1_000_000,
@@ -439,22 +531,30 @@ test('personal loan amount rounds positive raw TU debt up by exactly one thousan
     'negative debt' => ['-0.01', null],
 ]);
 
-test('a failed part upload discards only files belonging to that export', function (): void {
+test('a failed part upload discards only files belonging to that export', function (bool $historyFails): void {
     $key = ProspectListRuns::key('lendingtower', 'actor', 'failed-export');
     $disk = Mockery::mock(\Illuminate\Filesystem\FilesystemAdapter::class);
     $disk->shouldReceive('put')->with(ProspectListRuns::artifact($key, 1), Mockery::any(), Mockery::any())->once()->andReturn(true);
-    $disk->shouldReceive('put')->with(ProspectListRuns::artifact($key, 2), Mockery::any(), Mockery::any())->once()->andReturn(false);
+    $disk->shouldReceive('put')->with(ProspectListRuns::artifact($key, 2), Mockery::any(), Mockery::any())->once()->andReturn($historyFails);
+    $historyUpload = $disk->shouldReceive('put')->withArgs(static fn (string $path): bool => str_ends_with($path, '.ids'));
+    if ($historyFails) {
+        $historyUpload->twice()->andReturn(true, false);
+    } else {
+        $historyUpload->once()->andReturn(true);
+    }
     $disk->shouldReceive('deleteDirectory')->with(ProspectListRuns::artifactDirectory($key))->once()->andReturn(true);
+    $disk->shouldReceive('deleteDirectory')->with(ProspectListRuns::membershipDirectory($key))->once()->andReturn(true);
     $files = new ProspectListCsvFiles($disk, $key, ['State'], 1);
     try {
-        $files->write(['CA']);
-        expect(fn () => $files->write(['NY']))->toThrow(RuntimeException::class, 'Unable to store the prospect list');
+        $files->write(['CA'], 1);
+        $message = $historyFails ? 'Unable to store the campaign prospect IDs.' : 'Unable to store the prospect list.';
+        expect(fn () => $files->write(['NY'], 2))->toThrow(RuntimeException::class, $message);
         $files->discard();
     } finally {
         $files->close();
         Mockery::close();
     }
-});
+})->with(['CSV upload fails' => false, 'membership upload fails' => true]);
 
 test('campaign exports match the vendor layout and keep one campaign ID per downloaded file', function (?string $assignedMailerId): void {
     config(['prospect-list-builder.disk' => 'fixture', 'prospect-list-builder.stamp_exports' => true]);
@@ -495,13 +595,15 @@ test('campaign exports match the vendor layout and keep one campaign ID per down
     Cache::swap($cache);
     $parts = [];
     $disk = Mockery::mock(\Illuminate\Filesystem\FilesystemAdapter::class);
-    $disk->shouldReceive('put')->times(2)->andReturnUsing(function (string $path, $stream) use (&$parts): bool {
+    $disk->shouldReceive('put')->times(2)->withArgs(static fn (string $path): bool => str_ends_with($path, '.csv'))
+        ->andReturnUsing(function (string $path, $stream) use (&$parts): bool {
         while (($row = fgetcsv($stream, escape: '')) !== false) {
             $parts[$path][] = $row;
         }
 
         return true;
     });
+    $disk->shouldReceive('put')->times(2)->withArgs(static fn (string $path): bool => str_ends_with($path, '.ids'))->andReturn(true);
     $disk->shouldReceive('exists')->andReturnUsing(static function (string $path) use (&$parts): bool {
         return isset($parts[$path]);
     });
@@ -510,7 +612,12 @@ test('campaign exports match the vendor layout and keep one campaign ID per down
     $storage->shouldReceive('disk')->with('fixture')->andReturn($disk);
     Storage::swap($storage);
     $logger = Mockery::mock(\Psr\Log\LoggerInterface::class);
-    $logger->shouldReceive('info')->once();
+    $logger->shouldReceive('info')->with('Prospect list exported.', Mockery::any())->once();
+    $logger->shouldReceive('info')->with('Prospect campaign download requested.', Mockery::on(
+        static fn (array $context): bool => $context['export_key'] === $key
+            && $context['campaign_id'] === ProspectListExportFiles::find($key, $context['part'])
+            && $context['tenant'] === 'lendingtower' && $context['actor'] === 'actor',
+    ))->times(4);
     Log::swap($logger);
     $responses = Mockery::mock(ResponseFactory::class);
     $responses->shouldReceive('json')->andReturnUsing(static fn (array $response) => new JsonResponse($response));
@@ -585,7 +692,9 @@ test('TCPA screening runs before publishing the selected CSV columns and stamps 
         $csvRows = [];
         $cache = new CacheRepository(new ArrayStore());
         $disk = Mockery::mock(\Illuminate\Filesystem\FilesystemAdapter::class);
-        $put = $disk->shouldReceive('put');
+        $put = $disk->shouldReceive('put')->withArgs(static fn (string $path): bool => str_ends_with($path, '.csv'));
+        $disk->shouldReceive('put')->withArgs(static fn (string $path): bool => str_ends_with($path, '.ids'))
+            ->times($scenario === 'successful' ? 1 : 0)->andReturn(true);
         if ($scenario === 'successful') {
             $put->once()->andReturnUsing(function (string $path, $stream) use (&$csvRows): bool {
                 while (($row = fgetcsv($stream, escape: '')) !== false) {
@@ -911,4 +1020,16 @@ test('Azure age filters bind date bounds and parse the TU text field', function 
 
     expect($queries[0]['query'])->toContain("TRY_CONVERT(date, NULLIF(LTRIM(RTRIM([t].[DOB])), ''), 23) BETWEEN '1980-11-25' AND '1991-11-24'")
         ->and(array_slice($queries[0]['bindings'], -2))->toBe(['1980-11-25', '1991-11-24']);
+
+    $queries = $connection->pretend(function () use ($prospects): void {
+        $date = Carbon::parse('2026-11-24');
+        $prospects->count(['fields' => ['utilization' => ['operator' => 'range', 'maximum' => '100000']]], $date);
+        $prospects->diagnostics(['fresh_mailed' => true], $date);
+    });
+
+    expect($queries[0]['query'])->toContain('[t].[derivedFields_UnsecUtilization] <= CAST(')
+        ->toContain('AS decimal(28, 10))')
+        ->and($queries[0]['bindings'])->toContain('100000')
+        ->and($queries[1]['query'])->toContain('outer apply', '[mail_match].[found] is not null', 'OPTION (MAXDOP 1)')
+        ->not->toContain('exists (');
 });

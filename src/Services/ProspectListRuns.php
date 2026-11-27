@@ -33,6 +33,11 @@ final class ProspectListRuns
         return 'prospect-lists/'.substr($key, strlen('prospect-list:'));
     }
 
+    public static function membershipDirectory(string $key): string
+    {
+        return 'prospect-list-history/'.substr($key, strlen('prospect-list:'));
+    }
+
     public static function fingerprint(array $filters): string
     {
         ksort($filters);

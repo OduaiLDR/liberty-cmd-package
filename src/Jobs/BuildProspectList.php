@@ -79,6 +79,9 @@ final class BuildProspectList implements ShouldQueue
                 if (! empty($this->filters['fresh_mailed'])) {
                     throw new RuntimeException('Newest mailed exports require export history.');
                 }
+                if (isset($this->filters['suppression'])) {
+                    throw new RuntimeException('Export suppression requires export history.');
+                }
                 $result = $this->export($prospects, $asOf, false, $run['campaign'] ?? null);
             }
 
@@ -150,7 +153,7 @@ final class BuildProspectList implements ShouldQueue
                             }
                             $states[$state] = ($states[$state] ?? 0) + 1;
                         }
-                        $files->write($cells);
+                        $files->write($cells, (int) $row->prospect_id);
                         $count++;
                         if (is_resource($idStream)) {
                             $writtenIds[] = $row->prospect_id;
@@ -239,8 +242,14 @@ final class BuildProspectList implements ShouldQueue
                 $run['failure_reason'] = 'tcpa_scrub';
             }
             $store->put($this->key, $run, ProspectListRuns::RETENTION_SECONDS);
-            if ($error instanceof TimeoutExceededException && ($this->rowsPerFile ?? null) !== null) {
-                Storage::disk(config('prospect-list-builder.disk'))->deleteDirectory(ProspectListRuns::artifactDirectory($this->key));
+            if ($error instanceof TimeoutExceededException && $this->columns !== null) {
+                $disk = Storage::disk(config('prospect-list-builder.disk'));
+                $disk->deleteDirectory(ProspectListRuns::membershipDirectory($this->key));
+                if (($this->rowsPerFile ?? null) === null) {
+                    $disk->delete(ProspectListRuns::artifact($this->key));
+                } else {
+                    $disk->deleteDirectory(ProspectListRuns::artifactDirectory($this->key));
+                }
             }
         }
     }

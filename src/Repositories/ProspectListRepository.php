@@ -34,7 +34,7 @@ class ProspectListRepository extends SqlSrvRepository
             $lastRow = null;
             while ($rowLimit > 0) {
                 $pageSize = min(self::EXPORT_BATCH_SIZE, $rowLimit);
-                $page = (clone $query)->forPageAfterId($pageSize, $lastRow?->prospect_id, 'p.PK');
+                $page = $this->orderRecordPage(clone $query, $filters, $pageSize, $lastRow);
                 $rows = $this->readExportPage($page, $filters, $columns);
                 if ($rows->isEmpty() || $consume($rows) === false || $rows->count() < $pageSize) {
                     return;
@@ -49,13 +49,64 @@ class ProspectListRepository extends SqlSrvRepository
     public function preview(array $filters, array $columns, Carbon $asOf, int $rowLimit): Collection
     {
         return $this->withQueryTimeout(8, function () use ($filters, $columns, $asOf, $rowLimit): Collection {
-            $query = $this->exportQuery($filters, $columns, $asOf);
-            $page = empty($filters['fresh_mailed'])
-                ? $query->forPageAfterId($rowLimit, null, 'p.PK')
-                : $this->rankByMailDate($query, $asOf, $rowLimit);
+            if (empty($filters['fresh_mailed']) && ! empty($filters['recent_first']) && $this->projectsTuFields($columns)) {
+                $page = $this->rankedRecordPreview($filters, $columns, $asOf, $rowLimit);
+            } else {
+                $query = $this->exportQuery($filters, $columns, $asOf);
+                $page = empty($filters['fresh_mailed'])
+                    ? $this->orderRecordPage($query, $filters, $rowLimit)
+                    : $this->rankByMailDate($query, $asOf, $rowLimit);
+            }
 
             return $this->readExportPage($page, $filters, $columns);
         });
+    }
+
+    private function projectsTuFields(array $columns): bool
+    {
+        $definitions = ProspectListFields::columns();
+        foreach ($columns as $column) {
+            if ($column !== 'personal_loan_amount' && str_starts_with($definitions[$column][1] ?? '', 't.')) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function rankedRecordPreview(array $filters, array $columns, Carbon $asOf, int $rowLimit): Builder
+    {
+        // Sort the IDs before loading TU fields that are only used in the output.
+        $ranked = $this->orderRecordPage(
+            $this->filtered($filters, $asOf)->select('p.PK as prospect_id'), $filters, $rowLimit,
+        );
+        $eligibilityOverrides = array_intersect_key($filters, array_flip(['include_opted_out', 'include_bad_phone', 'include_contacted']));
+
+        return $this->exportQuery($eligibilityOverrides, $columns, $asOf)
+            ->joinSub($ranked, 'ranked', static fn (JoinClause $join) => $join->on('ranked.prospect_id', '=', 'p.PK'))
+            ->addSelect('ranked.record_date')->orderByDesc('ranked.record_date')->orderBy('p.PK');
+    }
+
+    private function orderRecordPage(Builder $query, array $filters, int $size, ?object $lastRow = null): Builder
+    {
+        if (empty($filters['recent_first'])) {
+            return $query->forPageAfterId($size, $lastRow?->prospect_id, 'p.PK');
+        }
+
+        if ($lastRow !== null) {
+            if ($lastRow->record_date === null) {
+                $query->whereNull('p.Creation_Date')->where('p.PK', '>', $lastRow->prospect_id);
+            } else {
+                $query->where(static function (Builder $page) use ($lastRow): void {
+                    $page->where('p.Creation_Date', '<', $lastRow->record_date)
+                        ->orWhereNull('p.Creation_Date')
+                        ->orWhere(static fn (Builder $sameDate) => $sameDate->where('p.Creation_Date', $lastRow->record_date)
+                            ->where('p.PK', '>', $lastRow->prospect_id));
+                });
+            }
+        }
+
+        return $query->addSelect('p.Creation_Date as record_date')->orderByDesc('p.Creation_Date')->orderBy('p.PK')->limit($size);
     }
 
     private function eachFreshBatch(array $filters, array $columns, Carbon $asOf, int $rowLimit, callable $consume): void
@@ -259,7 +310,7 @@ class ProspectListRepository extends SqlSrvRepository
         }
     }
 
-    private function applyFilters(Builder $query, array $filters, Carbon $asOf, bool $matchMail = true): void
+    private function applyFilters(Builder $query, array $filters, Carbon $asOf, bool $matchMail = true, bool $mailMatchJoined = false): void
     {
         if (! empty($filters['states'])) {
             $query->whereIn('p.State', $filters['states']);
@@ -278,6 +329,10 @@ class ProspectListRepository extends SqlSrvRepository
         if (isset($filters['date_to'])) {
             $query->where('p.Creation_Date', '<', Carbon::parse($filters['date_to'])->addDay()->toDateString());
         }
+        if (isset($filters['max_record_age_weeks'])) {
+            $query->where('p.Creation_Date', '>=', $asOf->copy()->subWeeks((int) $filters['max_record_age_weeks'])->toDateString())
+                ->where('p.Creation_Date', '<', $asOf->copy()->addDay()->toDateString());
+        }
         $birthDate = $this->birthDateExpression($query);
         if ($birthDate !== null && (isset($filters['age_min']) || isset($filters['age_max']))) {
             $bounds = [
@@ -294,8 +349,21 @@ class ProspectListRepository extends SqlSrvRepository
         }
         if (! empty($filters['fresh_mailed'])) {
             $query->whereNull('p.Latest_Export_Date')->whereNull('p.Last_SMS_Date');
-            if ($matchMail) {
+            if ($mailMatchJoined) {
+                $query->whereNotNull('mail_match.found');
+            } elseif ($matchMail) {
                 $query->whereExists($this->mailingHistory($asOf));
+            }
+        } elseif (isset($filters['suppression'])) {
+            $cutoff = $filters['suppression'] === 'weeks'
+                ? $asOf->copy()->subWeeks((int) $filters['suppression_weeks'])->toDateString()
+                : null;
+            foreach (['Latest_Export_Date', 'Last_SMS_Date'] as $column) {
+                if ($cutoff === null) {
+                    $query->whereNull("p.$column");
+                } else {
+                    $query->where(static fn (Builder $dates) => $dates->whereNull("p.$column")->orWhere("p.$column", '<', $cutoff));
+                }
             }
         } elseif (isset($filters['months_since_pull'])) {
             $cutoff = $asOf->copy()->subMonthsNoOverflow((int) $filters['months_since_pull'])->toDateString();
@@ -311,10 +379,26 @@ class ProspectListRepository extends SqlSrvRepository
                 'present' => $query->whereRaw('NOT '.$this->missingCondition($query, $definitions[$id])),
                 'missing' => $query->whereRaw($this->missingCondition($query, $definitions[$id])),
                 'equals' => $query->where($column, '=', $selection['value']),
-                'range' => $query
-                    ->when(isset($selection['minimum']), fn (Builder $range) => $range->where($column, '>=', $selection['minimum']))
-                    ->when(isset($selection['maximum']), fn (Builder $range) => $range->where($column, '<=', $selection['maximum'])),
+                'range' => $this->applyFieldRange($query, $definitions[$id], $selection),
             };
+        }
+    }
+
+    private function applyFieldRange(Builder $query, array $definition, array $selection): void
+    {
+        $column = $definition[1];
+        $wideDecimal = $definition[3] === 'number' && $query->getConnection()->getDriverName() === 'sqlsrv';
+        foreach (['minimum' => '>=', 'maximum' => '<='] as $bound => $operator) {
+            if (! isset($selection[$bound])) {
+                continue;
+            }
+
+            if ($wideDecimal) {
+                // The API accepts wider bounds than some TU decimal columns can hold.
+                $query->whereRaw($query->getGrammar()->wrap($column)." $operator CAST(? AS decimal(28, 10))", [$selection[$bound]]);
+            } else {
+                $query->where($column, $operator, $selection[$bound]);
+            }
         }
     }
 
@@ -344,15 +428,22 @@ class ProspectListRepository extends SqlSrvRepository
         $groups = [
             'states' => ['states'], 'debt' => ['debt_min', 'debt_max'], 'score' => ['score_min', 'score_max'],
             'age' => ['age_min', 'age_max'], 'date_added' => ['date_from', 'date_to'],
-            'contact' => ['contact'], 'last_pull' => empty($filters['fresh_mailed']) ? ['months_since_pull'] : [],
+            'record_age' => ['max_record_age_weeks'], 'contact' => ['contact'],
+            'last_pull' => empty($filters['fresh_mailed']) && ! isset($filters['suppression']) ? ['months_since_pull'] : [],
+            'suppression' => empty($filters['fresh_mailed']) ? ['suppression', 'suppression_weeks'] : [],
             'fresh_mailed' => ['fresh_mailed'],
         ];
         $sample = $this->table('TblProspects')->orderByDesc('PK')->limit(2500);
         $query = $this->connection()->query()->fromSub($sample, 'p')->select('p.State')
             ->selectRaw('COUNT(*) as sample_size')->groupBy('p.State');
         $this->applyEligibility($query, $filters);
+        $mailMatchJoined = ! empty($filters['fresh_mailed']) && $this->connection()->getDriverName() === 'sqlsrv';
+        if ($mailMatchJoined) {
+            // SQL Server cannot aggregate a CASE expression that contains EXISTS.
+            $query->leftJoinLateral($this->mailingHistory($asOf)->selectRaw('1 as found')->limit(1), 'mail_match');
+        }
         $combinedCriteria = $query->newQuery();
-        $this->applyFilters($combinedCriteria, $filters, $asOf);
+        $this->applyFilters($combinedCriteria, $filters, $asOf, mailMatchJoined: $mailMatchJoined);
         $combinedCondition = substr($combinedCriteria->getGrammar()->compileWheres($combinedCriteria), strlen('where '));
         $query->selectRaw($combinedCondition === '' ? 'COUNT(*) as records' : "COUNT(CASE WHEN $combinedCondition THEN 1 END) as records",
             $combinedCriteria->getBindings());
@@ -371,7 +462,7 @@ class ProspectListRepository extends SqlSrvRepository
         $active = [];
         foreach ($selections as $group => $selection) {
             $criterion = $query->newQuery();
-            $this->applyFilters($criterion, $selection, $asOf);
+            $this->applyFilters($criterion, $selection, $asOf, mailMatchJoined: $mailMatchJoined);
             $condition = substr($criterion->getGrammar()->compileWheres($criterion), strlen('where '));
             $query->selectRaw("COUNT(CASE WHEN $condition THEN 1 END) as [{$group}_matching]", $criterion->getBindings());
 
@@ -380,7 +471,7 @@ class ProspectListRepository extends SqlSrvRepository
                 'debt' => 'p.Current_Debt IS NULL',
                 'score' => 't.evtg04_finscore IS NULL',
                 'age' => $this->birthDateExpression($query).' IS NULL',
-                'date_added' => 'p.Creation_Date IS NULL',
+                'date_added', 'record_age' => 'p.Creation_Date IS NULL',
                 'contact' => ($selection['contact'] === 'phone_email')
                     ? "p.Phone IS NULL OR p.Phone = '' OR p.Email IS NULL OR p.Email = ''"
                     : "p.Phone IS NULL OR p.Phone = ''",
@@ -402,7 +493,9 @@ class ProspectListRepository extends SqlSrvRepository
             $active[$group] = ['label' => $label, 'has_missing' => $missing !== null];
         }
 
-        $results = $this->withQueryTimeout(10, fn () => $query->get());
+        $results = $this->withQueryTimeout(10, fn () => $mailMatchJoined
+            ? new Collection($query->getConnection()->select($query->toSql().' OPTION (MAXDOP 1)', $query->getBindings()))
+            : $query->get());
         $states = [];
         foreach ($results as $row) {
             $state = strtoupper(trim((string) $row->State));
