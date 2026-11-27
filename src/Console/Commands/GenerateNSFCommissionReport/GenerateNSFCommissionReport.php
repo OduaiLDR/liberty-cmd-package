@@ -85,25 +85,25 @@ class GenerateNSFCommissionReport extends Command
         }
         $arg     = strtolower((string) $this->argument('source'));
         $captureStructured = $this->option('structured-shadow') || getenv('PAYROLL_NSF_STRUCTURED_CAPTURE') === '1';
-        if ($captureStructured && !$this->option('structured-shadow')
-            && ($arg !== 'both' || !$this->option('no-email') || !PayrollReportArtifactArchive::captureRequested())) {
+        if ($captureStructured && ($arg !== 'both' || !$this->option('no-email') || !PayrollReportArtifactArchive::captureRequested())) {
             $this->error('Payroll NSF structured capture requires a reserved two-company run and no email.');
             return Command::FAILURE;
         }
         $sources = ($arg === 'both') ? ['ldr', 'plaw'] : [$arg];
+        $captureId = $captureStructured ? bin2hex(random_bytes(16)) : null;
 
         foreach ($sources as $src) {
             if (!isset(self::SOURCE_CONFIG[$src])) {
                 $this->error("Unknown source: $src");
                 return Command::FAILURE;
             }
-            if (!$this->runForSource($src, $queryOnly, $captureStructured)) return Command::FAILURE;
+            if (!$this->runForSource($src, $queryOnly, $captureId)) return Command::FAILURE;
         }
 
         return Command::SUCCESS;
     }
 
-    private function runForSource(string $source, bool $queryOnly, bool $captureStructured): bool
+    private function runForSource(string $source, bool $queryOnly, ?string $captureId): bool
     {
         $cfg     = self::SOURCE_CONFIG[$source];
         $display = $cfg['display'];
@@ -208,9 +208,10 @@ class GenerateNSFCommissionReport extends Command
                 );
             }
 
-            $structuredCapture = $captureStructured
+            $structuredCapture = $captureId !== null
                 ? NsfStructuredCapture::fromCalculation(
                     (string) getenv('PAYROLL_COMMISSION_RUN_ID'),
+                    $captureId,
                     $readiness,
                     $dataRows,
                     $pricedRows,

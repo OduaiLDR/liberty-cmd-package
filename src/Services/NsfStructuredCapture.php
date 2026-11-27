@@ -11,6 +11,7 @@ final class NsfStructuredCapture
 
     public static function fromCalculation(
         string $runId,
+        string $captureId,
         array $readiness,
         array $dataRows,
         array $pricedRows,
@@ -23,6 +24,7 @@ final class NsfStructuredCapture
             'source' => $readiness['source'],
             'period' => $readiness['period'],
             'runId' => $runId,
+            'captureId' => $captureId,
             'readiness' => $readiness,
             'rosterBasis' => $managedRoster ? 'managed' : 'fallback',
             'contacts' => array_map(static fn (array $row): array => [
@@ -64,6 +66,7 @@ final class NsfStructuredCapture
     public static function export(array $artifacts, string $period, string $runId, bool $queryOnly): string
     {
         $readinessIds = [$runId];
+        $invocationIds = [];
         $sources = [];
         foreach (['ldr', 'plaw'] as $source) {
             $key = 'nsf_' . $source;
@@ -78,6 +81,7 @@ final class NsfStructuredCapture
             if (($context['queryOnly'] ?? false) !== $queryOnly || !is_array($capture)
                 || ($capture['version'] ?? null) !== 1 || ($capture['source'] ?? null) !== $source
                 || ($capture['period'] ?? null) !== $period || ($capture['runId'] ?? null) !== $runId
+                || (array_key_exists('captureId', $capture) && !is_string($capture['captureId']))
                 || !in_array($capture['rosterBasis'] ?? null, ['managed', 'fallback'], true)) {
                 throw new \RuntimeException('The NSF run has no structured evidence in the requested capture mode.');
             }
@@ -94,6 +98,7 @@ final class NsfStructuredCapture
                 throw new \RuntimeException('The NSF structured source has invalid readiness evidence.');
             }
             $readinessIds[] = $readinessId;
+            $invocationIds[] = $capture['captureId'] ?? null;
             $captureJson = json_encode($capture, self::JSON_FLAGS);
             $sources[$source] = [
                 'workbookSha256' => $artifact['sha256'],
@@ -102,7 +107,21 @@ final class NsfStructuredCapture
             ];
         }
 
+        self::assertSharedInvocation($invocationIds, $readinessIds, $queryOnly);
         return json_encode(['version' => 1, 'runId' => $runId, 'period' => $period, 'sources' => $sources], self::JSON_FLAGS);
+    }
+
+    /** Historical payable captures predate the invocation ID. A comparison export must prove its pair. */
+    public static function assertSharedInvocation(array $invocationIds, array $reservedIds, bool $required): void
+    {
+        [$ldr, $plaw] = $invocationIds;
+        if (!$required && $ldr === null && $plaw === null) {
+            return;
+        }
+        if (!is_string($ldr) || !preg_match('/^[a-f0-9]{32}$/D', $ldr) || $ldr !== $plaw
+            || in_array($ldr, $reservedIds, true)) {
+            throw new \InvalidArgumentException('The NSF sources do not belong to the same structured capture invocation.');
+        }
     }
 
     private static function matchesReadinessTiming(array $readiness, string $period): bool

@@ -160,7 +160,7 @@ class GenerateRetentionManagerCommission extends Command
         $retentionRows = $this->dedupeRetentionRowsByContactId($retentionRows);
         $this->sortRetentionRows($retentionRows);
         $nsfRows = $roster = $readinessIds = [];
-        $structuredNsf = $includeNsf ? $this->archivedNsfLeadershipInputs($startDate, $artifacts, allowUnassigned: true) : null;
+        $structuredNsf = $includeNsf ? $this->archivedNsfLeadershipInputs($startDate, $artifacts) : null;
         if ($structuredNsf !== null) {
             ['rows' => $nsfRows, 'roster' => $roster, 'readinessIds' => $readinessIds] = $structuredNsf;
         } elseif ($includeNsf) {
@@ -345,10 +345,10 @@ class GenerateRetentionManagerCommission extends Command
     /** Calculate leadership from the corresponding trusted v1 query-only NSF export. */
     public function buildPayrollReviewNsfStructuredSnapshot(string $period, string $runId, array $envelope): array
     {
-        return $this->buildFrozenNsfLeadershipSnapshot($period, $this->nsfLeadershipInputs($period, $runId, $envelope));
+        return $this->buildFrozenNsfLeadershipSnapshot($period, $this->nsfLeadershipInputs($period, $runId, $envelope, requireInvocation: true));
     }
 
-    private function archivedNsfLeadershipInputs(string $period, array $artifacts, bool $allowUnassigned = false): ?array
+    private function archivedNsfLeadershipInputs(string $period, array $artifacts): ?array
     {
         $pair = [];
         $hasStructured = false;
@@ -374,12 +374,12 @@ class GenerateRetentionManagerCommission extends Command
         $runId = $pair['nsf_ldr']['identity'];
         $queryOnly = $pair['nsf_ldr']['context']['queryOnly'] ?? false;
         $envelope = json_decode(NsfStructuredCapture::export($pair, $period, $runId, $queryOnly), true, flags: JSON_THROW_ON_ERROR);
-        return $this->nsfLeadershipInputs($period, $runId, $envelope, $allowUnassigned);
+        return $this->nsfLeadershipInputs($period, $runId, $envelope);
     }
 
-    private function nsfLeadershipInputs(string $period, string $runId, array $envelope, bool $allowUnassigned = false): array
+    private function nsfLeadershipInputs(string $period, string $runId, array $envelope, bool $requireInvocation = false): array
     {
-        $inputs = NsfStructuredTeamLeader::inputs($period, $runId, $envelope, $allowUnassigned);
+        $inputs = NsfStructuredTeamLeader::inputs($period, $runId, $envelope, $requireInvocation);
         $roster = [];
         foreach ($inputs['rosters'] as $names) {
             $seen = [];

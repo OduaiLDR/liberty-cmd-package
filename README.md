@@ -8,8 +8,10 @@ the workbook-backed report. The export records the frozen roster, eligibility,
 and readiness from each company. The calculation reads the export and prints
 the result as JSON for comparison.
 
-For an existing query-only shadow capture, run this from CMD Runner with the
-updated package installed. Use Bash so the command pipe preserves UTF-8.
+The query-only shadow must capture LDR and PLAW together using `both`.
+The exporter checks the shared invocation ID. If a capture predates that ID
+or only one company was saved, run a fresh two-company shadow with a new
+reserved run ID. Use Bash in CMD Runner so the command pipe preserves UTF-8.
 
 ```bash
 set -o pipefail

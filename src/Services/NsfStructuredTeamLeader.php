@@ -15,7 +15,7 @@ use stdClass;
 /** Read the roster fields and frozen contact eligibility from a trusted v1 shadow export. */
 final class NsfStructuredTeamLeader
 {
-    public static function inputs(string $period, string $runId, array $envelope, bool $allowUnassigned = false): array
+    public static function inputs(string $period, string $runId, array $envelope, bool $requireInvocation = false): array
     {
         self::requireFields($envelope, ['version', 'period', 'runId', 'sources']);
         if (!preg_match('/^[0-9]{4}-(0[1-9]|1[0-2])-01$/D', $period) || !self::isHexId($runId, 32)
@@ -25,7 +25,7 @@ final class NsfStructuredTeamLeader
         }
         self::requireFields($envelope['sources'], ['ldr', 'plaw']);
 
-        $rows = $rosters = $readinessIds = [];
+        $rows = $rosters = $readinessIds = $invocationIds = [];
         foreach (['ldr' => 'LDR', 'plaw' => 'Progress Law'] as $source => $display) {
             $capture = self::capture($envelope['sources'][$source], $period, $runId, $source);
             $readinessId = self::readinessId($capture->readiness, $period, $source);
@@ -33,11 +33,12 @@ final class NsfStructuredTeamLeader
                 self::invalid();
             }
             $readinessIds[$source] = $readinessId;
+            $invocationIds[] = $capture->captureId ?? null;
             $rosters[$source] = self::roster($capture->agents);
 
             $seen = [];
             foreach ($capture->contacts as $contact) {
-                $row = self::contact($contact, $period, $display, $allowUnassigned);
+                $row = self::contact($contact, $period, $display);
                 if (isset($seen[$row['ID']])) {
                     self::invalid();
                 }
@@ -45,6 +46,7 @@ final class NsfStructuredTeamLeader
                 $rows[] = $row;
             }
         }
+        NsfStructuredCapture::assertSharedInvocation($invocationIds, [$runId, ...array_values($readinessIds)], $requireInvocation);
 
         return [
             'periodEnd' => (new DateTimeImmutable($period, new DateTimeZone('UTC')))->format('Y-m-t'),
@@ -70,7 +72,12 @@ final class NsfStructuredTeamLeader
         if (!$capture instanceof stdClass) {
             self::invalid();
         }
-        self::requireFields((array) $capture, ['version', 'source', 'period', 'runId', 'readiness', 'rosterBasis', 'contacts', 'agents', 'unassigned']);
+        $fields = ['version', 'source', 'period', 'runId', 'readiness', 'rosterBasis', 'contacts', 'agents', 'unassigned'];
+        if (property_exists($capture, 'captureId')) {
+            $fields[] = 'captureId';
+            if (!self::isHexId($capture->captureId, 32)) self::invalid();
+        }
+        self::requireFields((array) $capture, $fields);
         if ($capture->version !== 1 || $capture->source !== $source || $capture->period !== $period || $capture->runId !== $runId
             || !in_array($capture->rosterBasis, ['managed', 'fallback'], true)
             || !is_array($capture->contacts) || !is_array($capture->agents) || !is_array($capture->unassigned)) {
@@ -107,9 +114,16 @@ final class NsfStructuredTeamLeader
     {
         $roster = [];
         foreach ($agents as $agent) {
-            if (!$agent instanceof stdClass || !self::isAgent($agent->agent ?? null) || !is_bool($agent->onRoster ?? null)
+            if (!$agent instanceof stdClass || !is_bool($agent->onRoster ?? null)
                 || !is_string($agent->location ?? null) || !is_string($agent->company ?? null)) {
                 self::invalid();
+            }
+            if (!self::isAgent($agent->agent ?? null)) {
+                if ($agent->onRoster || !is_string($agent->agent ?? null) || !self::isUnassigned($agent->agent)
+                    || ($agent->commissionCents ?? null) !== 0 || ($agent->clears ?? null) !== 0) {
+                    self::invalid();
+                }
+                continue;
             }
             if ($agent->onRoster) {
                 if (strcasecmp(trim($agent->agent), 'Unassigned Agents') === 0) {
@@ -122,14 +136,13 @@ final class NsfStructuredTeamLeader
         return array_map(static fn (array $row): string => trim($row['agent']), Formatter::sortByLocationCompanyAgent($roster));
     }
 
-    private static function contact(mixed $contact, string $period, string $display, bool $allowUnassigned): array
+    private static function contact(mixed $contact, string $period, string $display): array
     {
         if (!$contact instanceof stdClass) {
             self::invalid();
         }
         self::requireFields((array) $contact, ['contactId', 'agent', 'returnedDate', 'action', 'recoupDate', 'clearedDate', 'eligible']);
-        $unassigned = $allowUnassigned && $contact->eligible === false
-            && ($contact->agent === null || (is_string($contact->agent) && in_array(trim($contact->agent), ['', '0'], true)));
+        $unassigned = $contact->eligible === false && self::isUnassigned($contact->agent);
         if (!is_string($contact->contactId) || !preg_match('/^[1-9][0-9]*$/D', $contact->contactId)
             || (!self::isAgent($contact->agent) && !$unassigned) || !is_bool($contact->eligible)
             || ($contact->action !== null && (!is_string($contact->action)
@@ -143,8 +156,14 @@ final class NsfStructuredTeamLeader
             }
         }
 
-        return ['ID' => $contact->contactId, 'AGENT' => $contact->agent, 'NSF_ACTION' => $contact->action,
+        return ['ID' => $contact->contactId, 'AGENT' => $unassigned ? null : $contact->agent, 'NSF_ACTION' => $contact->action,
             'VALID_COMMISSION' => $contact->eligible, 'SOURCE' => $display];
+    }
+
+    private static function isUnassigned(mixed $value): bool
+    {
+        return $value === null || (is_string($value) && (trim($value) === ''
+            || DefaultValueBinder::dataTypeForValue(trim($value)) === DataType::TYPE_NUMERIC));
     }
 
     private static function isDate(mixed $value): bool

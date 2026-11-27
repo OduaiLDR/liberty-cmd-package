@@ -317,11 +317,16 @@ final class NsfQueryOnlyCaptureTest extends TestCase
             'missing capture' => ['nsfStructuredCapture' => null] + $context,
         ];
         $capture = $context['nsfStructuredCapture'];
+        $missingInvocation = $capture;
+        unset($missingInvocation['captureId']);
+        $wrongContexts['missing invocation ID'] = ['nsfStructuredCapture' => $missingInvocation] + $context;
         foreach ([
             'unknown version' => ['version' => 2],
             'wrong source' => ['source' => 'ldr'],
             'wrong month' => ['period' => '2098-02-01'],
             'wrong outer run' => ['runId' => str_repeat('b', 32)],
+            'different invocation' => ['captureId' => str_repeat('c', 32)],
+            'outer run as invocation' => ['captureId' => self::RUN_ID],
             'missing result rows' => ['agents' => null],
         ] as $case => $override) {
             $wrongContexts[$case] = ['nsfStructuredCapture' => $override + $capture] + $context;
@@ -348,6 +353,58 @@ final class NsfQueryOnlyCaptureTest extends TestCase
         self::assertSame([1, ''], $this->runExport(), 'changed workbook bytes');
         unlink($metadataPath);
         self::assertSame([1, ''], $this->runExport(), 'missing brand');
+    }
+
+    public function test_structured_shadow_requires_both_companies_before_opening_connectors(): void
+    {
+        foreach (['ldr', 'plaw'] as $source) {
+            [$code, , $connectorCalls] = $this->runNsf(new RecordingSqlServerConnector, [],
+                ['--no-email' => true, '--structured-shadow' => true], $source);
+            self::assertSame(1, $code);
+            self::assertSame([], $connectorCalls);
+        }
+        self::assertSame([1, ''], $this->runExport());
+    }
+
+    public function test_unpaid_agent_placeholders_produce_the_same_structured_and_workbook_results(): void
+    {
+        [$code, $output] = $this->runNsf(new RecordingSqlServerConnector, [
+            'ldr' => [$this->sourceRow(101, '123', null)],
+            'plaw' => [$this->sourceRow(102, '', null)],
+        ], ['--no-email' => true, '--structured-shadow' => true]);
+        self::assertSame(0, $code, $output);
+        $artifacts = $this->archivedArtifacts();
+        self::assertSame('123', $artifacts['nsf_ldr']['context']['nsfStructuredCapture']['contacts'][0]['agent']);
+        $legacy = (new GenerateRetentionManagerCommission)->freezePayrollReviewLeadership(self::PERIOD, '2098-01-31',
+            array_map(static fn (array $artifact): array => ['path' => $artifact['path']], $artifacts), null, true);
+        $leader = new GenerateRetentionManagerCommission;
+        $structured = $leader->freezePayrollReviewLeadership(self::PERIOD, '2098-01-31', $artifacts, null, true);
+        self::assertSame($legacy, $structured);
+        [$exit, $json] = $this->runExport();
+        self::assertSame(0, $exit);
+        [$readerExit, $result, $errors] = $this->runTeamLeaderReader($json);
+        self::assertSame(0, $readerExit, $errors);
+        $envelope = json_decode($json, true, flags: JSON_THROW_ON_ERROR);
+        $comparison = $leader->buildPayrollReviewNsfStructuredSnapshot(self::PERIOD, self::RUN_ID, $envelope);
+        self::assertSame($comparison, json_decode($result, true, flags: JSON_THROW_ON_ERROR));
+        self::assertSame($structured['reports']['nsf_team_leader']['team'], $comparison['team']);
+        self::assertSame($structured['reports']['nsf_team_leader']['summary'], $comparison['summary']);
+        self::assertSame(0, $comparison['summary']['assignedCount']);
+
+        $paid = $this->changeCapture($envelope, 'ldr', static function (array $capture): array {
+            foreach ($capture['agents'] as &$agent) {
+                if ((string) $agent['agent'] === '123') $agent['commissionCents'] = 100;
+            }
+            return $capture;
+        });
+        $this->assertRejectsTeamLeaderEvidence($leader, 'paid off-roster numeric identity', self::PERIOD, self::RUN_ID, $paid);
+        foreach (['ldr', 'plaw'] as $source) {
+            $envelope = $this->changeCapture($envelope, $source, static function (array $capture): array {
+                unset($capture['captureId']);
+                return $capture;
+            });
+        }
+        $this->assertRejectsTeamLeaderEvidence($leader, 'shadow export without invocation IDs', self::PERIOD, self::RUN_ID, $envelope);
     }
 
     public function test_structured_leadership_fails_closed_on_incomplete_or_inconsistent_evidence(): void
@@ -536,8 +593,17 @@ final class NsfQueryOnlyCaptureTest extends TestCase
         unset($artifact);
         $frozen = $leader->freezePayrollReviewLeadership(self::PERIOD, '2098-01-31', $artifacts, null, true);
         self::assertSame($wanted['reports'], $frozen['reports']);
+        $legacyCaptures = $artifacts;
+        foreach ($legacyCaptures as &$artifact) {
+            unset($artifact['context']['nsfStructuredCapture']['captureId']);
+            $artifact['contextSha256'] = hash('sha256', json_encode($artifact['context'], self::JSON_FLAGS));
+        }
+        unset($artifact);
+        self::assertSame($frozen['reports'], $leader->freezePayrollReviewLeadership(self::PERIOD, '2098-01-31',
+            $legacyCaptures, null, true)['reports']);
 
-        $this->assertRejectsTeamLeaderEvidence($leader, 'zero placeholder in a strict shadow', self::PERIOD, self::RUN_ID, $envelope);
+        self::assertSame($frozen['reports']['nsf_team_leader']['summary'],
+            $leader->buildPayrollReviewNsfStructuredSnapshot(self::PERIOD, self::RUN_ID, $envelope)['summary']);
         foreach ([
             'eligible zero placeholder' => static function (array $capture): array {
                 $capture['contacts'][1]['eligible'] = true;
@@ -547,10 +613,6 @@ final class NsfQueryOnlyCaptureTest extends TestCase
                 $capture['agents'][0]['agent'] = '0';
                 return $capture;
             },
-            'other numeric placeholder' => static function (array $capture): array {
-                $capture['contacts'][1]['agent'] = '123';
-                return $capture;
-            },
             'formula placeholder' => static function (array $capture): array {
                 $capture['contacts'][1]['agent'] = '=1+1';
                 return $capture;
@@ -558,7 +620,7 @@ final class NsfQueryOnlyCaptureTest extends TestCase
         ] as $case => $change) {
             $bad = $this->changeCapture($envelope, 'plaw', $change);
             try {
-                NsfStructuredTeamLeader::inputs(self::PERIOD, self::RUN_ID, $bad, allowUnassigned: true);
+                NsfStructuredTeamLeader::inputs(self::PERIOD, self::RUN_ID, $bad);
                 self::fail('Accepted ' . $case);
             } catch (\InvalidArgumentException $error) {
                 self::assertStringContainsString('outside the supported leadership scope', $error->getMessage(), $case);
@@ -615,7 +677,7 @@ final class NsfQueryOnlyCaptureTest extends TestCase
         }
     }
 
-    private function runNsf(DBConnector $sql, array $sourceRows, array $options): array
+    private function runNsf(DBConnector $sql, array $sourceRows, array $options, string $source = 'both'): array
     {
         $command = new class($sql, $sourceRows) extends GenerateNSFCommissionReport {
             public array $connectorCalls = [];
@@ -636,7 +698,7 @@ final class NsfQueryOnlyCaptureTest extends TestCase
         };
         $command->setLaravel($this->app);
         $output = new BufferedOutput;
-        $code = $command->run(new ArrayInput(['source' => 'both', 'period' => self::PERIOD] + $options, $command->getDefinition()), $output);
+        $code = $command->run(new ArrayInput(['source' => $source, 'period' => self::PERIOD] + $options, $command->getDefinition()), $output);
         return [$code, $output->fetch(), $command->connectorCalls];
     }
 
