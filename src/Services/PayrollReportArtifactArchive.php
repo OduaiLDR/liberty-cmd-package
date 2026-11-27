@@ -13,6 +13,7 @@ final class PayrollReportArtifactArchive
     public const MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
     public const SOURCE_KEYS = ['retention_ldr', 'retention_plaw', 'lookback_ldr', 'lookback_plaw', 'nsf_ldr', 'nsf_plaw'];
     public const LEADERSHIP_KEYS = ['customer_support_manager', 'retention_team_leader', 'nsf_team_leader'];
+    private const CONTEXT_JSON_FLAGS = JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR;
     private string $root;
     public function __construct(?string $root = null) { $this->root = $root ?? storage_path('app/payroll-report-artifacts'); }
 
@@ -70,7 +71,8 @@ final class PayrollReportArtifactArchive
             }
             if (file_exists($destination) || is_link($destination)) {
                 $stored = $this->readAt($key, $period, $bundleId, $destination);
-                if ($stored['context'] !== $context) {
+                $persistedContext = json_decode(json_encode($context, self::CONTEXT_JSON_FLAGS), true, flags: JSON_THROW_ON_ERROR);
+                if (self::canonicalContext($stored['context']) !== self::canonicalContext($persistedContext)) {
                     throw new \RuntimeException('Leadership workbook evidence differs from the frozen export.');
                 }
                 return $stored;
@@ -91,6 +93,21 @@ final class PayrollReportArtifactArchive
             flock($lock, LOCK_UN);
             fclose($lock);
         }
+    }
+
+    /** JSON object key order does not affect evidence, but list order does. */
+    private static function canonicalContext(array $context): array
+    {
+        if (!array_is_list($context)) {
+            ksort($context);
+        }
+        foreach ($context as &$value) {
+            if (is_array($value)) {
+                $value = self::canonicalContext($value);
+            }
+        }
+        unset($value);
+        return $context;
     }
 
     private function captureAt(string $key, string $period, string $identity, array $file, array $context, string $directory): array
@@ -118,7 +135,7 @@ final class PayrollReportArtifactArchive
                 throw new \RuntimeException('Legacy evidence does not match the original workbook and unverified scope.');
             }
         }
-        $contextJson = json_encode($context, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+        $contextJson = json_encode($context, self::CONTEXT_JSON_FLAGS);
         $context = json_decode($contextJson, true, flags: JSON_THROW_ON_ERROR);
         $metadata = ['key' => $key, 'period' => $period, 'identity' => $identity, 'fileName' => $fileName,
             'contentType' => self::MIME, ...$evidence, 'context' => $context, 'contextSha256' => hash('sha256', $contextJson)];
@@ -169,7 +186,7 @@ final class PayrollReportArtifactArchive
         $metadata = json_decode((string) file_get_contents($directory . '/artifact.json'), true, flags: JSON_THROW_ON_ERROR);
         if (($metadata['key'] ?? null) !== $key || ($metadata['period'] ?? null) !== $period || ($metadata['identity'] ?? null) !== $identity
             || ($metadata['contentType'] ?? null) !== self::MIME || !is_array($metadata['context'] ?? null)
-            || hash('sha256', json_encode($metadata['context'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)) !== ($metadata['contextSha256'] ?? null)
+            || hash('sha256', json_encode($metadata['context'], self::CONTEXT_JSON_FLAGS)) !== ($metadata['contextSha256'] ?? null)
             || $this->verifyWorkbook($path) !== ['sha256' => $metadata['sha256'] ?? null, 'byteLength' => $metadata['byteLength'] ?? null]) {
             throw new \RuntimeException('The correlated payroll workbook archive no longer matches its immutable evidence.');
         }

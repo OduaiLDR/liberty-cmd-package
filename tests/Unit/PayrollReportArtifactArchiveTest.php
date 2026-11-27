@@ -106,6 +106,31 @@ class PayrollReportArtifactArchiveTest extends TestCase
         $this->assertSame('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', $saved['contentType']);
         $this->assertSame($file['filename'], $saved['fileName']);
     }
+
+    public function test_leadership_retry_reuses_workbook_with_json_equivalent_context(): void
+    {
+        $archive = new PayrollReportArtifactArchive($this->directory . '/leadership');
+        $bundleId = str_repeat('b', 64);
+        $file = $this->workbook();
+        $context = ['summary' => ['totalPay' => 0.0, 'rate' => 0.35], 'lines' => [5.0, 0]];
+        $first = $archive->materializeLeadership('nsf_team_leader', '2098-09-01', $bundleId, $context, static fn () => $file);
+        $unexpectedRender = static fn () => self::fail('An existing workbook must never be rendered again.');
+        $again = $archive->materializeLeadership('nsf_team_leader', '2098-09-01', $bundleId, $context, $unexpectedRender);
+        $this->assertSame($first, $again);
+        $reordered = ['lines' => [5, 0.0], 'summary' => ['rate' => 0.35, 'totalPay' => 0]];
+        $this->assertSame($first, $archive->materializeLeadership('nsf_team_leader', '2098-09-01', $bundleId, $reordered, $unexpectedRender));
+        foreach ([
+            ['summary' => ['totalPay' => '0', 'rate' => 0.35], 'lines' => [5, 0]],
+            ['summary' => $context['summary'], 'lines' => [0, 5]],
+        ] as $changed) {
+            try {
+                $archive->materializeLeadership('nsf_team_leader', '2098-09-01', $bundleId, $changed, $unexpectedRender);
+                self::fail('A changed archived value was accepted.');
+            } catch (\RuntimeException $error) {
+                self::assertStringContainsString('differs from the frozen export', $error->getMessage());
+            }
+        }
+    }
     public function test_existing_identity_is_immutable_but_same_bytes_can_be_retried(): void
     {
         $archive = new PayrollReportArtifactArchive($this->directory . '/archive');
